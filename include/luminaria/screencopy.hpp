@@ -20,6 +20,7 @@ struct wl_resource; // opaque
 namespace luminaria {
 
 class Display;
+class VulkanRenderer;
 
 /// Callback to capture pixels from an output region.
 /// Fill `rgba` with tightly-packed RGBA8, row-major, top-to-bottom.
@@ -48,6 +49,11 @@ public:
     /// Register an output for capture. `output` is the wl_resource the client
     /// passes to capture_output. `capture` is called when a client requests a copy.
     void add_output(wl_resource* output, int width, int height, ScreencopyCaptureFunc capture);
+
+    /// Enable dmabuf capture targets. Clients may then hand a linux-dmabuf buffer
+    /// instead of shm; LINEAR is written via mmap, tiled via the renderer. Without
+    /// this, only shm targets are advertised.
+    void set_renderer(VulkanRenderer* renderer);
 
     struct Impl;
 

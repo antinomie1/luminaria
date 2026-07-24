@@ -14,10 +14,19 @@ luminaria_lib = static_library('luminaria',
     'types/seat.cpp',
     'types/output_global.cpp',
     'types/screencopy.cpp',
+    'types/linux_dmabuf.cpp',
+    'types/subcompositor.cpp',
+    'types/data_device.cpp',
+    'types/drm_syncobj.cpp',
   ),
   xdg_shell_c,         # generated protocol code
   xdg_shell_h,         # generated server header (also on the include path)
   xdg_shell_client_h,  # nested backend acts as a client of the parent
+  xdg_decoration_c, xdg_decoration_client_h, # …and asks it to decorate our window
+  dmabuf_c, dmabuf_h,  # linux-dmabuf-v1 server glue
+  primary_sel_c, primary_sel_h,
+  xdg_output_c, xdg_output_h,
+  syncobj_c, syncobj_h,
   wlr_screencopy_c, wlr_screencopy_h,
   ext_copy_capture_c, ext_copy_capture_h,
   ext_capture_source_c, ext_capture_source_h,

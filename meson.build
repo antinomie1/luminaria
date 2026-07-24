@@ -30,8 +30,9 @@ xcb = dependency('xcb')
 libdrm = dependency('libdrm')
 libinput = dependency('libinput')
 libudev = dependency('libudev')
+gbm = dependency('gbm')
 
-luminaria_deps = [wayland_server, vulkan, xkbcommon, wayland_client, xcb, libdrm, libinput, libudev]
+luminaria_deps = [wayland_server, vulkan, xkbcommon, wayland_client, xcb, libdrm, libinput, libudev, gbm]
 
 # --- Generate server-side glue for extension protocols (xdg-shell). ---
 wl_scanner_dep = dependency('wayland-scanner', native : true)
@@ -48,6 +49,62 @@ xdg_shell_c = custom_target('xdg-shell-protocol.c',
 # Client header — only tests act as clients; the interface symbols come from the lib.
 xdg_shell_client_h = custom_target('xdg-shell-client-protocol.h',
   input : xdg_xml, output : 'xdg-shell-client-protocol.h',
+  command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+
+# --- linux-dmabuf-unstable-v1: GPU (dmabuf) client buffers. ---
+dmabuf_xml = wl_protocols_dir / 'unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml'
+dmabuf_h = custom_target('linux-dmabuf-unstable-v1-protocol.h',
+  input : dmabuf_xml, output : 'linux-dmabuf-unstable-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+dmabuf_c = custom_target('linux-dmabuf-unstable-v1-protocol.c',
+  input : dmabuf_xml, output : 'linux-dmabuf-unstable-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+# Client header — only tests act as dmabuf clients.
+dmabuf_client_h = custom_target('linux-dmabuf-unstable-v1-client-protocol.h',
+  input : dmabuf_xml, output : 'linux-dmabuf-unstable-v1-client-protocol.h',
+  command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+
+# --- xdg-decoration-unstable-v1: we ask the PARENT compositor to decorate our
+#     nested window. Client side only — the server-side global is a separate item.
+xdg_decoration_xml = wl_protocols_dir / 'unstable/xdg-decoration/xdg-decoration-unstable-v1.xml'
+xdg_decoration_c = custom_target('xdg-decoration-unstable-v1-protocol.c',
+  input : xdg_decoration_xml, output : 'xdg-decoration-unstable-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+xdg_decoration_client_h = custom_target('xdg-decoration-unstable-v1-client-protocol.h',
+  input : xdg_decoration_xml, output : 'xdg-decoration-unstable-v1-client-protocol.h',
+  command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+
+# --- xdg-output-unstable-v1: logical output layout (grim/slurp read this). ---
+xdg_output_xml = wl_protocols_dir / 'unstable/xdg-output/xdg-output-unstable-v1.xml'
+xdg_output_h = custom_target('xdg-output-unstable-v1-protocol.h',
+  input : xdg_output_xml, output : 'xdg-output-unstable-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+xdg_output_c = custom_target('xdg-output-unstable-v1-protocol.c',
+  input : xdg_output_xml, output : 'xdg-output-unstable-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+# --- primary-selection-unstable-v1: middle-click paste. ---
+primary_sel_xml = wl_protocols_dir / 'unstable/primary-selection/primary-selection-unstable-v1.xml'
+primary_sel_h = custom_target('primary-selection-unstable-v1-protocol.h',
+  input : primary_sel_xml, output : 'primary-selection-unstable-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+primary_sel_c = custom_target('primary-selection-unstable-v1-protocol.c',
+  input : primary_sel_xml, output : 'primary-selection-unstable-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+primary_sel_client_h = custom_target('primary-selection-unstable-v1-client-protocol.h',
+  input : primary_sel_xml, output : 'primary-selection-unstable-v1-client-protocol.h',
+  command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+
+# --- linux-drm-syncobj-v1: explicit GPU synchronisation. ---
+syncobj_xml = wl_protocols_dir / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml'
+syncobj_h = custom_target('linux-drm-syncobj-v1-protocol.h',
+  input : syncobj_xml, output : 'linux-drm-syncobj-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+syncobj_c = custom_target('linux-drm-syncobj-v1-protocol.c',
+  input : syncobj_xml, output : 'linux-drm-syncobj-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+syncobj_client_h = custom_target('linux-drm-syncobj-v1-client-protocol.h',
+  input : syncobj_xml, output : 'linux-drm-syncobj-v1-client-protocol.h',
   command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
 
 # --- Screencopy protocols ---

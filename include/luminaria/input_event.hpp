@@ -27,5 +27,13 @@ struct PointerButtonEvent {
 struct PointerMotionAbsEvent {
     double x, y;
 };
+// One scroll frame. `dx/dy` are smooth (touchpad / hi-res wheel) deltas in
+// surface units, positive = right/down. `dx_steps/dy_steps` count wheel notches
+// and are 0 for touchpads. `stop_*` marks the end of a smooth scroll sequence.
+struct PointerAxisEvent {
+    double dx = 0.0, dy = 0.0;
+    int32_t dx_steps = 0, dy_steps = 0;
+    bool stop_horizontal = false, stop_vertical = false;
+};
 
 } // namespace luminaria

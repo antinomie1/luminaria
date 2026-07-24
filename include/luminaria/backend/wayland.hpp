@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "luminaria/backend.hpp"
 #include "luminaria/core/event_loop.hpp"
@@ -16,6 +17,14 @@
 #include "luminaria/output.hpp"
 
 namespace luminaria {
+
+/// Who draws the frame around our nested window, as negotiated with the parent
+/// compositor via xdg-decoration-unstable-v1.
+enum class DecorationMode {
+    None,       ///< the parent has no xdg-decoration global: no frame at all
+    ClientSide, ///< the parent insists WE draw it (GTK-style CSD); we don't
+    ServerSide, ///< the parent draws a native titlebar around us — what we ask for
+};
 
 class WaylandBackend final : public Backend {
 public:
@@ -29,10 +38,18 @@ public:
     WaylandBackend(const WaylandBackend&) = delete;
     WaylandBackend& operator=(const WaylandBackend&) = delete;
 
-    /// Create a parent window of the given size. Call before start().
-    Output& add_output(int width, int height);
+    /// Create a parent window of the given size, titled `title`. The window
+    /// asks the parent compositor for a native (server-side) decoration, so it
+    /// looks like any other application on the host desktop. Call before start().
+    Output& add_output(int width, int height, std::string title = "luminaria");
 
     Status start() override;
+
+    /// What the parent granted. Only meaningful after start() — the negotiation
+    /// completes with the first configure. `None` means the parent doesn't
+    /// implement xdg-decoration at all (e.g. GNOME/Mutter), so the nested window
+    /// is bare; `ClientSide` means it refused to decorate us.
+    [[nodiscard]] DecorationMode decoration_mode() const noexcept;
 
     // Input forwarded from the parent compositor (cursor is over our window).
     // Coordinates are output-local; the compositor hit-tests and routes to a
@@ -41,6 +58,8 @@ public:
     Signal<ModifiersEvent> modifiers;
     Signal<PointerMotionAbsEvent> pointer_motion;
     Signal<PointerButtonEvent> pointer_button;
+    /// One scroll frame, accumulated across the parent's axis events.
+    Signal<PointerAxisEvent> pointer_axis;
 
     struct Impl;
 

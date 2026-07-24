@@ -6,9 +6,14 @@
 #include "luminaria/screencopy.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <ctime>
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#include <drm_fourcc.h>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
@@ -17,6 +22,8 @@
 #include "ext-image-capture-source-v1-protocol.h"
 
 #include "luminaria/core/display.hpp"
+#include "luminaria/linux_dmabuf.hpp"
+#include "luminaria/render/vulkan.hpp"
 
 namespace luminaria {
 
@@ -55,6 +62,9 @@ struct OutputEntry {
 // =============================================================================
 struct ScreencopyManager::Impl {
     wl_display* display = nullptr;
+    VulkanRenderer* renderer = nullptr; // set → dmabuf targets advertised/writable
+    dev_t render_dev = 0;               // DRM render node dev_t (for ext dmabuf_device)
+    bool has_dev = false;
 
     // wlr-screencopy globals
     wl_global* wlr_manager_global = nullptr;
@@ -112,14 +122,11 @@ void wlr_frame_destroy_request(wl_client*, wl_resource* resource) {
 bool write_shm_rgba(wl_resource* buffer, const std::vector<uint8_t>& rgba,
                     int width, int height, int shm_stride) {
     wl_shm_buffer* shm = wl_shm_buffer_get(buffer);
-    if (!shm) { std::fprintf(stderr, "write_shm_rgba: not shm!\n"); return false; }
+    if (!shm) { return false; }
 
     wl_shm_buffer_begin_access(shm);
     auto* dst = static_cast<uint8_t*>(wl_shm_buffer_get_data(shm));
-    if (!dst) { std::fprintf(stderr, "write_shm_rgba: null data!\n"); wl_shm_buffer_end_access(shm); return false; }
-
-    std::fprintf(stderr, "write_shm_rgba: %dx%d stride=%d rgba=%zu dst=%p\n",
-                 width, height, shm_stride, rgba.size(), (void*)dst);
+    if (!dst) { wl_shm_buffer_end_access(shm); return false; }
 
     // Copy row by row, converting RGBA → ARGB8888 (little-endian BGRA).
     for (int y = 0; y < height; ++y) {
@@ -136,6 +143,53 @@ bool write_shm_rgba(wl_resource* buffer, const std::vector<uint8_t>& rgba,
     return true;
 }
 
+bool dmabuf_is_linear(uint64_t m) {
+    return m == DRM_FORMAT_MOD_LINEAR || m == DRM_FORMAT_MOD_INVALID;
+}
+
+/// Write tightly-packed RGBA8 into a client dmabuf target (ARGB8888/XRGB8888).
+/// LINEAR is mmap'd; any other modifier goes through the renderer. Returns false
+/// on size/format mismatch or a missing renderer for a tiled buffer.
+bool write_dmabuf_rgba(VulkanRenderer* renderer, wl_resource* buffer,
+                       const std::vector<uint8_t>& rgba, int width, int height) {
+    DmabufInfo info;
+    if (!dmabuf_buffer_info(buffer, info)) {
+        return false;
+    }
+    if (info.width != width || info.height != height ||
+        (info.format != DRM_FORMAT_ARGB8888 && info.format != DRM_FORMAT_XRGB8888)) {
+        return false;
+    }
+    if (dmabuf_is_linear(info.modifier)) {
+        const size_t len =
+            static_cast<size_t>(info.offset) + static_cast<size_t>(info.stride) * height;
+        void* map = mmap(nullptr, len, PROT_WRITE, MAP_SHARED, info.fd, 0);
+        if (map == MAP_FAILED) {
+            return false;
+        }
+        auto* base = static_cast<uint8_t*>(map) + info.offset;
+        for (int y = 0; y < height; ++y) {
+            const uint8_t* src = rgba.data() + static_cast<size_t>(y) * width * 4;
+            uint8_t* dst = base + static_cast<size_t>(y) * info.stride;
+            for (int x = 0; x < width; ++x) {
+                dst[x * 4 + 0] = src[x * 4 + 2]; // B
+                dst[x * 4 + 1] = src[x * 4 + 1]; // G
+                dst[x * 4 + 2] = src[x * 4 + 0]; // R
+                dst[x * 4 + 3] = src[x * 4 + 3]; // A
+            }
+        }
+        munmap(map, len);
+        return true;
+    }
+    if (renderer == nullptr) {
+        return false;
+    }
+    return renderer
+        ->export_dmabuf(info.fd, width, height, info.format, info.offset, info.stride, info.modifier,
+                        rgba)
+        .has_value();
+}
+
 void wlr_frame_do_copy(WlrFrame* f, wl_resource* buffer, bool with_damage) {
     if (f->copy_requested) {
         wl_resource_post_error(f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_ALREADY_USED,
@@ -145,40 +199,48 @@ void wlr_frame_do_copy(WlrFrame* f, wl_resource* buffer, bool with_damage) {
     f->copy_requested = true;
     f->copy_with_damage = with_damage;
 
+    const int cap_w = f->region_w;
+    const int cap_h = f->region_h;
+
+    // Validate the target buffer (shm or dmabuf) before capturing.
     wl_shm_buffer* shm = wl_shm_buffer_get(buffer);
-    if (!shm) {
-        std::fprintf(stderr, "wlr_copy: not a shm buffer!\n");
-        zwlr_screencopy_frame_v1_send_failed(f->resource);
-        return;
-    }
-
-    int buf_w = wl_shm_buffer_get_width(shm);
-    int buf_h = wl_shm_buffer_get_height(shm);
-    int buf_stride = wl_shm_buffer_get_stride(shm);
-    uint32_t buf_format = wl_shm_buffer_get_format(shm);
-    std::fprintf(stderr, "wlr_copy: buf=%dx%d stride=%d fmt=%u (want %dx%d ARGB8888)\n",
-                 buf_w, buf_h, buf_stride, buf_format, f->region_w, f->region_h);
-
-    int cap_w = f->region_w;
-    int cap_h = f->region_h;
-    if (buf_w != cap_w || buf_h != cap_h || buf_format != WL_SHM_FORMAT_ARGB8888) {
-        wl_resource_post_error(f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
-                               "buffer size/format mismatch: expected %dx%d ARGB8888, got %dx%d fmt=%u",
-                               cap_w, cap_h, buf_w, buf_h, buf_format);
-        return;
+    int shm_stride = 0;
+    if (shm) {
+        const int bw = wl_shm_buffer_get_width(shm);
+        const int bh = wl_shm_buffer_get_height(shm);
+        const uint32_t fmt = wl_shm_buffer_get_format(shm);
+        shm_stride = wl_shm_buffer_get_stride(shm);
+        if (bw != cap_w || bh != cap_h || fmt != WL_SHM_FORMAT_ARGB8888) {
+            wl_resource_post_error(
+                f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
+                "buffer size/format mismatch: expected %dx%d ARGB8888, got %dx%d fmt=%u", cap_w,
+                cap_h, bw, bh, fmt);
+            return;
+        }
+    } else {
+        DmabufInfo info;
+        if (!dmabuf_buffer_info(buffer, info)) {
+            zwlr_screencopy_frame_v1_send_failed(f->resource);
+            return;
+        }
+        if (info.width != cap_w || info.height != cap_h) {
+            wl_resource_post_error(f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
+                                   "dmabuf size mismatch: expected %dx%d, got %dx%d", cap_w, cap_h,
+                                   info.width, info.height);
+            return;
+        }
     }
 
     // Capture pixels from the compositor.
     std::vector<uint8_t> rgba;
     if (!f->output->capture(f->region_x, f->region_y, cap_w, cap_h, rgba)) {
-        std::fprintf(stderr, "wlr_copy: capture returned false\n");
         zwlr_screencopy_frame_v1_send_failed(f->resource);
         return;
     }
-    std::fprintf(stderr, "wlr_copy: capture OK, rgba=%zu first4=%02x%02x%02x%02x\n",
-                 rgba.size(), rgba[0], rgba[1], rgba[2], rgba[3]);
 
-    if (!write_shm_rgba(buffer, rgba, cap_w, cap_h, buf_stride)) {
+    const bool wrote = shm ? write_shm_rgba(buffer, rgba, cap_w, cap_h, shm_stride)
+                           : write_dmabuf_rgba(f->mgr->renderer, buffer, rgba, cap_w, cap_h);
+    if (!wrote) {
         zwlr_screencopy_frame_v1_send_failed(f->resource);
         return;
     }
@@ -251,8 +313,16 @@ void wlr_manager_capture_output(wl_client* client, wl_resource* mgr_resource, ui
                                            static_cast<uint32_t>(out->width),
                                            static_cast<uint32_t>(out->height),
                                            static_cast<uint32_t>(out->width * 4));
-    // v3: signal end of buffer type enumeration.
+    // v3: advertise dmabuf targets (if enabled), then end enumeration.
     if (version >= 3) {
+        if (mgr->renderer) {
+            zwlr_screencopy_frame_v1_send_linux_dmabuf(frame_res, DRM_FORMAT_XRGB8888,
+                                                       static_cast<uint32_t>(out->width),
+                                                       static_cast<uint32_t>(out->height));
+            zwlr_screencopy_frame_v1_send_linux_dmabuf(frame_res, DRM_FORMAT_ARGB8888,
+                                                       static_cast<uint32_t>(out->width),
+                                                       static_cast<uint32_t>(out->height));
+        }
         zwlr_screencopy_frame_v1_send_buffer_done(frame_res);
     }
 }
@@ -290,6 +360,14 @@ void wlr_manager_capture_output_region(wl_client* client, wl_resource* mgr_resou
                                            static_cast<uint32_t>(ch),
                                            static_cast<uint32_t>(cw * 4));
     if (version >= 3) {
+        if (mgr->renderer) {
+            zwlr_screencopy_frame_v1_send_linux_dmabuf(frame_res, DRM_FORMAT_XRGB8888,
+                                                       static_cast<uint32_t>(cw),
+                                                       static_cast<uint32_t>(ch));
+            zwlr_screencopy_frame_v1_send_linux_dmabuf(frame_res, DRM_FORMAT_ARGB8888,
+                                                       static_cast<uint32_t>(cw),
+                                                       static_cast<uint32_t>(ch));
+        }
         zwlr_screencopy_frame_v1_send_buffer_done(frame_res);
     }
 }
@@ -328,7 +406,24 @@ struct ExtFrame {
     OutputEntry* output = nullptr;
     wl_resource* attached_buffer = nullptr;
     bool captured = false;
+    // attach_buffer and capture are separate requests, so the buffer is held
+    // across a round trip — and a client may destroy it in between. Same rule as
+    // wl_surface: never keep a raw buffer resource without a destroy listener.
+    wl_listener buffer_destroy{};
+
+    ~ExtFrame() {
+        if (buffer_destroy.link.prev != nullptr) {
+            wl_list_remove(&buffer_destroy.link);
+        }
+    }
 };
+
+void ext_frame_forget_buffer(wl_listener* listener, void*) {
+    auto* f = reinterpret_cast<ExtFrame*>(reinterpret_cast<char*>(listener) -
+                                          offsetof(ExtFrame, buffer_destroy));
+    f->attached_buffer = nullptr;
+    wl_list_init(&f->buffer_destroy.link); // libwayland already unlinked it
+}
 
 void ext_frame_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
@@ -342,7 +437,15 @@ void ext_frame_attach_buffer(wl_client*, wl_resource* resource, wl_resource* buf
                                "frame already captured");
         return;
     }
+    if (f->attached_buffer != nullptr && f->buffer_destroy.link.prev != nullptr) {
+        wl_list_remove(&f->buffer_destroy.link);
+        wl_list_init(&f->buffer_destroy.link);
+    }
     f->attached_buffer = buffer;
+    if (buffer != nullptr) {
+        f->buffer_destroy.notify = ext_frame_forget_buffer;
+        wl_resource_add_destroy_listener(buffer, &f->buffer_destroy);
+    }
 }
 
 void ext_frame_damage_buffer(wl_client*, wl_resource* resource,
@@ -381,14 +484,19 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
     }
 
     wl_shm_buffer* shm = wl_shm_buffer_get(f->attached_buffer);
-    if (!shm) {
+    bool wrote = false;
+    if (shm) {
+        int stride = wl_shm_buffer_get_stride(shm);
+        wrote = write_shm_rgba(f->attached_buffer, rgba, f->output->width, f->output->height, stride);
+    } else {
+        wrote = write_dmabuf_rgba(f->mgr->renderer, f->attached_buffer, rgba, f->output->width,
+                                  f->output->height);
+    }
+    if (!wrote) {
         ext_image_copy_capture_frame_v1_send_failed(f->resource,
             EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
         return;
     }
-
-    int stride = wl_shm_buffer_get_stride(shm);
-    write_shm_rgba(f->attached_buffer, rgba, f->output->width, f->output->height, stride);
 
     ext_image_copy_capture_frame_v1_send_transform(f->resource, WL_OUTPUT_TRANSFORM_NORMAL);
     ext_image_copy_capture_frame_v1_send_damage(f->resource, 0, 0,
@@ -435,7 +543,10 @@ void ext_session_create_frame(wl_client* client, wl_resource* session_resource, 
         wl_client_post_no_memory(client);
         return;
     }
-    auto* frame = new ExtFrame{s->mgr, frame_res, s->output, nullptr, false};
+    auto* frame = new ExtFrame{};
+    frame->mgr = s->mgr;
+    frame->resource = frame_res;
+    frame->output = s->output;
     wl_resource_set_implementation(frame_res, &ext_frame_impl, frame, ext_frame_resource_destroy);
 }
 
@@ -476,10 +587,32 @@ void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, ui
     wl_resource_set_implementation(session_res, &ext_session_impl, session,
                                      ext_session_resource_destroy);
 
-    // Send buffer constraints: shm only, full output size, ARGB8888.
+    // Send buffer constraints: full output size, ARGB8888 shm, plus dmabuf
+    // (device + per-format modifiers) when a renderer is enabled.
     ext_image_copy_capture_session_v1_send_buffer_size(session_res,
         static_cast<uint32_t>(out->width), static_cast<uint32_t>(out->height));
     ext_image_copy_capture_session_v1_send_shm_format(session_res, WL_SHM_FORMAT_ARGB8888);
+    if (mgr->renderer && mgr->has_dev) {
+        struct wl_array dev;
+        wl_array_init(&dev);
+        std::memcpy(wl_array_add(&dev, sizeof(dev_t)), &mgr->render_dev, sizeof(dev_t));
+        ext_image_copy_capture_session_v1_send_dmabuf_device(session_res, &dev);
+        wl_array_release(&dev);
+
+        for (uint32_t fmt : {DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888}) {
+            auto mods = mgr->renderer->dmabuf_modifiers(fmt);
+            if (mods.empty()) {
+                mods.push_back(DRM_FORMAT_MOD_LINEAR);
+            }
+            struct wl_array ma;
+            wl_array_init(&ma);
+            for (uint64_t m : mods) {
+                std::memcpy(wl_array_add(&ma, sizeof(uint64_t)), &m, sizeof(uint64_t));
+            }
+            ext_image_copy_capture_session_v1_send_dmabuf_format(session_res, fmt, &ma);
+            wl_array_release(&ma);
+        }
+    }
     ext_image_copy_capture_session_v1_send_done(session_res);
 }
 
@@ -604,6 +737,18 @@ Result<ScreencopyManager> ScreencopyManager::create(Display& display) {
 void ScreencopyManager::add_output(wl_resource* output, int width, int height,
                                      ScreencopyCaptureFunc capture) {
     impl_->outputs.push_back(OutputEntry{output, width, height, std::move(capture)});
+}
+
+void ScreencopyManager::set_renderer(VulkanRenderer* renderer) {
+    impl_->renderer = (renderer != nullptr && renderer->dmabuf_supported()) ? renderer : nullptr;
+    // dev_t of the render node clients should allocate dmabufs on (ext protocol).
+    struct stat st;
+    if (impl_->renderer != nullptr && stat("/dev/dri/renderD128", &st) == 0) {
+        impl_->render_dev = st.st_rdev;
+        impl_->has_dev = true;
+    } else {
+        impl_->has_dev = false;
+    }
 }
 
 } // namespace luminaria

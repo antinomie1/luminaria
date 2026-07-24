@@ -51,6 +51,32 @@ public:
                                                        std::span<const RectFill> rects,
                                                        std::span<const TextureFill> textures);
 
+    // --- linux-dmabuf import/export (any DRM modifier the GPU supports) ---
+
+    /// True if the device exposes the external-memory-dmabuf + DRM-modifier
+    /// extensions, i.e. import/export below actually work.
+    [[nodiscard]] bool dmabuf_supported() const noexcept;
+
+    /// DRM modifiers usable for import+export of `drm_format` (single-plane,
+    /// transfer-capable). Always includes DRM_FORMAT_MOD_LINEAR when supported.
+    /// Empty if dmabuf is unsupported or the format has no usable modifier.
+    [[nodiscard]] std::vector<std::uint64_t> dmabuf_modifiers(std::uint32_t drm_format);
+
+    /// Import a single-plane dmabuf (ARGB8888/XRGB8888, any modifier) and read it
+    /// back as tightly-packed RGBA8. `fd` is borrowed (dup'd internally).
+    [[nodiscard]] Result<std::vector<std::uint8_t>> import_dmabuf(int fd, int width, int height,
+                                                                  std::uint32_t drm_format,
+                                                                  std::uint32_t offset,
+                                                                  std::uint32_t stride,
+                                                                  std::uint64_t modifier);
+
+    /// Write tightly-packed RGBA8 into a single-plane dmabuf target (screencopy).
+    /// `fd` is borrowed (dup'd internally).
+    [[nodiscard]] Status export_dmabuf(int fd, int width, int height, std::uint32_t drm_format,
+                                       std::uint32_t offset, std::uint32_t stride,
+                                       std::uint64_t modifier,
+                                       const std::vector<std::uint8_t>& rgba);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

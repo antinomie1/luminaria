@@ -12,6 +12,7 @@
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 
+#include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 namespace luminaria {
@@ -82,10 +83,31 @@ public:
     wl_surface* surface;
     xdg_surface* xsurf = nullptr;
     xdg_toplevel* toplevel = nullptr;
+    zxdg_toplevel_decoration_v1* decoration = nullptr;
     bool configured = false;
+    // True once the decoration has told us who draws the frame. Starts true so
+    // a parent without xdg-decoration never makes start() wait.
+    bool decoration_configured = true;
+    DecorationMode decoration_mode = DecorationMode::None;
 
     WaylandOutput(wl_display* parent, wl_shm* shm, wl_surface* surface, int w, int h)
         : Output(w, h), parent(parent), shm(shm), surface(surface) {}
+
+    ~WaylandOutput() override {
+        // Innermost first: the decoration hangs off the toplevel.
+        if (decoration != nullptr) {
+            zxdg_toplevel_decoration_v1_destroy(decoration);
+        }
+        if (toplevel != nullptr) {
+            xdg_toplevel_destroy(toplevel);
+        }
+        if (xsurf != nullptr) {
+            xdg_surface_destroy(xsurf);
+        }
+        if (surface != nullptr) {
+            wl_surface_destroy(surface);
+        }
+    }
 
     Status commit(Color color) override {
         wl_buffer* buffer = make_solid_buffer(shm, width_, height_, color);
@@ -153,7 +175,10 @@ struct WaylandBackend::Impl {
     wl_seat* seat = nullptr;
     wl_pointer* pointer = nullptr;
     wl_keyboard* keyboard = nullptr;
+    zxdg_decoration_manager_v1* decoration_manager = nullptr; // null if the parent lacks it
     WaylandBackend* owner = nullptr; // set in start(), after all moves; emits input signals
+    PointerAxisEvent axis;           // accumulated until wl_pointer.frame
+    bool axis_pending = false;
     EventSource fd_source;
     std::vector<std::unique_ptr<WaylandOutput>> outputs;
 
@@ -167,6 +192,9 @@ struct WaylandBackend::Impl {
         }
         if (seat != nullptr) {
             wl_seat_destroy(seat);
+        }
+        if (decoration_manager != nullptr) {
+            zxdg_decoration_manager_v1_destroy(decoration_manager);
         }
         if (wm_base != nullptr) {
             xdg_wm_base_destroy(wm_base);
@@ -219,8 +247,52 @@ void ptr_button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button, ui
         impl->owner->pointer_button.emit(e);
     }
 }
-void ptr_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
-const wl_pointer_listener kPointerListener{ptr_enter, ptr_leave, ptr_motion, ptr_button, ptr_axis};
+// Scroll arrives as several events terminated by wl_pointer.frame; accumulate
+// and emit one PointerAxisEvent per frame so the compositor scrolls once.
+void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    const double v = wl_fixed_to_double(value);
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        impl->axis.dy += v;
+    } else {
+        impl->axis.dx += v;
+    }
+    impl->axis_pending = true;
+}
+void ptr_axis_source(void*, wl_pointer*, uint32_t) {}
+void ptr_axis_stop(void* data, wl_pointer*, uint32_t, uint32_t axis) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        impl->axis.stop_vertical = true;
+    } else {
+        impl->axis.stop_horizontal = true;
+    }
+    impl->axis_pending = true;
+}
+void ptr_axis_discrete(void* data, wl_pointer*, uint32_t axis, int32_t discrete) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        impl->axis.dy_steps += discrete;
+    } else {
+        impl->axis.dx_steps += discrete;
+    }
+    impl->axis_pending = true;
+}
+void ptr_frame(void* data, wl_pointer*) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (!impl->axis_pending) {
+        return;
+    }
+    PointerAxisEvent e = impl->axis;
+    impl->axis = PointerAxisEvent{};
+    impl->axis_pending = false;
+    if (impl->owner != nullptr) {
+        impl->owner->pointer_axis.emit(e);
+    }
+}
+const wl_pointer_listener kPointerListener{ptr_enter,       ptr_leave,     ptr_motion,
+                                           ptr_button,      ptr_axis,      ptr_frame,
+                                           ptr_axis_source, ptr_axis_stop, ptr_axis_discrete};
 
 void kb_keymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); }
 void kb_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
@@ -270,11 +342,15 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
         xdg_wm_base_add_listener(impl->wm_base, &kWmBaseListener, impl);
     } else if (std::strcmp(interface, "wl_shm") == 0) {
         impl->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+    } else if (std::strcmp(interface, "zxdg_decoration_manager_v1") == 0) {
+        // Optional: only compositors that do server-side decorations advertise it.
+        impl->decoration_manager = static_cast<zxdg_decoration_manager_v1*>(
+            wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1));
     } else if (std::strcmp(interface, "wl_seat") == 0) {
-        // Bind v1: we only consume enter/leave/motion/button/axis. Higher versions
-        // send frame/axis_source/etc — libwayland aborts if a listener slot for a
-        // sent event is null, so don't ask for events we don't handle.
-        impl->seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 1));
+        // Bind v5: that is what gives us scroll (axis_source/discrete/stop) and
+        // wl_pointer.frame. Every listener slot up to v5 is filled below —
+        // libwayland aborts on a null slot for an event the parent sends.
+        impl->seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 5));
         wl_seat_add_listener(impl->seat, &kSeatListener, impl);
     }
 }
@@ -292,6 +368,17 @@ const xdg_surface_listener kXdgSurfaceListener{xdg_surface_configure};
 void toplevel_configure(void*, xdg_toplevel*, int32_t, int32_t, wl_array*) {}
 void toplevel_close(void*, xdg_toplevel*) {}
 const xdg_toplevel_listener kToplevelListener{toplevel_configure, toplevel_close};
+
+// The parent's answer to our set_mode: it may hand us SERVER_SIDE (what we
+// asked for — a native titlebar) or insist on CLIENT_SIDE.
+void decoration_configure(void* data, zxdg_toplevel_decoration_v1*, uint32_t mode) {
+    auto* out = static_cast<WaylandOutput*>(data);
+    out->decoration_mode = mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+                               ? DecorationMode::ServerSide
+                               : DecorationMode::ClientSide;
+    out->decoration_configured = true;
+}
+const zxdg_toplevel_decoration_v1_listener kDecorationListener{decoration_configure};
 
 } // namespace
 
@@ -318,7 +405,7 @@ Result<WaylandBackend> WaylandBackend::create(EventLoop loop) {
     return WaylandBackend{std::move(impl)};
 }
 
-Output& WaylandBackend::add_output(int width, int height) {
+Output& WaylandBackend::add_output(int width, int height, std::string title) {
     auto out = std::make_unique<WaylandOutput>(impl_->parent, impl_->shm,
                                                wl_compositor_create_surface(impl_->compositor),
                                                width, height);
@@ -326,7 +413,22 @@ Output& WaylandBackend::add_output(int width, int height) {
     xdg_surface_add_listener(out->xsurf, &kXdgSurfaceListener, out.get());
     out->toplevel = xdg_surface_get_toplevel(out->xsurf);
     xdg_toplevel_add_listener(out->toplevel, &kToplevelListener, out.get());
-    xdg_toplevel_set_title(out->toplevel, "luminaria");
+    xdg_toplevel_set_title(out->toplevel, title.c_str());
+    // app_id is what the host desktop keys its icon and window grouping off.
+    xdg_toplevel_set_app_id(out->toplevel, "org.luminaria.compositor");
+
+    // Ask the parent for a native titlebar. Must be requested before the first
+    // buffer: the answering configure arrives with the xdg_surface configure,
+    // and start() waits for both.
+    if (impl_->decoration_manager != nullptr) {
+        out->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+            impl_->decoration_manager, out->toplevel);
+        zxdg_toplevel_decoration_v1_add_listener(out->decoration, &kDecorationListener, out.get());
+        zxdg_toplevel_decoration_v1_set_mode(out->decoration,
+                                             ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        out->decoration_configured = false;
+    }
+
     wl_surface_commit(out->surface); // initial commit -> parent sends configure
     wl_display_flush(impl_->parent);
 
@@ -344,10 +446,13 @@ Status WaylandBackend::start() {
         }
     });
 
-    // Block until every output has had its first configure.
+    // Block until every output has had its first configure — including the
+    // decoration's, so we never attach a buffer before the frame is settled.
     for (int tries = 0; tries < 100; ++tries) {
-        const bool all = std::ranges::all_of(
-            impl_->outputs, [](const std::unique_ptr<WaylandOutput>& o) { return o->configured; });
+        const bool all =
+            std::ranges::all_of(impl_->outputs, [](const std::unique_ptr<WaylandOutput>& o) {
+                return o->configured && o->decoration_configured;
+            });
         if (all) {
             break;
         }
@@ -369,6 +474,13 @@ Status WaylandBackend::start() {
     }
     wl_display_flush(impl_->parent);
     return ok();
+}
+
+DecorationMode WaylandBackend::decoration_mode() const noexcept {
+    if (impl_->outputs.empty()) {
+        return DecorationMode::None;
+    }
+    return impl_->outputs.front()->decoration_mode;
 }
 
 } // namespace luminaria

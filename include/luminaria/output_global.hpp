@@ -5,10 +5,16 @@
 // clients (e.g. weston-terminal) won't map a window until they see a wl_output.
 //
 // Public header stays C-header-free.
+//
+// It also carries the matching `zxdg_output_manager_v1` (xdg-output-unstable-v1):
+// wl_output only describes the physical mode, so tools that arrange outputs in a
+// layout — screenshot utilities above all — read the *logical* position and size
+// from xdg-output instead. `grim` warns and produces a zero-sized image without it.
 #pragma once
 
 #include <functional>
 #include <memory>
+#include <string>
 
 #include "luminaria/core/expected.hpp"
 
@@ -22,8 +28,10 @@ class Display;
 /// so the libwayland global can hold a pointer to it.
 class OutputGlobal {
 public:
-    /// Advertise an output of `width`x`height` px at 60Hz, scale 1.
-    [[nodiscard]] static Result<OutputGlobal> create(Display& display, int width, int height);
+    /// Advertise an output of `width`x`height` px at 60Hz, scale 1, under
+    /// `name` (what `grim -o` and other tools address it by).
+    [[nodiscard]] static Result<OutputGlobal> create(Display& display, int width, int height,
+                                                     std::string name = "luminaria-1");
 
     ~OutputGlobal();
     OutputGlobal(OutputGlobal&&) noexcept;
@@ -33,6 +41,7 @@ public:
 
     [[nodiscard]] int width() const noexcept;
     [[nodiscard]] int height() const noexcept;
+    [[nodiscard]] const std::string& name() const noexcept;
 
     /// Register a callback invoked for every wl_output resource created
     /// (past and future). Used by screencopy to track capturable outputs.

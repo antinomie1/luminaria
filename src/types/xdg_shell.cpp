@@ -1,6 +1,8 @@
 #include "luminaria/xdg_shell.hpp"
 
+#include <algorithm>
 #include <memory>
+#include <vector>
 
 #include <wayland-server-core.h>
 
@@ -15,6 +17,9 @@ struct XdgShell::Impl {
     wl_display* display = nullptr;
     wl_global* global = nullptr;
     Signal<NewToplevel> new_toplevel;
+    Signal<NewPopup> new_popup;
+    int bounds_width = 0;
+    int bounds_height = 0;
 
     ~Impl() {
         if (global != nullptr) {
@@ -26,6 +31,85 @@ struct XdgShell::Impl {
 namespace {
 
 struct XdgSurface;
+class PopupImpl;
+
+// ---------------------------------------------------------------- positioner
+
+// The full xdg_positioner state (protocol version 3). `place()` turns it into a
+// popup rectangle relative to the parent's window-geometry origin.
+struct Positioner {
+    int width = 0, height = 0;
+    int anchor_x = 0, anchor_y = 0, anchor_width = 0, anchor_height = 0;
+    uint32_t anchor = XDG_POSITIONER_ANCHOR_NONE;
+    uint32_t gravity = XDG_POSITIONER_GRAVITY_NONE;
+    uint32_t constraint_adjustment = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE;
+    int offset_x = 0, offset_y = 0;
+    bool reactive = false;
+    int parent_width = 0, parent_height = 0;
+    uint32_t parent_configure = 0;
+};
+
+bool anchor_is_top(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_TOP || a == XDG_POSITIONER_ANCHOR_TOP_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+}
+bool anchor_is_bottom(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_BOTTOM || a == XDG_POSITIONER_ANCHOR_BOTTOM_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+}
+bool anchor_is_left(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_LEFT || a == XDG_POSITIONER_ANCHOR_TOP_LEFT ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+}
+bool anchor_is_right(uint32_t a) {
+    return a == XDG_POSITIONER_ANCHOR_RIGHT || a == XDG_POSITIONER_ANCHOR_TOP_RIGHT ||
+           a == XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+}
+// The gravity enum has the same layout as the anchor enum, so the same tests work.
+static_assert(static_cast<uint32_t>(XDG_POSITIONER_GRAVITY_TOP_LEFT) ==
+              static_cast<uint32_t>(XDG_POSITIONER_ANCHOR_TOP_LEFT));
+
+/// Anchor point on the anchor rect, then the popup laid out from it per gravity,
+/// then the client's offset. All in parent window-geometry coordinates.
+///
+/// TODO: constraint_adjustment (flip/slide/resize) is parsed and stored but not
+/// applied — that needs the parent's absolute position on an output, which the
+/// shell doesn't know. Menus that fit on screen (the common case) are correct;
+/// one near an edge may overhang. See TODO-CORNERS-CUT.md.
+XdgGeometry place(const Positioner& p) {
+    int x = p.anchor_x;
+    int y = p.anchor_y;
+    if (anchor_is_left(p.anchor)) {
+        // x += 0
+    } else if (anchor_is_right(p.anchor)) {
+        x += p.anchor_width;
+    } else {
+        x += p.anchor_width / 2;
+    }
+    if (anchor_is_top(p.anchor)) {
+        // y += 0
+    } else if (anchor_is_bottom(p.anchor)) {
+        y += p.anchor_height;
+    } else {
+        y += p.anchor_height / 2;
+    }
+
+    // Gravity is the direction the popup extends away from the anchor point.
+    if (anchor_is_left(p.gravity)) {
+        x -= p.width;
+    } else if (!anchor_is_right(p.gravity)) {
+        x -= p.width / 2;
+    }
+    if (anchor_is_top(p.gravity)) {
+        y -= p.height;
+    } else if (!anchor_is_bottom(p.gravity)) {
+        y -= p.height / 2;
+    }
+
+    return XdgGeometry{x + p.offset_x, y + p.offset_y, p.width, p.height};
+}
+
+// ------------------------------------------------------------------ toplevel
 
 // Concrete toplevel. Owned by its own xdg_toplevel wl_resource (address stable
 // for its lifetime). `owner` links back to the XdgSurface; either side nulls the
@@ -37,9 +121,96 @@ public:
     XdgSurface* owner = nullptr;     // nulled if the xdg_surface is destroyed first
     bool mapped_ = false;
 
+    std::string title_;
+    std::string app_id_;
+    int min_w_ = 0, min_h_ = 0, max_w_ = 0, max_h_ = 0;
+    bool maximized_ = false, fullscreen_ = false, activated_ = false, resizing_ = false;
+    int pending_w_ = 0, pending_h_ = 0;
+
     Surface& surface() noexcept override { return *surf; }
     [[nodiscard]] bool mapped() const noexcept override { return mapped_; }
+    [[nodiscard]] const std::string& title() const noexcept override { return title_; }
+    [[nodiscard]] const std::string& app_id() const noexcept override { return app_id_; }
+    [[nodiscard]] int min_width() const noexcept override { return min_w_; }
+    [[nodiscard]] int min_height() const noexcept override { return min_h_; }
+    [[nodiscard]] int max_width() const noexcept override { return max_w_; }
+    [[nodiscard]] int max_height() const noexcept override { return max_h_; }
+    [[nodiscard]] XdgGeometry geometry() const noexcept override;
+
+    uint32_t configure(int width, int height) override;
+    // Each of these re-configures the client at its last known size, but only
+    // when the state actually changed — a no-op set_activated(true) on an
+    // already-focused window shouldn't make it repaint.
+    void set_maximized(bool v) override {
+        if (maximized_ == v) {
+            return;
+        }
+        maximized_ = v;
+        (void)configure(pending_w_, pending_h_);
+    }
+    void set_fullscreen(bool v) override {
+        if (fullscreen_ == v) {
+            return;
+        }
+        fullscreen_ = v;
+        (void)configure(pending_w_, pending_h_);
+    }
+    void set_activated(bool v) override {
+        if (activated_ == v) {
+            return;
+        }
+        activated_ = v;
+        (void)configure(pending_w_, pending_h_);
+    }
+    void set_resizing(bool v) override {
+        if (resizing_ == v) {
+            return;
+        }
+        resizing_ = v;
+        (void)configure(pending_w_, pending_h_);
+    }
+    [[nodiscard]] bool is_maximized() const noexcept override { return maximized_; }
+    [[nodiscard]] bool is_fullscreen() const noexcept override { return fullscreen_; }
+    [[nodiscard]] bool is_activated() const noexcept override { return activated_; }
+    [[nodiscard]] bool is_resizing() const noexcept override { return resizing_; }
+    [[nodiscard]] int pending_width() const noexcept override { return pending_w_; }
+    [[nodiscard]] int pending_height() const noexcept override { return pending_h_; }
+
+    void close() override {
+        if (resource != nullptr) {
+            xdg_toplevel_send_close(resource);
+        }
+    }
 };
+
+// --------------------------------------------------------------------- popup
+
+class PopupImpl final : public Popup {
+public:
+    Surface* surf = nullptr;
+    wl_resource* resource = nullptr; // xdg_popup
+    XdgSurface* owner = nullptr;     // our own xdg_surface; nulled if it dies first
+    XdgSurface* parent = nullptr;    // parent xdg_surface; nulled if it dies first
+    Positioner positioner;
+    XdgGeometry geo;
+    bool mapped_ = false;
+    bool grabbed_ = false;
+    bool done_ = false;
+
+    Surface& surface() noexcept override { return *surf; }
+    [[nodiscard]] Surface* parent_surface() const noexcept override;
+    [[nodiscard]] bool mapped() const noexcept override { return mapped_; }
+    [[nodiscard]] bool has_grab() const noexcept override { return grabbed_; }
+    [[nodiscard]] int x() const noexcept override { return geo.x; }
+    [[nodiscard]] int y() const noexcept override { return geo.y; }
+    [[nodiscard]] int width() const noexcept override { return geo.width; }
+    [[nodiscard]] int height() const noexcept override { return geo.height; }
+
+    void dismiss() override;
+    void send_configure();
+};
+
+// --------------------------------------------------------------- xdg_surface
 
 // Per-xdg_surface driver. Owned by the xdg_surface resource.
 struct XdgSurface {
@@ -48,54 +219,229 @@ struct XdgSurface {
     Surface* surface = nullptr;
     Signal<SurfaceCommit>::Connection commit_conn;
     ToplevelImpl* toplevel = nullptr; // owned by its resource; nulled on its destroy
+    PopupImpl* popup = nullptr;       // ditto
+    std::vector<PopupImpl*> child_popups; // popups parented to this xdg_surface
     bool initialized = false;
+    bool has_geometry = false;
+    XdgGeometry geometry;
+    uint32_t last_acked = 0;
+
+    [[nodiscard]] XdgGeometry effective_geometry() const {
+        if (has_geometry) {
+            return geometry;
+        }
+        return XdgGeometry{0, 0, surface != nullptr ? surface->buffer_width() : 0,
+                           surface != nullptr ? surface->buffer_height() : 0};
+    }
 };
 
-void send_configure(XdgSurface* xs) {
-    if (xs->toplevel && xs->toplevel->resource != nullptr) {
-        wl_array states;
-        wl_array_init(&states);
-        xdg_toplevel_send_configure(xs->toplevel->resource, 0, 0, &states);
-        wl_array_release(&states);
+XdgGeometry ToplevelImpl::geometry() const noexcept {
+    if (owner != nullptr) {
+        return owner->effective_geometry();
     }
-    const uint32_t serial = wl_display_next_serial(xs->shell->display);
-    xdg_surface_send_configure(xs->resource, serial);
+    return XdgGeometry{};
+}
+
+Surface* PopupImpl::parent_surface() const noexcept {
+    return parent != nullptr ? parent->surface : nullptr;
+}
+
+uint32_t ToplevelImpl::configure(int width, int height) {
+    if (owner == nullptr || resource == nullptr) {
+        return 0;
+    }
+    // A configure carrying MAXIMIZED or FULLSCREEN must name a real size: the
+    // client is required to obey it, so 0x0 ("you pick") is a contradiction.
+    // Qt logs `Configure event with maximized or fullscreen state contains
+    // invalid width: 0` and ignores the whole event. Substitute the best size we
+    // have — the compositor's advertised bounds, else the window's own geometry.
+    if ((maximized_ || fullscreen_) && (width <= 0 || height <= 0)) {
+        const XdgGeometry geo = owner->effective_geometry();
+        width = owner->shell->bounds_width > 0 ? owner->shell->bounds_width : geo.width;
+        height = owner->shell->bounds_height > 0 ? owner->shell->bounds_height : geo.height;
+    }
+    const uint32_t version = static_cast<uint32_t>(wl_resource_get_version(resource));
+    if (version >= XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION && owner->shell->bounds_width > 0) {
+        xdg_toplevel_send_configure_bounds(resource, owner->shell->bounds_width,
+                                           owner->shell->bounds_height);
+    }
+    wl_array states;
+    wl_array_init(&states);
+    const auto push = [&states](uint32_t state) {
+        if (auto* slot = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
+            slot != nullptr) {
+            *slot = state;
+        }
+    };
+    if (maximized_) {
+        push(XDG_TOPLEVEL_STATE_MAXIMIZED);
+    }
+    if (fullscreen_) {
+        push(XDG_TOPLEVEL_STATE_FULLSCREEN);
+    }
+    if (resizing_) {
+        push(XDG_TOPLEVEL_STATE_RESIZING);
+    }
+    if (activated_) {
+        push(XDG_TOPLEVEL_STATE_ACTIVATED);
+    }
+    xdg_toplevel_send_configure(resource, width, height, &states);
+    wl_array_release(&states);
+    pending_w_ = width;
+    pending_h_ = height;
+
+    const uint32_t serial = wl_display_next_serial(owner->shell->display);
+    xdg_surface_send_configure(owner->resource, serial);
+    return serial;
+}
+
+void PopupImpl::send_configure() {
+    if (owner == nullptr || resource == nullptr) {
+        return;
+    }
+    xdg_popup_send_configure(resource, geo.x, geo.y, geo.width, geo.height);
+    const uint32_t serial = wl_display_next_serial(owner->shell->display);
+    xdg_surface_send_configure(owner->resource, serial);
+}
+
+void PopupImpl::dismiss() {
+    if (done_ || resource == nullptr) {
+        return;
+    }
+    done_ = true;
+    // Children first: a nested submenu must go away before its parent.
+    if (owner != nullptr) {
+        const std::vector<PopupImpl*> children = owner->child_popups;
+        for (PopupImpl* child : children) {
+            child->dismiss();
+        }
+    }
+    xdg_popup_send_popup_done(resource);
+    if (mapped_) {
+        mapped_ = false;
+        PopupUnmap event{*this};
+        unmap.emit(event);
+    }
 }
 
 void on_surface_commit(XdgSurface* xs) {
     if (!xs->initialized) {
         // Initial commit: the client is waiting for its first configure.
         xs->initialized = true;
-        send_configure(xs);
+        if (xs->toplevel != nullptr) {
+            (void)xs->toplevel->configure(0, 0);
+        } else if (xs->popup != nullptr) {
+            xs->popup->send_configure();
+        } else {
+            // Role not assigned yet — still answer, per xdg_surface semantics.
+            xdg_surface_send_configure(xs->resource, wl_display_next_serial(xs->shell->display));
+        }
         return;
     }
-    if (xs->toplevel && xs->surface->has_buffer() && !xs->toplevel->mapped_) {
-        xs->toplevel->mapped_ = true;
-        ToplevelMap event{*xs->toplevel};
-        xs->toplevel->map.emit(event);
+    if (xs->toplevel != nullptr) {
+        ToplevelImpl* tl = xs->toplevel;
+        if (xs->surface->has_buffer() && !tl->mapped_) {
+            tl->mapped_ = true;
+            ToplevelMap event{*tl};
+            tl->map.emit(event);
+        } else if (!xs->surface->has_buffer() && tl->mapped_) {
+            tl->mapped_ = false;
+            ToplevelUnmap event{*tl};
+            tl->unmap.emit(event);
+        }
+        return;
+    }
+    if (xs->popup != nullptr) {
+        PopupImpl* popup = xs->popup;
+        if (xs->surface->has_buffer() && !popup->mapped_ && !popup->done_) {
+            popup->mapped_ = true;
+            PopupMap event{*popup};
+            popup->map.emit(event);
+        } else if (!xs->surface->has_buffer() && popup->mapped_) {
+            popup->mapped_ = false;
+            PopupUnmap event{*popup};
+            popup->unmap.emit(event);
+        }
     }
 }
 
-// ---- xdg_toplevel ----
-// TODO: title/app_id/min/max/state requests are accepted no-ops — no window
-// decorations or state machine yet, but real clients call them at startup so the
-// slots must be non-null.
+// ---- xdg_toplevel requests ----
+ToplevelImpl* toplevel_of(wl_resource* resource) {
+    return static_cast<ToplevelImpl*>(wl_resource_get_user_data(resource));
+}
 void toplevel_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
+// TODO: set_parent (transient-for) and show_window_menu stay no-ops — the
+// library has no window-menu concept and nothing stacks transients yet.
 void tl_set_parent(wl_client*, wl_resource*, wl_resource*) {}
-void tl_set_title(wl_client*, wl_resource*, const char*) {}
-void tl_set_app_id(wl_client*, wl_resource*, const char*) {}
+void tl_set_title(wl_client*, wl_resource* resource, const char* title) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    tl->title_ = title != nullptr ? title : "";
+    ToplevelIdentityChange event{*tl};
+    tl->identity_change.emit(event);
+}
+void tl_set_app_id(wl_client*, wl_resource* resource, const char* app_id) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    tl->app_id_ = app_id != nullptr ? app_id : "";
+    ToplevelIdentityChange event{*tl};
+    tl->identity_change.emit(event);
+}
 void tl_show_window_menu(wl_client*, wl_resource*, wl_resource*, uint32_t, int32_t, int32_t) {}
-void tl_move(wl_client*, wl_resource*, wl_resource*, uint32_t) {}
-void tl_resize(wl_client*, wl_resource*, wl_resource*, uint32_t, uint32_t) {}
-void tl_set_max_size(wl_client*, wl_resource*, int32_t, int32_t) {}
-void tl_set_min_size(wl_client*, wl_resource*, int32_t, int32_t) {}
-void tl_set_maximized(wl_client*, wl_resource*) {}
-void tl_unset_maximized(wl_client*, wl_resource*) {}
-void tl_set_fullscreen(wl_client*, wl_resource*, wl_resource*) {}
-void tl_unset_fullscreen(wl_client*, wl_resource*) {}
-void tl_set_minimized(wl_client*, wl_resource*) {}
+void tl_move(wl_client*, wl_resource* resource, wl_resource*, uint32_t serial) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    ToplevelRequestMove event{*tl, serial};
+    tl->request_move.emit(event);
+}
+void tl_resize(wl_client*, wl_resource* resource, wl_resource*, uint32_t serial, uint32_t edges) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    ToplevelRequestResize event{*tl, serial, edges};
+    tl->request_resize.emit(event);
+}
+void tl_set_max_size(wl_client*, wl_resource* resource, int32_t width, int32_t height) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    tl->max_w_ = width;
+    tl->max_h_ = height;
+}
+void tl_set_min_size(wl_client*, wl_resource* resource, int32_t width, int32_t height) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    tl->min_w_ = width;
+    tl->min_h_ = height;
+}
+void tl_request_maximized(wl_resource* resource, bool maximized) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    ToplevelRequestMaximize event{*tl, maximized};
+    tl->request_maximize.emit(event);
+    if (tl->maximized_ != maximized && tl->request_maximize.slot_count() == 0) {
+        // Nobody is arbitrating; ack the request so the client isn't left hanging.
+        tl->set_maximized(maximized);
+    }
+}
+void tl_set_maximized(wl_client*, wl_resource* resource) {
+    tl_request_maximized(resource, true);
+}
+void tl_unset_maximized(wl_client*, wl_resource* resource) {
+    tl_request_maximized(resource, false);
+}
+void tl_request_fullscreen(wl_resource* resource, bool fullscreen) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    ToplevelRequestFullscreen event{*tl, fullscreen};
+    tl->request_fullscreen.emit(event);
+    if (tl->fullscreen_ != fullscreen && tl->request_fullscreen.slot_count() == 0) {
+        tl->set_fullscreen(fullscreen);
+    }
+}
+void tl_set_fullscreen(wl_client*, wl_resource* resource, wl_resource*) {
+    tl_request_fullscreen(resource, true);
+}
+void tl_unset_fullscreen(wl_client*, wl_resource* resource) {
+    tl_request_fullscreen(resource, false);
+}
+void tl_set_minimized(wl_client*, wl_resource* resource) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    ToplevelRequestMinimize event{*tl};
+    tl->request_minimize.emit(event);
+}
 constexpr struct xdg_toplevel_interface toplevel_impl = {
     .destroy = toplevel_destroy_request,
     .set_parent = tl_set_parent,
@@ -113,7 +459,12 @@ constexpr struct xdg_toplevel_interface toplevel_impl = {
     .set_minimized = tl_set_minimized,
 };
 void toplevel_resource_destroy(wl_resource* resource) {
-    auto* tl = static_cast<ToplevelImpl*>(wl_resource_get_user_data(resource));
+    auto* tl = toplevel_of(resource);
+    if (tl->mapped_) {
+        tl->mapped_ = false;
+        ToplevelUnmap unmap_event{*tl};
+        tl->unmap.emit(unmap_event);
+    }
     ToplevelDestroy event{*tl};
     tl->destroy.emit(event);
     if (tl->owner != nullptr) {
@@ -122,31 +473,121 @@ void toplevel_resource_destroy(wl_resource* resource) {
     delete tl;
 }
 
-// ---- xdg_positioner / xdg_popup ----
-// TODO: inert but valid — popups get created and their xdg_surface still
-// gets configured on commit, so clients don't crash or hang; full popup
-// placement/grab is not implemented yet.
+// ---- xdg_positioner ----
+Positioner* positioner_of(wl_resource* resource) {
+    return static_cast<Positioner*>(wl_resource_get_user_data(resource));
+}
 void generic_destroy(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
-void pos_set_size(wl_client*, wl_resource*, int32_t, int32_t) {}
-void pos_set_anchor_rect(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
-void pos_set_u32(wl_client*, wl_resource*, uint32_t) {}
-void pos_set_offset(wl_client*, wl_resource*, int32_t, int32_t) {}
+void pos_set_size(wl_client*, wl_resource* resource, int32_t width, int32_t height) {
+    if (width < 1 || height < 1) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT,
+                               "set_size: width and height must be positive");
+        return;
+    }
+    positioner_of(resource)->width = width;
+    positioner_of(resource)->height = height;
+}
+void pos_set_anchor_rect(wl_client*, wl_resource* resource, int32_t x, int32_t y, int32_t width,
+                         int32_t height) {
+    if (width < 0 || height < 0) {
+        wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT,
+                               "set_anchor_rect: negative size");
+        return;
+    }
+    Positioner* p = positioner_of(resource);
+    p->anchor_x = x;
+    p->anchor_y = y;
+    p->anchor_width = width;
+    p->anchor_height = height;
+}
+void pos_set_anchor(wl_client*, wl_resource* resource, uint32_t anchor) {
+    positioner_of(resource)->anchor = anchor;
+}
+void pos_set_gravity(wl_client*, wl_resource* resource, uint32_t gravity) {
+    positioner_of(resource)->gravity = gravity;
+}
+void pos_set_constraint_adjustment(wl_client*, wl_resource* resource, uint32_t adjustment) {
+    positioner_of(resource)->constraint_adjustment = adjustment;
+}
+void pos_set_offset(wl_client*, wl_resource* resource, int32_t x, int32_t y) {
+    positioner_of(resource)->offset_x = x;
+    positioner_of(resource)->offset_y = y;
+}
+void pos_set_reactive(wl_client*, wl_resource* resource) {
+    positioner_of(resource)->reactive = true;
+}
+void pos_set_parent_size(wl_client*, wl_resource* resource, int32_t width, int32_t height) {
+    positioner_of(resource)->parent_width = width;
+    positioner_of(resource)->parent_height = height;
+}
+void pos_set_parent_configure(wl_client*, wl_resource* resource, uint32_t serial) {
+    positioner_of(resource)->parent_configure = serial;
+}
 constexpr struct xdg_positioner_interface positioner_impl = {
     .destroy = generic_destroy,
     .set_size = pos_set_size,
     .set_anchor_rect = pos_set_anchor_rect,
-    .set_anchor = pos_set_u32,
-    .set_gravity = pos_set_u32,
-    .set_constraint_adjustment = pos_set_u32,
+    .set_anchor = pos_set_anchor,
+    .set_gravity = pos_set_gravity,
+    .set_constraint_adjustment = pos_set_constraint_adjustment,
     .set_offset = pos_set_offset,
+    .set_reactive = pos_set_reactive,
+    .set_parent_size = pos_set_parent_size,
+    .set_parent_configure = pos_set_parent_configure,
 };
-void popup_grab(wl_client*, wl_resource*, wl_resource*, uint32_t) {}
+void positioner_resource_destroy(wl_resource* resource) {
+    delete positioner_of(resource);
+}
+
+// ---- xdg_popup requests ----
+PopupImpl* popup_of(wl_resource* resource) {
+    return static_cast<PopupImpl*>(wl_resource_get_user_data(resource));
+}
+void popup_destroy_request(wl_client*, wl_resource* resource) {
+    wl_resource_destroy(resource);
+}
+void popup_grab(wl_client*, wl_resource* resource, wl_resource*, uint32_t serial) {
+    PopupImpl* popup = popup_of(resource);
+    popup->grabbed_ = true;
+    PopupGrab event{*popup, serial};
+    popup->grab.emit(event);
+}
+void popup_reposition(wl_client*, wl_resource* resource, wl_resource* positioner_resource,
+                      uint32_t token) {
+    PopupImpl* popup = popup_of(resource);
+    popup->positioner = *positioner_of(positioner_resource);
+    popup->geo = place(popup->positioner);
+    if (wl_resource_get_version(resource) >= XDG_POPUP_REPOSITIONED_SINCE_VERSION) {
+        xdg_popup_send_repositioned(resource, token);
+    }
+    popup->send_configure();
+    PopupReposition event{*popup};
+    popup->reposition.emit(event);
+}
 constexpr struct xdg_popup_interface popup_impl = {
-    .destroy = generic_destroy,
+    .destroy = popup_destroy_request,
     .grab = popup_grab,
+    .reposition = popup_reposition,
 };
+void popup_resource_destroy(wl_resource* resource) {
+    auto* popup = popup_of(resource);
+    if (popup->mapped_) {
+        popup->mapped_ = false;
+        PopupUnmap unmap_event{*popup};
+        popup->unmap.emit(unmap_event);
+    }
+    PopupDestroy event{*popup};
+    popup->destroy.emit(event);
+    if (popup->owner != nullptr) {
+        popup->owner->popup = nullptr;
+    }
+    if (popup->parent != nullptr) {
+        std::erase(popup->parent->child_popups, popup);
+    }
+    delete popup;
+}
 
 // ---- xdg_surface ----
 XdgSurface* xdg_surface_of(wl_resource* resource) {
@@ -157,27 +598,87 @@ void xdg_surface_destroy_request(wl_client*, wl_resource* resource) {
 }
 void xdg_surface_get_toplevel(wl_client* client, wl_resource* resource, uint32_t id) {
     auto* xs = xdg_surface_of(resource);
+    if (xs->toplevel != nullptr || xs->popup != nullptr) {
+        wl_resource_post_error(resource, XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED,
+                               "xdg_surface already has a role");
+        return;
+    }
     auto* tl = new ToplevelImpl();
     tl->surf = xs->surface;
     tl->owner = xs;
     tl->resource = wl_resource_create(client, &xdg_toplevel_interface,
                                       wl_resource_get_version(resource), id);
+    if (tl->resource == nullptr) {
+        delete tl;
+        wl_client_post_no_memory(client);
+        return;
+    }
     wl_resource_set_implementation(tl->resource, &toplevel_impl, tl, toplevel_resource_destroy);
     xs->toplevel = tl;
+
+    // Tell the client which window-management actions we honour (v5+).
+    if (wl_resource_get_version(tl->resource) >= XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) {
+        wl_array caps;
+        wl_array_init(&caps);
+        for (uint32_t cap : {static_cast<uint32_t>(XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE),
+                             static_cast<uint32_t>(XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN)}) {
+            if (auto* slot = static_cast<uint32_t*>(wl_array_add(&caps, sizeof(uint32_t)));
+                slot != nullptr) {
+                *slot = cap;
+            }
+        }
+        xdg_toplevel_send_wm_capabilities(tl->resource, &caps);
+        wl_array_release(&caps);
+    }
 
     NewToplevel event{*tl};
     xs->shell->new_toplevel.emit(event);
 }
-void xdg_surface_get_popup(wl_client* client, wl_resource* resource, uint32_t id, wl_resource*,
-                           wl_resource*) {
-    wl_resource* popup = wl_resource_create(client, &xdg_popup_interface,
-                                            wl_resource_get_version(resource), id);
-    if (popup != nullptr) {
-        wl_resource_set_implementation(popup, &popup_impl, nullptr, nullptr);
+void xdg_surface_get_popup(wl_client* client, wl_resource* resource, uint32_t id,
+                           wl_resource* parent_resource, wl_resource* positioner_resource) {
+    auto* xs = xdg_surface_of(resource);
+    if (xs->toplevel != nullptr || xs->popup != nullptr) {
+        wl_resource_post_error(resource, XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED,
+                               "xdg_surface already has a role");
+        return;
     }
+    Positioner* positioner = positioner_of(positioner_resource);
+    if (positioner->width < 1 || positioner->height < 1) {
+        wl_resource_post_error(resource, XDG_WM_BASE_ERROR_INVALID_POSITIONER,
+                               "get_popup: positioner has no size");
+        return;
+    }
+    auto* popup = new PopupImpl();
+    popup->surf = xs->surface;
+    popup->owner = xs;
+    popup->parent = parent_resource != nullptr ? xdg_surface_of(parent_resource) : nullptr;
+    popup->positioner = *positioner;
+    popup->geo = place(popup->positioner);
+    popup->resource = wl_resource_create(client, &xdg_popup_interface,
+                                         wl_resource_get_version(resource), id);
+    if (popup->resource == nullptr) {
+        delete popup;
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(popup->resource, &popup_impl, popup, popup_resource_destroy);
+    xs->popup = popup;
+    if (popup->parent != nullptr) {
+        popup->parent->child_popups.push_back(popup);
+    }
+
+    NewPopup event{*popup};
+    xs->shell->new_popup.emit(event);
 }
-void xdg_surface_set_window_geometry(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
-void xdg_surface_ack_configure(wl_client*, wl_resource*, uint32_t) {}
+void xdg_surface_set_window_geometry(wl_client*, wl_resource* resource, int32_t x, int32_t y,
+                                     int32_t width, int32_t height) {
+    auto* xs = xdg_surface_of(resource);
+    xs->has_geometry = width > 0 && height > 0;
+    xs->geometry = XdgGeometry{x, y, width, height};
+}
+void xdg_surface_ack_configure(wl_client*, wl_resource* resource, uint32_t serial) {
+    xdg_surface_of(resource)->last_acked = serial;
+}
 constexpr struct xdg_surface_interface xdg_surface_impl = {
     .destroy = xdg_surface_destroy_request,
     .get_toplevel = xdg_surface_get_toplevel,
@@ -191,6 +692,15 @@ void xdg_surface_resource_destroy(wl_resource* resource) {
         // Our toplevel's resource outlives us; sever the back-pointer so its
         // destroy handler won't touch this freed XdgSurface.
         xs->toplevel->owner = nullptr;
+    }
+    if (xs->popup != nullptr) {
+        xs->popup->owner = nullptr;
+    }
+    // Popups parented to us lose their anchor: tell them and unlink.
+    const std::vector<PopupImpl*> children = xs->child_popups;
+    for (PopupImpl* child : children) {
+        child->dismiss();
+        child->parent = nullptr;
     }
     delete xs;
 }
@@ -209,6 +719,11 @@ void wm_base_get_xdg_surface(wl_client* client, wl_resource* wm_resource, uint32
     xs->surface = surface;
     xs->resource = wl_resource_create(client, &xdg_surface_interface,
                                       wl_resource_get_version(wm_resource), id);
+    if (xs->resource == nullptr) {
+        delete xs;
+        wl_client_post_no_memory(client);
+        return;
+    }
     wl_resource_set_implementation(xs->resource, &xdg_surface_impl, xs,
                                    xdg_surface_resource_destroy);
     xs->commit_conn = surface->commit.connect([xs](SurfaceCommit&) { on_surface_commit(xs); });
@@ -216,9 +731,12 @@ void wm_base_get_xdg_surface(wl_client* client, wl_resource* wm_resource, uint32
 void wm_base_create_positioner(wl_client* client, wl_resource* resource, uint32_t id) {
     wl_resource* pos = wl_resource_create(client, &xdg_positioner_interface,
                                           wl_resource_get_version(resource), id);
-    if (pos != nullptr) {
-        wl_resource_set_implementation(pos, &positioner_impl, nullptr, nullptr);
+    if (pos == nullptr) {
+        wl_client_post_no_memory(client);
+        return;
     }
+    wl_resource_set_implementation(pos, &positioner_impl, new Positioner{},
+                                   positioner_resource_destroy);
 }
 void wm_base_pong(wl_client*, wl_resource*, uint32_t) {}
 constexpr struct xdg_wm_base_interface wm_base_impl = {
@@ -231,6 +749,10 @@ constexpr struct xdg_wm_base_interface wm_base_impl = {
 void wm_base_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     wl_resource* resource = wl_resource_create(client, &xdg_wm_base_interface,
                                                static_cast<int>(version), id);
+    if (resource == nullptr) {
+        wl_client_post_no_memory(client);
+        return;
+    }
     wl_resource_set_implementation(resource, &wm_base_impl, data, nullptr);
 }
 
@@ -244,7 +766,9 @@ XdgShell& XdgShell::operator=(XdgShell&&) noexcept = default;
 Result<XdgShell> XdgShell::create(Display& display) {
     auto impl = std::make_unique<Impl>();
     impl->display = display.c_ptr();
-    impl->global = wl_global_create(impl->display, &xdg_wm_base_interface, 1, impl.get(),
+    // Version 5: popups with reposition (v3), configure_bounds (v4),
+    // wm_capabilities (v5). Every request slot up to here is implemented.
+    impl->global = wl_global_create(impl->display, &xdg_wm_base_interface, 5, impl.get(),
                                     wm_base_bind);
     if (impl->global == nullptr) {
         return fail("wl_global_create(xdg_wm_base) failed");
@@ -254,6 +778,15 @@ Result<XdgShell> XdgShell::create(Display& display) {
 
 Signal<NewToplevel>& XdgShell::new_toplevel() noexcept {
     return impl_->new_toplevel;
+}
+
+Signal<NewPopup>& XdgShell::new_popup() noexcept {
+    return impl_->new_popup;
+}
+
+void XdgShell::set_bounds(int width, int height) noexcept {
+    impl_->bounds_width = width;
+    impl_->bounds_height = height;
 }
 
 } // namespace luminaria
