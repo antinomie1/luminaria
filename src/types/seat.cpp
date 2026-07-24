@@ -98,10 +98,11 @@ void seat_get_keyboard(wl_client* client, wl_resource* seat_resource, uint32_t i
         wl_keyboard_send_repeat_info(resource, 25, 600);
     }
 }
+constexpr struct wl_touch_interface touch_impl = {.release = resource_release};
 void seat_get_touch(wl_client* client, wl_resource* seat_resource, uint32_t id) {
     wl_resource* resource = wl_resource_create(client, &wl_touch_interface,
                                                wl_resource_get_version(seat_resource), id);
-    wl_resource_set_implementation(resource, nullptr, nullptr, nullptr);
+    wl_resource_set_implementation(resource, &touch_impl, nullptr, nullptr);
 }
 void seat_release(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
@@ -204,6 +205,19 @@ void Seat::notify_key(uint32_t key, bool pressed) {
     for (wl_resource* kb : impl_->keyboards) {
         if (wl_resource_get_client(kb) == client) {
             wl_keyboard_send_key(kb, serial, 0, key, state);
+        }
+    }
+}
+
+void Seat::notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+    if (impl_->kb_focus == nullptr) {
+        return;
+    }
+    wl_client* client = client_of(impl_->kb_focus);
+    const uint32_t serial = impl_->next_serial();
+    for (wl_resource* kb : impl_->keyboards) {
+        if (wl_resource_get_client(kb) == client) {
+            wl_keyboard_send_modifiers(kb, serial, depressed, latched, locked, group);
         }
     }
 }

@@ -288,12 +288,24 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
         std::vector<vk::raii::Buffer> staging;
         std::vector<vk::raii::DeviceMemory> staging_memory;
         for (const TextureFill& t : textures) {
-            // TODO: no clipping — surfaces fully inside the output only.
-            if (t.rgba == nullptr || t.w <= 0 || t.h <= 0 || t.x < 0 || t.y < 0 ||
-                t.x + t.w > width || t.y + t.h > height) {
+            if (t.rgba == nullptr || t.w <= 0 || t.h <= 0) {
                 continue;
             }
-            const vk::DeviceSize size = static_cast<vk::DeviceSize>(t.w) * t.h * 4;
+            // Clip the surface rect to the output; copy only the visible sub-rect
+            // (a partially off-screen window still shows the part that's on-screen).
+            const int dx0 = std::max(0, t.x);
+            const int dy0 = std::max(0, t.y);
+            const int dx1 = std::min(width, t.x + t.w);
+            const int dy1 = std::min(height, t.y + t.h);
+            if (dx1 <= dx0 || dy1 <= dy0) {
+                continue; // fully off-screen
+            }
+            const int cw = dx1 - dx0;
+            const int ch = dy1 - dy0;
+            const int sx = dx0 - t.x; // source-column offset into t.rgba
+            const int sy = dy0 - t.y; // source-row offset into t.rgba
+
+            const vk::DeviceSize size = static_cast<vk::DeviceSize>(cw) * ch * 4;
             vk::raii::Buffer sb{device, vk::BufferCreateInfo{{}, size,
                                                              vk::BufferUsageFlagBits::eTransferSrc,
                                                              vk::SharingMode::eExclusive}};
@@ -305,16 +317,21 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
                                              vk::MemoryPropertyFlagBits::eHostVisible |
                                                  vk::MemoryPropertyFlagBits::eHostCoherent)}};
             sb.bindMemory(*sm, 0);
-            void* p = sm.mapMemory(0, VK_WHOLE_SIZE);
-            std::memcpy(p, t.rgba, static_cast<size_t>(size));
+            auto* dstp = static_cast<uint8_t*>(sm.mapMemory(0, VK_WHOLE_SIZE));
+            const auto* srcp = static_cast<const uint8_t*>(t.rgba);
+            for (int row = 0; row < ch; ++row) { // pack the clipped rows tightly
+                std::memcpy(dstp + static_cast<size_t>(row) * cw * 4,
+                            srcp + (static_cast<size_t>(sy + row) * t.w + sx) * 4,
+                            static_cast<size_t>(cw) * 4);
+            }
             sm.unmapMemory();
 
             vk::BufferImageCopy copy{0,
                                      0,
                                      0,
                                      {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-                                     {t.x, t.y, 0},
-                                     {static_cast<uint32_t>(t.w), static_cast<uint32_t>(t.h), 1}};
+                                     {dx0, dy0, 0},
+                                     {static_cast<uint32_t>(cw), static_cast<uint32_t>(ch), 1}};
             cmd.copyBufferToImage(*sb, *image, vk::ImageLayout::eTransferDstOptimal, copy);
             staging.push_back(std::move(sb));
             staging_memory.push_back(std::move(sm));

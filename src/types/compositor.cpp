@@ -68,6 +68,11 @@ uint32_t now_ms() {
 
 void Surface::apply_commit() {
     if (pending_buffer_dirty_) {
+        // Release the buffer we're replacing so the client can reuse it. We copy
+        // buffer contents at render time, so we only need to hold the current one.
+        if (current_buffer_ != nullptr && current_buffer_ != pending_buffer_) {
+            wl_buffer_send_release(current_buffer_);
+        }
         current_buffer_ = pending_buffer_;
         pending_buffer_dirty_ = false;
     }
@@ -147,13 +152,18 @@ void compositor_create_surface(wl_client* client, wl_resource* compositor_resour
     impl->new_surface.emit(event);
 }
 
-// Minimal wl_region: we don't use regions yet, so create an inert resource.
-// TODO: add/subtract land when input/opaque regions matter (Phase 3).
+// Minimal wl_region: all requests wired (add/subtract accepted no-ops) so clients
+// that build opaque/input regions don't hit a null slot.
+// TODO: track the region geometry when input/opaque regions actually matter.
 void region_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
+void region_add(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
+void region_subtract(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
 constexpr struct wl_region_interface region_impl = {
     .destroy = region_destroy_request,
+    .add = region_add,
+    .subtract = region_subtract,
 };
 
 void compositor_create_region(wl_client* client, wl_resource* compositor_resource, uint32_t id) {

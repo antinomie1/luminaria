@@ -36,6 +36,8 @@ public:
     void set_keyboard_focus(Surface* surface);
     /// Send a key event to the keyboard-focused client. `pressed` = down.
     void notify_key(uint32_t key, bool pressed);
+    /// Send the current modifier state (Shift/Ctrl/…) to the keyboard-focused client.
+    void notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
 
     // --- pointer ---
     /// Move pointer focus onto `surface` at local (sx,sy) and send enter.

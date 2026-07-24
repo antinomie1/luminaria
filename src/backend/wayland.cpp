@@ -37,7 +37,9 @@ void buffer_release(void* data, wl_buffer* buffer) {
 }
 const wl_buffer_listener kBufferListener{buffer_release};
 
-wl_buffer* make_solid_buffer(wl_shm* shm, int w, int h, Color color) {
+// Allocate an XRGB8888 shm buffer; on success sets *out_pixels to the w*h u32
+// mapping for the caller to fill. The buffer frees itself on parent release.
+wl_buffer* make_shm_buffer(wl_shm* shm, int w, int h, uint32_t** out_pixels) {
     const int stride = w * 4;
     const size_t size = static_cast<size_t>(stride) * h;
     int fd = memfd_create("luminaria-nested", MFD_CLOEXEC);
@@ -48,18 +50,28 @@ wl_buffer* make_solid_buffer(wl_shm* shm, int w, int h, Color color) {
     if (ftruncate(fd, static_cast<off_t>(size)) == 0) {
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (p != MAP_FAILED) {
-            const uint32_t argb = (static_cast<uint32_t>(to_u8(color.r)) << 16) |
-                                  (static_cast<uint32_t>(to_u8(color.g)) << 8) |
-                                  static_cast<uint32_t>(to_u8(color.b));
-            std::fill_n(static_cast<uint32_t*>(p), static_cast<size_t>(w) * h, argb);
             wl_shm_pool* pool = wl_shm_create_pool(shm, fd, static_cast<int32_t>(size));
             buffer = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
             wl_shm_pool_destroy(pool);
             auto* sb = new ShmBuffer{buffer, p, size};
             wl_buffer_add_listener(buffer, &kBufferListener, sb);
+            *out_pixels = static_cast<uint32_t*>(p);
         }
     }
     close(fd);
+    return buffer;
+}
+
+wl_buffer* make_solid_buffer(wl_shm* shm, int w, int h, Color color) {
+    uint32_t* px = nullptr;
+    wl_buffer* buffer = make_shm_buffer(shm, w, h, &px);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    const uint32_t argb = (static_cast<uint32_t>(to_u8(color.r)) << 16) |
+                          (static_cast<uint32_t>(to_u8(color.g)) << 8) |
+                          static_cast<uint32_t>(to_u8(color.b));
+    std::fill_n(px, static_cast<size_t>(w) * h, argb);
     return buffer;
 }
 
@@ -82,6 +94,32 @@ public:
         }
         wl_surface_attach(surface, buffer, 0, 0);
         wl_surface_damage_buffer(surface, 0, 0, width_, height_);
+        request_frame();
+        wl_surface_commit(surface);
+        wl_display_flush(parent);
+        return ok();
+    }
+
+    // Present a composited RGBA frame: pack into an XRGB8888 shm buffer and
+    // hand it to the parent. This is what makes client windows visible nested.
+    Status commit_frame(std::span<const Pixel> rgba, int w, int h) override {
+        if (w != width_ || h != height_ ||
+            rgba.size() < static_cast<size_t>(w) * static_cast<size_t>(h)) {
+            return fail("nested: frame size mismatch");
+        }
+        uint32_t* px = nullptr;
+        wl_buffer* buffer = make_shm_buffer(shm, w, h, &px);
+        if (buffer == nullptr) {
+            return fail("nested: buffer allocation failed");
+        }
+        const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+        for (size_t i = 0; i < n; ++i) {
+            px[i] = (static_cast<uint32_t>(rgba[i].r) << 16) |
+                    (static_cast<uint32_t>(rgba[i].g) << 8) |
+                    static_cast<uint32_t>(rgba[i].b);
+        }
+        wl_surface_attach(surface, buffer, 0, 0);
+        wl_surface_damage_buffer(surface, 0, 0, w, h);
         request_frame();
         wl_surface_commit(surface);
         wl_display_flush(parent);
@@ -112,11 +150,24 @@ struct WaylandBackend::Impl {
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
     wl_shm* shm = nullptr;
+    wl_seat* seat = nullptr;
+    wl_pointer* pointer = nullptr;
+    wl_keyboard* keyboard = nullptr;
+    WaylandBackend* owner = nullptr; // set in start(), after all moves; emits input signals
     EventSource fd_source;
     std::vector<std::unique_ptr<WaylandOutput>> outputs;
 
     ~Impl() {
         outputs.clear();
+        if (keyboard != nullptr) {
+            wl_keyboard_destroy(keyboard);
+        }
+        if (pointer != nullptr) {
+            wl_pointer_destroy(pointer);
+        }
+        if (seat != nullptr) {
+            wl_seat_destroy(seat);
+        }
         if (wm_base != nullptr) {
             xdg_wm_base_destroy(wm_base);
         }
@@ -142,6 +193,71 @@ void wm_base_ping(void*, xdg_wm_base* wm, uint32_t serial) {
 }
 const xdg_wm_base_listener kWmBaseListener{wm_base_ping};
 
+// ---- parent input: forward pointer/keyboard into the backend's signals ----
+// data is Impl*; owner is set by the time these fire (start() ran first).
+void emit_motion(WaylandBackend::Impl* impl, double x, double y) {
+    if (impl->owner != nullptr) {
+        PointerMotionAbsEvent e{x, y};
+        impl->owner->pointer_motion.emit(e);
+    }
+}
+void ptr_enter(void* data, wl_pointer*, uint32_t, wl_surface*, wl_fixed_t sx, wl_fixed_t sy) {
+    emit_motion(static_cast<WaylandBackend::Impl*>(data), wl_fixed_to_double(sx),
+                wl_fixed_to_double(sy));
+}
+void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface*) {
+    emit_motion(static_cast<WaylandBackend::Impl*>(data), -1.0, -1.0); // clear focus
+}
+void ptr_motion(void* data, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
+    emit_motion(static_cast<WaylandBackend::Impl*>(data), wl_fixed_to_double(sx),
+                wl_fixed_to_double(sy));
+}
+void ptr_button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (impl->owner != nullptr) {
+        PointerButtonEvent e{button, state == WL_POINTER_BUTTON_STATE_PRESSED};
+        impl->owner->pointer_button.emit(e);
+    }
+}
+void ptr_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
+const wl_pointer_listener kPointerListener{ptr_enter, ptr_leave, ptr_motion, ptr_button, ptr_axis};
+
+void kb_keymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); }
+void kb_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
+void kb_leave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
+void kb_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (impl->owner != nullptr) {
+        KeyEvent e{key, state == WL_KEYBOARD_KEY_STATE_PRESSED};
+        impl->owner->key.emit(e);
+    }
+}
+void kb_mods(void* data, wl_keyboard*, uint32_t, uint32_t dep, uint32_t lat, uint32_t lock,
+             uint32_t grp) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (impl->owner != nullptr) {
+        ModifiersEvent e{dep, lat, lock, grp};
+        impl->owner->modifiers.emit(e);
+    }
+}
+void kb_repeat(void*, wl_keyboard*, int32_t, int32_t) {}
+const wl_keyboard_listener kKeyboardListener{kb_keymap, kb_enter, kb_leave,
+                                             kb_key,    kb_mods,  kb_repeat};
+
+void seat_caps(void* data, wl_seat* seat, uint32_t caps) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) != 0 && impl->pointer == nullptr) {
+        impl->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(impl->pointer, &kPointerListener, impl);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0 && impl->keyboard == nullptr) {
+        impl->keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(impl->keyboard, &kKeyboardListener, impl);
+    }
+}
+void seat_name(void*, wl_seat*, const char*) {}
+const wl_seat_listener kSeatListener{seat_caps, seat_name};
+
 void registry_global(void* data, wl_registry* registry, uint32_t name, const char* interface,
                      uint32_t) {
     auto* impl = static_cast<WaylandBackend::Impl*>(data);
@@ -154,6 +270,12 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
         xdg_wm_base_add_listener(impl->wm_base, &kWmBaseListener, impl);
     } else if (std::strcmp(interface, "wl_shm") == 0) {
         impl->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+    } else if (std::strcmp(interface, "wl_seat") == 0) {
+        // Bind v1: we only consume enter/leave/motion/button/axis. Higher versions
+        // send frame/axis_source/etc — libwayland aborts if a listener slot for a
+        // sent event is null, so don't ask for events we don't handle.
+        impl->seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 1));
+        wl_seat_add_listener(impl->seat, &kSeatListener, impl);
     }
 }
 void registry_global_remove(void*, wl_registry*, uint32_t) {}
@@ -214,6 +336,7 @@ Output& WaylandBackend::add_output(int width, int height) {
 }
 
 Status WaylandBackend::start() {
+    impl_->owner = this; // this object is now at its final address; input can emit
     // Drive the parent connection from our event loop.
     impl_->fd_source = impl_->loop.add_fd(wl_display_get_fd(impl_->parent), [this] {
         if (wl_display_dispatch(impl_->parent) < 0) {

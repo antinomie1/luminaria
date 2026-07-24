@@ -12,6 +12,7 @@ luminaria_lib = static_library('luminaria',
     'types/xdg_shell.cpp',
     'scene/scene.cpp',
     'types/seat.cpp',
+    'types/output_global.cpp',
   ),
   xdg_shell_c,         # generated protocol code
   xdg_shell_h,         # generated server header (also on the include path)

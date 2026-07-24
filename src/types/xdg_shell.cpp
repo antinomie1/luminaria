@@ -25,11 +25,16 @@ struct XdgShell::Impl {
 
 namespace {
 
-// Concrete toplevel. Owned by its XdgSurface (unique_ptr); address stable.
+struct XdgSurface;
+
+// Concrete toplevel. Owned by its own xdg_toplevel wl_resource (address stable
+// for its lifetime). `owner` links back to the XdgSurface; either side nulls the
+// cross-pointer when it dies, so client teardown in any resource order is safe.
 class ToplevelImpl final : public Toplevel {
 public:
     Surface* surf = nullptr;
-    wl_resource* resource = nullptr; // xdg_toplevel; null after client destroys it
+    wl_resource* resource = nullptr; // xdg_toplevel
+    XdgSurface* owner = nullptr;     // nulled if the xdg_surface is destroyed first
     bool mapped_ = false;
 
     Surface& surface() noexcept override { return *surf; }
@@ -42,7 +47,7 @@ struct XdgSurface {
     wl_resource* resource = nullptr; // xdg_surface
     Surface* surface = nullptr;
     Signal<SurfaceCommit>::Connection commit_conn;
-    std::unique_ptr<ToplevelImpl> toplevel;
+    ToplevelImpl* toplevel = nullptr; // owned by its resource; nulled on its destroy
     bool initialized = false;
 };
 
@@ -111,7 +116,10 @@ void toplevel_resource_destroy(wl_resource* resource) {
     auto* tl = static_cast<ToplevelImpl*>(wl_resource_get_user_data(resource));
     ToplevelDestroy event{*tl};
     tl->destroy.emit(event);
-    tl->resource = nullptr; // object itself lives until the XdgSurface is gone
+    if (tl->owner != nullptr) {
+        tl->owner->toplevel = nullptr; // stop the xdg_surface from touching us
+    }
+    delete tl;
 }
 
 // ---- xdg_positioner / xdg_popup ----
@@ -149,15 +157,15 @@ void xdg_surface_destroy_request(wl_client*, wl_resource* resource) {
 }
 void xdg_surface_get_toplevel(wl_client* client, wl_resource* resource, uint32_t id) {
     auto* xs = xdg_surface_of(resource);
-    auto toplevel = std::make_unique<ToplevelImpl>();
-    toplevel->surf = xs->surface;
-    toplevel->resource = wl_resource_create(client, &xdg_toplevel_interface,
-                                            wl_resource_get_version(resource), id);
-    wl_resource_set_implementation(toplevel->resource, &toplevel_impl, toplevel.get(),
-                                   toplevel_resource_destroy);
-    xs->toplevel = std::move(toplevel);
+    auto* tl = new ToplevelImpl();
+    tl->surf = xs->surface;
+    tl->owner = xs;
+    tl->resource = wl_resource_create(client, &xdg_toplevel_interface,
+                                      wl_resource_get_version(resource), id);
+    wl_resource_set_implementation(tl->resource, &toplevel_impl, tl, toplevel_resource_destroy);
+    xs->toplevel = tl;
 
-    NewToplevel event{*xs->toplevel};
+    NewToplevel event{*tl};
     xs->shell->new_toplevel.emit(event);
 }
 void xdg_surface_get_popup(wl_client* client, wl_resource* resource, uint32_t id, wl_resource*,
@@ -178,7 +186,13 @@ constexpr struct xdg_surface_interface xdg_surface_impl = {
     .ack_configure = xdg_surface_ack_configure,
 };
 void xdg_surface_resource_destroy(wl_resource* resource) {
-    delete xdg_surface_of(resource);
+    auto* xs = xdg_surface_of(resource);
+    if (xs->toplevel != nullptr) {
+        // Our toplevel's resource outlives us; sever the back-pointer so its
+        // destroy handler won't touch this freed XdgSurface.
+        xs->toplevel->owner = nullptr;
+    }
+    delete xs;
 }
 
 // ---- xdg_wm_base ----

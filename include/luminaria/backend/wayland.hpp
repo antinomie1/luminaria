@@ -11,6 +11,8 @@
 #include "luminaria/backend.hpp"
 #include "luminaria/core/event_loop.hpp"
 #include "luminaria/core/expected.hpp"
+#include "luminaria/core/signal.hpp"
+#include "luminaria/input_event.hpp"
 #include "luminaria/output.hpp"
 
 namespace luminaria {
@@ -31,6 +33,14 @@ public:
     Output& add_output(int width, int height);
 
     Status start() override;
+
+    // Input forwarded from the parent compositor (cursor is over our window).
+    // Coordinates are output-local; the compositor hit-tests and routes to a
+    // client surface. Pointer leave clears focus (motion x/y set to -1,-1).
+    Signal<KeyEvent> key;
+    Signal<ModifiersEvent> modifiers;
+    Signal<PointerMotionAbsEvent> pointer_motion;
+    Signal<PointerButtonEvent> pointer_button;
 
     struct Impl;
 

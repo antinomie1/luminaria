@@ -14,12 +14,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <list>
+#include <memory>
 #include <vector>
 
 #include "luminaria/backend/drm.hpp"
 #include "luminaria/backend/libinput.hpp"
 #include "luminaria/compositor.hpp"
 #include "luminaria/core/display.hpp"
+#include "luminaria/output_global.hpp"
 #include "luminaria/render/vulkan.hpp"
 #include "luminaria/seat.hpp"
 #include "luminaria/xdg_shell.hpp"
@@ -105,10 +107,14 @@ int main(int argc, char** argv) {
 
     // DRM frame -> composite all mapped client windows -> scan out.
     luminaria::Signal<luminaria::FrameEvent>::Connection frame_conn;
+    std::unique_ptr<luminaria::OutputGlobal> output_global; // clients need a wl_output to map
     auto out_conn = drm->new_output.connect([&](luminaria::NewOutput& e) {
         const int ow = e.output.width();
         const int oh = e.output.height();
         std::printf("luminaria-tty: output %dx%d\n", ow, oh);
+        if (auto og = luminaria::OutputGlobal::create(*display, ow, oh)) {
+            output_global = std::make_unique<luminaria::OutputGlobal>(std::move(*og));
+        }
         frame_conn = e.output.frame.connect([&, ow, oh](luminaria::FrameEvent& fe) {
             std::vector<std::vector<std::uint8_t>> holds;
             std::vector<luminaria::TextureFill> textures;

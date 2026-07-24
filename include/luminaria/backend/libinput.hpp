@@ -15,20 +15,9 @@
 #include "luminaria/core/event_loop.hpp"
 #include "luminaria/core/expected.hpp"
 #include "luminaria/core/signal.hpp"
+#include "luminaria/input_event.hpp"
 
 namespace luminaria {
-
-struct KeyEvent {
-    uint32_t keycode; // evdev code (KEY_ESC == 1)
-    bool pressed;
-};
-struct PointerMotionEvent {
-    double dx, dy;
-};
-struct PointerButtonEvent {
-    uint32_t button; // evdev code (BTN_LEFT == 272)
-    bool pressed;
-};
 
 class LibinputBackend {
 public:
