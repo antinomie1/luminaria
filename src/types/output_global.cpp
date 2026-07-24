@@ -1,5 +1,7 @@
 #include "luminaria/output_global.hpp"
 
+#include <vector>
+
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
@@ -12,6 +14,8 @@ struct OutputGlobal::Impl {
     wl_global* global = nullptr;
     int width = 0;
     int height = 0;
+    std::vector<BindFunc> bind_callbacks;
+    std::vector<wl_resource*> resources; // all bound wl_output resources (weak refs)
 
     ~Impl() {
         if (global != nullptr) {
@@ -27,6 +31,8 @@ void output_release(wl_client*, wl_resource* resource) {
 }
 constexpr struct wl_output_interface output_impl = {.release = output_release};
 
+[[maybe_unused]] void output_resource_destroy(wl_resource*) {} // no-op; resource tracked in Impl::resources
+
 void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     auto* self = static_cast<OutputGlobal::Impl*>(data);
     wl_resource* resource =
@@ -35,7 +41,10 @@ void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(resource, &output_impl, self, nullptr);
+    wl_resource_set_implementation(resource, &output_impl, self, output_resource_destroy);
+    // Keep a weak reference; the destroy handler is a no-op but we still store it
+    // so callbacks can iterate all bound resources.
+    self->resources.push_back(resource);
 
     wl_output_send_geometry(resource, 0, 0, self->width, self->height, WL_OUTPUT_SUBPIXEL_UNKNOWN,
                             "luminaria", "virtual", WL_OUTPUT_TRANSFORM_NORMAL);
@@ -46,6 +55,11 @@ void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     }
     if (version >= WL_OUTPUT_DONE_SINCE_VERSION) {
         wl_output_send_done(resource);
+    }
+
+    // Notify all registered callbacks (e.g. screencopy manager).
+    for (auto& fn : self->bind_callbacks) {
+        fn(resource);
     }
 }
 
@@ -68,6 +82,18 @@ Result<OutputGlobal> OutputGlobal::create(Display& display, int width, int heigh
         return fail("wl_global_create(wl_output) failed");
     }
     return OutputGlobal{std::move(impl)};
+}
+
+int OutputGlobal::width() const noexcept { return impl_->width; }
+int OutputGlobal::height() const noexcept { return impl_->height; }
+
+void OutputGlobal::on_bind(BindFunc fn) {
+    // Call for all already-bound resources.
+    for (auto* r : impl_->resources) {
+        fn(r);
+    }
+    // Store for future binds.
+    impl_->bind_callbacks.push_back(std::move(fn));
 }
 
 } // namespace luminaria

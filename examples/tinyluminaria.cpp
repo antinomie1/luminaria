@@ -3,9 +3,11 @@
 //
 // Runs on the headless backend (no GPU/display needed to smoke-test the wiring).
 // Set LUMINARIA_EXIT_MS to auto-terminate after N ms (used by the smoke test).
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <memory>
 #include <string>
@@ -17,6 +19,7 @@
 #include "luminaria/core/display.hpp"
 #include "luminaria/output_global.hpp"
 #include "luminaria/render/vulkan.hpp"
+#include "luminaria/screencopy.hpp"
 #include "luminaria/seat.hpp"
 #include "luminaria/xdg_shell.hpp"
 
@@ -75,6 +78,26 @@ int main() {
     // Real clients (weston-terminal) won't map a window until they see an output.
     auto output_global = must(luminaria::OutputGlobal::create(display, 800, 600), "wl_output");
 
+    // Screencopy: allow tools like grim/slurp to capture the output.
+    auto screencopy = must(luminaria::ScreencopyManager::create(display), "screencopy");
+    // Cache the last rendered frame so the capture callback can serve subregions.
+    auto last_frame = std::make_shared<std::vector<luminaria::Pixel>>();
+    output_global.on_bind([&](wl_resource* res) {
+        screencopy.add_output(res, output_global.width(), output_global.height(),
+            [last_frame, ow = output_global.width(), oh = output_global.height()]
+            (int x, int y, int w, int h, std::vector<uint8_t>& rgba) -> bool {
+                if (last_frame->empty()) return false;
+                // Extract subregion from the cached full-frame pixels.
+                rgba.resize(static_cast<size_t>(w) * h * 4);
+                for (int row = 0; row < h; ++row) {
+                    const auto* src = last_frame->data() + (y + row) * ow + x;
+                    auto* dst = reinterpret_cast<uint8_t*>(rgba.data()) + row * w * 4;
+                    std::memcpy(dst, src, static_cast<size_t>(w) * 4);
+                }
+                return true;
+            });
+    });
+
     // Optional GPU compositor. Without it (no Vulkan device) we fall back to a
     // solid background — the window still runs, just isn't drawn.
     std::unique_ptr<luminaria::VulkanRenderer> renderer;
@@ -130,6 +153,8 @@ int main() {
                                 frame_n, windows.size(), textures.size());
                 }
                 if (auto px = renderer->composite(ow, oh, kBg, {}, textures)) {
+                    // Cache the frame for screencopy clients.
+                    *last_frame = *px;
                     if (auto s = fe.output.commit_frame(*px, ow, oh); !s) {
                         std::fprintf(stderr, "tinyluminaria: commit_frame: %s\n",
                                      s.error().message.c_str());
@@ -139,6 +164,14 @@ int main() {
                     std::fprintf(stderr, "tinyluminaria: composite: %s\n",
                                  px.error().message.c_str());
                 }
+            }
+            // Fallback: solid background. Also populate last_frame for screencopy.
+            {
+                last_frame->resize(static_cast<size_t>(ow) * oh);
+                luminaria::Pixel bg{static_cast<uint8_t>(kBg.r * 255),
+                                    static_cast<uint8_t>(kBg.g * 255),
+                                    static_cast<uint8_t>(kBg.b * 255), 255};
+                std::fill(last_frame->begin(), last_frame->end(), bg);
             }
             (void)fe.output.commit(kBg);
         }));

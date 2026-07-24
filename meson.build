@@ -50,6 +50,31 @@ xdg_shell_client_h = custom_target('xdg-shell-client-protocol.h',
   input : xdg_xml, output : 'xdg-shell-client-protocol.h',
   command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
 
+# --- Screencopy protocols ---
+wlr_screencopy_xml = files('protocol/wlr-screencopy-unstable-v1.xml')
+wlr_screencopy_h = custom_target('wlr-screencopy-unstable-v1-protocol.h',
+  input : wlr_screencopy_xml, output : 'wlr-screencopy-unstable-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+wlr_screencopy_c = custom_target('wlr-screencopy-unstable-v1-protocol.c',
+  input : wlr_screencopy_xml, output : 'wlr-screencopy-unstable-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+ext_copy_capture_xml = files('protocol/ext-image-copy-capture-v1.xml')
+ext_copy_capture_h = custom_target('ext-image-copy-capture-v1-protocol.h',
+  input : ext_copy_capture_xml, output : 'ext-image-copy-capture-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+ext_copy_capture_c = custom_target('ext-image-copy-capture-v1-protocol.c',
+  input : ext_copy_capture_xml, output : 'ext-image-copy-capture-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+ext_capture_source_xml = files('protocol/ext-image-capture-source-v1.xml')
+ext_capture_source_h = custom_target('ext-image-capture-source-v1-protocol.h',
+  input : ext_capture_source_xml, output : 'ext-image-capture-source-v1-protocol.h',
+  command : [wl_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+ext_capture_source_c = custom_target('ext-image-capture-source-v1-protocol.c',
+  input : ext_capture_source_xml, output : 'ext-image-capture-source-v1-protocol.c',
+  command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
 luminaria_inc = include_directories('include')
 
 subdir('src')

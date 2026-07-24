@@ -13,10 +13,14 @@ luminaria_lib = static_library('luminaria',
     'scene/scene.cpp',
     'types/seat.cpp',
     'types/output_global.cpp',
+    'types/screencopy.cpp',
   ),
   xdg_shell_c,         # generated protocol code
   xdg_shell_h,         # generated server header (also on the include path)
   xdg_shell_client_h,  # nested backend acts as a client of the parent
+  wlr_screencopy_c, wlr_screencopy_h,
+  ext_copy_capture_c, ext_copy_capture_h,
+  ext_capture_source_c, ext_capture_source_h,
   include_directories : luminaria_inc,
   dependencies : luminaria_deps,
 )

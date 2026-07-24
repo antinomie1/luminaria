@@ -7,9 +7,12 @@
 // Public header stays C-header-free.
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "luminaria/core/expected.hpp"
+
+struct wl_resource;
 
 namespace luminaria {
 
@@ -27,6 +30,14 @@ public:
     OutputGlobal& operator=(OutputGlobal&&) noexcept;
     OutputGlobal(const OutputGlobal&) = delete;
     OutputGlobal& operator=(const OutputGlobal&) = delete;
+
+    [[nodiscard]] int width() const noexcept;
+    [[nodiscard]] int height() const noexcept;
+
+    /// Register a callback invoked for every wl_output resource created
+    /// (past and future). Used by screencopy to track capturable outputs.
+    using BindFunc = std::function<void(wl_resource*)>;
+    void on_bind(BindFunc fn);
 
     struct Impl;
 
