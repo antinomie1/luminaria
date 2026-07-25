@@ -133,6 +133,35 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 
 一处 `// no-op: unsupported`（不支持的捕获格式组合）。
 
+### 2.10 layer-shell（`src/types/layer_shell.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| 锚点 / margin / exclusive zone 求解 | **已实现**（`arrange_layer_surface()`）：含 v5 的 `set_exclusive_edge`，角落锚定时按显式边消歧，锚定组合本身有歧义的按协议不预留 |
+| 双缓冲状态 | **已实现** —— layer / anchor / size / margin / exclusive zone / keyboard interactivity 全部在 `wl_surface.commit` 上生效 |
+| 协议错误 | 已发：`invalid_size`（0 宽高未锚定对边）、`invalid_anchor`、`invalid_keyboard_interactivity`、`invalid_exclusive_edge`、首次 configure 前贴 buffer 的 `already_constructed` |
+| `keyboard_interactivity` | 库只**如实报告**客户端的请求，不代 compositor 决定焦点。`exclusive`（锁屏 / 密码框）由谁独占键盘，是 compositor 的策略 |
+| `get_popup` | 只发 `LayerSurface::new_popup` 信号 —— 库不替 xdg_popup 换父级。面板菜单的定位要 compositor 自己按 layer surface 的位置摆（`Popup::parent_surface()` 对这种 popup 是 null） |
+| 输出选择 | `output_resource()` 原样交出客户端要的 wl_output（可为 null = 由 compositor 挑）。库不做"最近使用的输出"这类策略 |
+
+### 2.11 foreign-toplevel（`src/types/foreign_toplevel.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| 列表自维护 | **已实现** —— `track(shell)` 后跟着 `Toplevel` 的 map / unmap / destroy / identity_change / **state_change** / parent_change 走；晚绑定的客户端拿全量列表 |
+| `set_rectangle` | **校验后丢弃**（负尺寸发 `invalid_rectangle`）。它是最小化动画飞向任务栏按钮的目标矩形，本库不做动画，存下来也没人用 |
+| `output_enter/leave` | 要 compositor 调 `set_output()` 才有 —— 窗口在哪块屏上是 compositor 的布局知识，库看不到 |
+| minimized 状态 | 借 `Toplevel::set_minimized()` 记账。xdg-shell 没有 minimized 状态，所以这一位**不下发给客户端**，只用于窗口列表与 compositor 自己 |
+
+### 2.12 xdg-activation（`src/types/xdg_activation.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| token 一次性 | **已实现** —— 无论 compositor 认不认，`activate` 一到就作废，杜绝重放 |
+| token 强度 | 128 位，来自 `getrandom(2)`（内核 CSPRNG）。不用 `<random>` —— 那些发生器看够输出就能预测，而能猜到 token 就等于能随时抢焦点。取不到熵时干脆不记录该 token，发个永远兑不出来的空串 |
+| serial 校验 | **不做** —— 库没有"这个客户端最近收到过哪些 serial"的账。`ActivationTokenRequest` 把 seat + serial 原样交给 compositor，`granted` 默认 true。防焦点窃取要 compositor 自己核对 |
+| 未兑换 token | 最多存 32 个，超了丢最旧的。要了 token 又不用的客户端不会把内存吃光，代价是极端情况下老 token 提前失效 |
+
 ---
 
 ## 三、汇总

@@ -75,6 +75,13 @@ struct ToplevelRequestResize {
 struct ToplevelIdentityChange {
     Toplevel& toplevel;
 };
+/// The COMPOSITOR changed this window's state (maximized / fullscreen /
+/// activated / resizing / minimized) — i.e. one of the set_* methods below
+/// actually changed something. Distinct from the request_* signals above, which
+/// are the client asking. Window-list protocols mirror this.
+struct ToplevelStateChange {
+    Toplevel& toplevel;
+};
 /// The client declared this window transient for another (xdg_toplevel.set_parent).
 /// `parent` is null when the relationship was cleared or the parent has gone.
 /// A compositor should keep the child stacked above its parent and, for dialogs,
@@ -114,6 +121,7 @@ public:
     Signal<ToplevelRequestMove> request_move;
     Signal<ToplevelRequestResize> request_resize;
     Signal<ToplevelIdentityChange> identity_change;
+    Signal<ToplevelStateChange> state_change;
     Signal<ToplevelParentChange> parent_change;
     Signal<ToplevelRequestWindowMenu> request_window_menu;
 
@@ -141,11 +149,17 @@ public:
     virtual void set_fullscreen(bool fullscreen) = 0;
     virtual void set_activated(bool activated) = 0;
     virtual void set_resizing(bool resizing) = 0;
+    /// Compositor bookkeeping only: xdg-shell has no minimized state, so nothing
+    /// is sent to the client (minimizing a window means not drawing it). It is
+    /// tracked here because window-list protocols and taskbars need it, and
+    /// because `request_minimize` has to land somewhere.
+    virtual void set_minimized(bool minimized) = 0;
 
     [[nodiscard]] virtual bool is_maximized() const noexcept = 0;
     [[nodiscard]] virtual bool is_fullscreen() const noexcept = 0;
     [[nodiscard]] virtual bool is_activated() const noexcept = 0;
     [[nodiscard]] virtual bool is_resizing() const noexcept = 0;
+    [[nodiscard]] virtual bool is_minimized() const noexcept = 0;
     /// Size we last asked the client to take (0 if we never asked).
     [[nodiscard]] virtual int pending_width() const noexcept = 0;
     [[nodiscard]] virtual int pending_height() const noexcept = 0;
@@ -257,5 +271,9 @@ private:
 /// something else. How other globals (xdg-decoration) get from a client object
 /// to ours.
 [[nodiscard]] Toplevel* toplevel_from_resource(wl_resource* resource);
+
+/// The same for an `xdg_popup` resource. layer-shell needs it: a panel's menu is
+/// an xdg_popup re-parented to a zwlr_layer_surface_v1.
+[[nodiscard]] Popup* popup_from_resource(wl_resource* resource);
 
 } // namespace luminaria

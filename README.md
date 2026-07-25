@@ -114,6 +114,9 @@ xmake f -m release && xmake   # 优化构建（默认是 debug）
 | 协议 | `wp_tearing_control_v1` — 客户端（游戏）请求不等 vblank 直接上屏；hint 是双缓冲 surface 状态，DRM 后端转成 `DRM_MODE_PAGE_FLIP_ASYNC` | tearing |
 | 协议 | `wp_cursor_shape_v1` (v2) — 客户端说要哪种光标（`text` / `ns-resize` / …）而非自带位图；36 种 shape 全部映射到 XDG 光标名，交给 compositor 画 | cursor-shape |
 | 协议 | `ext_workspace_v1` — 工作区列表 / 切换（面板、pager）。服务端拥有工作区集合，客户端只能请求；group ↔ output 关联、state（active/urgent/hidden）、请求经 `commit` 批量下发 | workspace |
+| 协议 | `zwlr_layer_shell_v1` (v5) — 桌面自己的表面：面板 / 状态栏 / 壁纸 / 通知 / 锁屏层。四个 layer 各有 z 序，锚定到输出边缘；exclusive zone 从可用区里切出一条谁也不许盖的带子。layer / anchor / size / margin / exclusive zone 全是双缓冲状态，随 `wl_surface.commit` 生效并发 `state_change`；映射流程与 xdg-shell 同规矩（先无 buffer 提交、configure、再贴 buffer）。`arrange_layer_surface()` 一次算完摆放 + 收缩可用区 + 下发 configure —— 这段锚点算术每个 compositor 都得写一遍，写错就是面板互相压 | layer-shell |
+| 协议 | `zwlr_foreign_toplevel_management_v1` (v3) — 任务栏 / 窗口切换器看到的窗口列表。不用手工发布：`track(shell)` 之后自维护，窗口 map 时进列表，title / app_id / 状态跟着 toplevel 自己的信号走，unmap 或销毁时消失，晚启动的任务栏照样拿到全量列表；客户端的 activate / minimize / maximize / fullscreen / close 经 `request()` 交给 compositor 仲裁。注意这个 global 让一个客户端能枚举并操作**所有别人的**窗口，只该给桌面自家组件 | foreign-toplevel |
+| 协议 | `xdg_activation_v1` — 「把那个窗口提到前面」。两步握手：有焦点的客户端拿 token（附 seat + 输入 serial），带外（环境变量 / D-Bus）传给另一个客户端，后者拿 `activate` 换焦点。token 随机 128 位、一次性；compositor 在 `new_token` 里核对 serial 决定发不发 —— 这就是它防焦点窃取的全部机制，`request_activate` 仍只是请求，给不给焦点是 compositor 的事 | xdg-activation |
 | 协议 | `linux-drm-syncobj-v1` — 显式 GPU 同步，**全异步、无 CPU 等待**：acquire point 导出成 sync_file 交给渲染器当 `VkSemaphore` 等；渲染的 out-fence 直接写进客户端的 release point，客户端在 GPU 停止读取的那一刻就能复用 buffer | syncobj |
 | 协议 | `wl_output` v4 — geometry / mode / scale / name / description / done（客户端 map 前需要；`name` 是 `grim -o` 等工具寻址输出用的）。`set_scale()` / `set_transform()` 会重发几何信息并以 `done` 收尾 | output-scale |
 | 协议 | `xdg-output-unstable-v1`（`zxdg_output_manager_v1` v3）— 输出的**逻辑**位置与尺寸（mode ÷ scale，旋转时长宽互换），随 scale/transform/位置变化实时更新。wl_output 只描述物理模式；要把截图摆到画布上的工具（grim / slurp / 录屏器）读的是这个。缺了它 `grim` 只会警告并写出 0×0 的 PNG | — |
@@ -289,12 +292,12 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 
 ### P2 — 完整功能 / 桌面外壳
 
-- ✗ **layer-shell**（`wlr-layer-shell` 或 `ext-*`）— 面板 / 状态栏 / 壁纸 / 锁屏层
+- ✓ **layer-shell**（`zwlr_layer_shell_v1` v5）— 面板 / 状态栏 / 壁纸 / 通知层，含 `arrange_layer_surface()` 锚点与 exclusive zone 求解（见协议表）
 - ✗ **`ext-session-lock-v1`** — 锁屏
 - ✓ **截图/录屏**：`wlr-screencopy-unstable-v1` (v3) + `ext-image-copy-capture-v1` + `ext-image-capture-source-v1` — 客户端捕获整块输出到 **wl_shm 或 dmabuf** buffer。三个 global 一起注册，每个可捕获输出经 `add_output()` 挂上 capture 回调，客户端请求时回调填 RGBA（当前帧 GPU 合成结果）。dmabuf 目标：`set_renderer()` 后 wlr 路径发 `linux_dmabuf` 事件、ext 路径广告 `dmabuf_device` + 每格式 modifier；写入时 LINEAR 走 mmap，tiled 走 `VulkanRenderer::export_dmabuf`。`grim` 截图、`wf-recorder` 录屏皆可。
 - ✓ **`ext-workspace-v1`** — 工作区列表/切换（见协议表）
-- ✗ **`wlr-foreign-toplevel-management`** — 任务栏列窗口
-- ✗ **`xdg-activation`** — 焦点转移 / 紧急提示
+- ✓ **`wlr-foreign-toplevel-management`** — 任务栏列窗口（见协议表）
+- ✓ **`xdg-activation`** — 焦点转移 / 紧急提示（见协议表）
 - ✗ **idle**：`ext-idle-notify` + idle-inhibit（视频防息屏）
 - ✗ **output-management + gamma-control**（夜间模式）
 - ✗ **data-control**（剪贴板管理器）
@@ -318,7 +321,7 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 4. ~~**多输出 + damage + presentation-time**~~ — ✓ 已做
 5. ~~**热插拔（udev）+ 每输出 scale/transform**~~ — ✓ 已做
 6. ~~**异步 explicit sync + 多矩形 damage + libseat + 光标平面/主题 + HiDPI 全套**~~ — ✓ 已做
-7. **layer-shell + session-lock** — 有这个才算"桌面"
+7. ~~**layer-shell**~~ — ✓ 已做；**session-lock** 仍缺，补上才算完整"桌面"
 8. **text-input / input-method** — 中文输入（P1 最后一项）
 
 ---

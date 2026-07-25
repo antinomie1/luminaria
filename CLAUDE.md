@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Luminaria: a minimal Wayland compositor **library** in modern C++23, built on top of
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
-built with xmake. Roughly wlroots-shaped but far smaller (17 protocol types vs wlroots' 73).
+built with xmake. Roughly wlroots-shaped but far smaller (20 protocol types vs wlroots' 73).
 
 It ships as a **C++20 named module**. `import luminaria;` is the entire interface — there are
 no public headers.
@@ -96,7 +96,10 @@ Layers, bottom-up (`src/` mirrors `include/luminaria/`):
   `linux_dmabuf`, `screencopy`, `data_device` (clipboard + DnD + primary selection),
   `drm_syncobj` (explicit sync), `single_pixel_buffer`, `presentation_time`,
   `tearing_control`, `cursor_shape`, `workspace` (ext-workspace), `xdg_decoration`,
-  `viewporter`, `fractional_scale`.
+  `viewporter`, `fractional_scale`, `layer_shell` (wlr-layer-shell, plus the
+  `arrange_layer_surface()` anchor/exclusive-zone solver), `foreign_toplevel`
+  (wlr-foreign-toplevel-management, mirrors an `XdgShell` on its own via
+  `track()`), `xdg_activation`.
 - **render/vulkan** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs
@@ -200,3 +203,9 @@ calls `clear_damage()`.
 4. Add `export import :<name>;` to `include/luminaria.cppm`.
 5. Drop a test in `tests/` — `xmake.lua` turns every `tests/test_*.cpp` into its own binary
    automatically. Exit 77 to skip when the machine cannot run it.
+
+An XML argument name becomes a C parameter name verbatim, and everything here that
+consumes the generated headers is C++ — so an argument called `namespace`, `class`,
+`new`, `template`… simply does not compile. The name never appears on the wire, so the
+fix for a protocol whose XML we vendor is to rename the argument in `protocol/` with a
+comment saying why: `wlr-layer-shell-unstable-v1.xml` has `namespace` renamed to `scope`.

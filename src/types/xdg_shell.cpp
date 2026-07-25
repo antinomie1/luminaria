@@ -222,6 +222,7 @@ public:
     std::string app_id_;
     int min_w_ = 0, min_h_ = 0, max_w_ = 0, max_h_ = 0;
     bool maximized_ = false, fullscreen_ = false, activated_ = false, resizing_ = false;
+    bool minimized_ = false;
     int pending_w_ = 0, pending_h_ = 0;
 
     ToplevelImpl* parent_ = nullptr;              // transient-for
@@ -268,38 +269,55 @@ public:
     // Each of these re-configures the client at its last known size, but only
     // when the state actually changed — a no-op set_activated(true) on an
     // already-focused window shouldn't make it repaint.
+    void reconfigure_and_announce() {
+        (void)configure(pending_w_, pending_h_);
+        announce_state();
+    }
+    void announce_state() {
+        ToplevelStateChange event{*this};
+        state_change.emit(event);
+    }
     void set_maximized(bool v) override {
         if (maximized_ == v) {
             return;
         }
         maximized_ = v;
-        (void)configure(pending_w_, pending_h_);
+        reconfigure_and_announce();
     }
     void set_fullscreen(bool v) override {
         if (fullscreen_ == v) {
             return;
         }
         fullscreen_ = v;
-        (void)configure(pending_w_, pending_h_);
+        reconfigure_and_announce();
     }
     void set_activated(bool v) override {
         if (activated_ == v) {
             return;
         }
         activated_ = v;
-        (void)configure(pending_w_, pending_h_);
+        reconfigure_and_announce();
     }
     void set_resizing(bool v) override {
         if (resizing_ == v) {
             return;
         }
         resizing_ = v;
-        (void)configure(pending_w_, pending_h_);
+        reconfigure_and_announce();
+    }
+    // No configure: xdg-shell has no minimized state to send.
+    void set_minimized(bool v) override {
+        if (minimized_ == v) {
+            return;
+        }
+        minimized_ = v;
+        announce_state();
     }
     [[nodiscard]] bool is_maximized() const noexcept override { return maximized_; }
     [[nodiscard]] bool is_fullscreen() const noexcept override { return fullscreen_; }
     [[nodiscard]] bool is_activated() const noexcept override { return activated_; }
     [[nodiscard]] bool is_resizing() const noexcept override { return resizing_; }
+    [[nodiscard]] bool is_minimized() const noexcept override { return minimized_; }
     [[nodiscard]] int pending_width() const noexcept override { return pending_w_; }
     [[nodiscard]] int pending_height() const noexcept override { return pending_h_; }
 
@@ -961,6 +979,14 @@ Toplevel* toplevel_from_resource(wl_resource* resource) {
         return nullptr;
     }
     return static_cast<Toplevel*>(static_cast<ToplevelImpl*>(wl_resource_get_user_data(resource)));
+}
+
+Popup* popup_from_resource(wl_resource* resource) {
+    if (resource == nullptr ||
+        !wl_resource_instance_of(resource, &xdg_popup_interface, &popup_impl)) {
+        return nullptr;
+    }
+    return static_cast<Popup*>(static_cast<PopupImpl*>(wl_resource_get_user_data(resource)));
 }
 
 } // namespace luminaria

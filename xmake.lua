@@ -84,12 +84,15 @@ target("luminaria")
             {"tablet-v2",                     "stable/tablet/tablet-v2.xml",                                "sc"},
             {"ext-workspace-v1",              "staging/ext-workspace/ext-workspace-v1.xml",                 "scl"},
             {"linux-drm-syncobj-v1",          "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml",         "scl"},
+            {"xdg-activation-v1",             "staging/xdg-activation/xdg-activation-v1.xml",               "scl"},
         }
         -- Protocols upstream does not ship; the XML lives in protocol/.
         local local_protocols = {
             {"wlr-screencopy-unstable-v1",   "sc"},
             {"ext-image-copy-capture-v1",    "sc"},
             {"ext-image-capture-source-v1",  "sc"},
+            {"wlr-layer-shell-unstable-v1",  "scl"},
+            {"wlr-foreign-toplevel-management-unstable-v1", "scl"},
         }
 
         local gendir = path.join(os.projectdir(), "build", "generated")
