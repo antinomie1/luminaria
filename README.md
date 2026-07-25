@@ -1,7 +1,8 @@
 # Luminaria
 
 从零实现的极简 Wayland compositor 库，现代 C++。
-架在 `libwayland-server` 上（不重造线协议），Vulkan 渲染，Meson 构建。
+架在 `libwayland-server` 上（不重造线协议），Vulkan 渲染，xmake 构建。
+以 **C++20 named module** 交付 —— `import luminaria;` 就是全部接口，没有公开头文件。
 设计原则：**对外友好、对内高效、整体简单**。
 
 **当前状态：** P0 完成，**P1 除 IME 外全部完成**。真实客户端（`weston-terminal`）可连接、
@@ -26,7 +27,7 @@
 
 ```sh
 sudo dnf install -y \
-  gcc-c++ meson ninja-build pkgconf-pkg-config \
+  gcc-c++ xmake pkgconf-pkg-config \
   wayland-devel wayland-protocols-devel \
   libxkbcommon-devel \
   vulkan-loader-devel vulkan-headers glslang mesa-vulkan-drivers \
@@ -41,7 +42,7 @@ sudo dnf install -y \
   xorg-x11-server-Xwayland libxcb-devel xcb-util-wm-devel
 ```
 
-编译需 C++23 stdlib（`<expected>`），gcc ≥ 14 / clang ≥ 18，以及 Vulkan、xkbcommon、
+编译需 **gcc ≥ 16**（更早的版本编不动模块分区），以及 Vulkan、xkbcommon、
 libdrm、libinput、libudev、**libseat**、wayland-protocols，外加
 **`glslangValidator`（glslang 包）**—— 渲染器的纹理四边形管线用它把 GLSL 编成 SPIR-V 并
 直接嵌进二进制（运行时不读 shader 文件）。
@@ -55,14 +56,30 @@ compositor。
 ## 构建 & 测试
 
 ```sh
-meson setup build
-ninja -C build
-meson test -C build
+xmake f -y      # 配置：顺带跑 wayland-scanner 和 glslangValidator
+xmake           # 构建库与示例
+xmake build -a  # 连测试二进制一起
+xmake test      # 跑全部测试
+xmake f -m release && xmake   # 优化构建（默认是 debug）
 ```
 
 多数测试用**进程内 `libwayland-client`**（socketpair）驱动真实协议，无需 GPU /
 父 compositor；Vulkan 测试用真 GPU；`wayland-nested` 连真父 compositor（有
-`WAYLAND_DISPLAY` 才跑）。
+`WAYLAND_DISPLAY` 才跑）。跑不了的测试以 **exit 77** 自我跳过（无 GPU / 无空闲 VT /
+无 seat），`xmake test` 会把原因打出来并记为通过。
+
+### 模块结构
+
+| 文件 | 角色 |
+|---|---|
+| `include/luminaria.cppm` | 主接口单元，只做 `export import` |
+| `include/luminaria/**.cppm` | 接口分区，一个对应原来的一个公开头文件（`util/box.cppm` = `luminaria:util.box`） |
+| `src/**.cpp` | 实现单元（`module luminaria;`），隐式导入主接口 |
+| `include/luminaria/detail/wayland_fwd.h` | 唯一剩下的头文件：libwayland 不透明类型的前置声明，供各单元在 global module fragment 里 `#include` |
+
+用 xmake 而不是 Meson 的原因很实际：Meson 的模块依赖扫描器把输出名硬编码成 MSVC 的
+`.ifc`（`mesonbuild/scripts/depscan.py`），GCC 下 ninja 直接报
+`inputs may not also have inputs`，根本跑不起来。
 
 ---
 
@@ -323,8 +340,10 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
   也不做模式切换 —— 每个输出固定用 connector 报的首选模式。
 - **嵌套/headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
   13ms debug）。这是 wl_shm 呈现的代价，DRM 后端没有 —— 它直接扫描输出 dmabuf。
-- **默认 `meson setup build` 是 debug（`-O0`）**，逐像素转换会慢 5 倍。跑真实负载用
-  `meson setup --buildtype=release build-rel`。
+- **默认构建是 debug（`-O0`）**，逐像素转换会慢 5 倍。跑真实负载用 `xmake f -m release`。
+- **模块化踩到两个 gcc 16 的坑**：接口单元里 defaulted 的 hidden-friend `operator==` 会
+  ICE（改成成员形式），`std::function` / `std::make_shared` 要求每个实例化点都能看见
+  `<typeinfo>`，不像头文件那样继承得到。
 - **渲染器必须比 Display 活得久**：Surface 缓存的 `GpuTexture` 属于 `VulkanRenderer`。
   两个示例都把渲染器声明在 Display 之前（局部变量逆序析构）。
 - **`send_frame_done()` 是 compositor 的责任**：`wl_surface.frame` 不再在 commit 时自动应答，

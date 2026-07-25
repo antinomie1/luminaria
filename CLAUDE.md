@@ -6,29 +6,59 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Luminaria: a minimal Wayland compositor **library** in modern C++23, built on top of
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
-built with Meson. Roughly wlroots-shaped but far smaller (17 protocol types vs wlroots' 73).
+built with xmake. Roughly wlroots-shaped but far smaller (17 protocol types vs wlroots' 73).
+
+It ships as a **C++20 named module**. `import luminaria;` is the entire interface — there are
+no public headers.
 `README.md` (Chinese) holds the current feature matrix and the roadmap of missing protocols;
 `TODO-CORNERS-CUT.md` (Chinese) is an audit of every TODO and every deliberate no-op stub.
 
 ## Build / test / run
 
 ```sh
-meson setup build
-ninja -C build
-meson test -C build                       # all tests
-meson test -C build dmabuf                # one test by name (names in tests/meson.build)
-meson test -C build --verbose vulkan      # show stdout
-ninja -C build examples/tinyluminaria     # single target
+xmake f -y                # configure (also runs wayland-scanner + glslangValidator)
+xmake                     # build the library and the examples
+xmake build -a            # ...and every test binary
+xmake test                # run all tests
+xmake test test_dmabuf/*  # run one
+xmake build tinyluminaria # one target
+xmake f -m release        # optimised build; debug is the default
 ```
 
-`werror=true`, `warning_level=3`, `cpp_std=c++23` — warnings break the build. `<expected>` is a
-hard requirement (gcc ≥ 14 / clang ≥ 18); Meson errors out at configure time without it.
-`glslangValidator` and `libseat` are hard dependencies too.
+Warnings are fatal (`all`, `extra`, `pedantic`, `error`), minus
+`-Wno-missing-field-initializers` for the libwayland vtable idiom. Requires **gcc ≥ 16** —
+older compilers cannot build the module partitions — plus `glslangValidator` and `libseat`.
 
-**C++20 modules are not usable here.** Meson 1.11's dyndep scanner hardcodes MSVC `.ifc`
-output names (`mesonbuild/scripts/depscan.py`), so ninja fails with "inputs may not also
-have inputs" for GCC. Raw `g++ -fmodules` works fine — a modules migration means moving to
-CMake ≥ 3.28 (`FILE_SET CXX_MODULES`) first. Don't half-start it.
+**Why xmake and not Meson.** Meson's module dependency scanner hardcodes MSVC-shaped `.ifc`
+output names (`mesonbuild/scripts/depscan.py`), so ninja dies with "inputs may not also have
+inputs" on GCC. xmake scans and orders module units correctly for GCC; that is the whole
+reason for the switch.
+
+Generated code (`wayland-scanner` glue, SPIR-V arrays) lands in `build/generated/` at
+configure time and is regenerated only when its input is newer.
+
+## Modules
+
+- `include/luminaria.cppm` is the primary interface unit. It does nothing but
+  `export import` every partition.
+- `include/luminaria/**.cppm` is one **interface partition** per former public header, named
+  after its path: `util/box.cppm` is `luminaria:util.box`. Consumers never name a partition.
+- `src/**.cpp` are **implementation units** (`module luminaria;`). They implicitly import the
+  primary interface, so they need no imports of their own — only their C and std includes,
+  which must sit in the global module fragment above `module luminaria;`.
+- Anything a unit `#include`s belongs in its **global module fragment**: `module;` first, then
+  the includes, then `export module …`. Declaring a C type after `export module` attaches it
+  to module luminaria and makes it a *different type* from the one the C headers declare.
+  That is why the opaque forward declarations live in
+  `include/luminaria/detail/wayland_fwd.h` and are `#include`d — declaring them inline in the
+  fragment trips `-Wglobal-module`.
+- Two gcc-16 quirks worth knowing before you hit them: a defaulted **hidden-friend**
+  `operator==` in an interface unit ICEs (use the member form), and `std::function` /
+  `std::make_shared` want `<typeinfo>` visible at every point of instantiation rather than
+  inheriting it the way a header did.
+- Consumers that also talk to libwayland directly (a test acting as a client) include those C
+  headers themselves and get the same types — the forward declarations are attached to the
+  global module precisely so that works.
 
 Running the example compositors:
 
@@ -161,8 +191,12 @@ calls `clear_damage()`.
 
 1. Stable/unstable protocols come from `wayland-protocols` (path resolved via pkgdata);
    ones not shipped there live as XML in `protocol/`.
-2. In the root `meson.build`, add `custom_target`s for the server header + private code
-   (and a client header if a test acts as a client).
-3. Add the new `src/types/<name>.cpp` and the generated targets to `src/meson.build`.
-4. Public header in `include/luminaria/<name>.hpp` following the pimpl + `Result` pattern above.
-5. Add a test in `tests/` and register it in `tests/meson.build`.
+2. Add a row to the `protocols` (or `local_protocols`) table in `xmake.lua`: name, path, and
+   which halves to generate — `s` server header, `c` private code, `l` client header for
+   tests that act as clients.
+3. Write `src/types/<name>.cpp` as an implementation unit and
+   `include/luminaria/<name>.cppm` as an interface partition, following the pimpl + `Result`
+   pattern above. Both are picked up by the existing globs; nothing else to register.
+4. Add `export import :<name>;` to `include/luminaria.cppm`.
+5. Drop a test in `tests/` — `xmake.lua` turns every `tests/test_*.cpp` into its own binary
+   automatically. Exit 77 to skip when the machine cannot run it.
