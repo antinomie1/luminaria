@@ -1,11 +1,11 @@
+#include <typeinfo>
 // Phase 1 slice A: headless backend drives the output/commit/frame loop.
 // Validates Backend->new_output, the software frame pump, commit, and event-loop
 // integration end to end — no GPU. Solid color stands in for a rendered buffer.
 #include <cassert>
 #include <vector>
 
-#include "luminaria/backend/headless.hpp"
-#include "luminaria/core/display.hpp"
+import luminaria;
 
 int main() {
     auto display = luminaria::Display::create();

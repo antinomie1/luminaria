@@ -3,7 +3,7 @@
 #include <cassert>
 #include <cstdio>
 
-#include "luminaria/render/vulkan.hpp"
+import luminaria;
 
 int main() {
     auto renderer = luminaria::VulkanRenderer::create();

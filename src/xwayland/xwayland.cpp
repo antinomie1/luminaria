@@ -1,4 +1,6 @@
-#include "luminaria/xwayland.hpp"
+module;
+
+#include <memory>
 
 #include <cerrno>
 #include <cstdio>
@@ -14,8 +16,7 @@
 
 #include <xcb/xcb.h>
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/core/event_loop.hpp"
+module luminaria;
 
 namespace luminaria {
 

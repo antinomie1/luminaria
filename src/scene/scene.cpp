@@ -1,8 +1,12 @@
-#include "luminaria/scene.hpp"
+module;
+
+#include <vector>
+
+#include <memory>
 
 #include <algorithm>
 
-#include "luminaria/compositor.hpp"
+module luminaria;
 
 namespace luminaria {
 

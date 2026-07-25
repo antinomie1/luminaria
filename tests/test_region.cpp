@@ -4,8 +4,7 @@
 #include <cassert>
 #include <numeric>
 
-#include "luminaria/util/region.hpp"
-#include "luminaria/util/transform.hpp"
+import luminaria;
 
 namespace {
 

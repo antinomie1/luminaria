@@ -1,4 +1,13 @@
-#include "luminaria/cursor_theme.hpp"
+module;
+
+#include <memory>
+
+#include <cstddef>
+
+#include <cstdint>
+
+#include <string>
+#include <vector>
 
 #include <algorithm>
 #include <cstdio>
@@ -8,6 +17,8 @@
 #include <optional>
 
 #include <sys/stat.h>
+
+module luminaria;
 
 namespace luminaria {
 

@@ -1,4 +1,10 @@
-#include "luminaria/compositor.hpp"
+module;
+
+#include <memory>
+
+#include <cstdint>
+
+#include <vector>
 
 #include <algorithm>
 #include <cmath>
@@ -9,9 +15,7 @@
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/linux_dmabuf.hpp"
-#include "luminaria/single_pixel_buffer.hpp"
+module luminaria;
 
 namespace luminaria {
 

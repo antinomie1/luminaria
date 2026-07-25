@@ -1,4 +1,6 @@
-#include "luminaria/cursor_shape.hpp"
+module;
+
+#include <cstdint>
 
 // Implements wp_cursor_shape_manager_v1 (version 2). The device object is a
 // thin handle: it remembers which wl_pointer (or tablet tool) it decorates and
@@ -11,7 +13,8 @@
 #include <wayland-server-core.h>
 
 #include "cursor-shape-v1-protocol.h"
-#include "luminaria/core/display.hpp"
+
+module luminaria;
 
 namespace luminaria {
 

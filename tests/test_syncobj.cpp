@@ -26,9 +26,7 @@
 
 #include "linux-drm-syncobj-v1-client-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/drm_syncobj.hpp"
+import luminaria;
 
 namespace {
 

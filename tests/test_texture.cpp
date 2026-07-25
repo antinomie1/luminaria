@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "luminaria/render/vulkan.hpp"
+import luminaria;
 
 using namespace luminaria;
 

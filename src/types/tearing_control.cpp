@@ -1,4 +1,4 @@
-#include "luminaria/tearing_control.hpp"
+module;
 
 // Implements wp_tearing_control_manager_v1 (version 1). The hint is
 // double-buffered surface state, so it is stashed as pending and applied by the
@@ -9,9 +9,9 @@
 
 #include <wayland-server-core.h>
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
 #include "tearing-control-v1-protocol.h"
+
+module luminaria;
 
 namespace luminaria {
 

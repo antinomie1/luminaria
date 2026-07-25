@@ -1,4 +1,4 @@
-#include "luminaria/single_pixel_buffer.hpp"
+module;
 
 // Implements wp_single_pixel_buffer_manager_v1 (version 1). The wl_buffer it
 // mints owns nothing but four bytes: there is no pool, no fd and no GPU
@@ -11,8 +11,9 @@
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
-#include "luminaria/core/display.hpp"
 #include "single-pixel-buffer-v1-protocol.h"
+
+module luminaria;
 
 namespace luminaria {
 

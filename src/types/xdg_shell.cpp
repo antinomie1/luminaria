@@ -1,4 +1,4 @@
-#include "luminaria/xdg_shell.hpp"
+module;
 
 #include <algorithm>
 #include <memory>
@@ -8,8 +8,7 @@
 
 #include "xdg-shell-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
+module luminaria;
 
 namespace luminaria {
 

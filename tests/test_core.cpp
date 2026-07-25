@@ -1,8 +1,10 @@
+#include <typeinfo>
+#include <utility>
 // Phase 0 acceptance: a Display + EventLoop can be created, an idle callback
 // runs, and run() returns after terminate(). Exercises RAII create/destroy too.
 #include <cassert>
 
-#include "luminaria/core/display.hpp"
+import luminaria;
 
 int main() {
     auto display = luminaria::Display::create();

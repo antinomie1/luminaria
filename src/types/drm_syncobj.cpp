@@ -1,4 +1,6 @@
-#include "luminaria/drm_syncobj.hpp"
+module;
+
+#include <memory>
 
 #include <cstdint>
 #include <ctime>
@@ -12,8 +14,7 @@
 
 #include "linux-drm-syncobj-v1-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
+module luminaria;
 
 namespace luminaria {
 

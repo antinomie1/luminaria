@@ -1,4 +1,4 @@
-#include "luminaria/presentation_time.hpp"
+module;
 
 // Implements wp_presentation (version 2). Feedback objects queue up per
 // surface; the compositor drains a surface's queue when the frame carrying it
@@ -13,9 +13,9 @@
 
 #include <wayland-server-core.h>
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
 #include "presentation-time-protocol.h"
+
+module luminaria;
 
 namespace luminaria {
 

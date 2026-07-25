@@ -1,4 +1,6 @@
-#include "luminaria/render/vulkan.hpp"
+module;
+
+#include <cstdint>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +20,8 @@
 
 #include "quad_frag_spv.h"
 #include "quad_vert_spv.h"
+
+module luminaria;
 
 namespace luminaria {
 

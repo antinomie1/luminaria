@@ -14,9 +14,9 @@
 #include <wayland-client-protocol.h>
 #include <wayland-server-core.h>
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/output_global.hpp"
 #include "xdg-output-unstable-v1-client-protocol.h"
+
+import luminaria;
 
 namespace {
 

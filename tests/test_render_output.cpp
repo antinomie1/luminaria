@@ -6,10 +6,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "luminaria/backend/headless.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/render/vulkan.hpp"
-#include "luminaria/scene.hpp"
+import luminaria;
 
 using namespace luminaria;
 

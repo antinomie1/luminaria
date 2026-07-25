@@ -1,3 +1,4 @@
+#include <typeinfo>
 // libseat needs a real logind session or a running seatd, which CI and a
 // desktop terminal usually aren't. So this skips (77) rather than failing when
 // there is no seat to join — what it actually guards is that create() reports
@@ -5,8 +6,7 @@
 #include <cassert>
 #include <cstdio>
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/session.hpp"
+import luminaria;
 
 int main() {
     auto display = luminaria::Display::create();

@@ -1,5 +1,6 @@
 // wp_cursor_shape_v1: a client names the cursor it wants and the compositor
 // gets the request with the matching theme name.
+#include <cstdint>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -14,9 +15,8 @@
 #include <wayland-server-core.h>
 
 #include "cursor-shape-v1-client-protocol.h"
-#include "luminaria/core/display.hpp"
-#include "luminaria/cursor_shape.hpp"
-#include "luminaria/seat.hpp"
+
+import luminaria;
 
 namespace {
 

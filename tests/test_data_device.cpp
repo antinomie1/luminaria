@@ -19,10 +19,7 @@
 
 #include "primary-selection-unstable-v1-client-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/data_device.hpp"
-#include "luminaria/seat.hpp"
+import luminaria;
 
 namespace {
 

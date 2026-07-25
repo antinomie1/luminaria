@@ -8,6 +8,7 @@
 // Also covers the xdg-shell half of the same report: a configure that carries
 // MAXIMIZED must never name a 0x0 size ("Configure event with maximized or
 // fullscreen state contains invalid width: 0" in Qt's log).
+#include <cstdint>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -24,9 +25,7 @@
 
 #include "xdg-shell-client-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/xdg_shell.hpp"
+import luminaria;
 
 namespace {
 

@@ -21,10 +21,8 @@
 #include <wayland-server-core.h>
 
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/linux_dmabuf.hpp"
-#include "luminaria/render/vulkan.hpp"
+
+import luminaria;
 
 namespace {
 

@@ -1,4 +1,6 @@
-#include "luminaria/output_global.hpp"
+module;
+
+#include <memory>
 
 #include <string>
 #include <vector>
@@ -8,8 +10,7 @@
 
 #include "xdg-output-unstable-v1-protocol.h"
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/util/transform.hpp"
+module luminaria;
 
 namespace luminaria {
 

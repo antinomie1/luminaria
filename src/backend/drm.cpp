@@ -1,4 +1,6 @@
-#include "luminaria/backend/drm.hpp"
+module;
+
+#include <memory>
 
 #include <algorithm>
 #include <cstdint>
@@ -16,14 +18,13 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#include "luminaria/session.hpp"
+module luminaria;
 
 // Atomic modesetting only. The legacy drmModeSetCrtc/drmModePageFlip pair cannot
 // express a per-frame state change across several planes and outputs at once,
 // which is exactly what a cursor plane, direct scanout of a client buffer, or
 // two monitors flipping on the same vblank need. Everything below builds one
 // atomic request per frame; the first one carries the modeset.
-
 namespace luminaria {
 
 namespace {

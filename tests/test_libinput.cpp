@@ -4,8 +4,7 @@
 #include <cassert>
 #include <cstdio>
 
-#include "luminaria/backend/libinput.hpp"
-#include "luminaria/core/display.hpp"
+import luminaria;
 
 int main() {
     auto display = luminaria::Display::create();

@@ -1,6 +1,10 @@
-#include "luminaria/core/display.hpp"
+module;
+
+#include <string>
 
 #include <wayland-server-core.h>
+
+module luminaria;
 
 namespace luminaria {
 

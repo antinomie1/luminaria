@@ -1,7 +1,7 @@
 // Compile-time + runtime checks for the value-semantic Box.
 #include <cassert>
 
-#include "luminaria/util/box.hpp"
+import luminaria;
 
 using luminaria::Box;
 

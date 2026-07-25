@@ -1,11 +1,11 @@
+#include <typeinfo>
 // DRM backend: modeset a real monitor and page-flip frames. Skips (exit 77)
 // unless run from a VT that can become DRM master (so it no-ops under a desktop
 // session and actually runs on a bare tty).
 #include <cassert>
 #include <cstdio>
 
-#include "luminaria/backend/drm.hpp"
-#include "luminaria/core/display.hpp"
+import luminaria;
 
 int main() {
     auto display = luminaria::Display::create();

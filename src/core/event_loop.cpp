@@ -1,8 +1,12 @@
-#include "luminaria/core/event_loop.hpp"
+module;
+
+#include <functional>
 
 #include <utility>
 
 #include <wayland-server-core.h>
+
+module luminaria;
 
 namespace luminaria {
 

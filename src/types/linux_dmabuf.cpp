@@ -1,4 +1,8 @@
-#include "luminaria/linux_dmabuf.hpp"
+module;
+
+#include <memory>
+
+#include <vector>
 
 // Implements zwp_linux_dmabuf_v1 (version 3): clients hand us dmabuf-backed
 // wl_buffers. LINEAR buffers are mmap'd on the CPU (fast path); any other
@@ -22,8 +26,8 @@
 #include <wayland-server-protocol.h>
 
 #include "linux-dmabuf-unstable-v1-protocol.h"
-#include "luminaria/core/display.hpp"
-#include "luminaria/render/vulkan.hpp"
+
+module luminaria;
 
 namespace luminaria {
 

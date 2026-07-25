@@ -14,10 +14,9 @@
 #include <wayland-client-protocol.h>
 #include <wayland-server-core.h>
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/single_pixel_buffer.hpp"
 #include "single-pixel-buffer-v1-client-protocol.h"
+
+import luminaria;
 
 namespace {
 

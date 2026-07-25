@@ -17,9 +17,7 @@
 #include <wayland-client-protocol.h>
 #include <wayland-server-core.h>
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/subcompositor.hpp"
+import luminaria;
 
 namespace {
 

@@ -1,5 +1,6 @@
 // ext-workspace-v1: a pager lists the compositor's workspaces, sees which one
 // is active, and asks to switch. The switch is the compositor's to make.
+#include <cstdint>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -15,8 +16,8 @@
 #include <wayland-server-core.h>
 
 #include "ext-workspace-v1-client-protocol.h"
-#include "luminaria/core/display.hpp"
-#include "luminaria/workspace.hpp"
+
+import luminaria;
 
 namespace {
 

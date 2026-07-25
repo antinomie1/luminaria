@@ -1,4 +1,8 @@
-#include "luminaria/session.hpp"
+module;
+
+#include <memory>
+
+module luminaria;
 
 // libseat.h has no extern "C" guard of its own, so C++ would mangle every
 // symbol in it. This is the same treatment the other C headers get implicitly.

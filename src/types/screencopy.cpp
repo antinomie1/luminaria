@@ -3,7 +3,12 @@
 // Implements both the legacy wlr-screencopy and the newer ext-image-copy-capture
 // protocols. Only wl_shm buffers are supported (no dmabuf for now).
 // RAII: each session/frame owns its wl_resource; destruction cleanly unregisters.
-#include "luminaria/screencopy.hpp"
+
+module;
+
+#include <memory>
+
+#include <vector>
 
 #include <algorithm>
 #include <cstddef>
@@ -21,9 +26,7 @@
 #include "ext-image-copy-capture-v1-protocol.h"
 #include "ext-image-capture-source-v1-protocol.h"
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/linux_dmabuf.hpp"
-#include "luminaria/render/vulkan.hpp"
+module luminaria;
 
 namespace luminaria {
 

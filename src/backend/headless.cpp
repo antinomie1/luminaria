@@ -1,6 +1,12 @@
-#include "luminaria/backend/headless.hpp"
+module;
+
+#include <memory>
+
+#include <span>
 
 #include <utility>
+
+module luminaria;
 
 namespace luminaria {
 

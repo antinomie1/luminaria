@@ -1,4 +1,6 @@
-#include "luminaria/viewporter.hpp"
+module;
+
+#include <memory>
 
 #include <cstdint>
 
@@ -6,8 +8,7 @@
 
 #include "viewporter-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
+module luminaria;
 
 namespace luminaria {
 

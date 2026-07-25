@@ -25,22 +25,7 @@
 
 #include <drm_fourcc.h>
 
-#include "luminaria/backend/drm.hpp"
-#include "luminaria/backend/libinput.hpp"
-#include "luminaria/compositor.hpp"
-#include "luminaria/cursor_shape.hpp"
-#include "luminaria/cursor_theme.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/linux_dmabuf.hpp"
-#include "luminaria/output_global.hpp"
-#include "luminaria/output_layout.hpp"
-#include "luminaria/presentation_time.hpp"
-#include "luminaria/render/vulkan.hpp"
-#include "luminaria/seat.hpp"
-#include "luminaria/session.hpp"
-#include "luminaria/single_pixel_buffer.hpp"
-#include "luminaria/tearing_control.hpp"
-#include "luminaria/xdg_shell.hpp"
+import luminaria;
 
 namespace {
 constexpr uint32_t KEY_ESC = 1;

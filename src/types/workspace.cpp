@@ -1,4 +1,6 @@
-#include "luminaria/workspace.hpp"
+module;
+
+#include <cstdint>
 
 // Implements ext_workspace_manager_v1 (version 1).
 //
@@ -16,8 +18,8 @@
 #include <wayland-server-core.h>
 
 #include "ext-workspace-v1-protocol.h"
-#include "luminaria/core/display.hpp"
-#include "luminaria/output_global.hpp"
+
+module luminaria;
 
 namespace luminaria {
 

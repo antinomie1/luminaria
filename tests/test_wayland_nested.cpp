@@ -1,11 +1,11 @@
+#include <typeinfo>
 // Nested backend against a real parent compositor: connect, open a window, and
 // present frames. Skips (exit 77) when no parent compositor is available.
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 
-#include "luminaria/backend/wayland.hpp"
-#include "luminaria/core/display.hpp"
+import luminaria;
 
 int main() {
     if (std::getenv("WAYLAND_DISPLAY") == nullptr) {

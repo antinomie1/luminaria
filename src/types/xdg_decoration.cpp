@@ -1,4 +1,8 @@
-#include "luminaria/xdg_decoration.hpp"
+module;
+
+#include <memory>
+
+#include <optional>
 
 #include <cstdint>
 
@@ -6,8 +10,7 @@
 
 #include "xdg-decoration-unstable-v1-protocol.h"
 
-#include "luminaria/core/display.hpp"
-#include "luminaria/xdg_shell.hpp"
+module luminaria;
 
 namespace luminaria {
 

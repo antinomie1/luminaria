@@ -1,10 +1,11 @@
-#include "luminaria/subcompositor.hpp"
+module;
+
+#include <memory>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
+module luminaria;
 
 namespace luminaria {
 

@@ -2,10 +2,7 @@
 // coordinate space, and what a window straddling two of them covers.
 #include <cassert>
 
-#include "luminaria/backend/headless.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/output_layout.hpp"
-#include "luminaria/util/transform.hpp"
+import luminaria;
 
 int main() {
     auto display = luminaria::Display::create();

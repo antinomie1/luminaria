@@ -1,4 +1,6 @@
-#include "luminaria/backend/libinput.hpp"
+module;
+
+#include <memory>
 
 #include <cerrno>
 
@@ -11,7 +13,7 @@
 #include <libinput.h>
 #include <libudev.h>
 
-#include "luminaria/session.hpp"
+module luminaria;
 
 namespace luminaria {
 

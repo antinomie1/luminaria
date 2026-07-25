@@ -1,8 +1,9 @@
+#include <vector>
 // Phase 2 scene graph: tree structure, positioning, raise, and hit-testing.
 // Pure logic — no client, no GPU. Also covers damage culling on flatten.
 #include <cassert>
 
-#include "luminaria/scene.hpp"
+import luminaria;
 
 using namespace luminaria;
 

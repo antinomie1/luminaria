@@ -20,11 +20,9 @@
 #include <wayland-client-protocol.h>
 #include <wayland-server-core.h>
 
-#include "luminaria/backend/headless.hpp"
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/presentation_time.hpp"
 #include "presentation-time-client-protocol.h"
+
+import luminaria;
 
 namespace {
 

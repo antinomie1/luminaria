@@ -1,4 +1,8 @@
-#include "luminaria/seat.hpp"
+module;
+
+#include <memory>
+
+#include <string>
 
 #include <algorithm>
 #include <cstring>
@@ -12,8 +16,7 @@
 #include <wayland-server-protocol.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
+module luminaria;
 
 namespace luminaria {
 

@@ -19,12 +19,7 @@
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/fractional_scale.hpp"
-#include "luminaria/viewporter.hpp"
-#include "luminaria/xdg_decoration.hpp"
-#include "luminaria/xdg_shell.hpp"
+import luminaria;
 
 namespace {
 

@@ -1,4 +1,6 @@
-#include "luminaria/backend/wayland.hpp"
+module;
+
+#include <span>
 
 #include <algorithm>
 #include <cstdint>
@@ -14,6 +16,8 @@
 
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+
+module luminaria;
 
 namespace luminaria {
 

@@ -1,4 +1,6 @@
-#include "luminaria/data_device.hpp"
+module;
+
+#include <memory>
 
 #include <algorithm>
 #include <ctime>
@@ -12,9 +14,7 @@
 
 #include "primary-selection-unstable-v1-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/seat.hpp"
+module luminaria;
 
 namespace luminaria {
 

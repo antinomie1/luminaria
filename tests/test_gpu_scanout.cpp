@@ -9,7 +9,7 @@
 
 #include <drm_fourcc.h>
 
-#include "luminaria/render/vulkan.hpp"
+import luminaria;
 
 int main() {
     auto renderer = luminaria::VulkanRenderer::create();

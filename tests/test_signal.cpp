@@ -5,7 +5,7 @@
 #include <optional>
 #include <vector>
 
-#include "luminaria/core/signal.hpp"
+import luminaria;
 
 using luminaria::Signal;
 

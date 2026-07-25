@@ -1,4 +1,6 @@
-#include "luminaria/fractional_scale.hpp"
+module;
+
+#include <memory>
 
 #include <algorithm>
 #include <cstdint>
@@ -8,8 +10,7 @@
 
 #include "fractional-scale-v1-protocol.h"
 
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
+module luminaria;
 
 namespace luminaria {
 

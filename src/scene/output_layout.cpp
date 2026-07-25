@@ -1,6 +1,10 @@
-#include "luminaria/output_layout.hpp"
+module;
+
+#include <vector>
 
 #include <algorithm>
+
+module luminaria;
 
 namespace luminaria {
 

@@ -4,6 +4,8 @@
 // Runs on the headless backend (no GPU/display needed to smoke-test the wiring).
 // Env knobs: LUMINARIA_BACKEND=headless forces headless, LUMINARIA_OUTPUT=WxH
 // sets the output size, LUMINARIA_EXIT_MS auto-terminates after N ms (smoke test).
+#include "luminaria/detail/wayland_fwd.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -17,29 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "luminaria/backend/headless.hpp"
-#include "luminaria/backend/wayland.hpp"
-#include "luminaria/compositor.hpp"
-#include "luminaria/core/display.hpp"
-#include "luminaria/cursor_shape.hpp"
-#include "luminaria/cursor_theme.hpp"
-#include "luminaria/data_device.hpp"
-#include "luminaria/drm_syncobj.hpp"
-#include "luminaria/fractional_scale.hpp"
-#include "luminaria/linux_dmabuf.hpp"
-#include "luminaria/output_global.hpp"
-#include "luminaria/output_layout.hpp"
-#include "luminaria/presentation_time.hpp"
-#include "luminaria/render/vulkan.hpp"
-#include "luminaria/screencopy.hpp"
-#include "luminaria/seat.hpp"
-#include "luminaria/single_pixel_buffer.hpp"
-#include "luminaria/subcompositor.hpp"
-#include "luminaria/tearing_control.hpp"
-#include "luminaria/viewporter.hpp"
-#include "luminaria/workspace.hpp"
-#include "luminaria/xdg_decoration.hpp"
-#include "luminaria/xdg_shell.hpp"
+import luminaria;
 
 namespace {
 template <class T>

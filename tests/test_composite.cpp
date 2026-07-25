@@ -5,8 +5,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "luminaria/render/vulkan.hpp"
-#include "luminaria/scene.hpp"
+import luminaria;
 
 using namespace luminaria;
 
