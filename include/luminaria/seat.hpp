@@ -68,6 +68,17 @@ public:
     /// pointer; enable touch once a touch device actually exists.
     void set_capabilities(bool keyboard, bool pointer, bool touch);
 
+    /// Replace the keyboard layout with an xkb keymap in text form, and re-send
+    /// it to every bound wl_keyboard. Returns false if it doesn't compile, in
+    /// which case the old one stays.
+    ///
+    /// This is what keeps a NESTED compositor's keys honest: the parent reports
+    /// modifier masks computed against ITS keymap, and interpreting those
+    /// against a locally-guessed one only works by luck on a US layout. Adopt
+    /// `WaylandBackend::keymap()` and the two agree by construction.
+    [[nodiscard]] bool set_keymap(const std::string& xkb_text);
+    [[nodiscard]] const std::string& keymap() const noexcept;
+
     // --- keyboard ---
     /// Give keyboard focus to `surface` (nullptr clears focus). Sends leave/enter.
     void set_keyboard_focus(Surface* surface);

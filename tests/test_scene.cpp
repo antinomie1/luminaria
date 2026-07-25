@@ -1,5 +1,5 @@
 // Phase 2 scene graph: tree structure, positioning, raise, and hit-testing.
-// Pure logic — no client, no GPU.
+// Pure logic — no client, no GPU. Also covers damage culling on flatten.
 #include <cassert>
 
 #include "luminaria/scene.hpp"
@@ -49,6 +49,18 @@ int main() {
     assert(hit_c.has_value());
     assert(hit_c->node == &c);
     assert(hit_c->sx == 5 && hit_c->sy == 5);
+
+    // --- damage culling: flattening with a region drops what did not change ---
+    const std::vector<RectFill> all = scene_rects(root);
+    assert(all.size() == 3);
+    // An empty region means "no damage information", so nothing is dropped.
+    assert(scene_rects(root, Region{}).size() == all.size());
+    // A region covering only the nested rect leaves exactly that one.
+    const std::vector<RectFill> culled = scene_rects(root, Region{Box{205, 205, 4, 4}});
+    assert(culled.size() == 1);
+    assert((culled.front().box == Box{205, 205, 20, 20}));
+    // A region covering nothing leaves nothing.
+    assert(scene_rects(root, Region{Box{9000, 9000, 10, 10}}).empty());
 
     return 0;
 }

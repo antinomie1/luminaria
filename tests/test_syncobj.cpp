@@ -153,10 +153,17 @@ int main() {
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
     int commits = 0;
+    int acquire_fences = 0;
     std::vector<luminaria::Signal<luminaria::SurfaceCommit>::Connection> conns;
     auto ns = compositor->new_surface().connect([&](luminaria::NewSurface& e) {
-        conns.push_back(
-            e.surface.commit.connect([&](luminaria::SurfaceCommit&) { ++commits; }));
+        conns.push_back(e.surface.commit.connect([&](luminaria::SurfaceCommit& ce) {
+            ++commits;
+            // The acquire point is exported as a sync_file rather than waited
+            // for on the CPU — that fd is what the renderer hands the GPU.
+            if (ce.surface.acquire_fence_fd() >= 0) {
+                ++acquire_fences;
+            }
+        }));
     });
 
     wl_client* client = wl_client_create(display->c_ptr(), fds[0]);
@@ -175,5 +182,8 @@ int main() {
 
     assert(commits == 2);
     assert(g_client.release_signalled);
+    // The first commit named an acquire point, so the surface must have come
+    // out of it holding a fence. (The second names none.)
+    assert(acquire_fences == 1);
     return 0;
 }

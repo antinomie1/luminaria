@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Luminaria: a minimal Wayland compositor **library** in modern C++23, built on top of
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
-built with Meson. Roughly wlroots-shaped but far smaller (13 protocol types vs wlroots' 73).
+built with Meson. Roughly wlroots-shaped but far smaller (17 protocol types vs wlroots' 73).
 `README.md` (Chinese) holds the current feature matrix and the roadmap of missing protocols;
 `TODO-CORNERS-CUT.md` (Chinese) is an audit of every TODO and every deliberate no-op stub.
 
@@ -23,6 +23,12 @@ ninja -C build examples/tinyluminaria     # single target
 
 `werror=true`, `warning_level=3`, `cpp_std=c++23` — warnings break the build. `<expected>` is a
 hard requirement (gcc ≥ 14 / clang ≥ 18); Meson errors out at configure time without it.
+`glslangValidator` and `libseat` are hard dependencies too.
+
+**C++20 modules are not usable here.** Meson 1.11's dyndep scanner hardcodes MSVC `.ifc`
+output names (`mesonbuild/scripts/depscan.py`), so ninja fails with "inputs may not also
+have inputs" for GCC. Raw `g++ -fmodules` works fine — a modules migration means moving to
+CMake ≥ 3.28 (`FILE_SET CXX_MODULES`) first. Don't half-start it.
 
 Running the example compositors:
 
@@ -47,31 +53,79 @@ Layers, bottom-up (`src/` mirrors `include/luminaria/`):
   (non-owning view + RAII timer/fd sources), `Signal<Event>`, `Result<T>`, `CUnique`.
 - **backend** — `Backend` emits `new_output`; `Output` emits `frame` and accepts
   `commit(Color)` / `commit_frame(rgba)`. Implementations: `HeadlessBackend` (software frame
-  pump), `WaylandBackend` (nested window in a parent compositor, also forwards parent input),
-  `DrmBackend` (KMS dumb buffers, legacy pageflip), `LibinputBackend` (bare-metal input signals).
+  pump), `WaylandBackend` (nested window in a parent compositor, forwards parent input AND
+  its keymap), `DrmBackend` (KMS atomic modeset, one Output per connected connector kept live
+  by a udev hotplug monitor, `import_scanout`/`commit_scanout(id, in_fence)` for GPU dmabuf
+  framebuffers, plus an optional hardware cursor plane), `LibinputBackend` (bare-metal input
+  signals). Every `Output` carries a `scale` and a `Transform`; `Output::destroy` fires when a
+  monitor goes away. `Session` (libseat, `backend/session.cpp`) owns the device fds and tells
+  both bare-metal backends when the VT is taken away.
 - **types/** — one file per Wayland global: `compositor` (`wl_compositor`/`wl_surface`,
   including the subsurface tree), `subcompositor`, `xdg_shell` (toplevels + popups +
   positioners), `seat` (keyboard/pointer/touch/cursor/DnD hooks), `output_global`,
   `linux_dmabuf`, `screencopy`, `data_device` (clipboard + DnD + primary selection),
-  `drm_syncobj` (explicit sync).
-- **render/vulkan** — offscreen composite to an RGBA `std::vector<Pixel>`, plus dmabuf
-  import/export via `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`.
+  `drm_syncobj` (explicit sync), `single_pixel_buffer`, `presentation_time`,
+  `tearing_control`, `cursor_shape`, `workspace` (ext-workspace), `xdg_decoration`,
+  `viewporter`, `fractional_scale`.
+- **render/vulkan** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
+  shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
+  a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs
+  are in the output's *logical* coordinates; the `OutputMapping` (scale + transform) turns
+  them into pixels, which is where rotation actually happens (per-corner UVs). Shaders live
+  in `src/render/quad.{vert,frag}` and are compiled to SPIR-V arrays at build time by
+  `glslangValidator --vn` — a hard build dependency. CPU: the older `composite()` returning
+  an RGBA `std::vector<Pixel>`, kept for headless/screencopy; it cannot scale or rotate.
+  Both rest on `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`.
+  `render_to` scissors each *disjoint* damage box separately (a `Region`, not a bounding
+  box), skips anything hidden behind a `GpuTextureFill::opaque` rect, and — given a
+  `RenderSync` — waits on client acquire fences as `VkSemaphore`s and hands back a
+  sync_file instead of stalling. Unfinished submits live in `Impl::in_flight` until their
+  fence clears.
 - **scene** — retained tree (Tree/Rect/Surface), positioning, hit-testing, flattening to
-  `RectFill`s for the renderer.
+  `RectFill`s and `GpuTextureFill`s, and damage (`scene_damage()` →
+  `scene_rects(root, damage)` / `scene_textures(root, renderer, damage)` →
+  `scene_clear_damage()`); `OutputLayout` (`scene/output_layout.cpp`) is the one place
+  that knows where each output sits in the global coordinate space, in *logical* units
+  (`util/transform.hpp` holds the logical↔device mapping and nothing else does).
+  `util/region.hpp` is the disjoint-box set both damage and wl_region are built on.
 - **xwayland** — spawns Xwayland plus a minimal XWM over xcb.
 
 Per-frame flow in a compositor built on this (see `examples/tinyluminaria.cpp`,
 `examples/tty_compositor.cpp`): `Output::frame` fires → walk mapped toplevels, each expanded
 via `Surface::surface_tree()` (the surface plus its subsurfaces, back-to-front), then popups
-anchored to their parents, then the cursor → `Surface::current_buffer_rgba()` converts each
-client buffer to RGBA → `VulkanRenderer::composite()` → `Output::commit_frame()`. Input goes
+anchored to their parents, then the cursor → `Surface::current_buffer_texture()` puts each
+client buffer on the GPU → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()`.
+Backends without dmabuf scanout (headless, nested) take the CPU variant instead:
+`current_buffer_rgba()` → `composite()` → `commit_frame()`. Input goes
 the other way: backend input signal → scene/manual hit test → `Seat` focus + event routing.
 `tinyluminaria` builds one z-ordered layer list per frame and uses it for BOTH rendering and
 hit-testing, so clicks can't disagree with pixels.
 
-`Surface::current_buffer_rgba` is the single bridge from client buffers to pixels: shm first,
-then `dmabuf_buffer_to_rgba()` (LINEAR via mmap, other modifiers via `VulkanRenderer::import_dmabuf`).
-Everything is read back to CPU RGBA today — there is no zero-copy scanout path.
+Two bridges out of client buffers, and new code should prefer the first:
+`Surface::current_buffer_texture()` (dmabuf → `VulkanRenderer::import_texture`, everything else
+uploaded) never reads pixels back; `Surface::current_buffer_rgba()` (shm, then single-pixel, then
+`dmabuf_buffer_to_rgba()`) does, and exists for screencopy and the non-dmabuf backends.
+What is still missing on the GPU path: direct scanout of a *client* buffer, a hardware cursor
+plane, and passing fences instead of blocking on them (`render_to` waits on a fence today).
+
+**Surface coordinates are not buffer pixels.** A client can hand over a denser buffer
+(`set_buffer_scale`), a rotated one (`set_buffer_transform`), or crop and stretch it
+(`wp_viewporter`). Layout, hit-testing and subsurface offsets all use
+`Surface::surface_width()/surface_height()`; only code that touches pixels wants
+`buffer_width()`. Hit-testing goes through `Surface::accepts_input()` so the client's input
+region decides, not the buffer rectangle.
+
+**The renderer must outlive the Display.** `Surface::buffer_texture()` caches a `GpuTexture`
+owned by the `VulkanRenderer`, so the renderer has to be declared *before* the `Display`
+(locals are destroyed in reverse order). Both examples do this with a comment; getting it
+wrong aborts inside `vk::raii` at shutdown.
+
+**Frame callbacks are the compositor's job.** `wl_surface.frame` is NOT answered on commit —
+answering there makes clients render frames the display never shows. They queue until the
+compositor calls `Surface::send_frame_done(time_ms)`, which belongs in the `Output::present`
+handler (alongside `Presentation::notify_presented`). Forget it and every client freezes after
+one frame. Damage works the same way: `Surface::damage()` accumulates until whoever rendered it
+calls `clear_damage()`.
 
 ## Conventions that matter here
 

@@ -1,132 +1,135 @@
 # TODO & Corners Cut — Luminaria 源码审计
 
-更新于 2026-07-25（P0 完工后重新梳理）。列出源码中所有 `TODO` 注释与"偷工减料"处
+更新于 2026-07-25（P1 完工后重新梳理，IME 除外）。列出源码中所有 `TODO` 注释与"偷工减料"处
 （为免真实客户端崩溃而设的空操作桩，以及有已知天花板的简化实现）。
 
-> **本轮变化：** P0 完成后，原先的大块空操作（xdg_toplevel 全部状态请求、xdg_positioner
-> 全部请求、`wl_pointer.set_cursor`、seat 无 destroy listener）都已落地实现，从本文档移除。
-> 剩下的桩集中在 damage / region / transform / scale 这一类"不实现也不影响客户端跑"的项。
+> **本轮变化：** 上一轮剩下的桩基本清空了。`wl_region`（add/subtract）、
+> `set_opaque_region` / `set_input_region`、`set_buffer_scale` / `set_buffer_transform`、
+> `wl_surface.offset`、`xdg_toplevel.set_parent` / `show_window_menu`、
+> `xdg_positioner` 的 `constraint_adjustment` 全部落地。同时补上了
+> **异步 explicit sync**（CPU 50ms 等待彻底移除）、**多矩形 scissor damage + 不透明遮挡剔除**、
+> **libseat 会话 / VT 切换**、**光标主题 + 硬件光标平面**、
+> **viewporter / fractional-scale / xdg-decoration（服务端）**、
+> 以及 **按 wl_buffer 缓存的 GPU 纹理**。
 
 ---
 
 ## 一、TODO 注释清单
 
-### `src/types/compositor.cpp`
+### `.cpp`
 
-| TODO |
-|------|
-| `frame` 回调在 commit 时触发，而非实际展示时。暂时可用；若客户端空转则靠输出帧节奏限速。（对应 README P1 `presentation-time`） |
-| 所有 `wl_surface` 请求均已接线（避免真实客户端命中空槽）；damage / region / transform / scale / offset 当前为空操作。 |
-| 待 input/opaque region 真正起作用时，跟踪区域几何体。 |
-
-### `src/types/xdg_shell.cpp`
-
-| TODO |
-|------|
-| `constraint_adjustment`（flip/slide/resize）已解析并保存，但**未施加** —— 施加它需要父窗口在输出上的绝对位置，shell 层拿不到。见下 §2.4。 |
-| `set_parent`（transient-for）与 `show_window_menu` 保持空操作 —— 库里没有窗口菜单概念，也没有 transient 堆叠。 |
+| 文件 | TODO |
+|------|------|
+| `examples/tty_compositor.cpp` | 窗口以固定偏移层叠（无移动/缩放/堆叠 UI）。 |
 
 ### `include/luminaria/` 头文件
 
 | 文件 | TODO |
 |------|------|
-| `backend.hpp` | `new_input` 在 Phase 3（输入）加入，目前暂不需要。 |
-| `backend/drm.hpp` | dumb buffer + 无 libseat —— 无 VT 切换/恢复处理，无 atomic modesetting。 |
-| `backend/libinput.hpp` | 无 libseat —— 依赖会话 ACL；键码为原始值。 |
-| `backend/wayland.hpp` | wl_shm CPU 路径。 |
-| `render/vulkan.hpp` | 基于拷贝的放置 —— 无缩放、无 alpha 混合；待需要半透明或缩放输出时升级为纹理四边形管线。 |
-| `scene.hpp` | 尚无 damage tracking —— 待逐帧重绘开销大到需要时再加入。 |
-| `util/rect_fill.hpp` | 目前仅纯色填充；纹理表面待渲染管线就绪后加入。 |
+| `backend/drm.hpp` | 无客户端 buffer 直出（全屏免合成）；无模式切换 —— 每输出固定用 connector 的首选模式。 |
+| `backend/wayland.hpp` | 嵌套后端呈现走 wl_shm CPU 路径（父 compositor 那一侧）。 |
 | `xwayland.hpp` | 最小 XWM —— 已处理 map/configure 请求；完整 ICCCM/EWMH 待补。 |
 
-### `examples/tty_compositor.cpp`
-
-| TODO |
-|------|
-| 窗口以固定偏移层叠（无移动/缩放/堆叠 UI）。 |
+**其余头文件的 TODO 已全部清除。**
 
 ---
 
-## 二、Corners Cut — 空操作桩
+## 二、Corners Cut — 仍在的简化
 
-> 以下请求均接受但不执行任何操作。目的：真实客户端（GTK/Qt 等）启动时会调用这些协议请求，
-> 若槽位为 null，`libwayland` 会 abort。桩的存在保证客户端不崩溃。
+### 2.1 `wl_surface`（`src/types/compositor.cpp`）
 
-### 2.1 `wl_surface` 请求 (`src/types/compositor.cpp`)
-
-```cpp
-void surface_noop_damage(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
-void surface_noop_region(wl_client*, wl_resource*, wl_resource*) {}
-void surface_noop_i32(wl_client*, wl_resource*, int32_t) {}
-void surface_noop_offset(wl_client*, wl_resource*, int32_t, int32_t) {}
-```
+**全部请求均已实现，无空操作桩。**
 
 | 请求 | 状态 | 备注 |
 |------|------|------|
-| `damage` | 空操作 | damage tracking 未实现（README P1） |
-| `damage_buffer` | 空操作 | 同上 |
-| `set_opaque_region` | 空操作 | region 未跟踪 |
-| `set_input_region` | 空操作 | 同上 —— 命中测试用 buffer 矩形，不用 input region |
-| `set_buffer_transform` | 空操作 | transform 未实现 |
-| `set_buffer_scale` | 空操作 | scale 未实现（README P1 HiDPI） |
-| `offset` | 空操作 | — |
+| `damage` | 已实现 | 累积进 `Surface::damage()`，按 surface 尺寸裁剪 |
+| `damage_buffer` | 已实现 | 按 buffer scale/transform 反算回 surface 坐标 |
+| `set_opaque_region` | **已实现** | 存进 `Surface::opaque_region()`，渲染器据此剔除被遮挡内容 |
+| `set_input_region` | **已实现** | `Surface::accepts_input()` 用它做命中测试（圆角/阴影可穿透） |
+| `set_buffer_transform` | **已实现** | 取逆后存为 buffer→surface，与输出 transform 复合成一次采样 |
+| `set_buffer_scale` | **已实现** | 影响 `surface_width/height`；HiDPI 客户端的 2x buffer 仍占 1x 窗口 |
+| `offset` | **已实现** | 累积进 `offset_x/y`，参与 `surface_tree()` 定位 |
 
-### 2.2 `wl_region` 请求 (`src/types/compositor.cpp`)
+`wl_compositor` 版本升到 **6**，新增 `preferred_buffer_scale` /
+`preferred_buffer_transform` 事件。
 
-| 请求 | 状态 | 备注 |
-|------|------|------|
-| `add` | 空操作 | 待 input/opaque region 真正需要时实现 |
-| `subtract` | 空操作 | 同上 |
+### 2.2 `wl_region`（`src/types/compositor.cpp`）
 
-### 2.3 `xdg_toplevel` 请求 (`src/types/xdg_shell.cpp`)
+`add` / `subtract` 由 `util/region.hpp` 的不相交矩形集实现（见 `tests/test_region.cpp`）。
 
-13 个请求中 **11 个已实现**，剩 2 个空操作：
+> **天花板：** `Region` 是 O(n) 的矩形向量，不合并相邻矩形。真实负载下矩形数量成为问题时
+> 换 `pixman_region32`。已标 `ponytail:`。
 
-| 请求 | 状态 | 备注 |
-|------|------|------|
-| `set_parent` | 空操作 | 无 transient 窗口层级 |
-| `show_window_menu` | 空操作 | 无服务端窗口菜单 |
+### 2.3 `xdg_toplevel`（`src/types/xdg_shell.cpp`）
 
-其余（`set_title` / `set_app_id` / `set_min_size` / `set_max_size` / `move` / `resize` /
-`set_maximized` / `unset_maximized` / `set_fullscreen` / `unset_fullscreen` / `set_minimized`）
-均已记录状态或发出信号交给 compositor 仲裁。
+**13 个请求全部实现，无空操作桩。** `set_parent` 维护 transient-for 关系并发
+`ToplevelParentChange`（两端销毁时自动解链）；`show_window_menu` 发
+`ToplevelRequestWindowMenu` 交给 compositor（库里不画菜单，这是设计）。
 
 > **注意一处刻意设计：** `set_maximized` / `set_fullscreen` 在**没有任何监听者**时会自动
-> 应答（直接置位并回 configure）。这是为了让不接管窗口状态的最小 compositor 也不会把客户端
-> 挂住；接管者一旦 connect，控制权完全交给它。
+> 应答。这是为了让不接管窗口状态的最小 compositor 也不会把客户端挂住。
 
-### 2.4 `xdg_positioner` 的 `constraint_adjustment` (`src/types/xdg_shell.cpp`)
+### 2.4 `xdg_positioner` 的 `constraint_adjustment`
 
-positioner 的全部请求都已实现并影响 popup 位置（anchor / gravity / offset / size /
-`set_reactive` / `set_parent_size` / `set_parent_configure` 都被记录），**唯独
-`constraint_adjustment` 存而不用**：
+**已实现**（`constrain()`，按协议规定的 flip → slide → resize 顺序，逐轴独立求解）。
+
+需要知道父窗口在布局中的绝对位置，这由 compositor 通过
+`XdgShell::set_popup_constraint_query()` 提供。
+
+| 项 | 状态 |
+|----|------|
+| anchor / gravity / offset / size 求解 | 已实现 |
+| `flip_x` / `flip_y` | 已实现（翻转后仍溢出则撤销） |
+| `slide_x` / `slide_y` | 已实现（先推右/下边，再推左/上边） |
+| `resize_x` / `resize_y` | 已实现（裁到可用区，最小 1px） |
+
+> **天花板：** 不设置 `set_popup_constraint_query()` 的 compositor 拿不到约束
+> —— shell 层无从知道窗口在哪。`tinyluminaria` 已接线，见 `tests/test_popup.cpp`。
+
+### 2.5 `linux-drm-syncobj` —— **CPU 等待已移除**
 
 | 项 | 状态 | 天花板 |
 |----|------|--------|
-| anchor / gravity / offset / size 求解 | 已实现 | — |
-| `flip_x` / `flip_y` / `slide_x` / `slide_y` / `resize_x` / `resize_y` | 解析但不施加 | 需要父窗口在输出上的**绝对**位置 + 输出可用区，shell 层没有这个信息 |
+| acquire point | commit 时 `drmSyncobjTransfer` + `drmSyncobjExportSyncFile` 导出成 sync_file，交给 `Surface::acquire_fence_fd()` | fence 尚未 materialize 时退回一次有界 CPU 等待再重试导出 |
+| 渲染等待 | 该 fd 作为 `VkSemaphore`（`VK_KHR_external_semaphore_fd`，`eTemporary` 导入）进入 queue submit | GPU 不支持该扩展时退回 fence 阻塞 |
+| release point | 渲染的 out-fence 经 `drmSyncobjImportSyncFile` + `drmSyncobjTransfer` 写进 release point | compositor 必须调 `Surface::notify_rendered(fence)`；不调则退回"下次 commit 时 signal" |
 
-后果：屏幕内的菜单位置完全正确；贴近输出边缘的菜单可能溢出屏幕而不是翻转/滑动。
-升级路径：给 `XdgShell` 加一个"父窗口绝对位置查询"回调（compositor 才知道窗口摆在哪），
-或把 popup 定位整体上移到 scene 层。
+### 2.6 渲染提交与扫描输出 —— **停等已移除**
 
-### 2.5 `linux-drm-syncobj` 的 acquire 等待 (`src/types/drm_syncobj.cpp`)
+| 项 | 状态 |
+|----|------|
+| `render_to()` | 可返回 out-fence（`RenderSync::out_fence_fd`）而不等 fence；未完成的提交挂在 `in_flight` 列表上按 fence 回收 |
+| KMS 提交 | 该 out-fence 作为 primary plane 的 `IN_FENCE_FD` 交给 `drmModeAtomicCommit` |
+| 反向 | atomic 的 `OUT_FENCE_PTR` 回来，经 `Output::take_present_fence()` → `ScanoutTarget::set_acquire_fence()` 喂给下一帧渲染 |
+| 纹理导入 | **已按 `wl_buffer` 缓存**：dmabuf 导入是客户端内存的实时视图，跨 commit 保留；shm 上传是快照，每次 commit 重传 |
+| `commit_frame(pixels)` | CPU 读回路径仍在 —— 故意保留：无 dmabuf 的 GPU / headless / 嵌套后端要靠它 |
 
-| 项 | 状态 | 天花板 |
-|----|------|--------|
-| acquire point | commit 时 **CPU 阻塞** `drmSyncobjTimelineWait`，默认 50 ms 超时 | 合成本身就是 CPU 读回，没有可以把 fence 传下去的地方 |
-| release point | buffer 被下次 commit 替换时 signal（等价于原本发 `wl_buffer.release` 的时刻） | 严格说应在"读完像素之后"；当前读像素发生在两次 commit 之间，故成立 |
+> **生命周期约束（新）：** Surface 缓存的 `GpuTexture` 属于 `VulkanRenderer`，
+> 所以**渲染器必须在 Display 之前构造、之后析构**。两个示例都已按此排列并加了注释。
 
-超时只丢一帧，不会卡死事件循环。做到零拷贝 scanout 后，应改成把 fence 直接交给 KMS
-（`DRM_MODE_ATOMIC` 的 `IN_FENCE_FD` / `OUT_FENCE_PTR`）而不是阻塞等待。
+### 2.7 damage —— 多矩形 scissor + 遮挡剔除
 
-### 2.6 缓冲区一律 CPU 读回
+`render_to()` 把 damage 折成不相交 `Region`，逐矩形 `setScissor` 后各画一次；
+render pass 的 renderArea 取整个 region 的包围盒（一个 render pass 只能有一个）。
+纹理按前后顺序累积 `GpuTextureFill::opaque`，被完全遮挡的表面一次都不采样。
 
-`Surface::current_buffer_rgba` 把每个客户端 buffer（shm 或 dmabuf）读成 RGBA 再合成。
-没有零拷贝 scanout 路径。这是全库最大的性能天花板，也是 README「非协议部分」里
-「DRM atomic + GBM scanout」那一条的实际含义。
+| 项 | 天花板 |
+|----|--------|
+| `GpuTextureFill::opaque` | 单个矩形，不是 region —— 声明不透明区的客户端几乎都声明整个表面。已标 `ponytail:` |
+| 描述符池 | 每帧新建。缓存 per-texture set 需要我们还没有的失效机制。已标 `ponytail:` |
 
-### 2.7 截图/录屏 (`src/types/screencopy.cpp`)
+### 2.8 会话与裸机限制
+
+| 项 | 状态 |
+|----|------|
+| libseat 会话 / VT 切换 | **已实现**（`luminaria/session.hpp`）。DRM 后端在失活时 `drmDropMaster` 并暂停提交，恢复时重取 master + 重新 modeset；libinput 走 `libinput_suspend/resume` |
+| 硬件光标平面 | **已实现**。每输出额外认领一个 `DRM_PLANE_TYPE_CURSOR`，独立 atomic 提交，移动指针不触发重绘 |
+| 光标主题 | **已实现**（`luminaria/cursor_theme.hpp`）。自带 XCursor 解析器（含主题继承与动画帧），不依赖 libXcursor / X11 |
+| 客户端 buffer 直出 | 未做 —— 全屏单窗口免合成 |
+| 模式切换 | 未做 —— 固定用 connector 首选模式 |
+| GPU 本身热插拔 | 未做 —— 只跟踪 connector 状态 |
+
+### 2.9 截图/录屏（`src/types/screencopy.cpp`）
 
 一处 `// no-op: unsupported`（不支持的捕获格式组合）。
 
@@ -136,34 +139,34 @@ positioner 的全部请求都已实现并影响 popup 位置（anchor / gravity 
 
 | 类别 | 数量 |
 |------|------|
-| TODO 注释 (`.cpp`) | 5 |
-| TODO 注释 (`.hpp`) | 8 |
-| TODO 注释 (`examples/`) | 1 |
-| 空操作桩函数 | ~12 |
-| **总计标记点** | **~26**（上一轮 ~41） |
+| TODO 注释 (`.cpp` / `examples/`) | 1 |
+| TODO 注释 (`.hpp`) | 3 |
+| 空操作桩函数 | **0** |
+| **总计标记点** | **~4**（上一轮 ~26） |
 
 ### 按影响面分类
 
-| 影响 | 桩/缺失 |
-|------|---------|
-| 不影响客户端运行 | `damage`, `region`, `transform`, `scale`, `offset`, `set_parent`, `show_window_menu` |
-| 客户端可感知但有降级 | popup `constraint_adjustment`（贴边菜单溢出） |
-| 性能天花板 | buffer 一律 CPU 读回；无 damage tracking；syncobj acquire 为 CPU 阻塞 |
-| 裸机限制 | 无 libseat (VT 切换)、DRM legacy 模式、键码原始值 |
+| 影响 | 剩余项 |
+|------|--------|
+| 不影响客户端运行 | 无 |
+| 客户端可感知但有降级 | 未设置 `set_popup_constraint_query()` 时贴边菜单溢出 |
+| 性能天花板 | `Region` 不合并相邻矩形；`opaque` 只取包围盒；描述符池每帧新建 |
+| 裸机限制 | 无模式切换、无客户端 buffer 直出、GPU 设备热插拔不处理、键码原始值 |
+| 未实现的协议 | IME（`text-input-v3` / `input-method-v2`）、layer-shell、session-lock |
 
 ---
 
 ## 四、与 README 路线图对照
 
-README 中以 `✓=已有，✗=缺，△=部分` 标记。**P0 已全部为 ✓**；本文档剩余的桩对应以下项：
+**P0 与 P1（IME 除外）已全部为 ✓。** 本文档剩余的项对应：
 
-| README 项 | 对应桩 |
-|-----------|--------|
-| ✗ damage tracking (P1) | §2.1 `damage` / `damage_buffer` 空操作 |
-| ✗ `presentation-time` (P1) | `compositor.cpp`：`frame` 在 commit 触发而非 vblank |
-| ✗ HiDPI / fractional-scale (P1) | §2.1 `set_buffer_scale` / `set_buffer_transform` 空操作 |
-| ✗ `xdg-decoration` (P1) | §2.3 `show_window_menu` 空操作；无服务端装饰 |
-| △ 零拷贝 scanout（非协议部分） | §2.6 全量 CPU 读回；§2.5 syncobj 只能 CPU 等 |
-| △ DRM atomic（非协议部分） | `drm.hpp` TODO：legacy only |
+| README 项 | 对应 |
+|-----------|------|
+| ✓ damage tracking (P1) | §2.7 多矩形 scissor + 遮挡剔除已落地；粒度天花板见表 |
+| ✓ HiDPI / fractional-scale (P1) | §2.1 buffer scale/transform + viewporter + fractional-scale 全齐 |
+| ✓ `xdg-decoration` (P1) | 服务端 global 已实现；库不画装饰，默认答 client-side |
+| ✓ libseat (P1) | §2.8 |
+| ✓ 光标 (P1) | §2.8 主题加载 + 硬件平面 |
+| ✓ explicit sync（非协议部分） | §2.5 / §2.6 全异步 |
+| ✗ IME (P1) | 唯一未做的 P1 项 |
 | △ XWM（非协议部分） | `xwayland.hpp` TODO：minimal |
-| P0 ✓ popup（有降级） | §2.4 `constraint_adjustment` 存而不用 |

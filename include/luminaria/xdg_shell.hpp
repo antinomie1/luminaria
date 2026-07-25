@@ -14,11 +14,15 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
 #include "luminaria/core/expected.hpp"
 #include "luminaria/core/signal.hpp"
+#include "luminaria/util/box.hpp"
+
+struct wl_resource; // opaque, from libwayland-server
 
 namespace luminaria {
 
@@ -67,6 +71,22 @@ struct ToplevelRequestResize {
 struct ToplevelIdentityChange {
     Toplevel& toplevel;
 };
+/// The client declared this window transient for another (xdg_toplevel.set_parent).
+/// `parent` is null when the relationship was cleared or the parent has gone.
+/// A compositor should keep the child stacked above its parent and, for dialogs,
+/// centre it there.
+struct ToplevelParentChange {
+    Toplevel& toplevel;
+    Toplevel* parent;
+};
+/// Right-click on the client's own decorations: it wants US to show the window
+/// menu (close / maximize / move to workspace) at (x,y) in its surface
+/// coordinates. Ignoring it is legal — there just won't be a menu.
+struct ToplevelRequestWindowMenu {
+    Toplevel& toplevel;
+    std::uint32_t serial;
+    int x, y;
+};
 
 /// A rectangle in surface-local coordinates (xdg window geometry, popup extent).
 struct XdgGeometry {
@@ -90,8 +110,12 @@ public:
     Signal<ToplevelRequestMove> request_move;
     Signal<ToplevelRequestResize> request_resize;
     Signal<ToplevelIdentityChange> identity_change;
+    Signal<ToplevelParentChange> parent_change;
+    Signal<ToplevelRequestWindowMenu> request_window_menu;
 
     [[nodiscard]] virtual Surface& surface() noexcept = 0;
+    /// The window this one is transient for (a dialog's owner), or null.
+    [[nodiscard]] virtual Toplevel* parent() const noexcept = 0;
     [[nodiscard]] virtual bool mapped() const noexcept = 0;
 
     [[nodiscard]] virtual const std::string& title() const noexcept = 0;
@@ -206,11 +230,28 @@ public:
     /// area). Sent to clients as xdg_toplevel.configure_bounds. 0 disables it.
     void set_bounds(int width, int height) noexcept;
 
+    /// Where a popup's parent sits, so xdg_positioner's constraint_adjustment
+    /// (flip / slide / resize) can actually be applied: fill `parent` with the
+    /// parent surface's window-geometry origin in the coordinate space you lay
+    /// windows out in, and `usable` with the area a popup must stay inside
+    /// (normally the output the parent is on). Return false if the surface isn't
+    /// placed anywhere yet.
+    ///
+    /// Without this the shell has no idea where on screen the parent is, so a
+    /// menu near an edge overhangs instead of flipping. Set it and menus behave.
+    using PopupConstraintQuery = std::function<bool(Surface& parent, Box& parent_box, Box& usable)>;
+    void set_popup_constraint_query(PopupConstraintQuery query);
+
     struct Impl; // named by the protocol glue
 
 private:
     std::unique_ptr<Impl> impl_;
     explicit XdgShell(std::unique_ptr<Impl> impl) noexcept;
 };
+
+/// The Toplevel behind an `xdg_toplevel` resource, or null if that resource is
+/// something else. How other globals (xdg-decoration) get from a client object
+/// to ours.
+[[nodiscard]] Toplevel* toplevel_from_resource(wl_resource* resource);
 
 } // namespace luminaria

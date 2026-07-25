@@ -20,6 +20,7 @@ struct XdgShell::Impl {
     Signal<NewPopup> new_popup;
     int bounds_width = 0;
     int bounds_height = 0;
+    XdgShell::PopupConstraintQuery constraint_query;
 
     ~Impl() {
         if (global != nullptr) {
@@ -69,13 +70,34 @@ bool anchor_is_right(uint32_t a) {
 static_assert(static_cast<uint32_t>(XDG_POSITIONER_GRAVITY_TOP_LEFT) ==
               static_cast<uint32_t>(XDG_POSITIONER_ANCHOR_TOP_LEFT));
 
+/// Mirror an anchor/gravity value along one axis. Flipping a popup means
+/// flipping both, so a menu anchored bottom-left growing down becomes anchored
+/// top-left growing up.
+uint32_t flip_axis(uint32_t v, bool horizontal) {
+    switch (v) {
+    case XDG_POSITIONER_ANCHOR_TOP:
+        return horizontal ? v : uint32_t{XDG_POSITIONER_ANCHOR_BOTTOM};
+    case XDG_POSITIONER_ANCHOR_BOTTOM:
+        return horizontal ? v : uint32_t{XDG_POSITIONER_ANCHOR_TOP};
+    case XDG_POSITIONER_ANCHOR_LEFT:
+        return horizontal ? uint32_t{XDG_POSITIONER_ANCHOR_RIGHT} : v;
+    case XDG_POSITIONER_ANCHOR_RIGHT:
+        return horizontal ? uint32_t{XDG_POSITIONER_ANCHOR_LEFT} : v;
+    case XDG_POSITIONER_ANCHOR_TOP_LEFT:
+        return horizontal ? XDG_POSITIONER_ANCHOR_TOP_RIGHT : XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+    case XDG_POSITIONER_ANCHOR_TOP_RIGHT:
+        return horizontal ? XDG_POSITIONER_ANCHOR_TOP_LEFT : XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+    case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT:
+        return horizontal ? XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT : XDG_POSITIONER_ANCHOR_TOP_LEFT;
+    case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+        return horizontal ? XDG_POSITIONER_ANCHOR_BOTTOM_LEFT : XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+    default:
+        return v;
+    }
+}
+
 /// Anchor point on the anchor rect, then the popup laid out from it per gravity,
 /// then the client's offset. All in parent window-geometry coordinates.
-///
-/// TODO: constraint_adjustment (flip/slide/resize) is parsed and stored but not
-/// applied — that needs the parent's absolute position on an output, which the
-/// shell doesn't know. Menus that fit on screen (the common case) are correct;
-/// one near an edge may overhang. See TODO-CORNERS-CUT.md.
 XdgGeometry place(const Positioner& p) {
     int x = p.anchor_x;
     int y = p.anchor_y;
@@ -109,6 +131,82 @@ XdgGeometry place(const Positioner& p) {
     return XdgGeometry{x + p.offset_x, y + p.offset_y, p.width, p.height};
 }
 
+/// Apply constraint_adjustment. `geo` comes out of place() in parent
+/// window-geometry coordinates; `parent_box` says where that origin is in the
+/// layout, and `usable` is the area the popup has to stay inside (the output).
+///
+/// The protocol fixes the order: flip first (a menu that would fall off the
+/// bottom opens upwards), then slide (nudge it back in), then resize (shrink it
+/// as a last resort). Each axis is solved independently.
+XdgGeometry constrain(const Positioner& p, XdgGeometry geo, const Box& parent_box,
+                      const Box& usable) {
+    const uint32_t adjust = p.constraint_adjustment;
+    if (adjust == XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE || usable.empty()) {
+        return geo;
+    }
+    // Work in layout coordinates, then convert back at the end.
+    const int ox = parent_box.x;
+    const int oy = parent_box.y;
+    auto overflows_x = [&](const XdgGeometry& g) {
+        return g.x + ox < usable.x || g.x + ox + g.width > usable.x + usable.width;
+    };
+    auto overflows_y = [&](const XdgGeometry& g) {
+        return g.y + oy < usable.y || g.y + oy + g.height > usable.y + usable.height;
+    };
+
+    if ((adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X) != 0 && overflows_x(geo)) {
+        Positioner flipped = p;
+        flipped.anchor = flip_axis(p.anchor, true);
+        flipped.gravity = flip_axis(p.gravity, true);
+        flipped.offset_x = -p.offset_x;
+        const XdgGeometry candidate = place(flipped);
+        if (!overflows_x(candidate)) {
+            geo.x = candidate.x; // only take the flip if it actually helped
+        }
+    }
+    if ((adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y) != 0 && overflows_y(geo)) {
+        Positioner flipped = p;
+        flipped.anchor = flip_axis(p.anchor, false);
+        flipped.gravity = flip_axis(p.gravity, false);
+        flipped.offset_y = -p.offset_y;
+        const XdgGeometry candidate = place(flipped);
+        if (!overflows_y(candidate)) {
+            geo.y = candidate.y;
+        }
+    }
+    if ((adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X) != 0 && overflows_x(geo)) {
+        // Push the right edge in first, then the left: with a popup wider than
+        // the screen the left edge is the one that has to win.
+        if (geo.x + ox + geo.width > usable.x + usable.width) {
+            geo.x = usable.x + usable.width - geo.width - ox;
+        }
+        if (geo.x + ox < usable.x) {
+            geo.x = usable.x - ox;
+        }
+    }
+    if ((adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y) != 0 && overflows_y(geo)) {
+        if (geo.y + oy + geo.height > usable.y + usable.height) {
+            geo.y = usable.y + usable.height - geo.height - oy;
+        }
+        if (geo.y + oy < usable.y) {
+            geo.y = usable.y - oy;
+        }
+    }
+    if ((adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X) != 0 && overflows_x(geo)) {
+        const int left = std::max(geo.x + ox, usable.x);
+        const int right = std::min(geo.x + ox + geo.width, usable.x + usable.width);
+        geo.x = left - ox;
+        geo.width = std::max(1, right - left);
+    }
+    if ((adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y) != 0 && overflows_y(geo)) {
+        const int top = std::max(geo.y + oy, usable.y);
+        const int bottom = std::min(geo.y + oy + geo.height, usable.y + usable.height);
+        geo.y = top - oy;
+        geo.height = std::max(1, bottom - top);
+    }
+    return geo;
+}
+
 // ------------------------------------------------------------------ toplevel
 
 // Concrete toplevel. Owned by its own xdg_toplevel wl_resource (address stable
@@ -127,7 +225,37 @@ public:
     bool maximized_ = false, fullscreen_ = false, activated_ = false, resizing_ = false;
     int pending_w_ = 0, pending_h_ = 0;
 
+    ToplevelImpl* parent_ = nullptr;              // transient-for
+    std::vector<ToplevelImpl*> transients_;       // the other end of that edge
+
+    ~ToplevelImpl() override {
+        // Unlink both directions so no half of a transient pair dangles.
+        set_parent_impl(nullptr);
+        for (ToplevelImpl* child : transients_) {
+            child->parent_ = nullptr;
+            ToplevelParentChange event{*child, nullptr};
+            child->parent_change.emit(event);
+        }
+        transients_.clear();
+    }
+
+    void set_parent_impl(ToplevelImpl* parent) {
+        if (parent_ == parent) {
+            return;
+        }
+        if (parent_ != nullptr) {
+            std::erase(parent_->transients_, this);
+        }
+        parent_ = parent;
+        if (parent_ != nullptr) {
+            parent_->transients_.push_back(this);
+        }
+        ToplevelParentChange event{*this, parent_};
+        parent_change.emit(event);
+    }
+
     Surface& surface() noexcept override { return *surf; }
+    [[nodiscard]] Toplevel* parent() const noexcept override { return parent_; }
     [[nodiscard]] bool mapped() const noexcept override { return mapped_; }
     [[nodiscard]] const std::string& title() const noexcept override { return title_; }
     [[nodiscard]] const std::string& app_id() const noexcept override { return app_id_; }
@@ -230,8 +358,10 @@ struct XdgSurface {
         if (has_geometry) {
             return geometry;
         }
-        return XdgGeometry{0, 0, surface != nullptr ? surface->buffer_width() : 0,
-                           surface != nullptr ? surface->buffer_height() : 0};
+        // xdg_surface geometry is in surface coordinates, not buffer pixels: a
+        // HiDPI client's 2x buffer still describes a 1x window.
+        return XdgGeometry{0, 0, surface != nullptr ? surface->surface_width() : 0,
+                           surface != nullptr ? surface->surface_height() : 0};
     }
 };
 
@@ -244,6 +374,24 @@ XdgGeometry ToplevelImpl::geometry() const noexcept {
 
 Surface* PopupImpl::parent_surface() const noexcept {
     return parent != nullptr ? parent->surface : nullptr;
+}
+
+/// place() plus the constraint pass, when the compositor told us where things
+/// are. Every popup position goes through here, so create and reposition can't
+/// drift apart.
+XdgGeometry place_popup(PopupImpl& popup) {
+    const XdgGeometry geo = place(popup.positioner);
+    XdgShell::Impl* shell = popup.parent != nullptr ? popup.parent->shell : nullptr;
+    Surface* parent_surface = popup.parent_surface();
+    if (shell == nullptr || !shell->constraint_query || parent_surface == nullptr) {
+        return geo;
+    }
+    Box parent_box{};
+    Box usable{};
+    if (!shell->constraint_query(*parent_surface, parent_box, usable)) {
+        return geo;
+    }
+    return constrain(popup.positioner, geo, parent_box, usable);
 }
 
 uint32_t ToplevelImpl::configure(int width, int height) {
@@ -372,9 +520,25 @@ ToplevelImpl* toplevel_of(wl_resource* resource) {
 void toplevel_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
-// TODO: set_parent (transient-for) and show_window_menu stay no-ops — the
-// library has no window-menu concept and nothing stacks transients yet.
-void tl_set_parent(wl_client*, wl_resource*, wl_resource*) {}
+// Transient-for. The shell tracks the relationship (and keeps it consistent
+// when either window dies); stacking and centring are the compositor's call, so
+// it hears about it through the signal.
+void tl_set_parent(wl_client*, wl_resource* resource, wl_resource* parent_resource) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    auto* parent = parent_resource != nullptr ? toplevel_of(parent_resource) : nullptr;
+    if (parent == tl) {
+        return; // a window cannot be its own parent
+    }
+    tl->set_parent_impl(parent);
+}
+// The client wants the compositor's window menu at (x,y). We have no menu of our
+// own, so this is purely a signal — a compositor that wants one draws it.
+void tl_show_window_menu(wl_client*, wl_resource* resource, wl_resource*, uint32_t serial,
+                         int32_t x, int32_t y) {
+    ToplevelImpl* tl = toplevel_of(resource);
+    ToplevelRequestWindowMenu event{*tl, serial, x, y};
+    tl->request_window_menu.emit(event);
+}
 void tl_set_title(wl_client*, wl_resource* resource, const char* title) {
     ToplevelImpl* tl = toplevel_of(resource);
     tl->title_ = title != nullptr ? title : "";
@@ -387,7 +551,6 @@ void tl_set_app_id(wl_client*, wl_resource* resource, const char* app_id) {
     ToplevelIdentityChange event{*tl};
     tl->identity_change.emit(event);
 }
-void tl_show_window_menu(wl_client*, wl_resource*, wl_resource*, uint32_t, int32_t, int32_t) {}
 void tl_move(wl_client*, wl_resource* resource, wl_resource*, uint32_t serial) {
     ToplevelImpl* tl = toplevel_of(resource);
     ToplevelRequestMove event{*tl, serial};
@@ -558,7 +721,7 @@ void popup_reposition(wl_client*, wl_resource* resource, wl_resource* positioner
                       uint32_t token) {
     PopupImpl* popup = popup_of(resource);
     popup->positioner = *positioner_of(positioner_resource);
-    popup->geo = place(popup->positioner);
+    popup->geo = place_popup(*popup);
     if (wl_resource_get_version(resource) >= XDG_POPUP_REPOSITIONED_SINCE_VERSION) {
         xdg_popup_send_repositioned(resource, token);
     }
@@ -653,7 +816,7 @@ void xdg_surface_get_popup(wl_client* client, wl_resource* resource, uint32_t id
     popup->owner = xs;
     popup->parent = parent_resource != nullptr ? xdg_surface_of(parent_resource) : nullptr;
     popup->positioner = *positioner;
-    popup->geo = place(popup->positioner);
+    popup->geo = place_popup(*popup);
     popup->resource = wl_resource_create(client, &xdg_popup_interface,
                                          wl_resource_get_version(resource), id);
     if (popup->resource == nullptr) {
@@ -787,6 +950,18 @@ Signal<NewPopup>& XdgShell::new_popup() noexcept {
 void XdgShell::set_bounds(int width, int height) noexcept {
     impl_->bounds_width = width;
     impl_->bounds_height = height;
+}
+
+void XdgShell::set_popup_constraint_query(PopupConstraintQuery query) {
+    impl_->constraint_query = std::move(query);
+}
+
+Toplevel* toplevel_from_resource(wl_resource* resource) {
+    if (resource == nullptr ||
+        !wl_resource_instance_of(resource, &xdg_toplevel_interface, &toplevel_impl)) {
+        return nullptr;
+    }
+    return static_cast<Toplevel*>(static_cast<ToplevelImpl*>(wl_resource_get_user_data(resource)));
 }
 
 } // namespace luminaria

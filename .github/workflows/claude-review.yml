@@ -1,0 +1,85 @@
+name: Claude PR Review
+
+# Reviews every pull request. The focus areas below are the ones that actually
+# bite in this codebase — lifetimes across the C boundary and stalls on the
+# frame path — rather than a generic checklist.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Review the pull request
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this change to a Wayland compositor library. Read CLAUDE.md
+            first — its conventions are the house rules and most real bugs here
+            are violations of them. You cannot build or test on this runner, so
+            reason from the source and never claim you ran anything.
+
+            Weigh these above style:
+
+            1. Lifetimes across the C boundary
+               - Every retained `wl_resource*` owned by a CLIENT needs a destroy
+                 listener. Buffers are the sharp edge: toolkits drop their whole
+                 swapchain on resize, and the next `wl_buffer.release` or read
+                 then touches freed memory.
+               - Anything caching a `Surface*` must subscribe to
+                 `Surface::destroy` and clear the pointer there.
+               - A `GpuTexture` or `ScanoutTarget` must not outlive the
+                 `VulkanRenderer` that made it. Check declaration order.
+               - C handles are RAII-wrapped; a bare `wl_list_remove` in
+                 compositor code is a smell.
+
+            2. Protocol correctness
+               - Every request slot in a libwayland interface vtable must be
+                 filled. A null slot aborts the process the first time a real
+                 GTK or Qt client calls it.
+               - Errors go back to the client via `wl_resource_post_error` with
+                 the enum the protocol defines, not by ignoring the request.
+               - Double-buffered state belongs in the pending struct and is
+                 applied on commit. Sticky state must survive the reset.
+
+            3. The frame path
+               - No new CPU stall. Fences travel as sync_file fds: client
+                 acquire point -> VkSemaphore -> render out-fence -> KMS
+                 IN_FENCE_FD. Flag anything that waits on a fence or reads GPU
+                 memory back per frame.
+               - Damage must stay a set of disjoint boxes; overlapping rects
+                 blend a translucent surface twice.
+               - Surface coordinates are not buffer pixels. Layout and
+                 hit-testing use `surface_width()/surface_height()`.
+
+            4. Result discipline
+               - Fallible operations return `Result<T>`/`Status`. Nothing may
+                 throw across a C callback; Vulkan-Hpp exceptions are caught at
+                 the method boundary.
+
+            5. Tests
+               - Non-trivial logic leaves one runnable check behind, registered
+                 in tests/meson.build. Protocol work is driven by a real
+                 in-process libwayland client, not by calling the server API.
+
+            Use inline comments for specific defects. Keep general observations
+            to one top-level comment. Say plainly when the change looks right —
+            do not invent findings to fill space.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

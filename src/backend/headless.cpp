@@ -7,8 +7,7 @@ namespace luminaria {
 HeadlessOutput::HeadlessOutput(EventLoop loop, int width, int height, unsigned interval_ms)
     : Output(width, height), interval_ms_(interval_ms) {
     frame_timer_ = loop.add_timer([this] {
-        FrameEvent event{*this};
-        frame.emit(event);
+        emit_software_frame(interval_ms_ * 1000000u);
         frame_timer_.arm(interval_ms_); // repeat
     });
 }

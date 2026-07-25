@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "luminaria/core/expected.hpp"
+#include "luminaria/util/dmabuf.hpp"
 
 struct wl_resource;
 
@@ -59,13 +60,9 @@ private:
                                          int& width, int& height);
 
 /// Plane + format metadata for a dmabuf wl_buffer minted by this global. Used by
-/// screencopy to write a captured frame into a client's dmabuf target.
-struct DmabufInfo {
-    int fd;
-    int width, height;
-    std::uint32_t format, offset, stride;
-    std::uint64_t modifier;
-};
+/// screencopy to write a captured frame into a client's dmabuf target, and by
+/// the renderer to import it as a GPU texture without a CPU round trip.
+using DmabufInfo = DmabufPlane;
 
 /// Fill `out` if `buffer` is a dmabuf wl_buffer from this global; else false.
 [[nodiscard]] bool dmabuf_buffer_info(wl_resource* buffer, DmabufInfo& out);

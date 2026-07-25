@@ -78,6 +78,10 @@ wl_buffer* make_solid_buffer(wl_shm* shm, int w, int h, Color color) {
 
 class WaylandOutput final : public Output {
 public:
+    /// Kick a frame from outside (the very first one, before the parent's
+    /// callback chain exists).
+    void kick_frame() { emit_software_frame(); }
+
     wl_display* parent;
     wl_shm* shm;
     wl_surface* surface;
@@ -88,7 +92,7 @@ public:
     // True once the decoration has told us who draws the frame. Starts true so
     // a parent without xdg-decoration never makes start() wait.
     bool decoration_configured = true;
-    DecorationMode decoration_mode = DecorationMode::None;
+    HostDecorationMode decoration_mode = HostDecorationMode::None;
 
     WaylandOutput(wl_display* parent, wl_shm* shm, wl_surface* surface, int w, int h)
         : Output(w, h), parent(parent), shm(shm), surface(surface) {}
@@ -157,8 +161,9 @@ private:
     static void on_frame(void* data, wl_callback* cb, uint32_t) {
         auto* self = static_cast<WaylandOutput*>(data);
         wl_callback_destroy(cb);
-        FrameEvent event{*self};
-        self->frame.emit(event);
+        // The parent compositor already paced us to its vblank; report the
+        // arrival time as the presentation time.
+        self->emit_software_frame();
     }
     static constexpr wl_callback_listener frame_listener_{on_frame};
 };
@@ -177,6 +182,7 @@ struct WaylandBackend::Impl {
     wl_keyboard* keyboard = nullptr;
     zxdg_decoration_manager_v1* decoration_manager = nullptr; // null if the parent lacks it
     WaylandBackend* owner = nullptr; // set in start(), after all moves; emits input signals
+    std::string keymap;              // the parent's xkb keymap, verbatim
     PointerAxisEvent axis;           // accumulated until wl_pointer.frame
     bool axis_pending = false;
     EventSource fd_source;
@@ -294,7 +300,26 @@ const wl_pointer_listener kPointerListener{ptr_enter,       ptr_leave,     ptr_m
                                            ptr_button,      ptr_axis,      ptr_frame,
                                            ptr_axis_source, ptr_axis_stop, ptr_axis_discrete};
 
-void kb_keymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); }
+// Keep the parent's keymap rather than throwing it away. The modifier masks the
+// parent reports below are computed against THIS keymap; interpreting them
+// against a locally-guessed one only works by accident on a US layout.
+void kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && size > 0) {
+        void* p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (p != MAP_FAILED) {
+            // The payload is NUL-terminated; don't take the terminator itself.
+            const char* text = static_cast<const char*>(p);
+            impl->keymap.assign(text, strnlen(text, size));
+            munmap(p, size);
+            if (impl->owner != nullptr) {
+                KeymapChange e{impl->keymap};
+                impl->owner->keymap_changed.emit(e);
+            }
+        }
+    }
+    close(fd);
+}
 void kb_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
 void kb_leave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
 void kb_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state) {
@@ -374,8 +399,8 @@ const xdg_toplevel_listener kToplevelListener{toplevel_configure, toplevel_close
 void decoration_configure(void* data, zxdg_toplevel_decoration_v1*, uint32_t mode) {
     auto* out = static_cast<WaylandOutput*>(data);
     out->decoration_mode = mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
-                               ? DecorationMode::ServerSide
-                               : DecorationMode::ClientSide;
+                               ? HostDecorationMode::ServerSide
+                               : HostDecorationMode::ClientSide;
     out->decoration_configured = true;
 }
 const zxdg_toplevel_decoration_v1_listener kDecorationListener{decoration_configure};
@@ -467,18 +492,17 @@ Status WaylandBackend::start() {
     // the window); subsequent frames come from parent frame callbacks.
     for (auto& out : impl_->outputs) {
         WaylandOutput* raw = out.get();
-        impl_->loop.once([raw] {
-            FrameEvent event{*raw};
-            raw->frame.emit(event);
-        });
+        impl_->loop.once([raw] { raw->kick_frame(); });
     }
     wl_display_flush(impl_->parent);
     return ok();
 }
 
-DecorationMode WaylandBackend::decoration_mode() const noexcept {
+const std::string& WaylandBackend::keymap() const noexcept { return impl_->keymap; }
+
+HostDecorationMode WaylandBackend::decoration_mode() const noexcept {
     if (impl_->outputs.empty()) {
-        return DecorationMode::None;
+        return HostDecorationMode::None;
     }
     return impl_->outputs.front()->decoration_mode;
 }

@@ -251,6 +251,36 @@ Result<Seat> Seat::create(Display& display, std::string name) {
     return Seat{std::move(impl)};
 }
 
+bool Seat::set_keymap(const std::string& xkb_text) {
+    if (xkb_text.empty() || xkb_text == impl_->keymap) {
+        return !xkb_text.empty();
+    }
+    // Compile it before believing it: a keymap we can't parse would leave every
+    // client with a keyboard that types nothing.
+    xkb_context* ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (ctx == nullptr) {
+        return false;
+    }
+    xkb_keymap* keymap = xkb_keymap_new_from_string(ctx, xkb_text.c_str(),
+                                                    XKB_KEYMAP_FORMAT_TEXT_V1,
+                                                    XKB_KEYMAP_COMPILE_NO_FLAGS);
+    const bool valid = keymap != nullptr;
+    if (keymap != nullptr) {
+        xkb_keymap_unref(keymap);
+    }
+    xkb_context_unref(ctx);
+    if (!valid) {
+        return false;
+    }
+    impl_->keymap = xkb_text;
+    for (wl_resource* kb : impl_->keyboards) {
+        send_keymap(impl_.get(), kb);
+    }
+    return true;
+}
+
+const std::string& Seat::keymap() const noexcept { return impl_->keymap; }
+
 void Seat::set_capabilities(bool keyboard, bool pointer, bool touch) {
     uint32_t caps = 0;
     if (keyboard) {

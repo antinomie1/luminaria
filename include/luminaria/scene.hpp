@@ -4,17 +4,19 @@
 // hit-testing, and damage. Node kinds: Tree (container), Rect (solid color),
 // Surface (a client wl_surface). Children are ordered back-to-front (last = top).
 //
-// This slice provides the tree + positioning + hit-testing (what input routing
-// needs). Rendering the tree via the Vulkan renderer plugs in when we composite.
-// TODO: no damage tracking yet — add when per-frame repaint cost demands it.
+// The tree does positioning, hit-testing, flattening for the renderer, and
+// damage: `scene_damage()` gathers what the clients said changed, and the
+// flatten functions take that region and skip everything outside it.
 #pragma once
 
 #include <memory>
 #include <optional>
 #include <vector>
 
+#include "luminaria/render/vulkan.hpp"
 #include "luminaria/util/color.hpp"
 #include "luminaria/util/rect_fill.hpp"
+#include "luminaria/util/region.hpp"
 
 namespace luminaria {
 
@@ -122,9 +124,31 @@ struct SceneHit {
 [[nodiscard]] std::optional<SceneHit> scene_node_at(const SceneTree& tree, int lx, int ly);
 
 /// Flatten the tree's Rect nodes to back-to-front RectFills in absolute
-/// coordinates, ready for the renderer. (Surface nodes are skipped until the
-/// renderer can sample client buffers.)
+/// coordinates, ready for the renderer. Surface nodes go through
+/// `scene_textures()` instead.
 [[nodiscard]] std::vector<RectFill> scene_rects(const SceneTree& root);
+
+/// The same, but only the rects that intersect `damage`. An empty region means
+/// nothing is dropped — pass `scene_damage()` and a frame where one client
+/// blinked a cursor costs one small quad instead of the whole tree.
+[[nodiscard]] std::vector<RectFill> scene_rects(const SceneTree& root, const Region& damage);
+
+/// Flatten the tree's Surface nodes to GpuTextureFills in absolute coordinates,
+/// back-to-front, importing each client buffer through the surface's texture
+/// cache. Surfaces with no usable buffer, and (when `damage` is non-empty) those
+/// outside it, are skipped. `renderer` must outlive the surfaces.
+[[nodiscard]] std::vector<GpuTextureFill> scene_textures(const SceneTree& root,
+                                                          VulkanRenderer& renderer,
+                                                          const Region& damage = {});
+
+/// Everything the clients in this tree reported as changed, in absolute
+/// coordinates and with no overlaps. Feed it to the flatten functions above and
+/// to `VulkanRenderer::render_to`, then call `scene_clear_damage()`.
+[[nodiscard]] Region scene_damage(const SceneTree& root);
+
+/// Damage consumed: start accumulating again. Call it once the frame carrying
+/// it has been submitted.
+void scene_clear_damage(const SceneTree& root);
 
 /// Root of a scene.
 class Scene {

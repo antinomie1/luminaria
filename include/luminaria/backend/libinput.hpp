@@ -1,9 +1,10 @@
 // luminaria/backend/libinput.hpp — bare-metal input via libinput. Emits keyboard and
 // pointer events the compositor routes into a Seat.
 //
-// Requires permission to open /dev/input/event* (a logged-in VT session gets it
-// via logind ACLs). TODO: no libseat — relies on session ACLs; codes are raw
-// evdev (same as wl_keyboard/wl_pointer expect), so they pass straight to Seat.
+// Devices are opened through a luminaria::Session (libseat) when one is given,
+// and directly otherwise — in which case it relies on the logind ACLs a
+// logged-in VT gets. Codes are raw evdev (what wl_keyboard/wl_pointer expect),
+// so they pass straight to Seat.
 //
 // SAFETY: create() only builds the context; start() opens the devices (and thus
 // grabs input). Never call start() under another compositor or you steal input.
@@ -19,10 +20,18 @@
 
 namespace luminaria {
 
+class Session;
+
 class LibinputBackend {
 public:
     /// Build the libinput/udev context. Does NOT open any input device yet.
-    [[nodiscard]] static Result<LibinputBackend> create(EventLoop loop);
+    ///
+    /// Pass a `Session` (luminaria/session.hpp) and devices are opened through
+    /// libseat, so a VT switch revokes them cleanly and input is suspended
+    /// while another session has the console. Without one it falls back to
+    /// opening /dev/input/event* directly, which needs the logind ACLs of a
+    /// logged-in VT and cannot survive a switch.
+    [[nodiscard]] static Result<LibinputBackend> create(EventLoop loop, Session* session = nullptr);
 
     ~LibinputBackend();
     LibinputBackend(LibinputBackend&&) noexcept;

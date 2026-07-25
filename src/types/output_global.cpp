@@ -9,6 +9,7 @@
 #include "xdg-output-unstable-v1-protocol.h"
 
 #include "luminaria/core/display.hpp"
+#include "luminaria/util/transform.hpp"
 
 namespace luminaria {
 
@@ -18,9 +19,22 @@ struct OutputGlobal::Impl {
     wl_global* xdg_output_global = nullptr;
     int width = 0;
     int height = 0;
+    int logical_x = 0;
+    int logical_y = 0;
+    int scale = 1;
+    Transform transform = Transform::normal;
     std::string name;
     std::vector<BindFunc> bind_callbacks;
-    std::vector<wl_resource*> resources; // all bound wl_output resources (weak refs)
+    std::vector<wl_resource*> resources;     // all bound wl_output resources (weak refs)
+    std::vector<wl_resource*> xdg_resources; // …and their zxdg_output_v1 companions
+
+    // Layout size: the mode divided by the scale, axes swapped when rotated.
+    [[nodiscard]] int logical_width() const {
+        return (transform_swaps_axes(transform) ? height : width) / scale;
+    }
+    [[nodiscard]] int logical_height() const {
+        return (transform_swaps_axes(transform) ? width : height) / scale;
+    }
 
     ~Impl() {
         if (xdg_output_global != nullptr) {
@@ -39,7 +53,12 @@ void output_release(wl_client*, wl_resource* resource) {
 }
 constexpr struct wl_output_interface output_impl = {.release = output_release};
 
-[[maybe_unused]] void output_resource_destroy(wl_resource*) {} // no-op; resource tracked in Impl::resources
+// A client can unbind a wl_output at any time; drop the weak reference or the
+// next iteration over Impl::resources walks freed memory.
+void output_resource_destroy(wl_resource* resource) {
+    auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource));
+    std::erase(self->resources, resource);
+}
 
 void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     auto* self = static_cast<OutputGlobal::Impl*>(data);
@@ -50,16 +69,17 @@ void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
         return;
     }
     wl_resource_set_implementation(resource, &output_impl, self, output_resource_destroy);
-    // Keep a weak reference; the destroy handler is a no-op but we still store it
-    // so callbacks can iterate all bound resources.
+    // Keep a weak reference so callbacks can iterate all bound resources; the
+    // destroy handler above removes it again.
     self->resources.push_back(resource);
 
     wl_output_send_geometry(resource, 0, 0, self->width, self->height, WL_OUTPUT_SUBPIXEL_UNKNOWN,
-                            "luminaria", "virtual", WL_OUTPUT_TRANSFORM_NORMAL);
+                            "luminaria", "virtual",
+                            static_cast<int32_t>(self->transform));
     wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED, self->width,
                         self->height, 60000);
     if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
-        wl_output_send_scale(resource, 1);
+        wl_output_send_scale(resource, self->scale);
     }
     if (version >= WL_OUTPUT_NAME_SINCE_VERSION) {
         wl_output_send_name(resource, self->name.c_str());
@@ -82,10 +102,15 @@ void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
 // have to place captures on a canvas — grim, slurp, screen recorders — read this
 // one. Without it grim guesses, gets nothing, and writes a 0x0 PNG.
 //
-// Single fixed output at the origin, so logical == physical.
+// Logical position comes from the compositor's OutputLayout; logical size is the
+// mode after scale and rotation.
 
 void xdg_output_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
+}
+void xdg_output_resource_destroy(wl_resource* resource) {
+    auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource));
+    std::erase(self->xdg_resources, resource);
 }
 constexpr struct zxdg_output_v1_interface xdg_output_impl = {
     .destroy = xdg_output_destroy_request,
@@ -105,10 +130,11 @@ void xdg_output_manager_get_xdg_output(wl_client* client, wl_resource* manager_r
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(resource, &xdg_output_impl, self, nullptr);
+    wl_resource_set_implementation(resource, &xdg_output_impl, self, xdg_output_resource_destroy);
+    self->xdg_resources.push_back(resource);
 
-    zxdg_output_v1_send_logical_position(resource, 0, 0);
-    zxdg_output_v1_send_logical_size(resource, self->width, self->height);
+    zxdg_output_v1_send_logical_position(resource, self->logical_x, self->logical_y);
+    zxdg_output_v1_send_logical_size(resource, self->logical_width(), self->logical_height());
     if (version >= ZXDG_OUTPUT_V1_NAME_SINCE_VERSION) {
         zxdg_output_v1_send_name(resource, self->name.c_str());
         zxdg_output_v1_send_description(resource, "luminaria virtual output");
@@ -162,6 +188,60 @@ Result<OutputGlobal> OutputGlobal::create(Display& display, int width, int heigh
     }
     return OutputGlobal{std::move(impl)};
 }
+
+wl_resource* OutputGlobal::resource_for(wl_client* client) const {
+    for (wl_resource* r : impl_->resources) {
+        if (wl_resource_get_client(r) == client) {
+            return r;
+        }
+    }
+    return nullptr;
+}
+
+namespace {
+
+// Re-announce everything the clients already saw and close the atomic update.
+// wl_output.done is the barrier for xdg_output too, since xdg-output v3.
+void broadcast(OutputGlobal::Impl& impl) {
+    for (wl_resource* r : impl.xdg_resources) {
+        zxdg_output_v1_send_logical_position(r, impl.logical_x, impl.logical_y);
+        zxdg_output_v1_send_logical_size(r, impl.logical_width(), impl.logical_height());
+    }
+    for (wl_resource* r : impl.resources) {
+        const auto version = static_cast<uint32_t>(wl_resource_get_version(r));
+        wl_output_send_geometry(r, 0, 0, impl.width, impl.height, WL_OUTPUT_SUBPIXEL_UNKNOWN,
+                                "luminaria", "virtual", static_cast<int32_t>(impl.transform));
+        if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
+            wl_output_send_scale(r, impl.scale);
+        }
+        if (version >= WL_OUTPUT_DONE_SINCE_VERSION) {
+            wl_output_send_done(r);
+        }
+    }
+}
+
+} // namespace
+
+void OutputGlobal::set_logical_position(int x, int y) {
+    impl_->logical_x = x;
+    impl_->logical_y = y;
+    broadcast(*impl_);
+}
+
+void OutputGlobal::set_scale(int scale) {
+    impl_->scale = scale < 1 ? 1 : scale;
+    broadcast(*impl_);
+}
+
+void OutputGlobal::set_transform(Transform transform) {
+    impl_->transform = transform;
+    broadcast(*impl_);
+}
+
+int OutputGlobal::scale() const noexcept { return impl_->scale; }
+Transform OutputGlobal::transform() const noexcept { return impl_->transform; }
+int OutputGlobal::logical_width() const noexcept { return impl_->logical_width(); }
+int OutputGlobal::logical_height() const noexcept { return impl_->logical_height(); }
 
 int OutputGlobal::width() const noexcept { return impl_->width; }
 int OutputGlobal::height() const noexcept { return impl_->height; }

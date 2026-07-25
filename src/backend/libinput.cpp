@@ -5,8 +5,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <map>
+#include <string>
+
 #include <libinput.h>
 #include <libudev.h>
+
+#include "luminaria/session.hpp"
 
 namespace luminaria {
 
@@ -16,6 +21,13 @@ struct LibinputBackend::Impl {
     libinput* li = nullptr;
     EventSource fd_source;
 
+    // With a session, every /dev/input/event* goes through libseat so the
+    // kernel can revoke it on a VT switch. The map is what close_restricted
+    // needs to give the device back by id rather than by fd.
+    Session* session = nullptr;
+    std::map<int, int> session_devices; // fd -> libseat device id
+    Signal<SessionActive>::Connection session_conn;
+
     Signal<KeyEvent> key;
     Signal<PointerMotionEvent> pointer_motion;
     Signal<PointerButtonEvent> pointer_button;
@@ -24,6 +36,12 @@ struct LibinputBackend::Impl {
         fd_source = EventSource{};
         if (li != nullptr) {
             libinput_unref(li);
+        }
+        if (session != nullptr) {
+            for (const auto& [fd, id] : session_devices) {
+                session->close_device(id);
+            }
+            session_devices.clear();
         }
         if (udev_ctx != nullptr) {
             udev_unref(udev_ctx);
@@ -68,11 +86,28 @@ struct LibinputBackend::Impl {
 
 namespace {
 
-int open_restricted(const char* path, int flags, void*) {
+int open_restricted(const char* path, int flags, void* data) {
+    auto* impl = static_cast<LibinputBackend::Impl*>(data);
+    if (impl != nullptr && impl->session != nullptr) {
+        int id = -1;
+        if (auto fd = impl->session->open_device(path, id)) {
+            impl->session_devices[*fd] = id;
+            return *fd;
+        }
+        return -EACCES;
+    }
     int fd = open(path, flags | O_CLOEXEC);
     return fd < 0 ? -errno : fd;
 }
-void close_restricted(int fd, void*) {
+void close_restricted(int fd, void* data) {
+    auto* impl = static_cast<LibinputBackend::Impl*>(data);
+    if (impl != nullptr && impl->session != nullptr) {
+        if (auto it = impl->session_devices.find(fd); it != impl->session_devices.end()) {
+            impl->session->close_device(it->second);
+            impl->session_devices.erase(it);
+            return; // the session owns the fd
+        }
+    }
     close(fd);
 }
 constexpr libinput_interface kInterface{open_restricted, close_restricted};
@@ -84,19 +119,23 @@ LibinputBackend::~LibinputBackend() = default;
 LibinputBackend::LibinputBackend(LibinputBackend&&) noexcept = default;
 LibinputBackend& LibinputBackend::operator=(LibinputBackend&&) noexcept = default;
 
-Result<LibinputBackend> LibinputBackend::create(EventLoop loop) {
+Result<LibinputBackend> LibinputBackend::create(EventLoop loop, Session* session) {
     udev* udev_ctx = udev_new();
     if (udev_ctx == nullptr) {
         return fail("libinput: udev_new failed");
     }
-    libinput* li = libinput_udev_create_context(&kInterface, nullptr, udev_ctx);
-    if (li == nullptr) {
-        udev_unref(udev_ctx);
-        return fail("libinput: create_context failed");
-    }
     auto impl = std::make_unique<Impl>();
     impl->loop = loop;
     impl->udev_ctx = udev_ctx;
+    impl->session = session;
+    // The context's user data is the Impl, so open_restricted can reach the
+    // session. It is created before the context for exactly that reason.
+    libinput* li = libinput_udev_create_context(&kInterface, impl.get(), udev_ctx);
+    if (li == nullptr) {
+        udev_unref(udev_ctx);
+        impl->udev_ctx = nullptr;
+        return fail("libinput: create_context failed");
+    }
     impl->li = li;
     return LibinputBackend{std::move(impl)};
 }
@@ -107,6 +146,18 @@ Status LibinputBackend::start() {
     }
     Impl* raw = impl_.get();
     impl_->fd_source = impl_->loop.add_fd(libinput_get_fd(impl_->li), [raw] { raw->dispatch(); });
+    // libinput has to be told about the VT switch too, or it keeps reporting
+    // keys pressed on someone else's session when we come back.
+    if (impl_->session != nullptr) {
+        impl_->session_conn =
+            impl_->session->activity().connect([raw](SessionActive& event) {
+                if (event.active) {
+                    libinput_resume(raw->li);
+                } else {
+                    libinput_suspend(raw->li);
+                }
+            });
+    }
     return ok();
 }
 

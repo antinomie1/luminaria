@@ -36,6 +36,22 @@ struct Box {
         return Box{x0, y0, x1 - x0, y1 - y0};
     }
 
+    /// The smallest box covering both. An empty operand is ignored, so folding
+    /// a list starting from `Box{}` gives the bounding box of the non-empty ones.
+    [[nodiscard]] constexpr Box union_with(const Box& o) const noexcept {
+        if (empty()) {
+            return o;
+        }
+        if (o.empty()) {
+            return *this;
+        }
+        const int x0 = std::min(x, o.x);
+        const int y0 = std::min(y, o.y);
+        const int x1 = std::max(x + width, o.x + o.width);
+        const int y1 = std::max(y + height, o.y + o.height);
+        return Box{x0, y0, x1 - x0, y1 - y0};
+    }
+
     friend constexpr bool operator==(const Box&, const Box&) = default;
 };
 

@@ -1,14 +1,17 @@
 #include "luminaria/compositor.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
-#include <ctime>
+
+#include <unistd.h> // close
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
 #include "luminaria/core/display.hpp"
 #include "luminaria/linux_dmabuf.hpp"
+#include "luminaria/single_pixel_buffer.hpp"
 
 namespace luminaria {
 
@@ -30,7 +33,14 @@ bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, in
     }
     wl_shm_buffer* shm = wl_shm_buffer_get(current_buffer_);
     if (shm == nullptr) {
-        // Not shm: try a linux-dmabuf buffer (LINEAR, mmap'd CPU-side).
+        // Not shm: a 1x1 single-pixel buffer, else a linux-dmabuf buffer
+        // (LINEAR, mmap'd CPU-side).
+        if (uint8_t px[4]; single_pixel_buffer_color(current_buffer_, px)) {
+            out.assign(px, px + 4);
+            width = 1;
+            height = 1;
+            return true;
+        }
         return dmabuf_buffer_to_rgba(current_buffer_, out, width, height);
     }
     const uint32_t format = wl_shm_buffer_get_format(shm);
@@ -62,13 +72,52 @@ bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, in
     return true;
 }
 
-namespace {
-uint32_t now_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint32_t>(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+GpuTexture* Surface::buffer_texture(VulkanRenderer& renderer) {
+    if (current_buffer_ == nullptr) {
+        texture_.reset();
+        texture_buffer_ = nullptr;
+        return nullptr;
+    }
+    // A cached dmabuf import stays correct as long as the buffer is the same
+    // object: the GPU is reading the client's pages, so new contents need no
+    // new import. An upload is only good until the client draws again, which is
+    // why commit_state() drops it.
+    if (texture_.has_value() && texture_buffer_ == current_buffer_ &&
+        texture_renderer_ == &renderer) {
+        return &*texture_;
+    }
+
+    texture_.reset();
+    texture_buffer_ = current_buffer_;
+    texture_renderer_ = &renderer;
+    texture_live_ = false;
+
+    // A dmabuf goes straight to the GPU — no mapping, no conversion, no copy.
+    if (DmabufInfo info{}; dmabuf_buffer_info(current_buffer_, info)) {
+        if (auto texture = renderer.import_texture(info)) {
+            texture_.emplace(std::move(*texture));
+            texture_live_ = true;
+            return &*texture_;
+        }
+        // The GPU refused this modifier; a LINEAR buffer can still be mapped and
+        // uploaded below, so fall through instead of failing the frame.
+    }
+    // Everything else is CPU-side pixels already; upload them once.
+    std::vector<uint8_t> rgba;
+    int w = 0, h = 0;
+    if (!current_buffer_rgba(rgba, w, h)) {
+        texture_buffer_ = nullptr;
+        return nullptr;
+    }
+    if (auto texture = renderer.upload_texture(w, h, rgba)) {
+        texture_.emplace(std::move(*texture));
+        return &*texture_;
+    }
+    texture_buffer_ = nullptr;
+    return nullptr;
 }
 
+namespace {
 // Buffer extent without decoding pixels: shm knows it directly, dmabuf carries
 // it in the plane metadata. Used for hit-testing and subsurface layout.
 void buffer_size(wl_resource* buffer, int& w, int& h) {
@@ -85,6 +134,11 @@ void buffer_size(wl_resource* buffer, int& w, int& h) {
     if (DmabufInfo info{}; dmabuf_buffer_info(buffer, info)) {
         w = info.width;
         h = info.height;
+        return;
+    }
+    if (uint8_t px[4]; single_pixel_buffer_color(buffer, px)) {
+        w = 1;
+        h = 1;
     }
 }
 } // namespace
@@ -157,6 +211,11 @@ void Surface::forget_buffer(wl_resource* buffer) noexcept {
         buffer_width_ = 0;
         buffer_height_ = 0;
     }
+    if (texture_buffer_ == buffer) {
+        // The imported texture is a view of memory that is going away.
+        texture_.reset();
+        texture_buffer_ = nullptr;
+    }
     std::erase_if(buffer_watches_, [buffer](const std::unique_ptr<BufferWatch>& watch) {
         return watch->buffer == buffer;
     });
@@ -168,11 +227,212 @@ void Surface::set_pending_buffer(wl_resource* buffer) {
     watch_buffer(buffer);
 }
 
+void Surface::add_pending_damage(int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    pending_.damage.push_back(Box{x, y, width, height});
+}
+
+void Surface::add_pending_buffer_damage(int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    pending_.buffer_damage.push_back(Box{x, y, width, height});
+}
+
+void Surface::set_pending_opaque_region(const Region* region) {
+    pending_.opaque = region != nullptr ? *region : Region{};
+}
+
+void Surface::set_pending_input_region(const Region* region) {
+    // A null region is the protocol's "infinite": the whole surface takes input.
+    pending_.has_input = region != nullptr;
+    pending_.input = region != nullptr ? *region : Region{};
+}
+
+void Surface::set_pending_buffer_scale(int scale) {
+    pending_.scale = scale < 1 ? 1 : scale;
+}
+
+void Surface::set_pending_buffer_transform(int transform) {
+    if (transform < 0 || transform > 7) {
+        return;
+    }
+    // The client reports the transform it PRE-APPLIED to match an output; what
+    // we need to undo it is the inverse, and that is what we store throughout.
+    pending_.transform = transform_invert(static_cast<Transform>(transform));
+}
+
+void Surface::add_pending_offset(int dx, int dy) {
+    pending_.offset_x += dx;
+    pending_.offset_y += dy;
+}
+
+void Surface::set_pending_viewport_source(double x, double y, double w, double h) {
+    pending_.viewport.has_source = w > 0 && h > 0;
+    pending_.viewport.src_x = x;
+    pending_.viewport.src_y = y;
+    pending_.viewport.src_w = w;
+    pending_.viewport.src_h = h;
+}
+
+void Surface::set_pending_viewport_destination(int w, int h) {
+    pending_.viewport.dst_w = w;
+    pending_.viewport.dst_h = h;
+}
+
+void Surface::set_acquire_fence(int fd) noexcept {
+    if (acquire_fence_ >= 0) {
+        close(acquire_fence_);
+    }
+    acquire_fence_ = fd;
+}
+
+void Surface::notify_rendered(int fence_fd) {
+    SurfaceRendered event{*this, fence_fd};
+    rendered.emit(event);
+}
+
+void Surface::set_preferred_buffer_scale(int scale) {
+    if (wl_resource_get_version(resource_) >= WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION) {
+        wl_surface_send_preferred_buffer_scale(resource_, scale < 1 ? 1 : scale);
+    }
+}
+
+void Surface::set_preferred_buffer_transform(Transform transform) {
+    if (wl_resource_get_version(resource_) >= WL_SURFACE_PREFERRED_BUFFER_TRANSFORM_SINCE_VERSION) {
+        wl_surface_send_preferred_buffer_transform(resource_,
+                                                   static_cast<uint32_t>(transform));
+    }
+}
+
+namespace {
+/// Buffer pixels -> surface coordinates. `buffer_to_surface` maps the buffer's
+/// orientation onto the surface's; the scale then divides, rounded outward so a
+/// damage rect never shrinks below what actually changed.
+Box buffer_box_to_surface(const Box& b, Transform buffer_to_surface, int scale, int surface_w,
+                          int surface_h) {
+    const Box rotated =
+        transform_box(buffer_to_surface, 1, b, surface_w * scale, surface_h * scale);
+    const int x0 = rotated.x / scale;
+    const int y0 = rotated.y / scale;
+    const int x1 = (rotated.x + rotated.width + scale - 1) / scale;
+    const int y1 = (rotated.y + rotated.height + scale - 1) / scale;
+    return Box{x0, y0, x1 - x0, y1 - y0};
+}
+} // namespace
+
+int Surface::surface_width() const noexcept {
+    if (viewport_.dst_w >= 0) {
+        return viewport_.dst_w;
+    }
+    if (viewport_.has_source) {
+        return static_cast<int>(std::ceil(viewport_.src_w));
+    }
+    const int w = transform_swaps_axes(buffer_transform_) ? buffer_height_ : buffer_width_;
+    return w / buffer_scale_;
+}
+
+int Surface::surface_height() const noexcept {
+    if (viewport_.dst_h >= 0) {
+        return viewport_.dst_h;
+    }
+    if (viewport_.has_source) {
+        return static_cast<int>(std::ceil(viewport_.src_h));
+    }
+    const int h = transform_swaps_axes(buffer_transform_) ? buffer_width_ : buffer_height_;
+    return h / buffer_scale_;
+}
+
+namespace {
+/// transform_box's rules on the unit square, in floats — for normalized texture
+/// coordinates, where the integer version would round a crop to nothing.
+void unit_transform(Transform t, float& x0, float& y0, float& x1, float& y1) noexcept {
+    if (transform_flipped(t)) {
+        const float nx0 = 1.0f - x1, nx1 = 1.0f - x0;
+        x0 = nx0;
+        x1 = nx1;
+    }
+    const float a = x0, b = y0, c = x1, d = y1;
+    switch (transform_rotation(t)) {
+    case 90:
+        x0 = 1.0f - d;
+        y0 = a;
+        x1 = 1.0f - b;
+        y1 = c;
+        break;
+    case 180:
+        x0 = 1.0f - c;
+        y0 = 1.0f - d;
+        x1 = 1.0f - a;
+        y1 = 1.0f - b;
+        break;
+    case 270:
+        x0 = b;
+        y0 = 1.0f - c;
+        x1 = d;
+        y1 = 1.0f - a;
+        break;
+    default:
+        break;
+    }
+}
+} // namespace
+
+void Surface::buffer_source_uv(float& u0, float& v0, float& u1, float& v1) const noexcept {
+    u0 = v0 = 0.0f;
+    u1 = v1 = 1.0f;
+    if (!viewport_.has_source || buffer_width_ <= 0 || buffer_height_ <= 0) {
+        return;
+    }
+    // The crop is given in the buffer's coordinates *after* transform and scale.
+    // Normalizing divides the scale out, so only the rotation is left to undo.
+    const bool swap = transform_swaps_axes(buffer_transform_);
+    const double base_w = static_cast<double>(swap ? buffer_height_ : buffer_width_) / buffer_scale_;
+    const double base_h = static_cast<double>(swap ? buffer_width_ : buffer_height_) / buffer_scale_;
+    if (base_w <= 0 || base_h <= 0) {
+        return;
+    }
+    u0 = static_cast<float>(viewport_.src_x / base_w);
+    v0 = static_cast<float>(viewport_.src_y / base_h);
+    u1 = static_cast<float>((viewport_.src_x + viewport_.src_w) / base_w);
+    v1 = static_cast<float>((viewport_.src_y + viewport_.src_h) / base_h);
+    unit_transform(transform_invert(buffer_transform_), u0, v0, u1, v1);
+}
+
+bool Surface::accepts_input(double sx, double sy) const noexcept {
+    if (sx < 0 || sy < 0 || sx >= surface_width() || sy >= surface_height()) {
+        return false;
+    }
+    // No region set means the protocol's "infinite" region: everything.
+    return !has_input_region_ ||
+           input_.contains(static_cast<int>(sx), static_cast<int>(sy));
+}
+
+void Surface::send_frame_done(std::uint32_t time_ms) {
+    for (wl_resource* cb : queued_frame_callbacks_) {
+        wl_callback_send_done(cb, time_ms);
+        wl_resource_destroy(cb);
+    }
+    queued_frame_callbacks_.clear();
+}
+
 Surface::Surface(wl_resource* resource) noexcept : resource_(resource) {}
 
 Surface::~Surface() {
     SurfaceDestroy event{*this};
     destroy.emit(event);
+    // Callbacks the client is still waiting on will never fire; the protocol
+    // says to destroy them rather than leave the client hanging.
+    for (wl_resource* cb : queued_frame_callbacks_) {
+        wl_resource_destroy(cb);
+    }
+    queued_frame_callbacks_.clear();
+    if (acquire_fence_ >= 0) {
+        close(acquire_fence_);
+        acquire_fence_ = -1;
+    }
     // Orphan our children and unlink from our parent so no dangling edges remain.
     for (Surface* child : below_) {
         child->parent_ = nullptr;
@@ -208,6 +468,35 @@ void Surface::merge_state(State& into, State&& from) {
     into.frame_callbacks.insert(into.frame_callbacks.end(), from.frame_callbacks.begin(),
                                 from.frame_callbacks.end());
     from.frame_callbacks.clear();
+    into.damage.insert(into.damage.end(), from.damage.begin(), from.damage.end());
+    from.damage.clear();
+    into.buffer_damage.insert(into.buffer_damage.end(), from.buffer_damage.begin(),
+                              from.buffer_damage.end());
+    from.buffer_damage.clear();
+    into.tearing = from.tearing;
+    into.scale = from.scale;
+    into.transform = from.transform;
+    into.opaque = std::move(from.opaque);
+    into.input = std::move(from.input);
+    into.has_input = from.has_input;
+    into.viewport = from.viewport;
+    into.offset_x += from.offset_x;
+    into.offset_y += from.offset_y;
+}
+
+// Most double-buffered state is *sticky*: scale, transform, the regions and the
+// viewport keep their value until the client changes them, so the fresh pending
+// state starts from what was just applied rather than from the defaults. Damage,
+// frame callbacks, the buffer and the offset are per-commit and do reset.
+void Surface::reset_pending(const State& applied) {
+    pending_ = State{};
+    pending_.tearing = applied.tearing;
+    pending_.scale = applied.scale;
+    pending_.transform = applied.transform;
+    pending_.opaque = applied.opaque;
+    pending_.input = applied.input;
+    pending_.has_input = applied.has_input;
+    pending_.viewport = applied.viewport;
 }
 
 void Surface::apply_commit() {
@@ -215,16 +504,18 @@ void Surface::apply_commit() {
         // Sync subsurface: state is cached until the parent commits.
         merge_state(cached_, std::move(pending_));
         has_cached_ = true;
-        pending_ = State{};
+        reset_pending(cached_);
         prune_buffer_watches();
         return;
     }
     State state = std::move(pending_);
-    pending_ = State{};
+    reset_pending(state);
     commit_state(std::move(state));
 }
 
 void Surface::commit_state(State state) {
+    const int old_w = surface_width();
+    const int old_h = surface_height();
     if (state.buffer_dirty) {
         // Release the buffer we're replacing so the client can reuse it. We copy
         // buffer contents at render time, so we only need to hold the current one.
@@ -234,18 +525,71 @@ void Surface::commit_state(State state) {
         current_buffer_ = state.buffer;
         buffer_size(current_buffer_, buffer_width_, buffer_height_);
     }
+    if (!texture_live_ || texture_buffer_ != current_buffer_) {
+        texture_.reset();
+        texture_buffer_ = nullptr;
+    }
+    tearing_ = state.tearing;
+    buffer_scale_ = state.scale;
+    buffer_transform_ = state.transform;
+    opaque_ = state.opaque;
+    input_ = state.input;
+    has_input_region_ = state.has_input;
+    viewport_ = state.viewport;
+    offset_x_ += state.offset_x;
+    offset_y_ += state.offset_y;
+
+    const int new_w = surface_width();
+    const int new_h = surface_height();
+    // A resize invalidates everything; so does a new buffer the client didn't
+    // bother to describe. Otherwise take the client's word, clipped to the
+    // surface — a lying damage rect must not make us read outside the buffer.
+    const bool resized = new_w != old_w || new_h != old_h;
+    const bool described = !state.damage.empty() || !state.buffer_damage.empty();
+    if (resized || (state.buffer_dirty && !described)) {
+        damage_.assign(1, Box{0, 0, new_w, new_h});
+    } else {
+        const Box bounds{0, 0, new_w, new_h};
+        for (const Box& b : state.damage) {
+            if (const Box clipped = b.intersection(bounds); !clipped.empty()) {
+                damage_.push_back(clipped);
+            }
+        }
+        // damage_buffer arrives in buffer pixels: undo the transform and scale
+        // so everything downstream sees one coordinate space. A viewport makes
+        // that mapping non-uniform (crop + stretch), and chasing it is not worth
+        // it for a hint — repaint the surface instead.
+        if (!state.buffer_damage.empty()) {
+            const bool swap = transform_swaps_axes(buffer_transform_);
+            const int base_w = (swap ? buffer_height_ : buffer_width_) / buffer_scale_;
+            const int base_h = (swap ? buffer_width_ : buffer_height_) / buffer_scale_;
+            if (viewport_.has_source || viewport_.dst_w >= 0) {
+                damage_.push_back(bounds);
+            } else {
+                for (const Box& b : state.buffer_damage) {
+                    const Box surf = buffer_box_to_surface(b, buffer_transform_, buffer_scale_,
+                                                           base_w, base_h);
+                    if (const Box clipped = surf.intersection(bounds); !clipped.empty()) {
+                        damage_.push_back(clipped);
+                    }
+                }
+            }
+        }
+    }
+    // Regions are surface state, so clip them once here rather than at every use.
+    opaque_.intersect(Box{0, 0, new_w, new_h});
+    input_.intersect(Box{0, 0, new_w, new_h});
+
     prune_buffer_watches();
     SurfaceCommit event{*this};
     commit.emit(event);
 
-    // Ack frame callbacks so the client draws its next frame.
-    // TODO: fired on commit rather than on presentation — fine for now; pace
-    // via the output frame if a client spins.
-    const uint32_t time = now_ms();
-    for (wl_resource* cb : state.frame_callbacks) {
-        wl_callback_send_done(cb, time);
-        wl_resource_destroy(cb);
-    }
+    // Frame callbacks are NOT acked here: a client that draws on commit-ack runs
+    // as fast as the CPU allows and tears through frames the display never
+    // showed. They wait for send_frame_done(), which the compositor calls when
+    // the frame is actually on screen.
+    queued_frame_callbacks_.insert(queued_frame_callbacks_.end(), state.frame_callbacks.begin(),
+                                   state.frame_callbacks.end());
 
     // A parent commit applies the whole synced subtree, including subsurface
     // positions (which are parent state).
@@ -374,6 +718,10 @@ bool Surface::sub_place(Surface& sibling, bool above) {
 }
 
 void Surface::collect_tree(std::vector<SurfaceAt>& out, int ox, int oy) {
+    // Each node carries its own wl_surface.offset, so a client that shifts its
+    // content moves without the compositor having to know why.
+    ox += offset_x_;
+    oy += offset_y_;
     for (Surface* child : below_) {
         child->collect_tree(out, ox + child->sub_x_, oy + child->sub_y_);
     }
@@ -396,8 +744,10 @@ std::optional<SurfaceAt> Surface::surface_at(double sx, double sy) {
         if (s->buffer_width_ <= 0 || s->buffer_height_ <= 0) {
             continue;
         }
-        if (sx >= it->x && sy >= it->y && sx < it->x + s->buffer_width_ &&
-            sy < it->y + s->buffer_height_) {
+        // The input region, not the buffer rectangle: a client with rounded
+        // corners or a drop shadow expects clicks in the transparent parts to
+        // fall through to whatever is behind it.
+        if (s->accepts_input(sx - it->x, sy - it->y)) {
             return *it;
         }
     }
@@ -410,11 +760,29 @@ Surface* surface_of(wl_resource* resource) {
     return static_cast<Surface*>(wl_resource_get_user_data(resource));
 }
 
+// wl_region user data. libwayland already type-checks the argument against the
+// wl_region interface, so the cast needs no guard of its own.
+Region* region_of(wl_resource* resource) {
+    return resource == nullptr ? nullptr
+                               : static_cast<Region*>(wl_resource_get_user_data(resource));
+}
+
 void surface_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
-void surface_attach(wl_client*, wl_resource* resource, wl_resource* buffer, int32_t, int32_t) {
-    surface_of(resource)->set_pending_buffer(buffer);
+void surface_attach(wl_client*, wl_resource* resource, wl_resource* buffer, int32_t x, int32_t y) {
+    Surface* surface = surface_of(resource);
+    surface->set_pending_buffer(buffer);
+    // Before v5 the offset rode along on attach; from v5 it must be zero and
+    // clients use wl_surface.offset instead.
+    if (x != 0 || y != 0) {
+        if (wl_resource_get_version(resource) >= WL_SURFACE_OFFSET_SINCE_VERSION) {
+            wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_OFFSET,
+                                   "wl_surface.attach offset must be zero since version 5");
+            return;
+        }
+        surface->add_pending_offset(x, y);
+    }
 }
 void surface_commit(wl_client*, wl_resource* resource) {
     surface_of(resource)->apply_commit();
@@ -425,26 +793,54 @@ void surface_frame(wl_client* client, wl_resource* resource, uint32_t callback_i
         surface_of(resource)->add_frame_callback(cb);
     }
 }
-// Requests we accept but don't act on yet (damage tracking / regions / transforms).
-void surface_noop_damage(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
-void surface_noop_region(wl_client*, wl_resource*, wl_resource*) {}
-void surface_noop_i32(wl_client*, wl_resource*, int32_t) {}
-void surface_noop_offset(wl_client*, wl_resource*, int32_t, int32_t) {}
+// wl_surface.damage is in surface coordinates; damage_buffer is in buffer
+// pixels and goes back through the buffer scale/transform on commit.
+void surface_damage(wl_client*, wl_resource* resource, int32_t x, int32_t y, int32_t width,
+                    int32_t height) {
+    surface_of(resource)->add_pending_damage(x, y, width, height);
+}
+void surface_damage_buffer(wl_client*, wl_resource* resource, int32_t x, int32_t y, int32_t width,
+                           int32_t height) {
+    surface_of(resource)->add_pending_buffer_damage(x, y, width, height);
+}
+void surface_set_opaque_region(wl_client*, wl_resource* resource, wl_resource* region) {
+    surface_of(resource)->set_pending_opaque_region(region_of(region));
+}
+void surface_set_input_region(wl_client*, wl_resource* resource, wl_resource* region) {
+    surface_of(resource)->set_pending_input_region(region_of(region));
+}
+void surface_set_buffer_transform(wl_client*, wl_resource* resource, int32_t transform) {
+    if (transform < 0 || transform > 7) {
+        wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_TRANSFORM,
+                               "unknown buffer transform %d", transform);
+        return;
+    }
+    surface_of(resource)->set_pending_buffer_transform(transform);
+}
+void surface_set_buffer_scale(wl_client*, wl_resource* resource, int32_t scale) {
+    if (scale < 1) {
+        wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_SCALE,
+                               "buffer scale must be positive, got %d", scale);
+        return;
+    }
+    surface_of(resource)->set_pending_buffer_scale(scale);
+}
+void surface_offset(wl_client*, wl_resource* resource, int32_t x, int32_t y) {
+    surface_of(resource)->add_pending_offset(x, y);
+}
 
-// TODO: all requests wired so real clients don't hit a null slot; damage /
-// regions / transform / scale / offset are accepted no-ops for now.
 constexpr struct wl_surface_interface surface_impl = {
     .destroy = surface_destroy_request,
     .attach = surface_attach,
-    .damage = surface_noop_damage,
+    .damage = surface_damage,
     .frame = surface_frame,
-    .set_opaque_region = surface_noop_region,
-    .set_input_region = surface_noop_region,
+    .set_opaque_region = surface_set_opaque_region,
+    .set_input_region = surface_set_input_region,
     .commit = surface_commit,
-    .set_buffer_transform = surface_noop_i32,
-    .set_buffer_scale = surface_noop_i32,
-    .damage_buffer = surface_noop_damage,
-    .offset = surface_noop_offset,
+    .set_buffer_transform = surface_set_buffer_transform,
+    .set_buffer_scale = surface_set_buffer_scale,
+    .damage_buffer = surface_damage_buffer,
+    .offset = surface_offset,
 };
 
 void surface_resource_destroy(wl_resource* resource) {
@@ -466,19 +862,27 @@ void compositor_create_surface(wl_client* client, wl_resource* compositor_resour
     impl->new_surface.emit(event);
 }
 
-// Minimal wl_region: all requests wired (add/subtract accepted no-ops) so clients
-// that build opaque/input regions don't hit a null slot.
-// TODO: track the region geometry when input/opaque regions actually matter.
+// wl_region: a real set of boxes. Clients build input and opaque regions out of
+// add/subtract, and both now decide things — where clicks land and what the
+// renderer can skip drawing.
 void region_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
-void region_add(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
-void region_subtract(wl_client*, wl_resource*, int32_t, int32_t, int32_t, int32_t) {}
+void region_add(wl_client*, wl_resource* resource, int32_t x, int32_t y, int32_t w, int32_t h) {
+    region_of(resource)->add(Box{x, y, w, h});
+}
+void region_subtract(wl_client*, wl_resource* resource, int32_t x, int32_t y, int32_t w,
+                     int32_t h) {
+    region_of(resource)->subtract(Box{x, y, w, h});
+}
 constexpr struct wl_region_interface region_impl = {
     .destroy = region_destroy_request,
     .add = region_add,
     .subtract = region_subtract,
 };
+void region_resource_destroy(wl_resource* resource) {
+    delete region_of(resource);
+}
 
 void compositor_create_region(wl_client* client, wl_resource* compositor_resource, uint32_t id) {
     wl_resource* resource = wl_resource_create(
@@ -487,7 +891,7 @@ void compositor_create_region(wl_client* client, wl_resource* compositor_resourc
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(resource, &region_impl, nullptr, nullptr);
+    wl_resource_set_implementation(resource, &region_impl, new Region{}, region_resource_destroy);
 }
 
 constexpr struct wl_compositor_interface compositor_impl = {
@@ -515,8 +919,10 @@ Compositor& Compositor::operator=(Compositor&&) noexcept = default;
 Result<Compositor> Compositor::create(Display& display) {
     auto impl = std::make_unique<Impl>();
     impl->display = display.c_ptr();
-    // Version 4: covers attach/damage/commit/scale/transform; enough for now.
-    impl->global = wl_global_create(impl->display, &wl_compositor_interface, 4, impl.get(),
+    // Version 6: wl_surface.offset (v5) plus preferred_buffer_scale /
+    // preferred_buffer_transform (v6), which is how a HiDPI-aware client learns
+    // what density to render at without inferring it from wl_output.
+    impl->global = wl_global_create(impl->display, &wl_compositor_interface, 6, impl.get(),
                                     compositor_bind);
     if (impl->global == nullptr) {
         return fail("wl_global_create(wl_compositor) failed");
@@ -526,6 +932,14 @@ Result<Compositor> Compositor::create(Display& display) {
 
 Signal<NewSurface>& Compositor::new_surface() noexcept {
     return impl_->new_surface;
+}
+
+Surface* surface_from_resource(wl_resource* resource) {
+    if (resource == nullptr ||
+        !wl_resource_instance_of(resource, &wl_surface_interface, &surface_impl)) {
+        return nullptr;
+    }
+    return static_cast<Surface*>(wl_resource_get_user_data(resource));
 }
 
 } // namespace luminaria

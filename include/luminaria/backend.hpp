@@ -28,7 +28,9 @@ public:
     virtual Status start() = 0;
 
     Signal<NewOutput> new_output;
-    // TODO: `new_input` joins here in Phase 3 (input), not needed yet.
+    // Input does not come through here: LibinputBackend and WaylandBackend
+    // expose their own signals, because what they emit differs (relative vs
+    // absolute motion) and the compositor routes them differently.
 };
 
 } // namespace luminaria

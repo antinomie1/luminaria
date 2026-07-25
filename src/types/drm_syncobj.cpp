@@ -68,6 +68,7 @@ struct SyncSurface {
     Mgr* mgr = nullptr;
     Surface* surface = nullptr;
     Signal<SurfaceCommit>::Connection commit_conn;
+    Signal<SurfaceRendered>::Connection rendered_conn;
     Signal<SurfaceDestroy>::Connection destroy_conn;
 
     // Points set since the last commit (pending surface state).
@@ -102,28 +103,70 @@ void signal_release(SyncSurface* sync) {
     sync->has_current_release = false;
 }
 
-void wait_acquire(SyncSurface* sync) {
-    if (!sync->has_pending_acquire || sync->mgr == nullptr || sync->mgr->drm_fd < 0) {
-        return;
+/// Pull a timeline point out as a sync_file fd. This is the whole point of
+/// explicit sync: the fence travels to the renderer (and on to KMS) as a plain
+/// fd, and nobody waits on the CPU for the client's GPU work to finish.
+/// Returns -1 if the driver cannot hand it over.
+int export_point(int drm_fd, uint32_t handle, uint64_t point) {
+    uint32_t tmp = 0;
+    if (drmSyncobjCreate(drm_fd, 0, &tmp) != 0) {
+        return -1;
+    }
+    int sync_fd = -1;
+    if (drmSyncobjTransfer(drm_fd, tmp, 0, handle, point, 0) != 0 ||
+        drmSyncobjExportSyncFile(drm_fd, tmp, &sync_fd) != 0) {
+        sync_fd = -1;
+    }
+    drmSyncobjDestroy(drm_fd, tmp);
+    return sync_fd;
+}
+
+/// Make `point` signal when `sync_file_fd` does, instead of right now.
+bool import_into_point(int drm_fd, uint32_t handle, uint64_t point, int sync_file_fd) {
+    uint32_t tmp = 0;
+    if (drmSyncobjCreate(drm_fd, 0, &tmp) != 0) {
+        return false;
+    }
+    const bool done = drmSyncobjImportSyncFile(drm_fd, tmp, sync_file_fd) == 0 &&
+                      drmSyncobjTransfer(drm_fd, handle, point, tmp, 0, 0) == 0;
+    drmSyncobjDestroy(drm_fd, tmp);
+    return done;
+}
+
+/// A client is supposed to have submitted its work before committing, so the
+/// acquire fence exists and export_point() succeeds. If it hasn't, the fence has
+/// not materialised yet and there is nothing to export — wait, bounded, for it
+/// to appear and try once more. A client that never signals costs one late
+/// frame, not a hung compositor.
+int export_acquire(SyncSurface* sync) {
+    const int drm_fd = sync->mgr->drm_fd;
+    const uint32_t handle = sync->pending_acquire_handle;
+    const uint64_t point = sync->pending_acquire_point;
+    if (int fd = export_point(drm_fd, handle, point); fd >= 0) {
+        return fd;
     }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const int64_t timeout_ns = static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec +
                                static_cast<int64_t>(sync->mgr->acquire_timeout_ms) * 1000000;
-    uint32_t handle = sync->pending_acquire_handle;
-    uint64_t point = sync->pending_acquire_point;
-    // A bounded wait: a client that never signals costs us one late frame, not
-    // a hung compositor. (Zero-copy scanout would pass the fence to KMS instead
-    // of blocking here — see the dmabuf roadmap entry.)
-    drmSyncobjTimelineWait(sync->mgr->drm_fd, &handle, &point, 1, timeout_ns,
+    uint32_t h = handle;
+    uint64_t p = point;
+    drmSyncobjTimelineWait(drm_fd, &h, &p, 1, timeout_ns,
                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
                                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
                            nullptr);
+    return export_point(drm_fd, handle, point);
 }
 
 void on_commit(SyncSurface* sync) {
-    wait_acquire(sync);
-    // The buffer that was current until now is being replaced: release it.
+    if (sync->has_pending_acquire && sync->surface != nullptr && sync->mgr != nullptr &&
+        sync->mgr->drm_fd >= 0) {
+        // The renderer picks this up and waits on it as a VkSemaphore.
+        sync->surface->set_acquire_fence(export_acquire(sync));
+    }
+    // The buffer that was current until now is being replaced: release it. If
+    // the compositor told us when it finished reading (on_rendered below), this
+    // already happened and the point signals on the GPU's own schedule.
     signal_release(sync);
     if (sync->has_pending_release) {
         sync->has_current_release = true;
@@ -132,6 +175,22 @@ void on_commit(SyncSurface* sync) {
     }
     sync->has_pending_acquire = false;
     sync->has_pending_release = false;
+}
+
+/// The compositor submitted the render that samples this surface. Rather than
+/// signalling the release point once the frame is done, hand the client the
+/// render's own fence: it can start drawing into the buffer the moment the GPU
+/// stops reading it, without a round trip through us.
+void on_rendered(SyncSurface* sync, int fence_fd) {
+    if (!sync->has_current_release || sync->mgr == nullptr || sync->mgr->drm_fd < 0) {
+        return;
+    }
+    if (fence_fd >= 0 && import_into_point(sync->mgr->drm_fd, sync->current_release_handle,
+                                           sync->current_release_point, fence_fd)) {
+        sync->has_current_release = false; // the fence carries the signal now
+        return;
+    }
+    signal_release(sync); // no usable fence: the work is done, say so
 }
 
 void sync_surface_destroy_request(wl_client*, wl_resource* resource) {
@@ -202,10 +261,13 @@ void manager_get_surface(wl_client* client, wl_resource* resource, uint32_t id,
     sync->mgr = mgr;
     sync->surface = surface;
     sync->commit_conn = surface->commit.connect([sync](SurfaceCommit&) { on_commit(sync); });
+    sync->rendered_conn =
+        surface->rendered.connect([sync](SurfaceRendered& e) { on_rendered(sync, e.fence_fd); });
     sync->destroy_conn = surface->destroy.connect([sync](SurfaceDestroy&) {
         signal_release(sync);
         sync->surface = nullptr;
         sync->commit_conn.disconnect();
+        sync->rendered_conn.disconnect();
     });
     wl_resource_set_implementation(sync_resource, &sync_surface_impl, sync,
                                    sync_surface_resource_destroy);

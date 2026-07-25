@@ -30,6 +30,12 @@ constexpr int kExpectX = 15;
 constexpr int kExpectY = 35;
 constexpr int kPopupW = 100;
 constexpr int kPopupH = 50;
+// The constrained popup: 40x40, anchored to a rect at y=180 on a 200x200
+// output, so unflipped it would run 20px off the bottom.
+constexpr int kEdgeW = 40;
+constexpr int kEdgeH = 40;
+constexpr int kOutputSize = 200;
+constexpr int kFlippedY = 140; // 180 (anchor top) - 40 (grown upwards)
 // After reposition the offset becomes (0,0), so the popup lands on the anchor.
 constexpr int kRepositionedX = 10;
 constexpr int kRepositionedY = 30;
@@ -180,6 +186,24 @@ void run_client(int fd) {
         xdg_popup_reposition(popup, pos2, kRepositionToken);
         xdg_positioner_destroy(pos2);
         wl_display_roundtrip(display);
+
+        // A second popup anchored near the bottom of the output, asking to be
+        // flipped rather than left hanging off the edge.
+        wl_surface* edge_surface = wl_compositor_create_surface(st.compositor);
+        xdg_surface* edge_xdg = xdg_wm_base_get_xdg_surface(st.wm_base, edge_surface);
+        xdg_surface_add_listener(edge_xdg, &kPopupXdgListener, &st);
+        xdg_positioner* edge_pos = xdg_wm_base_create_positioner(st.wm_base);
+        xdg_positioner_set_size(edge_pos, kEdgeW, kEdgeH);
+        xdg_positioner_set_anchor_rect(edge_pos, 10, 180, 20, 20);
+        xdg_positioner_set_anchor(edge_pos, XDG_POSITIONER_ANCHOR_BOTTOM_LEFT);
+        xdg_positioner_set_gravity(edge_pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+        xdg_positioner_set_constraint_adjustment(
+            edge_pos, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y);
+        xdg_popup* edge_popup = xdg_surface_get_popup(edge_xdg, parent_xdg, edge_pos);
+        xdg_positioner_destroy(edge_pos);
+        wl_surface_commit(edge_surface);
+        wl_display_roundtrip(display);
+        (void)edge_popup;
     }
     wl_display_disconnect(display);
 }
@@ -222,7 +246,28 @@ int main() {
         toplevel_surface = &e.toplevel.surface();
         tl_conns.push_back(e.toplevel.map.connect([](luminaria::ToplevelMap&) {}));
     });
+    // Without this the shell has no idea where the parent window is and cannot
+    // apply constraint_adjustment at all. Here the window sits at the origin of
+    // a 200x200 output.
+    shell->set_popup_constraint_query(
+        [&](luminaria::Surface& parent, luminaria::Box& parent_box, luminaria::Box& usable) {
+            if (&parent != toplevel_surface) {
+                return false;
+            }
+            parent_box = luminaria::Box{0, 0, kOutputSize, kOutputSize};
+            usable = luminaria::Box{0, 0, kOutputSize, kOutputSize};
+            return true;
+        });
+
+    int popups_seen = 0;
+    int flipped_x = -1, flipped_y = -1;
     auto np = shell->new_popup().connect([&](luminaria::NewPopup& e) {
+        if (++popups_seen == 2) {
+            // The second popup is the one that had to be flipped.
+            flipped_x = e.popup.x();
+            flipped_y = e.popup.y();
+            return;
+        }
         saw_popup = true;
         luminaria::Popup* popup = &e.popup;
         popup_x = popup->x();
@@ -258,6 +303,13 @@ int main() {
     assert(popup_x == kExpectX && popup_y == kExpectY);
     assert(popup_w == kPopupW && popup_h == kPopupH);
     assert(repositioned_x == kRepositionedX && repositioned_y == kRepositionedY);
+
+    // FLIP_Y: anchored to the bottom of a rect at y=180 and growing downwards,
+    // the popup would end at y=240 on a 200px output. Flipping anchors it to
+    // the TOP of the same rect and grows upwards instead, which fits.
+    assert(popups_seen == 2);
+    assert(flipped_x == 10);
+    assert(flipped_y == kFlippedY);
 
     // The client saw exactly the same rectangle on the wire.
     assert(g_client.configures >= 2);

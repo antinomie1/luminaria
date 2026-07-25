@@ -5,6 +5,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -15,7 +16,33 @@
 #include <drm_fourcc.h>
 #include <vulkan/vulkan_raii.hpp>
 
+#include "quad_frag_spv.h"
+#include "quad_vert_spv.h"
+
 namespace luminaria {
+
+/// The textured-quad pipeline: one draw per surface, positioned by push
+/// constants. Built once per target format and kept — compiling a pipeline every
+/// frame would cost more than the frame.
+struct QuadPipeline {
+    vk::Format format;
+    vk::raii::DescriptorSetLayout set_layout;
+    vk::raii::PipelineLayout layout;
+    vk::raii::RenderPass load_pass;  // partial repaint: keep what is there
+    vk::raii::RenderPass clear_pass; // full repaint: contents are undefined
+    vk::raii::Pipeline pipeline;
+};
+
+/// One submitted-but-not-waited-for render. Without the fence stall the command
+/// buffer, its descriptors and its semaphores are still in use after render_to
+/// returns, so they live here until the fence says otherwise.
+struct InFlight {
+    vk::raii::Fence fence;
+    vk::raii::CommandBuffers cmds;
+    vk::raii::DescriptorPool pool;
+    vk::raii::Framebuffer framebuffer;
+    std::vector<vk::raii::Semaphore> semaphores;
+};
 
 struct VulkanRenderer::Impl {
     vk::raii::Context context;
@@ -27,6 +54,19 @@ struct VulkanRenderer::Impl {
     vk::raii::CommandPool command_pool;
     bool dmabuf_ok = false;      // external-memory-dmabuf + DRM-modifier available
     bool queue_foreign = false;  // VK_EXT_queue_family_foreign available
+    bool sync_fd_ok = false;     // VK_KHR_external_semaphore_fd: fences in and out
+    std::optional<vk::raii::Sampler> sampler;
+    std::vector<QuadPipeline> pipelines;
+    std::vector<InFlight> in_flight;
+
+    QuadPipeline& quad_pipeline(vk::Format format);
+
+    /// Drop everything the GPU has finished with. Cheap and called once per
+    /// render; the list is bounded by how many frames the display is behind.
+    void reap() {
+        std::erase_if(in_flight,
+                      [](const InFlight& f) { return f.fence.getStatus() == vk::Result::eSuccess; });
+    }
 };
 
 namespace {
@@ -56,7 +96,14 @@ std::uint32_t find_memory_type(const vk::raii::PhysicalDevice& phys, std::uint32
 } // namespace
 
 VulkanRenderer::VulkanRenderer(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-VulkanRenderer::~VulkanRenderer() = default;
+VulkanRenderer::~VulkanRenderer() {
+    // Renders submitted without a CPU wait may still be running. Tearing down
+    // the device out from under them is undefined behaviour, so drain first.
+    if (impl_ && !impl_->in_flight.empty()) {
+        impl_->queue.waitIdle();
+        impl_->in_flight.clear();
+    }
+}
 VulkanRenderer::VulkanRenderer(VulkanRenderer&&) noexcept = default;
 VulkanRenderer& VulkanRenderer::operator=(VulkanRenderer&&) noexcept = default;
 
@@ -108,6 +155,13 @@ Result<VulkanRenderer> VulkanRenderer::create() {
             exts.clear(); // don't half-enable; nothing else needs these
             queue_foreign = false;
         }
+        // Semaphores that cross the device boundary as sync_file fds: a client's
+        // acquire point comes in, the finished render goes out to KMS. Optional —
+        // without it render_to falls back to a CPU fence wait.
+        const bool sync_fd_ok = has(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+        if (sync_fd_ok) {
+            exts.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+        }
 
         vk::DeviceCreateInfo device_info{{}, queue_info};
         device_info.setPEnabledExtensionNames(exts);
@@ -119,7 +173,19 @@ Result<VulkanRenderer> VulkanRenderer::create() {
         auto impl = std::make_unique<Impl>(Impl{std::move(context), std::move(instance),
                                                 std::move(physical), queue_family, std::move(device),
                                                 std::move(queue), std::move(command_pool),
-                                                dmabuf_ok, queue_foreign});
+                                                dmabuf_ok, queue_foreign, sync_fd_ok, std::nullopt,
+                                                {}, {}});
+        // Linear filtering with clamped edges: a scaled or rotated surface must
+        // not smear its opposite edge in along the seam.
+        impl->sampler.emplace(
+            impl->device,
+            vk::SamplerCreateInfo{{},
+                                  vk::Filter::eLinear,
+                                  vk::Filter::eLinear,
+                                  vk::SamplerMipmapMode::eNearest,
+                                  vk::SamplerAddressMode::eClampToEdge,
+                                  vk::SamplerAddressMode::eClampToEdge,
+                                  vk::SamplerAddressMode::eClampToEdge});
         return VulkanRenderer{std::move(impl)};
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan init: "} + e.what());
@@ -492,31 +558,24 @@ DmabufImage make_dmabuf_image(const vk::raii::Device& device, int fd, int w, int
 
 } // namespace
 
-bool VulkanRenderer::dmabuf_supported() const noexcept { return impl_->dmabuf_ok; }
+namespace {
 
-std::vector<std::uint64_t> VulkanRenderer::dmabuf_modifiers(std::uint32_t drm_format) {
-    std::vector<std::uint64_t> out;
-    if (!impl_->dmabuf_ok) {
-        return out;
-    }
-    const vk::Format fmt = drm_to_vk(drm_format);
-    if (fmt == vk::Format::eUndefined) {
-        return out;
-    }
+// Single-plane DRM modifiers for `fmt` whose tiling features cover `want`.
+std::vector<std::uint64_t> modifiers_with(const vk::raii::PhysicalDevice& physical, vk::Format fmt,
+                                          VkFormatFeatureFlags want) {
     // C structs + core-1.1 entrypoint: two-pass (count, then fill).
     VkDrmFormatModifierPropertiesListEXT list{};
     list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
     VkFormatProperties2 props2{};
     props2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
     props2.pNext = &list;
-    const VkPhysicalDevice phys = static_cast<VkPhysicalDevice>(*impl_->physical);
+    const VkPhysicalDevice phys = static_cast<VkPhysicalDevice>(*physical);
     vkGetPhysicalDeviceFormatProperties2(phys, static_cast<VkFormat>(fmt), &props2);
     std::vector<VkDrmFormatModifierPropertiesEXT> mods(list.drmFormatModifierCount);
     list.pDrmFormatModifierProperties = mods.data();
     vkGetPhysicalDeviceFormatProperties2(phys, static_cast<VkFormat>(fmt), &props2);
 
-    constexpr VkFormatFeatureFlags want =
-        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    std::vector<std::uint64_t> out;
     for (const auto& m : mods) {
         if (m.drmFormatModifierPlaneCount == 1 &&
             (m.drmFormatModifierTilingFeatures & want) == want) {
@@ -524,6 +583,25 @@ std::vector<std::uint64_t> VulkanRenderer::dmabuf_modifiers(std::uint32_t drm_fo
         }
     }
     return out;
+}
+
+} // namespace
+
+bool VulkanRenderer::dmabuf_supported() const noexcept { return impl_->dmabuf_ok; }
+
+std::vector<std::uint64_t> VulkanRenderer::dmabuf_modifiers(std::uint32_t drm_format) {
+    if (!impl_->dmabuf_ok) {
+        return {};
+    }
+    const vk::Format fmt = drm_to_vk(drm_format);
+    if (fmt == vk::Format::eUndefined) {
+        return {};
+    }
+    // Transfer both ways for the CPU read-back path, sampled so the same buffer
+    // can be textured straight onto a scanout target on the GPU path.
+    return modifiers_with(impl_->physical, fmt,
+                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
 }
 
 Result<std::vector<std::uint8_t>> VulkanRenderer::import_dmabuf(int fd, int width, int height,
@@ -713,6 +791,851 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height, std::uint32_
         return ok();
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan dmabuf export: "} + e.what());
+    }
+}
+
+// =============================================================================
+// GPU compositing: client dmabuf -> texture -> scanout dmabuf -> KMS.
+//
+// Nothing here reads pixels back to system memory. Client buffers become VkImages
+// the GPU samples in place; the frame is composited into an image that is itself
+// a dmabuf, which the DRM backend turns into a KMS framebuffer and page-flips.
+// =============================================================================
+
+struct GpuTexture::Impl {
+    vk::raii::Image image;
+    vk::raii::DeviceMemory memory;
+    vk::raii::ImageView view;
+    int width;
+    int height;
+    bool external; // imported dmabuf: acquire from the foreign queue on each use
+};
+
+struct ScanoutTarget::Impl {
+    vk::raii::Image image;
+    vk::raii::DeviceMemory memory;
+    vk::raii::ImageView view;
+    vk::Format format;
+    DmabufPlane plane;          // plane.fd is owned here
+    bool has_content = false;   // false until the first full render
+    int acquire_fence = -1;     // sync_file from the flip still scanning us out
+
+    // Staging buffer for read_scanout(), created on first use and kept. It is
+    // mapped once and stays mapped: re-creating and re-mapping it per frame was
+    // most of the cost of reading a frame back.
+    std::optional<vk::raii::Buffer> readback;
+    std::optional<vk::raii::DeviceMemory> readback_memory;
+    std::uint8_t* readback_map = nullptr;
+    bool readback_coherent = true; // false: needs an explicit invalidate
+
+    ~Impl() {
+        if (plane.fd >= 0) {
+            close(plane.fd);
+        }
+        if (acquire_fence >= 0) {
+            close(acquire_fence);
+        }
+    }
+};
+
+GpuTexture::GpuTexture(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+GpuTexture::~GpuTexture() = default;
+GpuTexture::GpuTexture(GpuTexture&&) noexcept = default;
+GpuTexture& GpuTexture::operator=(GpuTexture&&) noexcept = default;
+int GpuTexture::width() const noexcept { return impl_->width; }
+int GpuTexture::height() const noexcept { return impl_->height; }
+
+ScanoutTarget::ScanoutTarget(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+ScanoutTarget::~ScanoutTarget() = default;
+ScanoutTarget::ScanoutTarget(ScanoutTarget&&) noexcept = default;
+ScanoutTarget& ScanoutTarget::operator=(ScanoutTarget&&) noexcept = default;
+const DmabufPlane& ScanoutTarget::plane() const noexcept { return impl_->plane; }
+
+void ScanoutTarget::set_acquire_fence(int fd) noexcept {
+    if (impl_->acquire_fence >= 0) {
+        close(impl_->acquire_fence);
+    }
+    impl_->acquire_fence = fd;
+}
+
+Status VulkanRenderer::read_scanout(ScanoutTarget& target, std::vector<std::uint8_t>& out) {
+    try {
+        auto& device = impl_->device;
+        ScanoutTarget::Impl& t = *target.impl_;
+        const auto uw = static_cast<std::uint32_t>(t.plane.width);
+        const auto uh = static_cast<std::uint32_t>(t.plane.height);
+        const vk::DeviceSize size = static_cast<vk::DeviceSize>(uw) * uh * 4;
+
+        if (!t.readback.has_value()) {
+            t.readback.emplace(device,
+                               vk::BufferCreateInfo{{},
+                                                    size,
+                                                    vk::BufferUsageFlagBits::eTransferDst,
+                                                    vk::SharingMode::eExclusive});
+            const auto req = t.readback->getMemoryRequirements();
+            // HOST_CACHED first: the conversion below reads every byte back, and
+            // scalar reads out of uncached (write-combined) memory run at a few
+            // tens of MB/s — which is where the 90ms went.
+            std::uint32_t type = 0;
+            try {
+                type = find_memory_type(impl_->physical, req.memoryTypeBits,
+                                        vk::MemoryPropertyFlagBits::eHostVisible |
+                                            vk::MemoryPropertyFlagBits::eHostCached);
+                t.readback_coherent = false;
+            } catch (const std::exception&) {
+                type = find_memory_type(impl_->physical, req.memoryTypeBits,
+                                        vk::MemoryPropertyFlagBits::eHostVisible |
+                                            vk::MemoryPropertyFlagBits::eHostCoherent);
+                t.readback_coherent = true;
+            }
+            t.readback_memory.emplace(device, vk::MemoryAllocateInfo{req.size, type});
+            t.readback->bindMemory(**t.readback_memory, 0);
+            t.readback_map =
+                static_cast<std::uint8_t*>(t.readback_memory->mapMemory(0, VK_WHOLE_SIZE));
+        }
+
+        vk::raii::CommandBuffers command_buffers{
+            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
+                                                  vk::CommandBufferLevel::ePrimary, 1}};
+        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        // render_to leaves the image in eGeneral, released to the foreign owner.
+        vk::ImageMemoryBarrier to_src{{},
+                                      vk::AccessFlagBits::eTransferRead,
+                                      vk::ImageLayout::eGeneral,
+                                      vk::ImageLayout::eTransferSrcOptimal,
+                                      VK_QUEUE_FAMILY_IGNORED,
+                                      VK_QUEUE_FAMILY_IGNORED,
+                                      *t.image,
+                                      whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_src);
+        vk::BufferImageCopy region{0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                   {0, 0, 0}, {uw, uh, 1}};
+        cmd.copyImageToBuffer(*t.image, vk::ImageLayout::eTransferSrcOptimal, **t.readback, region);
+        // Put it back where render_to and the display engine expect to find it.
+        vk::ImageMemoryBarrier back{vk::AccessFlagBits::eTransferRead,
+                                    {},
+                                    vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::ImageLayout::eGeneral,
+                                    VK_QUEUE_FAMILY_IGNORED,
+                                    VK_QUEUE_FAMILY_IGNORED,
+                                    *t.image,
+                                    whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, back);
+        cmd.end();
+
+        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::SubmitInfo submit;
+        submit.setCommandBuffers(*cmd);
+        impl_->queue.submit(submit, *fence);
+        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
+            vk::Result::eSuccess) {
+            return fail("fence wait failed");
+        }
+        if (!t.readback_coherent) {
+            device.invalidateMappedMemoryRanges(
+                vk::MappedMemoryRange{**t.readback_memory, 0, VK_WHOLE_SIZE});
+        }
+
+        const bool opaque = t.plane.format == DRM_FORMAT_XRGB8888;
+        out.resize(static_cast<size_t>(size));
+        const std::uint8_t* base = t.readback_map;
+        for (size_t i = 0; i < static_cast<size_t>(uw) * uh; ++i) {
+            out[i * 4 + 0] = base[i * 4 + 2]; // BGRA in, RGBA out
+            out[i * 4 + 1] = base[i * 4 + 1];
+            out[i * 4 + 2] = base[i * 4 + 0];
+            out[i * 4 + 3] = opaque ? 255 : base[i * 4 + 3];
+        }
+        return ok();
+    } catch (const std::exception& e) {
+        return fail(std::string{"vulkan read_scanout: "} + e.what());
+    }
+}
+
+namespace {
+
+/// A view for sampling. Opaque formats (XRGB) carry garbage in the alpha byte,
+/// so swizzle alpha to 1 rather than branching in the shader.
+vk::raii::ImageView make_sampler_view(const vk::raii::Device& device, const vk::raii::Image& image,
+                                      vk::Format format, bool opaque) {
+    const vk::ComponentMapping swizzle{vk::ComponentSwizzle::eIdentity,
+                                       vk::ComponentSwizzle::eIdentity,
+                                       vk::ComponentSwizzle::eIdentity,
+                                       opaque ? vk::ComponentSwizzle::eOne
+                                              : vk::ComponentSwizzle::eIdentity};
+    return vk::raii::ImageView{
+        device, vk::ImageViewCreateInfo{{},
+                                        *image,
+                                        vk::ImageViewType::e2D,
+                                        format,
+                                        swizzle,
+                                        {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}};
+}
+
+/// Which source corner each destination corner samples, for the four device
+/// corners in triangle-strip order (TL, TR, BL, BR). This is where output
+/// rotation actually happens: the quad is already placed in device space, and
+/// the UVs turn the picture inside it.
+std::array<std::array<float, 2>, 4> corner_uvs(Transform t, float u0, float v0, float u1,
+                                               float v1) {
+    if (transform_flipped(t)) {
+        std::swap(u0, u1); // mirrored along the logical x axis, before rotating
+    }
+    switch (transform_rotation(t)) {
+    case 90:
+        return {{{u0, v1}, {u0, v0}, {u1, v1}, {u1, v0}}};
+    case 180:
+        return {{{u1, v1}, {u0, v1}, {u1, v0}, {u0, v0}}};
+    case 270:
+        return {{{u1, v0}, {u1, v1}, {u0, v0}, {u0, v1}}};
+    default:
+        return {{{u0, v0}, {u1, v0}, {u0, v1}, {u1, v1}}};
+    }
+}
+
+struct QuadPush {
+    float rect[4];
+    float uv01[4];
+    float uv23[4];
+};
+
+vk::raii::RenderPass make_pass(const vk::raii::Device& device, vk::Format format, bool load) {
+    vk::AttachmentDescription attachment{
+        {},
+        format,
+        vk::SampleCountFlagBits::e1,
+        load ? vk::AttachmentLoadOp::eLoad : vk::AttachmentLoadOp::eClear,
+        vk::AttachmentStoreOp::eStore,
+        vk::AttachmentLoadOp::eDontCare,
+        vk::AttachmentStoreOp::eDontCare,
+        load ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eUndefined,
+        vk::ImageLayout::eColorAttachmentOptimal};
+    vk::AttachmentReference color_ref{0, vk::ImageLayout::eColorAttachmentOptimal};
+    vk::SubpassDescription subpass{{}, vk::PipelineBindPoint::eGraphics, {}, color_ref};
+    return vk::raii::RenderPass{device, vk::RenderPassCreateInfo{{}, attachment, subpass}};
+}
+
+} // namespace
+
+QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
+    for (QuadPipeline& p : pipelines) {
+        if (p.format == format) {
+            return p;
+        }
+    }
+
+    vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eCombinedImageSampler, 1,
+                                           vk::ShaderStageFlagBits::eFragment};
+    vk::raii::DescriptorSetLayout set_layout{device, vk::DescriptorSetLayoutCreateInfo{{}, binding}};
+    vk::PushConstantRange push{vk::ShaderStageFlagBits::eVertex, 0, sizeof(QuadPush)};
+    vk::DescriptorSetLayout raw_set_layout = *set_layout;
+    vk::raii::PipelineLayout layout{
+        device, vk::PipelineLayoutCreateInfo{{}, raw_set_layout, push}};
+
+    vk::raii::ShaderModule vert{
+        device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadVertSpv), kQuadVertSpv}};
+    vk::raii::ShaderModule frag{
+        device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadFragSpv), kQuadFragSpv}};
+    const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
+        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
+        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag, "main"}};
+
+    vk::PipelineVertexInputStateCreateInfo vertex_input{}; // positions come from push constants
+    vk::PipelineInputAssemblyStateCreateInfo assembly{{}, vk::PrimitiveTopology::eTriangleStrip};
+    vk::PipelineViewportStateCreateInfo viewport{{}, 1, nullptr, 1, nullptr}; // dynamic
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.lineWidth = 1.0f;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    // Wayland buffers are pre-multiplied, so ONE / ONE_MINUS_SRC_ALPHA is the
+    // correct over-operator — translucent surfaces now blend instead of stamping.
+    vk::PipelineColorBlendAttachmentState blend{
+        VK_TRUE,
+        vk::BlendFactor::eOne,
+        vk::BlendFactor::eOneMinusSrcAlpha,
+        vk::BlendOp::eAdd,
+        vk::BlendFactor::eOne,
+        vk::BlendFactor::eOneMinusSrcAlpha,
+        vk::BlendOp::eAdd,
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    vk::PipelineColorBlendStateCreateInfo blending{{}, VK_FALSE, vk::LogicOp::eCopy, blend};
+    const std::array<vk::DynamicState, 2> dynamic_states{vk::DynamicState::eViewport,
+                                                         vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamic{{}, dynamic_states};
+
+    vk::raii::RenderPass load_pass = make_pass(device, format, true);
+    vk::raii::RenderPass clear_pass = make_pass(device, format, false);
+
+    vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr, &viewport,
+                                        &raster, &multisample, nullptr, &blending, &dynamic,
+                                        *layout, *clear_pass, 0};
+    vk::raii::Pipeline pipeline{device, nullptr, info};
+
+    pipelines.push_back(QuadPipeline{format, std::move(set_layout), std::move(layout),
+                                     std::move(load_pass), std::move(clear_pass),
+                                     std::move(pipeline)});
+    return pipelines.back();
+}
+
+Result<GpuTexture> VulkanRenderer::import_texture(const DmabufPlane& p) {
+    if (!impl_->dmabuf_ok) {
+        return fail("dmabuf import unsupported by GPU");
+    }
+    if (p.width <= 0 || p.height <= 0) {
+        return fail("invalid dmabuf dimensions");
+    }
+    const vk::Format fmt = drm_to_vk(p.format);
+    if (fmt == vk::Format::eUndefined) {
+        return fail("unsupported dmabuf format");
+    }
+    try {
+        DmabufImage img = make_dmabuf_image(impl_->device, p.fd, p.width, p.height, fmt, p.offset,
+                                            p.stride, p.modifier, vk::ImageUsageFlagBits::eSampled);
+        // XRGB has no meaningful alpha byte; force it to opaque in the view.
+        vk::raii::ImageView view = make_sampler_view(impl_->device, img.image, fmt,
+                                                     p.format == DRM_FORMAT_XRGB8888);
+        return GpuTexture{std::make_unique<GpuTexture::Impl>(
+            GpuTexture::Impl{std::move(img.image), std::move(img.memory), std::move(view), p.width,
+                             p.height, true})};
+    } catch (const std::exception& e) {
+        return fail(std::string{"vulkan texture import: "} + e.what());
+    }
+}
+
+Result<GpuTexture> VulkanRenderer::upload_texture(int width, int height,
+                                                  std::span<const std::uint8_t> rgba) {
+    if (width <= 0 || height <= 0) {
+        return fail("invalid texture dimensions");
+    }
+    if (rgba.size() < static_cast<size_t>(width) * height * 4) {
+        return fail("texture pixel data too small");
+    }
+    try {
+        auto& device = impl_->device;
+        const auto uw = static_cast<std::uint32_t>(width);
+        const auto uh = static_cast<std::uint32_t>(height);
+
+        vk::raii::Image image{device,
+                              vk::ImageCreateInfo{{},
+                                                  vk::ImageType::e2D,
+                                                  vk::Format::eR8G8B8A8Unorm,
+                                                  vk::Extent3D{uw, uh, 1},
+                                                  1,
+                                                  1,
+                                                  vk::SampleCountFlagBits::e1,
+                                                  vk::ImageTiling::eOptimal,
+                                                  vk::ImageUsageFlagBits::eTransferDst |
+                                                      vk::ImageUsageFlagBits::eSampled,
+                                                  vk::SharingMode::eExclusive,
+                                                  {},
+                                                  vk::ImageLayout::eUndefined}};
+        const auto req = image.getMemoryRequirements();
+        vk::raii::DeviceMemory memory{
+            device, vk::MemoryAllocateInfo{req.size,
+                                           find_memory_type(impl_->physical, req.memoryTypeBits,
+                                                            vk::MemoryPropertyFlagBits::eDeviceLocal)}};
+        image.bindMemory(*memory, 0);
+
+        const vk::DeviceSize size = static_cast<vk::DeviceSize>(uw) * uh * 4;
+        vk::raii::Buffer staging{device, vk::BufferCreateInfo{{}, size,
+                                                              vk::BufferUsageFlagBits::eTransferSrc,
+                                                              vk::SharingMode::eExclusive}};
+        const auto sreq = staging.getMemoryRequirements();
+        vk::raii::DeviceMemory staging_memory{
+            device, vk::MemoryAllocateInfo{
+                        sreq.size,
+                        find_memory_type(impl_->physical, sreq.memoryTypeBits,
+                                         vk::MemoryPropertyFlagBits::eHostVisible |
+                                             vk::MemoryPropertyFlagBits::eHostCoherent)}};
+        staging.bindMemory(*staging_memory, 0);
+        auto* sp = static_cast<std::uint8_t*>(staging_memory.mapMemory(0, VK_WHOLE_SIZE));
+        std::memcpy(sp, rgba.data(), static_cast<size_t>(size));
+        staging_memory.unmapMemory();
+
+        vk::raii::CommandBuffers command_buffers{
+            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
+                                                  vk::CommandBufferLevel::ePrimary, 1}};
+        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        vk::ImageMemoryBarrier to_dst{{},
+                                      vk::AccessFlagBits::eTransferWrite,
+                                      vk::ImageLayout::eUndefined,
+                                      vk::ImageLayout::eTransferDstOptimal,
+                                      VK_QUEUE_FAMILY_IGNORED,
+                                      VK_QUEUE_FAMILY_IGNORED,
+                                      *image,
+                                      whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_dst);
+        vk::BufferImageCopy region{
+            0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {0, 0, 0}, {uw, uh, 1}};
+        cmd.copyBufferToImage(*staging, *image, vk::ImageLayout::eTransferDstOptimal, region);
+        // Park it in ShaderReadOnlyOptimal: that is where render_to() expects it,
+        // so repeated frames re-use the texture with no further transition.
+        vk::ImageMemoryBarrier to_read{vk::AccessFlagBits::eTransferWrite,
+                                       vk::AccessFlagBits::eShaderRead,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       vk::ImageLayout::eShaderReadOnlyOptimal,
+                                       VK_QUEUE_FAMILY_IGNORED,
+                                       VK_QUEUE_FAMILY_IGNORED,
+                                       *image,
+                                       whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_read);
+        cmd.end();
+
+        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::SubmitInfo submit;
+        submit.setCommandBuffers(*cmd);
+        impl_->queue.submit(submit, *fence);
+        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
+            vk::Result::eSuccess) {
+            return fail("fence wait failed");
+        }
+        // current_buffer_rgba() already forces alpha to 255 for opaque formats,
+        // so this view needs no swizzle.
+        vk::raii::ImageView view =
+            make_sampler_view(impl_->device, image, vk::Format::eR8G8B8A8Unorm, false);
+        return GpuTexture{std::make_unique<GpuTexture::Impl>(GpuTexture::Impl{
+            std::move(image), std::move(memory), std::move(view), width, height, false})};
+    } catch (const std::exception& e) {
+        return fail(std::string{"vulkan texture upload: "} + e.what());
+    }
+}
+
+std::vector<std::uint64_t> VulkanRenderer::scanout_modifiers(std::uint32_t drm_format) {
+    if (!impl_->dmabuf_ok) {
+        return {};
+    }
+    const vk::Format fmt = drm_to_vk(drm_format);
+    if (fmt == vk::Format::eUndefined) {
+        return {};
+    }
+    // We render into it (colour attachment, with blending) and hand the pixels
+    // out for screencopy, so both features must be there.
+    return modifiers_with(impl_->physical, fmt,
+                          VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                              VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                              VK_FORMAT_FEATURE_TRANSFER_SRC_BIT);
+}
+
+Result<ScanoutTarget> VulkanRenderer::create_scanout(int width, int height,
+                                                     std::uint32_t drm_format,
+                                                     std::span<const std::uint64_t> modifiers) {
+    if (!impl_->dmabuf_ok) {
+        return fail("dmabuf export unsupported by GPU");
+    }
+    if (width <= 0 || height <= 0) {
+        return fail("invalid scanout dimensions");
+    }
+    const vk::Format fmt = drm_to_vk(drm_format);
+    if (fmt == vk::Format::eUndefined) {
+        return fail("unsupported scanout format");
+    }
+    // Empty request means "whatever works" — LINEAR always does.
+    std::vector<std::uint64_t> candidates(modifiers.begin(), modifiers.end());
+    if (candidates.empty()) {
+        candidates.push_back(DRM_FORMAT_MOD_LINEAR);
+    }
+    try {
+        auto& device = impl_->device;
+        const auto uw = static_cast<std::uint32_t>(width);
+        const auto uh = static_cast<std::uint32_t>(height);
+
+        vk::ImageDrmFormatModifierListCreateInfoEXT mod_list{candidates};
+        vk::ExternalMemoryImageCreateInfo ext_img{vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT};
+        ext_img.pNext = &mod_list;
+        vk::ImageCreateInfo ci{{},
+                               vk::ImageType::e2D,
+                               fmt,
+                               vk::Extent3D{uw, uh, 1},
+                               1,
+                               1,
+                               vk::SampleCountFlagBits::e1,
+                               vk::ImageTiling::eDrmFormatModifierEXT,
+                               vk::ImageUsageFlagBits::eColorAttachment |
+                                   vk::ImageUsageFlagBits::eTransferDst |
+                                   vk::ImageUsageFlagBits::eTransferSrc,
+                               vk::SharingMode::eExclusive,
+                               {},
+                               vk::ImageLayout::eUndefined};
+        ci.pNext = &ext_img;
+        vk::raii::Image image{device, ci};
+
+        const auto req = image.getMemoryRequirements();
+        vk::ExportMemoryAllocateInfo export_info{
+            vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT};
+        vk::MemoryDedicatedAllocateInfo dedicated{*image};
+        dedicated.pNext = &export_info;
+        vk::MemoryAllocateInfo alloc{req.size,
+                                     find_memory_type(impl_->physical, req.memoryTypeBits,
+                                                      vk::MemoryPropertyFlagBits::eDeviceLocal)};
+        alloc.pNext = &dedicated;
+        vk::raii::DeviceMemory memory{device, alloc};
+        image.bindMemory(*memory, 0);
+
+        vk::raii::ImageView view{
+            device, vk::ImageViewCreateInfo{{},
+                                            *image,
+                                            vk::ImageViewType::e2D,
+                                            fmt,
+                                            {},
+                                            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}};
+
+        const int fd = device.getMemoryFdKHR(
+            vk::MemoryGetFdInfoKHR{*memory, vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT});
+        const auto chosen = image.getDrmFormatModifierPropertiesEXT();
+        const auto layout = image.getSubresourceLayout(
+            vk::ImageSubresource{vk::ImageAspectFlagBits::eMemoryPlane0EXT, 0, 0});
+
+        DmabufPlane plane{fd,
+                          width,
+                          height,
+                          drm_format,
+                          static_cast<std::uint32_t>(layout.offset),
+                          static_cast<std::uint32_t>(layout.rowPitch),
+                          chosen.drmFormatModifier};
+        // Aggregate-new, not make_unique: Impl closes the fd in its destructor,
+        // which costs it the implicit move constructor.
+        return ScanoutTarget{std::unique_ptr<ScanoutTarget::Impl>(
+            new ScanoutTarget::Impl{std::move(image), std::move(memory), std::move(view), fmt,
+                                    plane, false, -1, std::nullopt, std::nullopt, nullptr, true})};
+    } catch (const std::exception& e) {
+        return fail(std::string{"vulkan scanout alloc: "} + e.what());
+    }
+}
+
+Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
+                                 std::span<const RectFill> rects,
+                                 std::span<const GpuTextureFill> textures,
+                                 std::span<const Box> damage, const OutputMapping& mapping,
+                                 const RenderSync& sync) {
+    try {
+        auto& device = impl_->device;
+        impl_->reap();
+        ScanoutTarget::Impl& t = *target.impl_;
+        const int device_w = t.plane.width;
+        const int device_h = t.plane.height;
+        const int scale = mapping.scale < 1 ? 1 : mapping.scale;
+        const Transform transform = mapping.transform;
+        // Everything the caller hands us is in logical coordinates; the target is
+        // device pixels. This is the only place the two meet.
+        const int logical_w = (transform_swaps_axes(transform) ? device_h : device_w) / scale;
+        const int logical_h = (transform_swaps_axes(transform) ? device_w : device_h) / scale;
+        auto to_device = [&](const Box& b) {
+            return transform_box(transform, scale, b, device_w, device_h);
+        };
+        auto to_rect2d = [](const Box& b) {
+            return vk::Rect2D{{b.x, b.y},
+                              {static_cast<uint32_t>(b.width), static_cast<uint32_t>(b.height)}};
+        };
+
+        // What to touch. The damage boxes become a disjoint region: overlapping
+        // rects would blend a translucent surface into the same pixel twice, and
+        // the render pass needs one area that covers them all.
+        const Box full{0, 0, logical_w, logical_h};
+        Region repaint;
+        const bool partial = !damage.empty() && t.has_content;
+        if (partial) {
+            for (const Box& d : damage) {
+                repaint.add(d.intersection(full));
+            }
+            if (repaint.empty()) {
+                return ok(); // nothing changed; the target already shows it
+            }
+        } else {
+            repaint.add(full);
+        }
+
+        // Occlusion: walk front to back and remember what is already covered by
+        // something the caller declared opaque. A maximised window over a
+        // wallpaper means the wallpaper is never sampled at all.
+        std::vector<Region> visible(textures.size());
+        Region covered;
+        for (size_t i = textures.size(); i-- > 0;) {
+            const GpuTextureFill& tf = textures[i];
+            if (tf.texture == nullptr || tf.w <= 0 || tf.h <= 0) {
+                continue;
+            }
+            visible[i] = repaint;
+            visible[i].intersect(Box{tf.x, tf.y, tf.w, tf.h});
+            visible[i].subtract(covered);
+            covered.add(tf.opaque.intersection(Box{tf.x, tf.y, tf.w, tf.h}));
+        }
+        // Whatever is left over is background and solid rects, the very back.
+        Region backdrop = repaint;
+        backdrop.subtract(covered);
+
+        const Box device_area = to_device(repaint.extents());
+
+        QuadPipeline& quad = impl_->quad_pipeline(t.format);
+        vk::ImageView fb_attachment = *t.view;
+        vk::raii::Framebuffer framebuffer{
+            device, vk::FramebufferCreateInfo{{},
+                                              partial ? *quad.load_pass : *quad.clear_pass,
+                                              fb_attachment,
+                                              static_cast<std::uint32_t>(device_w),
+                                              static_cast<std::uint32_t>(device_h),
+                                              1}};
+
+        // ponytail: a fresh descriptor pool per frame. Caching sets per texture
+        // needs invalidation we do not have yet, and pool creation is cheap.
+        const std::uint32_t texture_count =
+            static_cast<std::uint32_t>(std::max<size_t>(1, textures.size()));
+        vk::DescriptorPoolSize pool_size{vk::DescriptorType::eCombinedImageSampler, texture_count};
+        vk::raii::DescriptorPool descriptor_pool{
+            device, vk::DescriptorPoolCreateInfo{{}, texture_count, pool_size}};
+
+        vk::raii::CommandBuffers command_buffers{
+            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
+                                                  vk::CommandBufferLevel::ePrimary, 1}};
+        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+        const std::uint32_t foreign =
+            impl_->queue_foreign ? uint32_t{VK_QUEUE_FAMILY_FOREIGN_EXT} : VK_QUEUE_FAMILY_IGNORED;
+        const std::uint32_t self =
+            impl_->queue_foreign ? impl_->queue_family : VK_QUEUE_FAMILY_IGNORED;
+        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+
+        // Take the target back from the display engine. On a partial repaint the
+        // untouched pixels must survive, so we come in from the layout it left
+        // rather than from Undefined.
+        vk::ImageMemoryBarrier reacquire{{},
+                                         vk::AccessFlagBits::eColorAttachmentWrite,
+                                         partial ? vk::ImageLayout::eGeneral
+                                                 : vk::ImageLayout::eUndefined,
+                                         vk::ImageLayout::eColorAttachmentOptimal,
+                                         partial ? foreign : VK_QUEUE_FAMILY_IGNORED,
+                                         partial ? self : VK_QUEUE_FAMILY_IGNORED,
+                                         *t.image,
+                                         whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                            vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, {}, {},
+                            reacquire);
+
+        // Take every source texture for sampling. Imported client buffers come
+        // from the foreign (external) queue; ours already sit in the read layout.
+        for (const GpuTextureFill& tf : textures) {
+            if (tf.texture == nullptr) {
+                continue;
+            }
+            const GpuTexture::Impl& tex = *tf.texture->impl_;
+            vk::ImageMemoryBarrier acquire{
+                {},
+                vk::AccessFlagBits::eShaderRead,
+                tex.external ? vk::ImageLayout::eUndefined
+                             : vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::ImageLayout::eShaderReadOnlyOptimal,
+                tex.external ? foreign : VK_QUEUE_FAMILY_IGNORED,
+                tex.external ? self : VK_QUEUE_FAMILY_IGNORED,
+                *tex.image,
+                whole};
+            cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                                vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, acquire);
+        }
+
+        vk::ClearValue clear{vk::ClearColorValue{
+            std::array<float, 4>{background.r, background.g, background.b, background.a}}};
+        const vk::Rect2D render_area = to_rect2d(device_area);
+        cmd.beginRenderPass(vk::RenderPassBeginInfo{partial ? *quad.load_pass : *quad.clear_pass,
+                                                    *framebuffer, render_area, clear},
+                            vk::SubpassContents::eInline);
+
+        // On a partial repaint loadOp is eLoad, so the background has to be
+        // painted explicitly — over each damage box, not over the box spanning
+        // them, and not at all where an opaque surface will cover it anyway.
+        if (partial) {
+            std::vector<vk::ClearRect> clear_rects;
+            clear_rects.reserve(backdrop.rects().size());
+            for (const Box& b : backdrop.rects()) {
+                clear_rects.push_back(vk::ClearRect{to_rect2d(to_device(b)), 0, 1});
+            }
+            if (!clear_rects.empty()) {
+                vk::ClearAttachment clear_att{
+                    vk::ImageAspectFlagBits::eColor, 0,
+                    vk::ClearColorValue{std::array<float, 4>{background.r, background.g,
+                                                             background.b, background.a}}};
+                cmd.clearAttachments(clear_att, clear_rects);
+            }
+        }
+        for (const RectFill& rf : rects) {
+            std::vector<vk::ClearRect> clear_rects;
+            for (const Box& b : backdrop.rects()) {
+                if (const Box hit = rf.box.intersection(b); !hit.empty()) {
+                    clear_rects.push_back(vk::ClearRect{to_rect2d(to_device(hit)), 0, 1});
+                }
+            }
+            if (clear_rects.empty()) {
+                continue;
+            }
+            vk::ClearAttachment clear_att{
+                vk::ImageAspectFlagBits::eColor, 0,
+                vk::ClearColorValue{
+                    std::array<float, 4>{rf.color.r, rf.color.g, rf.color.b, rf.color.a}}};
+            cmd.clearAttachments(clear_att, clear_rects);
+        }
+
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *quad.pipeline);
+        cmd.setViewport(0, vk::Viewport{0.0f, 0.0f, static_cast<float>(device_w),
+                                        static_cast<float>(device_h), 0.0f, 1.0f});
+
+        for (size_t i = 0; i < textures.size(); ++i) {
+            const GpuTextureFill& tf = textures[i];
+            if (visible[i].empty()) {
+                continue; // fully occluded, off-screen, or outside the damage
+            }
+            const GpuTexture::Impl& tex = *tf.texture->impl_;
+
+            // The quad covers the whole destination rect; the scissor does the
+            // clipping. The source is sampled through the buffer transform folded
+            // into the output's, so one draw handles both rotations.
+            const Box dev = to_device(Box{tf.x, tf.y, tf.w, tf.h});
+            const auto uv =
+                corner_uvs(transform_compose(transform, tf.transform), tf.u0, tf.v0, tf.u1, tf.v1);
+            QuadPush push{};
+            push.rect[0] = 2.0f * static_cast<float>(dev.x) / static_cast<float>(device_w) - 1.0f;
+            push.rect[1] = 2.0f * static_cast<float>(dev.y) / static_cast<float>(device_h) - 1.0f;
+            push.rect[2] =
+                2.0f * static_cast<float>(dev.x + dev.width) / static_cast<float>(device_w) - 1.0f;
+            push.rect[3] =
+                2.0f * static_cast<float>(dev.y + dev.height) / static_cast<float>(device_h) - 1.0f;
+            push.uv01[0] = uv[0][0];
+            push.uv01[1] = uv[0][1];
+            push.uv01[2] = uv[1][0];
+            push.uv01[3] = uv[1][1];
+            push.uv23[0] = uv[2][0];
+            push.uv23[1] = uv[2][1];
+            push.uv23[2] = uv[3][0];
+            push.uv23[3] = uv[3][1];
+
+            vk::DescriptorSetLayout raw_layout = *quad.set_layout;
+            vk::raii::DescriptorSets sets{
+                device, vk::DescriptorSetAllocateInfo{*descriptor_pool, raw_layout}};
+            vk::DescriptorImageInfo image_info{**impl_->sampler, *tex.view,
+                                               vk::ImageLayout::eShaderReadOnlyOptimal};
+            device.updateDescriptorSets(
+                vk::WriteDescriptorSet{*sets.front(), 0, 0,
+                                       vk::DescriptorType::eCombinedImageSampler, image_info},
+                {});
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0,
+                                   *sets.front(), {});
+            cmd.pushConstants<QuadPush>(*quad.layout, vk::ShaderStageFlagBits::eVertex, 0, push);
+            // One draw per visible box: the vertex work is four vertices, and
+            // the fragments outside the scissor never happen.
+            for (const Box& b : visible[i].rects()) {
+                cmd.setScissor(0, to_rect2d(to_device(b)));
+                cmd.draw(4, 1, 0, 0);
+            }
+            // The set must outlive the submit; the pool below owns it either way.
+            sets.front().release();
+        }
+        cmd.endRenderPass();
+
+        // Release the target back to the foreign owner: the display engine reads
+        // it next, not us.
+        vk::ImageMemoryBarrier release{vk::AccessFlagBits::eColorAttachmentWrite,
+                                       {},
+                                       vk::ImageLayout::eColorAttachmentOptimal,
+                                       vk::ImageLayout::eGeneral,
+                                       self,
+                                       foreign,
+                                       *t.image,
+                                       whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                            vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, release);
+        cmd.end();
+
+        // --- explicit sync: wait on the GPU, not on the CPU ---
+        //
+        // Every fence a client gave us for its buffer, plus whatever the display
+        // engine still owes on this target, becomes a semaphore the queue waits
+        // on. The finished render becomes a sync_file the caller hands to KMS.
+        std::vector<vk::raii::Semaphore> semaphores;
+        std::vector<vk::Semaphore> wait_handles;
+        std::vector<vk::PipelineStageFlags> wait_stages;
+        auto add_wait = [&](int fd) {
+            if (fd < 0 || !impl_->sync_fd_ok) {
+                return;
+            }
+            const int dupfd = dup(fd); // the import consumes the fd it is given
+            if (dupfd < 0) {
+                return;
+            }
+            vk::raii::Semaphore sem{device, vk::SemaphoreCreateInfo{}};
+            device.importSemaphoreFdKHR(vk::ImportSemaphoreFdInfoKHR{
+                *sem, vk::SemaphoreImportFlagBits::eTemporary,
+                vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd, dupfd});
+            wait_handles.push_back(*sem);
+            wait_stages.push_back(vk::PipelineStageFlagBits::eAllCommands);
+            semaphores.push_back(std::move(sem));
+        };
+        for (int fd : sync.wait_fds) {
+            add_wait(fd);
+        }
+        add_wait(t.acquire_fence);
+
+        const bool want_out_fence = sync.out_fence_fd != nullptr && impl_->sync_fd_ok;
+        std::optional<vk::raii::Semaphore> out_sem;
+        if (want_out_fence) {
+            vk::ExportSemaphoreCreateInfo export_info{
+                vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd};
+            vk::SemaphoreCreateInfo ci{};
+            ci.pNext = &export_info;
+            out_sem.emplace(device, ci);
+        }
+
+        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::SubmitInfo submit;
+        submit.setCommandBuffers(*cmd);
+        if (!wait_handles.empty()) {
+            submit.setWaitSemaphores(wait_handles);
+            submit.setWaitDstStageMask(wait_stages);
+        }
+        vk::Semaphore out_handle;
+        if (out_sem.has_value()) {
+            out_handle = **out_sem;
+            submit.setSignalSemaphores(out_handle);
+        }
+        impl_->queue.submit(submit, *fence);
+
+        // The waits consumed the target's fence; a stale one must not be waited
+        // on twice.
+        if (t.acquire_fence >= 0) {
+            close(t.acquire_fence);
+            t.acquire_fence = -1;
+        }
+        t.has_content = true;
+
+        if (out_sem.has_value()) {
+            *sync.out_fence_fd = device.getSemaphoreFdKHR(vk::SemaphoreGetFdInfoKHR{
+                **out_sem, vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd});
+            semaphores.push_back(std::move(*out_sem));
+            // Nothing is waited on here: the command buffer, its descriptors and
+            // these semaphores stay alive in the in-flight list until the fence
+            // says the GPU is done with them.
+            impl_->in_flight.push_back(InFlight{std::move(fence), std::move(command_buffers),
+                                                std::move(descriptor_pool),
+                                                std::move(framebuffer), std::move(semaphores)});
+            return ok();
+        }
+        if (sync.out_fence_fd != nullptr) {
+            *sync.out_fence_fd = -1; // asked for a fence the device cannot give
+        }
+        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
+            vk::Result::eSuccess) {
+            return fail("fence wait failed");
+        }
+        return ok();
+    } catch (const std::exception& e) {
+        return fail(std::string{"vulkan render_to: "} + e.what());
     }
 }
 
