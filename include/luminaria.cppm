@@ -28,6 +28,7 @@ export import :core.handle;
 export import :core.signal;
 export import :cursor_shape;
 export import :cursor_theme;
+export import :data_control;
 export import :data_device;
 export import :drm_syncobj;
 export import :foreign_toplevel;
