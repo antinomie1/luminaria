@@ -51,6 +51,7 @@ export import :subcompositor;
 export import :tearing_control;
 export import :util.box;
 export import :util.color;
+export import :text_input;
 export import :util.dmabuf;
 export import :util.pixel;
 export import :util.rect_fill;
