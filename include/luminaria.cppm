@@ -42,6 +42,7 @@ export import :presentation_time;
 export import :render.vulkan;
 export import :scene;
 export import :screencopy;
+export import :relative_pointer;
 export import :seat;
 export import :session;
 export import :single_pixel_buffer;
