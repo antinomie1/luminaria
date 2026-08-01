@@ -117,6 +117,11 @@ xmake f -m release && xmake   # 优化构建（默认是 debug）
 | 协议 | `zwlr_layer_shell_v1` (v5) — 桌面自己的表面：面板 / 状态栏 / 壁纸 / 通知 / 锁屏层。四个 layer 各有 z 序，锚定到输出边缘；exclusive zone 从可用区里切出一条谁也不许盖的带子。layer / anchor / size / margin / exclusive zone 全是双缓冲状态，随 `wl_surface.commit` 生效并发 `state_change`；映射流程与 xdg-shell 同规矩（先无 buffer 提交、configure、再贴 buffer）。`arrange_layer_surface()` 一次算完摆放 + 收缩可用区 + 下发 configure —— 这段锚点算术每个 compositor 都得写一遍，写错就是面板互相压 | layer-shell |
 | 协议 | `zwlr_foreign_toplevel_management_v1` (v3) — 任务栏 / 窗口切换器看到的窗口列表。不用手工发布：`track(shell)` 之后自维护，窗口 map 时进列表，title / app_id / 状态跟着 toplevel 自己的信号走，unmap 或销毁时消失，晚启动的任务栏照样拿到全量列表；客户端的 activate / minimize / maximize / fullscreen / close 经 `request()` 交给 compositor 仲裁。注意这个 global 让一个客户端能枚举并操作**所有别人的**窗口，只该给桌面自家组件 | foreign-toplevel |
 | 协议 | `xdg_activation_v1` — 「把那个窗口提到前面」。两步握手：有焦点的客户端拿 token（附 seat + 输入 serial），带外（环境变量 / D-Bus）传给另一个客户端，后者拿 `activate` 换焦点。token 随机 128 位、一次性；compositor 在 `new_token` 里核对 serial 决定发不发 —— 这就是它防焦点窃取的全部机制，`request_activate` 仍只是请求，给不给焦点是 compositor 的事 | xdg-activation |
+| 协议 | `zwp_relative_pointer_manager_v1` — 指针的**位移**而非位置。光标被锁住不动时 `wl_pointer.motion` 一个都不会发，游戏/3D 视口就是靠这条通道看见鼠标在动；加速后与设备原始两套 delta 都给，后者是游戏要的。事件只发给持有指针焦点的客户端 | relative-pointer |
+| 协议 | `zwp_pointer_constraints_v1` — 锁定（locked，光标钉死不动）与限制（confined，光标能动但出不了表面/区域）。客户端只能**请求**，`activate()` 之前一律无效，且**表面没有指针焦点时拒绝激活** —— 这条规则写在库里，compositor 想忘也忘不掉；焦点一走自动解除。region / cursor position hint 是双缓冲状态，随 `wl_surface.commit` 生效 | pointer-constraints |
+| 协议 | `zwp_text_input_manager_v3` — 中文/日文输入法的通道。客户端侧状态（enable、周边文本、内容类型、光标矩形）双缓冲，`commit` 时整体生效；我们回的 preedit / commit_string / delete_surrounding_text 同样攒到 `send_done()` 才发，done 的 serial 就是收到的 commit 次数。焦点跟随 seat 键盘焦点，不由客户端选。本库只终结协议，接 IBus/Fcitx 或 input-method-v2 是 compositor 的事 | text-input |
+| 协议 | `zwp_idle_inhibit_manager_v1` — 「正在放视频，别息屏」。协议本身零回程流量，全部意义在服务端：`inhibited()` 只统计**可见**的 inhibitor（`set_visible(false)` 表示表面被最小化/切走了），`changed` 只在跨越 0 的那一刻发一次，可以直接接到息屏计时器上 | idle-inhibit |
+| 协议 | `zwlr_data_control_manager_v1` (v2) — 没有窗口的剪贴板：`wl-copy` / `wl-paste` / 剪贴板历史工具要在没有焦点、没有 surface 的情况下读写选区。两块剪贴板都覆盖（普通 + 中键）。写入方向经 `SelectionSource` 桥接进 `DataDeviceManager`，粘贴的客户端看到的就是一个普通 offer，分辨不出源不是 `wl_data_source`。选区易主时旧 offer 立即作废，免得剪贴板管理器把新内容当旧的。**这个 global 绕过了「选区跟随焦点」这条安全规则**，`set_filter()` 可以只发给受信任的客户端 | data-control |
 | 协议 | `linux-drm-syncobj-v1` — 显式 GPU 同步，**全异步、无 CPU 等待**：acquire point 导出成 sync_file 交给渲染器当 `VkSemaphore` 等；渲染的 out-fence 直接写进客户端的 release point，客户端在 GPU 停止读取的那一刻就能复用 buffer | syncobj |
 | 协议 | `wl_output` v4 — geometry / mode / scale / name / description / done（客户端 map 前需要；`name` 是 `grim -o` 等工具寻址输出用的）。`set_scale()` / `set_transform()` 会重发几何信息并以 `done` 收尾 | output-scale |
 | 协议 | `xdg-output-unstable-v1`（`zxdg_output_manager_v1` v3）— 输出的**逻辑**位置与尺寸（mode ÷ scale，旋转时长宽互换），随 scale/transform/位置变化实时更新。wl_output 只描述物理模式；要把截图摆到画布上的工具（grim / slurp / 录屏器）读的是这个。缺了它 `grim` 只会警告并写出 0×0 的 PNG | — |
@@ -210,7 +215,7 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 ## 完整 Compositor 路线图（缺失协议 / 部分）
 
 达到"能日常用的完整 Wayland compositor"还需实现以下内容。按**客户端是否可用**分层。
-✓=已有，✗=缺，△=部分。参照：wlroots 有 73 个 type 实现，luminaria 现有 13 个。
+✓=已有，✗=缺，△=部分。参照：wlroots 有 73 个 type 实现，luminaria 现有 25 个。
 
 ### P0 — 不做真实程序直接跑不起来 ✅ 全部完成
 
@@ -277,7 +282,10 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
       （真实缩放，120 分之一为单位）、`wp-viewporter`（源裁剪 + 目标拉伸）、客户端侧
       `set_buffer_scale` / `set_buffer_transform`（buffer transform 与输出 transform 复合成
       一次采样），以及 `wl_surface.preferred_buffer_scale`（v6）
-- ✗ **IME**：`text-input-v3` + `input-method-v2` — 中文/日文输入法（**P1 唯一未做项**）
+- △ **IME**：`text-input-v3` ✓ / `input-method-v2` ✗ — 客户端一侧完整（见协议表：双缓冲状态、
+      焦点跟随 seat、preedit / commit_string / delete_surrounding_text + done serial）。
+      **仍缺** `input-method-v2`：输入法程序自己接进来的那一半，现在得由 compositor 自行桥接
+      IBus / Fcitx
 - ✓ **libseat** 会话管理 + VT 切换 —— `luminaria/session.hpp`。设备经 libseat 打开；
       会话失活时 DRM 丢 master、停止提交、libinput 挂起，恢复时重取 master 并重新 modeset。
       没有 seat 时如实降级（仍可从已登录 VT 跑，只是切 VT 不安全）
@@ -298,10 +306,11 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 - ✓ **`ext-workspace-v1`** — 工作区列表/切换（见协议表）
 - ✓ **`wlr-foreign-toplevel-management`** — 任务栏列窗口（见协议表）
 - ✓ **`xdg-activation`** — 焦点转移 / 紧急提示（见协议表）
-- ✗ **idle**：`ext-idle-notify` + idle-inhibit（视频防息屏）
+- △ **idle**：`idle-inhibit` ✓（视频防息屏，见协议表）/ `ext-idle-notify` ✗（空闲通知）
 - ✗ **output-management + gamma-control**（夜间模式）
-- ✗ **data-control**（剪贴板管理器）
-- ✗ **relative-pointer + pointer-constraints**（游戏/3D 锁定光标）、tablet-v2、pointer-gestures
+- ✓ **`data-control`**（剪贴板管理器）— `zwlr_data_control_manager_v1` v2，见协议表
+- ✓ **relative-pointer + pointer-constraints**（游戏/3D 锁定光标）— 见协议表；
+      **仍缺** tablet-v2、pointer-gestures
 
 ### 非协议部分
 
@@ -322,7 +331,9 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 5. ~~**热插拔（udev）+ 每输出 scale/transform**~~ — ✓ 已做
 6. ~~**异步 explicit sync + 多矩形 damage + libseat + 光标平面/主题 + HiDPI 全套**~~ — ✓ 已做
 7. ~~**layer-shell**~~ — ✓ 已做；**session-lock** 仍缺，补上才算完整"桌面"
-8. **text-input / input-method** — 中文输入（P1 最后一项）
+8. ~~**text-input-v3**~~ — ✓ 已做（客户端一侧）；**input-method-v2** 仍缺，中文输入还差接
+   IBus/Fcitx 那一半
+9. ~~**relative-pointer + pointer-constraints + idle-inhibit + data-control**~~ — ✓ 已做
 
 ---
 

@@ -1,9 +1,14 @@
 # TODO & Corners Cut — Luminaria 源码审计
 
-更新于 2026-07-25（P1 完工后重新梳理，IME 除外）。列出源码中所有 `TODO` 注释与"偷工减料"处
+更新于 2026-08-02（补齐 relative-pointer / pointer-constraints / text-input-v3 /
+idle-inhibit / wlr-data-control 之后）。列出源码中所有 `TODO` 注释与"偷工减料"处
 （为免真实客户端崩溃而设的空操作桩，以及有已知天花板的简化实现）。
 
-> **本轮变化：** 上一轮剩下的桩基本清空了。`wl_region`（add/subtract）、
+> **本轮变化：** 新增五个协议（§2.13–§2.17）。`text-input-v3` 落地后，IME 只剩
+> `input-method-v2` 那一半；`data-control` 顺带在 `data_device` 里开出了 `SelectionSource`
+> 这条口子，让剪贴板的所有者可以不是 `wl_data_source`。
+>
+> **上一轮变化：** 剩下的桩基本清空了。`wl_region`（add/subtract）、
 > `set_opaque_region` / `set_input_region`、`set_buffer_scale` / `set_buffer_transform`、
 > `wl_surface.offset`、`xdg_toplevel.set_parent` / `show_window_menu`、
 > `xdg_positioner` 的 `constraint_adjustment` 全部落地。同时补上了
@@ -162,6 +167,52 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | serial 校验 | **不做** —— 库没有"这个客户端最近收到过哪些 serial"的账。`ActivationTokenRequest` 把 seat + serial 原样交给 compositor，`granted` 默认 true。防焦点窃取要 compositor 自己核对 |
 | 未兑换 token | 最多存 32 个，超了丢最旧的。要了 token 又不用的客户端不会把内存吃光，代价是极端情况下老 token 提前失效 |
 
+### 2.13 relative-pointer（`src/types/relative_pointer.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| `get_relative_pointer` 的 `pointer` 参数 | **忽略** —— 库只有一个 seat，客户端的哪个 `wl_pointer` 与"哪个客户端"是同一件事，路由按客户端做 |
+| 事件路由 | 只发给持有**指针焦点**的客户端；没有焦点时 `send_motion()` 静默丢弃 |
+| delta 来源 | 加速后与未加速两对值都照单转发，库不自己算加速曲线 —— 只有一对可用的后端应当把同一对传两次 |
+
+### 2.14 pointer-constraints（`src/types/pointer_constraints.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| 激活门槛 | **表面无指针焦点时 `activate()` 静默拒绝**，焦点一走自动 `deactivate()` —— 写在库里而不是留给 compositor，因为忘了就是"任意客户端可劫持鼠标" |
+| 逃生快捷键 | **不提供** —— 按哪个键解开锁定是 compositor 的策略，库不替它选 |
+| `already_constrained` | 已实现（同一 surface + pointer 第二次约束是致命错误） |
+| region / cursor hint | 双缓冲，随 `wl_surface.commit` 生效；创建请求里带的初始 region 立即生效 |
+| 光标实际的钉住 / 限制 | **不做** —— 库不拥有光标位置。`active_constraint()` 告诉 compositor 该不该动光标、`region()` 给出边界，真正的钳位在 compositor 的指针处理里 |
+
+### 2.15 text-input-v3（`src/types/text_input.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| 双缓冲状态 | 已实现（两侧都是）：客户端的 enable / 周边文本 / 内容类型 / 光标矩形随 `commit` 生效，我们的 preedit / commit_string / delete_surrounding_text 随 `send_done()` 生效 |
+| done serial | 等于收到的 `commit` 次数，符合协议要求 |
+| 焦点 | 跟随 seat 键盘焦点；`leave` 之后到下一次 `enter` 之前，该对象的请求一律忽略 |
+| `input-method-v2` | **未实现** —— 本库只终结 text-input 一侧。接 IBus / Fcitx 或实现 input-method global 是 compositor 的事，这是 P1 剩下的唯一缺口 |
+| "同一 seat 上只允许一个 text input 处于 enabled" | **不强制** —— 协议说重复 `enable` 应被忽略，实际工具包不会这么干；`focused()` 取第一个 enabled 的 |
+
+### 2.16 idle-inhibit（`src/types/idle_inhibit.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| 可见性 | inhibitor 默认 `visible = true`，`inhibited()` 只数可见的。表面被最小化 / 切到别的工作区时由 compositor 调 `set_visible(false)` —— 库看不到什么是"可见" |
+| `changed` 信号 | 只在跨越 0 的那一刻发，可以直接接息屏计时器 |
+| `ext-idle-notify-v1` | **未实现** —— 反方向的协议（告诉客户端"用户闲了 N 秒"），与本条正交 |
+
+### 2.17 data-control（`src/types/data_control.cpp`）
+
+| 项 | 状态 |
+|----|------|
+| 权限 | 这个 global 按设计绕过"选区跟随焦点"。默认**发给所有客户端**；`set_filter()` 可以只发给受信任的 |
+| filter 的实现 | 用 libwayland 的 `wl_display_set_global_filter`，而 wl_display **只有一个** filter 槽且拿不回旧值 —— 所以无法链式叠加。compositor 若自己要 filter，应当把 data-control 的判断写进自己那个里，而不是调 `set_filter()` |
+| 陈旧 offer | 选区易主时旧 offer 立即作废，之后 `receive` 只是把管道关掉。否则剪贴板管理器会把新内容当成它手里那份旧的 |
+| `finished` 事件 | **不发** —— 它用于 compositor 中途收回权限，本库没有运行时撤权的入口 |
+| 桥接方向 | 写入方向经 `SelectionSource` 进 `DataDeviceManager` / `PrimarySelectionManager`；粘贴的客户端看到的是普通 offer，分辨不出源不是 `wl_data_source` |
+
 ---
 
 ## 三、汇总
@@ -181,13 +232,13 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | 客户端可感知但有降级 | 未设置 `set_popup_constraint_query()` 时贴边菜单溢出 |
 | 性能天花板 | `Region` 不合并相邻矩形；`opaque` 只取包围盒；描述符池每帧新建 |
 | 裸机限制 | 无模式切换、无客户端 buffer 直出、GPU 设备热插拔不处理、键码原始值 |
-| 未实现的协议 | IME（`text-input-v3` / `input-method-v2`）、layer-shell、session-lock |
+| 未实现的协议 | `input-method-v2`（IME 的输入法一侧）、`ext-session-lock-v1`、`ext-idle-notify-v1`、output-management / gamma-control、tablet-v2 / pointer-gestures |
 
 ---
 
 ## 四、与 README 路线图对照
 
-**P0 与 P1（IME 除外）已全部为 ✓。** 本文档剩余的项对应：
+**P0 与 P1（`input-method-v2` 除外）已全部为 ✓。** 本文档剩余的项对应：
 
 | README 项 | 对应 |
 |-----------|------|
@@ -197,5 +248,8 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | ✓ libseat (P1) | §2.8 |
 | ✓ 光标 (P1) | §2.8 主题加载 + 硬件平面 |
 | ✓ explicit sync（非协议部分） | §2.5 / §2.6 全异步 |
-| ✗ IME (P1) | 唯一未做的 P1 项 |
+| △ IME (P1) | §2.15 —— `text-input-v3` 已做，`input-method-v2` 未做 |
+| ✓ relative-pointer / pointer-constraints (P2) | §2.13 / §2.14 |
+| △ idle (P2) | §2.16 —— `idle-inhibit` 已做，`ext-idle-notify` 未做 |
+| ✓ data-control (P2) | §2.17 |
 | △ XWM（非协议部分） | `xwayland.hpp` TODO：minimal |
