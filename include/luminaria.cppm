@@ -33,6 +33,7 @@ export import :drm_syncobj;
 export import :foreign_toplevel;
 export import :fractional_scale;
 export import :input_event;
+export import :idle_inhibit;
 export import :layer_shell;
 export import :linux_dmabuf;
 export import :output;
