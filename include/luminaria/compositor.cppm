@@ -353,6 +353,11 @@ private:
 /// presentation-time, xdg-shell) to get from a client's object to ours.
 [[nodiscard]] Surface* surface_from_resource(wl_resource* resource);
 
+/// The Region behind a `wl_region` resource (null in, null out). Protocols that
+/// take a wl_region of their own — pointer-constraints' confinement area — read
+/// it through this rather than re-implementing wl_region.
+[[nodiscard]] Region* region_from_resource(wl_resource* resource);
+
 /// The wl_compositor global. Move-only; state is pointer-stable (pimpl) so the
 /// libwayland global can safely hold a pointer to it.
 class Compositor {
