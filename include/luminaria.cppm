@@ -40,6 +40,7 @@ export import :output_global;
 export import :output_layout;
 export import :presentation_time;
 export import :render.vulkan;
+export import :pointer_constraints;
 export import :scene;
 export import :screencopy;
 export import :relative_pointer;
