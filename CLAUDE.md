@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Luminaria: a minimal Wayland compositor **library** in modern C++23, built on top of
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
-built with xmake. Roughly wlroots-shaped but far smaller (20 protocol types vs wlroots' 73).
+built with xmake. Roughly wlroots-shaped but far smaller (25 protocol types vs wlroots' 73).
 
 It ships as a **C++20 named module**. `import luminaria;` is the entire interface — there are
 no public headers.
@@ -99,7 +99,9 @@ Layers, bottom-up (`src/` mirrors `include/luminaria/`):
   `viewporter`, `fractional_scale`, `layer_shell` (wlr-layer-shell, plus the
   `arrange_layer_surface()` anchor/exclusive-zone solver), `foreign_toplevel`
   (wlr-foreign-toplevel-management, mirrors an `XdgShell` on its own via
-  `track()`), `xdg_activation`.
+  `track()`), `xdg_activation`, `relative_pointer`, `pointer_constraints`,
+  `text_input` (text-input-v3), `idle_inhibit`, `data_control`
+  (wlr-data-control, bridged into `data_device` through `SelectionSource`).
 - **render/vulkan** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs

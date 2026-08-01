@@ -45,6 +45,12 @@ struct DataDeviceManager::Impl {
     Signal<SeatKeyboardFocus>::Connection focus_conn;
 
     Source* selection = nullptr;
+    // A selection set from outside the protocol (a data-control client, a
+    // clipboard manager). We own the Source wrapping it, but not the
+    // SelectionSource itself.
+    Source* external_selection = nullptr;
+    Signal<SelectionChange> selection_changed;
+    const std::vector<std::string> no_mimes;
 
     // Drag state (all null when no drag is running).
     Source* drag_source = nullptr;
@@ -63,7 +69,12 @@ using Mgr = DataDeviceManager::Impl;
 
 // Owned by its wl_data_source resource.
 struct Source {
+    // Exactly one of these is set: `resource` for an ordinary client's
+    // wl_data_source, `external` for a selection that came from outside the
+    // protocol. Everything downstream goes through source_send/source_cancel so
+    // the rest of this file does not have to care which.
     wl_resource* resource = nullptr;
+    SelectionSource* external = nullptr;
     Mgr* mgr = nullptr;
     std::vector<std::string> mimes;
     uint32_t dnd_actions = 0;
@@ -90,10 +101,28 @@ Offer* offer_of(wl_resource* r) {
 
 void end_drag(Mgr* mgr, bool cancelled);
 
+// --- the one place that knows a source might not be a client's ---
+void source_send(Source* source, const char* mime, int fd) {
+    if (source->external != nullptr) {
+        source->external->send(mime, fd);
+    } else {
+        wl_data_source_send_send(source->resource, mime, fd);
+    }
+}
+void source_cancel(Source* source) {
+    if (source->external != nullptr) {
+        source->external->cancelled();
+    } else {
+        wl_data_source_send_cancelled(source->resource);
+    }
+}
+
 // ---- wl_data_offer ----
 void offer_accept(wl_client*, wl_resource* resource, uint32_t, const char* mime) {
     Offer* offer = offer_of(resource);
-    if (offer->source != nullptr) {
+    // An external source has no `target` event to receive; it is a clipboard
+    // owner, and only drag-and-drop uses target.
+    if (offer->source != nullptr && offer->source->external == nullptr) {
         wl_data_source_send_target(offer->source->resource, mime);
     }
 }
@@ -101,7 +130,7 @@ void offer_receive(wl_client*, wl_resource* resource, const char* mime, int32_t 
     Offer* offer = offer_of(resource);
     if (offer->source != nullptr) {
         // Hand the pipe straight to the owning client; the bytes never touch us.
-        wl_data_source_send_send(offer->source->resource, mime, fd);
+        source_send(offer->source, mime, fd);
     }
     close(fd);
 }
@@ -110,7 +139,7 @@ void offer_destroy_request(wl_client*, wl_resource* resource) {
 }
 void offer_finish(wl_client*, wl_resource* resource) {
     Offer* offer = offer_of(resource);
-    if (offer->source != nullptr && offer->is_drag &&
+    if (offer->source != nullptr && offer->source->external == nullptr && offer->is_drag &&
         wl_resource_get_version(offer->source->resource) >=
             WL_DATA_SOURCE_DND_FINISHED_SINCE_VERSION) {
         wl_data_source_send_dnd_finished(offer->source->resource);
@@ -132,8 +161,9 @@ void offer_set_actions(wl_client*, wl_resource* resource, uint32_t actions,
     if (wl_resource_get_version(resource) >= WL_DATA_OFFER_ACTION_SINCE_VERSION) {
         wl_data_offer_send_action(resource, chosen);
     }
-    if (offer->source != nullptr && wl_resource_get_version(offer->source->resource) >=
-                                        WL_DATA_SOURCE_ACTION_SINCE_VERSION) {
+    if (offer->source != nullptr && offer->source->external == nullptr &&
+        wl_resource_get_version(offer->source->resource) >=
+            WL_DATA_SOURCE_ACTION_SINCE_VERSION) {
         wl_data_source_send_action(offer->source->resource, chosen);
     }
 }
@@ -200,19 +230,31 @@ void broadcast_selection(Mgr* mgr) {
     send_selection_to_client(mgr, wl_resource_get_client(focus->c_resource()));
 }
 
-void set_selection(Mgr* mgr, Source* source) {
+void apply_selection(Mgr* mgr, Source* source) {
     if (mgr->selection == source) {
         return;
     }
     if (mgr->selection != nullptr) {
-        mgr->selection->is_selection = false;
-        wl_data_source_send_cancelled(mgr->selection->resource);
+        Source* old = mgr->selection;
+        old->is_selection = false;
+        source_cancel(old);
+        if (old == mgr->external_selection) {
+            // We allocated this wrapper; the SelectionSource behind it belongs
+            // to the caller and has just been told it lost the clipboard.
+            for (wl_resource* offer : old->offers) {
+                offer_of(offer)->source = nullptr;
+            }
+            mgr->external_selection = nullptr;
+            delete old;
+        }
     }
     mgr->selection = source;
     if (source != nullptr) {
         source->is_selection = true;
     }
     broadcast_selection(mgr);
+    SelectionChange event{source != nullptr ? source->mimes : mgr->no_mimes};
+    mgr->selection_changed.emit(event);
 }
 
 // ---- wl_data_source ----
@@ -242,6 +284,8 @@ void source_resource_destroy(wl_resource* resource) {
     if (mgr != nullptr && mgr->selection == source) {
         mgr->selection = nullptr;
         broadcast_selection(mgr); // tells the focused client the clipboard is empty
+        SelectionChange event{mgr->no_mimes};
+        mgr->selection_changed.emit(event);
     }
     if (mgr != nullptr && mgr->drag_source == source) {
         mgr->drag_source = nullptr;
@@ -376,7 +420,7 @@ void device_start_drag(wl_client*, wl_resource* resource, wl_resource* source_re
 void device_set_selection(wl_client*, wl_resource* resource, wl_resource* source_resource,
                           uint32_t /*serial*/) {
     auto* mgr = static_cast<Mgr*>(wl_resource_get_user_data(resource));
-    set_selection(mgr, source_resource != nullptr ? source_of(source_resource) : nullptr);
+    apply_selection(mgr, source_resource != nullptr ? source_of(source_resource) : nullptr);
 }
 
 void device_release(wl_client*, wl_resource* resource) {
@@ -474,6 +518,45 @@ bool DataDeviceManager::dragging() const noexcept {
     return impl_->drag_source != nullptr;
 }
 
+Signal<SelectionChange>& DataDeviceManager::selection_changed() noexcept {
+    return impl_->selection_changed;
+}
+
+const std::vector<std::string>& DataDeviceManager::selection_mime_types() const noexcept {
+    return impl_->selection != nullptr ? impl_->selection->mimes : impl_->no_mimes;
+}
+
+bool DataDeviceManager::selection_receive(const std::string& mime, int fd) {
+    if (impl_->selection == nullptr) {
+        close(fd);
+        return false;
+    }
+    source_send(impl_->selection, mime.c_str(), fd);
+    close(fd);
+    return true;
+}
+
+void DataDeviceManager::set_selection(SelectionSource* source) {
+    if (source == nullptr) {
+        apply_selection(impl_.get(), nullptr);
+        return;
+    }
+    // The wrapper is ours; the SelectionSource behind it is the caller's. Note
+    // the order: apply_selection compares the OUTGOING selection against
+    // external_selection to decide whether to free it, so the new wrapper is
+    // recorded only afterwards.
+    auto* wrapper = new Source{};
+    wrapper->external = source;
+    wrapper->mgr = impl_.get();
+    wrapper->mimes = source->mime_types();
+    apply_selection(impl_.get(), wrapper);
+    impl_->external_selection = wrapper;
+}
+
+SelectionSource* DataDeviceManager::selection_source() const noexcept {
+    return impl_->selection != nullptr ? impl_->selection->external : nullptr;
+}
+
 // ===========================================================================
 // zwp_primary_selection_device_manager_v1 — middle-click paste
 // ===========================================================================
@@ -489,6 +572,9 @@ struct PrimarySelectionManager::Impl {
     Signal<SeatKeyboardFocus>::Connection focus_conn;
 
     PrimarySource* selection = nullptr;
+    PrimarySource* external_selection = nullptr;
+    Signal<SelectionChange> selection_changed;
+    const std::vector<std::string> no_mimes;
 
     ~Impl() {
         if (global != nullptr) {
@@ -500,7 +586,10 @@ struct PrimarySelectionManager::Impl {
 using PrimaryMgr = PrimarySelectionManager::Impl;
 
 struct PrimarySource {
+    // Same split as Source above: a client's zwp_primary_selection_source_v1,
+    // or a selection handed to us from outside the protocol.
     wl_resource* resource = nullptr;
+    SelectionSource* external = nullptr;
     PrimaryMgr* mgr = nullptr;
     std::vector<std::string> mimes;
     std::vector<wl_resource*> offers;
@@ -512,6 +601,21 @@ struct PrimaryOffer {
 
 namespace {
 
+void primary_source_send(PrimarySource* source, const char* mime, int fd) {
+    if (source->external != nullptr) {
+        source->external->send(mime, fd);
+    } else {
+        zwp_primary_selection_source_v1_send_send(source->resource, mime, fd);
+    }
+}
+void primary_source_cancel(PrimarySource* source) {
+    if (source->external != nullptr) {
+        source->external->cancelled();
+    } else {
+        zwp_primary_selection_source_v1_send_cancelled(source->resource);
+    }
+}
+
 PrimarySource* primary_source_of(wl_resource* r) {
     return static_cast<PrimarySource*>(wl_resource_get_user_data(r));
 }
@@ -522,7 +626,7 @@ PrimaryOffer* primary_offer_of(wl_resource* r) {
 void primary_offer_receive(wl_client*, wl_resource* resource, const char* mime, int32_t fd) {
     PrimaryOffer* offer = primary_offer_of(resource);
     if (offer->source != nullptr) {
-        zwp_primary_selection_source_v1_send_send(offer->source->resource, mime, fd);
+        primary_source_send(offer->source, mime, fd);
     }
     close(fd);
 }
@@ -592,23 +696,38 @@ void primary_source_resource_destroy(wl_resource* resource) {
     if (source->mgr != nullptr && source->mgr->selection == source) {
         source->mgr->selection = nullptr;
         primary_broadcast(source->mgr);
+        SelectionChange event{source->mgr->no_mimes};
+        source->mgr->selection_changed.emit(event);
     }
     delete source;
+}
+
+void primary_set_selection(PrimaryMgr* mgr, PrimarySource* source) {
+    if (mgr->selection == source) {
+        return;
+    }
+    if (mgr->selection != nullptr) {
+        PrimarySource* old = mgr->selection;
+        primary_source_cancel(old);
+        if (old == mgr->external_selection) {
+            for (wl_resource* offer : old->offers) {
+                primary_offer_of(offer)->source = nullptr;
+            }
+            mgr->external_selection = nullptr;
+            delete old;
+        }
+    }
+    mgr->selection = source;
+    primary_broadcast(mgr);
+    SelectionChange event{source != nullptr ? source->mimes : mgr->no_mimes};
+    mgr->selection_changed.emit(event);
 }
 
 void primary_device_set_selection(wl_client*, wl_resource* resource, wl_resource* source_resource,
                                   uint32_t /*serial*/) {
     auto* mgr = static_cast<PrimaryMgr*>(wl_resource_get_user_data(resource));
-    PrimarySource* source =
-        source_resource != nullptr ? primary_source_of(source_resource) : nullptr;
-    if (mgr->selection == source) {
-        return;
-    }
-    if (mgr->selection != nullptr) {
-        zwp_primary_selection_source_v1_send_cancelled(mgr->selection->resource);
-    }
-    mgr->selection = source;
-    primary_broadcast(mgr);
+    primary_set_selection(mgr,
+                          source_resource != nullptr ? primary_source_of(source_resource) : nullptr);
 }
 constexpr struct zwp_primary_selection_device_v1_interface primary_device_impl = {
     .set_selection = primary_device_set_selection,
@@ -696,6 +815,41 @@ Result<PrimarySelectionManager> PrimarySelectionManager::create(Display& display
         }
     });
     return PrimarySelectionManager{std::move(impl)};
+}
+
+Signal<SelectionChange>& PrimarySelectionManager::selection_changed() noexcept {
+    return impl_->selection_changed;
+}
+
+const std::vector<std::string>& PrimarySelectionManager::selection_mime_types() const noexcept {
+    return impl_->selection != nullptr ? impl_->selection->mimes : impl_->no_mimes;
+}
+
+bool PrimarySelectionManager::selection_receive(const std::string& mime, int fd) {
+    if (impl_->selection == nullptr) {
+        close(fd);
+        return false;
+    }
+    primary_source_send(impl_->selection, mime.c_str(), fd);
+    close(fd);
+    return true;
+}
+
+void PrimarySelectionManager::set_selection(SelectionSource* source) {
+    if (source == nullptr) {
+        primary_set_selection(impl_.get(), nullptr);
+        return;
+    }
+    auto* wrapper = new PrimarySource{};
+    wrapper->external = source;
+    wrapper->mgr = impl_.get();
+    wrapper->mimes = source->mime_types();
+    primary_set_selection(impl_.get(), wrapper);
+    impl_->external_selection = wrapper;
+}
+
+SelectionSource* PrimarySelectionManager::selection_source() const noexcept {
+    return impl_->selection != nullptr ? impl_->selection->external : nullptr;
 }
 
 } // namespace luminaria

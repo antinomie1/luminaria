@@ -946,4 +946,12 @@ Surface* surface_from_resource(wl_resource* resource) {
     return static_cast<Surface*>(wl_resource_get_user_data(resource));
 }
 
+Region* region_from_resource(wl_resource* resource) {
+    if (resource == nullptr ||
+        !wl_resource_instance_of(resource, &wl_region_interface, &region_impl)) {
+        return nullptr;
+    }
+    return static_cast<Region*>(wl_resource_get_user_data(resource));
+}
+
 } // namespace luminaria
