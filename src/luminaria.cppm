@@ -35,6 +35,7 @@ export import :fractional_scale;
 export import :handle;
 export import :headless;
 export import :idle_inhibit;
+export import :idle_notify;
 export import :input_event;
 export import :layer_shell;
 export import :libinput;

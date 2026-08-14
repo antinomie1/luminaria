@@ -93,6 +93,7 @@ target("luminaria")
             {"pointer-constraints-unstable-v1", "unstable/pointer-constraints/pointer-constraints-unstable-v1.xml", "scl"},
             {"text-input-unstable-v3",        "unstable/text-input/text-input-unstable-v3.xml",             "scl"},
             {"idle-inhibit-unstable-v1",      "unstable/idle-inhibit/idle-inhibit-unstable-v1.xml",         "scl"},
+            {"ext-idle-notify-v1",            "staging/ext-idle-notify/ext-idle-notify-v1.xml",             "scl"},
         }
         -- Protocols upstream does not ship; the XML lives in protocol/.
         local local_protocols = {

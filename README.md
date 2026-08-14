@@ -146,6 +146,7 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
 | 协议 | `zwp_relative_pointer_manager_v1` — 指针的**位移**而非位置。光标被锁住不动时 `wl_pointer.motion` 一个都不会发，游戏/3D 视口就是靠这条通道看见鼠标在动；加速后与设备原始两套 delta 都给，后者是游戏要的。事件只发给持有指针焦点的客户端 | relative-pointer |
 | 协议 | `zwp_pointer_constraints_v1` — 锁定（locked，光标钉死不动）与限制（confined，光标能动但出不了表面/区域）。客户端只能**请求**，`activate()` 之前一律无效，且**表面没有指针焦点时拒绝激活** —— 这条规则写在库里，compositor 想忘也忘不掉；焦点一走自动解除。region / cursor position hint 是双缓冲状态，随 `wl_surface.commit` 生效 | pointer-constraints |
 | 协议 | `zwp_text_input_manager_v3` — 中文/日文输入法的通道。客户端侧状态（enable、周边文本、内容类型、光标矩形）双缓冲，`commit` 时整体生效；我们回的 preedit / commit_string / delete_surrounding_text 同样攒到 `send_done()` 才发，done 的 serial 就是收到的 commit 次数。焦点跟随 seat 键盘焦点，不由客户端选。本库只终结协议，接 IBus/Fcitx 或 input-method-v2 是 compositor 的事 | text-input |
+| 协议 | `ext_idle_notifier_v1` (v2) — 反方向：告诉客户端「用户已经 N 毫秒没动了」。锁屏器要 10 分钟、调光要 30 秒，各自一个独立定时器互不干扰。库看不见输入，所以活动信号由 compositor 调 `notify_activity()` 送进来；v2 的 `get_input_idle_notification` 与普通的差别只有一条——它**无视 idle inhibitor**，把 `IdleInhibitManager::changed` 接到 `set_inhibited()` 上，两种语义就都对了 | idle-notify |
 | 协议 | `zwp_idle_inhibit_manager_v1` — 「正在放视频，别息屏」。协议本身零回程流量，全部意义在服务端：`inhibited()` 只统计**可见**的 inhibitor（`set_visible(false)` 表示表面被最小化/切走了），`changed` 只在跨越 0 的那一刻发一次，可以直接接到息屏计时器上 | idle-inhibit |
 | 协议 | `zwlr_data_control_manager_v1` (v2) — 没有窗口的剪贴板：`wl-copy` / `wl-paste` / 剪贴板历史工具要在没有焦点、没有 surface 的情况下读写选区。两块剪贴板都覆盖（普通 + 中键）。写入方向经 `SelectionSource` 桥接进 `DataDeviceManager`，粘贴的客户端看到的就是一个普通 offer，分辨不出源不是 `wl_data_source`。选区易主时旧 offer 立即作废，免得剪贴板管理器把新内容当旧的。**这个 global 绕过了「选区跟随焦点」这条安全规则**，`set_filter()` 可以只发给受信任的客户端 | data-control |
 | 协议 | `linux-drm-syncobj-v1` — 显式 GPU 同步，**全异步、无 CPU 等待**：acquire point 导出成 sync_file 交给渲染器当 `VkSemaphore` 等；渲染的 out-fence 直接写进客户端的 release point，客户端在 GPU 停止读取的那一刻就能复用 buffer | syncobj |
@@ -332,7 +333,7 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 - ✓ **`ext-workspace-v1`** — 工作区列表/切换（见协议表）
 - ✓ **`wlr-foreign-toplevel-management`** — 任务栏列窗口（见协议表）
 - ✓ **`xdg-activation`** — 焦点转移 / 紧急提示（见协议表）
-- △ **idle**：`idle-inhibit` ✓（视频防息屏，见协议表）/ `ext-idle-notify` ✗（空闲通知）
+- ✓ **idle**：`idle-inhibit`（视频防息屏）+ `ext-idle-notify`（空闲通知），两个方向都齐了
 - ✗ **output-management + gamma-control**（夜间模式）
 - ✓ **`data-control`**（剪贴板管理器）— `zwlr_data_control_manager_v1` v2，见协议表
 - ✓ **relative-pointer + pointer-constraints**（游戏/3D 锁定光标）— 见协议表；
