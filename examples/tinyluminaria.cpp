@@ -4,7 +4,7 @@
 // Runs on the headless backend (no GPU/display needed to smoke-test the wiring).
 // Env knobs: LUMINARIA_BACKEND=headless forces headless, LUMINARIA_OUTPUT=WxH
 // sets the output size, LUMINARIA_EXIT_MS auto-terminates after N ms (smoke test).
-#include "luminaria/detail/wayland_fwd.h"
+#include "detail/wayland_fwd.h"
 
 #include <algorithm>
 #include <cstdint>

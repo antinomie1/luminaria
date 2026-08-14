@@ -42,13 +42,15 @@ sudo dnf install -y \
   xorg-x11-server-Xwayland libxcb-devel xcb-util-wm-devel
 ```
 
-编译需 **gcc ≥ 16**（更早的版本编不动模块分区），以及 Vulkan、xkbcommon、
+编译需 **clang ≥ 22**（`xmake f --toolchain=clang`）或 **gcc ≥ 16** —— 更早的版本编不动
+模块分区。目前实际验证过的是 clang 22：库、示例、47 个测试全部构建通过，`xmake test` 47/47。
+另需 Vulkan、xkbcommon、
 libdrm、libinput、libudev、**libseat**、wayland-protocols，外加
 **`glslangValidator`（glslang 包）**—— 渲染器的纹理四边形管线用它把 GLSL 编成 SPIR-V 并
 直接嵌进二进制（运行时不读 shader 文件）。
 
 光标主题不需要 libXcursor：XCursor 文件格式的解析器就在
-`src/render/cursor_theme.cpp` 里（含主题继承与动画帧），免去把 X11 拖进 Wayland
+`cursor_theme.cppm` 里（含主题继承与动画帧），免去把 X11 拖进 Wayland
 compositor。
 
 ---
@@ -70,12 +72,36 @@ xmake f -m release && xmake   # 优化构建（默认是 debug）
 
 ### 模块结构
 
-| 文件 | 角色 |
-|---|---|
-| `include/luminaria.cppm` | 主接口单元，只做 `export import` |
-| `include/luminaria/**.cppm` | 接口分区，一个对应原来的一个公开头文件（`util/box.cppm` = `luminaria:util.box`） |
-| `src/**.cpp` | 实现单元（`module luminaria;`），隐式导入主接口 |
-| `include/luminaria/detail/wayland_fwd.h` | 唯一剩下的头文件：libwayland 不透明类型的前置声明，供各单元在 global module fragment 里 `#include` |
+没有 `include/`——这里没有任何东西是头文件，所以不存在「接口与实现分家」这回事。
+`src/` 按职责分目录，分区名则是扁平的（跟文件名走，不跟路径走），所以挪动文件不构成 API 变化。
+
+```
+src/luminaria.cppm       主接口单元，只做 export import
+src/core/                display event_loop expected handle signal
+src/util/                box color dmabuf pixel rect_fill region transform
+src/backend/             backend output input_event session drm headless libinput wayland
+src/render/              vulkan cursor_theme + quad.{vert,frag}
+src/scene/               scene output_layout
+src/protocol/            25 个 Wayland global，一个一文件
+src/xwayland/            X11 桥
+src/detail/wayland_fwd.h 唯一剩下的头文件
+```
+
+每个 `.cppm` **接口与实现同文件**：先是 `export namespace luminaria { … }`，然后一条
+`// --- implementation` 分隔线，之后是 pimpl 的 `struct X::Impl`、匿名 namespace 里的
+协议胶水和成员定义。
+
+分区之间必须**显式 `import` 且不能成环**。旧布局把这件事藏起来了——实现单元白拿整个主
+接口，所以谁也不用声明依赖；现在 `seat.cppm` 想看见 `Surface` 就得写
+`import :compositor;`。当前的依赖图是一个八层的 DAG，底层是 `box` / `signal` /
+`expected`，顶层是 `data_control`；新加一条闭合成环的边会直接编译不过，这时候该做的是把
+共用的类型下沉到第三个更低的分区里。
+
+合并之后还有两条只有编译器会告诉你的规矩：**模块链接的声明不能在签名里出现匿名 namespace
+里的类型**（`Impl::light_up(DrmOutput&)` 这种，`-WTU-local-entity-exposure`），把那个类型
+提到 `namespace luminaria` 作用域即可，它仍然不导出；以及**实现部分的 namespace 级名字现在
+全模块共享**，所以 `using Mgr = …` 这类别名要带分区前缀（`DcMgr` / `DdMgr` / `FtImpl` …），
+而匿名 namespace 里的 `manager_bind` 们照旧各不相干。
 
 用 xmake 而不是 Meson 的原因很实际：Meson 的模块依赖扫描器把输出名硬编码成 MSVC 的
 `.ifc`（`mesonbuild/scripts/depscan.py`），GCC 下 ninja 直接报
@@ -97,7 +123,7 @@ xmake f -m release && xmake   # 优化构建（默认是 debug）
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | 协议 | `wl_compositor` v6 + `wl_surface` — **全部请求实现，无空操作**：attach / commit / frame、damage + damage_buffer（按 buffer scale/transform 反算）、`set_opaque_region` / `set_input_region`（真 region，决定遮挡剔除与命中测试）、`set_buffer_scale` / `set_buffer_transform`、`offset`；`preferred_buffer_scale` / `preferred_buffer_transform` 事件。`frame` 回调**推迟到实际上屏**而非 commit | compositor, frame-timing, surface-state |
-| 协议 | `wl_region` — `add` / `subtract` 由不相交矩形集实现（`util/region.hpp`），不是空操作 | region |
+| 协议 | `wl_region` — `add` / `subtract` 由不相交矩形集实现（`region.cppm`），不是空操作 | region |
 | 协议 | `wl_shm` buffer → RGBA 读回（ARGB8888 + XRGB8888） | client-texture |
 | 协议 | `linux-dmabuf-unstable-v1` (v3) + GBM 分配器 — GPU 客户端 dmabuf buffer 导入（ARGB8888 / XRGB8888，**任意 GPU modifier**）；广告 GPU 实际支持的 modifier 列表。合成路径**零拷贝**：`Surface::current_buffer_texture()` 经 Vulkan external-memory 直接把客户端 dmabuf 变成 `GpuTexture`，不落 CPU（CPU RGBA 读回只留给 screencopy / 老式 shm buffer） | dmabuf, gpu-scanout |
 | 协议 | `xdg_wm_base` v5 / `xdg_surface` / `xdg_toplevel` 全生命周期（配置握手 → map/unmap）；窗口状态机：maximize / fullscreen / activated / resizing 随 configure 下发，title / app_id / min-max size / window geometry 全部记录，交互式 move/resize 与 minimize 以信号交给 compositor 仲裁；`configure_bounds`（v4）+ `wm_capabilities`（v5） | xdg, toplevel-state |
@@ -286,11 +312,11 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
       焦点跟随 seat、preedit / commit_string / delete_surrounding_text + done serial）。
       **仍缺** `input-method-v2`：输入法程序自己接进来的那一半，现在得由 compositor 自行桥接
       IBus / Fcitx
-- ✓ **libseat** 会话管理 + VT 切换 —— `luminaria/session.hpp`。设备经 libseat 打开；
+- ✓ **libseat** 会话管理 + VT 切换 —— `session.cppm`。设备经 libseat 打开；
       会话失活时 DRM 丢 master、停止提交、libinput 挂起，恢复时重取 master 并重新 modeset。
       没有 seat 时如实降级（仍可从已登录 VT 跑，只是切 VT 不安全）
 - ✓ **光标** — `cursor-shape-v1`（shape → XDG 光标名）、**光标主题加载**
-      （`luminaria/cursor_theme.hpp`，自带 XCursor 解析器，支持主题继承与动画帧，不依赖
+      （`cursor_theme.cppm`，自带 XCursor 解析器，支持主题继承与动画帧，不依赖
       libXcursor）、**硬件光标 plane**（移动指针是一次只碰 cursor plane 的 atomic 提交）
 - ✓ **libinput 路由到 seat** — `luminaria-tty` 用与渲染同一份图层列表做命中测试
       （`Surface::accepts_input()`，尊重 input region），指针 enter/motion/button 与

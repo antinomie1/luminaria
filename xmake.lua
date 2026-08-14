@@ -1,8 +1,11 @@
 -- Luminaria — a minimal Wayland compositor library.
 --
--- Built as a C++23 *module*: `import luminaria;` is the whole interface. The
--- interface partitions live in include/luminaria/**.cppm (one per former public
--- header) and are marked public so dependent targets can import them.
+-- Built as a C++23 *module*: `import luminaria;` is the whole interface. Every
+-- partition lives in src/**/*.cppm — one file per concept, holding both its
+-- interface and its implementation — and they are marked public so dependent
+-- targets can import them. There is no include/: nothing here is a header, so
+-- the tree is grouped by responsibility (core, util, backend, render, scene,
+-- protocol, xwayland) rather than split interface-from-implementation.
 --
 -- xmake rather than Meson because Meson's module dependency scanner still emits
 -- MSVC-shaped `.ifc` outputs and cannot drive GCC's modules at all.
@@ -43,11 +46,12 @@ end
 
 target("luminaria")
     set_kind("static")
-    -- Interface partitions: public so anything depending on us can import them.
-    add_files("include/luminaria.cppm", "include/luminaria/**.cppm", {public = true})
-    -- for detail/wayland_fwd.h, which the interface units include in their GMF
-    add_includedirs("include", {public = true})
-    add_files("src/**.cpp")
+    -- Every module unit: public so anything depending on us can import them.
+    -- The implementation now lives in the partitions, so there are no .cpp files
+    -- of our own left — only wayland-scanner's C glue, added in on_load below.
+    add_files("src/**.cppm", {public = true})
+    -- for detail/wayland_fwd.h, included in the units' GMF
+    add_includedirs("src", {public = true})
     add_packages(pkg_aliases, {public = true})
     on_load(function (target)
         -- os.iorunv is only exposed in script scope, so the generator lives

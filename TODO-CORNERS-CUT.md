@@ -27,21 +27,21 @@ idle-inhibit / wlr-data-control 之后）。列出源码中所有 `TODO` 注释�
 |------|------|
 | `examples/tty_compositor.cpp` | 窗口以固定偏移层叠（无移动/缩放/堆叠 UI）。 |
 
-### `include/luminaria/` 头文件
+### 分区接口部分
 
 | 文件 | TODO |
 |------|------|
-| `backend/drm.hpp` | 无客户端 buffer 直出（全屏免合成）；无模式切换 —— 每输出固定用 connector 的首选模式。 |
-| `backend/wayland.hpp` | 嵌套后端呈现走 wl_shm CPU 路径（父 compositor 那一侧）。 |
-| `xwayland.hpp` | 最小 XWM —— 已处理 map/configure 请求；完整 ICCCM/EWMH 待补。 |
+| `drm.cppm` | 无客户端 buffer 直出（全屏免合成）；无模式切换 —— 每输出固定用 connector 的首选模式。 |
+| `wayland.cppm` | 嵌套后端呈现走 wl_shm CPU 路径（父 compositor 那一侧）。 |
+| `xwayland.cppm` | 最小 XWM —— 已处理 map/configure 请求；完整 ICCCM/EWMH 待补。 |
 
-**其余头文件的 TODO 已全部清除。**
+**其余分区的 TODO 已全部清除。**
 
 ---
 
 ## 二、Corners Cut — 仍在的简化
 
-### 2.1 `wl_surface`（`src/types/compositor.cpp`）
+### 2.1 `wl_surface`（`compositor.cppm`）
 
 **全部请求均已实现，无空操作桩。**
 
@@ -58,14 +58,14 @@ idle-inhibit / wlr-data-control 之后）。列出源码中所有 `TODO` 注释�
 `wl_compositor` 版本升到 **6**，新增 `preferred_buffer_scale` /
 `preferred_buffer_transform` 事件。
 
-### 2.2 `wl_region`（`src/types/compositor.cpp`）
+### 2.2 `wl_region`（`compositor.cppm`）
 
-`add` / `subtract` 由 `util/region.hpp` 的不相交矩形集实现（见 `tests/test_region.cpp`）。
+`add` / `subtract` 由 `region.cppm` 的不相交矩形集实现（见 `tests/test_region.cpp`）。
 
 > **天花板：** `Region` 是 O(n) 的矩形向量，不合并相邻矩形。真实负载下矩形数量成为问题时
 > 换 `pixman_region32`。已标 `ponytail:`。
 
-### 2.3 `xdg_toplevel`（`src/types/xdg_shell.cpp`）
+### 2.3 `xdg_toplevel`（`xdg_shell.cppm`）
 
 **13 个请求全部实现，无空操作桩。** `set_parent` 维护 transient-for 关系并发
 `ToplevelParentChange`（两端销毁时自动解链）；`show_window_menu` 发
@@ -127,18 +127,18 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 
 | 项 | 状态 |
 |----|------|
-| libseat 会话 / VT 切换 | **已实现**（`luminaria/session.hpp`）。DRM 后端在失活时 `drmDropMaster` 并暂停提交，恢复时重取 master + 重新 modeset；libinput 走 `libinput_suspend/resume` |
+| libseat 会话 / VT 切换 | **已实现**（`session.cppm`）。DRM 后端在失活时 `drmDropMaster` 并暂停提交，恢复时重取 master + 重新 modeset；libinput 走 `libinput_suspend/resume` |
 | 硬件光标平面 | **已实现**。每输出额外认领一个 `DRM_PLANE_TYPE_CURSOR`，独立 atomic 提交，移动指针不触发重绘 |
-| 光标主题 | **已实现**（`luminaria/cursor_theme.hpp`）。自带 XCursor 解析器（含主题继承与动画帧），不依赖 libXcursor / X11 |
+| 光标主题 | **已实现**（`cursor_theme.cppm`）。自带 XCursor 解析器（含主题继承与动画帧），不依赖 libXcursor / X11 |
 | 客户端 buffer 直出 | 未做 —— 全屏单窗口免合成 |
 | 模式切换 | 未做 —— 固定用 connector 首选模式 |
 | GPU 本身热插拔 | 未做 —— 只跟踪 connector 状态 |
 
-### 2.9 截图/录屏（`src/types/screencopy.cpp`）
+### 2.9 截图/录屏（`screencopy.cppm`）
 
 一处 `// no-op: unsupported`（不支持的捕获格式组合）。
 
-### 2.10 layer-shell（`src/types/layer_shell.cpp`）
+### 2.10 layer-shell（`layer_shell.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -149,7 +149,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | `get_popup` | 只发 `LayerSurface::new_popup` 信号 —— 库不替 xdg_popup 换父级。面板菜单的定位要 compositor 自己按 layer surface 的位置摆（`Popup::parent_surface()` 对这种 popup 是 null） |
 | 输出选择 | `output_resource()` 原样交出客户端要的 wl_output（可为 null = 由 compositor 挑）。库不做"最近使用的输出"这类策略 |
 
-### 2.11 foreign-toplevel（`src/types/foreign_toplevel.cpp`）
+### 2.11 foreign-toplevel（`foreign_toplevel.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -158,7 +158,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | `output_enter/leave` | 要 compositor 调 `set_output()` 才有 —— 窗口在哪块屏上是 compositor 的布局知识，库看不到 |
 | minimized 状态 | 借 `Toplevel::set_minimized()` 记账。xdg-shell 没有 minimized 状态，所以这一位**不下发给客户端**，只用于窗口列表与 compositor 自己 |
 
-### 2.12 xdg-activation（`src/types/xdg_activation.cpp`）
+### 2.12 xdg-activation（`xdg_activation.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -167,7 +167,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | serial 校验 | **不做** —— 库没有"这个客户端最近收到过哪些 serial"的账。`ActivationTokenRequest` 把 seat + serial 原样交给 compositor，`granted` 默认 true。防焦点窃取要 compositor 自己核对 |
 | 未兑换 token | 最多存 32 个，超了丢最旧的。要了 token 又不用的客户端不会把内存吃光，代价是极端情况下老 token 提前失效 |
 
-### 2.13 relative-pointer（`src/types/relative_pointer.cpp`）
+### 2.13 relative-pointer（`relative_pointer.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -175,7 +175,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | 事件路由 | 只发给持有**指针焦点**的客户端；没有焦点时 `send_motion()` 静默丢弃 |
 | delta 来源 | 加速后与未加速两对值都照单转发，库不自己算加速曲线 —— 只有一对可用的后端应当把同一对传两次 |
 
-### 2.14 pointer-constraints（`src/types/pointer_constraints.cpp`）
+### 2.14 pointer-constraints（`pointer_constraints.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -185,7 +185,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | region / cursor hint | 双缓冲，随 `wl_surface.commit` 生效；创建请求里带的初始 region 立即生效 |
 | 光标实际的钉住 / 限制 | **不做** —— 库不拥有光标位置。`active_constraint()` 告诉 compositor 该不该动光标、`region()` 给出边界，真正的钳位在 compositor 的指针处理里 |
 
-### 2.15 text-input-v3（`src/types/text_input.cpp`）
+### 2.15 text-input-v3（`text_input.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -195,7 +195,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | `input-method-v2` | **未实现** —— 本库只终结 text-input 一侧。接 IBus / Fcitx 或实现 input-method global 是 compositor 的事，这是 P1 剩下的唯一缺口 |
 | "同一 seat 上只允许一个 text input 处于 enabled" | **不强制** —— 协议说重复 `enable` 应被忽略，实际工具包不会这么干；`focused()` 取第一个 enabled 的 |
 
-### 2.16 idle-inhibit（`src/types/idle_inhibit.cpp`）
+### 2.16 idle-inhibit（`idle_inhibit.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -203,7 +203,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | `changed` 信号 | 只在跨越 0 的那一刻发，可以直接接息屏计时器 |
 | `ext-idle-notify-v1` | **未实现** —— 反方向的协议（告诉客户端"用户闲了 N 秒"），与本条正交 |
 
-### 2.17 data-control（`src/types/data_control.cpp`）
+### 2.17 data-control（`data_control.cppm`）
 
 | 项 | 状态 |
 |----|------|
@@ -220,7 +220,7 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | 类别 | 数量 |
 |------|------|
 | TODO 注释 (`.cpp` / `examples/`) | 1 |
-| TODO 注释 (`.hpp`) | 3 |
+| TODO 注释（分区接口） | 3 |
 | 空操作桩函数 | **0** |
 | **总计标记点** | **~4**（上一轮 ~26） |
 
@@ -252,4 +252,4 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | ✓ relative-pointer / pointer-constraints (P2) | §2.13 / §2.14 |
 | △ idle (P2) | §2.16 —— `idle-inhibit` 已做，`ext-idle-notify` 未做 |
 | ✓ data-control (P2) | §2.17 |
-| △ XWM（非协议部分） | `xwayland.hpp` TODO：minimal |
+| △ XWM（非协议部分） | `xwayland.cppm` TODO：minimal |

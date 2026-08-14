@@ -26,8 +26,10 @@ xmake f -m release        # optimised build; debug is the default
 ```
 
 Warnings are fatal (`all`, `extra`, `pedantic`, `error`), minus
-`-Wno-missing-field-initializers` for the libwayland vtable idiom. Requires **gcc ≥ 16** —
-older compilers cannot build the module partitions — plus `glslangValidator` and `libseat`.
+`-Wno-missing-field-initializers` for the libwayland vtable idiom. Needs **clang ≥ 22**
+(`xmake f --toolchain=clang`) or **gcc ≥ 16** — older compilers cannot build the module
+partitions — plus `glslangValidator` and `libseat`. clang is the toolchain the tree is
+currently verified against: 47/47 tests pass under clang 22.
 
 **Why xmake and not Meson.** Meson's module dependency scanner hardcodes MSVC-shaped `.ifc`
 output names (`mesonbuild/scripts/depscan.py`), so ninja dies with "inputs may not also have
@@ -39,20 +41,59 @@ configure time and is regenerated only when its input is newer.
 
 ## Modules
 
-- `include/luminaria.cppm` is the primary interface unit. It does nothing but
-  `export import` every partition.
-- `include/luminaria/**.cppm` is one **interface partition** per former public header, named
-  after its path: `util/box.cppm` is `luminaria:util.box`. Consumers never name a partition.
-- `src/**.cpp` are **implementation units** (`module luminaria;`). They implicitly import the
-  primary interface, so they need no imports of their own — only their C and std includes,
-  which must sit in the global module fragment above `module luminaria;`.
+There is no `include/`. Nothing here is a header, so nothing is split
+interface-from-implementation; `src/` is grouped by responsibility instead:
+
+```
+src/luminaria.cppm       primary interface unit — nothing but `export import`
+src/core/                display event_loop expected handle signal
+src/util/                box color dmabuf pixel rect_fill region transform
+src/backend/             backend output input_event session drm headless libinput wayland
+src/render/              vulkan cursor_theme + quad.{vert,frag}
+src/scene/               scene output_layout
+src/protocol/            the 25 Wayland globals, one file each
+src/xwayland/            the X11 bridge
+src/detail/wayland_fwd.h the one remaining header
+```
+
+- `src/**/<name>.cppm` is one **partition** per concept, named after the *file* and not its
+  path: `util/box.cppm` is `luminaria:box`. Directories organise the tree for humans;
+  partition names are flat, so moving a file between folders is not an API change.
+  Each file holds its interface *and* its implementation — the exported declarations in
+  `export namespace luminaria { … }`, then a `// --- implementation` divider, then the pimpl
+  `struct X::Impl`, the protocol glue in an anonymous namespace, and the member definitions.
+  Consumers never name a partition.
+- **Partitions must import what they use, and the import graph must stay acyclic.** This is
+  the one thing the old layout hid: implementation units got the whole primary interface for
+  free, so nothing ever declared a dependency. Now `seat.cppm` needs an explicit
+  `import :compositor;` to see `Surface`. The graph is currently a DAG eight levels deep —
+  `box`/`signal`/`expected` at the bottom, `data_control` at the top — and a new edge that
+  closes a cycle will not compile. If two partitions genuinely need each other, the shared
+  type belongs in a third, lower one.
 - Anything a unit `#include`s belongs in its **global module fragment**: `module;` first, then
   the includes, then `export module …`. Declaring a C type after `export module` attaches it
   to module luminaria and makes it a *different type* from the one the C headers declare.
   That is why the opaque forward declarations live in
-  `include/luminaria/detail/wayland_fwd.h` and are `#include`d — declaring them inline in the
-  fragment trips `-Wglobal-module`.
-- Two gcc-16 quirks worth knowing before you hit them: a defaulted **hidden-friend**
+  `src/detail/wayland_fwd.h` and are `#include`d — declaring them inline in the
+  fragment trips `-Wglobal-module`. Note that the GMF now also carries the real
+  `<wayland-server-core.h>` etc. that the implementation needs; GMF entities are not exported,
+  so `import luminaria;` still pulls in none of them. **Every** `#include` must be up there —
+  one below the module declaration is an error under clang
+  (`-Winclude-angled-in-module-purview`), which is why `session.cppm` wraps its
+  `extern "C" { #include <libseat.h> }` into the fragment.
+- **A module-linkage declaration may not name a TU-local type.** The glue in an anonymous
+  namespace has internal linkage, but `struct X::Impl` and its members have module linkage, so
+  `Impl::light_up(DrmOutput&)` where `DrmOutput` sits in the anonymous namespace is ill-formed
+  (`-WTU-local-entity-exposure`). This never came up while the implementations were separate
+  `.cpp` files. The fix is to lift just that type to `namespace luminaria` scope — it is still
+  unexported, so it stays private to the module — and leave the free functions where they are.
+  `drm.cppm`, `workspace.cppm` and `linux_dmabuf.cppm` carry a comment saying so.
+- **Namespace-scope names in the implementation half are now shared across the whole module.**
+  Two partitions can each have a `static`-ish `manager_bind` because those live in anonymous
+  namespaces, but a bare `using Mgr = Foo::Impl;` at namespace scope collides with every other
+  partition's `Mgr`. Hence `DcMgr` / `DdMgr` / `FsMgr` / `FtImpl` / `WsBinding` and friends:
+  aliases in the implementation half carry a partition prefix.
+- Two gcc-16 quirks worth knowing before you hit them (clang 22 accepts both): a defaulted **hidden-friend**
   `operator==` in an interface unit ICEs (use the member form), and `std::function` /
   `std::make_shared` want `<typeinfo>` visible at every point of instantiation rather than
   inheriting it the way a header did.
@@ -77,7 +118,7 @@ disconnect. `vulkan`/`composite`/`texture` need a real GPU; `wayland-nested` nee
 
 ## Architecture
 
-Layers, bottom-up (`src/` mirrors `include/luminaria/`):
+Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
 
 - **core** — `Display` (owns `wl_display` + socket + main loop), `EventLoop`/`EventSource`
   (non-owning view + RAII timer/fd sources), `Signal<Event>`, `Result<T>`, `CUnique`.
@@ -88,9 +129,9 @@ Layers, bottom-up (`src/` mirrors `include/luminaria/`):
   by a udev hotplug monitor, `import_scanout`/`commit_scanout(id, in_fence)` for GPU dmabuf
   framebuffers, plus an optional hardware cursor plane), `LibinputBackend` (bare-metal input
   signals). Every `Output` carries a `scale` and a `Transform`; `Output::destroy` fires when a
-  monitor goes away. `Session` (libseat, `backend/session.cpp`) owns the device fds and tells
+  monitor goes away. `Session` (libseat, `session.cppm`) owns the device fds and tells
   both bare-metal backends when the VT is taken away.
-- **types/** — one file per Wayland global: `compositor` (`wl_compositor`/`wl_surface`,
+- **protocol types** — one partition per Wayland global: `compositor` (`wl_compositor`/`wl_surface`,
   including the subsurface tree), `subcompositor`, `xdg_shell` (toplevels + popups +
   positioners), `seat` (keyboard/pointer/touch/cursor/DnD hooks), `output_global`,
   `linux_dmabuf`, `screencopy`, `data_device` (clipboard + DnD + primary selection),
@@ -102,7 +143,7 @@ Layers, bottom-up (`src/` mirrors `include/luminaria/`):
   `track()`), `xdg_activation`, `relative_pointer`, `pointer_constraints`,
   `text_input` (text-input-v3), `idle_inhibit`, `data_control`
   (wlr-data-control, bridged into `data_device` through `SelectionSource`).
-- **render/vulkan** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
+- **`vulkan`** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs
   are in the output's *logical* coordinates; the `OutputMapping` (scale + transform) turns
@@ -116,14 +157,14 @@ Layers, bottom-up (`src/` mirrors `include/luminaria/`):
   `RenderSync` — waits on client acquire fences as `VkSemaphore`s and hands back a
   sync_file instead of stalling. Unfinished submits live in `Impl::in_flight` until their
   fence clears.
-- **scene** — retained tree (Tree/Rect/Surface), positioning, hit-testing, flattening to
+- **`scene`** — retained tree (Tree/Rect/Surface), positioning, hit-testing, flattening to
   `RectFill`s and `GpuTextureFill`s, and damage (`scene_damage()` →
   `scene_rects(root, damage)` / `scene_textures(root, renderer, damage)` →
-  `scene_clear_damage()`); `OutputLayout` (`scene/output_layout.cpp`) is the one place
+  `scene_clear_damage()`); `OutputLayout` (`output_layout.cppm`) is the one place
   that knows where each output sits in the global coordinate space, in *logical* units
-  (`util/transform.hpp` holds the logical↔device mapping and nothing else does).
-  `util/region.hpp` is the disjoint-box set both damage and wl_region are built on.
-- **xwayland** — spawns Xwayland plus a minimal XWM over xcb.
+  (`transform.cppm` holds the logical↔device mapping and nothing else does).
+  `region.cppm` is the disjoint-box set both damage and wl_region are built on.
+- **`xwayland`** — spawns Xwayland plus a minimal XWM over xcb.
 
 Per-frame flow in a compositor built on this (see `examples/tinyluminaria.cpp`,
 `examples/tty_compositor.cpp`): `Output::frame` fires → walk mapped toplevels, each expanded
@@ -167,27 +208,27 @@ calls `clear_damage()`.
 - **No exceptions across the C boundary.** Fallible operations return `Result<T>` /
   `Status` (`fail("msg")`, `ok()`). Vulkan-Hpp throws internally; every `VulkanRenderer`
   method catches at its boundary and converts to `Result`.
-- **Public headers are C-header-free.** `wl_display`, `wl_resource`, etc. are forward-declared
-  only; all libwayland/Vulkan/xcb includes live in `.cpp`. Protocol globals use a pimpl
-  (`struct Impl` declared public, defined in the `.cpp`) so their address is stable for the
+- **The exported interface is C-header-free.** `wl_display`, `wl_resource`, etc. are forward-declared
+  only; all libwayland/Vulkan/xcb includes live in the global module fragment. Protocol globals
+  use a pimpl (`struct Impl` declared public, defined below the implementation divider) so their address is stable for the
   `wl_global` user-data pointer, while the wrapper stays move-only.
 - **Lifetime via RAII, never manual list surgery.** `Signal<E>::Connection` disconnects on
   destruction and survives either destruction order; C handles are wrapped in `CUnique<T, fn>`.
   There should be no `wl_list_remove` calls in compositor code.
 - **Null request slots abort libwayland.** Real GTK/Qt clients call requests we haven't
   implemented, and libwayland aborts on a null slot — so unimplemented requests are wired to
-  explicit no-op functions (`surface_noop_*` in `src/types/compositor.cpp`, `tl_set_parent` /
+  explicit no-op functions (`surface_noop_*` in `compositor.cppm`, `tl_set_parent` /
   `tl_show_window_menu`). When adding a protocol, fill every slot in the interface vtable.
   `-Wno-missing-field-initializers` is set project-wide for exactly this idiom.
 - **Raw `Surface*` needs a `Surface::destroy` subscription.** Anything caching a surface
   pointer (seat focus, cursor, drag focus, scene nodes) connects to `Surface::destroy` and
   clears the pointer there; the `Signal::Connection` is RAII so it can't outlive the holder.
-  `src/types/seat.cpp` is the reference for the pattern.
+  `seat.cppm` is the reference for the pattern.
 - **Any retained `wl_resource*` owned by a CLIENT needs a destroy listener.** Buffers are
   the sharp edge: toolkits drop their whole swapchain on resize / hide / re-show, so a
   committed `wl_buffer` dies under you and the next `wl_buffer.release` or readback
-  segfaults. `Surface::BufferWatch` (`src/types/compositor.cpp`) and `ExtFrame`'s
-  `buffer_destroy` (`src/types/screencopy.cpp`) show the shape:
+  segfaults. `Surface::BufferWatch` (`compositor.cppm`) and `ExtFrame`'s
+  `buffer_destroy` (`screencopy.cppm`) show the shape:
   `wl_resource_add_destroy_listener` + null the slot. `tests/test_buffer_destroy.cpp`
   guards it. This is the one place raw libwayland listeners are correct — the C signal is
   on the client's resource, not on one of our `Signal`s.
@@ -199,10 +240,11 @@ calls `clear_damage()`.
 2. Add a row to the `protocols` (or `local_protocols`) table in `xmake.lua`: name, path, and
    which halves to generate — `s` server header, `c` private code, `l` client header for
    tests that act as clients.
-3. Write `src/types/<name>.cpp` as an implementation unit and
-   `include/luminaria/<name>.cppm` as an interface partition, following the pimpl + `Result`
-   pattern above. Both are picked up by the existing globs; nothing else to register.
-4. Add `export import :<name>;` to `include/luminaria.cppm`.
+3. Write `src/protocol/<name>.cppm`: the exported interface, the `// --- implementation`
+   divider, then the glue — following the pimpl + `Result` pattern above. Add an
+   `import :<dep>;` for every partition you use, and keep the graph acyclic. The file is
+   picked up by the existing glob; nothing else to register.
+4. Add `export import :<name>;` to `src/luminaria.cppm`.
 5. Drop a test in `tests/` — `xmake.lua` turns every `tests/test_*.cpp` into its own binary
    automatically. Exit 77 to skip when the machine cannot run it.
 
