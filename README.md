@@ -43,7 +43,7 @@ sudo dnf install -y \
 ```
 
 编译需 **clang ≥ 22**（`xmake f --toolchain=clang`）或 **gcc ≥ 16** —— 更早的版本编不动
-模块分区。目前实际验证过的是 clang 22：库、示例、47 个测试全部构建通过，`xmake test` 47/47。
+模块分区。目前实际验证过的是 clang 22：库、示例与全部测试构建通过，`xmake test` 全绿。
 另需 Vulkan、xkbcommon、
 libdrm、libinput、libudev、**libseat**、wayland-protocols，外加
 **`glslangValidator`（glslang 包）**—— 渲染器的纹理四边形管线用它把 GLSL 编成 SPIR-V 并
