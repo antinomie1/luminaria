@@ -281,9 +281,11 @@ void collect_textures(const SceneTree& tree, int ox, int oy, VulkanRenderer& ren
         fill.transform = surface.buffer_transform();
         surface.buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
         // What the client promised is opaque, moved into absolute coordinates —
-        // the renderer skips whatever is behind it.
-        const Box opaque = surface.opaque_region().extents();
-        fill.opaque = Box{box.x + opaque.x, box.y + opaque.y, opaque.width, opaque.height};
+        // the renderer skips whatever is behind it. The whole region travels, not
+        // its bounding box: a rounded-corner window is opaque everywhere but the
+        // corners, and claiming those would cull the wallpaper behind them.
+        fill.opaque = surface.opaque_region();
+        fill.opaque.translate(box.x, box.y);
         out.push_back(fill);
     }
 }

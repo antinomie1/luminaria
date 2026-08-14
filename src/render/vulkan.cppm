@@ -109,12 +109,15 @@ struct GpuTextureFill {
     /// a rotated client on a rotated screen is still one sample.
     Transform transform = Transform::normal;
 
-    /// A sub-rect of the destination the caller guarantees is fully opaque, in
+    /// The part of the destination the caller guarantees is fully opaque, in
     /// logical coordinates. Whatever is behind it is not drawn at all.
     /// Empty (the default) means "assume translucent".
-    // ponytail: one box, not a region — clients that declare an opaque region
-    // overwhelmingly declare the whole surface. Widen it if one ever doesn't.
-    Box opaque{};
+    ///
+    /// A region and not a box, because the difference is visible: a window with
+    /// rounded corners declares itself opaque everywhere *except* the corners,
+    /// and a bounding box would claim those corners too — culling the wallpaper
+    /// that should show through them.
+    Region opaque{};
 
     /// Source crop, normalized against the BUFFER (before `transform`).
     /// Defaults to the whole texture; wp_viewporter narrows it.
@@ -1626,7 +1629,9 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             visible[i] = repaint;
             visible[i].intersect(Box{tf.x, tf.y, tf.w, tf.h});
             visible[i].subtract(covered);
-            covered.add(tf.opaque.intersection(Box{tf.x, tf.y, tf.w, tf.h}));
+            Region opaque = tf.opaque;
+            opaque.intersect(Box{tf.x, tf.y, tf.w, tf.h});
+            covered.add(opaque);
         }
         // Whatever is left over is background and solid rects, the very back.
         Region backdrop = repaint;

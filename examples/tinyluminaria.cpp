@@ -454,9 +454,8 @@ int main() {
                     fill.h = layer.surface->surface_height();
                     fill.transform = layer.surface->buffer_transform();
                     layer.surface->buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
-                    const luminaria::Box extents = layer.surface->opaque_region().extents();
-                    fill.opaque = luminaria::Box{layer.x + extents.x, layer.y + extents.y,
-                                                 extents.width, extents.height};
+                    fill.opaque = layer.surface->opaque_region();
+                    fill.opaque.translate(layer.x, layer.y);
                     gpu_fills.push_back(fill);
                 }
 

@@ -323,9 +323,8 @@ int main(int argc, char** argv) {
                 surface.buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
                 // What the client promised is opaque, so the renderer can skip
                 // everything underneath it.
-                const luminaria::Box extents = surface.opaque_region().extents();
-                fill.opaque = luminaria::Box{x + extents.x, y + extents.y, extents.width,
-                                             extents.height};
+                fill.opaque = surface.opaque_region();
+                fill.opaque.translate(x, y);
                 textures.push_back(fill);
             }
             fe.output.set_tearing(wants_tearing);

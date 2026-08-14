@@ -110,7 +110,7 @@ int main() {
     //     sampled, so painting red under an opaque green leaves green ---
     const luminaria::GpuTextureFill behind{&*texture, 0, 0, kW, kH};
     luminaria::GpuTextureFill front{&*green_tex, 0, 0, kW, kH};
-    front.opaque = luminaria::Box{0, 0, kW, kH};
+    front.opaque = luminaria::Region{luminaria::Box{0, 0, kW, kH}};
     const luminaria::GpuTextureFill both[2] = {behind, front};
     status = renderer->render_to(*target, luminaria::Color{1, 0, 1, 1}, {}, both);
     assert(status.has_value());
@@ -118,6 +118,31 @@ int main() {
                                      p.modifier);
     assert(pixels.has_value());
     assert((at(4, 4) == std::vector<std::uint8_t>{0, 255, 0}));
+
+    // --- a partial opaque region: what it does NOT claim must keep showing what
+    //     is behind it. This is the rounded-corner case — a bounding box would
+    //     claim the whole surface and cull the wallpaper under the corners. ---
+    // Left pixel opaque green, right pixel fully transparent.
+    std::vector<std::uint8_t> half(2 * 1 * 4);
+    half[1] = 255; // left: green
+    half[3] = 255; // left: alpha 255
+    half[7] = 0;   // right: alpha 0
+    auto half_tex = renderer->upload_texture(2, 1, half);
+    assert(half_tex.has_value());
+
+    luminaria::GpuTextureFill notched{&*half_tex, 0, 0, kW, kH};
+    // Only the left half is promised opaque; the right half is see-through.
+    notched.opaque = luminaria::Region{luminaria::Box{0, 0, kW / 2, kH}};
+    const luminaria::GpuTextureFill layered[2] = {behind, notched};
+    status = renderer->render_to(*target, luminaria::Color{0, 0, 1, 1}, {}, layered);
+    assert(status.has_value());
+    pixels = renderer->import_dmabuf(p.fd, p.width, p.height, p.format, p.offset, p.stride,
+                                     p.modifier);
+    assert(pixels.has_value());
+    assert((at(1, 4) == std::vector<std::uint8_t>{0, 255, 0})); // claimed: green on top
+    // Not claimed: the red surface behind was still drawn and shows through.
+    // With a bounding-box opaque this would have been culled to the blue clear.
+    assert((at(6, 4) == std::vector<std::uint8_t>{255, 0, 0}));
 
     // --- a client buffer stored rotated: the same texture, declared as 90
     //     degrees off, must land the other way round ---
