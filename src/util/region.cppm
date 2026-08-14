@@ -6,12 +6,18 @@
 // non-overlapping boxes rather than a pixman region. Disjointness is the whole
 // point: a translucent surface painted twice over the same pixel blends twice.
 //
-// ponytail: O(n) per op with no coalescing of adjacent boxes, so a pathological
-// client can grow the list. Swap in pixman_region32 if a real workload ever
+// Every mutation ends in a coalescing pass, so the box count tracks the shape of
+// the region rather than the history of how it was built: a client that damages a
+// window row by row leaves one box behind, not one per row. That matters because
+// the renderer turns each box into its own scissored draw.
+//
+// ponytail: the ops are O(n) and coalescing is O(n²) on top, which is the right
+// trade while n stays in the tens. Swap in pixman_region32 if a real workload ever
 // makes the box count matter.
 
 module;
 
+#include <cstddef>
 #include <vector>
 
 export module luminaria:region;
@@ -36,6 +42,7 @@ public:
         }
         subtract(box); // keep the invariant: nothing overlaps
         rects_.push_back(box);
+        coalesce();
     }
 
     void add(const Region& other) {
@@ -74,6 +81,7 @@ public:
             }
         }
         rects_ = std::move(out);
+        coalesce();
     }
 
     void subtract(const Region& other) {
@@ -92,6 +100,7 @@ public:
             }
         }
         rects_ = std::move(out);
+        coalesce();
     }
 
     void translate(int dx, int dy) noexcept {
@@ -133,7 +142,37 @@ public:
     [[nodiscard]] bool operator==(const Region&) const = default;
 
 private:
-    std::vector<Box> rects_; // pairwise disjoint
+    /// Merge every pair of boxes that shares a full edge, until none is left.
+    ///
+    /// Disjointness is what makes this sound: two boxes that agree exactly on one
+    /// axis and touch on the other tile a rectangle with no gap and no overlap, so
+    /// their bounding box *is* their union. Boxes that merely overlap or abut
+    /// partially are left alone — merging those would claim pixels the region does
+    /// not contain.
+    void coalesce() noexcept {
+        for (bool merged = true; merged;) {
+            merged = false;
+            for (std::size_t i = 0; i < rects_.size() && !merged; ++i) {
+                for (std::size_t j = i + 1; j < rects_.size(); ++j) {
+                    const Box& a = rects_[i];
+                    const Box& b = rects_[j];
+                    const bool stacked = a.x == b.x && a.width == b.width &&
+                                         (a.y + a.height == b.y || b.y + b.height == a.y);
+                    const bool side_by_side = a.y == b.y && a.height == b.height &&
+                                              (a.x + a.width == b.x || b.x + b.width == a.x);
+                    if (!stacked && !side_by_side) {
+                        continue;
+                    }
+                    rects_[i] = a.union_with(b);
+                    rects_.erase(rects_.begin() + static_cast<std::ptrdiff_t>(j));
+                    merged = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    std::vector<Box> rects_; // pairwise disjoint, and maximally coalesced
 };
 
 } // namespace luminaria

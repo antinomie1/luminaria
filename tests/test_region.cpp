@@ -66,6 +66,69 @@ int main() {
     a.add(b);
     assert(area(a) == 150);
 
+    // --- coalescing: the box count must follow the shape of the region, not the
+    //     order it was built in. Each box becomes its own scissored draw, so a
+    //     client damaging a window row by row must not cost one draw per row. ---
+
+    // Rows stacked into one rectangle.
+    Region rows;
+    for (int y = 0; y < 20; ++y) {
+        rows.add(Box{0, y, 40, 1});
+    }
+    assert(rows.rects().size() == 1);
+    assert(rows.rects()[0] == (Box{0, 0, 40, 20}));
+
+    // Columns too, and in an order that never grows the region monotonically.
+    Region cols;
+    for (int x : {3, 0, 4, 1, 2}) {
+        cols.add(Box{x, 0, 1, 8});
+    }
+    assert(cols.rects().size() == 1);
+    assert(cols.rects()[0] == (Box{0, 0, 5, 8}));
+
+    // The four quadrants of a square, added corner-first, are one box.
+    Region quads;
+    quads.add(Box{0, 0, 5, 5});
+    quads.add(Box{5, 5, 5, 5});
+    quads.add(Box{5, 0, 5, 5});
+    quads.add(Box{0, 5, 5, 5});
+    assert(quads.rects().size() == 1);
+    assert(quads.rects()[0] == (Box{0, 0, 10, 10}));
+
+    // Boxes that only touch at a corner, or overlap on part of an edge, are NOT
+    // one rectangle and must stay separate — merging them would claim pixels the
+    // region does not cover.
+    Region corner;
+    corner.add(Box{0, 0, 5, 5});
+    corner.add(Box{5, 5, 5, 5});
+    assert(corner.rects().size() == 2);
+    assert(area(corner) == 50);
+    assert(!corner.contains(7, 2));
+
+    Region partial;
+    partial.add(Box{0, 0, 10, 5});
+    partial.add(Box{0, 5, 4, 5}); // shares only part of the bottom edge
+    assert(partial.rects().size() == 2);
+    assert(area(partial) == 70);
+    assert(!partial.contains(6, 7));
+
+    // Punching a hole and filling it back in returns to a single box.
+    Region refilled{Box{0, 0, 12, 12}};
+    refilled.subtract(Box{4, 4, 4, 4});
+    assert(refilled.rects().size() > 1);
+    refilled.add(Box{4, 4, 4, 4});
+    assert(refilled.rects().size() == 1);
+    assert(refilled.rects()[0] == (Box{0, 0, 12, 12}));
+
+    // Intersect coalesces too: two boxes clipped down to a shared edge rejoin.
+    Region clip2;
+    clip2.add(Box{0, 0, 10, 10});
+    clip2.add(Box{10, 0, 10, 10});
+    assert(clip2.rects().size() == 1); // already one on the way in
+    clip2.intersect(Box{5, 0, 10, 10});
+    assert(clip2.rects().size() == 1);
+    assert(clip2.rects()[0] == (Box{5, 0, 10, 10}));
+
     // --- transform composition, which is what folds a client's
     //     set_buffer_transform into the output's own rotation ---
     using luminaria::Transform;
