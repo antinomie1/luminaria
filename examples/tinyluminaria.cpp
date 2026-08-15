@@ -265,18 +265,11 @@ int main() {
 
     std::list<Window> windows;    // stable addresses for the process lifetime
     std::list<PopupEntry> popups; // creation order: a child popup follows its parent
-    luminaria::Surface* ptr_focus = nullptr; // surface under the cursor
-    // Raw Surface* needs a destroy subscription, or a client that closes the
-    // window under the cursor leaves us pointing at freed memory.
-    luminaria::Signal<luminaria::SurfaceDestroy>::Connection ptr_focus_gone;
-    auto set_ptr_focus = [&](luminaria::Surface* surface) {
-        ptr_focus = surface;
-        ptr_focus_gone.disconnect();
-        if (surface != nullptr) {
-            ptr_focus_gone =
-                surface->destroy.connect([&](luminaria::SurfaceDestroy&) { ptr_focus = nullptr; });
-        }
-    };
+    luminaria::SurfaceId ptr_focus; // surface under the cursor
+    auto ptr_focus_conn =
+        seat.pointer_focus_changed().connect([&](luminaria::SeatPointerFocus& event) {
+            ptr_focus = event.surface;
+        });
     int ptr_x = 0, ptr_y = 0; // cursor position, output coordinates
     bool ptr_inside = false;
     // Real cursors from the user's theme, so a client asking for "text" gets an
@@ -431,7 +424,7 @@ int main() {
         for (const auto& [output, frame] : frames) {
             build_placements(*frame, *output);
             for (const luminaria::Placement& p : frame->placements()) {
-                if (p.surface != &parent) {
+                if (p.surface != parent.id()) {
                     continue;
                 }
                 parent_box = luminaria::Box{p.x, p.y, p.width, p.height};
@@ -479,11 +472,11 @@ int main() {
             }
             build_placements(*po.frame, pe.output);
             for (const luminaria::Placement& p : po.frame->placements()) {
-                if (p.surface == nullptr) {
-                    continue;
+                if (luminaria::Surface* surface = luminaria::surface_from_id(p.surface);
+                    surface != nullptr) {
+                    surface->send_frame_done(pe.time_ms());
+                    presentation.notify_presented(*surface, pe);
                 }
-                p.surface->send_frame_done(pe.time_ms());
-                presentation.notify_presented(*p.surface, pe);
             }
         });
 
@@ -631,31 +624,31 @@ int main() {
         // pixels by construction. accepts_input honours the client's input
         // region, so a click in a rounded corner or a shadow falls through to
         // whatever is behind.
-        auto hit_test = [&](double x, double y, double& lx, double& ly) -> luminaria::Surface* {
+        auto hit_test = [&](double x, double y, double& lx, double& ly) {
             luminaria::Frame* frame = frame_at(x, y);
-            return frame == nullptr ? nullptr : frame->surface_at(x, y, lx, ly);
+            return frame == nullptr ? luminaria::SurfaceId{} : frame->surface_at(x, y, lx, ly);
         };
         // The window (if any) a surface belongs to, so a click can raise+focus it.
-        auto window_of = [&](luminaria::Surface* surface) -> Window* {
+        auto window_of = [&](luminaria::SurfaceId surface) -> Window* {
             for (Window& w : windows) {
                 if (!w.mapped || w.toplevel == nullptr) {
                     continue;
                 }
                 for (const luminaria::SurfaceAt& at : w.toplevel->surface().surface_tree()) {
-                    if (at.surface == surface) {
+                    if (at.surface->id() == surface) {
                         return &w;
                     }
                 }
             }
             return nullptr;
         };
-        auto is_popup_surface = [&](luminaria::Surface* surface) {
+        auto is_popup_surface = [&](luminaria::SurfaceId surface) {
             for (PopupEntry& p : popups) {
                 if (!p.mapped || p.popup == nullptr) {
                     continue;
                 }
                 for (const luminaria::SurfaceAt& at : p.popup->surface().surface_tree()) {
-                    if (at.surface == surface) {
+                    if (at.surface->id() == surface) {
                         return true;
                     }
                 }
@@ -666,7 +659,7 @@ int main() {
         on_ptr_motion = nested->pointer_motion.connect([&](luminaria::PointerMotionAbsEvent& e) {
             if (e.x < 0) { // pointer left our window
                 ptr_inside = false;
-                set_ptr_focus(nullptr);
+                ptr_focus = {};
                 seat.pointer_clear_focus();
                 return;
             }
@@ -674,15 +667,16 @@ int main() {
             ptr_x = static_cast<int>(e.x);
             ptr_y = static_cast<int>(e.y);
             double lx = 0, ly = 0;
-            luminaria::Surface* hit = hit_test(e.x, e.y, lx, ly);
-            if (hit == nullptr) {
-                set_ptr_focus(nullptr);
+            const luminaria::SurfaceId hit = hit_test(e.x, e.y, lx, ly);
+            luminaria::Surface* surface = luminaria::surface_from_id(hit);
+            if (surface == nullptr) {
+                ptr_focus = {};
                 seat.pointer_clear_focus();
                 return;
             }
             if (hit != ptr_focus) {
-                set_ptr_focus(hit);
-                seat.pointer_enter(*hit, lx, ly);
+                ptr_focus = hit;
+                seat.pointer_enter(*surface, lx, ly);
             } else {
                 seat.pointer_motion(lx, ly);
             }
@@ -696,7 +690,7 @@ int main() {
                     }
                 }
             }
-            if (ptr_focus == nullptr) {
+            if (!ptr_focus.valid()) {
                 return;
             }
             if (e.pressed) {

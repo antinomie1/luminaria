@@ -28,8 +28,9 @@
 //
 // The list is also what hit-testing must run against, so that a click can never
 // land somewhere the pixels are not. Rebuild it (`begin` + `place`) at input
-// time as well — that is the cheap half, and rebuilding is what makes it safe
-// to hold no `Surface*` across dispatch.
+// time as well — that is the cheap half. Placements retain generational ids, so
+// even a list that accidentally survives a dispatch cannot dereference a dead
+// surface or a new surface that reused its registry slot.
 
 module;
 
@@ -57,12 +58,12 @@ export namespace luminaria {
 ///
 /// A frame's worth of these is the whole shell-layer state. They are refilled
 /// from scratch by `Frame::begin()`/`place()` and must not be stored across a
-/// dispatch — the `Surface*` in one is only as good as the frame it came from.
+/// dispatch; the SurfaceId still makes accidental retention memory-safe.
 struct Placement {
-    /// The client surface, or null when this is a compositor-owned texture (a
+    /// The client surface, or an invalid id for a compositor-owned texture (a
     /// themed cursor drawn into the frame, say).
-    Surface* surface = nullptr;
-    /// Resolved at `place()` time; null when the surface has no usable buffer
+    SurfaceId surface;
+    /// Resolved at `submit()` time; null when the surface has no usable buffer
     /// yet, in which case the placement is still hit-testable but not drawn.
     const GpuTexture* texture = nullptr;
 
@@ -143,7 +144,7 @@ public:
     /// Topmost placed surface accepting input at layout point (x,y), with the
     /// point in that surface's own coordinates. Honours the client's input
     /// region, so it agrees with the pixels by construction.
-    [[nodiscard]] Surface* surface_at(double x, double y, double& sx, double& sy) const;
+    [[nodiscard]] SurfaceId surface_at(double x, double y, double& sx, double& sy) const;
 
     /// "Pixels changed that no client reported." A window appearing, vanishing
     /// or moving is invisible to per-surface damage, and so is a frame that was
@@ -197,28 +198,22 @@ namespace luminaria {
 
 // A cached bridge from one Surface's current wl_buffer to a GPU texture. Kept
 // in the GPU shell rather than Surface so the core compositor has no Vulkan
-// dependency. Entries are pointer-stable because their signal handlers capture
-// their address.
+// dependency. Entries are pointer-stable because their commit handler captures
+// their address; their retained identity is nevertheless generational.
 struct FrSurfaceTexture {
-    Surface* surface = nullptr;
+    SurfaceId surface;
     const void* buffer = nullptr;
     std::optional<GpuTexture> texture;
     bool live = false; // dmabuf imports see new pixels; uploads are snapshots
     Signal<SurfaceCommit>::Connection committed;
-    Signal<SurfaceDestroy>::Connection destroyed;
 
     void watch(Surface& value) {
-        surface = &value;
+        surface = value.id();
         committed = value.commit.connect([this](SurfaceCommit&) {
             if (!live) {
                 texture.reset();
                 buffer = nullptr;
             }
-        });
-        destroyed = value.destroy.connect([this](SurfaceDestroy&) {
-            surface = nullptr;
-            buffer = nullptr;
-            texture.reset();
         });
     }
 };
@@ -241,8 +236,9 @@ struct Frame::Impl {
     std::vector<SurfaceAt> tree;          // scratch for place()
     std::vector<GpuTextureFill> fills;
     std::vector<Box> fill_opaque;         // the same boxes, output-local
-    std::vector<Surface*> drawn;
+    std::vector<SurfaceId> drawn;
     std::vector<std::unique_ptr<FrSurfaceTexture>> texture_cache;
+    Signal<SurfaceInvalidated>::Connection surface_invalidated;
     std::vector<Box> damage;              // this frame's, output-local
     std::vector<Box> repaint;             // damage + what the target still owes
     std::vector<int> acquire_fences;      // borrowed from the surfaces
@@ -261,12 +257,12 @@ struct Frame::Impl {
 
 GpuTexture* Frame::Impl::texture_for(Surface& surface) {
     std::erase_if(texture_cache, [](const std::unique_ptr<FrSurfaceTexture>& entry) {
-        return entry->surface == nullptr;
+        return !entry->surface.valid();
     });
 
     FrSurfaceTexture* entry = nullptr;
     for (const std::unique_ptr<FrSurfaceTexture>& candidate : texture_cache) {
-        if (candidate->surface == &surface) {
+        if (candidate->surface == surface.id()) {
             entry = candidate.get();
             break;
         }
@@ -330,6 +326,19 @@ void Frame::Impl::rotate_debt() {
 Frame::Frame(Output& output, VulkanRenderer& renderer) : impl_(std::make_unique<Impl>()) {
     impl_->output = &output;
     impl_->renderer = &renderer;
+    Impl* raw = impl_.get();
+    impl_->surface_invalidated =
+        surface_invalidated().connect([raw](SurfaceInvalidated& event) {
+            for (const std::unique_ptr<FrSurfaceTexture>& entry : raw->texture_cache) {
+                if (entry->surface != event.surface) {
+                    continue;
+                }
+                entry->surface = {};
+                entry->buffer = nullptr;
+                entry->texture.reset();
+                entry->committed.disconnect();
+            }
+        });
 }
 
 Frame::~Frame() = default;
@@ -435,7 +444,7 @@ void Frame::place(Surface& surface, int x, int y) {
             continue;
         }
         Placement p{};
-        p.surface = &s;
+        p.surface = s.id();
         p.x = sx;
         p.y = sy;
         p.width = box.width;
@@ -480,21 +489,22 @@ std::span<const Box> Frame::opaque_of(const Placement& placement) const noexcept
                                                              placement.opaque_count);
 }
 
-Surface* Frame::surface_at(double x, double y, double& sx, double& sy) const {
+SurfaceId Frame::surface_at(double x, double y, double& sx, double& sy) const {
     const std::vector<Placement>& list = impl_->placements;
     for (auto it = list.rbegin(); it != list.rend(); ++it) { // topmost first
-        if (it->surface == nullptr) {
+        Surface* surface = surface_from_id(it->surface);
+        if (surface == nullptr) {
             continue;
         }
         const double lx = x - it->x;
         const double ly = y - it->y;
-        if (it->surface->accepts_input(lx, ly)) {
+        if (surface->accepts_input(lx, ly)) {
             sx = lx;
             sy = ly;
             return it->surface;
         }
     }
-    return nullptr;
+    return {};
 }
 
 void Frame::damage_all() noexcept { impl_->full_redraw = true; }
@@ -538,25 +548,27 @@ Result<Presented> Frame::submit(Color background) {
     // The cursor has to be on its own plane, or it would not appear — nothing is
     // compositing it in.
     if (impl.direct.has_value() && output.has_cursor_plane() && impl.placements.size() == 1 &&
-        impl.placements[0].surface != nullptr) {
+        impl.placements[0].surface.valid()) {
         const Placement& only = impl.placements[0];
         if (only.x == impl.view.x && only.y == impl.view.y &&
             only.width == output.logical_width() && only.height == output.logical_height()) {
-            Surface& surface = *only.surface;
-            if (auto id = impl.direct->id_for(surface)) {
-                // The client's own acquire fence goes straight to KMS: the flip
-                // waits for the client's GPU work and we never touch it.
-                int fence = surface.acquire_fence_fd();
-                if (fence >= 0) {
-                    fence = ::dup(fence);
-                }
-                if (auto s = output.commit_scanout(*id, fence)) {
-                    impl.direct->committed(surface);
-                    surface.clear_damage();
-                    // The composited buffers no longer hold what is on screen,
-                    // so the next composited frame must be a complete one.
-                    impl.full_redraw = true;
-                    return Presented::scanout;
+            Surface* surface = surface_from_id(only.surface);
+            if (surface != nullptr) {
+                if (auto id = impl.direct->id_for(*surface)) {
+                    // The client's own acquire fence goes straight to KMS: the
+                    // flip waits for the client's GPU work and we never touch it.
+                    int fence = surface->acquire_fence_fd();
+                    if (fence >= 0) {
+                        fence = ::dup(fence);
+                    }
+                    if (auto s = output.commit_scanout(*id, fence)) {
+                        impl.direct->committed(*surface);
+                        surface->clear_damage();
+                        // The composited buffers no longer hold what is on screen,
+                        // so the next composited frame must be a complete one.
+                        impl.full_redraw = true;
+                        return Presented::scanout;
+                    }
                 }
             }
         }
@@ -577,8 +589,12 @@ Result<Presented> Frame::submit(Color background) {
     impl.fill_opaque.reserve(impl.opaque_arena.size());
     bool wants_tearing = false;
     for (Placement& p : impl.placements) {
-        if (p.surface != nullptr) {
-            p.texture = impl.texture_for(*p.surface);
+        Surface* surface = surface_from_id(p.surface);
+        if (p.surface.valid()) {
+            // This was a client placement. A non-resolving id means the client
+            // destroyed it after begin(); do not retain a texture pointer from
+            // an earlier submit of the same placement list.
+            p.texture = surface != nullptr ? impl.texture_for(*surface) : nullptr;
         }
         if (p.texture == nullptr) {
             continue;
@@ -586,16 +602,15 @@ Result<Presented> Frame::submit(Color background) {
         // Placements are in layout coordinates; the target is one output.
         const int x = p.x - impl.view.x;
         const int y = p.y - impl.view.y;
-        if (p.surface != nullptr) {
-            Surface& surface = *p.surface;
-            for (const Box& d : surface.damage()) {
+        if (surface != nullptr) {
+            for (const Box& d : surface->damage()) {
                 impl.damage.push_back(Box{x + d.x, y + d.y, d.width, d.height});
             }
-            wants_tearing = wants_tearing || surface.tearing_hint();
-            if (const int fence = surface.acquire_fence_fd(); fence >= 0) {
+            wants_tearing = wants_tearing || surface->tearing_hint();
+            if (const int fence = surface->acquire_fence_fd(); fence >= 0) {
                 impl.acquire_fences.push_back(fence);
             }
-            impl.drawn.push_back(&surface);
+            impl.drawn.push_back(p.surface);
         }
         GpuTextureFill fill{};
         fill.texture = p.texture;
@@ -662,8 +677,10 @@ Result<Presented> Frame::submit(Color background) {
             // Explicit-sync clients get the render's own fence as their release
             // point: they may reuse the buffer the moment the GPU stops reading
             // it, not whenever we next get round to saying so.
-            for (Surface* s : impl.drawn) {
-                s->notify_rendered(render_fence);
+            for (SurfaceId id : impl.drawn) {
+                if (Surface* surface = surface_from_id(id); surface != nullptr) {
+                    surface->notify_rendered(render_fence);
+                }
             }
             // commit_scanout takes the fence: KMS holds the flip until the GPU
             // signals, so we never wait for the render either.
@@ -700,8 +717,10 @@ Result<Presented> Frame::submit(Color background) {
     // round again, and start the clients accumulating afresh.
     impl.rotate_debt();
     impl.full_redraw = false;
-    for (Surface* s : impl.drawn) {
-        s->clear_damage();
+    for (SurfaceId id : impl.drawn) {
+        if (Surface* surface = surface_from_id(id); surface != nullptr) {
+            surface->clear_damage();
+        }
     }
     return result;
 }

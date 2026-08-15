@@ -212,7 +212,7 @@ int main() {
 
             // --- the list ---------------------------------------------------
             // Back-to-front, the whole tree, in layout coordinates.
-            assert(list[0].surface == parent);
+            assert(list[0].surface == parent->id());
             assert(list[0].x == kWinX && list[0].y == kWinY);
             assert(list[0].width == kParentW && list[0].height == kParentH);
             assert(list[1].x == kWinX + kSubX && list[1].y == kWinY + kSubY);
@@ -226,15 +226,15 @@ int main() {
 
             // --- hit-testing ------------------------------------------------
             double sx = -1, sy = -1;
-            assert(frame.surface_at(kWinX + 1, kWinY + 1, sx, sy) == parent);
+            assert(frame.surface_at(kWinX + 1, kWinY + 1, sx, sy) == parent->id());
             assert(sx == 1 && sy == 1);
             // Inside the parent's rectangle but outside its input region: the
             // client says it does not want that half, so nothing is hit.
-            assert(frame.surface_at(kWinX + kParentW - 1, kWinY + 1, sx, sy) == nullptr);
+            assert(!frame.surface_at(kWinX + kParentW - 1, kWinY + 1, sx, sy).valid());
             // The subsurface is hit-testable in its own right, above the parent.
             assert(frame.surface_at(kWinX + kSubX + 1, kWinY + kSubY + 1, sx, sy) == list[1].surface);
             assert(sx == 1 && sy == 1);
-            assert(frame.surface_at(kOutW - 1, kOutH - 1, sx, sy) == nullptr);
+            assert(!frame.surface_at(kOutW - 1, kOutH - 1, sx, sy).valid());
 
             // --- view culling -----------------------------------------------
             // A window on another monitor contributes nothing to this frame.
@@ -317,5 +317,12 @@ int main() {
     client_thread.join();
 
     assert(checked);
+    // The placement list deliberately remains populated after the client is
+    // gone. Its ids must not make that stale frame a source of dangling reads.
+    assert(!frame.placements().empty());
+    assert(luminaria::surface_from_id(frame.placements().front().surface) == nullptr);
+    double sx = 0, sy = 0;
+    assert(!frame.surface_at(kWinX + 1, kWinY + 1, sx, sy).valid());
+    assert(frame.submit(luminaria::Color{0, 0, 1, 1}).has_value());
     return 0;
 }

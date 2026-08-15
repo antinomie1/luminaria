@@ -373,12 +373,12 @@ int main(int argc, char** argv) {
     // Topmost surface accepting input at (x,y), plus the point in its own
     // coordinates — from the placement list of the screen the pointer is on, so
     // the answer is by construction the same one the renderer drew. Rebuilt
-    // here rather than reused from the last frame: it costs nothing, and no
-    // Surface* then has to survive a dispatch.
-    auto hit_test = [&](double x, double y, double& lx, double& ly) -> luminaria::Surface* {
+    // here rather than reused from the last frame: it costs nothing, and the
+    // returned identity remains safe across dispatch.
+    auto hit_test = [&](double x, double y, double& lx, double& ly) {
         luminaria::Output* on = layout.at(static_cast<int>(x), static_cast<int>(y));
         if (on == nullptr) {
-            return nullptr;
+            return luminaria::SurfaceId{};
         }
         for (Screen& sc : screens) {
             if (sc.output == on) {
@@ -386,22 +386,22 @@ int main(int argc, char** argv) {
                 return sc.frame->surface_at(x, y, lx, ly);
             }
         }
-        return nullptr;
+        return luminaria::SurfaceId{};
     };
-    auto window_of = [&windows](luminaria::Surface* surface) -> Window* {
+    auto window_of = [&windows](luminaria::SurfaceId surface) -> Window* {
         for (Window& w : windows) {
             if (!w.mapped || w.toplevel == nullptr) {
                 continue;
             }
             for (const luminaria::SurfaceAt& at : w.toplevel->surface().surface_tree()) {
-                if (at.surface == surface) {
+                if (at.surface->id() == surface) {
                     return &w;
                 }
             }
         }
         return nullptr;
     };
-    luminaria::Surface* pointer_focus = nullptr;
+    luminaria::SurfaceId pointer_focus;
     auto deliver_motion = [&] {
         clamp_cursor();
         // Hardware cursor: one small atomic commit per output, no repaint.
@@ -420,16 +420,17 @@ int main(int argc, char** argv) {
             }
         }
         double lx = 0, ly = 0;
-        luminaria::Surface* hit = hit_test(cursor_x, cursor_y, lx, ly);
-        if (hit == nullptr) {
-            if (pointer_focus != nullptr) {
+        const luminaria::SurfaceId hit = hit_test(cursor_x, cursor_y, lx, ly);
+        luminaria::Surface* surface = luminaria::surface_from_id(hit);
+        if (surface == nullptr) {
+            if (pointer_focus.valid()) {
                 seat->pointer_clear_focus();
-                pointer_focus = nullptr;
+                pointer_focus = {};
             }
             return;
         }
         if (hit != pointer_focus) {
-            seat->pointer_enter(*hit, lx, ly);
+            seat->pointer_enter(*surface, lx, ly);
             pointer_focus = hit;
         } else {
             seat->pointer_motion(lx, ly);
@@ -451,7 +452,7 @@ int main(int argc, char** argv) {
     auto btn_conn = input->pointer_button().connect([&](luminaria::PointerButtonEvent& e) {
         // A press on a window raises keyboard focus with it, the way every
         // click-to-focus desktop behaves.
-        if (e.pressed && pointer_focus != nullptr) {
+        if (e.pressed && pointer_focus.valid()) {
             if (Window* w = window_of(pointer_focus); w != nullptr) {
                 seat->set_keyboard_focus(&w->toplevel->surface());
             }
@@ -461,9 +462,7 @@ int main(int argc, char** argv) {
     // A surface that dies while the pointer is over it must not stay cached.
     auto pointer_focus_conn =
         seat->pointer_focus_changed().connect([&](luminaria::SeatPointerFocus& e) {
-            if (!e.surface.valid()) {
-                pointer_focus = nullptr;
-            }
+            pointer_focus = e.surface;
         });
 
     if (auto socket = display->add_socket_auto()) {

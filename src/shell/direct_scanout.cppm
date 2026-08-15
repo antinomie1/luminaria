@@ -112,33 +112,28 @@ namespace luminaria {
 // module-linkage class may not have a member naming an internal-linkage type.
 struct DsEntry;
 
-/// A buffer we told the client not to touch, and the surface that owns it. The
-/// surface can be destroyed while its buffer is on screen, so the pointer is
-/// cleared from `destroy` rather than trusted.
+/// A buffer we told the client not to touch, and the generational identity of
+/// the surface that owns it. A dead surface simply stops resolving, including
+/// after its registry slot has been reused.
 struct DsHold {
-    Surface* surface = nullptr;
+    SurfaceId surface;
     wl_resource* buffer = nullptr;
-    Signal<SurfaceDestroy>::Connection gone;
 
     DsHold() = default;
-    // Neither copyable nor movable: `gone`'s handler captures this address, so
-    // a moved DsHold would clear the fields of the object it came from.
     DsHold(const DsHold&) = delete;
     DsHold& operator=(const DsHold&) = delete;
 
     void release() {
-        if (surface != nullptr && buffer != nullptr) {
-            surface->unhold_buffer(buffer);
+        if (Surface* owner = surface_from_id(surface); owner != nullptr && buffer != nullptr) {
+            owner->unhold_buffer(buffer);
         }
-        surface = nullptr;
+        surface = {};
         buffer = nullptr;
-        gone = {};
     }
 
     void take(Surface& s, wl_resource* b) {
-        surface = &s;
+        surface = s.id();
         buffer = b;
-        watch();
         s.hold_buffer(b);
     }
 
@@ -147,22 +142,8 @@ struct DsHold {
     void adopt(DsHold& other) {
         surface = other.surface;
         buffer = other.buffer;
-        watch();
-        other.surface = nullptr;
+        other.surface = {};
         other.buffer = nullptr;
-        other.gone = {};
-    }
-
-private:
-    void watch() {
-        gone = surface == nullptr ? Signal<SurfaceDestroy>::Connection{}
-                                  : surface->destroy.connect([this](SurfaceDestroy&) {
-                                        // The surface is going and its buffers
-                                        // with it; unholding through a dying
-                                        // object would be a use-after-free.
-                                        surface = nullptr;
-                                        buffer = nullptr;
-                                    });
     }
 };
 
