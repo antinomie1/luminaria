@@ -268,6 +268,12 @@ public:
     /// relative to *this* surface. Always contains at least `{this, 0, 0}`.
     [[nodiscard]] std::vector<SurfaceAt> surface_tree();
 
+    /// The same, appended to a vector the caller owns and reuses. This is the
+    /// one a per-frame loop wants: the returning overload allocates a fresh
+    /// vector for every window, every frame, and the shell layer's budget for
+    /// that is zero.
+    void surface_tree(std::vector<SurfaceAt>& out);
+
     /// Topmost surface of this tree whose buffer covers (sx,sy), given in this
     /// surface's coordinates. The returned x/y is that surface's offset relative
     /// to this one — subtract it to get surface-local coordinates.
@@ -1192,6 +1198,8 @@ std::vector<SurfaceAt> Surface::surface_tree() {
     collect_tree(out, 0, 0);
     return out;
 }
+
+void Surface::surface_tree(std::vector<SurfaceAt>& out) { collect_tree(out, 0, 0); }
 
 std::optional<SurfaceAt> Surface::surface_at(double sx, double sy) {
     const std::vector<SurfaceAt> tree = surface_tree();

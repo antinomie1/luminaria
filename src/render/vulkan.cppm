@@ -114,11 +114,16 @@ struct GpuTextureFill {
     /// logical coordinates. Whatever is behind it is not drawn at all.
     /// Empty (the default) means "assume translucent".
     ///
-    /// A region and not a box, because the difference is visible: a window with
-    /// rounded corners declares itself opaque everywhere *except* the corners,
-    /// and a bounding box would claim those corners too — culling the wallpaper
-    /// that should show through them.
-    Region opaque{};
+    /// A set of boxes and not one box, because the difference is visible: a
+    /// window with rounded corners declares itself opaque everywhere *except*
+    /// the corners, and a bounding box would claim those corners too — culling
+    /// the wallpaper that should show through them.
+    ///
+    /// Borrowed, not owned: this is filled once per frame per surface, and a
+    /// `Region` here would be a heap allocation per surface per frame. The
+    /// shell layer points it at its own arena; the boxes must outlive the
+    /// `render_to` call and must not overlap each other.
+    std::span<const Box> opaque{};
 
     /// Source crop, normalized against the BUFFER (before `transform`).
     /// Defaults to the whole texture; wp_viewporter narrows it.
@@ -1721,9 +1726,13 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             visible[i] = repaint;
             visible[i].intersect(Box{tf.x, tf.y, tf.w, tf.h});
             visible[i].subtract(covered);
-            Region opaque = tf.opaque;
-            opaque.intersect(Box{tf.x, tf.y, tf.w, tf.h});
-            covered.add(opaque);
+            // Clipped to the destination rect box by box: a Region copy here
+            // would be one heap allocation per texture per frame.
+            for (const Box& b : tf.opaque) {
+                if (const Box hit = b.intersection(Box{tf.x, tf.y, tf.w, tf.h}); !hit.empty()) {
+                    covered.add(hit);
+                }
+            }
         }
         // Whatever is left over is background and solid rects, the very back.
         Region backdrop = repaint;

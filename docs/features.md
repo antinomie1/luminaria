@@ -84,11 +84,11 @@
 | layout | `OutputLayout` —— 输出在全局坐标系里的位置：`add_auto()` 横向排列、`box_of()` / `bounds()` / `at(x,y)` 命中、`intersecting(box)` 求窗口跨屏时各屏该画哪一块。用的是**逻辑尺寸**，所以旋转/HiDPI 输出占的格子跟它的 mode 不一样 | output-layout |
 | layout | `Transform` + `Output::scale()` —— 每输出旋转/翻转（值与 `WL_OUTPUT_TRANSFORM_*` 一致）与整数缩放。`transform_box()` 是逻辑坐标 → 帧缓冲像素的唯一映射，`transform_invert()` 供输入反向映射 | output-layout, output-scale |
 
-## 场景 / Xwayland / 示例
+## 外壳层 / Xwayland / 示例
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| scene | 场景树 + 定位 + 命中测试 + 扁平化到渲染器 | scene |
+| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份列表）、`surface_at()` 命中、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。稳态重排零堆分配 | frame |
 | xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |
 | example | `tinyluminaria`（嵌套/headless 参考 compositor）、`luminaria-drm-demo`、`luminaria-tty`（裸机 compositor） | tinyluminaria-smoke |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |

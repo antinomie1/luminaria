@@ -4,7 +4,7 @@
 -- partition lives in src/**/*.cppm — one file per concept, holding both its
 -- interface and its implementation — and they are marked public so dependent
 -- targets can import them. There is no include/: nothing here is a header, so
--- the tree is grouped by responsibility (core, util, backend, render, scene,
+-- the tree is grouped by responsibility (core, util, backend, render, shell,
 -- protocol, xwayland) rather than split interface-from-implementation.
 --
 -- xmake rather than Meson because Meson's module dependency scanner still emits

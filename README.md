@@ -60,4 +60,5 @@ WAYLAND_DISPLAY=wayland-0 ./build/examples/tinyluminaria    # 嵌套跑，打印
 
 **1.0 之前不承诺任何 API / ABI 稳定性**，下游请锁 commit。原因写在
 [ADR 0004](docs/adr/0004-no-api-stability-before-1.0.md)：已经排上日程的几件事
-（删场景树、切模块、表面换代际句柄）每一条都是 break，现在承诺稳定等于把简化永远留在原地。
+（切模块、表面换代际句柄）每一条都是 break——删场景树那一条已经落地了——现在承诺稳定
+等于把简化永远留在原地。

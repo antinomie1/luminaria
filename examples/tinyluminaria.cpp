@@ -33,21 +33,6 @@ T must(luminaria::Result<T> r, const char* what) {
 
 constexpr std::uint32_t kScanoutFormat = DRM_FORMAT_XRGB8888;
 
-/// Modifiers both the renderer can draw into and the output can present. An
-/// empty result means there is no zero-copy path to this output at all, and the
-/// caller has to composite into a plain target and read it back.
-std::vector<std::uint64_t> usable_modifiers(luminaria::VulkanRenderer& renderer,
-                                            luminaria::Output& output) {
-    const std::vector<std::uint64_t> display = output.scanout_modifiers(kScanoutFormat);
-    std::vector<std::uint64_t> both;
-    for (std::uint64_t m : renderer.scanout_modifiers(kScanoutFormat)) {
-        if (std::find(display.begin(), display.end(), m) != display.end()) {
-            both.push_back(m);
-        }
-    }
-    return both;
-}
-
 /// Output size, overridable with LUMINARIA_OUTPUT=WxH. Anything unparseable
 /// falls back to the default rather than producing a degenerate output.
 void output_size(int& width, int& height) {
@@ -84,14 +69,6 @@ struct PopupEntry {
     luminaria::Signal<luminaria::PopupMap>::Connection on_map;
     luminaria::Signal<luminaria::PopupUnmap>::Connection on_unmap;
     luminaria::Signal<luminaria::PopupDestroy>::Connection on_destroy;
-};
-
-/// One composited surface: a toplevel, one of its subsurfaces, or a popup,
-/// already placed in output coordinates. Built back-to-front once per frame and
-/// used for both rendering and hit-testing, so the two can never disagree.
-struct Layer {
-    luminaria::Surface* surface;
-    int x, y;
 };
 
 /// A built-in arrow, used whenever the focused client hasn't set a cursor of
@@ -230,15 +207,7 @@ int main() {
     // target, and connections. Nothing is shared across outputs, so a hotplug
     // event can never corrupt another monitor's data.
     struct PerOutput {
-        std::shared_ptr<std::vector<luminaria::Pixel>> last_frame =
-            std::make_shared<std::vector<luminaria::Pixel>>();
-        std::vector<std::uint8_t> readback; // reused every capture, never reallocated
-        // Render targets. Two of them, flipped between, when the output can
-        // scan a dmabuf out directly (`ids` non-empty); one otherwise, drawn
-        // into and then read back for commit_frame().
-        std::vector<luminaria::ScanoutTarget> targets;
-        std::vector<std::uint32_t> ids;
-        std::size_t next = 0;
+        std::optional<luminaria::Frame> frame; // the shell layer's ledger
         luminaria::Signal<luminaria::OutputDestroy>::Connection on_destroy;
         luminaria::Signal<luminaria::FrameEvent>::Connection on_frame;
         luminaria::Signal<luminaria::PresentEvent>::Connection on_present;
@@ -247,28 +216,23 @@ int main() {
 
     output_global.on_bind([&](wl_resource* res) {
         screencopy.add_output(res, output_global.width(), output_global.height(),
-            [&per_output, &renderer, ow = output_global.width(), oh = output_global.height()]
+            [&per_output, ow = output_global.width()]
             (int x, int y, int w, int h, std::vector<uint8_t>& rgba) -> bool {
-                if (per_output.empty()) return false;
-                // Single-output compositor: use the first (only) output's frame.
-                auto& po = per_output.begin()->second;
-                // On the direct-scanout path nothing is read back per frame, so
-                // do it here — only when something actually asks for a capture.
-                // `next` already points at the target for the NEXT frame, so the
-                // one before it holds what is on screen.
-                if (renderer && !po.ids.empty()) {
-                    const std::size_t shown = (po.next + po.targets.size() - 1) % po.targets.size();
-                    if (auto r = renderer->read_scanout(po.targets[shown], po.readback)) {
-                        po.last_frame->resize(po.readback.size() / 4);
-                        std::memcpy(po.last_frame->data(), po.readback.data(), po.readback.size());
-                    }
+                if (per_output.empty() || !per_output.begin()->second.frame.has_value()) {
+                    return false;
                 }
-                auto& frame = *po.last_frame;
-                if (frame.empty()) return false;
-                // Extract subregion from the cached full-frame pixels.
+                // Single-output compositor: use the first (only) output's frame.
+                // On the zero-copy path nothing is read back per frame, so the
+                // read happens here — only when something actually asks for a
+                // capture.
+                auto shown = per_output.begin()->second.frame->read_back();
+                if (!shown || shown->empty()) {
+                    return false;
+                }
+                // Extract subregion from the full frame.
                 rgba.resize(static_cast<size_t>(w) * h * 4);
                 for (int row = 0; row < h; ++row) {
-                    const auto* src = frame.data() + (y + row) * ow + x;
+                    const auto* src = shown->data() + (y + row) * ow + x;
                     auto* dst = reinterpret_cast<uint8_t*>(rgba.data()) + row * w * 4;
                     std::memcpy(dst, src, static_cast<size_t>(w) * 4);
                 }
@@ -390,10 +354,18 @@ int main() {
     luminaria::OutputLayout layout;
     const luminaria::Color kBg{0.1f, 0.1f, 0.12f, 1.0f};
 
-    // Everything visible, back-to-front, in output coordinates: toplevels with
-    // their subsurface trees, then popups anchored to their parents.
-    auto build_layers = [&] {
-        std::vector<Layer> layers;
+    // Per-output frame ledgers, created once the outputs exist. `Frame` is the
+    // shell layer: it holds the scanout buffers, the damage each of them still
+    // owes, and the decision of how this frame reaches the screen.
+    std::map<luminaria::Output*, luminaria::Frame*> frames;
+
+    // Refill one frame's placement list, back-to-front: toplevels with their
+    // subsurface trees, then popups anchored to their parents, then the cursor
+    // on top. This is the list that is both drawn and hit-tested, so the two
+    // cannot disagree; it is rebuilt whenever either is needed, and rebuilding
+    // it allocates nothing.
+    auto build_placements = [&](luminaria::Frame& frame, luminaria::Output& output) {
+        frame.begin(layout.box_of(output));
         std::map<luminaria::Surface*, std::pair<int, int>> origin;
         for (Window& w : windows) {
             if (!w.mapped || w.toplevel == nullptr) {
@@ -401,9 +373,7 @@ int main() {
             }
             luminaria::Surface& root = w.toplevel->surface();
             origin[&root] = {w.x, w.y};
-            for (const luminaria::SurfaceAt& at : root.surface_tree()) {
-                layers.push_back(Layer{at.surface, w.x + at.x, w.y + at.y});
-            }
+            frame.place(root, w.x, w.y);
         }
         for (PopupEntry& p : popups) {
             if (!p.mapped || p.popup == nullptr) {
@@ -417,11 +387,37 @@ int main() {
             const int py = parent->second.second + p.popup->y();
             luminaria::Surface& root = p.popup->surface();
             origin[&root] = {px, py};
-            for (const luminaria::SurfaceAt& at : root.surface_tree()) {
-                layers.push_back(Layer{at.surface, px + at.x, py + at.y});
-            }
+            frame.place(root, px, py);
         }
-        return layers;
+        // The cursor, composited in: there is no cursor plane on a nested or
+        // headless output, so it is a placement like any other. A client sprite
+        // wins over the theme image.
+        if (!ptr_inside) {
+            return;
+        }
+        if (luminaria::Surface* cursor = seat.cursor_surface(); cursor != nullptr) {
+            frame.place(*cursor, ptr_x - seat.cursor_hotspot_x(),
+                        ptr_y - seat.cursor_hotspot_y());
+        } else if (ensure_cursor_texture()) {
+            frame.place(*cursor_texture, ptr_x - cursor_texture_image->hotspot_x,
+                        ptr_y - cursor_texture_image->hotspot_y, cursor_texture_image->width,
+                        cursor_texture_image->height);
+        }
+    };
+
+    // The frame for a point in the layout, with its placement list already
+    // rebuilt — null before any output has appeared, or without a GPU.
+    auto frame_at = [&](double x, double y) -> luminaria::Frame* {
+        luminaria::Output* on = layout.at(static_cast<int>(x), static_cast<int>(y));
+        if (on == nullptr) {
+            on = frames.empty() ? nullptr : frames.begin()->first;
+        }
+        const auto it = on == nullptr ? frames.end() : frames.find(on);
+        if (it == frames.end()) {
+            return nullptr;
+        }
+        build_placements(*it->second, *it->first);
+        return it->second;
     };
 
     // Teach the shell where windows are, so xdg_positioner's constraint
@@ -430,90 +426,66 @@ int main() {
     // on screen anything is and menus simply overhang.
     shell.set_popup_constraint_query([&](luminaria::Surface& parent, luminaria::Box& parent_box,
                                          luminaria::Box& usable) {
-        for (const Layer& l : build_layers()) {
-            if (l.surface != &parent) {
-                continue;
+        for (const auto& [output, frame] : frames) {
+            build_placements(*frame, *output);
+            for (const luminaria::Placement& p : frame->placements()) {
+                if (p.surface != &parent) {
+                    continue;
+                }
+                parent_box = luminaria::Box{p.x, p.y, p.width, p.height};
+                usable = layout.box_of(*output);
+                return !usable.empty();
             }
-            parent_box = luminaria::Box{l.x, l.y, parent.surface_width(),
-                                        parent.surface_height()};
-            luminaria::Output* on = layout.at(l.x, l.y);
-            usable = on != nullptr ? layout.box_of(*on) : layout.bounds();
-            return !usable.empty();
         }
         return false;
     });
 
     auto new_output = backend->new_output.connect([&](luminaria::NewOutput& e) {
-        const int ow = e.output.width();
-        const int oh = e.output.height();
         layout.add_auto(e.output);
         const luminaria::Box placed = layout.box_of(e.output);
         output_global.set_logical_position(placed.x, placed.y);
 
-        // Per-output state: each monitor owns its own frame cache and GPU
-        // target. Cached across frames — allocating a scanout target every
-        // frame would leak GPU memory.
+        // Per-output state: each monitor owns its own Frame, and the Frame
+        // owns the buffers. They are allocated here rather than per frame —
+        // allocating a scanout target every frame would leak GPU memory.
         auto& po = per_output[&e.output];
         if (renderer) {
-            // Zero-copy first: allocate two targets in a layout both the
-            // renderer and the output accept and hand them straight over, so a
-            // frame never touches the CPU. Two of them because the one on
-            // screen must not be drawn into. An empty modifier list means the
-            // output has no such path (headless, or a parent compositor with no
-            // linux-dmabuf), and we go the read-back route below.
-            const std::vector<std::uint64_t> mods = usable_modifiers(*renderer, e.output);
-            while (!mods.empty() && po.targets.size() < 2) {
-                auto t = renderer->create_scanout(ow, oh, kScanoutFormat, mods);
-                if (!t) {
-                    std::fprintf(stderr, "tinyluminaria: scanout target: %s\n",
-                                 t.error().message.c_str());
-                    break;
-                }
-                auto id = e.output.import_scanout(t->plane());
-                if (!id) {
-                    std::fprintf(stderr, "tinyluminaria: scanout import: %s\n",
-                                 id.error().message.c_str());
-                    break;
-                }
-                po.targets.push_back(std::move(*t));
-                po.ids.push_back(*id);
-            }
-            if (po.targets.size() < 2) {
-                po.targets.clear();
-                po.ids.clear();
-            }
-            std::printf("tinyluminaria: present = %s\n",
-                        po.ids.empty() ? "GPU composite + CPU read-back"
-                                       : "direct dmabuf scanout (zero copy)");
-            if (po.targets.empty()) {
-                if (auto t = renderer->create_scanout(ow, oh, kScanoutFormat, {})) {
-                    po.targets.push_back(std::move(*t));
-                } else {
-                    std::fprintf(stderr, "tinyluminaria: scanout target: %s\n",
-                                 t.error().message.c_str());
-                }
+            po.frame.emplace(e.output, *renderer);
+            if (auto s = po.frame->reset(kScanoutFormat); !s) {
+                std::fprintf(stderr, "tinyluminaria: scanout target: %s\n",
+                             s.error().message.c_str());
+                po.frame.reset();
+            } else {
+                frames[&e.output] = &*po.frame;
+                std::printf("tinyluminaria: present = %s\n",
+                            po.frame->target_count() < 2 ? "GPU composite + CPU read-back"
+                                                         : "direct dmabuf scanout (zero copy)");
             }
         }
         // Output unplugged: drop it from the layout and free its state.
         po.on_destroy = e.output.destroy.connect([&](luminaria::OutputDestroy& ev) {
             layout.remove(ev.output);
+            frames.erase(&ev.output);
             per_output.erase(&ev.output);
         });
 
         // A frame reached the screen: only now do the clients that drew it get
         // told to draw again, and only now is their presentation feedback true.
-        po.on_present = e.output.present.connect([&](luminaria::PresentEvent& pe) {
-            for (const Layer& layer : build_layers()) {
-                layer.surface->send_frame_done(pe.time_ms());
-                presentation.notify_presented(*layer.surface, pe);
+        po.on_present = e.output.present.connect([&, &po = po](luminaria::PresentEvent& pe) {
+            if (!po.frame.has_value()) {
+                return;
             }
-            if (luminaria::Surface* cursor = seat.cursor_surface(); cursor != nullptr) {
-                cursor->send_frame_done(pe.time_ms());
+            build_placements(*po.frame, pe.output);
+            for (const luminaria::Placement& p : po.frame->placements()) {
+                if (p.surface == nullptr) {
+                    continue;
+                }
+                p.surface->send_frame_done(pe.time_ms());
+                presentation.notify_presented(*p.surface, pe);
             }
         });
 
-        // --- frame callback: GPU path first, CPU fallback below ---
-        po.on_frame = e.output.frame.connect([&, ow, oh, &po = po](luminaria::FrameEvent& fe) {
+        po.on_frame = e.output.frame.connect([&, &po = po](luminaria::FrameEvent& fe) {
             // Reap closed windows and popups here (safe point) — not in the
             // destroy callback, which would free the entry while its own slot
             // is running.
@@ -527,168 +499,22 @@ int main() {
                             frame_n, windows.size(), popups.size(), cursor_name);
             }
 
-            // --- GPU compositing path ---
-            // Client dmabufs are imported with zero copy; compositing and
-            // blending happen entirely on the GPU. Only the final frame is read
-            // back to the CPU, and only when the output cannot take the dmabuf
-            // itself. Falls through to the CPU path when there is no target.
-            if (renderer && !po.targets.empty()) {
-                // The textures are owned by the surfaces and cached there, so
-                // this is a list of borrowed pointers — no per-frame re-import,
-                // and nothing to keep alive here.
-                std::vector<luminaria::GpuTextureFill> gpu_fills;
-
-                for (const Layer& layer : build_layers()) {
-                    luminaria::GpuTexture* tex = layer.surface->buffer_texture(*renderer);
-                    if (tex == nullptr || tex->width() <= 0 || tex->height() <= 0) {
-                        continue;
-                    }
-                    luminaria::GpuTextureFill fill;
-                    fill.texture = tex;
-                    fill.x = layer.x;
-                    fill.y = layer.y;
-                    fill.w = layer.surface->surface_width();
-                    fill.h = layer.surface->surface_height();
-                    fill.transform = layer.surface->buffer_transform();
-                    layer.surface->buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
-                    fill.opaque = layer.surface->opaque_region();
-                    fill.opaque.translate(layer.x, layer.y);
-                    gpu_fills.push_back(fill);
-                }
-
-                // Cursor on top: client sprite first, otherwise the built-in
-                // arrow (CPU pixels — pushed as a one-off upload).
-                if (ptr_inside) {
-                    if (luminaria::Surface* cursor = seat.cursor_surface(); cursor != nullptr) {
-                        luminaria::GpuTexture* tex = cursor->buffer_texture(*renderer);
-                        if (tex != nullptr && tex->width() > 0 && tex->height() > 0) {
-                            luminaria::GpuTextureFill fill;
-                            fill.texture = tex;
-                            fill.x = ptr_x - seat.cursor_hotspot_x();
-                            fill.y = ptr_y - seat.cursor_hotspot_y();
-                            fill.w = cursor->surface_width();
-                            fill.h = cursor->surface_height();
-                            fill.transform = cursor->buffer_transform();
-                            cursor->buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
-                            gpu_fills.push_back(fill);
-                        }
-                    }
-                    else if (ensure_cursor_texture()) {
-                        luminaria::GpuTextureFill fill;
-                        fill.texture = &*cursor_texture;
-                        fill.x = ptr_x - cursor_texture_image->hotspot_x;
-                        fill.y = ptr_y - cursor_texture_image->hotspot_y;
-                        fill.w = cursor_texture_image->width;
-                        fill.h = cursor_texture_image->height;
-                        gpu_fills.push_back(fill);
-                    }
-                }
-
-                // All client damage consumed this frame.
-                for (const Layer& layer : build_layers()) {
-                    layer.surface->clear_damage();
-                }
-
-                luminaria::ScanoutTarget& target = po.targets[po.next];
-                if (auto s = renderer->render_to(target, kBg, {}, gpu_fills)) {
-                    // Zero-copy present: the output takes the dmabuf we just
-                    // drew into. Nothing is copied, mapped or read back — not
-                    // the client buffers, not the composited frame.
-                    if (!po.ids.empty()) {
-                        const std::uint32_t id = po.ids[po.next];
-                        po.next = (po.next + 1) % po.targets.size();
-                        if (auto s2 = fe.output.commit_scanout(id)) {
-                            return;
-                        } else {
-                            std::fprintf(stderr, "tinyluminaria: commit_scanout: %s\n",
-                                         s2.error().message.c_str());
-                        }
-                    }
-                    // Read the composited frame back once, for screencopy and
-                    // commit_frame. This is the ONLY CPU readback on this path —
-                    // client buffers never left the GPU. `read_scanout` copies
-                    // from the target's own image through a staging buffer it
-                    // keeps mapped; re-importing the dmabuf every frame instead
-                    // cost ~90ms, which is exactly what a laggy pointer is.
-                    else if (auto r = renderer->read_scanout(target, po.readback)) {
-                        po.last_frame->resize(po.readback.size() / 4);
-                        std::memcpy(po.last_frame->data(), po.readback.data(),
-                                    po.readback.size());
-                        if (auto s2 = fe.output.commit_frame(*po.last_frame, ow, oh); !s2) {
-                            std::fprintf(stderr, "tinyluminaria: commit_frame: %s\n",
-                                         s2.error().message.c_str());
-                        }
-                        return;
-                    } else {
-                        std::fprintf(stderr, "tinyluminaria: readback: %s\n",
-                                     r.error().message.c_str());
-                    }
+            // Compositing, damage, fences and the flip are all the shell
+            // layer's. This example only says what goes where — and that the
+            // cursor moving needs a repaint, since nothing reports damage for
+            // a pointer that is not on a plane of its own.
+            if (po.frame.has_value()) {
+                build_placements(*po.frame, fe.output);
+                if (auto presented = po.frame->submit(kBg)) {
+                    return;
                 } else {
-                    std::fprintf(stderr, "tinyluminaria: render_to: %s\n",
-                                 s.error().message.c_str());
+                    std::fprintf(stderr, "tinyluminaria: submit: %s\n",
+                                 presented.error().message.c_str());
                 }
-                // GPU path failed; fall through to CPU path.
             }
-
-            // --- CPU compositing fallback ---
-            // std::list never moves existing elements — pointers into its
-            // contents (TextureFill::rgba) stay valid across push_back.
-            {
-                std::list<std::vector<std::uint8_t>> holds;
-                std::vector<luminaria::TextureFill> textures;
-                if (renderer) {
-                    for (const Layer& layer : build_layers()) {
-                        std::vector<std::uint8_t> rgba;
-                        int bw = 0, bh = 0;
-                        if (layer.surface->current_buffer_rgba(rgba, bw, bh) && bw > 0 && bh > 0) {
-                            holds.push_back(std::move(rgba));
-                            textures.push_back({layer.x, layer.y, bw, bh, holds.back().data()});
-                        }
-                    }
-                    if (ptr_inside) {
-                        if (luminaria::Surface* cursor = seat.cursor_surface();
-                            cursor != nullptr) {
-                            std::vector<std::uint8_t> rgba;
-                            int bw = 0, bh = 0;
-                            if (cursor->current_buffer_rgba(rgba, bw, bh) && bw > 0 && bh > 0) {
-                                holds.push_back(std::move(rgba));
-                                textures.push_back({ptr_x - seat.cursor_hotspot_x(),
-                                                    ptr_y - seat.cursor_hotspot_y(), bw, bh,
-                                                    holds.back().data()});
-                            }
-                        } else if (const luminaria::CursorImage* image = themed_cursor();
-                                   image != nullptr) {
-                            textures.push_back({ptr_x - image->hotspot_x,
-                                                ptr_y - image->hotspot_y, image->width,
-                                                image->height, image->rgba.data()});
-                        } else {
-                            textures.push_back(
-                                {ptr_x, ptr_y, kCursorW, kCursorH, builtin_cursor.data()});
-                        }
-                    }
-                    for (const Layer& layer : build_layers()) {
-                        layer.surface->clear_damage();
-                    }
-                    if (auto px = renderer->composite(ow, oh, kBg, {}, textures)) {
-                        *po.last_frame = *px;
-                        if (auto s = fe.output.commit_frame(*px, ow, oh); !s) {
-                            std::fprintf(stderr, "tinyluminaria: commit_frame: %s\n",
-                                         s.error().message.c_str());
-                        }
-                        return;
-                    } else {
-                        std::fprintf(stderr, "tinyluminaria: composite: %s\n",
-                                     px.error().message.c_str());
-                    }
-                }
-                // Solid background — the output still works, just isn't drawn.
-                po.last_frame->resize(static_cast<size_t>(ow) * oh);
-                luminaria::Pixel bg{static_cast<uint8_t>(kBg.r * 255),
-                                    static_cast<uint8_t>(kBg.g * 255),
-                                    static_cast<uint8_t>(kBg.b * 255), 255};
-                std::fill(po.last_frame->begin(), po.last_frame->end(), bg);
-                (void)fe.output.commit(kBg);
-            }
+            // No GPU at all (or the frame could not be put on screen): the
+            // output still works, it just isn't drawn.
+            (void)fe.output.commit(kBg);
         });
     });
 
@@ -799,20 +625,13 @@ int main() {
     luminaria::Signal<luminaria::KeymapChange>::Connection on_keymap;
     if (nested) {
         // Topmost surface under (x,y), plus the point in its local coordinates.
+        // Against the frame's own placement list, so the answer agrees with the
+        // pixels by construction. accepts_input honours the client's input
+        // region, so a click in a rounded corner or a shadow falls through to
+        // whatever is behind.
         auto hit_test = [&](double x, double y, double& lx, double& ly) -> luminaria::Surface* {
-            const std::vector<Layer> layers = build_layers();
-            for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-                luminaria::Surface* s = it->surface;
-                // accepts_input honours the client's input region, so a click in
-                // a rounded corner or a shadow falls through to what's behind.
-                if (!s->accepts_input(x - it->x, y - it->y)) {
-                    continue;
-                }
-                lx = x - it->x;
-                ly = y - it->y;
-                return s;
-            }
-            return nullptr;
+            luminaria::Frame* frame = frame_at(x, y);
+            return frame == nullptr ? nullptr : frame->surface_at(x, y, lx, ly);
         };
         // The window (if any) a surface belongs to, so a click can raise+focus it.
         auto window_of = [&](luminaria::Surface* surface) -> Window* {

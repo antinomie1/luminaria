@@ -16,15 +16,24 @@
 - **render** — Vulkan。GPU 路径：客户端 dmabuf 零拷贝导入成纹理 → 合成进一块导出为 dmabuf 的
   `ScanoutTarget` → KMS 直接扫描输出，全程无 CPU 读回。CPU 路径（`composite()`）保留给无
   dmabuf 的后端与截图。
-- **scene** — `OutputLayout`（输出在全局坐标系里的位置，逻辑单位）与 `DirectScanout`（全屏
-  单窗口免合成的直出决策）。
+- **shell** — 外壳层，即时模式，没有树（见 [ADR 0001](./adr/0001-no-retained-scene-graph.md)）。
+  `Frame` 是每个输出一份的帧账本：混成器每帧 `begin(view)` + 逐窗口 `place()` 排出一串
+  **摆位**，这串摆位既用来画也用来命中测试（`surface_at()`），所以点击不可能跟像素对不上；
+  `submit()` 干完剩下的所有事——直出判断、遮挡与 damage 记账（含 buffer age 的跨缓冲债务）、
+  fence 编排、翻页，返回 `Presented::{composited,scanout,unchanged,fallback}`。
+  跨帧不保存任何窗口信息，只保存**内存**（所有 vector 只清空不释放，摆位的不透明区是指向
+  帧内 arena 的下标区间而不是 `Region` 拷贝）与 damage 债务。
+  另有 `OutputLayout`（输出在全局坐标系里的位置，逻辑单位）与 `DirectScanout`（全屏单窗口
+  免合成的直出决策）。
 
 ## 一帧长什么样
 
-`Output::frame` 触发 → 混成器排出这一帧的表面与位置 → `Surface::current_buffer_texture()`
-把客户端 buffer 放上 GPU → `VulkanRenderer::render_to(ScanoutTarget)` →
-`Output::commit_scanout()`。没有 dmabuf 直出的后端走 CPU 变体：`current_buffer_rgba()` →
-`composite()` → `commit_frame()`。输入反向走：后端输入信号 → 命中测试 → `Seat` 焦点与路由。
+`Output::frame` 触发 → `Frame::begin(view)` → 逐窗口 `Frame::place()` 排出这一帧的摆位 →
+`Frame::submit(background)`。submit 内部：`Surface::buffer_texture()` 把客户端 buffer 放上
+GPU → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()`；或者整个合成
+被跳过，某个客户端的 buffer 直接进 CRTC。不能直出 dmabuf 的输出（headless、嵌套）照样在 GPU
+上合成，只有成品帧过一次 CPU：`read_scanout()` → `commit_frame()`。输入反向走：后端输入信号
+→ `Frame::surface_at()` → `Seat` 焦点与路由。
 
 参考实现见 `examples/tty_compositor.cpp`（裸机）与 `examples/tinyluminaria.cpp`（嵌套/无头）。
 
@@ -42,7 +51,9 @@
 - **绝不听客户端的话去索引内存。** 宽高、stride、offset 是客户端独立声明的四个整数，上游
   谁也没有按真正的单位交叉验证过。碰像素之前先过 `layout_fits()` / `layout_length()`。
 - **缓存了裸 `Surface*` 就得订阅 `Surface::destroy`。**（这条正在被
-  [ADR 0002](./adr/0002-surface-generational-handle.md) 的代际句柄取代。）
+  [ADR 0002](./adr/0002-surface-generational-handle.md) 的代际句柄取代。）`Frame` 的摆位列表
+  不在此列——它不保留：需要时重排一遍（`begin` + `place`，零堆分配），不要跨 dispatch 持有
+  `Placement`。
 
 ## 模块结构
 
@@ -55,7 +66,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
-src/scene/               scene output_layout direct_scanout
+src/shell/               frame output_layout direct_scanout
 src/protocol/            25 个 Wayland global，一个一文件
 src/xwayland/            X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件

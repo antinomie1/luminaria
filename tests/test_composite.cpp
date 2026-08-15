@@ -1,5 +1,5 @@
-// Step 1: scene -> Vulkan compositing. Flatten a scene to RectFills, composite
-// them on the GPU, read the frame back, and verify pixels land where expected.
+// Solid-colour compositing on the GPU: hand the renderer a back-to-front list
+// of RectFills, read the frame back, and verify the pixels land where expected.
 // Skips (exit 77) if no Vulkan device.
 #include <cassert>
 #include <cstdio>
@@ -22,15 +22,11 @@ int main() {
         return 77;
     }
 
-    // Build a scene: full-output blue background, green square at (16,16,16x16).
-    Scene scene;
-    SceneRect& bg = scene.root().add_rect(64, 64, Color{0, 0, 1, 1});
-    (void)bg;
-    SceneRect& sq = scene.root().add_rect(16, 16, Color{0, 1, 0, 1});
-    sq.set_position(16, 16);
-
-    std::vector<RectFill> rects = scene_rects(scene.root());
-    assert(rects.size() == 2);
+    // Full-output blue background, green square at (16,16,16x16), in that order.
+    const std::vector<RectFill> rects = {
+        RectFill{Box{0, 0, 64, 64}, Color{0, 0, 1, 1}},
+        RectFill{Box{16, 16, 16, 16}, Color{0, 1, 0, 1}},
+    };
 
     auto frame = renderer->render_rects(64, 64, Color{0, 0, 0, 1}, rects);
     assert(frame.has_value());

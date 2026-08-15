@@ -1,5 +1,7 @@
 # 不做保留模式场景树
 
+> 已落地：`src/scene/` 整个目录不复存在，外壳层是 `src/shell/frame.cppm` 的 `Frame`。
+
 外壳层每帧由混成器现搭一个 `Placement` 列表（即时模式），而不是维护一棵跨帧存活的场景树。
 `src/scene/scene.cppm` 因此删除。
 
@@ -35,4 +37,5 @@
 活在输出上而非栈上，`clear()` 保留 capacity，opaque 区用指向共享 arena 的 span。
 **稳态下每帧零分配**是这条决定的验收条件。
 
-`output_layout` 与 `direct_scanout` 与树无关，随 `scene/` 目录一并移走。
+`output_layout` 与 `direct_scanout` 与树无关，随 `scene/` 目录一并移走——它们现在在
+`src/shell/` 下，跟 `Frame` 做伴。

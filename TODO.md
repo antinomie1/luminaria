@@ -20,55 +20,43 @@
 
 ### 1. bench harness + 三个数进 CI
 
-- **空闲态每秒 atomic 提交次数**，目标 **0**。这个数会立刻把第 2、3 步逼出来。
+- **空闲态每秒 atomic 提交次数**，目标 **0**。这个数会立刻把第 2 步逼出来。
 - **稳态 RSS**（单客户端）。
 - **每帧 GPU 提交耗时 p99**。
 
 没有 CI 门禁的话，"低占用"六个月后就只是 README 上的一句话。
 
-### 2. 外壳层：删场景树，立 `Placement` / `Frame`
+### 2. 低功耗一二级
 
-见 [ADR 0001](docs/adr/0001-no-retained-scene-graph.md)。
-
-- 删 `src/scene/scene.cppm` 与 `test_scene`；`output_layout` / `direct_scanout` 移出
-  `scene/`（它们跟树没关系）。
-- 把 `examples/tty_compositor.cpp:190-500` 那 300 行变成库的一部分：z 序列表 → damage 记账
-  （含 buffer age 的双缓冲债务）→ 遮挡剔除 → fence 编排 → 翻页决策。
-- 命名：每帧列表的元素是 `Placement`（`Layer` 已经被 `zwlr_layer_shell` 的四个层占了）。
-- 形态：外壳层**不可选、不持有窗口状态**。`Frame` 由混成器每帧填，跨帧只留 damage 历史与
-  fence。这是为了避开 wlroots 里 `wlr_scene` 可选导致的生态分裂。
-- **验收条件：稳态每帧零堆分配。** 先干掉 `fill.opaque = surface.opaque_region()` 那次
-  每表面 vector 拷贝（`tty_compositor.cpp:437`），改成指向共享 arena 的 span。
-
-### 3. 低功耗一二级
-
-- **无 damage 不提交** —— 消灭空闲态的 60Hz 空转。今天 `tty_compositor.cpp:445` 在 damage
-  为空时 push 一个空 `Box` 照样渲染 + 翻页，而这是示例在教人写的模式。
+- **无 damage 不提交** —— 消灭空闲态的 60Hz 空转。`Frame::submit()` 已经能分辨这一帧
+  「什么都没变」（返回 `Presented::unchanged`），但眼下照样渲染 + 翻页。
 - **按需 vblank** —— 静止时不订阅 vblank，来了 damage 再武装一次翻页。省的是内核回调与
   进程唤醒。
 - `headless.cppm` 的固定 16ms 软件定时器同理，无内容变化时不该转。
+- 顺带：`VulkanRenderer::render_to()` 每帧仍在堆上建 `Region`、`vk::raii::Framebuffer`、
+  `CommandBuffers`。外壳层那一半的每帧零分配已经由 `test_frame` 守住了，渲染器这一半没有。
 
-### 4. 模块切分
+### 3. 模块切分
 
 见 [ADR 0003](docs/adr/0003-module-split-and-protocol-admission.md)。
 `luminaria`（协议 + 核心 + headless）/ `luminaria.gpu` / `luminaria.xwayland` /
 `luminaria.desktop`，后者收下 `workspace`、`foreign_toplevel`、`data_control`
 ——它们只服务桌面外壳组件，且语义都是"操作别人的窗口"，不该默认注册。
 
-### 5. `Surface` 代际句柄 + 模糊测试
+### 4. `Surface` 代际句柄 + 模糊测试
 
-见 [ADR 0002](docs/adr/0002-surface-generational-handle.md)。排在第 2 步之后，是因为外壳层
-重写本来就要大改所有持有表面指针的地方，两次改一起做省一遍。
+见 [ADR 0002](docs/adr/0002-surface-generational-handle.md)。外壳层重写已经把
+`scene` 那一处悬空指针的账清掉了；剩下的是 seat / cursor / drag focus 那几处订阅。
 
 配套：畸形协议流的模糊测试客户端常态化跑。`f103082`（客户端声明的 buffer layout 越界）
 那一类洞靠人审是漏的。
 
-### 6. 协议补齐
+### 5. 协议补齐
 
 按低功耗价值排序：
 
 - **`wp-fifo-v1` + `wp-commit-timing-v1`** —— 客户端声明"我按刷新率走"与"这帧什么时候上屏"。
-  **不是锦上添花**：第 3 步要对"客户端在跑动画"这种常见情形真正省电，前提就是这两个。
+  **不是锦上添花**：第 2 步要对"客户端在跑动画"这种常见情形真正省电，前提就是这两个。
 - **`wp-content-type-v1`** —— 客户端说"我在放视频"，据此走直出或降刷新率。
 - **`ext-session-lock-v1`** —— 锁屏，安全性硬缺口。
 - **`input-method-v2`** —— IME 的输入法一侧。`text-input-v3` 已完整，缺的是接
@@ -88,14 +76,14 @@
 
 ## 源码里活着的标记
 
-只剩四处（上一轮审计是 ~26 处，空操作桩为 0）：
+只剩四处（空操作桩为 0）：
 
 | 位置 | 内容 |
 |------|------|
 | `xwayland.cppm:5` | 最小 XWM —— map/configure 已处理，完整 ICCCM/EWMH 未做 |
 | `region.cppm:14` | `Region` 的操作 O(n)、合并 O(n²)。矩形数量成为问题时换 `pixman_region32` |
 | `tearing_control.cppm:96` | 重复的 tearing_control 对象不发协议错误 |
-| `tty_compositor.cpp:11` | 示例里窗口固定偏移层叠，无移动/缩放/堆叠 UI |
+| `tty_compositor.cpp:13` | 示例里窗口固定偏移层叠，无移动/缩放/堆叠 UI |
 
 ## 已知的天花板（不是 bug，是没做完的地方）
 

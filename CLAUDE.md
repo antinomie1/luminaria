@@ -17,11 +17,11 @@ All prose docs are in Chinese. `README.md` is the introduction only — no techn
 decisions and why; `TODO.md` is the open work in execution order.
 
 **Four ADRs set the current direction, and parts of this file describe code they retire:**
-no retained scene graph (`src/scene/scene.cppm` is to be deleted, the shell layer is
-immediate-mode `Placement`/`Frame`), surfaces reached through generational handles rather
-than raw `Surface*` + destroy subscriptions, a four-way module split with an admission rule
-for the core module, and no API stability before 1.0. Read `docs/adr/` before designing
-anything structural.
+no retained scene graph (**done** — the scene tree is gone and the shell layer is
+immediate-mode `Placement`/`Frame` in `src/shell/`), surfaces reached through generational
+handles rather than raw `Surface*` + destroy subscriptions, a four-way module split with an
+admission rule for the core module, and no API stability before 1.0. Read `docs/adr/` before
+designing anything structural.
 
 ## Build / test / run
 
@@ -64,7 +64,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
-src/scene/               scene output_layout direct_scanout
+src/shell/               frame output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
 src/xwayland/            the X11 bridge
 src/detail/wayland_fwd.h the one remaining header
@@ -180,25 +180,37 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `GpuTexture` (the view it binds never changes); dead textures' sets go back on a free
   list, but only once every submit that could still be sampling through them has
   retired — `Impl::reap()` gates that on the oldest surviving `in_flight` index.
-- **`scene`** — retained tree (Tree/Rect/Surface), positioning, hit-testing, flattening to
-  `RectFill`s and `GpuTextureFill`s, and damage (`scene_damage()` →
-  `scene_rects(root, damage)` / `scene_textures(root, renderer, damage)` →
-  `scene_clear_damage()`); `OutputLayout` (`output_layout.cppm`) is the one place
-  that knows where each output sits in the global coordinate space, in *logical* units
-  (`transform.cppm` holds the logical↔device mapping and nothing else does).
-  `region.cppm` is the disjoint-box set both damage and wl_region are built on.
+- **shell** — the opinionated half, and deliberately immediate-mode: there is no retained
+  tree (ADR 0001). `Frame` (`shell/frame.cppm`) is the per-output ledger a compositor
+  refills every frame — `begin(view)` then `place(surface, x, y)` per window, giving a
+  z-ordered `Placement` list that is BOTH drawn and hit-tested (`surface_at()`), so a click
+  cannot disagree with the pixels. `submit(background)` then does everything that is the
+  same in every compositor: try direct scanout, build the `GpuTextureFill`s, repaint this
+  frame's client damage plus the damage the buffer being drawn into still owes (buffer age),
+  thread the display's out-fence and the clients' acquire fences through the GPU, flip, and
+  clear the surfaces' damage. It answers `Presented::{composited,scanout,unchanged,fallback}`;
+  `unchanged` is what step 3 needs to stop flipping over a still screen. **Nothing about a
+  window survives a frame** — what survives is the memory (every vector is cleared, never
+  freed; `Placement::opaque` is an index range into the frame's arena, never a `Region`
+  copy) and the damage debt. `tests/test_frame.cpp` asserts zero heap allocations across a
+  steady-state rebuild by replacing global `operator new`.
+  `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits
+  in the global coordinate space, in *logical* units (`transform.cppm` holds the
+  logical↔device mapping and nothing else does). `region.cppm` is the disjoint-box set both
+  damage and wl_region are built on.
 - **`xwayland`** — spawns Xwayland plus a minimal XWM over xcb.
 
 Per-frame flow in a compositor built on this (see `examples/tinyluminaria.cpp`,
-`examples/tty_compositor.cpp`): `Output::frame` fires → walk mapped toplevels, each expanded
-via `Surface::surface_tree()` (the surface plus its subsurfaces, back-to-front), then popups
-anchored to their parents, then the cursor → `Surface::current_buffer_texture()` puts each
-client buffer on the GPU → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()`.
-Backends without dmabuf scanout (headless, nested) take the CPU variant instead:
-`current_buffer_rgba()` → `composite()` → `commit_frame()`. Input goes
-the other way: backend input signal → scene/manual hit test → `Seat` focus + event routing.
-`tinyluminaria` builds one z-ordered layer list per frame and uses it for BOTH rendering and
-hit-testing, so clicks can't disagree with pixels.
+`examples/tty_compositor.cpp`): `Output::frame` fires → `Frame::begin(view)` → one
+`Frame::place(surface, x, y)` per mapped toplevel (which expands its subsurface tree),
+then popups anchored to their parents, then the cursor when there is no cursor plane →
+`Frame::submit(background)`. Inside that: `Surface::buffer_texture()` puts each client
+buffer on the GPU, `VulkanRenderer::render_to(ScanoutTarget)` composites, and
+`Output::commit_scanout()` flips — or the whole composite is skipped and one client's own
+buffer goes to the CRTC. Outputs without dmabuf scanout (headless, nested) still composite
+on the GPU and only the finished frame crosses to the CPU: `read_scanout()` →
+`commit_frame()`. Input goes the other way: backend input signal → `Frame::surface_at()`
+→ `Seat` focus + event routing.
 
 Two bridges out of client buffers, and new code should prefer the first:
 `Surface::current_buffer_texture()` (dmabuf → `VulkanRenderer::import_texture`, everything else
@@ -206,7 +218,7 @@ uploaded) never reads pixels back; `Surface::current_buffer_rgba()` (shm, then s
 `dmabuf_buffer_to_rgba()`) does, and exists for screencopy and the non-dmabuf backends.
 A third bridge skips the renderer entirely: `Surface::current_buffer_dmabuf()` describes a
 client buffer well enough to hand to `Output::import_scanout()`, and `DirectScanout`
-(`scene/direct_scanout.cppm`) decides when that is allowed — one fullscreen, unrotated,
+(`shell/direct_scanout.cppm`) decides when that is allowed — one fullscreen, unrotated,
 uncropped surface whose buffer is in a layout the display advertised — caches the imports per
 wl_buffer (a client rotates a swapchain; importing per frame would leak framebuffers), and
 holds the buffer through `Surface::hold_buffer()` so the client is not told it may redraw
@@ -275,11 +287,12 @@ calls `clear_damage()`.
   `tl_show_window_menu`). When adding a protocol, fill every slot in the interface vtable.
   `-Wno-missing-field-initializers` is set project-wide for exactly this idiom.
 - **Raw `Surface*` needs a `Surface::destroy` subscription.** Anything caching a surface
-  pointer (seat focus, cursor, drag focus, scene nodes) connects to `Surface::destroy` and
+  pointer (seat focus, cursor, drag focus) connects to `Surface::destroy` and
   clears the pointer there; the `Signal::Connection` is RAII so it can't outlive the holder.
   `seat.cppm` is the reference for the pattern. Seat clearing *its* copy is not enough —
-  `data_device.cppm`'s `drag_focus` and `scene.cppm`'s `SceneSurface` each need their own
-  subscription, and each has a regression test.
+  `data_device.cppm`'s `drag_focus` needs its own subscription, and has a regression test.
+  A `Frame`'s placement list is exempt because it is not retained: rebuild it (`begin` +
+  `place`) rather than holding a `Placement` across a dispatch.
 - **Any retained `wl_resource*` owned by a CLIENT needs a destroy listener.** Buffers are
   the sharp edge: toolkits drop their whole swapchain on resize / hide / re-show, so a
   committed `wl_buffer` dies under you and the next `wl_buffer.release` or readback

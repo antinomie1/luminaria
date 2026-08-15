@@ -1,4 +1,4 @@
-// The present path: render a scene on the GPU, hand the pixels to an output via
+// The present path: composite on the GPU, hand the pixels to an output via
 // commit_frame, and read them back from the (headless) output. This is exactly
 // what the DRM output does, minus the scanout. Skips (77) without Vulkan.
 #include <cassert>
@@ -19,11 +19,11 @@ int main() {
     auto display = Display::create();
     assert(display.has_value());
 
-    // Scene: red background rect + green square; flatten and composite.
-    Scene scene;
-    scene.root().add_rect(8, 8, Color{1, 0, 0, 1});
-    SceneRect& sq = scene.root().add_rect(4, 4, Color{0, 1, 0, 1});
-    sq.set_position(2, 2);
+    // Red background rect + green square on top of it.
+    const RectFill rects[] = {
+        {Box{0, 0, 8, 8}, Color{1, 0, 0, 1}},
+        {Box{2, 2, 4, 4}, Color{0, 1, 0, 1}},
+    };
 
     // A blue 2x2 client texture at (0,0).
     std::vector<std::uint8_t> blue(2 * 2 * 4);
@@ -35,7 +35,6 @@ int main() {
     }
     TextureFill tex[] = {{0, 0, 2, 2, blue.data()}};
 
-    auto rects = scene_rects(scene.root());
     auto pixels = renderer->composite(8, 8, Color{0, 0, 0, 1}, rects, tex);
     assert(pixels.has_value());
 

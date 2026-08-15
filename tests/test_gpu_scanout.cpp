@@ -110,7 +110,8 @@ int main() {
     //     sampled, so painting red under an opaque green leaves green ---
     const luminaria::GpuTextureFill behind{&*texture, 0, 0, kW, kH};
     luminaria::GpuTextureFill front{&*green_tex, 0, 0, kW, kH};
-    front.opaque = luminaria::Region{luminaria::Box{0, 0, kW, kH}};
+    const luminaria::Box all_opaque[1] = {{0, 0, kW, kH}};
+    front.opaque = all_opaque;
     const luminaria::GpuTextureFill both[2] = {behind, front};
     status = renderer->render_to(*target, luminaria::Color{1, 0, 1, 1}, {}, both);
     assert(status.has_value());
@@ -132,7 +133,8 @@ int main() {
 
     luminaria::GpuTextureFill notched{&*half_tex, 0, 0, kW, kH};
     // Only the left half is promised opaque; the right half is see-through.
-    notched.opaque = luminaria::Region{luminaria::Box{0, 0, kW / 2, kH}};
+    const luminaria::Box half_opaque[1] = {{0, 0, kW / 2, kH}};
+    notched.opaque = half_opaque;
     const luminaria::GpuTextureFill layered[2] = {behind, notched};
     status = renderer->render_to(*target, luminaria::Color{0, 0, 1, 1}, {}, layered);
     assert(status.has_value());

@@ -7,9 +7,10 @@
 //     WAYLAND_DISPLAY=wayland-1 weston-simple-shm
 // Esc quits.
 //
-// Pointer input is hit-tested against the same layer list that gets rendered,
-// and the cursor rides the KMS cursor plane. TODO: windows cascade at fixed
-// offsets — no move/resize/stacking UI.
+// Compositing, damage and the page flip are the shell layer's `Frame`; this
+// file decides only where windows go. Pointer input is hit-tested against the
+// same placement list that gets rendered, and the cursor rides the KMS cursor
+// plane. TODO: windows cascade at fixed offsets — no move/resize/stacking UI.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -21,8 +22,6 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h> // close, for the fences handed between GPU and KMS
-
 #include <drm_fourcc.h>
 
 import luminaria;
@@ -31,20 +30,6 @@ namespace {
 constexpr uint32_t KEY_ESC = 1;
 // XRGB8888: opaque 32-bit, the one format every KMS primary plane scans out.
 constexpr uint32_t kScanoutFormat = DRM_FORMAT_XRGB8888;
-
-/// Modifiers both the GPU can render+export and the display can scan out.
-/// Empty is fine — create_scanout() then falls back to LINEAR.
-std::vector<std::uint64_t> usable_modifiers(luminaria::VulkanRenderer& renderer,
-                                            luminaria::Output& output) {
-    const std::vector<std::uint64_t> display = output.scanout_modifiers(kScanoutFormat);
-    std::vector<std::uint64_t> both;
-    for (std::uint64_t m : renderer.scanout_modifiers(kScanoutFormat)) {
-        if (std::find(display.begin(), display.end(), m) != display.end()) {
-            both.push_back(m);
-        }
-    }
-    return both;
-}
 
 /// Small env knobs so a rotated or HiDPI panel can be tried without a config
 /// file: LUMINARIA_SCALE=2, LUMINARIA_TRANSFORM=1 (90 degrees) .. 7.
@@ -187,36 +172,13 @@ int main(int argc, char** argv) {
             });
     });
 
-    // One z-ordered list per frame, used for BOTH rendering and hit-testing, so
-    // a click can never land somewhere the pixels aren't. Positions are in
-    // layout coordinates; each window contributes its whole subsurface tree.
-    struct Layer {
-        luminaria::Surface* surface;
-        int x, y;
-    };
-    auto build_layers = [&windows] {
-        std::vector<Layer> layers;
-        for (Window& w : windows) {
-            if (!w.mapped || w.toplevel == nullptr) {
-                continue;
-            }
-            for (const luminaria::SurfaceAt& at : w.toplevel->surface().surface_tree()) {
-                layers.push_back(Layer{at.surface, w.x + at.x, w.y + at.y});
-            }
-        }
-        return layers;
-    };
-    // Every connected monitor becomes a Screen: its own wl_output, its own pair
-    // of GPU scanout buffers, its own damage history.
+    // Every connected monitor becomes a Screen: its own wl_output, and its own
+    // Frame — the shell layer's ledger, holding this output's scanout buffers,
+    // damage debt and direct-scanout cache.
     struct Screen {
         luminaria::Output* output = nullptr;
         std::unique_ptr<luminaria::OutputGlobal> global;
-        std::vector<luminaria::ScanoutTarget> targets;
-        std::vector<std::uint32_t> ids;
-        std::optional<luminaria::DirectScanout> direct;
-        int back = 0;
-        bool needs_full_redraw = true;
-        std::vector<luminaria::Box> previous_damage; // the other buffer's debt
+        std::optional<luminaria::Frame> frame;
         luminaria::Signal<luminaria::FrameEvent>::Connection frame_conn;
         luminaria::Signal<luminaria::PresentEvent>::Connection present_conn;
         luminaria::Signal<luminaria::OutputDestroy>::Connection destroy_conn;
@@ -225,10 +187,24 @@ int main(int argc, char** argv) {
     std::list<Screen> screens; // stable addresses: the callbacks capture Screen&
     luminaria::OutputLayout layout;
 
+    // Refill one screen's placement list: one z-ordered pass over the windows,
+    // each contributing its whole subsurface tree. This is the list the frame
+    // both draws and hit-tests, so a click can never land somewhere the pixels
+    // aren't — which is why it is rebuilt on input as well as on frame. It
+    // allocates nothing once the vectors have grown.
+    auto build_placements = [&windows, &layout](Screen& screen) {
+        screen.frame->begin(layout.box_of(*screen.output));
+        for (Window& w : windows) {
+            if (w.mapped && w.toplevel != nullptr) {
+                screen.frame->place(w.toplevel->surface(), w.x, w.y);
+            }
+        }
+    };
+
     // A window appearing or vanishing changes pixels nobody reported damage for.
     auto damage_everything = [&screens] {
         for (Screen& sc : screens) {
-            sc.needs_full_redraw = true;
+            sc.frame->damage_all();
         }
     };
     window_changed = damage_everything;
@@ -243,40 +219,13 @@ int main(int argc, char** argv) {
         const int ow = output.width();
         const int oh = output.height();
 
-        screen.targets.clear();
-        screen.ids.clear();
-        if (screen.direct.has_value()) {
-            screen.direct->clear();
-        } else {
-            screen.direct.emplace(output);
-        }
-        screen.back = 0;
-        screen.previous_damage.clear();
-        screen.needs_full_redraw = true;
-
-        // Double-buffered GPU scanout: composite into a dmabuf the GPU renders
-        // to and KMS scans out. Nothing on this path travels through the CPU.
-        const std::vector<std::uint64_t> mods = usable_modifiers(*renderer, output);
-        while (screen.targets.size() < 2) {
-            auto target = renderer->create_scanout(ow, oh, kScanoutFormat, mods);
-            if (!target) {
-                std::fprintf(stderr, "luminaria-tty: scanout: %s\n",
-                             target.error().message.c_str());
-                break;
-            }
-            auto id = output.import_scanout(target->plane());
-            if (!id) {
-                std::fprintf(stderr, "luminaria-tty: scanout import: %s\n",
-                             id.error().message.c_str());
-                break;
-            }
-            screen.targets.push_back(std::move(*target));
-            screen.ids.push_back(*id);
-        }
-        if (screen.targets.size() < 2) {
+        // Double-buffered GPU scanout: the frame composites into a dmabuf the
+        // GPU renders to and KMS scans out. Nothing on this path travels
+        // through the CPU. Falling back is the frame's business, not ours.
+        if (auto s = screen.frame->reset(kScanoutFormat); !s) {
+            std::fprintf(stderr, "luminaria-tty: scanout: %s\n", s.error().message.c_str());
+        } else if (screen.frame->target_count() < 2) {
             std::fprintf(stderr, "luminaria-tty: falling back to CPU read-back scanout\n");
-            screen.targets.clear();
-            screen.ids.clear();
         }
 
         // The output occupies a different amount of the layout at a new mode,
@@ -298,6 +247,7 @@ int main(int argc, char** argv) {
     auto out_conn = drm->new_output.connect([&](luminaria::NewOutput& e) {
         Screen& screen = screens.emplace_back();
         screen.output = &e.output;
+        screen.frame.emplace(e.output, *renderer);
         // Panel rotation, HiDPI and the mode are compositor policy; here they
         // come from the environment so the paths can be exercised without a
         // config file. LUMINARIA_MODE=1920x1080 or =1920x1080@60.
@@ -344,9 +294,7 @@ int main(int argc, char** argv) {
                                                        (luminaria::PresentEvent& pe) {
             // The flip landed, so whatever a direct scanout replaced is off the
             // screen and its client can have it back.
-            if (screen.direct.has_value()) {
-                screen.direct->presented();
-            }
+            screen.frame->presented();
             for (Window& w : windows) {
                 if (!w.mapped || w.toplevel == nullptr) {
                     continue;
@@ -357,140 +305,16 @@ int main(int argc, char** argv) {
             }
         });
 
-        screen.frame_conn = e.output.frame.connect([&, &screen = screen](luminaria::FrameEvent& fe) {
+        screen.frame_conn = e.output.frame.connect([&, &screen = screen](luminaria::FrameEvent&) {
             constexpr luminaria::Color background{0.1f, 0.1f, 0.13f, 1.0f};
-            const luminaria::Box view_box = layout.box_of(fe.output);
-
-            // --- direct scanout -------------------------------------------
-            //
-            // One window, covering the whole monitor, handing us a buffer the
-            // display can already read: point the CRTC at it and draw nothing
-            // at all. This is the fullscreen video / game case, and it saves
-            // the entire composite pass plus the memory bandwidth of a
-            // full-screen blit every frame.
-            //
-            // The cursor has to be on its own plane, or it would not appear:
-            // nothing is compositing it in.
-            if (screen.direct.has_value() && fe.output.has_cursor_plane()) {
-                const std::vector<Layer> layers = build_layers();
-                if (layers.size() == 1 && layers[0].x == view_box.x &&
-                    layers[0].y == view_box.y &&
-                    layers[0].surface->surface_width() == fe.output.logical_width() &&
-                    layers[0].surface->surface_height() == fe.output.logical_height()) {
-                    luminaria::Surface& surface = *layers[0].surface;
-                    if (auto id = screen.direct->id_for(surface)) {
-                        // The client's own acquire fence goes straight to KMS:
-                        // the flip waits for the client's GPU work, and we
-                        // never touch it.
-                        int fence = surface.acquire_fence_fd();
-                        if (fence >= 0) {
-                            fence = dup(fence);
-                        }
-                        if (fe.output.commit_scanout(*id, fence)) {
-                            screen.direct->committed(surface);
-                            surface.clear_damage();
-                            // The composited buffers no longer hold this frame,
-                            // so the next composited frame must be complete.
-                            screen.needs_full_redraw = true;
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Textures live on the surfaces and are cached there; this is a
-            // list of borrowed pointers.
-            std::vector<luminaria::GpuTextureFill> textures;
-            std::vector<luminaria::Surface*> drawn;
-            std::vector<luminaria::Box> damage;
-            std::vector<int> acquire_fences; // explicit-sync clients, borrowed fds
-            bool wants_tearing = false;
-            for (const Layer& layer : build_layers()) {
-                luminaria::Surface& surface = *layer.surface;
-                luminaria::GpuTexture* texture = surface.buffer_texture(*renderer);
-                if (texture == nullptr) {
-                    continue;
-                }
-                // Layer position is in layout space; the target is one output.
-                const int x = layer.x - view_box.x;
-                const int y = layer.y - view_box.y;
-                for (const luminaria::Box& d : surface.damage()) {
-                    damage.push_back(luminaria::Box{x + d.x, y + d.y, d.width, d.height});
-                }
-                wants_tearing = wants_tearing || surface.tearing_hint();
-                if (const int fence = surface.acquire_fence_fd(); fence >= 0) {
-                    acquire_fences.push_back(fence);
-                }
-                drawn.push_back(&surface);
-
-                luminaria::GpuTextureFill fill{};
-                fill.texture = texture;
-                fill.x = x;
-                fill.y = y;
-                // Surface coordinates, not buffer pixels: a 2x HiDPI client
-                // still occupies its 1x window.
-                fill.w = surface.surface_width();
-                fill.h = surface.surface_height();
-                fill.transform = surface.buffer_transform();
-                surface.buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
-                // What the client promised is opaque, so the renderer can skip
-                // everything underneath it.
-                fill.opaque = surface.opaque_region();
-                fill.opaque.translate(x, y);
-                textures.push_back(fill);
-            }
-            fe.output.set_tearing(wants_tearing);
-
-            // The buffer we are about to draw into is two frames old, so it owes
-            // the previous frame's damage as well as this one's.
-            std::vector<luminaria::Box> repaint;
-            if (!screen.needs_full_redraw) {
-                repaint = damage;
-                repaint.insert(repaint.end(), screen.previous_damage.begin(),
-                               screen.previous_damage.end());
-                if (repaint.empty()) {
-                    repaint.push_back(luminaria::Box{}); // nothing at all changed
-                }
-            }
-            screen.previous_damage = damage;
-            screen.needs_full_redraw = false;
-
-            bool presented = false;
-            if (!screen.targets.empty()) {
-                luminaria::ScanoutTarget& target = screen.targets[screen.back];
-                const luminaria::OutputMapping mapping{screen.output->transform(),
-                                                       screen.output->scale()};
-                // The buffer we are about to draw into may still be on screen;
-                // the flip's out-fence says when it isn't. Waiting for it on the
-                // GPU is the point — nothing here blocks.
-                target.set_acquire_fence(screen.output->take_present_fence());
-                int render_fence = -1;
-                const luminaria::RenderSync sync{acquire_fences, &render_fence};
-                if (renderer->render_to(target, background, {}, textures, repaint, mapping,
-                                        sync)) {
-                    // Explicit-sync clients get the render's own fence as their
-                    // release point: they may reuse the buffer the moment the
-                    // GPU stops reading it, not when we next get round to it.
-                    for (luminaria::Surface* s : drawn) {
-                        s->notify_rendered(render_fence);
-                    }
-                    // commit_scanout takes the fence: KMS holds the flip until
-                    // the GPU signals, so we never wait for the render either.
-                    presented = screen.output->commit_scanout(screen.ids[screen.back],
-                                                              render_fence).has_value();
-                    render_fence = -1; // owned by commit_scanout now
-                    if (presented) {
-                        screen.back = 1 - screen.back;
-                    }
-                } else if (render_fence >= 0) {
-                    close(render_fence);
-                }
-            }
-            if (!presented) {
-                (void)fe.output.commit(background);
-            }
-            for (luminaria::Surface* s : drawn) {
-                s->clear_damage();
+            // Everything below this line — damage bookkeeping against the buffer
+            // being drawn into, occlusion, the fences between GPU and display,
+            // and the decision to hand a fullscreen client's own buffer straight
+            // to the CRTC — is the shell layer's, not this compositor's.
+            build_placements(screen);
+            if (auto presented = screen.frame->submit(background); !presented) {
+                std::fprintf(stderr, "luminaria-tty: submit: %s\n",
+                             presented.error().message.c_str());
             }
         });
     });
@@ -547,14 +371,19 @@ int main(int argc, char** argv) {
                               static_cast<double>(bounds.y + bounds.height) - 1.0);
     };
     // Topmost surface accepting input at (x,y), plus the point in its own
-    // coordinates. accepts_input honours the client's input region.
+    // coordinates — from the placement list of the screen the pointer is on, so
+    // the answer is by construction the same one the renderer drew. Rebuilt
+    // here rather than reused from the last frame: it costs nothing, and no
+    // Surface* then has to survive a dispatch.
     auto hit_test = [&](double x, double y, double& lx, double& ly) -> luminaria::Surface* {
-        const std::vector<Layer> layers = build_layers();
-        for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-            if (it->surface->accepts_input(x - it->x, y - it->y)) {
-                lx = x - it->x;
-                ly = y - it->y;
-                return it->surface;
+        luminaria::Output* on = layout.at(static_cast<int>(x), static_cast<int>(y));
+        if (on == nullptr) {
+            return nullptr;
+        }
+        for (Screen& sc : screens) {
+            if (sc.output == on) {
+                build_placements(sc);
+                return sc.frame->surface_at(x, y, lx, ly);
             }
         }
         return nullptr;

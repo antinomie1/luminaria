@@ -1,4 +1,4 @@
-// luminaria/scene/direct_scanout.cppm — put a client's buffer on the screen
+// luminaria/shell/direct_scanout.cppm — put a client's buffer on the screen
 // without drawing anything.
 //
 // The usual frame is: import each client buffer as a texture, composite them

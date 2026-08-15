@@ -1,4 +1,4 @@
-// luminaria/output_layout.cppm — where the outputs sit relative to each other.
+// luminaria/shell/output_layout.cppm — where the outputs sit relative to each other.
 //
 // A backend hands out `Output`s that each know only their own size. A desktop
 // needs one shared coordinate space: which monitor is left of which, where a

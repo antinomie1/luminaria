@@ -8,7 +8,8 @@
 现有的防线是**约定**：任何缓存 `Surface*` 的地方都必须订阅 `Surface::destroy` 并在回调里清空。
 这条规矩写在 CLAUDE.md 里，配了 RAII 的 `Signal::Connection`，也确实有效——但它是一条**要记得
 遵守**的规矩，而"忘了订阅"这个错误类别永远存在。事实是已经忘过：`data_device` 的 drag focus
-和 `scene` 的 `SceneSurface` 各犯过一次，各配了一个回归测试。测试只覆盖犯过的那一处。
+和（当时的）`scene` 的 `SceneSurface` 各犯过一次，各配了一个回归测试。测试只覆盖犯过的
+那一处。
 
 内存安全若要作为本库相对 wlroots 的卖点，就不能是"我们很小心"，得是"这个错误写不出来"。
 代际句柄把"崩溃"降级成"查表返回 null"——忘了订阅不再是 use-after-free，只是一次没画出来。
