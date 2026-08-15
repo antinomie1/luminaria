@@ -36,8 +36,14 @@ public:
     /// The most recently presented frame (for tests/inspection).
     [[nodiscard]] const std::vector<Pixel>& last_frame() const noexcept { return last_frame_; }
 
-    /// Begin the software frame pump.
+    /// Ask for the first frame. Every later one is asked for the same way every
+    /// other backend's is — `Output::schedule_frame()`. The timer only paces
+    /// requests; it does not manufacture them, so an idle headless output ticks
+    /// exactly zero times a second.
     void start_pump();
+
+protected:
+    void arm_frame() override;
 };
 
 class HeadlessBackend final : public Backend {
@@ -62,10 +68,9 @@ namespace luminaria {
 
 HeadlessOutput::HeadlessOutput(EventLoop loop, int width, int height, unsigned interval_ms)
     : Output(width, height), interval_ms_(interval_ms) {
-    frame_timer_ = loop.add_timer([this] {
-        emit_software_frame(interval_ms_ * 1000000u);
-        frame_timer_.arm(interval_ms_); // repeat
-    });
+    // One-shot: emit_software_frame() clears the request, and a handler that
+    // wants another frame re-arms the timer through schedule_frame().
+    frame_timer_ = loop.add_timer([this] { emit_software_frame(interval_ms_ * 1000000u); });
 }
 
 Status HeadlessOutput::commit(Color color) {
@@ -82,9 +87,9 @@ Status HeadlessOutput::commit_frame(std::span<const Pixel> rgba, int width, int 
     return ok();
 }
 
-void HeadlessOutput::start_pump() {
-    frame_timer_.arm(interval_ms_);
-}
+void HeadlessOutput::arm_frame() { frame_timer_.arm(interval_ms_ == 0 ? 1 : interval_ms_); }
+
+void HeadlessOutput::start_pump() { schedule_frame(); }
 
 HeadlessBackend::HeadlessBackend(EventLoop loop, unsigned frame_interval_ms)
     : loop_(loop), interval_ms_(frame_interval_ms) {}

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <list>
 #include <memory>
@@ -789,6 +790,24 @@ int main(int argc, char** argv) {
                 return;
             }
             frames.count(*presented);
+            if (*presented == luminaria::Presented::unchanged) {
+                // Nothing was flipped, so no vblank is coming and the `present`
+                // handler above will not run. The clients still have to be
+                // released: one that committed without damaging anything is
+                // waiting on a frame callback, and withholding it would freeze
+                // it for good. No presentation feedback — nothing was presented.
+                timespec now{};
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                const auto time_ms = static_cast<std::uint32_t>(
+                    now.tv_sec * 1000 + now.tv_nsec / 1000000);
+                for (const luminaria::Placement& placement : screen.frame->placements()) {
+                    if (luminaria::Surface* surface =
+                            luminaria::surface_from_id(placement.surface);
+                        surface != nullptr) {
+                        surface->send_frame_done(time_ms);
+                    }
+                }
+            }
         });
     });
 

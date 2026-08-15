@@ -74,6 +74,7 @@
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | backend | 抽象 `Backend` + `HeadlessBackend`（软件帧泵，无 GPU/显示） | headless |
+| backend | **按需帧**：`Output::schedule_frame()` 要一个 `frame` 事件，一次一个；没人要就不发。提交本身**不**隐含下一帧，所以静止的屏幕不订阅 vblank、不叫醒进程。DRM 的帧来自翻页完成（空闲时改由 1ms 定时器补一次），嵌套的靠一次空 commit 向父混成器要 frame callback（拿的还是父的 vblank 节奏），headless 的定时器只管节流不再自续 | idle-frame, idle-wake |
 | backend | `WaylandBackend`（嵌套）：连父 compositor 开窗；**零拷贝呈现** —— 绑父 compositor 的 `zwp_linux_dmabuf_v1` (v3)，把渲染目标的 dmabuf 用 `create_immed` 包成 wl_buffer 直接 attach，合成帧一个像素都不经过 CPU；父 compositor 没有该 global 时 `scanout_modifiers()` 返回空表，调用方退回 wl_shm 路径；**转发父 compositor 输入**（指针 enter/leave/motion/button、滚轮 axis/discrete/stop 按 `wl_pointer.frame` 聚合、键盘按键 + 修饰键），经命中测试路由到 seat；**原生窗口装饰**：以 `xdg-decoration-unstable-v1` 客户端身份向父 compositor 请求 server-side 装饰（附 title + app_id），拿到宿主桌面的真标题栏，协商结果由 `decoration_mode()` 报告 | wayland-nested |
 | backend | `DrmBackend`（裸机 KMS）：**多输出 + 热插拔** —— 每个已连接 connector 各分一套 CRTC + primary plane，各自 modeset/翻页；udev netlink 监听 `drm` 子系统的 `HOTPLUG=1` 事件后重扫 connector 并做差集，新显示器发 `new_output`、拔掉的发 `Output::destroy`（并还原它自己的 CRTC）；**atomic 模式设置**（connector CRTC_ID + CRTC MODE_ID/ACTIVE + primary plane 全套 property，一次 `drmModeAtomicCommit`）、非阻塞翻页 + `page_flip_handler2` vblank 帧泵；scanout buffer 走 dmabuf 导入（`IN_FORMATS` 交出硬件真实支持的 modifier 列表），dumb buffer 仅作降级路径（真机未验证，测试 skip） | drm（需 tty） |
 | backend | `LibinputBackend`（裸机输入）：发出 KeyEvent / PointerMotion / PointerButton / **PointerAxis**（滚轮 v120 转 notch + 触摸板平滑增量 + 抬指 stop）/ **ModifiersEvent** 信号；自带 xkb 状态机（libinput 只给键码，Shift 按没按只有 keymap 答得出），`keymap()` 交给 `Seat::set_keymap()` 两边就对齐；**设备能力**按已开设备聚合（keyboard/pointer/touch），增删设备时发 `capabilities_changed`，直接喂 `Seat::set_capabilities()`；`create_path()` + `add_device()` 按路径开指定设备（可测，也给自管设备表的 compositor 用）；给了 `Session` 就经 libseat 开设备，VT 切换时 `libinput_suspend/resume` | libinput, libinput-uinput（需 input 组 / root） |
@@ -91,6 +92,7 @@
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。稳态重排零堆分配 | frame |
+| shell | **无 damage 不提交** —— `submit()` 发现这一帧与屏上那一帧完全一致时答 `unchanged`：不渲染、不翻页、不轮换缓冲，输出随即安静。唤醒是 `Frame` 自己的事——它盯着自己画过的每个表面的 commit，`damage_all()` 与 `reset()` 也各要一帧；混成器只需在收到 `unchanged` 时补发帧回调（那一帧没有 `present`） | idle-wake, frame |
 | xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |
 | example | `tinyluminaria`（嵌套/headless 参考 compositor）、`luminaria-drm-demo`、`luminaria-tty`（裸机 compositor） | tinyluminaria-smoke |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |

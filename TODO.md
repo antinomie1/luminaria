@@ -29,7 +29,9 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 
 ### 1. bench harness + 三个数进 CI
 
-- **空闲态每秒 atomic 提交次数**，目标 **0**。这个数会立刻把第 2 步逼出来。
+- **空闲态每秒 atomic 提交次数**，目标 **0**。第 2 步按设计已经做到（空闲时没有提交，
+  `luminaria-tty` 那行 `frames/s` 就不该再出现），但只在 headless 上量过；真机复核与
+  CI 门禁都还欠着，否则半年后又会悄悄回到 60。
 - **稳态 RSS**（单客户端）。
 - **每帧 GPU 提交耗时 p99**。
 
@@ -37,13 +39,19 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 
 ### 2. 低功耗一二级
 
-- **无 damage 不提交** —— 消灭空闲态的 60Hz 空转。`Frame::submit()` 已经能分辨这一帧
-  「什么都没变」（返回 `Presented::unchanged`），但眼下照样渲染 + 翻页。
-- **按需 vblank** —— 静止时不订阅 vblank，来了 damage 再武装一次翻页。省的是内核回调与
-  进程唤醒。
-- `headless.cppm` 的固定 16ms 软件定时器同理，无内容变化时不该转。
-- 顺带：`VulkanRenderer::render_to()` 每帧仍在堆上建 `Region`、`vk::raii::Framebuffer`、
+**已做**（2026-08-15）：无 damage 不提交 + 按需帧。`Frame::submit()` 答 `unchanged` 时
+不再渲染也不再翻页；`frame` 事件改成一次 `Output::schedule_frame()` 换一个，DRM 空闲时因此
+不再有翻页、也就没有 vblank 回调，headless 的定时器不再自续，嵌套后端靠一次空 commit 向父
+混成器要 callback。唤醒由 `Frame` 自己发起（它盯着画过的每个表面的 commit，加上
+`damage_all()` / `reset()`），混成器只需在 `unchanged` 时补发帧回调——那一帧没有 `present`。
+`test_idle_frame` 守后端契约，`test_idle_wake` 用一个按帧回调节流的客户端守「不空转也不冻住」
+（20 轮 20ms，20 帧；自由运行的 1ms 帧泵是 400 帧）。
+
+仍未做：
+
+- **`VulkanRenderer::render_to()` 每帧仍在堆上建** `Region`、`vk::raii::Framebuffer`、
   `CommandBuffers`。外壳层那一半的每帧零分配已经由 `test_frame` 守住了，渲染器这一半没有。
+- 真机复核：第 0 步的 tty 验证要重跑一遍，看空闲时 `frames/s` 那行是不是真的不再出现。
 
 ### 3. 协议补齐
 

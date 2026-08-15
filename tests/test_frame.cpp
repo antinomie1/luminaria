@@ -175,6 +175,8 @@ int main() {
     assert(subcompositor.has_value());
 
     luminaria::HeadlessOutput output(display->event_loop(), kOutW, kOutH, 16);
+    int frames_delivered = 0;
+    auto pump = output.frame.connect([&](luminaria::FrameEvent&) { ++frames_delivered; });
     luminaria::Frame frame(output, *renderer);
     auto ready = frame.reset(DRM_FORMAT_XRGB8888);
     if (!ready) {
@@ -292,9 +294,15 @@ int main() {
             auto again = frame.submit(luminaria::Color{0, 0, 1, 1});
             assert(again.has_value());
             assert(*again == luminaria::Presented::unchanged);
+            // Nothing reached the output either — no frame was drawn and none
+            // was committed, so what is on screen is still the frame above.
+            assert(output.last_frame().size() == px.size());
+            assert((output.last_frame()[static_cast<std::size_t>(kWinY + 1) * kOutW + kWinX + 1] ==
+                    luminaria::Pixel{255, 0, 0, 255}));
 
             // Until something declares the whole output stale.
             frame.damage_all();
+            assert(output.frame_scheduled());
             frame.begin(view);
             frame.place(*parent, kWinX, kWinY);
             auto forced = frame.submit(luminaria::Color{0, 0, 1, 1});
@@ -317,6 +325,12 @@ int main() {
     client_thread.join();
 
     assert(checked);
+    // Nothing ever started this output's pump, so a frame here is one the Frame
+    // asked for on the compositor's behalf — the mode reset, the damage_all
+    // above, or a client commit bringing new content. Either it has been
+    // delivered by now or it is still outstanding; what must not happen is
+    // neither, which is a screen that stopped flipping and never comes back.
+    assert(frames_delivered >= 1 || output.frame_scheduled());
     // The placement list deliberately remains populated after the client is
     // gone. Its ids must not make that stale frame a source of dangling reads.
     assert(!frame.placements().empty());

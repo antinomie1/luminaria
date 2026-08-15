@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <drm_fourcc.h>
 #include <list>
 #include <map>
@@ -489,6 +490,8 @@ int main() {
             std::erase_if(popups, [](const PopupEntry& p) { return p.popup == nullptr; });
 
             static int frame_n = 0;
+            // Every sixtieth frame — which used to be once a second and is now
+            // once every sixty frames anyone actually asked for.
             if (++frame_n % 60 == 1) {
                 std::printf("tinyluminaria: frame %d — %zu window(s), %zu popup(s), "
                             "cursor '%s'\n",
@@ -502,6 +505,23 @@ int main() {
             if (po.frame.has_value()) {
                 build_placements(*po.frame, fe.output);
                 if (auto presented = po.frame->submit(kBg)) {
+                    if (*presented == luminaria::Presented::unchanged) {
+                        // Nothing was committed, so no `present` follows and the
+                        // clients would wait forever for the frame callbacks that
+                        // handler sends. Release them here instead; there is no
+                        // presentation feedback to give, nothing was presented.
+                        timespec now{};
+                        clock_gettime(CLOCK_MONOTONIC, &now);
+                        const auto time_ms = static_cast<std::uint32_t>(
+                            now.tv_sec * 1000 + now.tv_nsec / 1000000);
+                        for (const luminaria::Placement& p : po.frame->placements()) {
+                            if (luminaria::Surface* surface =
+                                    luminaria::surface_from_id(p.surface);
+                                surface != nullptr) {
+                                surface->send_frame_done(time_ms);
+                            }
+                        }
+                    }
                     return;
                 } else {
                     std::fprintf(stderr, "tinyluminaria: submit: %s\n",
@@ -509,8 +529,11 @@ int main() {
                 }
             }
             // No GPU at all (or the frame could not be put on screen): the
-            // output still works, it just isn't drawn.
+            // output still works, it just isn't drawn. Nothing tracks damage on
+            // this path, so keep the pump turning by hand — it is a bring-up
+            // path, and a stalled one looks like a hang.
             (void)fe.output.commit(kBg);
+            fe.output.schedule_frame();
         });
     });
 

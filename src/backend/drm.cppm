@@ -425,11 +425,30 @@ public:
           plane_id(plane), connector_crtc_id_prop(0), mode(mode) {
         retry_timer = loop.add_timer([this] {
             if (suspended || flip_pending) {
+                // A frame is coming anyway (or nobody can see one): leave the
+                // request standing rather than spending it on nothing.
                 return;
             }
-            FrameEvent event{*this};
-            frame.emit(event);
+            emit_frame();
         });
+    }
+
+    /// Hand out one frame event. Every path that does this goes through here so
+    /// that a pending `schedule_frame()` is spent exactly once.
+    void emit_frame() {
+        frame_delivered();
+        FrameEvent event{*this};
+        frame.emit(event);
+    }
+
+    // A page flip already owes us a frame event, and so does a modeset — every
+    // atomic commit here asks for DRM_MODE_PAGE_FLIP_EVENT. So the only case
+    // that needs waking is the idle one: nothing in flight, nothing to wait on.
+    void arm_frame() override {
+        if (suspended || flip_pending) {
+            return;
+        }
+        retry_timer.arm(1);
     }
 
     ~DrmOutput() override {
@@ -819,8 +838,7 @@ void on_page_flip(int /*fd*/, unsigned seq, unsigned sec, unsigned usec, unsigne
                            !out->tearing,
                            true};
     out->present.emit(presented);
-    FrameEvent event{*out};
-    out->frame.emit(event);
+    out->emit_frame();
 }
 
 

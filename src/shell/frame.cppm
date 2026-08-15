@@ -89,8 +89,14 @@ enum class Presented {
     /// A client's own buffer went straight to the display; nothing was drawn.
     scanout,
     /// Nothing had changed, so the frame already on screen is still the right
-    /// one. It was committed again anyway — killing that idle flip is the whole
-    /// of the next step, and it needs this answer to know when it may.
+    /// one: nothing was drawn and nothing was committed, and the output will
+    /// now stop emitting `frame` until something asks it for one. This is where
+    /// an idle desktop's power goes.
+    ///
+    /// It also means no `present` event follows. Whatever the compositor does
+    /// there — `Surface::send_frame_done()` above all — it must do on this
+    /// answer too, or a client that committed without damaging anything waits
+    /// for a callback that is never sent.
     unchanged,
     /// No render target at all: a solid background was committed instead.
     fallback,
@@ -149,6 +155,9 @@ public:
     /// "Pixels changed that no client reported." A window appearing, vanishing
     /// or moving is invisible to per-surface damage, and so is a frame that was
     /// direct-scanned-out; every one of those has to force a full repaint.
+    ///
+    /// It also asks the output for a frame, so this is what wakes a screen that
+    /// has gone idle. Clients redrawing wake it by themselves.
     void damage_all() noexcept;
 
     /// Compose the placement list onto the output and put it on screen.
@@ -205,15 +214,22 @@ struct FrSurfaceTexture {
     const void* buffer = nullptr;
     std::optional<GpuTexture> texture;
     bool live = false; // dmabuf imports see new pixels; uploads are snapshots
+    Output* output = nullptr;
     Signal<SurfaceCommit>::Connection committed;
 
-    void watch(Surface& value) {
+    void watch(Surface& value, Output& out) {
         surface = value.id();
+        output = &out;
         committed = value.commit.connect([this](SurfaceCommit&) {
             if (!live) {
                 texture.reset();
                 buffer = nullptr;
             }
+            // A client we are showing has new content: this is the wake-up that
+            // lets the output stop flipping while nothing changes. Asking for a
+            // frame that then turns out to be `unchanged` costs one frame and
+            // then idles again; not asking freezes the screen.
+            output->schedule_frame();
         });
     }
 };
@@ -270,7 +286,7 @@ GpuTexture* Frame::Impl::texture_for(Surface& surface) {
     if (entry == nullptr) {
         auto fresh = std::make_unique<FrSurfaceTexture>();
         entry = fresh.get();
-        entry->watch(surface);
+        entry->watch(surface, *output);
         texture_cache.push_back(std::move(fresh));
     }
 
@@ -362,6 +378,9 @@ Status Frame::reset(std::uint32_t drm_format) {
     impl.back = 0;
     impl.debt.clear();
     impl.full_redraw = true;
+    // Whatever was on screen described the old mode; ask for the frame that
+    // replaces it rather than waiting for a client to happen to redraw.
+    output.schedule_frame();
     if (impl.direct.has_value()) {
         impl.direct->clear();
     } else {
@@ -507,7 +526,12 @@ SurfaceId Frame::surface_at(double x, double y, double& sx, double& sy) const {
     return {};
 }
 
-void Frame::damage_all() noexcept { impl_->full_redraw = true; }
+void Frame::damage_all() noexcept {
+    impl_->full_redraw = true;
+    // Whatever moved, appeared or vanished, no client is going to report it —
+    // so this is also the only chance to wake an output that has gone idle.
+    impl_->output->schedule_frame();
+}
 
 Result<std::span<const Pixel>> Frame::read_back() {
     Impl& impl = *impl_;
@@ -652,15 +676,37 @@ Result<Presented> Frame::submit(Color background) {
     // all changed", which the renderer answers by leaving the target alone.
     std::vector<Box>& repaint = impl.repaint;
     repaint.clear();
-    bool unchanged = false;
     if (!impl.full_redraw) {
         repaint.assign(impl.damage.begin(), impl.damage.end());
         for (const std::vector<Box>& owed : impl.debt) {
             repaint.insert(repaint.end(), owed.begin(), owed.end());
         }
-        unchanged = repaint.empty();
-        if (unchanged) {
-            repaint.push_back(Box{});
+        if (repaint.empty()) {
+            // Not one pixel of this output differs from what the display is
+            // already showing. Rendering it would produce the frame that is
+            // there, and flipping to it would wake the display engine to
+            // exchange two identical buffers — so do neither, and let the
+            // output go idle until someone asks for a frame again.
+            //
+            // Nothing is spent here: no buffer was drawn into, so `back` does
+            // not advance and no debt is rotated. The clients' damage is
+            // likewise untouched, because there was none.
+            //
+            // No `present` will follow this frame. Anything the compositor does
+            // there — frame callbacks above all — it has to do here instead, or
+            // a client that committed without damaging waits forever.
+            //
+            // Explicit-sync clients need the same care: their release point is
+            // signalled by the render, and there is no render. Nothing here
+            // ever read those buffers, so they are free immediately — say so,
+            // rather than leaving a syncobj client waiting on a fence that will
+            // never exist.
+            for (SurfaceId id : impl.drawn) {
+                if (Surface* surface = surface_from_id(id); surface != nullptr) {
+                    surface->notify_rendered(-1);
+                }
+            }
+            return Presented::unchanged;
         }
     }
 
@@ -698,7 +744,7 @@ Result<Presented> Frame::submit(Color background) {
                 return fail(flipped.error().message);
             }
             impl.back = (impl.back + 1) % impl.targets.size();
-            result = unchanged ? Presented::unchanged : Presented::composited;
+            result = Presented::composited;
         } else {
             // No zero-copy path. The composite still happens on the GPU; only
             // the finished frame crosses to the CPU, once.
@@ -716,7 +762,7 @@ Result<Presented> Frame::submit(Color background) {
                 !s) {
                 return fail(s.error().message);
             }
-            result = unchanged ? Presented::unchanged : Presented::composited;
+            result = Presented::composited;
         }
     } else if (auto s = output.commit(background); !s) {
         return fail(s.error().message);

@@ -12,6 +12,9 @@
   `mode_changed`。四个实现：`HeadlessBackend`（软件帧泵）、`WaylandBackend`（嵌套在父
   混成器里）、`DrmBackend`（KMS atomic）、`LibinputBackend`（裸机输入）。`Session`（libseat）
   决定现在谁有权碰 GPU 和输入设备。
+  **`frame` 是要来的，不是自己转的**：一次 `Output::schedule_frame()` 换一个 `frame` 事件。
+  没人要，就没有 vblank 订阅、没有内核回调、没有进程唤醒——静止的屏幕在这一层是零开销。
+  DRM 的帧来自翻页完成，嵌套的来自父混成器的 frame callback，headless 的定时器不再自己续。
 - **protocol** — 每个 Wayland global 一个分区，见 [features.md](./features.md)。
 - **render** — Vulkan。GPU 路径：客户端 dmabuf 零拷贝导入成纹理 → 合成进一块导出为 dmabuf 的
   `ScanoutTarget` → KMS 直接扫描输出，全程无 CPU 读回。CPU 路径（`composite()`）保留给无
@@ -21,6 +24,9 @@
   **摆位**，这串摆位既用来画也用来命中测试（`surface_at()`），所以点击不可能跟像素对不上；
   `submit()` 干完剩下的所有事——直出判断、遮挡与 damage 记账（含 buffer age 的跨缓冲债务）、
   fence 编排、翻页，返回 `Presented::{composited,scanout,unchanged,fallback}`。
+  `unchanged` 是「这一帧跟屏上那一帧一个样」：既不画也不提交，输出随即安静下来。
+  唤醒由 `Frame` 自己负责——它盯着自己画过的每个表面的 commit，`damage_all()` 与 `reset()`
+  也顺手要一帧。
   跨帧不保存任何窗口信息，只保存**内存**（所有 vector 只清空不释放，摆位的不透明区是指向
   帧内 arena 的下标区间而不是 `Region` 拷贝）与 damage 债务。
   另有 `OutputLayout`（输出在全局坐标系里的位置，逻辑单位）与 `DirectScanout`（全屏单窗口
@@ -46,6 +52,9 @@
   永远不上屏的帧。它攒着，直到混成器在 `Output::present` 里调 `Surface::send_frame_done()`。
   忘了调，所有客户端画完第一帧就冻住。damage 同理：`Surface::damage()` 一直累积到
   `clear_damage()`。
+  **`submit()` 答 `unchanged` 时没有 `present`**——这一帧没提交，也就没有翻页可等。那次
+  `send_frame_done()` 得在 `frame` 处理里补上：客户端 commit 了却没报 damage 是常事，扣着
+  回调就是把它永久冻住。两个示例混成器都是这么写的。
 - **`Frame` 必须比渲染器先销毁。** `Frame` 的 GPU bridge 缓存着属于 `VulkanRenderer` 的
   `GpuTexture`；参考混成器仍把渲染器声明在 `Display` 前面，让所有输出和帧账本先析构。
 - **绝不听客户端的话去索引内存。** 宽高、stride、offset 是客户端独立声明的四个整数，上游

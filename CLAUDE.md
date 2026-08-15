@@ -152,6 +152,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   sized for the old mode (scanout targets, scanout imports, the layout box, the
   `OutputGlobal`) has to be rebuilt there. `Session` (libseat, `session.cppm`) owns the device fds and tells
   both bare-metal backends when the VT is taken away.
+  **`frame` is asked for, not free-running.** One `Output::schedule_frame()` buys one `frame`
+  event; committing does NOT implicitly buy the next one. An idle screen therefore subscribes
+  to no vblank and wakes nobody — DRM's frames come from page-flip completions (plus a 1ms
+  timer to break out of idle), the nested backend asks its parent for a frame callback with an
+  empty commit, and headless's timer only paces requests instead of manufacturing them.
+  `Frame` does the asking for compositors built on it; anything else must call it by hand.
 - **protocol types** — one partition per Wayland global: `compositor` (`wl_compositor`/`wl_surface`,
   including the subsurface tree), `subcompositor`, `xdg_shell` (toplevels + popups +
   positioners), `seat` (keyboard/pointer/touch/cursor/DnD hooks), `output_global`,
@@ -241,7 +247,10 @@ answering there makes clients render frames the display never shows. They queue 
 compositor calls `Surface::send_frame_done(time_ms)`, which belongs in the `Output::present`
 handler (alongside `Presentation::notify_presented`). Forget it and every client freezes after
 one frame. Damage works the same way: `Surface::damage()` accumulates until whoever rendered it
-calls `clear_damage()`.
+calls `clear_damage()`. The one exception is `Presented::unchanged`: nothing was committed, so
+no `present` follows, and the same `send_frame_done()` has to happen in the `frame` handler
+instead — a client that commits without damaging anything is otherwise frozen for good. Both
+example compositors show the shape.
 
 ## Conventions that matter here
 

@@ -341,6 +341,20 @@ public:
         wl_callback_add_listener(cb, &frame_listener_, this);
     }
 
+protected:
+    // Frames here are the parent's to pace, and it only owes us one when we
+    // have asked. A commit carrying no new buffer is exactly that ask: it costs
+    // no allocation, changes nothing on screen, and comes back on the parent's
+    // vblank rather than on a timer of our own.
+    void arm_frame() override {
+        if (!configured || surface == nullptr) {
+            return; // the window does not exist yet; start() kicks the first frame
+        }
+        request_frame();
+        wl_surface_commit(surface);
+        wl_display_flush(parent);
+    }
+
 private:
     static void on_frame(void* data, wl_callback* cb, uint32_t) {
         auto* self = static_cast<WaylandOutput*>(data);

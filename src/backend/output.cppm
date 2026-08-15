@@ -120,6 +120,33 @@ public:
     Signal<OutputDestroy> destroy;
     Signal<OutputModeChange> mode_changed;
 
+    // --- asking for a frame ---
+    //
+    // An output that is not being committed to stops emitting `frame`. That is
+    // deliberate and it is where the idle power goes: DRM's frames come from
+    // page-flip completions, the nested backend's from the parent's frame
+    // callbacks, and headless stops re-arming its timer — so a screen nothing
+    // is changing on costs no vblank subscription, no kernel callback and no
+    // process wake-up at all. `schedule_frame()` is how the loop starts again.
+    //
+    // A compositor built on `Frame` gets most of this for free: `Frame` asks on
+    // its own behalf when a surface it drew commits, and `Frame::damage_all()`
+    // asks too. Call it directly for anything else that changes pixels.
+
+    /// Ask for one `frame` event, as soon as the display can pace one.
+    /// Idempotent while a frame is already on its way, and safe to call from
+    /// inside a `frame` handler — it asks for the next one.
+    void schedule_frame() {
+        if (frame_scheduled_) {
+            return;
+        }
+        frame_scheduled_ = true;
+        arm_frame();
+    }
+
+    /// True between `schedule_frame()` and the `frame` it asked for.
+    [[nodiscard]] bool frame_scheduled() const noexcept { return frame_scheduled_; }
+
     // --- video modes ---
 
     /// Every mode this display reports, preferred first. Empty for backends
@@ -256,10 +283,22 @@ public:
 protected:
     Output(int width, int height) noexcept : width_(width), height_(height) {}
 
+    /// Make the backend deliver one `frame` event. Called at most once per
+    /// `schedule_frame()`, and only when no frame was already pending. Backends
+    /// whose frames are already self-clocking (a page flip is in flight, the
+    /// parent owes us a callback) may do nothing here — the flag is cleared by
+    /// the emit either way.
+    virtual void arm_frame() {}
+
+    /// A `frame` event is being delivered now: the request is spent, and a
+    /// handler asking for another one must be able to get it.
+    void frame_delivered() noexcept { frame_scheduled_ = false; }
+
     /// Report a frame with a software timestamp, then ask for the next one.
     /// For backends with no vblank of their own (headless, nested): the clock is
     /// still CLOCK_MONOTONIC, so clients get usable timing, just not hw_clock.
     void emit_software_frame(std::uint32_t refresh_ns = 0) {
+        frame_delivered();
         timespec ts{};
         clock_gettime(CLOCK_MONOTONIC, &ts);
         PresentEvent presented{*this,
@@ -274,6 +313,7 @@ protected:
         frame.emit(next);
     }
 
+    bool frame_scheduled_ = false;
     int width_;
     int height_;
     int scale_ = 1;
