@@ -35,16 +35,43 @@ std::atomic<std::size_t> g_allocs{0};
 constexpr int kW = 128, kH = 96;
 } // namespace
 
-void* operator new(std::size_t n) {
+// Replacing operator new means replacing ALL of it. Under a sanitizer the
+// unreplaced forms are still the sanitizer's own, and a half-replaced set leaves
+// the pair crossed: something reaches `operator new(nothrow)` — ASan's, which
+// allocates from ASan's heap — and destruction then calls the plain
+// `operator delete` here, which hands that pointer to free(). ASan reports it as
+// alloc-dealloc-mismatch and aborts, which looks like a fault in the library and
+// is nothing of the kind. So every form goes through the same malloc/free pair,
+// and every allocating one is counted.
+namespace {
+void* counted_alloc(std::size_t n) {
     g_allocs.fetch_add(1, std::memory_order_relaxed);
-    void* p = std::malloc(n == 0 ? 1 : n);
+    return std::malloc(n == 0 ? 1 : n);
+}
+} // namespace
+
+void* operator new(std::size_t n) {
+    void* p = counted_alloc(n);
     if (p == nullptr) {
         throw std::bad_alloc();
     }
     return p;
 }
+void* operator new[](std::size_t n) {
+    void* p = counted_alloc(n);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept { return counted_alloc(n); }
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return counted_alloc(n); }
 void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 int main() {
     auto renderer = luminaria::VulkanRenderer::create();
