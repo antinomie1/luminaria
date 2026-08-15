@@ -205,7 +205,9 @@ public:
         // The dmabufs themselves belong to the renderer's scanout targets; only
         // the parent-side wl_buffer wrappers are ours.
         for (wl_buffer* buffer : scanout_buffers) {
-            wl_buffer_destroy(buffer);
+            if (buffer != nullptr) {
+                wl_buffer_destroy(buffer);
+            }
         }
         // Innermost first: the decoration hangs off the toplevel.
         if (decoration != nullptr) {
@@ -300,8 +302,17 @@ public:
         return static_cast<std::uint32_t>(scanout_buffers.size() - 1);
     }
 
+    /// The slot is left in place rather than compacted: ids are indices, and
+    /// renumbering them would invalidate every id the caller still holds.
+    void release_scanout(std::uint32_t id) override {
+        if (id < scanout_buffers.size() && scanout_buffers[id] != nullptr) {
+            wl_buffer_destroy(scanout_buffers[id]);
+            scanout_buffers[id] = nullptr;
+        }
+    }
+
     Status commit_scanout(std::uint32_t id, int in_fence_fd) override {
-        if (id >= scanout_buffers.size()) {
+        if (id >= scanout_buffers.size() || scanout_buffers[id] == nullptr) {
             if (in_fence_fd >= 0) {
                 close(in_fence_fd);
             }

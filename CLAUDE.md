@@ -29,7 +29,7 @@ Warnings are fatal (`all`, `extra`, `pedantic`, `error`), minus
 `-Wno-missing-field-initializers` for the libwayland vtable idiom. Needs **clang ≥ 22**
 (`xmake f --toolchain=clang`) or **gcc ≥ 16** — older compilers cannot build the module
 partitions — plus `glslangValidator` and `libseat`. clang is the toolchain the tree is
-currently verified against: 47/47 tests pass under clang 22.
+currently verified against: the whole suite passes under clang 22.
 
 **Why xmake and not Meson.** Meson's module dependency scanner hardcodes MSVC-shaped `.ifc`
 output names (`mesonbuild/scripts/depscan.py`), so ninja dies with "inputs may not also have
@@ -50,7 +50,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
-src/scene/               scene output_layout
+src/scene/               scene output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
 src/xwayland/            the X11 bridge
 src/detail/wayland_fwd.h the one remaining header
@@ -183,8 +183,16 @@ Two bridges out of client buffers, and new code should prefer the first:
 `Surface::current_buffer_texture()` (dmabuf → `VulkanRenderer::import_texture`, everything else
 uploaded) never reads pixels back; `Surface::current_buffer_rgba()` (shm, then single-pixel, then
 `dmabuf_buffer_to_rgba()`) does, and exists for screencopy and the non-dmabuf backends.
-What is still missing on the GPU path: direct scanout of a *client* buffer, a hardware cursor
-plane, and passing fences instead of blocking on them (`render_to` waits on a fence today).
+A third bridge skips the renderer entirely: `Surface::current_buffer_dmabuf()` describes a
+client buffer well enough to hand to `Output::import_scanout()`, and `DirectScanout`
+(`scene/direct_scanout.cppm`) decides when that is allowed — one fullscreen, unrotated,
+uncropped surface whose buffer is in a layout the display advertised — caches the imports per
+wl_buffer (a client rotates a swapchain; importing per frame would leak framebuffers), and
+holds the buffer through `Surface::hold_buffer()` so the client is not told it may redraw
+into a frame the display hardware is still scanning out. `luminaria-tty` uses it.
+
+What is still missing on the GPU path: passing fences instead of blocking on them
+(`render_to` waits on a fence today).
 
 **Surface coordinates are not buffer pixels.** A client can hand over a denser buffer
 (`set_buffer_scale`), a rotated one (`set_buffer_transform`), or crop and stretch it

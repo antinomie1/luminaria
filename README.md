@@ -81,7 +81,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
-src/scene/               scene output_layout
+src/scene/               scene output_layout direct_scanout
 src/protocol/            25 个 Wayland global，一个一文件
 src/xwayland/            X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件
@@ -342,8 +342,12 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 ### 非协议部分
 
 - △ **真正的 XWM**（现 xwayland 极简）— 窗口堆叠、焦点、`_NET_*` hints、ICCCM/EWMH、override-redirect、X 剪贴板桥、`WL_SURFACE_ID` 关联
-- ✓ **DRM atomic 模式设置 + GPU scanout** —— legacy pageflip 已整体弃用；**硬件光标 plane 已做**。
-      剩下的是客户端 buffer 直出 primary plane（全屏免合成）与多输出同帧提交
+- ✓ **DRM atomic 模式设置 + GPU scanout** —— legacy pageflip 已整体弃用；**硬件光标 plane 已做**；
+      **客户端 buffer 直出 primary plane 已做** —— `DirectScanout`（`scene/direct_scanout.cppm`）：
+      唯一全屏、未旋转未裁剪、且 modifier 是输出广告过的客户端 buffer 直接翻页，整帧不合成、
+      不拷贝。按 wl_buffer 缓存 KMS framebuffer（客户端轮转 swapchain，逐帧 import 会漏 fb），
+      并用 `Surface::hold_buffer()` 压住 `wl_buffer.release` —— 显示硬件还在读的那一帧，
+      不能告诉客户端可以重画。`luminaria-tty` 已接入。剩下的是多输出同帧提交
 - ✓ **异步 explicit sync 链路** —— acquire fence → `VkSemaphore` → 渲染 out-fence →
       atomic `IN_FENCE_FD`；`OUT_FENCE_PTR` 反向喂回。整条链路没有一次 CPU 停等
 - △ **渲染管线**：✓ 多矩形 scissor damage、✓ 不透明遮挡剔除、✓ alpha 混合、✓ 缩放与旋转、

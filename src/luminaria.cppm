@@ -25,6 +25,7 @@ export import :cursor_theme;
 export import :data_control;
 export import :data_device;
 export import :display;
+export import :direct_scanout;
 export import :dmabuf;
 export import :drm;
 export import :drm_syncobj;

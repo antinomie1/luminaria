@@ -28,6 +28,7 @@ export module luminaria:compositor;
 
 import :box;
 import :display;
+import :dmabuf;
 import :expected;
 import :linux_dmabuf;
 import :region;
@@ -224,6 +225,35 @@ public:
     /// the Display and destroying it after.
     [[nodiscard]] GpuTexture* buffer_texture(VulkanRenderer& renderer);
 
+    /// A third bridge, for the case where the compositor draws nothing at all:
+    /// if the committed buffer is a dmabuf, describe it so it can be handed
+    /// straight to `Output::import_scanout()`. False for shm, single-pixel and
+    /// no buffer. `out.fd` is borrowed and stays valid only while this same
+    /// buffer is committed — see `DirectScanout`, which does the bookkeeping.
+    [[nodiscard]] bool current_buffer_dmabuf(DmabufPlane& out) const;
+
+    /// The committed wl_buffer, or null. Raw, and mainly here so a cache can be
+    /// keyed on buffer identity; anything holding it MUST take a destroy
+    /// listener, because the client can drop it at any time.
+    [[nodiscard]] wl_resource* current_buffer() const noexcept { return current_buffer_; }
+
+    // --- holding a buffer past its commit ---
+    //
+    // Normally a buffer is released the moment the next one is committed: the
+    // renderer has already sampled it. Direct scanout breaks that promise — the
+    // display hardware reads the client's buffer for as long as it is on
+    // screen, so telling the client it may draw into it again puts a half-drawn
+    // frame on the monitor. `hold_buffer` defers the release until whoever put
+    // the buffer on screen says it is off again.
+
+    /// Suppress `wl_buffer.release` for `buffer` until `unhold_buffer`. Holding
+    /// the same buffer twice is one hold. Null and unknown buffers are ignored.
+    void hold_buffer(wl_resource* buffer);
+
+    /// Drop a hold, sending the release that was withheld if the buffer is no
+    /// longer the committed one. Safe to call for a buffer that was never held.
+    void unhold_buffer(wl_resource* buffer);
+
     // --- subsurface tree ---
 
     /// This surface's parent, if it is a subsurface.
@@ -327,6 +357,10 @@ private:
     Region input_;
     bool has_input_region_ = false;
     Viewport viewport_;
+    // Buffers someone is scanning out, and the releases that are waiting on
+    // them. Both are tiny — a client's swapchain is two or three buffers.
+    std::vector<wl_resource*> held_buffers_;
+    std::vector<wl_resource*> release_due_;
     int offset_x_ = 0, offset_y_ = 0;
     int acquire_fence_ = -1; // sync_file, owned
 
@@ -405,6 +439,33 @@ struct Compositor::Impl {
         }
     }
 };
+
+void Surface::hold_buffer(wl_resource* buffer) {
+    if (buffer == nullptr ||
+        std::find(held_buffers_.begin(), held_buffers_.end(), buffer) != held_buffers_.end()) {
+        return;
+    }
+    held_buffers_.push_back(buffer);
+    // The hold outlives the commit that installed the buffer, so the watch has
+    // to outlive it too: prune_buffer_watches() only keeps pending/cached/current.
+    watch_buffer(buffer);
+}
+
+void Surface::unhold_buffer(wl_resource* buffer) {
+    if (std::erase(held_buffers_, buffer) == 0) {
+        return;
+    }
+    // The release was withheld while the buffer was on screen. Now it is not,
+    // and the client is free to draw into it again.
+    if (std::erase(release_due_, buffer) != 0) {
+        wl_buffer_send_release(buffer);
+    }
+    prune_buffer_watches();
+}
+
+bool Surface::current_buffer_dmabuf(DmabufPlane& out) const {
+    return current_buffer_ != nullptr && dmabuf_buffer_info(current_buffer_, out);
+}
 
 bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, int& height) const {
     if (current_buffer_ == nullptr) {
@@ -572,11 +633,17 @@ void Surface::watch_buffer(wl_resource* buffer) {
 void Surface::prune_buffer_watches() {
     std::erase_if(buffer_watches_, [this](const std::unique_ptr<BufferWatch>& watch) {
         return watch->buffer != current_buffer_ && watch->buffer != pending_.buffer &&
-               watch->buffer != cached_.buffer;
+               watch->buffer != cached_.buffer &&
+               std::find(held_buffers_.begin(), held_buffers_.end(), watch->buffer) ==
+                   held_buffers_.end();
     });
 }
 
 void Surface::forget_buffer(wl_resource* buffer) noexcept {
+    // The client destroyed it out from under every hold. There is nothing left
+    // to release and nothing left to hold.
+    std::erase(held_buffers_, buffer);
+    std::erase(release_due_, buffer);
     // A pending/cached attach of a now-dead buffer degrades to "attach null",
     // which is exactly what the surface should show: nothing.
     if (pending_.buffer == buffer) {
@@ -897,9 +964,16 @@ void Surface::commit_state(State state) {
     const int old_h = surface_height();
     if (state.buffer_dirty) {
         // Release the buffer we're replacing so the client can reuse it. We copy
-        // buffer contents at render time, so we only need to hold the current one.
+        // buffer contents at render time, so we only need to hold the current one
+        // — unless someone put it on the screen directly, in which case the
+        // release waits for their unhold_buffer().
         if (current_buffer_ != nullptr && current_buffer_ != state.buffer) {
-            wl_buffer_send_release(current_buffer_);
+            if (std::find(held_buffers_.begin(), held_buffers_.end(), current_buffer_) !=
+                held_buffers_.end()) {
+                release_due_.push_back(current_buffer_);
+            } else {
+                wl_buffer_send_release(current_buffer_);
+            }
         }
         current_buffer_ = state.buffer;
         buffer_size(current_buffer_, buffer_width_, buffer_height_);

@@ -196,6 +196,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<luminaria::OutputGlobal> global;
         std::vector<luminaria::ScanoutTarget> targets;
         std::vector<std::uint32_t> ids;
+        std::optional<luminaria::DirectScanout> direct;
         int back = 0;
         bool needs_full_redraw = true;
         std::vector<luminaria::Box> previous_damage; // the other buffer's debt
@@ -268,10 +269,17 @@ int main(int argc, char** argv) {
             screen.targets.clear();
             screen.ids.clear();
         }
+        screen.direct.emplace(e.output);
 
         // A frame is on screen: pace the clients that drew it, and answer their
         // presentation feedback with the vblank timestamp the kernel gave us.
-        screen.present_conn = e.output.present.connect([&](luminaria::PresentEvent& pe) {
+        screen.present_conn = e.output.present.connect([&, &screen = screen]
+                                                       (luminaria::PresentEvent& pe) {
+            // The flip landed, so whatever a direct scanout replaced is off the
+            // screen and its client can have it back.
+            if (screen.direct.has_value()) {
+                screen.direct->presented();
+            }
             for (Window& w : windows) {
                 if (!w.mapped || w.toplevel == nullptr) {
                     continue;
@@ -285,6 +293,43 @@ int main(int argc, char** argv) {
         screen.frame_conn = e.output.frame.connect([&, &screen = screen](luminaria::FrameEvent& fe) {
             constexpr luminaria::Color background{0.1f, 0.1f, 0.13f, 1.0f};
             const luminaria::Box view_box = layout.box_of(fe.output);
+
+            // --- direct scanout -------------------------------------------
+            //
+            // One window, covering the whole monitor, handing us a buffer the
+            // display can already read: point the CRTC at it and draw nothing
+            // at all. This is the fullscreen video / game case, and it saves
+            // the entire composite pass plus the memory bandwidth of a
+            // full-screen blit every frame.
+            //
+            // The cursor has to be on its own plane, or it would not appear:
+            // nothing is compositing it in.
+            if (screen.direct.has_value() && fe.output.has_cursor_plane()) {
+                const std::vector<Layer> layers = build_layers();
+                if (layers.size() == 1 && layers[0].x == view_box.x &&
+                    layers[0].y == view_box.y &&
+                    layers[0].surface->surface_width() == fe.output.logical_width() &&
+                    layers[0].surface->surface_height() == fe.output.logical_height()) {
+                    luminaria::Surface& surface = *layers[0].surface;
+                    if (auto id = screen.direct->id_for(surface)) {
+                        // The client's own acquire fence goes straight to KMS:
+                        // the flip waits for the client's GPU work, and we
+                        // never touch it.
+                        int fence = surface.acquire_fence_fd();
+                        if (fence >= 0) {
+                            fence = dup(fence);
+                        }
+                        if (fe.output.commit_scanout(*id, fence)) {
+                            screen.direct->committed(surface);
+                            surface.clear_damage();
+                            // The composited buffers no longer hold this frame,
+                            // so the next composited frame must be complete.
+                            screen.needs_full_redraw = true;
+                            return;
+                        }
+                    }
+                }
+            }
 
             // Textures live on the surfaces and are cached there; this is a
             // list of borrowed pointers.

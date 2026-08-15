@@ -140,6 +140,14 @@ public:
         return fail("this output cannot scan out a dmabuf");
     }
 
+    /// Drop an import. A compositor's own render targets live as long as the
+    /// output does and never need this; buffers that came from a *client* do —
+    /// a toolkit drops its whole swapchain on every resize, and without this
+    /// the imports pile up for the life of the output. Releasing an id that
+    /// was never imported, or is currently on screen, is a no-op: the backend
+    /// keeps the scanned-out buffer alive until something replaces it.
+    virtual void release_scanout(std::uint32_t id) { (void)id; }
+
     /// Page-flip to a buffer returned by import_scanout(). `frame` fires again
     /// once the flip completes.
     ///

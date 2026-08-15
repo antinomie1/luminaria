@@ -17,8 +17,10 @@
 //
 // Each output drives a primary plane and, when the hardware has one to spare, a
 // cursor plane — so moving the pointer costs one small atomic commit instead of
-// a repaint. TODO: no direct scanout of a client buffer (fullscreen bypass),
-// and no mode switching: each output uses its connector's preferred mode.
+// a repaint. A client's own buffer can go straight onto the primary plane —
+// see `DirectScanout` in scene/direct_scanout.cppm, which does the eligibility
+// and lifetime bookkeeping on top of `import_scanout`/`release_scanout`.
+// TODO: no mode switching — each output uses its connector's preferred mode.
 
 module;
 
@@ -265,7 +267,8 @@ public:
     drmModeCrtc* saved_crtc = nullptr; // restored when this output goes away
     DumbFb fbs[2]; // CPU path (solid colour / read-back frames)
     int front = 0;
-    std::vector<ImportedFb> imported; // GPU path (renderer scanout targets)
+    std::vector<ImportedFb> imported; // GPU path (renderer scanout targets, client buffers)
+    std::vector<ImportedFb> retired;  // released but still on screen; freed on the next flip
     CursorPlane cursor;
 
     uint32_t pending_fb = 0;
@@ -296,9 +299,11 @@ public:
                            saved_crtc->y, nullptr, 0, nullptr);
             drmModeFreeCrtc(saved_crtc);
         }
-        for (ImportedFb& fb : imported) {
-            drmModeRmFB(fd, fb.fb_id);
-            drmCloseBufferHandle(fd, fb.handle);
+        for (const std::vector<ImportedFb>& list : {imported, retired}) {
+            for (const ImportedFb& fb : list) {
+                drmModeRmFB(fd, fb.fb_id);
+                drmCloseBufferHandle(fd, fb.handle);
+            }
         }
         destroy_fb(fd, fbs[0]);
         destroy_fb(fd, fbs[1]);
@@ -516,6 +521,37 @@ public:
         return fb_id;
     }
 
+    /// Drop an import — the client that owned the buffer dropped it. The one
+    /// the CRTC is scanning out cannot go yet (the screen would go dark on the
+    /// next vblank), so it waits in `retired` until a later frame replaces it.
+    void release_scanout(std::uint32_t id) override {
+        const auto it = std::find_if(imported.begin(), imported.end(),
+                                     [id](const ImportedFb& fb) { return fb.fb_id == id; });
+        if (it == imported.end()) {
+            return;
+        }
+        const ImportedFb fb = *it;
+        imported.erase(it);
+        if (fb.fb_id == pending_fb) {
+            retired.push_back(fb);
+            return;
+        }
+        drmModeRmFB(fd, fb.fb_id);
+        drmCloseBufferHandle(fd, fb.handle);
+    }
+
+    /// Free everything in `retired` that is no longer the scanned-out buffer.
+    void reap_retired() {
+        std::erase_if(retired, [this](const ImportedFb& fb) {
+            if (fb.fb_id == pending_fb) {
+                return false;
+            }
+            drmModeRmFB(fd, fb.fb_id);
+            drmCloseBufferHandle(fd, fb.handle);
+            return true;
+        });
+    }
+
     // --- hardware cursor plane ---
 
     [[nodiscard]] bool has_cursor_plane() const noexcept override {
@@ -632,6 +668,7 @@ public:
         const Status s = atomic(id, !modeset_done, in_fence_fd);
         if (s) {
             modeset_done = true;
+            reap_retired(); // whatever this frame replaced is now free to go
         }
         return s;
     }
