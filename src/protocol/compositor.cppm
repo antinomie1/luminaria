@@ -13,7 +13,9 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <vector>
 
@@ -41,6 +43,19 @@ export namespace luminaria {
 
 class Display;
 class Surface;
+
+/// Stable identity for a Surface. Slots are reused, but their generation is
+/// advanced first, so an id retained past client destruction never resolves to
+/// a different client's later surface (the ABA case).
+struct SurfaceId {
+    std::uint32_t index = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t generation = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return index != std::numeric_limits<std::uint32_t>::max();
+    }
+    [[nodiscard]] bool operator==(const SurfaceId&) const noexcept = default;
+};
 
 struct NewSurface {
     Surface& surface;
@@ -175,6 +190,10 @@ public:
 
     /// Escape hatch for protocol wiring (e.g. seat focus): the wl_surface resource.
     [[nodiscard]] wl_resource* c_resource() const noexcept { return resource_; }
+
+    /// This surface's generational identity. Safe to retain across dispatch;
+    /// resolve it with surface_from_id() each time it is used.
+    [[nodiscard]] SurfaceId id() const noexcept { return id_; }
 
     /// Copy the committed wl_shm buffer into tightly-packed RGBA8 (`out`), setting
     /// width/height. Returns false if there is no buffer or it isn't a supported
@@ -337,6 +356,7 @@ private:
     void collect_tree(std::vector<SurfaceAt>& out, int ox, int oy);
 
     wl_resource* resource_;
+    SurfaceId id_;
     wl_resource* current_buffer_ = nullptr;
     int buffer_width_ = 0;
     int buffer_height_ = 0;
@@ -379,6 +399,9 @@ private:
 /// presentation-time, xdg-shell) to get from a client's object to ours.
 [[nodiscard]] Surface* surface_from_resource(wl_resource* resource);
 
+/// Resolve a generational id, or null once that exact Surface has gone away.
+[[nodiscard]] Surface* surface_from_id(SurfaceId id) noexcept;
+
 /// The Region behind a `wl_region` resource (null in, null out). Protocols that
 /// take a wl_region of their own — pointer-constraints' confinement area — read
 /// it through this rather than re-implementing wl_region.
@@ -410,6 +433,83 @@ private:
 
 // --------------------------------------------------------------- implementation
 namespace luminaria {
+
+namespace {
+
+struct SurfaceSlot {
+    Surface* surface = nullptr;
+    std::uint32_t generation = 1;
+};
+
+struct SurfaceRegistry {
+    std::vector<SurfaceSlot> slots;
+    std::vector<std::uint32_t> free;
+};
+
+SurfaceRegistry& surface_registry() {
+    static SurfaceRegistry registry;
+    return registry;
+}
+
+SurfaceId register_surface(Surface* surface) noexcept {
+    try {
+        SurfaceRegistry& registry = surface_registry();
+        if (!registry.free.empty()) {
+            const std::uint32_t index = registry.free.back();
+            registry.free.pop_back();
+            SurfaceSlot& slot = registry.slots[index];
+            slot.surface = surface;
+            return SurfaceId{index, slot.generation};
+        }
+        if (registry.slots.size() >= std::numeric_limits<std::uint32_t>::max()) {
+            return {};
+        }
+        const auto index = static_cast<std::uint32_t>(registry.slots.size());
+        registry.slots.push_back(SurfaceSlot{surface, 1});
+        return SurfaceId{index, 1};
+    } catch (...) {
+        return {};
+    }
+}
+
+void unregister_surface(SurfaceId id) noexcept {
+    if (!id.valid()) {
+        return;
+    }
+    SurfaceRegistry& registry = surface_registry();
+    if (id.index >= registry.slots.size()) {
+        return;
+    }
+    SurfaceSlot& slot = registry.slots[id.index];
+    if (slot.surface == nullptr || slot.generation != id.generation) {
+        return;
+    }
+    slot.surface = nullptr;
+    ++slot.generation;
+    if (slot.generation == 0) {
+        slot.generation = 1;
+    }
+    try {
+        registry.free.push_back(id.index);
+    } catch (...) {
+        // Losing a free-list entry only prevents this slot being reused. The
+        // generation was already advanced, so stale ids remain harmless.
+    }
+}
+
+} // namespace
+
+Surface* surface_from_id(SurfaceId id) noexcept {
+    if (!id.valid()) {
+        return nullptr;
+    }
+    SurfaceRegistry& registry = surface_registry();
+    if (id.index >= registry.slots.size()) {
+        return nullptr;
+    }
+    const SurfaceSlot& slot = registry.slots[id.index];
+    return slot.generation == id.generation ? slot.surface : nullptr;
+}
 
 struct Compositor::Impl {
     wl_display* display = nullptr;
@@ -792,7 +892,7 @@ void Surface::send_frame_done(std::uint32_t time_ms) {
     queued_frame_callbacks_.clear();
 }
 
-Surface::Surface(wl_resource* resource) noexcept : resource_(resource) {}
+Surface::Surface(wl_resource* resource) noexcept : resource_(resource), id_(register_surface(this)) {}
 
 Surface::~Surface() {
     SurfaceDestroy event{*this};
@@ -815,6 +915,7 @@ Surface::~Surface() {
         std::erase(parent_->above_, this);
         parent_ = nullptr;
     }
+    unregister_surface(id_);
 }
 
 bool Surface::effective_sync() const noexcept {
@@ -1230,7 +1331,13 @@ void compositor_create_surface(wl_client* client, wl_resource* compositor_resour
         wl_client_post_no_memory(client);
         return;
     }
-    auto* surface = new Surface{resource};
+    auto* surface = new (std::nothrow) Surface{resource};
+    if (surface == nullptr || !surface->id().valid()) {
+        delete surface;
+        wl_resource_destroy(resource);
+        wl_client_post_no_memory(client);
+        return;
+    }
     wl_resource_set_implementation(resource, &surface_impl, surface, surface_resource_destroy);
 
     NewSurface event{*surface};
