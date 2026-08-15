@@ -10,8 +10,18 @@ built with xmake. Roughly wlroots-shaped but far smaller (25 protocol types vs w
 
 It ships as a **C++20 named module**. `import luminaria;` is the entire interface — there are
 no public headers.
-`README.md` (Chinese) holds the current feature matrix and the roadmap of missing protocols;
-`TODO-CORNERS-CUT.md` (Chinese) is an audit of every TODO and every deliberate no-op stub.
+All prose docs are in Chinese. `README.md` is the introduction only — no technical detail.
+`CONTEXT.md` is the glossary (what "混成器"/"合成"/"布局" mean here, and what they don't);
+`docs/architecture.md` is the layering, module structure and the rules that bite;
+`docs/features.md` is the feature matrix; `docs/adr/` holds the irreversible design
+decisions and why; `TODO.md` is the open work in execution order.
+
+**Four ADRs set the current direction, and parts of this file describe code they retire:**
+no retained scene graph (`src/scene/scene.cppm` is to be deleted, the shell layer is
+immediate-mode `Placement`/`Frame`), surfaces reached through generational handles rather
+than raw `Surface*` + destroy subscriptions, a four-way module split with an admission rule
+for the core module, and no API stability before 1.0. Read `docs/adr/` before designing
+anything structural.
 
 ## Build / test / run
 
