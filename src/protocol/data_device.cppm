@@ -178,6 +178,11 @@ struct DataDeviceManager::Impl {
     wl_resource* drag_icon = nullptr;  // wl_surface used as the drag image
     Surface* drag_focus = nullptr;     // surface under the cursor
     wl_resource* drag_offer = nullptr; // offer handed to drag_focus's client
+    // drag_focus is a raw Surface* that outlives nothing on its own: a client
+    // may destroy the surface it is dragging over, mid-drag, and Seat's own
+    // destroy handler only clears Seat's copy. Everything downstream
+    // (drag_motion, drag_drop) dereferences this to find the target client.
+    Signal<SurfaceDestroy>::Connection drag_focus_gone;
 
     ~Impl() {
         if (global != nullptr) {
@@ -432,6 +437,7 @@ void drag_send_leave(DdMgr* mgr) {
         wl_resource_destroy(offer);
     }
     mgr->drag_focus = nullptr;
+    mgr->drag_focus_gone.disconnect();
 }
 
 void drag_focus(DdMgr* mgr, Surface* surface, double sx, double sy) {
@@ -455,6 +461,19 @@ void drag_focus(DdMgr* mgr, Surface* surface, double sx, double sy) {
                                   wl_fixed_from_double(sy), offer);
     }
     mgr->drag_focus = surface;
+    mgr->drag_focus_gone = surface->destroy.connect([mgr](SurfaceDestroy&) {
+        // No leave is sent: the surface is already being torn down, exactly as
+        // Seat does for a focus that dies. The offer is a resource of that
+        // client and stays valid, but it refers to a drop target that no longer
+        // exists, so it goes too.
+        mgr->drag_focus = nullptr;
+        if (mgr->drag_offer != nullptr) {
+            wl_resource* offer = mgr->drag_offer;
+            mgr->drag_offer = nullptr;
+            wl_resource_destroy(offer);
+        }
+        mgr->drag_focus_gone.disconnect();
+    });
 }
 
 void drag_motion(DdMgr* mgr, double sx, double sy) {

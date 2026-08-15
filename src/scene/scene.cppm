@@ -23,6 +23,7 @@ import :color;
 import :compositor;
 import :rect_fill;
 import :region;
+import :signal;
 import :vulkan;
 
 export namespace luminaria {
@@ -92,14 +93,30 @@ private:
     Color color_;
 };
 
+/// A client surface placed in the tree.
+///
+/// The node does not own the surface and cannot keep it alive: a client may
+/// destroy a wl_surface while the compositor still has a node pointing at it.
+/// So the pointer is cleared from the surface's own destroy signal, and
+/// `surface()` returns null from then on — a scene walk skips the node instead
+/// of reading freed memory. A caller that stored the result of an earlier
+/// `surface()` call must not hold it across dispatch.
 class SceneSurface final : public SceneLeaf {
 public:
     SceneSurface(Surface& surface, int width, int height) noexcept
-        : SceneLeaf(Type::Surface, width, height), surface_(&surface) {}
-    [[nodiscard]] Surface& surface() const noexcept { return *surface_; }
+        : SceneLeaf(Type::Surface, width, height), surface_(&surface) {
+        gone_ = surface.destroy.connect([this](SurfaceDestroy&) {
+            surface_ = nullptr;
+            gone_.disconnect();
+        });
+    }
+
+    /// The surface, or null once the client has destroyed it.
+    [[nodiscard]] Surface* surface() const noexcept { return surface_; }
 
 private:
-    Surface* surface_;
+    Surface* surface_ = nullptr;
+    Signal<SurfaceDestroy>::Connection gone_;
 };
 
 class SceneTree final : public SceneNode {
@@ -263,7 +280,11 @@ void collect_textures(const SceneTree& tree, int ox, int oy, VulkanRenderer& ren
             continue;
         }
         const auto& node = static_cast<const SceneSurface&>(*child);
-        Surface& surface = node.surface();
+        Surface* surface_ptr = node.surface();
+        if (surface_ptr == nullptr) {
+            continue; // destroyed by its client; the node outlived it
+        }
+        Surface& surface = *surface_ptr;
         const Box box{cx, cy, surface.surface_width(), surface.surface_height()};
         if (box.empty() || (!damage.empty() && !damage.intersects(box))) {
             continue;
@@ -299,7 +320,9 @@ void for_each_surface(const SceneTree& tree, int ox, int oy, Fn&& fn) {
         if (child->type() == SceneNode::Type::Tree) {
             for_each_surface(static_cast<const SceneTree&>(*child), cx, cy, fn);
         } else if (child->type() == SceneNode::Type::Surface) {
-            fn(static_cast<const SceneSurface&>(*child).surface(), cx, cy);
+            if (Surface* s = static_cast<const SceneSurface&>(*child).surface(); s != nullptr) {
+                fn(*s, cx, cy);
+            }
         }
     }
 }
