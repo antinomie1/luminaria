@@ -76,6 +76,11 @@ struct Window {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Line-buffered: this output is a diagnostic log, and a block-buffered one
+    // loses its tail exactly when it matters — a compositor that died, or a VT
+    // that was taken away.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     const char* env = std::getenv("LUMINARIA_DRM_DEVICE");
     const char* device = argc > 1 ? argv[1] : env;
 
@@ -108,6 +113,16 @@ int main(int argc, char** argv) {
                     s.error().message.c_str());
     }
     luminaria::Session* seat_session = session.has_value() ? &*session : nullptr;
+    // A VT switch is the one thing on this path that touches DRM master, the
+    // input fds and the modeset all at once, so it says so in the log: what
+    // follows an "inactive" line is what a switch away actually did.
+    luminaria::Signal<luminaria::SessionActive>::Connection session_conn;
+    if (seat_session != nullptr) {
+        session_conn = seat_session->activity().connect([](luminaria::SessionActive& e) {
+            std::printf("luminaria-tty: session %s\n",
+                        e.active ? "active — VT switched in" : "inactive — VT switched away");
+        });
+    }
 
     auto drm = device != nullptr
                    ? luminaria::DrmBackend::create(display->event_loop(), device, seat_session)
@@ -164,12 +179,16 @@ int main(int argc, char** argv) {
             seat->set_keyboard_focus(&w.toplevel->surface());
             seat->pointer_enter(w.toplevel->surface(), 0, 0);
             window_changed();
+            std::printf("luminaria-tty: window mapped at (%d,%d), %dx%d — \"%s\"\n", w.x, w.y,
+                        w.toplevel->surface().surface_width(),
+                        w.toplevel->surface().surface_height(), w.toplevel->title().c_str());
         });
         w.on_destroy =
             e.toplevel.destroy.connect([&w, &window_changed](luminaria::ToplevelDestroy&) {
                 w.mapped = false;
                 w.toplevel = nullptr;
                 window_changed();
+                std::printf("luminaria-tty: window gone\n");
             });
     });
 
@@ -190,6 +209,40 @@ int main(int argc, char** argv) {
     };
     std::list<Screen> screens; // stable addresses: the callbacks capture Screen&
     luminaria::OutputLayout layout;
+
+    // What the frames actually did, reported once a second and only when it
+    // changed — this is what a real-hardware run leaves in the log. `scanout`
+    // means a client's own buffer reached the CRTC untouched; a screen reporting
+    // ~60 `unchanged` per second is the idle flipping that the next step is
+    // meant to kill, and when it does, this line will simply stop appearing.
+    struct FrameLog {
+        unsigned composited = 0, scanout = 0, unchanged = 0, fallback = 0;
+
+        void count(luminaria::Presented presented) {
+            switch (presented) {
+            case luminaria::Presented::composited: ++composited; break;
+            case luminaria::Presented::scanout: ++scanout; break;
+            case luminaria::Presented::unchanged: ++unchanged; break;
+            case luminaria::Presented::fallback: ++fallback; break;
+            }
+        }
+        bool operator==(const FrameLog&) const noexcept = default;
+    };
+    FrameLog frames;
+    FrameLog reported;
+    luminaria::EventSource stats_timer;
+    stats_timer = display->event_loop().add_timer([&] {
+        if (!(frames == reported)) {
+            std::printf("luminaria-tty: frames/s composited=%u scanout=%u unchanged=%u "
+                        "fallback=%u\n",
+                        frames.composited - reported.composited,
+                        frames.scanout - reported.scanout, frames.unchanged - reported.unchanged,
+                        frames.fallback - reported.fallback);
+            reported = frames;
+        }
+        stats_timer.arm(1000);
+    });
+    stats_timer.arm(1000);
 
     // --- the pointer's picture ------------------------------------------------
     //
@@ -377,8 +430,9 @@ int main(int argc, char** argv) {
             screen.global->set_transform(output.transform());
             screen.global->set_logical_position(view.x, view.y);
         }
-        std::printf("luminaria-tty: output %dx%d@%.3gHz at (%d,%d)\n", ow, oh,
-                    output.current_mode().refresh_mhz / 1000.0, view.x, view.y);
+        std::printf("luminaria-tty: output %dx%d@%.3gHz at (%d,%d), scale %d, cursor plane %s\n",
+                    ow, oh, output.current_mode().refresh_mhz / 1000.0, view.x, view.y,
+                    output.scale(), output.has_cursor_plane() ? "yes" : "no (composited)");
     };
 
     auto out_conn = drm->new_output.connect([&](luminaria::NewOutput& e) {
@@ -452,10 +506,13 @@ int main(int argc, char** argv) {
             // and the decision to hand a fullscreen client's own buffer straight
             // to the CRTC — is the shell layer's, not this compositor's.
             build_placements(screen);
-            if (auto presented = screen.frame->submit(background); !presented) {
+            auto presented = screen.frame->submit(background);
+            if (!presented) {
                 std::fprintf(stderr, "luminaria-tty: submit: %s\n",
                              presented.error().message.c_str());
+                return;
             }
+            frames.count(*presented);
         });
     });
 
@@ -613,6 +670,9 @@ int main(int argc, char** argv) {
     auto caps_conn =
         input->capabilities_changed().connect([&](luminaria::InputCapabilities& caps) {
             seat->set_capabilities(caps.keyboard, caps.pointer, /*touch=*/false);
+            std::printf("luminaria-tty: input devices: keyboard=%s pointer=%s touch=%s\n",
+                        caps.keyboard ? "yes" : "no", caps.pointer ? "yes" : "no",
+                        caps.touch ? "yes (not routed)" : "no");
         });
     auto motion_conn = input->pointer_motion().connect([&](luminaria::PointerMotionEvent& e) {
         cursor_x += e.dx;

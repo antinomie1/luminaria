@@ -75,6 +75,16 @@ xdg-shell / seat，每帧用 Vulkan 合成 mapped 客户端窗口后扫描到显
 WAYLAND_DISPLAY=wayland-1 weston-terminal
 ```
 
+**真机验证并留下证据**（TODO 第 0 项）：`scripts/tty-check.sh` 把运行环境记下来、给
+compositor 的输出打时间戳、按需拉起一个客户端，退出后在 `logs/tty-check-<时间>/` 生成
+`report.md` —— 模式设置、硬件光标平面、GPU 直出、VT 切换、热插拔、空闲翻页数逐项勾出来，
+连同原始日志。屏幕被接管之前它会先把要做的动作列出来。
+
+```sh
+./scripts/tty-check.sh                 # 自动挑客户端
+./scripts/tty-check.sh --no-client     # 只跑 compositor
+```
+
 **截图 / 录屏**（compositor 跑起来后，任一后端，指向它的 `WAYLAND_DISPLAY`）：
 
 ```sh
