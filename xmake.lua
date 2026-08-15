@@ -155,7 +155,12 @@ target("luminaria")
             {"input-method-unstable-v2",     "scl"},
         }
 
-        local gendir = path.join(os.projectdir(), "build", "generated")
+        -- os.scriptdir(), never os.projectdir(): when this xmake.lua is pulled
+        -- into a larger build with includes(), the project dir is the PARENT's
+        -- root and every path below would resolve outside the tree. scriptdir is
+        -- always this file's directory, which is also what the relative
+        -- add_files/add_includedirs above already resolve against.
+        local gendir = path.join(os.scriptdir(), "build", "generated")
         local scanner = tool_path("wayland-scanner", "wayland_scanner")
         local protodir = tool_path("wayland-protocols", "pkgdatadir")
         local sources = {}
@@ -181,7 +186,7 @@ target("luminaria")
             scan(p[1], path.join(protodir, p[2]), p[3])
         end
         for _, p in ipairs(local_protocols) do
-            scan(p[1], path.join(os.projectdir(), "protocol", p[1] .. ".xml"), p[2])
+            scan(p[1], path.join(os.scriptdir(), "protocol", p[1] .. ".xml"), p[2])
         end
 
         target:add("files", sources)
@@ -202,11 +207,12 @@ target("luminaria-gpu")
         local function stale(src, dst)
             return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
         end
+        -- os.scriptdir() for the same reason as the protocol scanner above.
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
-            local src = path.join(os.projectdir(), "src", "render", shader[1])
-            local dst = path.join(os.projectdir(), "build", "generated", shader[3])
+            local src = path.join(os.scriptdir(), "src", "render", shader[1])
+            local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
             if stale(src, dst) then
                 os.mkdir(path.directory(dst))
                 os.iorunv("glslangValidator", {"-V", "--vn", shader[2], "-o", dst, src})
@@ -224,8 +230,8 @@ target("luminaria-gpu")
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
-            local src = path.join(os.projectdir(), "src", "render", shader[1])
-            local dst = path.join(os.projectdir(), "build", "generated", shader[3])
+            local src = path.join(os.scriptdir(), "src", "render", shader[1])
+            local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
             if stale(src, dst) then
                 os.mkdir(path.directory(dst))
                 os.iorunv("glslangValidator", {"-V", "--vn", shader[2], "-o", dst, src})
@@ -308,7 +314,10 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
         -- convention here: a test that cannot run (no GPU, no free VT, no seat)
         -- says why on stderr and is not a failure.
         on_test(function (target, opt)
-            local code = os.execv(target:targetfile(), {}, {try = true, curdir = os.projectdir()})
+            -- scriptdir, not projectdir: a test's relative paths (tests/*.supp,
+            -- protocol/*.xml) are relative to luminaria's root even when the
+            -- enclosing project is somebody else's.
+            local code = os.execv(target:targetfile(), {}, {try = true, curdir = os.scriptdir()})
             if code == 77 then
                 cprint("${color.warning}skipped${clear} %s (see the reason above)", target:name())
                 return true
