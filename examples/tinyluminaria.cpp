@@ -153,6 +153,16 @@ int main() {
     // Games asking to skip the vblank wait; forwarded to the output that owns
     // the fullscreen surface (only the DRM backend can actually tear).
     auto tearing = must(luminaria::TearingControlManager::create(display), "tearing-control");
+    // The other half of pacing, and the reason an animating client can sleep:
+    // FIFO parks a commit until the previous frame has been shown (the barrier
+    // is cleared by send_frame_done() in the present handler below), and commit
+    // timing parks one until a named instant. Neither needs anything else here.
+    auto fifo = must(luminaria::FifoManager::create(display), "wp-fifo");
+    auto commit_timing =
+        must(luminaria::CommitTimingManager::create(display), "wp-commit-timing");
+    // "I am playing a video" / "I am a game", for whoever decides refresh rate
+    // and scanout policy. Read it off the Surface.
+    auto content_type = must(luminaria::ContentTypeManager::create(display), "content-type");
     // Named cursors, so clients stop shipping their own bitmaps.
     auto cursor_shape = must(luminaria::CursorShapeManager::create(display), "cursor-shape");
     // Crop/stretch a buffer, and tell clients the true (fractional) output

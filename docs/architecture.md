@@ -78,7 +78,7 @@ src/util/                box color dmabuf pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
 src/shell/               frame output_layout direct_scanout
-src/protocol/            25 个 Wayland global，一个一文件
+src/protocol/            30 个 Wayland global，一个一文件
 src/xwayland/            `luminaria.xwayland`，X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件
 ```

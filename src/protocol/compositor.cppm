@@ -22,6 +22,7 @@ module;
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <ctime>
 #include <unistd.h> // close
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -241,6 +242,60 @@ public:
     /// Called by the wp_tearing_control_v1 glue; applied on the next commit.
     void set_pending_tearing_hint(bool async) noexcept { pending_.tearing = async; }
 
+    // --- content type (wp_content_type_v1) ---
+
+    /// What the client says it is showing. Values match `wp_content_type_v1.type`:
+    /// 0 none, 1 photo, 2 video, 3 game. A hint, and sticky double-buffered
+    /// state like the scale and the transform — read it to pick a refresh rate,
+    /// to prefer direct scanout, or to leave the screen on.
+    [[nodiscard]] std::uint32_t content_type() const noexcept { return content_type_; }
+    /// Called by the wp_content_type_v1 glue; applied on the next commit.
+    void set_pending_content_type(std::uint32_t type) noexcept { pending_.content_type = type; }
+
+    // --- deferred commits (wp_fifo_v1, wp_commit_timing_v1) ---
+    //
+    // Both protocols say the same thing in two ways: "do not apply this commit
+    // yet". FIFO waits for the previous content to have been shown, so a client
+    // animating at the refresh rate stops racing ahead of the display; commit
+    // timing waits for a wall-clock instant. One gate serves both — a commit
+    // that is not allowed through is parked, and applied later by
+    // `clear_fifo_barrier()` or `release_deferred_commit()`.
+
+    /// True while this surface owes the display one presentation before another
+    /// waiting commit may be applied (wp_fifo_v1.set_barrier).
+    [[nodiscard]] bool fifo_barrier() const noexcept { return fifo_barrier_; }
+    /// Called by the wp_fifo_v1 glue; both apply to the next commit only.
+    void set_pending_fifo_barrier() noexcept { pending_.fifo_barrier = true; }
+    void set_pending_fifo_wait() noexcept { pending_.fifo_wait = true; }
+    /// Called by the wp_commit_timing_v1 glue: do not apply the next commit
+    /// before this CLOCK_MONOTONIC nanosecond stamp. 0 clears the constraint.
+    void set_pending_commit_time(std::uint64_t ns) noexcept { pending_.commit_time_ns = ns; }
+    /// The stamp staged for the next commit, 0 if none. The glue asks so it can
+    /// answer wp_commit_timer_v1's "one timestamp per commit" error without
+    /// keeping a second copy that a commit would have to invalidate.
+    [[nodiscard]] std::uint64_t pending_commit_time() const noexcept {
+        return pending_.commit_time_ns;
+    }
+
+    /// True while a commit is parked waiting for one of the two conditions.
+    [[nodiscard]] bool has_deferred_commit() const noexcept { return has_deferred_; }
+    /// The stamp the parked commit is waiting for, or 0 if it only waits on the
+    /// FIFO barrier. Meaningless when nothing is parked.
+    [[nodiscard]] std::uint64_t deferred_commit_time() const noexcept {
+        return deferred_.commit_time_ns;
+    }
+    /// Apply the parked commit if both conditions are now met at `now_ns`.
+    /// Returns true if one was applied. Cheap and idempotent when nothing is
+    /// parked, so a per-frame sweep is fine.
+    bool release_deferred_commit(std::uint64_t now_ns);
+
+    /// The content committed under a FIFO barrier has been shown (or never will
+    /// be, because the surface is not visible): drop the barrier and let a
+    /// commit that was waiting on it through. `send_frame_done()` already does
+    /// this — call it by hand only for a surface you are NOT presenting, which
+    /// is the case the protocol requires so a hidden client does not freeze.
+    void clear_fifo_barrier();
+
     /// A third bridge, for the case where the compositor draws nothing at all:
     /// if the committed buffer is a dmabuf, describe it so it can be handed
     /// straight to `Output::import_scanout()`. False for shm, single-pixel and
@@ -353,6 +408,10 @@ private:
         wl_resource* buffer = nullptr;
         bool buffer_dirty = false;
         bool tearing = false;
+        std::uint32_t content_type = 0;
+        bool fifo_barrier = false;      // per-commit, not sticky
+        bool fifo_wait = false;         // per-commit, not sticky
+        std::uint64_t commit_time_ns = 0; // per-commit, not sticky
         std::vector<wl_resource*> frame_callbacks;
         std::vector<Box> damage;         // surface coordinates
         std::vector<Box> buffer_damage;  // buffer coordinates (damage_buffer)
@@ -370,6 +429,7 @@ private:
     void commit_state(State state);
     void parent_committed();
     void reset_pending(const State& applied);
+    [[nodiscard]] bool gate_blocks(const State& state, std::uint64_t now_ns) const noexcept;
     static void merge_state(State& into, State&& from);
     [[nodiscard]] bool effective_sync() const noexcept;
     void apply_pending_position() noexcept;
@@ -382,6 +442,8 @@ private:
     int buffer_width_ = 0;
     int buffer_height_ = 0;
     bool tearing_ = false;
+    std::uint32_t content_type_ = 0;
+    bool fifo_barrier_ = false;
     int buffer_scale_ = 1;
     Transform buffer_transform_ = Transform::normal; // buffer -> surface
     Region opaque_;
@@ -402,6 +464,8 @@ private:
     State pending_;         // accumulated since the last commit request
     State cached_;          // sync-mode state waiting for the parent's commit
     bool has_cached_ = false;
+    State deferred_;        // fifo / commit-timing state waiting for its gate
+    bool has_deferred_ = false;
     // One entry per client buffer we still reference, so we hear about its
     // destruction before we touch a freed wl_resource.
     std::vector<std::unique_ptr<BufferWatch>> buffer_watches_;
@@ -460,6 +524,15 @@ private:
 namespace luminaria {
 
 namespace {
+
+/// CLOCK_MONOTONIC in nanoseconds — the clock wp_commit_timing_v1 timestamps
+/// are expressed in, and the same one presentation-time reports.
+std::uint64_t monotonic_ns() noexcept {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
+           static_cast<std::uint64_t>(ts.tv_nsec);
+}
 
 struct SurfaceSlot {
     Surface* surface = nullptr;
@@ -650,6 +723,7 @@ void Surface::add_frame_callback(wl_resource* callback) {
 void Surface::forget_frame_callback(wl_resource* callback) noexcept {
     std::erase(pending_.frame_callbacks, callback);
     std::erase(cached_.frame_callbacks, callback);
+    std::erase(deferred_.frame_callbacks, callback);
     std::erase(queued_frame_callbacks_, callback);
 }
 
@@ -725,7 +799,7 @@ void Surface::watch_buffer(wl_resource* buffer) {
 void Surface::prune_buffer_watches() {
     std::erase_if(buffer_watches_, [this](const std::unique_ptr<BufferWatch>& watch) {
         return watch->buffer != current_buffer_ && watch->buffer != pending_.buffer &&
-               watch->buffer != cached_.buffer &&
+               watch->buffer != cached_.buffer && watch->buffer != deferred_.buffer &&
                std::find(held_buffers_.begin(), held_buffers_.end(), watch->buffer) ==
                    held_buffers_.end();
     });
@@ -743,6 +817,11 @@ void Surface::forget_buffer(wl_resource* buffer) noexcept {
     }
     if (cached_.buffer == buffer) {
         cached_.buffer = nullptr;
+    }
+    // ...including one parked behind a fifo barrier or a commit timestamp: a
+    // client may well drop its swapchain while a frame of it is still waiting.
+    if (deferred_.buffer == buffer) {
+        deferred_.buffer = nullptr;
     }
     if (current_buffer_ == buffer) {
         current_buffer_ = nullptr;
@@ -952,6 +1031,10 @@ void Surface::send_frame_done(std::uint32_t time_ms) {
         wl_callback_send_done(cb, time_ms);
         wl_resource_destroy(cb);
     }
+    // This surface's content has been shown, which is precisely the condition
+    // wp_fifo_v1 barriers wait on. Doing it here means a compositor that
+    // already answers frame callbacks at presentation gets FIFO for free.
+    clear_fifo_barrier();
 }
 
 Surface::Surface(wl_resource* resource) noexcept : resource_(resource), id_(register_surface(this)) {}
@@ -1017,6 +1100,12 @@ void Surface::merge_state(State& into, State&& from) {
                               from.buffer_damage.end());
     from.buffer_damage.clear();
     into.tearing = from.tearing;
+    into.content_type = from.content_type;
+    // A deferred commit that is merged into inherits the newer gate: the client
+    // asked for this content to wait, so the whole collapsed state waits.
+    into.fifo_barrier = into.fifo_barrier || from.fifo_barrier;
+    into.fifo_wait = into.fifo_wait || from.fifo_wait;
+    into.commit_time_ns = std::max(into.commit_time_ns, from.commit_time_ns);
     into.scale = from.scale;
     into.transform = from.transform;
     into.opaque = std::move(from.opaque);
@@ -1034,6 +1123,7 @@ void Surface::merge_state(State& into, State&& from) {
 void Surface::reset_pending(const State& applied) {
     pending_ = State{};
     pending_.tearing = applied.tearing;
+    pending_.content_type = applied.content_type;
     pending_.scale = applied.scale;
     pending_.transform = applied.transform;
     pending_.opaque = applied.opaque;
@@ -1053,7 +1143,46 @@ void Surface::apply_commit() {
     }
     State state = std::move(pending_);
     reset_pending(state);
+    // The fifo / commit-timing gate. A commit parked here is not visible to
+    // anything downstream — no `commit` signal, no damage, no frame callbacks —
+    // until it is let through, which is exactly what the two protocols promise.
+    if (gate_blocks(state, monotonic_ns())) {
+        merge_state(deferred_, std::move(state));
+        has_deferred_ = true;
+        prune_buffer_watches();
+        return;
+    }
+    if (has_deferred_) {
+        // Never reorder a client's own commits: an ungated one that arrives
+        // while an earlier commit is parked joins it and waits its turn.
+        merge_state(deferred_, std::move(state));
+        prune_buffer_watches();
+        return;
+    }
     commit_state(std::move(state));
+}
+
+bool Surface::gate_blocks(const State& state, std::uint64_t now_ns) const noexcept {
+    if (state.fifo_wait && fifo_barrier_) {
+        return true;
+    }
+    return state.commit_time_ns > now_ns;
+}
+
+bool Surface::release_deferred_commit(std::uint64_t now_ns) {
+    if (!has_deferred_ || gate_blocks(deferred_, now_ns)) {
+        return false;
+    }
+    State state = std::move(deferred_);
+    deferred_ = State{};
+    has_deferred_ = false;
+    commit_state(std::move(state));
+    return true;
+}
+
+void Surface::clear_fifo_barrier() {
+    fifo_barrier_ = false;
+    release_deferred_commit(monotonic_ns());
 }
 
 void Surface::commit_state(State state) {
@@ -1076,6 +1205,12 @@ void Surface::commit_state(State state) {
         buffer_size(current_buffer_, buffer_width_, buffer_height_);
     }
     tearing_ = state.tearing;
+    content_type_ = state.content_type;
+    // The barrier belongs to the content this commit carries: it is owed one
+    // presentation, and only then may a waiting commit through.
+    if (state.fifo_barrier) {
+        fifo_barrier_ = true;
+    }
     buffer_scale_ = state.scale;
     buffer_transform_ = state.transform;
     opaque_ = state.opaque;

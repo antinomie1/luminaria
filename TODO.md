@@ -57,16 +57,24 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 
 - 真机复核：第 0 步的 tty 验证要重跑一遍，看空闲时 `frames/s` 那行是不是真的不再出现。
 
-### 3. 协议补齐
+### 3. 协议补齐 — 已完成（2026-08-15）
 
-按低功耗价值排序：
+五个协议全部落地，协议对象数 25 → 30。
 
-- **`wp-fifo-v1` + `wp-commit-timing-v1`** —— 客户端声明"我按刷新率走"与"这帧什么时候上屏"。
-  **不是锦上添花**：第 2 步要对"客户端在跑动画"这种常见情形真正省电，前提就是这两个。
-- **`wp-content-type-v1`** —— 客户端说"我在放视频"，据此走直出或降刷新率。
-- **`ext-session-lock-v1`** —— 锁屏，安全性硬缺口。
-- **`input-method-v2`** —— IME 的输入法一侧。`text-input-v3` 已完整，缺的是接
-  IBus / Fcitx 的那一半。
+- **`wp-fifo-v1` + `wp-commit-timing-v1`** —— 两者共用 `Surface` 上新加的**提交闸门**：
+  被扣住的那次 commit 对下游完全不存在（不发 commit 信号、不产生 damage、不排帧回调），
+  这正是两个协议承诺的语义。FIFO 的 barrier 由 `Surface::send_frame_done()` 清除，
+  所以按规矩在 present 里答帧回调的 compositor 不需要额外接线；commit-timing 的到点唤醒
+  由 global 自带的 EventLoop 定时器发起。`test_fifo` / `test_commit_timing` 守着。
+- **`wp-content-type-v1`** —— 粘性双缓冲状态，`Surface::content_type()`。`test_content_type`。
+- **`ext-session-lock-v1`** —— 失败向关：客户端崩了不解锁（`SessionLockDestroy::unlocked`
+  区分两种消失），四个锁定表面协议错误全发。`test_session_lock`。
+- **`input-method-v2`** —— 接上了 `text-input-v3` 的另一端，两边状态由库自动抄通，
+  `test_input_method` 用一个同时扮演应用与输入法的客户端跑完整个来回。XML 上游不发，
+  vendored 到 `protocol/`。
+
+三个核心协议已注册进 `tinyluminaria`；两个 desktop 协议按 ADR 0003 只在 `luminaria.desktop`
+里，需要 compositor 自己创建。剩下的收尾在下面「已知的天花板」里。
 
 ---
 
@@ -93,6 +101,15 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 
 ## 已知的天花板（不是 bug，是没做完的地方）
 
+- **闸门里只停一次提交** —— `wp-fifo-v1` / `wp-commit-timing-v1` 的规范说排队的提交按序
+  排成一列；这里第二次提交合并进已经停着的那一次（gate 取两者的并集，时间戳取较晚的），
+  也就是塌缩成一帧。动画客户端每帧一次提交，落不到这个差异上；真要排队得让 `Surface`
+  持有一条 `State` 队列。
+- **不可见表面的 FIFO 放行归混成器** —— barrier 只在 `send_frame_done()` 时清除，所以最小化
+  或被完全遮挡、混成器不再 present 的客户端会一直停在闸门里。`FifoManager::unblock_hidden()`
+  是那把钥匙，但什么算"不可见"只有混成器知道，示例里还没接。
+- **输入法的键盘 grab 要混成器路由** —— `InputMethod::keyboard_grab()` 非空时按键该先给它
+  再给客户端，库拿不到键盘就替不了这个决定；keymap 已经替你发了。候选窗的摆放同理。
 - **popup 的 `constraint_adjustment` 要混成器配合** —— 不调
   `XdgShell::set_popup_constraint_query()` 就拿不到父窗口位置，贴边菜单会溢出。
 - **GPU 设备热插拔不处理** —— 只跟踪 connector 状态，整块显卡消失不管。

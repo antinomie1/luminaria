@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Luminaria: a minimal Wayland compositor **library** in modern C++23, built on top of
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
-built with xmake. Roughly wlroots-shaped but far smaller (25 protocol types vs wlroots' 73).
+built with xmake. Roughly wlroots-shaped but far smaller (30 protocol types vs wlroots' 73).
 
 It ships as four **C++23 named modules** with no public headers: `luminaria` is the
 dependency-light protocol/core interface, with opt-in `luminaria.gpu`, `luminaria.desktop`
@@ -164,13 +164,17 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `linux_dmabuf`, `screencopy` (wlr-screencopy + ext-image-copy-capture, including cursor sessions
   fed by `ScreencopyManager::set_cursor_source()`), `data_device` (clipboard + DnD + primary selection),
   `drm_syncobj` (explicit sync), `single_pixel_buffer`, `presentation_time`,
-  `tearing_control`, `cursor_shape`, `workspace` (ext-workspace), `xdg_decoration`,
+  `tearing_control`, `fifo` + `commit_timing` (the two pacing protocols, which park a
+  commit on `Surface`'s commit gate until the previous frame was presented or a stamp
+  arrives), `content_type`, `cursor_shape`, `workspace` (ext-workspace), `xdg_decoration`,
   `viewporter`, `fractional_scale`, `layer_shell` (wlr-layer-shell, plus the
   `arrange_layer_surface()` anchor/exclusive-zone solver), `foreign_toplevel`
   (wlr-foreign-toplevel-management, mirrors an `XdgShell` on its own via
   `track()`), `xdg_activation`, `relative_pointer`, `pointer_constraints`,
   `text_input` (text-input-v3), `idle_inhibit`, `data_control`
-  (wlr-data-control, bridged into `data_device` through `SelectionSource`).
+  (wlr-data-control, bridged into `data_device` through `SelectionSource`),
+  `session_lock` (ext-session-lock, which fails CLOSED: a lock client that dies leaves
+  the session locked), `input_method` (input-method-v2, bridged to `text_input`).
 - **`vulkan`** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs

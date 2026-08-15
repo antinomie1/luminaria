@@ -79,8 +79,10 @@ target("luminaria")
     add_files("src/backend/backend.cppm", "src/backend/headless.cppm",
               "src/backend/input_event.cppm", "src/backend/output.cppm",
               "src/backend/wayland.cppm", {public = true})
-    add_files("src/protocol/client_buffer.cppm", "src/protocol/compositor.cppm",
+    add_files("src/protocol/client_buffer.cppm", "src/protocol/commit_timing.cppm",
+              "src/protocol/compositor.cppm", "src/protocol/content_type.cppm",
               "src/protocol/cursor_shape.cppm", "src/protocol/data_device.cppm",
+              "src/protocol/fifo.cppm",
               "src/protocol/fractional_scale.cppm", "src/protocol/idle_inhibit.cppm",
               "src/protocol/idle_notify.cppm", "src/protocol/layer_shell.cppm",
               "src/protocol/output_global.cppm", "src/protocol/pointer_constraints.cppm",
@@ -135,6 +137,10 @@ target("luminaria")
             {"text-input-unstable-v3",        "unstable/text-input/text-input-unstable-v3.xml",             "scl"},
             {"idle-inhibit-unstable-v1",      "unstable/idle-inhibit/idle-inhibit-unstable-v1.xml",         "scl"},
             {"ext-idle-notify-v1",            "staging/ext-idle-notify/ext-idle-notify-v1.xml",             "scl"},
+            {"fifo-v1",                       "staging/fifo/fifo-v1.xml",                                   "scl"},
+            {"commit-timing-v1",              "staging/commit-timing/commit-timing-v1.xml",                 "scl"},
+            {"content-type-v1",               "staging/content-type/content-type-v1.xml",                   "scl"},
+            {"ext-session-lock-v1",           "staging/ext-session-lock/ext-session-lock-v1.xml",           "scl"},
         }
         -- Protocols upstream does not ship; the XML lives in protocol/.
         local local_protocols = {
@@ -144,6 +150,7 @@ target("luminaria")
             {"wlr-layer-shell-unstable-v1",  "scl"},
             {"wlr-foreign-toplevel-management-unstable-v1", "scl"},
             {"wlr-data-control-unstable-v1", "scl"},
+            {"input-method-unstable-v2",     "scl"},
         }
 
         local gendir = path.join(os.projectdir(), "build", "generated")
@@ -208,7 +215,8 @@ target("luminaria-desktop")
     set_kind("static")
     add_deps("luminaria")
     add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
-              "src/protocol/foreign_toplevel.cppm", "src/protocol/workspace.cppm",
+              "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
+              "src/protocol/session_lock.cppm", "src/protocol/workspace.cppm",
               {public = true})
 
 target("luminaria-xwayland")
@@ -249,7 +257,8 @@ local gpu_tests = {
     test_wayland_nested = true,
 }
 local desktop_tests = {
-    test_data_control = true, test_foreign_toplevel = true, test_workspace = true,
+    test_data_control = true, test_foreign_toplevel = true, test_input_method = true,
+    test_session_lock = true, test_workspace = true,
 }
 
 for _, file in ipairs(os.files("tests/test_*.cpp")) do
