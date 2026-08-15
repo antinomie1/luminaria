@@ -98,8 +98,8 @@ target("luminaria")
         -- Protocols upstream does not ship; the XML lives in protocol/.
         local local_protocols = {
             {"wlr-screencopy-unstable-v1",   "sc"},
-            {"ext-image-copy-capture-v1",    "sc"},
-            {"ext-image-capture-source-v1",  "sc"},
+            {"ext-image-copy-capture-v1",    "scl"},
+            {"ext-image-capture-source-v1",  "scl"},
             {"wlr-layer-shell-unstable-v1",  "scl"},
             {"wlr-foreign-toplevel-management-unstable-v1", "scl"},
             {"wlr-data-control-unstable-v1", "scl"},

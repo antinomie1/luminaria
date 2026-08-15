@@ -133,10 +133,13 @@ render pass 的 renderArea 取整个 region 的包围盒（一个 render pass �
 | 客户端 buffer 直出 | 未做 —— 全屏单窗口免合成 |
 | 模式切换 | 未做 —— 固定用 connector 首选模式 |
 | GPU 本身热插拔 | 未做 —— 只跟踪 connector 状态 |
+| 模式切换 | **已实现** —— `Output::modes()` / `set_mode()` / `mode_changed` |
+| 客户端 buffer 直出 | **已实现** —— `DirectScanout`（`scene/direct_scanout.cppm`） |
 
 ### 2.9 截图/录屏（`screencopy.cppm`）
 
-一处 `// no-op: unsupported`（不支持的捕获格式组合）。
+已无 no-op —— `create_pointer_cursor_session` 已实现（见 `set_cursor_source()` /
+`notify_cursor_changed()`，测试 `cursor-capture`）。
 
 ### 2.10 layer-shell（`layer_shell.cppm`）
 

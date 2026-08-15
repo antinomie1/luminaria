@@ -353,6 +353,38 @@ int main() {
         cursor_texture_image = image;
         return true;
     };
+    // The cursor as a capture source of its own: a screen recorder asking for a
+    // cursor session gets these pixels, so it can leave the pointer out of the
+    // video and draw it back at its own frame rate. A client-set cursor surface
+    // wins over the theme, same as when we composite it.
+    auto cursor_capture = [&](wl_resource*, luminaria::CursorCapture& out) {
+        if (!ptr_inside) {
+            return false;
+        }
+        if (luminaria::Surface* c = seat.cursor_surface(); c != nullptr) {
+            int w = 0, h = 0;
+            if (!c->current_buffer_rgba(out.rgba, w, h)) {
+                return false;
+            }
+            out.width = w;
+            out.height = h;
+            out.hotspot_x = seat.cursor_hotspot_x();
+            out.hotspot_y = seat.cursor_hotspot_y();
+        } else if (const luminaria::CursorImage* image = themed_cursor(); image != nullptr) {
+            out.rgba = image->rgba;
+            out.width = image->width;
+            out.height = image->height;
+            out.hotspot_x = image->hotspot_x;
+            out.hotspot_y = image->hotspot_y;
+        } else {
+            return false;
+        }
+        out.x = ptr_x;
+        out.y = ptr_y;
+        return true;
+    };
+    screencopy.set_cursor_source(cursor_capture);
+
     // Where the outputs sit relative to each other. One output here, but the
     // layout is what xdg-output and multi-monitor hit-testing quote.
     luminaria::OutputLayout layout;

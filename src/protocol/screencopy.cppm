@@ -47,6 +47,25 @@ class VulkanRenderer;
 using ScreencopyCaptureFunc = std::function<bool(int x, int y, int w, int h,
                                                   std::vector<std::uint8_t>& rgba)>;
 
+/// The pointer cursor as it looks right now. A screen recorder that wants the
+/// cursor as a separate layer — so it can be composited at the viewer's own
+/// frame rate rather than baked into the video — captures it through
+/// ext-image-copy-capture's cursor sessions, and this is where the pixels and
+/// the geometry come from.
+struct CursorCapture {
+    int width = 0, height = 0;      ///< cursor image size, in buffer pixels
+    int hotspot_x = 0, hotspot_y = 0;
+    int x = 0, y = 0;               ///< hotspot position, in the output's pixels
+    std::vector<std::uint8_t> rgba; ///< tightly packed, width*height*4
+};
+
+/// Fill `out` and return true when a cursor is visible on `output` (the
+/// wl_output resource passed to `add_output`); false when it is elsewhere or
+/// hidden. Without one of these registered, cursor capture sessions are still
+/// created — the client's object id has to be valid either way — and told
+/// immediately that they have stopped.
+using ScreencopyCursorFunc = std::function<bool(wl_resource* output, CursorCapture& out)>;
+
 /// The wlr_screencopy_manager_v1 + ext_image_copy_capture_manager_v1 globals.
 ///
 /// Usage:
@@ -73,6 +92,16 @@ public:
     /// instead of shm; LINEAR is written via mmap, tiled via the renderer. Without
     /// this, only shm targets are advertised.
     void set_renderer(VulkanRenderer* renderer);
+
+    /// Where the pointer cursor comes from, for cursor capture sessions.
+    void set_cursor_source(ScreencopyCursorFunc fn);
+
+    /// The cursor moved, changed shape, or left the screen. Re-reads the
+    /// source and updates every live cursor session: enter/leave, position and
+    /// hotspot, and fresh buffer constraints when the image changed size. Call
+    /// it from wherever the compositor already moves its pointer; with no
+    /// cursor sessions open it costs one empty loop.
+    void notify_cursor_changed();
 
     struct Impl;
 
@@ -125,11 +154,18 @@ struct OutputEntry {
 // =============================================================================
 // ScreencopyManager::Impl
 // =============================================================================
+// Forward: cursor sessions are held by the manager, and the manager is declared
+// first. Not in an anonymous namespace — a module-linkage member may not name a
+// TU-local type.
+struct ExtCursorSession;
+
 struct ScreencopyManager::Impl {
     wl_display* display = nullptr;
     VulkanRenderer* renderer = nullptr; // set → dmabuf targets advertised/writable
     dev_t render_dev = 0;               // DRM render node dev_t (for ext dmabuf_device)
     bool has_dev = false;
+    ScreencopyCursorFunc cursor_source;             // unset → cursor capture unavailable
+    std::vector<ExtCursorSession*> cursor_sessions; // live, weak; each unregisters itself
 
     // wlr-screencopy globals
     wl_global* wlr_manager_global = nullptr;
@@ -462,13 +498,53 @@ void wlr_manager_bind(wl_client* client, void* data, uint32_t version, uint32_t 
 // =============================================================================
 // ext-image-copy-capture-v1 implementation
 // =============================================================================
+
+// At namespace scope, not in the anonymous namespace below: ScreencopyManager::Impl
+// keeps a vector of these, and a module-linkage member may not name a TU-local
+// type. Unexported, so it stays private to module luminaria all the same.
+struct ExtCursorSession {
+    ScreencopyManager::Impl* mgr = nullptr;
+    wl_resource* resource = nullptr; // ext_image_copy_capture_cursor_session_v1
+    OutputEntry* output = nullptr;
+    wl_resource* inner = nullptr;    // the capture session, once asked for
+    bool entered = false;
+    int width = 0, height = 0;       // last advertised buffer size
+    int hotspot_x = 0, hotspot_y = 0;
+    int x = 0, y = 0;
+};
+
+// =============================================================================
+// ext-image-copy-capture-v1 implementation
+// =============================================================================
 namespace {
+
+// ---- ext_image_copy_capture_cursor_session_v1 ----
+//
+// A cursor session is the pointer as a capture source of its own, so a screen
+// recorder can keep the cursor out of the video and composite it back at
+// playback time. It carries the geometry (enter/leave, position, hotspot) and
+// hands out an ordinary capture session for the pixels.
+//
+// The compositor supplies the cursor through ScreencopyManager::set_cursor_source
+// and pokes notify_cursor_changed() when it moves. With no source registered
+// the session object is still created — the client's new_id must be bound or
+// libwayland kills the connection on its next request — and its capture
+// session is told `stopped` straight away, which is the protocol's way of
+// saying "this will never produce frames".
+/// Ask the compositor what the pointer looks like on this session's output.
+bool ext_cursor_read(ExtCursorSession& cs, CursorCapture& out) {
+    if (!cs.mgr->cursor_source || cs.output == nullptr) {
+        return false;
+    }
+    return cs.mgr->cursor_source(cs.output->output, out) && out.width > 0 && out.height > 0;
+}
 
 // ---- ext_image_copy_capture_frame_v1 ----
 struct ExtFrame {
     ScreencopyManager::Impl* mgr = nullptr;
     wl_resource* resource = nullptr;
     OutputEntry* output = nullptr;
+    ExtCursorSession* cursor = nullptr; // set → this frame captures the pointer, not the screen
     wl_resource* attached_buffer = nullptr;
     bool captured = false;
     // attach_buffer and capture are separate requests, so the buffer is held
@@ -540,22 +616,39 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
     }
     f->captured = true;
 
-    // Capture pixels.
+    // Capture pixels — of the screen, or of the pointer when this frame belongs
+    // to a cursor session. The cursor's size is its own, not the output's.
     std::vector<uint8_t> rgba;
-    if (!f->output->capture(0, 0, f->output->width, f->output->height, rgba)) {
-        ext_image_copy_capture_frame_v1_send_failed(f->resource,
-            EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
-        return;
+    int cap_w = 0, cap_h = 0;
+    if (f->cursor != nullptr) {
+        CursorCapture cc;
+        if (!ext_cursor_read(*f->cursor, cc)) {
+            // No cursor on this output right now. Not an error the client can
+            // fix by reallocating — it should wait for the next `enter`.
+            ext_image_copy_capture_frame_v1_send_failed(f->resource,
+                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+            return;
+        }
+        cap_w = cc.width;
+        cap_h = cc.height;
+        rgba = std::move(cc.rgba);
+    } else {
+        cap_w = f->output->width;
+        cap_h = f->output->height;
+        if (!f->output->capture(0, 0, cap_w, cap_h, rgba)) {
+            ext_image_copy_capture_frame_v1_send_failed(f->resource,
+                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+            return;
+        }
     }
 
     wl_shm_buffer* shm = wl_shm_buffer_get(f->attached_buffer);
     bool wrote = false;
     if (shm) {
         int stride = wl_shm_buffer_get_stride(shm);
-        wrote = write_shm_rgba(f->attached_buffer, rgba, f->output->width, f->output->height, stride);
+        wrote = write_shm_rgba(f->attached_buffer, rgba, cap_w, cap_h, stride);
     } else {
-        wrote = write_dmabuf_rgba(f->mgr->renderer, f->attached_buffer, rgba, f->output->width,
-                                  f->output->height);
+        wrote = write_dmabuf_rgba(f->mgr->renderer, f->attached_buffer, rgba, cap_w, cap_h);
     }
     if (!wrote) {
         ext_image_copy_capture_frame_v1_send_failed(f->resource,
@@ -564,9 +657,8 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
     }
 
     ext_image_copy_capture_frame_v1_send_transform(f->resource, WL_OUTPUT_TRANSFORM_NORMAL);
-    ext_image_copy_capture_frame_v1_send_damage(f->resource, 0, 0,
-                                                  static_cast<int32_t>(f->output->width),
-                                                  static_cast<int32_t>(f->output->height));
+    ext_image_copy_capture_frame_v1_send_damage(f->resource, 0, 0, static_cast<int32_t>(cap_w),
+                                                  static_cast<int32_t>(cap_h));
     auto ts = monotonic_time();
     ext_image_copy_capture_frame_v1_send_presentation_time(f->resource, ts.tv_sec_hi,
                                                              ts.tv_sec_lo, ts.tv_nsec);
@@ -589,6 +681,7 @@ struct ExtSession {
     ScreencopyManager::Impl* mgr = nullptr;
     wl_resource* resource = nullptr;
     OutputEntry* output = nullptr;
+    ExtCursorSession* cursor = nullptr;
     bool stopped = false;
 };
 
@@ -612,6 +705,7 @@ void ext_session_create_frame(wl_client* client, wl_resource* session_resource, 
     frame->mgr = s->mgr;
     frame->resource = frame_res;
     frame->output = s->output;
+    frame->cursor = s->cursor;
     wl_resource_set_implementation(frame_res, &ext_frame_impl, frame, ext_frame_resource_destroy);
 }
 
@@ -648,7 +742,7 @@ void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, ui
         wl_client_post_no_memory(client);
         return;
     }
-    auto* session = new ExtSession{mgr, session_res, out, false};
+    auto* session = new ExtSession{mgr, session_res, out, nullptr, false};
     wl_resource_set_implementation(session_res, &ext_session_impl, session,
                                      ext_session_resource_destroy);
 
@@ -681,10 +775,132 @@ void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, ui
     ext_image_copy_capture_session_v1_send_done(session_res);
 }
 
-// We don't support pointer cursor capture for now.
-void ext_manager_create_pointer_cursor_session(wl_client*, wl_resource*, uint32_t, wl_resource*,
-                                                 wl_resource*) {
-    // no-op: unsupported
+/// Re-read the cursor and tell the session what changed. Sends the geometry
+/// events in the order the protocol requires — `enter` before any `position` or
+/// `hotspot` — and re-advertises buffer constraints when the image changed size,
+/// because the client's buffer is now the wrong one.
+void ext_cursor_refresh(ExtCursorSession& cs) {
+    CursorCapture cc;
+    if (!ext_cursor_read(cs, cc)) {
+        if (cs.entered) {
+            cs.entered = false;
+            ext_image_copy_capture_cursor_session_v1_send_leave(cs.resource);
+        }
+        return;
+    }
+    if (cs.inner != nullptr && (cc.width != cs.width || cc.height != cs.height)) {
+        ext_image_copy_capture_session_v1_send_buffer_size(
+            cs.inner, static_cast<uint32_t>(cc.width), static_cast<uint32_t>(cc.height));
+        ext_image_copy_capture_session_v1_send_shm_format(cs.inner, WL_SHM_FORMAT_ARGB8888);
+        ext_image_copy_capture_session_v1_send_done(cs.inner);
+    }
+    cs.width = cc.width;
+    cs.height = cc.height;
+    if (!cs.entered) {
+        cs.entered = true;
+        ext_image_copy_capture_cursor_session_v1_send_enter(cs.resource);
+        // Force both below: an enter starts a fresh conversation.
+        cs.x = cc.x + 1;
+        cs.hotspot_x = cc.hotspot_x + 1;
+    }
+    if (cc.x != cs.x || cc.y != cs.y) {
+        cs.x = cc.x;
+        cs.y = cc.y;
+        ext_image_copy_capture_cursor_session_v1_send_position(cs.resource, cc.x, cc.y);
+    }
+    if (cc.hotspot_x != cs.hotspot_x || cc.hotspot_y != cs.hotspot_y) {
+        cs.hotspot_x = cc.hotspot_x;
+        cs.hotspot_y = cc.hotspot_y;
+        ext_image_copy_capture_cursor_session_v1_send_hotspot(cs.resource, cc.hotspot_x,
+                                                              cc.hotspot_y);
+    }
+}
+
+void ext_cursor_session_destroy_request(wl_client*, wl_resource* resource) {
+    wl_resource_destroy(resource);
+}
+
+void ext_cursor_session_get_capture_session(wl_client* client, wl_resource* resource, uint32_t id) {
+    auto* cs = static_cast<ExtCursorSession*>(wl_resource_get_user_data(resource));
+    if (cs->inner != nullptr) {
+        wl_resource_post_error(resource,
+                               EXT_IMAGE_COPY_CAPTURE_CURSOR_SESSION_V1_ERROR_DUPLICATE_SESSION,
+                               "get_capture_session sent twice");
+        return;
+    }
+    const uint32_t version = wl_resource_get_version(resource);
+    wl_resource* session_res = wl_resource_create(
+        client, &ext_image_copy_capture_session_v1_interface, static_cast<int>(version), id);
+    if (!session_res) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    auto* session = new ExtSession{cs->mgr, session_res, cs->output, cs, false};
+    wl_resource_set_implementation(session_res, &ext_session_impl, session,
+                                   ext_session_resource_destroy);
+    cs->inner = session_res;
+
+    CursorCapture cc;
+    if (!ext_cursor_read(*cs, cc)) {
+        // Either the compositor never registered a cursor source, or there is
+        // no cursor to capture and no way to say "later" for a session that has
+        // not advertised a size yet. Say so plainly instead of leaving the
+        // client waiting on constraints that will never come.
+        session->stopped = true;
+        ext_image_copy_capture_session_v1_send_stopped(session_res);
+        return;
+    }
+    cs->width = cc.width;
+    cs->height = cc.height;
+    ext_image_copy_capture_session_v1_send_buffer_size(
+        session_res, static_cast<uint32_t>(cc.width), static_cast<uint32_t>(cc.height));
+    ext_image_copy_capture_session_v1_send_shm_format(session_res, WL_SHM_FORMAT_ARGB8888);
+    ext_image_copy_capture_session_v1_send_done(session_res);
+    // The geometry the client needs to place what it captures.
+    ext_cursor_refresh(*cs);
+}
+
+constexpr struct ext_image_copy_capture_cursor_session_v1_interface ext_cursor_session_impl = {
+    .destroy = ext_cursor_session_destroy_request,
+    .get_capture_session = ext_cursor_session_get_capture_session,
+};
+
+void ext_cursor_session_resource_destroy(wl_resource* resource) {
+    auto* cs = static_cast<ExtCursorSession*>(wl_resource_get_user_data(resource));
+    std::erase(cs->mgr->cursor_sessions, cs);
+    delete cs;
+}
+
+void ext_manager_create_pointer_cursor_session(wl_client* client, wl_resource* mgr_resource,
+                                                 uint32_t id, wl_resource* source,
+                                                 wl_resource* /*pointer*/) {
+    // The wl_pointer is accepted and ignored: this library has a single seat,
+    // so "which pointer" and "which client" are the same question.
+    auto* mgr = ext_manager_of(mgr_resource);
+    auto* out = static_cast<OutputEntry*>(wl_resource_get_user_data(source));
+    if (!out) {
+        wl_resource_post_error(mgr_resource, 0, "invalid source");
+        return;
+    }
+    const uint32_t version = wl_resource_get_version(mgr_resource);
+    wl_resource* resource =
+        wl_resource_create(client, &ext_image_copy_capture_cursor_session_v1_interface,
+                           static_cast<int>(version), id);
+    if (!resource) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    auto* cs = new ExtCursorSession{};
+    cs->mgr = mgr;
+    cs->resource = resource;
+    cs->output = out;
+    wl_resource_set_implementation(resource, &ext_cursor_session_impl, cs,
+                                   ext_cursor_session_resource_destroy);
+    mgr->cursor_sessions.push_back(cs);
+    // A cursor already on this output has entered as far as the client is
+    // concerned; it just has nowhere to put the pixels until it asks for the
+    // capture session.
+    ext_cursor_refresh(*cs);
 }
 
 void ext_manager_destroy(wl_client*, wl_resource* resource) {
@@ -802,6 +1018,20 @@ Result<ScreencopyManager> ScreencopyManager::create(Display& display) {
 void ScreencopyManager::add_output(wl_resource* output, int width, int height,
                                      ScreencopyCaptureFunc capture) {
     impl_->outputs.push_back(OutputEntry{output, width, height, std::move(capture)});
+}
+
+void ScreencopyManager::set_cursor_source(ScreencopyCursorFunc fn) {
+    impl_->cursor_source = std::move(fn);
+    notify_cursor_changed();
+}
+
+void ScreencopyManager::notify_cursor_changed() {
+    // A copy: a handler cannot destroy a session from here, but the send calls
+    // can fail a client and take its sessions with it.
+    const std::vector<ExtCursorSession*> live = impl_->cursor_sessions;
+    for (ExtCursorSession* cs : live) {
+        ext_cursor_refresh(*cs);
+    }
 }
 
 void ScreencopyManager::set_renderer(VulkanRenderer* renderer) {

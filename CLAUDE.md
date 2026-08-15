@@ -139,7 +139,8 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
 - **protocol types** — one partition per Wayland global: `compositor` (`wl_compositor`/`wl_surface`,
   including the subsurface tree), `subcompositor`, `xdg_shell` (toplevels + popups +
   positioners), `seat` (keyboard/pointer/touch/cursor/DnD hooks), `output_global`,
-  `linux_dmabuf`, `screencopy`, `data_device` (clipboard + DnD + primary selection),
+  `linux_dmabuf`, `screencopy` (wlr-screencopy + ext-image-copy-capture, including cursor sessions
+  fed by `ScreencopyManager::set_cursor_source()`), `data_device` (clipboard + DnD + primary selection),
   `drm_syncobj` (explicit sync), `single_pixel_buffer`, `presentation_time`,
   `tearing_control`, `cursor_shape`, `workspace` (ext-workspace), `xdg_decoration`,
   `viewporter`, `fractional_scale`, `layer_shell` (wlr-layer-shell, plus the
