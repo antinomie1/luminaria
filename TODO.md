@@ -81,4 +81,11 @@
   防焦点窃取要混成器自己核对。
 - **`data_control` 的 filter 无法链式叠加** —— libwayland 的 `wl_display` 只有一个 global
   filter 槽且拿不回旧值。混成器若自己要 filter，应把 data-control 的判断写进自己那个里。
-- **嵌套模式下没有独立于 Shift/Ctrl 的修饰键状态**（父混成器报告的除外）。
+- **嵌套模式下没有独立于 Shift/Ctrl 的修饰键状态**（父混成器报告的除外）。裸机一侧已经有
+  了：`LibinputBackend` 自带 xkb 状态机。
+- **`LibinputBackend` 只发相对指针运动** —— 绝对定位设备（触摸屏、数位板，以及虚拟机给客户机
+  的那块 tablet）的 `LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE` 不处理，于是虚拟机里指针根本
+  不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
+- **`LibinputBackend` 报告 touch 能力但不发 touch 事件** —— `capabilities()` 如实说有触摸屏，
+  触摸事件本身还没接（`Seat` 那一侧 `touch_down/motion/up/frame` 是齐的）。所以示例里
+  `set_capabilities()` 的 touch 一律传 false。
