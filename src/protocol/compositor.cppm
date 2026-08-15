@@ -36,7 +36,6 @@ import :pixel_layout;
 import :region;
 import :signal;
 import :transform;
-import :vulkan;
 
 export namespace luminaria {
 
@@ -210,22 +209,6 @@ public:
     /// Called by the wp_tearing_control_v1 glue; applied on the next commit.
     void set_pending_tearing_hint(bool async) noexcept { pending_.tearing = async; }
 
-    /// The same bridge, but landing on the GPU: a dmabuf buffer is imported with
-    /// no copy at all, shm and single-pixel buffers are uploaded once. This is
-    /// what the compositing path wants — nothing here reads pixels back to the
-    /// CPU.
-    ///
-    /// The result is CACHED on the surface. A dmabuf import is a live view of
-    /// the client's pages, so it survives until the buffer is replaced; an shm
-    /// upload is a copy, so it is redone on every commit. Either way the caller
-    /// gets a borrowed pointer and stops paying to re-import an unchanged
-    /// window every frame. Null if there is no buffer or it cannot be imported.
-    ///
-    /// LIFETIME: `renderer` must outlive this Surface — the cached texture
-    /// belongs to it. In practice that means creating the VulkanRenderer before
-    /// the Display and destroying it after.
-    [[nodiscard]] GpuTexture* buffer_texture(VulkanRenderer& renderer);
-
     /// A third bridge, for the case where the compositor draws nothing at all:
     /// if the committed buffer is a dmabuf, describe it so it can be handed
     /// straight to `Output::import_scanout()`. False for shm, single-pixel and
@@ -371,13 +354,6 @@ private:
     int offset_x_ = 0, offset_y_ = 0;
     UniqueFd acquire_fence_; // sync_file, owned
 
-    // GPU texture cache. `texture_live_` marks a dmabuf import, which reads the
-    // client's memory directly and so stays valid across commits; an upload is
-    // a snapshot and has to be redone whenever the client draws again.
-    std::optional<GpuTexture> texture_;
-    wl_resource* texture_buffer_ = nullptr;
-    VulkanRenderer* texture_renderer_ = nullptr;
-    bool texture_live_ = false;
     std::vector<Box> damage_;
     std::vector<wl_resource*> queued_frame_callbacks_; // fired on presentation
 
@@ -521,51 +497,6 @@ bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, in
     return true;
 }
 
-GpuTexture* Surface::buffer_texture(VulkanRenderer& renderer) {
-    if (current_buffer_ == nullptr) {
-        texture_.reset();
-        texture_buffer_ = nullptr;
-        return nullptr;
-    }
-    // A cached dmabuf import stays correct as long as the buffer is the same
-    // object: the GPU is reading the client's pages, so new contents need no
-    // new import. An upload is only good until the client draws again, which is
-    // why commit_state() drops it.
-    if (texture_.has_value() && texture_buffer_ == current_buffer_ &&
-        texture_renderer_ == &renderer) {
-        return &*texture_;
-    }
-
-    texture_.reset();
-    texture_buffer_ = current_buffer_;
-    texture_renderer_ = &renderer;
-    texture_live_ = false;
-
-    // A dmabuf goes straight to the GPU — no mapping, no conversion, no copy.
-    if (DmabufPlane info{}; current_buffer_dmabuf(info)) {
-        if (auto texture = renderer.import_texture(info)) {
-            texture_.emplace(std::move(*texture));
-            texture_live_ = true;
-            return &*texture_;
-        }
-        // The GPU refused this modifier; a LINEAR buffer can still be mapped and
-        // uploaded below, so fall through instead of failing the frame.
-    }
-    // Everything else is CPU-side pixels already; upload them once.
-    std::vector<uint8_t> rgba;
-    int w = 0, h = 0;
-    if (!current_buffer_rgba(rgba, w, h)) {
-        texture_buffer_ = nullptr;
-        return nullptr;
-    }
-    if (auto texture = renderer.upload_texture(w, h, rgba)) {
-        texture_.emplace(std::move(*texture));
-        return &*texture_;
-    }
-    texture_buffer_ = nullptr;
-    return nullptr;
-}
-
 namespace {
 // Buffer extent without decoding pixels: shm knows it directly, dmabuf carries
 // it in the plane metadata. Used for hit-testing and subsurface layout.
@@ -661,11 +592,6 @@ void Surface::forget_buffer(wl_resource* buffer) noexcept {
         current_buffer_ = nullptr;
         buffer_width_ = 0;
         buffer_height_ = 0;
-    }
-    if (texture_buffer_ == buffer) {
-        // The imported texture is a view of memory that is going away.
-        texture_.reset();
-        texture_buffer_ = nullptr;
     }
     std::erase_if(buffer_watches_, [buffer](const std::unique_ptr<BufferWatch>& watch) {
         return watch->buffer == buffer;
@@ -975,10 +901,6 @@ void Surface::commit_state(State state) {
         }
         current_buffer_ = state.buffer;
         buffer_size(current_buffer_, buffer_width_, buffer_height_);
-    }
-    if (!texture_live_ || texture_buffer_ != current_buffer_) {
-        texture_.reset();
-        texture_buffer_ = nullptr;
     }
     tearing_ = state.tearing;
     buffer_scale_ = state.scale;

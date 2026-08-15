@@ -53,6 +53,7 @@ import :direct_scanout;
 import :expected;
 import :output;
 import :pixel;
+import :signal;
 import :transform;
 import :vulkan;
 
@@ -201,6 +202,34 @@ private:
 
 namespace luminaria {
 
+// A cached bridge from one Surface's current wl_buffer to a GPU texture. Kept
+// in the GPU shell rather than Surface so the core compositor has no Vulkan
+// dependency. Entries are pointer-stable because their signal handlers capture
+// their address.
+struct FrSurfaceTexture {
+    Surface* surface = nullptr;
+    const void* buffer = nullptr;
+    std::optional<GpuTexture> texture;
+    bool live = false; // dmabuf imports see new pixels; uploads are snapshots
+    Signal<SurfaceCommit>::Connection committed;
+    Signal<SurfaceDestroy>::Connection destroyed;
+
+    void watch(Surface& value) {
+        surface = &value;
+        committed = value.commit.connect([this](SurfaceCommit&) {
+            if (!live) {
+                texture.reset();
+                buffer = nullptr;
+            }
+        });
+        destroyed = value.destroy.connect([this](SurfaceDestroy&) {
+            surface = nullptr;
+            buffer = nullptr;
+            texture.reset();
+        });
+    }
+};
+
 struct Frame::Impl {
     Output* output = nullptr;
     VulkanRenderer* renderer = nullptr;
@@ -220,6 +249,7 @@ struct Frame::Impl {
     std::vector<GpuTextureFill> fills;
     std::vector<Box> fill_opaque;         // the same boxes, output-local
     std::vector<Surface*> drawn;
+    std::vector<std::unique_ptr<FrSurfaceTexture>> texture_cache;
     std::vector<Box> damage;              // this frame's, output-local
     std::vector<Box> repaint;             // damage + what the target still owes
     std::vector<int> acquire_fences;      // borrowed from the surfaces
@@ -233,7 +263,64 @@ struct Frame::Impl {
     bool full_redraw = true;
 
     void rotate_debt();
+    [[nodiscard]] GpuTexture* texture_for(Surface& surface);
 };
+
+GpuTexture* Frame::Impl::texture_for(Surface& surface) {
+    std::erase_if(texture_cache, [](const std::unique_ptr<FrSurfaceTexture>& entry) {
+        return entry->surface == nullptr;
+    });
+
+    FrSurfaceTexture* entry = nullptr;
+    for (const std::unique_ptr<FrSurfaceTexture>& candidate : texture_cache) {
+        if (candidate->surface == &surface) {
+            entry = candidate.get();
+            break;
+        }
+    }
+    if (entry == nullptr) {
+        auto fresh = std::make_unique<FrSurfaceTexture>();
+        entry = fresh.get();
+        entry->watch(surface);
+        texture_cache.push_back(std::move(fresh));
+    }
+
+    const void* current = surface.current_buffer();
+    if (current == nullptr) {
+        entry->texture.reset();
+        entry->buffer = nullptr;
+        return nullptr;
+    }
+    if (entry->texture.has_value() && entry->buffer == current) {
+        return &*entry->texture;
+    }
+
+    entry->texture.reset();
+    entry->buffer = current;
+    entry->live = false;
+
+    if (DmabufPlane plane{}; surface.current_buffer_dmabuf(plane)) {
+        if (auto imported = renderer->import_texture(plane)) {
+            entry->texture.emplace(std::move(*imported));
+            entry->live = true;
+            return &*entry->texture;
+        }
+    }
+
+    std::vector<std::uint8_t> rgba;
+    int width = 0;
+    int height = 0;
+    if (!surface.current_buffer_rgba(rgba, width, height)) {
+        entry->buffer = nullptr;
+        return nullptr;
+    }
+    if (auto uploaded = renderer->upload_texture(width, height, rgba)) {
+        entry->texture.emplace(std::move(*uploaded));
+        return &*entry->texture;
+    }
+    entry->buffer = nullptr;
+    return nullptr;
+}
 
 void Frame::Impl::rotate_debt() {
     // debt[0] is the oldest outstanding frame — the one the buffer we just drew
@@ -484,8 +571,8 @@ Result<Presented> Frame::submit(Color background) {
 
     // --- what to draw --------------------------------------------------------
     //
-    // Textures are cached on the surfaces and owned by the renderer; this is a
-    // list of borrowed pointers, and an unchanged client buffer costs nothing.
+    // Textures are cached in this frame's GPU bridge and owned by the renderer;
+    // this is a list of borrowed pointers, and an unchanged buffer costs nothing.
     impl.fills.clear();
     impl.drawn.clear();
     impl.damage.clear();
@@ -498,7 +585,7 @@ Result<Presented> Frame::submit(Color background) {
     bool wants_tearing = false;
     for (Placement& p : impl.placements) {
         if (p.surface != nullptr) {
-            p.texture = p.surface->buffer_texture(*impl.renderer);
+            p.texture = impl.texture_for(*p.surface);
         }
         if (p.texture == nullptr) {
             continue;
