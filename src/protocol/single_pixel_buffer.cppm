@@ -13,6 +13,8 @@ module;
 #include "detail/wayland_fwd.h"
 #include <cstdint>
 #include <memory>
+#include <typeinfo>
+#include <vector>
 
 #include <utility>
 #include <wayland-server-core.h>
@@ -21,6 +23,7 @@ module;
 
 export module luminaria:single_pixel_buffer;
 
+import :client_buffer;
 import :display;
 import :expected;
 
@@ -63,20 +66,17 @@ namespace luminaria {
 
 namespace {
 
-struct SinglePixel {
-    std::uint8_t rgba[4];
-};
+struct SinglePixel final : ClientBuffer {
+    std::uint8_t pixel[4];
 
-void buffer_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
-void buffer_resource_destroy(wl_resource* resource) {
-    delete static_cast<SinglePixel*>(wl_resource_get_user_data(resource));
-}
-
-constexpr struct wl_buffer_interface single_pixel_wl_buffer_impl = {
-    .destroy = buffer_destroy_request,
+    [[nodiscard]] int width() const noexcept override { return 1; }
+    [[nodiscard]] int height() const noexcept override { return 1; }
+    [[nodiscard]] bool rgba(std::vector<std::uint8_t>& out, int& w, int& h) const override {
+        out.assign(pixel, pixel + 4);
+        w = 1;
+        h = 1;
+        return true;
+    }
 };
 
 void manager_destroy_request(wl_client*, wl_resource* resource) {
@@ -93,12 +93,12 @@ void manager_create_u32_rgba_buffer(wl_client* client, wl_resource* manager, uin
     }
     // The protocol carries each channel as a 32-bit fraction of UINT32_MAX;
     // our pixel pipeline is 8-bit, so keep the top byte.
-    auto* px = new SinglePixel{{static_cast<std::uint8_t>(r >> 24),
-                                static_cast<std::uint8_t>(g >> 24),
-                                static_cast<std::uint8_t>(b >> 24),
-                                static_cast<std::uint8_t>(a >> 24)}};
-    wl_resource_set_implementation(resource, &single_pixel_wl_buffer_impl, px,
-                                   buffer_resource_destroy);
+    auto px = std::make_unique<SinglePixel>();
+    px->pixel[0] = static_cast<std::uint8_t>(r >> 24);
+    px->pixel[1] = static_cast<std::uint8_t>(g >> 24);
+    px->pixel[2] = static_cast<std::uint8_t>(b >> 24);
+    px->pixel[3] = static_cast<std::uint8_t>(a >> 24);
+    install_client_buffer(resource, std::move(px));
 }
 
 constexpr struct wp_single_pixel_buffer_manager_v1_interface manager_impl = {
@@ -147,13 +147,12 @@ Result<SinglePixelBufferManager> SinglePixelBufferManager::create(Display& displ
 }
 
 bool single_pixel_buffer_color(wl_resource* buffer, std::uint8_t rgba[4]) {
-    if (buffer == nullptr ||
-        !wl_resource_instance_of(buffer, &wl_buffer_interface, &single_pixel_wl_buffer_impl)) {
+    auto* px = dynamic_cast<SinglePixel*>(client_buffer_from_resource(buffer));
+    if (px == nullptr) {
         return false;
     }
-    const auto* px = static_cast<const SinglePixel*>(wl_resource_get_user_data(buffer));
     for (int i = 0; i < 4; ++i) {
-        rgba[i] = px->rgba[i];
+        rgba[i] = px->pixel[i];
     }
     return true;
 }

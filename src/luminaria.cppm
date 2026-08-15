@@ -18,6 +18,7 @@ export module luminaria;
 
 export import :backend;
 export import :box;
+export import :client_buffer;
 export import :color;
 export import :compositor;
 export import :cursor_shape;

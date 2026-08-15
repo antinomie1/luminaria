@@ -27,15 +27,14 @@ module;
 export module luminaria:compositor;
 
 import :box;
+import :client_buffer;
 import :display;
 import :dmabuf;
 import :expected;
 import :handle;
-import :linux_dmabuf;
 import :pixel_layout;
 import :region;
 import :signal;
-import :single_pixel_buffer;
 import :transform;
 import :vulkan;
 
@@ -472,7 +471,8 @@ void Surface::unhold_buffer(wl_resource* buffer) {
 }
 
 bool Surface::current_buffer_dmabuf(DmabufPlane& out) const {
-    return current_buffer_ != nullptr && dmabuf_buffer_info(current_buffer_, out);
+    ClientBuffer* buffer = client_buffer_from_resource(current_buffer_);
+    return buffer != nullptr && buffer->dmabuf(out);
 }
 
 bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, int& height) const {
@@ -481,15 +481,8 @@ bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, in
     }
     wl_shm_buffer* shm = wl_shm_buffer_get(current_buffer_);
     if (shm == nullptr) {
-        // Not shm: a 1x1 single-pixel buffer, else a linux-dmabuf buffer
-        // (LINEAR, mmap'd CPU-side).
-        if (uint8_t px[4]; single_pixel_buffer_color(current_buffer_, px)) {
-            out.assign(px, px + 4);
-            width = 1;
-            height = 1;
-            return true;
-        }
-        return dmabuf_buffer_to_rgba(current_buffer_, out, width, height);
+        ClientBuffer* buffer = client_buffer_from_resource(current_buffer_);
+        return buffer != nullptr && buffer->rgba(out, width, height);
     }
     const uint32_t format = wl_shm_buffer_get_format(shm);
     if (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888) {
@@ -549,7 +542,7 @@ GpuTexture* Surface::buffer_texture(VulkanRenderer& renderer) {
     texture_live_ = false;
 
     // A dmabuf goes straight to the GPU — no mapping, no conversion, no copy.
-    if (DmabufInfo info{}; dmabuf_buffer_info(current_buffer_, info)) {
+    if (DmabufPlane info{}; current_buffer_dmabuf(info)) {
         if (auto texture = renderer.import_texture(info)) {
             texture_.emplace(std::move(*texture));
             texture_live_ = true;
@@ -587,14 +580,10 @@ void buffer_size(wl_resource* buffer, int& w, int& h) {
         h = wl_shm_buffer_get_height(shm);
         return;
     }
-    if (DmabufInfo info{}; dmabuf_buffer_info(buffer, info)) {
-        w = info.width;
-        h = info.height;
+    if (ClientBuffer* contents = client_buffer_from_resource(buffer); contents != nullptr) {
+        w = contents->width();
+        h = contents->height();
         return;
-    }
-    if (uint8_t px[4]; single_pixel_buffer_color(buffer, px)) {
-        w = 1;
-        h = 1;
     }
 }
 } // namespace

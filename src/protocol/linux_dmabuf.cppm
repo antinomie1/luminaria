@@ -36,6 +36,7 @@ module;
 
 export module luminaria:linux_dmabuf;
 
+import :client_buffer;
 import :display;
 import :dmabuf;
 import :expected;
@@ -134,10 +135,10 @@ bool is_linear(uint64_t modifier) {
 }
 
 // One imported dmabuf, owned by its wl_buffer resource. Single plane.
-struct DmabufBuffer {
+struct DmabufBuffer final : ClientBuffer {
     int fd = -1;
-    int32_t width = 0;
-    int32_t height = 0;
+    int32_t width_value = 0;
+    int32_t height_value = 0;
     uint32_t format = 0;
     uint32_t offset = 0;
     uint32_t stride = 0;
@@ -149,17 +150,13 @@ struct DmabufBuffer {
             close(fd);
         }
     }
-};
 
-void buffer_destroy(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-constexpr struct wl_buffer_interface dmabuf_wl_buffer_impl = {
-    .destroy = buffer_destroy,
+    [[nodiscard]] int width() const noexcept override { return width_value; }
+    [[nodiscard]] int height() const noexcept override { return height_value; }
+    [[nodiscard]] bool rgba(std::vector<std::uint8_t>& out, int& width,
+                            int& height) const override;
+    [[nodiscard]] bool dmabuf(DmabufPlane& out) const noexcept override;
 };
-void buffer_resource_destroy(wl_resource* resource) {
-    delete static_cast<DmabufBuffer*>(wl_resource_get_user_data(resource));
-}
 
 // --- zwp_linux_buffer_params_v1: accumulates planes, then mints a wl_buffer. ---
 
@@ -239,12 +236,18 @@ wl_resource* build_buffer(wl_client* client, wl_resource* params_resource, uint3
         return nullptr;
     }
     // Move plane0's owned fd into a heap DmabufBuffer; params keeps none.
-    auto* buf = new DmabufBuffer{p->plane0.fd,     width,  height,        format,
-                                 p->plane0.offset, p->plane0.stride, p->plane0.modifier,
-                                 p->renderer};
+    auto buf = std::make_unique<DmabufBuffer>();
+    buf->fd = p->plane0.fd;
+    buf->width_value = width;
+    buf->height_value = height;
+    buf->format = format;
+    buf->offset = p->plane0.offset;
+    buf->stride = p->plane0.stride;
+    buf->modifier = p->plane0.modifier;
+    buf->renderer = p->renderer;
     p->plane0.fd = -1;
     p->have_plane0 = false;
-    wl_resource_set_implementation(buffer, &dmabuf_wl_buffer_impl, buf, buffer_resource_destroy);
+    install_client_buffer(buffer, std::move(buf));
     return buffer;
 }
 
@@ -393,8 +396,8 @@ namespace {
 // mmap a LINEAR dmabuf and convert to RGBA. Returns false on mmap failure.
 bool linear_to_rgba(const DmabufBuffer* buf, std::vector<std::uint8_t>& out, int& width,
                     int& height) {
-    const int w = buf->width;
-    const int h = buf->height;
+    const int w = buf->width_value;
+    const int h = buf->height_value;
     // build_buffer() already refused a short stride; check again rather than
     // trust that every future path into a DmabufBuffer came through it.
     const size_t map_len = layout_length(w, h, buf->stride, buf->offset);
@@ -427,13 +430,32 @@ bool linear_to_rgba(const DmabufBuffer* buf, std::vector<std::uint8_t>& out, int
 }
 
 const DmabufBuffer* as_dmabuf(wl_resource* buffer) {
-    if (buffer == nullptr ||
-        !wl_resource_instance_of(buffer, &wl_buffer_interface, &dmabuf_wl_buffer_impl)) {
-        return nullptr;
-    }
-    return static_cast<const DmabufBuffer*>(wl_resource_get_user_data(buffer));
+    return dynamic_cast<const DmabufBuffer*>(client_buffer_from_resource(buffer));
 }
 } // namespace
+
+bool DmabufBuffer::rgba(std::vector<std::uint8_t>& out, int& width, int& height) const {
+    if (is_linear(modifier)) {
+        return linear_to_rgba(this, out, width, height);
+    }
+    if (renderer == nullptr) {
+        return false;
+    }
+    auto pixels = renderer->import_dmabuf(fd, width_value, height_value, format, offset, stride,
+                                          modifier);
+    if (!pixels) {
+        return false;
+    }
+    out = std::move(*pixels);
+    width = width_value;
+    height = height_value;
+    return true;
+}
+
+bool DmabufBuffer::dmabuf(DmabufPlane& out) const noexcept {
+    out = DmabufPlane{fd, width_value, height_value, format, offset, stride, modifier};
+    return true;
+}
 
 bool dmabuf_buffer_to_rgba(wl_resource* buffer, std::vector<std::uint8_t>& out, int& width,
                            int& height) {
@@ -441,22 +463,7 @@ bool dmabuf_buffer_to_rgba(wl_resource* buffer, std::vector<std::uint8_t>& out, 
     if (buf == nullptr) {
         return false;
     }
-    if (is_linear(buf->modifier)) {
-        return linear_to_rgba(buf, out, width, height);
-    }
-    // Tiled/vendor modifier: import through the GPU.
-    if (buf->renderer == nullptr) {
-        return false;
-    }
-    auto rgba = buf->renderer->import_dmabuf(buf->fd, buf->width, buf->height, buf->format,
-                                             buf->offset, buf->stride, buf->modifier);
-    if (!rgba) {
-        return false;
-    }
-    out = std::move(*rgba);
-    width = buf->width;
-    height = buf->height;
-    return true;
+    return buf->rgba(out, width, height);
 }
 
 bool dmabuf_buffer_info(wl_resource* buffer, DmabufInfo& out) {
@@ -464,7 +471,7 @@ bool dmabuf_buffer_info(wl_resource* buffer, DmabufInfo& out) {
     if (buf == nullptr) {
         return false;
     }
-    out = DmabufInfo{buf->fd,     buf->width,  buf->height,  buf->format,
+    out = DmabufInfo{buf->fd,     buf->width_value,  buf->height_value,  buf->format,
                      buf->offset, buf->stride, buf->modifier};
     return true;
 }
