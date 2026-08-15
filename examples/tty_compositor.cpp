@@ -21,14 +21,15 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <drm_fourcc.h>
+#include <linux/input-event-codes.h>
 
 import luminaria.gpu;
 
 namespace {
-constexpr uint32_t KEY_ESC = 1;
 // XRGB8888: opaque 32-bit, the one format every KMS primary plane scans out.
 constexpr uint32_t kScanoutFormat = DRM_FORMAT_XRGB8888;
 
@@ -69,9 +70,29 @@ luminaria::Transform env_transform() {
 struct Window {
     luminaria::Toplevel* toplevel = nullptr;
     int x = 0, y = 0;
+    int saved_x = 0, saved_y = 0;
+    int saved_width = 0, saved_height = 0;
+    int pending_x = 0, pending_y = 0;
+    int pending_width = 0, pending_height = 0;
     bool mapped = false;
+    bool minimized = false;
+    bool geometry_pending = false;
     luminaria::Signal<luminaria::ToplevelMap>::Connection on_map;
+    luminaria::Signal<luminaria::ToplevelUnmap>::Connection on_unmap;
     luminaria::Signal<luminaria::ToplevelDestroy>::Connection on_destroy;
+    luminaria::Signal<luminaria::SurfaceCommit>::Connection on_commit;
+    luminaria::Signal<luminaria::ToplevelRequestMaximize>::Connection on_maximize;
+    luminaria::Signal<luminaria::ToplevelRequestFullscreen>::Connection on_fullscreen;
+    luminaria::Signal<luminaria::ToplevelRequestMinimize>::Connection on_minimize;
+};
+
+struct PopupEntry {
+    luminaria::Popup* popup = nullptr;
+    bool mapped = false;
+    luminaria::Signal<luminaria::PopupMap>::Connection on_map;
+    luminaria::Signal<luminaria::PopupUnmap>::Connection on_unmap;
+    luminaria::Signal<luminaria::PopupDestroy>::Connection on_destroy;
+    luminaria::Signal<luminaria::PopupReposition>::Connection on_reposition;
 };
 } // namespace
 
@@ -145,6 +166,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "luminaria-tty: protocol setup failed\n");
         return 1;
     }
+    // Do not advertise xdg-decoration until this example can draw server-side
+    // title bars. Qt then uses its built-in client decorations; their requests
+    // are handled by the XdgToplevel policy below.
 
     // GPU clients (GTK4, anything on Mesa/EGL) hand us dmabufs; the renderer
     // imports them straight into the composite with no copy.
@@ -165,30 +189,106 @@ int main(int argc, char** argv) {
     }
 
     std::list<Window> windows; // stable addresses; slots kept for the process life
+    std::list<PopupEntry> popups; // creation order keeps child popups above their parents
     // Set once the screens exist; map/unmap call it to force a full repaint.
     std::function<void()> window_changed = [] {};
+    std::function<void(Window&, bool)> maximize_window = [](Window&, bool) {};
+    std::function<void(Window&, bool)> fullscreen_window = [](Window&, bool) {};
+    std::function<void(Window&)> minimize_window = [](Window&) {};
+    auto focus_window = [&](Window* target) {
+        for (Window& candidate : windows) {
+            if (candidate.toplevel != nullptr) {
+                candidate.toplevel->set_activated(&candidate == target);
+            }
+        }
+        seat->set_keyboard_focus(target != nullptr && target->toplevel != nullptr
+                                     ? &target->toplevel->surface()
+                                     : nullptr);
+    };
 
     auto new_toplevel = shell->new_toplevel().connect([&](luminaria::NewToplevel& e) {
         Window& w = windows.emplace_back();
         w.toplevel = &e.toplevel;
         const int n = static_cast<int>(windows.size()) - 1;
-        w.x = 40 + 30 * n;
-        w.y = 40 + 30 * n;
-        w.on_map = e.toplevel.map.connect([&w, &seat, &window_changed](luminaria::ToplevelMap&) {
+        w.x = w.saved_x = 40 + 30 * n;
+        w.y = w.saved_y = 40 + 30 * n;
+        w.on_map = e.toplevel.map.connect([&w, &focus_window, &window_changed](luminaria::ToplevelMap&) {
             w.mapped = true;
-            seat->set_keyboard_focus(&w.toplevel->surface());
-            seat->pointer_enter(w.toplevel->surface(), 0, 0);
+            w.minimized = false;
+            focus_window(&w);
             window_changed();
             std::printf("luminaria-tty: window mapped at (%d,%d), %dx%d — \"%s\"\n", w.x, w.y,
                         w.toplevel->surface().surface_width(),
                         w.toplevel->surface().surface_height(), w.toplevel->title().c_str());
         });
+        w.on_unmap = e.toplevel.unmap.connect([&w, &window_changed](luminaria::ToplevelUnmap&) {
+            w.mapped = false;
+            w.geometry_pending = false;
+            window_changed();
+        });
         w.on_destroy =
-            e.toplevel.destroy.connect([&w, &window_changed](luminaria::ToplevelDestroy&) {
+            e.toplevel.destroy.connect([&w, &focus_window, &window_changed](luminaria::ToplevelDestroy&) {
+                focus_window(nullptr);
                 w.mapped = false;
                 w.toplevel = nullptr;
                 window_changed();
                 std::printf("luminaria-tty: window gone\n");
+            });
+        w.on_commit = e.toplevel.surface().commit.connect(
+            [&w, &window_changed](luminaria::SurfaceCommit&) {
+                if (!w.geometry_pending || w.toplevel == nullptr) {
+                    return;
+                }
+                const luminaria::XdgGeometry geometry = w.toplevel->geometry();
+                if (geometry.width != w.pending_width || geometry.height != w.pending_height) {
+                    return;
+                }
+                w.x = w.pending_x;
+                w.y = w.pending_y;
+                w.geometry_pending = false;
+                window_changed();
+                std::printf("luminaria-tty: window geometry landed at (%d,%d), %dx%d\n", w.x,
+                            w.y, geometry.width, geometry.height);
+            });
+        w.on_maximize = e.toplevel.request_maximize.connect(
+            [&w, &maximize_window](luminaria::ToplevelRequestMaximize& request) {
+                maximize_window(w, request.maximized);
+            });
+        w.on_fullscreen = e.toplevel.request_fullscreen.connect(
+            [&w, &fullscreen_window](luminaria::ToplevelRequestFullscreen& request) {
+                fullscreen_window(w, request.fullscreen);
+            });
+        w.on_minimize = e.toplevel.request_minimize.connect(
+            [&w, &minimize_window](luminaria::ToplevelRequestMinimize&) { minimize_window(w); });
+    });
+
+    // Qt menus, combo boxes and tooltips are xdg_popup surfaces, not
+    // subsurfaces of the toplevel. Track their lifetime so they join the same
+    // placement list used for drawing and hit-testing.
+    auto new_popup = shell->new_popup().connect([&](luminaria::NewPopup& e) {
+        PopupEntry& p = popups.emplace_back();
+        p.popup = &e.popup;
+        std::printf("luminaria-tty: popup created at (%d,%d), %dx%d parent=%p\n", e.popup.x(),
+                    e.popup.y(), e.popup.width(), e.popup.height(),
+                    static_cast<void*>(e.popup.parent_surface()));
+        p.on_map = e.popup.map.connect([&p, &window_changed](luminaria::PopupMap&) {
+            p.mapped = true;
+            window_changed();
+            std::printf("luminaria-tty: popup mapped %dx%d at (%d,%d)\n", p.popup->width(),
+                        p.popup->height(), p.popup->x(), p.popup->y());
+        });
+        p.on_unmap = e.popup.unmap.connect([&p, &window_changed](luminaria::PopupUnmap&) {
+            p.mapped = false;
+            window_changed();
+        });
+        p.on_destroy = e.popup.destroy.connect([&p, &window_changed](luminaria::PopupDestroy&) {
+            p.mapped = false;
+            p.popup = nullptr;
+            window_changed();
+        });
+        p.on_reposition =
+            e.popup.reposition.connect([&window_changed](luminaria::PopupReposition&) {
+                window_changed();
             });
     });
 
@@ -296,12 +396,46 @@ int main(int argc, char** argv) {
     // both draws and hit-tests, so a click can never land somewhere the pixels
     // aren't — which is why it is rebuilt on input as well as on frame. It
     // allocates nothing once the vectors have grown.
+    using SurfaceOrigin = std::pair<luminaria::Surface*, std::pair<int, int>>;
+    std::vector<SurfaceOrigin> surface_origins;
     auto build_placements = [&](Screen& screen) {
         screen.frame->begin(layout.box_of(*screen.output));
-        for (Window& w : windows) {
-            if (w.mapped && w.toplevel != nullptr) {
-                screen.frame->place(w.toplevel->surface(), w.x, w.y);
+        surface_origins.clear();
+        auto remember_tree_origins = [&](luminaria::Surface& root, int x, int y) {
+            for (const luminaria::SurfaceAt& at : root.surface_tree()) {
+                surface_origins.push_back({at.surface, {x + at.x, y + at.y}});
             }
+        };
+        for (Window& w : windows) {
+            if (w.mapped && !w.minimized && w.toplevel != nullptr) {
+                luminaria::Surface& root = w.toplevel->surface();
+                remember_tree_origins(root, w.x, w.y);
+                screen.frame->place(root, w.x, w.y);
+            }
+        }
+        for (PopupEntry& p : popups) {
+            if (!p.mapped || p.popup == nullptr) {
+                continue;
+            }
+            int px = p.popup->x();
+            int py = p.popup->y();
+            if (luminaria::Surface* parent_surface = p.popup->parent_surface();
+                parent_surface != nullptr) {
+                const auto parent = std::find_if(
+                    surface_origins.begin(), surface_origins.end(),
+                    [parent_surface](const SurfaceOrigin& origin) {
+                        return origin.first == parent_surface;
+                    });
+                if (parent == surface_origins.end()) {
+                    std::printf("luminaria-tty: popup skipped: parent not placed\n");
+                    continue;
+                }
+                px += parent->second.first;
+                py += parent->second.second;
+            }
+            luminaria::Surface& root = p.popup->surface();
+            remember_tree_origins(root, px, py);
+            screen.frame->place(root, px, py);
         }
         // The cursor last, so it is on top — and only where the hardware isn't
         // already carrying it. A client sprite wins over the theme image; a
@@ -322,6 +456,25 @@ int main(int argc, char** argv) {
                                 cursor_texture_image->width, cursor_texture_image->height);
         }
     };
+
+    // Give xdg-positioner the output bounds so a menu near an edge can flip or
+    // slide into view instead of being configured off-screen.
+    shell->set_popup_constraint_query(
+        [&](luminaria::Surface& parent, luminaria::Box& parent_box, luminaria::Box& usable) {
+            for (Screen& sc : screens) {
+                build_placements(sc);
+                for (const luminaria::Placement& placement : sc.frame->placements()) {
+                    if (placement.surface != parent.id()) {
+                        continue;
+                    }
+                    parent_box = luminaria::Box{placement.x, placement.y, placement.width,
+                                                placement.height};
+                    usable = layout.box_of(*sc.output);
+                    return !usable.empty();
+                }
+            }
+            return false;
+        });
 
     // Everything about the pointer's picture that is NOT its position: which
     // image, and whether each screen's plane can carry it. Called when the
@@ -370,14 +523,29 @@ int main(int argc, char** argv) {
             sc.cursor_on_plane = false;
             if (sc.output->has_cursor_plane()) {
                 if (rgba.empty()) {
-                    (void)sc.output->hide_cursor();
-                    sc.cursor_on_plane = true; // nothing to draw, hardware agrees
-                } else if (sc.output->set_cursor(rgba, width, height, hotspot_x, hotspot_y)) {
-                    sc.cursor_on_plane = true;
+                    auto hidden_status = sc.output->hide_cursor();
+                    sc.cursor_on_plane = hidden_status.has_value();
+                    if (!hidden_status) {
+                        std::fprintf(stderr, "luminaria-tty: hide cursor: %s\n",
+                                     hidden_status.error().message.c_str());
+                    }
                 } else {
-                    // Too big for the plane, or the commit failed: composite it
-                    // rather than leave the last picture stuck there.
-                    (void)sc.output->hide_cursor();
+                    auto cursor_status =
+                        sc.output->set_cursor(rgba, width, height, hotspot_x, hotspot_y);
+                    if (cursor_status) {
+                        sc.cursor_on_plane = true;
+                    } else {
+                        // Too big for the plane: hide the old hardware image
+                        // before compositing. If hiding itself fails, keep the
+                        // old plane state instead of drawing a duplicate cursor.
+                        auto hidden_status = sc.output->hide_cursor();
+                        if (!hidden_status) {
+                            sc.cursor_on_plane = was_on_plane;
+                            std::fprintf(stderr, "luminaria-tty: cursor: %s; hide: %s\n",
+                                         cursor_status.error().message.c_str(),
+                                         hidden_status.error().message.c_str());
+                        }
+                    }
                 }
             }
             // Whatever the cursor was covering has to be repainted when it
@@ -398,6 +566,107 @@ int main(int argc, char** argv) {
         }
     };
     window_changed = damage_everything;
+    auto set_window_covering_layout = [&](Window& window, bool enabled, bool fullscreen) {
+        if (window.toplevel == nullptr) {
+            return;
+        }
+        luminaria::Output* output = layout.at(window.x, window.y);
+        if (output == nullptr && !screens.empty()) {
+            output = screens.front().output;
+        }
+        const luminaria::Box bounds =
+            output != nullptr ? layout.box_of(*output) : luminaria::Box{};
+        if (bounds.empty()) {
+            return;
+        }
+        if (enabled) {
+            if (!window.toplevel->is_maximized() && !window.toplevel->is_fullscreen()) {
+                window.saved_x = window.x;
+                window.saved_y = window.y;
+                const luminaria::XdgGeometry geometry = window.toplevel->geometry();
+                window.saved_width = geometry.width;
+                window.saved_height = geometry.height;
+            }
+            // Keep the old buffer at its old position until the client commits
+            // the size requested below. Moving first exposes a one-frame mix of
+            // old geometry and new placement, especially on maximize/restore.
+            window.pending_x = bounds.x;
+            window.pending_y = bounds.y;
+            window.pending_width = bounds.width;
+            window.pending_height = bounds.height;
+            window.geometry_pending = true;
+            shell->set_bounds(bounds.width, bounds.height);
+        } else {
+            window.pending_x = window.saved_x;
+            window.pending_y = window.saved_y;
+            window.pending_width = window.saved_width;
+            window.pending_height = window.saved_height;
+            window.geometry_pending = window.saved_width > 0 && window.saved_height > 0;
+        }
+        if (fullscreen) {
+            window.toplevel->set_fullscreen(enabled);
+        } else {
+            window.toplevel->set_maximized(enabled);
+        }
+        if (enabled) {
+            // The state setter preserves the last configured size. After one
+            // restore that size is the normal window geometry, so a second
+            // maximize would otherwise send MAXIMIZED + 917x501 (for example),
+            // which Qt immediately rejects by requesting restore again. Make
+            // the final configure in this batch pair the state with the output.
+            (void)window.toplevel->configure(bounds.width, bounds.height);
+        } else {
+            if (window.geometry_pending) {
+                (void)window.toplevel->configure(window.saved_width, window.saved_height);
+            } else {
+                window.x = window.saved_x;
+                window.y = window.saved_y;
+                (void)window.toplevel->configure(0, 0);
+            }
+        }
+        std::printf("luminaria-tty: window %s requested — target (%d,%d), %dx%d\n",
+                    enabled ? (fullscreen ? "fullscreen" : "maximize") : "restore",
+                    window.pending_x, window.pending_y, window.pending_width,
+                    window.pending_height);
+    };
+    maximize_window = [&](Window& window, bool enabled) {
+        set_window_covering_layout(window, enabled, false);
+    };
+    fullscreen_window = [&](Window& window, bool enabled) {
+        set_window_covering_layout(window, enabled, true);
+    };
+    minimize_window = [&](Window& window) {
+        if (window.toplevel == nullptr) {
+            return;
+        }
+        window.minimized = true;
+        window.geometry_pending = false;
+        window.toplevel->set_minimized(true);
+        if (seat->keyboard_focus() == window.toplevel->surface().id()) {
+            focus_window(nullptr);
+        }
+        if (seat->pointer_focus() == window.toplevel->surface().id()) {
+            seat->pointer_clear_focus();
+        }
+        damage_everything();
+        std::printf("luminaria-tty: window minimized — \"%s\"\n",
+                    window.toplevel->title().c_str());
+    };
+    auto clamp_cursor = [&] {
+        const luminaria::Box bounds = layout.bounds();
+        if (bounds.empty()) {
+            return;
+        }
+        if (!cursor_placed) {
+            cursor_x = bounds.x + bounds.width / 2.0;
+            cursor_y = bounds.y + bounds.height / 2.0;
+            cursor_placed = true;
+        }
+        cursor_x = std::clamp(cursor_x, static_cast<double>(bounds.x),
+                              static_cast<double>(bounds.x + bounds.width) - 1.0);
+        cursor_y = std::clamp(cursor_y, static_cast<double>(bounds.y),
+                              static_cast<double>(bounds.y + bounds.height) - 1.0);
+    };
 
     // (Re)build everything that is sized for an output's current mode: the pair
     // of GPU scanout buffers, the direct-scanout cache, its box in the layout
@@ -422,6 +691,8 @@ int main(int argc, char** argv) {
         // so its place in it is recomputed rather than kept.
         layout.remove(output);
         layout.add_auto(output);
+        const luminaria::Box all_outputs = layout.bounds();
+        shell->set_bounds(all_outputs.width, all_outputs.height);
         const luminaria::Box view = layout.box_of(output);
         if (screen.global) {
             screen.global->set_modes(output.modes());
@@ -480,6 +751,7 @@ int main(int argc, char** argv) {
         rebuild_screen(screen);
         // A monitor that just appeared has an empty cursor plane and a
         // cursor_on_plane nobody has decided yet.
+        clamp_cursor();
         sync_cursor(/*force=*/true);
 
         // A frame is on screen: pace the clients that drew it, and answer their
@@ -489,18 +761,22 @@ int main(int argc, char** argv) {
             // The flip landed, so whatever a direct scanout replaced is off the
             // screen and its client can have it back.
             screen.frame->presented();
-            for (Window& w : windows) {
-                if (!w.mapped || w.toplevel == nullptr) {
-                    continue;
+            build_placements(screen);
+            for (const luminaria::Placement& placement : screen.frame->placements()) {
+                if (luminaria::Surface* surface =
+                        luminaria::surface_from_id(placement.surface);
+                    surface != nullptr) {
+                    surface->send_frame_done(pe.time_ms());
+                    presentation->notify_presented(*surface, pe);
                 }
-                luminaria::Surface& surface = w.toplevel->surface();
-                surface.send_frame_done(pe.time_ms());
-                presentation->notify_presented(surface, pe);
             }
         });
 
         screen.frame_conn = e.output.frame.connect([&, &screen = screen](luminaria::FrameEvent&) {
             constexpr luminaria::Color background{0.1f, 0.1f, 0.13f, 1.0f};
+            // Destroy callbacks only null entries: erase them here, after the
+            // callback that owns their Connection has returned.
+            std::erase_if(popups, [](const PopupEntry& popup) { return popup.popup == nullptr; });
             // Everything below this line — damage bookkeeping against the buffer
             // being drawn into, occlusion, the fences between GPU and display,
             // and the decision to hand a fullscreen client's own buffer straight
@@ -541,21 +817,6 @@ int main(int argc, char** argv) {
             }
             sync_cursor();
         });
-    auto clamp_cursor = [&] {
-        const luminaria::Box bounds = layout.bounds();
-        if (bounds.empty()) {
-            return;
-        }
-        if (!cursor_placed) {
-            cursor_x = bounds.x + bounds.width / 2.0;
-            cursor_y = bounds.y + bounds.height / 2.0;
-            cursor_placed = true;
-        }
-        cursor_x = std::clamp(cursor_x, static_cast<double>(bounds.x),
-                              static_cast<double>(bounds.x + bounds.width) - 1.0);
-        cursor_y = std::clamp(cursor_y, static_cast<double>(bounds.y),
-                              static_cast<double>(bounds.y + bounds.height) - 1.0);
-    };
     // Topmost surface accepting input at (x,y), plus the point in its own
     // coordinates — from the placement list of the screen the pointer is on, so
     // the answer is by construction the same one the renderer drew. Rebuilt
@@ -576,7 +837,7 @@ int main(int argc, char** argv) {
     };
     auto window_of = [&windows](luminaria::SurfaceId surface) -> Window* {
         for (Window& w : windows) {
-            if (!w.mapped || w.toplevel == nullptr) {
+            if (!w.mapped || w.minimized || w.toplevel == nullptr) {
                 continue;
             }
             for (const luminaria::SurfaceAt& at : w.toplevel->surface().surface_tree()) {
@@ -586,6 +847,19 @@ int main(int argc, char** argv) {
             }
         }
         return nullptr;
+    };
+    auto is_popup_surface = [&popups](luminaria::SurfaceId surface) {
+        for (PopupEntry& p : popups) {
+            if (!p.mapped || p.popup == nullptr) {
+                continue;
+            }
+            for (const luminaria::SurfaceAt& at : p.popup->surface().surface_tree()) {
+                if (at.surface->id() == surface) {
+                    return true;
+                }
+            }
+        }
+        return false;
     };
     luminaria::SurfaceId pointer_focus;
     auto deliver_motion = [&] {
@@ -641,7 +915,46 @@ int main(int argc, char** argv) {
     if (!seat->set_keymap(input->keymap())) {
         std::fprintf(stderr, "luminaria-tty: backend keymap rejected, keeping ours\n");
     }
+    bool left_ctrl = false, right_ctrl = false, left_alt = false, right_alt = false;
+    auto vt_for_key = [](std::uint32_t key) {
+        if (key >= KEY_F1 && key <= KEY_F10) {
+            return static_cast<int>(key - KEY_F1 + 1);
+        }
+        if (key == KEY_F11) {
+            return 11;
+        }
+        if (key == KEY_F12) {
+            return 12;
+        }
+        return 0;
+    };
     auto key_conn = input->key().connect([&](luminaria::KeyEvent& e) {
+        switch (e.keycode) {
+        case KEY_LEFTCTRL: left_ctrl = e.pressed; break;
+        case KEY_RIGHTCTRL: right_ctrl = e.pressed; break;
+        case KEY_LEFTALT: left_alt = e.pressed; break;
+        case KEY_RIGHTALT: right_alt = e.pressed; break;
+        default: break;
+        }
+        const int vt = vt_for_key(e.keycode);
+        if (e.pressed && vt != 0 && (left_ctrl || right_ctrl) && (left_alt || right_alt) &&
+            seat_session != nullptr) {
+            // The shortcut belongs to the compositor. Release modifiers from
+            // the focused client before libinput is suspended, otherwise the
+            // client may keep Ctrl/Alt logically held after switching back.
+            if (left_ctrl) seat->notify_key(KEY_LEFTCTRL, false);
+            if (right_ctrl) seat->notify_key(KEY_RIGHTCTRL, false);
+            if (left_alt) seat->notify_key(KEY_LEFTALT, false);
+            if (right_alt) seat->notify_key(KEY_RIGHTALT, false);
+            seat->notify_modifiers(0, 0, 0, 0);
+            if (auto switched = seat_session->switch_to(vt); !switched) {
+                std::fprintf(stderr, "luminaria-tty: VT switch to %d: %s\n", vt,
+                             switched.error().message.c_str());
+            } else {
+                std::printf("luminaria-tty: requested VT %d\n", vt);
+            }
+            return;
+        }
         if (e.pressed && e.keycode == KEY_ESC) {
             display->terminate();
         } else {
@@ -680,11 +993,20 @@ int main(int argc, char** argv) {
         deliver_motion();
     });
     auto btn_conn = input->pointer_button().connect([&](luminaria::PointerButtonEvent& e) {
+        // An xdg_popup grab owns menu interaction. Clicking anywhere outside
+        // its surface dismisses it before the underlying window sees the click.
+        if (e.pressed && !is_popup_surface(pointer_focus)) {
+            for (PopupEntry& p : popups) {
+                if (p.popup != nullptr && p.popup->has_grab()) {
+                    p.popup->dismiss();
+                }
+            }
+        }
         // A press on a window raises keyboard focus with it, the way every
         // click-to-focus desktop behaves.
         if (e.pressed && pointer_focus.valid()) {
             if (Window* w = window_of(pointer_focus); w != nullptr) {
-                seat->set_keyboard_focus(&w->toplevel->surface());
+                focus_window(w);
             }
         }
         seat->pointer_button(e.button, e.pressed);

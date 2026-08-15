@@ -27,6 +27,7 @@ struct ClientState {
     xdg_wm_base* wm_base = nullptr;
     wl_surface* surface = nullptr;
     bool committed_buffer = false;
+    wl_callback* pending_frame = nullptr;
 };
 
 wl_buffer* make_buffer(ClientState* st, int w, int h) {
@@ -99,6 +100,13 @@ void run_client(int fd) {
         wl_surface_commit(st.surface); // initial commit -> server sends configure
         wl_display_roundtrip(display); // configure arrives; listener acks+attaches+commits
         wl_display_roundtrip(display); // ensure the mapping commit is sent AND processed
+
+        // Leave a wl_surface.frame callback pending when the client disconnects.
+        // wl_client_destroy is free to destroy that callback before the surface;
+        // the surface must not retain and destroy the stale wl_resource again.
+        st.pending_frame = wl_surface_frame(st.surface);
+        wl_surface_commit(st.surface);
+        wl_display_flush(display);
     }
     wl_display_disconnect(display); // server terminates on our disconnect
 }

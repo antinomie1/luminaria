@@ -237,7 +237,7 @@ void xdg_output_manager_destroy_request(wl_client*, wl_resource* resource) {
 }
 
 void xdg_output_manager_get_xdg_output(wl_client* client, wl_resource* manager_resource,
-                                       uint32_t id, wl_resource* /*output*/) {
+                                       uint32_t id, wl_resource* output) {
     auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(manager_resource));
     const uint32_t version = static_cast<uint32_t>(wl_resource_get_version(manager_resource));
     wl_resource* resource =
@@ -255,9 +255,16 @@ void xdg_output_manager_get_xdg_output(wl_client* client, wl_resource* manager_r
         zxdg_output_v1_send_name(resource, self->name.c_str());
         zxdg_output_v1_send_description(resource, "luminaria virtual output");
     }
-    // Since v3 the atomicity barrier is wl_output.done, not our own done event.
-    if (version < ZXDG_OUTPUT_V1_NAME_SINCE_VERSION + 1) {
+    // Since xdg-output v3 the atomicity barrier is wl_output.done, not our own
+    // done event. The client's get_xdg_output request necessarily arrives
+    // after wl_output's initial bind-time done, so close THIS batch with a new
+    // wl_output.done. Without it Qt keeps the output as a placeholder forever
+    // and abandons every popup it tries to create.
+    if (version < 3) {
         zxdg_output_v1_send_done(resource);
+    } else if (output != nullptr &&
+               wl_resource_get_version(output) >= WL_OUTPUT_DONE_SINCE_VERSION) {
+        wl_output_send_done(output);
     }
 }
 

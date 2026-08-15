@@ -10,13 +10,22 @@
 排序原则：**能不能观测**。为"低功耗"做的每一个决定，效果都只在真机上看得见，所以真机验证
 排在最前面；bench 排第二，因为它是后面所有优化的验收手段。
 
-### 0. 真机验证 DRM 路径 — 阻塞后面一切
+### 0. 真机验证 DRM 剩余路径 — 多输出、热插拔、直出
 
-整条 DRM 路径**从未在真实显示器上跑过**：atomic 提交、`IN_FENCE_FD` / `OUT_FENCE_PTR`、
-多输出 CRTC/plane 分配、udev 热插拔、硬件光标平面、VT 切换。渲染与几何那一侧有测试覆盖，
-但"真实显示器上的翻页"只能在真机上确认，而下面每一条的效果都落在这 1,211 行上。
+2026-08-15 已在一块 1920×1080@60Hz 的真实显示器上完成第一轮空闲 VT 验证：atomic
+模式设置与连续翻页、GPU 合成的 in/out fence 链、libinput 键鼠、硬件光标平面、
+Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜单、最大化/还原、最小化、
+关闭以及窗口消失后的双缓冲重绘也经过反复手测。证据由 `scripts/tty-check.sh` 留在 `logs/`。
 
-做法：一个空闲 VT + 一台显示器，跑 `luminaria-tty`，逐项对照上面的清单。
+仍需真机覆盖的部分：
+
+- 两台及以上显示器的 CRTC/primary/cursor plane 分配与跨屏指针。
+- udev connector 热插拔，以及拔屏后所有 per-output 状态的回收。
+- `Output::set_mode()` 后 scanout target、layout、`wl_output` 的整链重建。
+- 客户端 dmabuf 的直接扫描（当前 Konsole 验证只有 GPU 合成，日志中 `scanout=0`）。
+
+做法：空闲 VT 上跑 `luminaria-tty`，用 `scripts/tty-check.sh` 留证；下一轮优先接第二台显示器，
+再用可全屏 dmabuf 客户端触发直出。
 
 ### 1. bench harness + 三个数进 CI
 

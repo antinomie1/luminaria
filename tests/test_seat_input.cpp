@@ -36,6 +36,8 @@ struct ClientState {
     bool got_axis_stop = false;
     double axis_value = 0.0;
     int32_t axis_discrete = 0;
+    bool got_button_press = false;
+    bool got_button_release = false;
 
     bool got_touch_down = false;
     bool got_touch_motion = false;
@@ -55,7 +57,14 @@ void ptr_enter(void* data, wl_pointer* pointer, uint32_t serial, wl_surface*, wl
 }
 void ptr_leave(void*, wl_pointer*, uint32_t, wl_surface*) {}
 void ptr_motion(void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {}
-void ptr_button(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {}
+void ptr_button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state) {
+    if (button != 0x110) { // BTN_LEFT
+        return;
+    }
+    auto* st = static_cast<ClientState*>(data);
+    st->got_button_press = st->got_button_press || state == WL_POINTER_BUTTON_STATE_PRESSED;
+    st->got_button_release = st->got_button_release || state == WL_POINTER_BUTTON_STATE_RELEASED;
+}
 void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
     auto* st = static_cast<ClientState*>(data);
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
@@ -218,6 +227,8 @@ int main() {
             seat->pointer_axis_discrete(0, 1);       // one wheel notch down
             seat->pointer_axis(0.0, 12.0);           // smooth scroll
             seat->pointer_axis_stop(false, true);    // fingers lifted
+            seat->pointer_button(0x110, true);       // click a client-side decoration
+            seat->pointer_button(0x110, false);
             seat->touch_down(*surface, 0, 11.0, 22.0);
             seat->touch_motion(0, 12.0, 23.0);
             seat->touch_up(0);
@@ -243,6 +254,7 @@ int main() {
     assert(g_client.got_axis_discrete && g_client.axis_discrete == 1);
     assert(g_client.got_axis && g_client.axis_value == 12.0);
     assert(g_client.got_axis_stop);
+    assert(g_client.got_button_press && g_client.got_button_release);
 
     assert(g_client.got_touch_down);
     assert(g_client.touch_x == 11.0 && g_client.touch_y == 22.0);

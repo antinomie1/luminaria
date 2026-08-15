@@ -896,6 +896,11 @@ void tl_set_minimized(wl_client*, wl_resource* resource) {
     ToplevelImpl* tl = toplevel_of(resource);
     ToplevelRequestMinimize event{*tl};
     tl->request_minimize.emit(event);
+    if (!tl->minimized_ && tl->request_minimize.slot_count() == 0) {
+        // Match maximize/fullscreen: with no compositor policy listening, at
+        // least retain the state so window-list consumers see the request.
+        tl->set_minimized(true);
+    }
 }
 constexpr struct xdg_toplevel_interface toplevel_impl = {
     .destroy = toplevel_destroy_request,
@@ -1076,7 +1081,8 @@ void xdg_surface_get_toplevel(wl_client* client, wl_resource* resource, uint32_t
         wl_array caps;
         wl_array_init(&caps);
         for (uint32_t cap : {static_cast<uint32_t>(XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE),
-                             static_cast<uint32_t>(XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN)}) {
+                             static_cast<uint32_t>(XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN),
+                             static_cast<uint32_t>(XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE)}) {
             if (auto* slot = static_cast<uint32_t*>(wl_array_add(&caps, sizeof(uint32_t)));
                 slot != nullptr) {
                 *slot = cap;

@@ -299,7 +299,7 @@ public:
     /// wl_surface.damage_buffer: buffer coordinates, so it has to come back
     /// through the buffer scale and transform before it means anything.
     void add_pending_buffer_damage(int x, int y, int width, int height);
-    void add_frame_callback(wl_resource* callback) { pending_.frame_callbacks.push_back(callback); }
+    void add_frame_callback(wl_resource* callback);
     void set_pending_opaque_region(const Region* region);
     void set_pending_input_region(const Region* region);
     /// Called by the seat (cursor) and the data device (drag icon) when this
@@ -319,6 +319,10 @@ public:
     /// releases or reads a dead resource. (Clients really do this — a toolkit
     /// discards its whole swapchain when the window is resized or re-shown.)
     void forget_buffer(wl_resource* buffer) noexcept;
+    /// Called by a wl_callback resource's destroy hook. Frame callbacks are
+    /// client-owned resources too: wl_client_destroy may tear one down before
+    /// its surface, so every retained slot must forget it immediately.
+    void forget_frame_callback(wl_resource* callback) noexcept;
 
     // --- internal: called by the wl_subsurface glue in subcompositor.cpp ---
     /// Become a subsurface of `parent` (placed on top of it). Returns false if
@@ -624,6 +628,32 @@ bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, in
 }
 
 namespace {
+void frame_callback_resource_destroy(wl_resource* callback) {
+    auto* surface = static_cast<Surface*>(wl_resource_get_user_data(callback));
+    if (surface != nullptr) {
+        surface->forget_frame_callback(callback);
+    }
+}
+} // namespace
+
+void Surface::add_frame_callback(wl_resource* callback) {
+    if (callback == nullptr) {
+        return;
+    }
+    // wl_callback has no requests, but installing an implementation gives the
+    // resource a destroy hook. This is the same lifetime boundary as a buffer
+    // destroy listener: the client owns the resource and may disappear first.
+    wl_resource_set_implementation(callback, nullptr, this, frame_callback_resource_destroy);
+    pending_.frame_callbacks.push_back(callback);
+}
+
+void Surface::forget_frame_callback(wl_resource* callback) noexcept {
+    std::erase(pending_.frame_callbacks, callback);
+    std::erase(cached_.frame_callbacks, callback);
+    std::erase(queued_frame_callbacks_, callback);
+}
+
+namespace {
 // Buffer extent without decoding pixels: shm knows it directly, dmabuf carries
 // it in the plane metadata. Used for hit-testing and subsurface layout.
 void buffer_size(wl_resource* buffer, int& w, int& h) {
@@ -914,11 +944,14 @@ bool Surface::accepts_input(double sx, double sy) const noexcept {
 }
 
 void Surface::send_frame_done(std::uint32_t time_ms) {
-    for (wl_resource* cb : queued_frame_callbacks_) {
+    // Destroying a callback invokes forget_frame_callback(), so iterate a local
+    // snapshot rather than a vector the destroy hook mutates under this loop.
+    std::vector<wl_resource*> callbacks = std::move(queued_frame_callbacks_);
+    queued_frame_callbacks_.clear();
+    for (wl_resource* cb : callbacks) {
         wl_callback_send_done(cb, time_ms);
         wl_resource_destroy(cb);
     }
-    queued_frame_callbacks_.clear();
 }
 
 Surface::Surface(wl_resource* resource) noexcept : resource_(resource), id_(register_surface(this)) {}
@@ -928,10 +961,17 @@ Surface::~Surface() {
     destroy.emit(event);
     // Callbacks the client is still waiting on will never fire; the protocol
     // says to destroy them rather than leave the client hanging.
-    for (wl_resource* cb : queued_frame_callbacks_) {
+    std::vector<wl_resource*> callbacks = std::move(pending_.frame_callbacks);
+    callbacks.insert(callbacks.end(), cached_.frame_callbacks.begin(),
+                     cached_.frame_callbacks.end());
+    callbacks.insert(callbacks.end(), queued_frame_callbacks_.begin(),
+                     queued_frame_callbacks_.end());
+    pending_.frame_callbacks.clear();
+    cached_.frame_callbacks.clear();
+    queued_frame_callbacks_.clear();
+    for (wl_resource* cb : callbacks) {
         wl_resource_destroy(cb);
     }
-    queued_frame_callbacks_.clear();
     // Orphan our children and unlink from our parent so no dangling edges remain.
     for (Surface* child : below_) {
         child->parent_ = nullptr;

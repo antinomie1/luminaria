@@ -125,9 +125,10 @@ cat <<EOF
     1. 看背景色出来（深蓝灰 #1a1a21），指针能动
     2. ${CLIENT:-（未启动客户端，自己开一个）} 会自动连上 —— 确认窗口画出来了
     3. 指针移到窗口上，滚一下滚轮，按几下 Shift / 字母键
-    4. 有第二台显示器的话，插拔一次
-    5. Ctrl+Alt+F1 切走，再 Ctrl+Alt+F$(fgconsole 2>/dev/null || echo N) 切回来
-    6. 按 Esc 退出
+    4. 打开标题栏菜单，测试最大化/还原；最小化或关闭放在最后
+    5. 有第二台显示器的话，插拔一次
+    6. Ctrl+Alt+F1 切走，再 Ctrl+Alt+F$(fgconsole 2>/dev/null || echo N) 切回来
+    7. 按 Esc 退出
 
   卡死的话：切到别的 VT，pkill luminaria-tty。
 
@@ -140,12 +141,13 @@ fi
 read -rp "  准备好了按回车开始…" _ || true
 
 # ------------------------------------------------------------------ 跑
-# 客户端在混成器打印出 socket 名之后才启动 —— 从日志里读那一行，比 sleep 可靠。
+# 客户端在 socket 和第一个 wl_output 都就绪后才启动。只等 socket 会让 Qt 在
+# drm->start() 发布输出前完成 registry roundtrip，随后只能造一个 placeholder screen。
 if [[ -n "$CLIENT" ]]; then
     (
         for _ in $(seq 1 100); do
             sock="$(grep -m1 -o 'WAYLAND_DISPLAY=[^ ]*' "$RUN_LOG" 2>/dev/null | head -1 | cut -d= -f2)"
-            if [[ -n "$sock" ]]; then
+            if [[ -n "$sock" ]] && grep -q 'luminaria-tty: output [0-9]' "$RUN_LOG" 2>/dev/null; then
                 export WAYLAND_DISPLAY="$sock"
                 export QT_QPA_PLATFORM=wayland GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
                 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -269,7 +271,8 @@ if [[ "$OUTPUT_COUNT" -gt 0 ]]; then
 fi
 
 if grep -q 'input devices:' "$RUN_LOG"; then
-    row "libinput 设备" "OK" "$(grep -m1 'input devices:' "$RUN_LOG" | sed 's/^[0-9:]* //')"
+    # 热插拔会先报告 pointer=no 再报告 pointer=yes；最终状态才是本次验证结果。
+    row "libinput 设备" "OK" "$(grep 'input devices:' "$RUN_LOG" | tail -1 | sed 's/^[0-9:]* //')"
 else
     row "libinput 设备" "**没有设备**" "没有 input devices 行"
 fi

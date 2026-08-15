@@ -104,7 +104,10 @@ void run_client(int fd) {
     // Logical: 800x600 rotated is 600x800, halved by the scale.
     assert(st.logical_w == 300 && st.logical_h == 400);
     assert(st.logical_x == 100 && st.logical_y == 50);
-    assert(st.dones > 0);
+    // One done closes wl_output's initial state; xdg-output v3 requires a
+    // second wl_output.done after its logical position/size batch. Qt does not
+    // promote a placeholder screen without that second barrier.
+    assert(st.dones >= 2);
 
     wl_display_disconnect(display);
 }

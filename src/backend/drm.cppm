@@ -29,6 +29,7 @@ module;
 #include <string>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -282,6 +283,8 @@ public:
     bool suspended = false; // the VT belongs to someone else right now
     bool tearing = false; // wp_tearing_control_v1: flip without waiting for vblank
     UniqueFd present_fence; // OUT_FENCE_PTR from the last commit, owned until taken
+    bool cursor_dirty = false; // desired cursor state still has to reach KMS
+    EventSource retry_timer;   // a rejected primary commit must not stop the frame pump
 
     /// Nominal frame duration in nanoseconds, straight from the mode timings.
     [[nodiscard]] uint32_t refresh_ns() const noexcept { return mode_refresh_ns(mode); }
@@ -416,10 +419,18 @@ public:
 
     void set_tearing(bool async) override { tearing = async; }
 
-    DrmOutput(int fd, uint32_t crtc, uint32_t connector, uint32_t plane,
+    DrmOutput(EventLoop loop, int fd, uint32_t crtc, uint32_t connector, uint32_t plane,
               const drmModeModeInfo& mode)
         : Output(mode.hdisplay, mode.vdisplay), fd(fd), crtc_id(crtc), connector_id(connector),
-          plane_id(plane), connector_crtc_id_prop(0), mode(mode) {}
+          plane_id(plane), connector_crtc_id_prop(0), mode(mode) {
+        retry_timer = loop.add_timer([this] {
+            if (suspended || flip_pending) {
+                return;
+            }
+            FrameEvent event{*this};
+            frame.emit(event);
+        });
+    }
 
     ~DrmOutput() override {
         if (saved_crtc) {
@@ -505,6 +516,39 @@ public:
         add(plane_id, plane_props.crtc_w, static_cast<uint64_t>(width_));
         add(plane_id, plane_props.crtc_h, static_cast<uint64_t>(height_));
 
+        // Cursor updates are folded into the next primary-plane flip. A
+        // blocking cursor-only atomic commit waits for vblank on some drivers;
+        // doing one for every libinput motion event therefore builds an input
+        // backlog and makes the pointer visibly lag. Keeping both planes in one
+        // request also means they can never race each other on the same CRTC.
+        if (cursor_dirty && has_cursor_plane()) {
+            auto add_cursor = [&](uint32_t prop, uint64_t value) {
+                drmModeAtomicAddProperty(req.get(), cursor.plane_id, prop, value);
+            };
+            if (!cursor.visible) {
+                add_cursor(cursor.props.fb_id, 0);
+                add_cursor(cursor.props.crtc_id, 0);
+            } else {
+                const Box logical{cursor.x - cursor.hotspot_x, cursor.y - cursor.hotspot_y,
+                                  cursor.width, cursor.height};
+                const Box dev = to_device(logical);
+                add_cursor(cursor.props.fb_id, cursor.fb.fb_id);
+                add_cursor(cursor.props.crtc_id, crtc_id);
+                add_cursor(cursor.props.src_x, 0);
+                add_cursor(cursor.props.src_y, 0);
+                add_cursor(cursor.props.src_w,
+                           static_cast<uint64_t>(cursor.width) << 16);
+                add_cursor(cursor.props.src_h,
+                           static_cast<uint64_t>(cursor.height) << 16);
+                add_cursor(cursor.props.crtc_x,
+                           static_cast<uint64_t>(static_cast<int64_t>(dev.x)));
+                add_cursor(cursor.props.crtc_y,
+                           static_cast<uint64_t>(static_cast<int64_t>(dev.y)));
+                add_cursor(cursor.props.crtc_w, static_cast<uint64_t>(dev.width));
+                add_cursor(cursor.props.crtc_h, static_cast<uint64_t>(dev.height));
+            }
+        }
+
         uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT;
         if (modeset) {
             flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
@@ -519,13 +563,16 @@ public:
         // The out-fence is only an fd once the ioctl has written the slot.
         UniqueFd out_fence{out_fence_slot};
         if (rc != 0) {
-            return fail("drm: drmModeAtomicCommit failed");
+            const int error = errno;
+            return fail(std::string{"drm: drmModeAtomicCommit failed: "} +
+                        std::strerror(error));
         }
         if (out_fence) {
             present_fence = std::move(out_fence); // drops one nobody took
         }
         pending_fb = fb_id;
         flip_pending = true;
+        cursor_dirty = false;
         return ok();
     }
 
@@ -540,6 +587,8 @@ public:
         if (s) {
             front = back;
             modeset_done = true;
+        } else {
+            retry_timer.arm(16);
         }
         return s;
     }
@@ -566,6 +615,8 @@ public:
         if (s) {
             front = back;
             modeset_done = true;
+        } else {
+            retry_timer.arm(16);
         }
         return s;
     }
@@ -666,45 +717,18 @@ public:
         return cursor.plane_id != 0 && cursor.fb.map != nullptr;
     }
 
-    /// One atomic commit that touches only the cursor plane. Deliberately
-    /// separate from the frame commit: the pointer moves far more often than
-    /// the screen behind it changes, and this way it costs no repaint at all.
+    /// Queue the latest cursor state for the next primary-plane atomic commit.
+    /// The one-shot timer starts a frame when the display is otherwise idle;
+    /// while a flip is pending its completion already starts that next frame.
     Status commit_cursor() {
         if (suspended || !has_cursor_plane()) {
             return ok();
         }
-        drmModeAtomicReq* req = drmModeAtomicAlloc();
-        if (req == nullptr) {
-            return fail("drm: drmModeAtomicAlloc failed");
+        cursor_dirty = true;
+        if (modeset_done && !flip_pending) {
+            retry_timer.arm(1);
         }
-        auto add = [&](uint32_t prop, uint64_t value) {
-            drmModeAtomicAddProperty(req, cursor.plane_id, prop, value);
-        };
-        if (!cursor.visible) {
-            add(cursor.props.fb_id, 0);
-            add(cursor.props.crtc_id, 0);
-        } else {
-            // The hotspot is what tracks the pointer, so the plane's top-left
-            // sits that far up and to the left of it.
-            const Box logical{cursor.x - cursor.hotspot_x, cursor.y - cursor.hotspot_y,
-                              cursor.width, cursor.height};
-            const Box dev = to_device(logical);
-            add(cursor.props.fb_id, cursor.fb.fb_id);
-            add(cursor.props.crtc_id, crtc_id);
-            add(cursor.props.src_x, 0);
-            add(cursor.props.src_y, 0);
-            add(cursor.props.src_w, static_cast<uint64_t>(cursor.width) << 16);
-            add(cursor.props.src_h, static_cast<uint64_t>(cursor.height) << 16);
-            add(cursor.props.crtc_x, static_cast<uint64_t>(static_cast<int64_t>(dev.x)));
-            add(cursor.props.crtc_y, static_cast<uint64_t>(static_cast<int64_t>(dev.y)));
-            add(cursor.props.crtc_w, static_cast<uint64_t>(dev.width));
-            add(cursor.props.crtc_h, static_cast<uint64_t>(dev.height));
-        }
-        // No page-flip event: this commit owes us nothing, and asking for one
-        // would confuse the frame pump.
-        const int rc = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_NONBLOCK, nullptr);
-        drmModeAtomicFree(req);
-        return rc == 0 ? ok() : fail("drm: cursor atomic commit failed");
+        return ok();
     }
 
     Status set_cursor(std::span<const std::uint8_t> rgba, int width, int height, int hotspot_x,
@@ -774,6 +798,8 @@ public:
         if (s) {
             modeset_done = true;
             reap_retired(); // whatever this frame replaced is now free to go
+        } else {
+            retry_timer.arm(16);
         }
         return s;
     }
@@ -989,7 +1015,8 @@ struct DrmBackend::Impl {
             return nullptr;
         }
         const drmModeModeInfo mode = connector->modes[0]; // preferred mode first
-        auto out = std::make_unique<DrmOutput>(fd, crtc_id, connector->connector_id, plane_id, mode);
+        auto out = std::make_unique<DrmOutput>(loop, fd, crtc_id, connector->connector_id,
+                                               plane_id, mode);
         // The connector is freed by the caller, so the mode list is copied out
         // rather than pointed at. It is what set_mode() matches against.
         out->available_modes.assign(connector->modes, connector->modes + connector->count_modes);
@@ -1133,6 +1160,11 @@ Status DrmBackend::start() {
             impl_->session->activity().connect([this](SessionActive& event) {
                 for (auto& out : impl_->outputs) {
                     out->suspended = !event.active;
+                    if (!event.active) {
+                        // The next session may replace every plane. Re-apply
+                        // our desired cursor after the modeset on return.
+                        out->cursor_dirty = true;
+                    }
                 }
                 if (!event.active) {
                     drmDropMaster(impl_->fd);

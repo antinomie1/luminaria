@@ -40,6 +40,7 @@ struct ClientState {
     bool cfg_activated = false;
     int bounds_w = -1, bounds_h = -1;
     bool got_wm_capabilities = false;
+    bool can_minimize = false;
     bool got_close = false;
 };
 
@@ -93,8 +94,15 @@ void toplevel_configure_bounds(void* data, xdg_toplevel*, int32_t width, int32_t
     st->bounds_w = width;
     st->bounds_h = height;
 }
-void toplevel_wm_capabilities(void* data, xdg_toplevel*, wl_array*) {
-    static_cast<ClientState*>(data)->got_wm_capabilities = true;
+void toplevel_wm_capabilities(void* data, xdg_toplevel*, wl_array* capabilities) {
+    auto* st = static_cast<ClientState*>(data);
+    st->got_wm_capabilities = true;
+    const auto* first = static_cast<const uint32_t*>(capabilities->data);
+    const size_t count = capabilities->size / sizeof(uint32_t);
+    for (size_t i = 0; i < count; ++i) {
+        st->can_minimize = st->can_minimize ||
+                           first[i] == XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE;
+    }
 }
 const xdg_toplevel_listener kToplevelListener{toplevel_configure, toplevel_close,
                                               toplevel_configure_bounds,
@@ -153,6 +161,8 @@ void run_client(int fd) {
         xdg_toplevel_set_maximized(toplevel); // the compositor decides
         wl_display_roundtrip(display);
         wl_display_roundtrip(display); // the answering configure arrives
+        xdg_toplevel_set_minimized(toplevel);
+        wl_display_roundtrip(display);
     }
     wl_display_disconnect(display);
 }
@@ -186,9 +196,11 @@ int main() {
     int seen_min_w = -1, seen_min_h = -1, seen_max_w = -1, seen_max_h = -1;
     luminaria::XdgGeometry seen_geometry{};
     bool saw_maximize_request = false;
+    bool saw_minimize_request = false;
     bool server_thinks_maximized = false;
     std::vector<luminaria::Signal<luminaria::ToplevelMap>::Connection> map_conns;
     std::vector<luminaria::Signal<luminaria::ToplevelRequestMaximize>::Connection> max_conns;
+    std::vector<luminaria::Signal<luminaria::ToplevelRequestMinimize>::Connection> min_conns;
 
     auto nt = shell->new_toplevel().connect([&](luminaria::NewToplevel& e) {
         luminaria::Toplevel* tl = &e.toplevel;
@@ -201,6 +213,7 @@ int main() {
             seen_max_h = tl->max_height();
             seen_geometry = tl->geometry();
             tl->set_activated(true);
+            tl->close();
         }));
         max_conns.push_back(
             tl->request_maximize.connect([&, tl](luminaria::ToplevelRequestMaximize& ev) {
@@ -209,6 +222,11 @@ int main() {
                 tl->set_maximized(ev.maximized);
                 (void)tl->configure(kBoundsW, kBoundsH);
                 server_thinks_maximized = tl->is_maximized();
+            }));
+        min_conns.push_back(tl->request_minimize.connect(
+            [&, tl](luminaria::ToplevelRequestMinimize&) {
+                saw_minimize_request = true;
+                tl->set_minimized(true);
             }));
     });
 
@@ -236,8 +254,11 @@ int main() {
 
     assert(g_client.bounds_w == kBoundsW && g_client.bounds_h == kBoundsH);
     assert(g_client.got_wm_capabilities);
+    assert(g_client.can_minimize);
     assert(g_client.last_cfg_w == kBoundsW && g_client.last_cfg_h == kBoundsH);
     assert(g_client.cfg_maximized);
     assert(g_client.cfg_activated);
+    assert(g_client.got_close);
+    assert(saw_minimize_request);
     return 0;
 }

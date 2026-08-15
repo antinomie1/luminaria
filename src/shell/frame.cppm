@@ -581,6 +581,15 @@ Result<Presented> Frame::submit(Color background) {
     impl.fills.clear();
     impl.drawn.clear();
     impl.damage.clear();
+    // A forced redraw is not only about the target selected this frame. Every
+    // other buffer in the rotation still contains the old scene and must carry
+    // a full-output debt until it comes round. Without recording this box,
+    // closing a window alternates between the cleared target and a stale target
+    // for one cycle — seen as the destroyed rectangle flickering back.
+    if (impl.full_redraw) {
+        impl.damage.push_back(
+            Box{0, 0, output.logical_width(), output.logical_height()});
+    }
     impl.acquire_fences.clear();
     impl.fill_opaque.clear();
     // The fills hold spans into this, so it must not reallocate while they are
