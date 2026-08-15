@@ -230,8 +230,17 @@ calls `clear_damage()`.
   use a pimpl (`struct Impl` declared public, defined below the implementation divider) so their address is stable for the
   `wl_global` user-data pointer, while the wrapper stays move-only.
 - **Lifetime via RAII, never manual list surgery.** `Signal<E>::Connection` disconnects on
-  destruction and survives either destruction order; C handles are wrapped in `CUnique<T, fn>`.
+  destruction and survives either destruction order; C handles are wrapped in `CUnique<T, fn>`
+  and owned fds in `UniqueFd` (both in `core/handle.cppm`).
   There should be no `wl_list_remove` calls in compositor code.
+- **An owned fd is a `UniqueFd`; a borrowed one is an `int`.** This is the rule that stops
+  the leaks fence plumbing used to grow: `DrmOutput::atomic()` had four separate `close()`
+  calls for one in-fence, one per early return, and the next early return would have got
+  none. A member that owns an fd (`Surface::acquire_fence_`, `ScanoutTarget::Impl::acquire_fence`,
+  `DrmOutput::present_fence`) holds a `UniqueFd`; a function that takes ownership takes one
+  by value. The exported signatures stay `int` — `set_acquire_fence(int)`,
+  `commit_scanout(id, int)`, `take_present_fence()` — because they are the C boundary, and
+  the implementation wraps or `release()`s on the first line.
 - **Null request slots abort libwayland.** Real GTK/Qt clients call requests we haven't
   implemented, and libwayland aborts on a null slot — so unimplemented requests are wired to
   explicit no-op functions (`surface_noop_*` in `compositor.cppm`, `tl_set_parent` /

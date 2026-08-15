@@ -32,6 +32,7 @@ import :box;
 import :color;
 import :dmabuf;
 import :expected;
+import :handle;
 import :pixel;
 import :rect_fill;
 import :region;
@@ -1137,9 +1138,9 @@ struct ScanoutTarget::Impl {
     vk::raii::DeviceMemory memory;
     vk::raii::ImageView view;
     vk::Format format;
-    DmabufPlane plane;          // plane.fd is owned here
-    bool has_content = false;   // false until the first full render
-    int acquire_fence = -1;     // sync_file from the flip still scanning us out
+    DmabufPlane plane;        // plane.fd is owned here
+    bool has_content = false; // false until the first full render
+    UniqueFd acquire_fence;   // sync_file from the flip still scanning us out
 
     // Staging buffer for read_scanout(), created on first use and kept. It is
     // mapped once and stays mapped: re-creating and re-mapping it per frame was
@@ -1152,9 +1153,6 @@ struct ScanoutTarget::Impl {
     ~Impl() {
         if (plane.fd >= 0) {
             close(plane.fd);
-        }
-        if (acquire_fence >= 0) {
-            close(acquire_fence);
         }
     }
 };
@@ -1177,10 +1175,7 @@ ScanoutTarget& ScanoutTarget::operator=(ScanoutTarget&&) noexcept = default;
 const DmabufPlane& ScanoutTarget::plane() const noexcept { return impl_->plane; }
 
 void ScanoutTarget::set_acquire_fence(int fd) noexcept {
-    if (impl_->acquire_fence >= 0) {
-        close(impl_->acquire_fence);
-    }
-    impl_->acquire_fence = fd;
+    impl_->acquire_fence.reset(fd);
 }
 
 Status VulkanRenderer::read_scanout(ScanoutTarget& target, std::vector<std::uint8_t>& out) {
@@ -1664,7 +1659,8 @@ Result<ScanoutTarget> VulkanRenderer::create_scanout(int width, int height,
         // which costs it the implicit move constructor.
         return ScanoutTarget{std::unique_ptr<ScanoutTarget::Impl>(
             new ScanoutTarget::Impl{std::move(image), std::move(memory), std::move(view), fmt,
-                                    plane, false, -1, std::nullopt, std::nullopt, nullptr, true})};
+                                    plane, false, UniqueFd{}, std::nullopt, std::nullopt, nullptr,
+                                    true})};
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan scanout alloc: "} + e.what());
     }
@@ -1932,7 +1928,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         for (int fd : sync.wait_fds) {
             add_wait(fd);
         }
-        add_wait(t.acquire_fence);
+        add_wait(t.acquire_fence.get());
 
         const bool want_out_fence = sync.out_fence_fd != nullptr && impl_->sync_fd_ok;
         std::optional<vk::raii::Semaphore> out_sem;
@@ -1960,10 +1956,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
 
         // The waits consumed the target's fence; a stale one must not be waited
         // on twice.
-        if (t.acquire_fence >= 0) {
-            close(t.acquire_fence);
-            t.acquire_fence = -1;
-        }
+        t.acquire_fence.reset();
         t.has_content = true;
 
         if (out_sem.has_value()) {

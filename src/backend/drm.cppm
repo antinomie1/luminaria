@@ -50,6 +50,7 @@ import :color;
 import :dmabuf;
 import :event_loop;
 import :expected;
+import :handle;
 import :output;
 import :pixel;
 import :session;
@@ -279,7 +280,7 @@ public:
     bool flip_pending = false;
     bool suspended = false; // the VT belongs to someone else right now
     bool tearing = false; // wp_tearing_control_v1: flip without waiting for vblank
-    int present_fence = -1; // OUT_FENCE_PTR from the last commit, owned until taken
+    UniqueFd present_fence; // OUT_FENCE_PTR from the last commit, owned until taken
 
     /// Nominal frame duration in nanoseconds, straight from the mode timings.
     [[nodiscard]] uint32_t refresh_ns() const noexcept { return mode_refresh_ns(mode); }
@@ -437,16 +438,9 @@ public:
         if (mode_blob != 0) {
             drmModeDestroyPropertyBlob(fd, mode_blob);
         }
-        if (present_fence >= 0) {
-            close(present_fence);
-        }
     }
 
-    int take_present_fence() noexcept override {
-        const int fd_out = present_fence;
-        present_fence = -1;
-        return fd_out;
-    }
+    int take_present_fence() noexcept override { return present_fence.release(); }
 
     void fill(DumbFb& fb, Color color) {
         const uint32_t pixel = (static_cast<uint32_t>(clamp8(color.r)) << 16) |
@@ -464,37 +458,34 @@ public:
     /// modeset. `modeset` commits synchronously; every later frame is a
     /// non-blocking flip that reports back through the page-flip event.
     ///
-    /// `in_fence_fd` (owned by this call) is the GPU's "the frame is drawn"
+    /// `in_fence` (taken by this call) is the GPU's "the frame is drawn"
     /// fence. Handing it to KMS is the last CPU stall removed from the pipeline:
     /// we commit while the GPU is still rendering, and the display engine holds
     /// the flip until the fence signals. OUT_FENCE_PTR comes back the other way,
     /// signalling when this frame lands and the buffer it replaces is free.
-    Status atomic(uint32_t fb_id, bool modeset, int in_fence_fd = -1) {
+    ///
+    /// Both fences and the request are RAII, so every early return below just
+    /// returns — there is no cleanup to forget on a path added later.
+    Status atomic(uint32_t fb_id, bool modeset, UniqueFd in_fence = {}) {
         if (suspended) {
             // Another VT owns the display; every ioctl would fail with EACCES.
             // Dropping the frame is right — nobody can see it anyway.
-            if (in_fence_fd >= 0) {
-                close(in_fence_fd);
-            }
             return ok();
         }
-        drmModeAtomicReq* req = drmModeAtomicAlloc();
-        if (req == nullptr) {
-            if (in_fence_fd >= 0) {
-                close(in_fence_fd);
-            }
+        CUnique<drmModeAtomicReq, drmModeAtomicFree> req{drmModeAtomicAlloc()};
+        if (!req) {
             return fail("drm: drmModeAtomicAlloc failed");
         }
         auto add = [&](uint32_t obj, uint32_t prop, uint64_t value) {
-            drmModeAtomicAddProperty(req, obj, prop, value);
+            drmModeAtomicAddProperty(req.get(), obj, prop, value);
         };
         if (modeset) {
             add(connector_id, connector_crtc_id_prop, crtc_id);
             add(crtc_id, crtc_props.mode_id, mode_blob);
             add(crtc_id, crtc_props.active, 1);
         }
-        if (in_fence_fd >= 0 && plane_props.in_fence_fd != 0) {
-            add(plane_id, plane_props.in_fence_fd, static_cast<uint64_t>(in_fence_fd));
+        if (in_fence && plane_props.in_fence_fd != 0) {
+            add(plane_id, plane_props.in_fence_fd, static_cast<uint64_t>(in_fence.get()));
         }
         // A torn flip has no defined "on screen" moment, so don't ask for one.
         int32_t out_fence_slot = -1;
@@ -523,23 +514,15 @@ public:
                 flags |= DRM_MODE_PAGE_FLIP_ASYNC;
             }
         }
-        const int rc = drmModeAtomicCommit(fd, req, flags, this);
-        drmModeAtomicFree(req);
-        // KMS took a reference to the fence; the fd itself stays ours to close.
-        if (in_fence_fd >= 0) {
-            close(in_fence_fd);
-        }
+        const int rc = drmModeAtomicCommit(fd, req.get(), flags, this);
+        // KMS took its own reference to the in-fence; ours dies with this scope.
+        // The out-fence is only an fd once the ioctl has written the slot.
+        UniqueFd out_fence{out_fence_slot};
         if (rc != 0) {
-            if (out_fence_slot >= 0) {
-                close(out_fence_slot);
-            }
             return fail("drm: drmModeAtomicCommit failed");
         }
-        if (out_fence_slot >= 0) {
-            if (present_fence >= 0) {
-                close(present_fence); // nobody took the previous one
-            }
-            present_fence = out_fence_slot;
+        if (out_fence) {
+            present_fence = std::move(out_fence); // drops one nobody took
         }
         pending_fb = fb_id;
         flip_pending = true;
@@ -778,20 +761,17 @@ public:
     }
 
     Status commit_scanout(std::uint32_t id, int in_fence_fd) override {
+        // The Output contract hands ownership of the fd over; take it right
+        // away so the two early returns below cannot drop it.
+        UniqueFd in_fence{in_fence_fd};
         if (std::none_of(imported.begin(), imported.end(),
                          [id](const ImportedFb& fb) { return fb.fb_id == id; })) {
-            if (in_fence_fd >= 0) {
-                close(in_fence_fd);
-            }
             return fail("drm: unknown scanout buffer");
         }
         if (flip_pending) {
-            if (in_fence_fd >= 0) {
-                close(in_fence_fd);
-            }
             return ok();
         }
-        const Status s = atomic(id, !modeset_done, in_fence_fd);
+        const Status s = atomic(id, !modeset_done, std::move(in_fence));
         if (s) {
             modeset_done = true;
             reap_retired(); // whatever this frame replaced is now free to go

@@ -30,6 +30,7 @@ import :box;
 import :display;
 import :dmabuf;
 import :expected;
+import :handle;
 import :linux_dmabuf;
 import :region;
 import :signal;
@@ -160,7 +161,7 @@ public:
     /// A sync_file the GPU must wait on before sampling this surface's buffer,
     /// or -1. Borrowed: valid until the next commit, never close it. Feed it to
     /// VulkanRenderer::render_to so nothing blocks on the CPU.
-    [[nodiscard]] int acquire_fence_fd() const noexcept { return acquire_fence_; }
+    [[nodiscard]] int acquire_fence_fd() const noexcept { return acquire_fence_.get(); }
     /// Called by the linux-drm-syncobj glue on commit; takes ownership of `fd`.
     void set_acquire_fence(int fd) noexcept;
     /// Called by the compositor once the render sampling this surface has been
@@ -362,7 +363,7 @@ private:
     std::vector<wl_resource*> held_buffers_;
     std::vector<wl_resource*> release_due_;
     int offset_x_ = 0, offset_y_ = 0;
-    int acquire_fence_ = -1; // sync_file, owned
+    UniqueFd acquire_fence_; // sync_file, owned
 
     // GPU texture cache. `texture_live_` marks a dmabuf import, which reads the
     // client's memory directly and so stays valid across commits; an upload is
@@ -729,10 +730,7 @@ void Surface::set_pending_viewport_destination(int w, int h) {
 }
 
 void Surface::set_acquire_fence(int fd) noexcept {
-    if (acquire_fence_ >= 0) {
-        close(acquire_fence_);
-    }
-    acquire_fence_ = fd;
+    acquire_fence_.reset(fd);
 }
 
 void Surface::notify_rendered(int fence_fd) {
@@ -875,10 +873,6 @@ Surface::~Surface() {
         wl_resource_destroy(cb);
     }
     queued_frame_callbacks_.clear();
-    if (acquire_fence_ >= 0) {
-        close(acquire_fence_);
-        acquire_fence_ = -1;
-    }
     // Orphan our children and unlink from our parent so no dangling edges remain.
     for (Surface* child : below_) {
         child->parent_ = nullptr;
