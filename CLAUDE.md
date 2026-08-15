@@ -49,8 +49,8 @@ output names (`mesonbuild/scripts/depscan.py`), so ninja dies with "inputs may n
 inputs" on GCC. xmake scans and orders module units correctly for GCC; that is the whole
 reason for the switch.
 
-Generated code (`wayland-scanner` glue, SPIR-V arrays) lands in `build/generated/` at
-configure time and is regenerated only when its input is newer.
+Generated code lands in `build/generated/`: protocol glue is refreshed at configure time;
+shader SPIR-V is also freshness-checked before every GPU build.
 
 ## Modules
 

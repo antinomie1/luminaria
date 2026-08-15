@@ -30,6 +30,19 @@ export module luminaria.gpu:vulkan;
 
 import luminaria;
 
+// Not exported: the innards of whatever a render pass draws into. A scanout
+// target and an offscreen target differ in exactly one thing — who holds the
+// image between passes, the display engine or us — so the pass is written once
+// against this and the two entry points fill it in.
+//
+// At namespace scope rather than in an anonymous namespace because a
+// module-linkage member function names it, and a module-linkage declaration may
+// not name a TU-local type. Unexported all the same, so it stays private to the
+// module.
+namespace luminaria {
+struct VulkanRenderTarget;
+} // namespace luminaria
+
 export namespace luminaria {
 
 /// A surface's pixels placed at (x,y). `rgba` is w*h*4 tightly-packed RGBA8.
@@ -91,6 +104,47 @@ private:
     explicit ScanoutTarget(std::unique_ptr<Impl> impl) noexcept;
 };
 
+/// A GPU image that is rendered into and then sampled — the intermediate a
+/// window becomes when an effect applies to the whole of it rather than to each
+/// of its surfaces. See docs/adr/0005.
+///
+/// A toplevel is a tree: the parent, its subsurfaces, and the popups hanging off
+/// it. Fading that window out by drawing each of those at half opacity is wrong
+/// wherever two of them overlap — the overlap is blended twice and shows as a
+/// seam that brightens with every layer. Rounding the window's corners cannot be
+/// done one surface at a time either, because a surface does not know whether it
+/// is at a corner of the window. So the tree is composited in here first, as it
+/// is, and the result is drawn back as ONE quad with the effect applied to that.
+///
+/// It costs a second render pass and an image the size of the window, so nothing
+/// takes this path by default, and the targets must be cached and reused rather
+/// than allocated per frame. Move-only, and it must not outlive the
+/// VulkanRenderer that made it.
+class OffscreenTarget {
+public:
+    ~OffscreenTarget();
+    OffscreenTarget(OffscreenTarget&&) noexcept;
+    OffscreenTarget& operator=(OffscreenTarget&&) noexcept;
+    OffscreenTarget(const OffscreenTarget&) = delete;
+    OffscreenTarget& operator=(const OffscreenTarget&) = delete;
+
+    /// The composited result, ready to be a `GpuTextureFill::texture` in the
+    /// pass that draws it onto the output. The same texture for the life of the
+    /// target — each `render_offscreen()` replaces its contents in place, so the
+    /// descriptor set it caches stays valid.
+    [[nodiscard]] const GpuTexture& texture() const noexcept;
+
+    [[nodiscard]] int width() const noexcept;
+    [[nodiscard]] int height() const noexcept;
+
+    struct Impl;
+
+private:
+    friend class VulkanRenderer;
+    std::unique_ptr<Impl> impl_;
+    explicit OffscreenTarget(std::unique_ptr<Impl> impl) noexcept;
+};
+
 /// A GpuTexture stretched into the destination rect (x,y,w,h), in the output's
 /// LOGICAL coordinates — the renderer applies scale and rotation.
 struct GpuTextureFill {
@@ -120,6 +174,20 @@ struct GpuTextureFill {
     /// Source crop, normalized against the BUFFER (before `transform`).
     /// Defaults to the whole texture; wp_viewporter narrows it.
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+
+    /// Whole-quad opacity, multiplied into the sample. 1.0 draws the texture as
+    /// it is.
+    ///
+    /// Applying this to each surface of a window separately is NOT how a window
+    /// is faded out: two overlapping surfaces would be blended twice and the
+    /// overlap would come out brighter. Composite the window into an
+    /// `OffscreenTarget` at full opacity and put the alpha on the single quad
+    /// that draws the result — see docs/adr/0005.
+    ///
+    /// Anything below 1.0 also makes `opaque` a lie. A translucent quad hides
+    /// nothing, so leave that empty, or the occlusion pass will cull what should
+    /// be showing through.
+    float alpha = 1.0f;
 };
 
 /// How an output's logical coordinates map onto its framebuffer: the integer
@@ -230,6 +298,38 @@ public:
                                    const OutputMapping& mapping = {},
                                    const RenderSync& sync = {});
 
+    // --- offscreen composition (ADR 0005) ---
+
+    /// Allocate an offscreen target `width`x`height` pixels, with an alpha
+    /// channel: a window composited here is transparent wherever its surfaces
+    /// did not reach, and stays transparent when it is drawn onto the output.
+    ///
+    /// Allocate it once per window and keep it — a target per window per frame
+    /// would undo the steady-state zero-allocation property the rest of this
+    /// renderer is built for. Rebuild it when the window's size changes.
+    [[nodiscard]] Result<OffscreenTarget> create_offscreen(int width, int height);
+
+    /// Composite into an offscreen target instead of onto a display. Everything
+    /// works as `render_to`, with two differences.
+    ///
+    /// There is no `OutputMapping`: an offscreen image is its own pixel space,
+    /// and the scale and rotation of whatever output it lands on are applied
+    /// when it is drawn there — once, to the finished window, rather than to
+    /// each of its surfaces, which is half the reason for compositing it here.
+    ///
+    /// And it is left ready to be sampled rather than handed to a display
+    /// engine, in the very layout `render_to` expects of a source texture, so
+    /// `texture()` goes straight into the next pass with nothing in between.
+    ///
+    /// `background` is normally fully transparent. What is composited here is a
+    /// window and not a screen: the pixels it does not cover have to let the
+    /// wallpaper through once it is drawn.
+    [[nodiscard]] Status render_offscreen(OffscreenTarget& target, Color background,
+                                          std::span<const RectFill> rects,
+                                          std::span<const GpuTextureFill> textures,
+                                          std::span<const Box> damage = {},
+                                          const RenderSync& sync = {});
+
     // --- linux-dmabuf import/export (any DRM modifier the GPU supports) ---
 
     /// True if the device exposes the external-memory-dmabuf + DRM-modifier
@@ -274,6 +374,16 @@ private:
     // A GpuTexture caches a descriptor set the renderer owns, and hands it back
     // when it dies; that needs to name the renderer's Impl.
     friend class GpuTexture;
+
+    /// The one render pass, written once for both destinations. A member and not
+    /// a free function because it reaches into GpuTexture's innards, and the
+    /// friendship above is what makes that legal.
+    [[nodiscard]] Status render_pass_to(VulkanRenderTarget& target, Color background,
+                                        std::span<const RectFill> rects,
+                                        std::span<const GpuTextureFill> textures,
+                                        std::span<const Box> damage,
+                                        const OutputMapping& mapping, const RenderSync& sync);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit VulkanRenderer(std::unique_ptr<Impl> impl) noexcept;
@@ -1215,6 +1325,25 @@ struct GpuTexture::Impl {
     mutable VulkanRenderer::Impl* owner = nullptr;
 };
 
+// Whatever the one render pass draws into, by reference. Everything here is
+// borrowed from the target that owns it and lives only for the call.
+struct VulkanRenderTarget {
+    vk::Image image;
+    vk::ImageView view;
+    vk::Format format;
+    int width;  // device pixels
+    int height; // device pixels
+    bool* has_content;
+    std::optional<vk::raii::Framebuffer>* fb_load;
+    std::optional<vk::raii::Framebuffer>* fb_clear;
+    UniqueFd* acquire_fence;
+    /// True: the image is handed to and taken back from the display engine, so
+    /// it crosses the foreign queue and rests in eGeneral between passes. False:
+    /// it is ours throughout and rests in eShaderReadOnlyOptimal, ready to be
+    /// sampled by the pass that draws it.
+    bool scanout;
+};
+
 struct ScanoutTarget::Impl {
     vk::raii::Image image;
     vk::raii::DeviceMemory memory;
@@ -1246,6 +1375,21 @@ struct ScanoutTarget::Impl {
     }
 };
 
+// The image, its memory, its view and its cached descriptor set all live in the
+// GpuTexture — it is what the next pass samples, so it may as well be the owner.
+// What is added here is only what makes it a destination as well as a source.
+struct OffscreenTarget::Impl {
+    GpuTexture texture;
+    vk::Format format;
+    bool has_content = false;
+    std::optional<vk::raii::Framebuffer> fb_load;
+    std::optional<vk::raii::Framebuffer> fb_clear;
+    // Never set: nothing outside this renderer ever holds an offscreen image, so
+    // there is no foreign fence to wait for. It exists because the shared pass
+    // takes one, and an empty UniqueFd is the honest way to say "none".
+    UniqueFd acquire_fence;
+};
+
 GpuTexture::GpuTexture(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 GpuTexture::~GpuTexture() {
     if (impl_ && impl_->owner != nullptr) {
@@ -1256,6 +1400,14 @@ GpuTexture::GpuTexture(GpuTexture&&) noexcept = default;
 GpuTexture& GpuTexture::operator=(GpuTexture&&) noexcept = default;
 int GpuTexture::width() const noexcept { return impl_->width; }
 int GpuTexture::height() const noexcept { return impl_->height; }
+
+OffscreenTarget::OffscreenTarget(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+OffscreenTarget::~OffscreenTarget() = default;
+OffscreenTarget::OffscreenTarget(OffscreenTarget&&) noexcept = default;
+OffscreenTarget& OffscreenTarget::operator=(OffscreenTarget&&) noexcept = default;
+const GpuTexture& OffscreenTarget::texture() const noexcept { return impl_->texture; }
+int OffscreenTarget::width() const noexcept { return impl_->texture.width(); }
+int OffscreenTarget::height() const noexcept { return impl_->texture.height(); }
 
 ScanoutTarget::ScanoutTarget(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 ScanoutTarget::~ScanoutTarget() = default;
@@ -1410,6 +1562,7 @@ struct QuadPush {
     float rect[4];
     float uv01[4];
     float uv23[4];
+    float alpha;
 };
 
 vk::raii::RenderPass make_pass(const vk::raii::Device& device, vk::Format format, bool load) {
@@ -1474,7 +1627,11 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
         }
     }
 
-    vk::PushConstantRange push{vk::ShaderStageFlagBits::eVertex, 0, sizeof(QuadPush)};
+    // The block is shared: the vertex stage positions the quad, the fragment
+    // stage reads the opacity off the end of the same struct.
+    vk::PushConstantRange push{vk::ShaderStageFlagBits::eVertex |
+                                   vk::ShaderStageFlagBits::eFragment,
+                               0, sizeof(QuadPush)};
     vk::DescriptorSetLayout raw_set_layout = quad_set_layout();
     vk::raii::PipelineLayout layout{
         device, vk::PipelineLayoutCreateInfo{{}, raw_set_layout, push}};
@@ -1652,6 +1809,81 @@ Result<GpuTexture> VulkanRenderer::upload_texture(int width, int height,
     }
 }
 
+Result<OffscreenTarget> VulkanRenderer::create_offscreen(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return fail("invalid offscreen dimensions");
+    }
+    try {
+        auto& device = impl_->device;
+        const auto uw = static_cast<std::uint32_t>(width);
+        const auto uh = static_cast<std::uint32_t>(height);
+        // With alpha, and the same format an uploaded texture uses, so the two
+        // share a pipeline. A window composited here keeps its own transparency.
+        const vk::Format format = vk::Format::eR8G8B8A8Unorm;
+
+        vk::raii::Image image{device,
+                              vk::ImageCreateInfo{{},
+                                                  vk::ImageType::e2D,
+                                                  format,
+                                                  vk::Extent3D{uw, uh, 1},
+                                                  1,
+                                                  1,
+                                                  vk::SampleCountFlagBits::e1,
+                                                  vk::ImageTiling::eOptimal,
+                                                  vk::ImageUsageFlagBits::eColorAttachment |
+                                                      vk::ImageUsageFlagBits::eSampled |
+                                                      vk::ImageUsageFlagBits::eTransferSrc,
+                                                  vk::SharingMode::eExclusive,
+                                                  {},
+                                                  vk::ImageLayout::eUndefined}};
+        const auto req = image.getMemoryRequirements();
+        vk::raii::DeviceMemory memory{
+            device, vk::MemoryAllocateInfo{req.size,
+                                           find_memory_type(impl_->physical, req.memoryTypeBits,
+                                                            vk::MemoryPropertyFlagBits::eDeviceLocal)}};
+        image.bindMemory(*memory, 0);
+
+        // Park it in the sampled layout straight away. The contents are
+        // undefined until something renders into it, but the LAYOUT has to be
+        // the one every source texture is assumed to be in — otherwise an
+        // offscreen that is drawn before it is rendered into would be sampled
+        // through a barrier that lies about where it came from.
+        vk::raii::CommandBuffers command_buffers{
+            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
+                                                  vk::CommandBufferLevel::ePrimary, 1}};
+        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        vk::ImageMemoryBarrier to_read{{},
+                                       vk::AccessFlagBits::eShaderRead,
+                                       vk::ImageLayout::eUndefined,
+                                       vk::ImageLayout::eShaderReadOnlyOptimal,
+                                       VK_QUEUE_FAMILY_IGNORED,
+                                       VK_QUEUE_FAMILY_IGNORED,
+                                       *image,
+                                       whole};
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                            vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_read);
+        cmd.end();
+        vk::raii::Fence fence = impl_->acquire_fence_object();
+        vk::SubmitInfo submit;
+        submit.setCommandBuffers(*cmd);
+        impl_->queue.submit(submit, *fence);
+        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
+            vk::Result::eSuccess) {
+            return fail("fence wait failed");
+        }
+
+        vk::raii::ImageView view = make_sampler_view(device, image, format, false);
+        GpuTexture texture{std::make_unique<GpuTexture::Impl>(GpuTexture::Impl{
+            std::move(image), std::move(memory), std::move(view), width, height, false})};
+        return OffscreenTarget{std::make_unique<OffscreenTarget::Impl>(
+            OffscreenTarget::Impl{std::move(texture), format})};
+    } catch (const std::exception& e) {
+        return fail(std::string{"vulkan offscreen target: "} + e.what());
+    }
+}
+
 std::vector<std::uint64_t> VulkanRenderer::scanout_modifiers(std::uint32_t drm_format) {
     if (!impl_->dmabuf_ok) {
         return {};
@@ -1760,12 +1992,37 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
                                  std::span<const GpuTextureFill> textures,
                                  std::span<const Box> damage, const OutputMapping& mapping,
                                  const RenderSync& sync) {
+    ScanoutTarget::Impl& s = *target.impl_;
+    VulkanRenderTarget t{*s.image,     *s.view,   s.format,        s.plane.width, s.plane.height,
+                         &s.has_content, &s.fb_load, &s.fb_clear, &s.acquire_fence,
+                         /*scanout=*/true};
+    return render_pass_to(t, background, rects, textures, damage, mapping, sync);
+}
+
+Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color background,
+                                        std::span<const RectFill> rects,
+                                        std::span<const GpuTextureFill> textures,
+                                        std::span<const Box> damage, const RenderSync& sync) {
+    OffscreenTarget::Impl& o = *target.impl_;
+    const GpuTexture::Impl& tex = *o.texture.impl_;
+    // No OutputMapping: this image is its own pixel space, and the output's
+    // scale and rotation are applied to the finished window when it is drawn.
+    VulkanRenderTarget t{*tex.image,     *tex.view,  o.format,    tex.width, tex.height,
+                         &o.has_content, &o.fb_load, &o.fb_clear, &o.acquire_fence,
+                         /*scanout=*/false};
+    return render_pass_to(t, background, rects, textures, damage, OutputMapping{}, sync);
+}
+
+Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
+                                      std::span<const RectFill> rects,
+                                      std::span<const GpuTextureFill> textures,
+                                      std::span<const Box> damage, const OutputMapping& mapping,
+                                      const RenderSync& sync) {
     try {
         auto& device = impl_->device;
         impl_->reap();
-        ScanoutTarget::Impl& t = *target.impl_;
-        const int device_w = t.plane.width;
-        const int device_h = t.plane.height;
+        const int device_w = t.width;
+        const int device_h = t.height;
         const int scale = mapping.scale < 1 ? 1 : mapping.scale;
         const Transform transform = mapping.transform;
         // Everything the caller hands us is in logical coordinates; the target is
@@ -1789,7 +2046,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         // worth of heap traffic.
         Region& repaint = impl_->repaint;
         repaint.clear();
-        const bool partial = !damage.empty() && t.has_content;
+        const bool partial = !damage.empty() && *t.has_content;
         if (partial) {
             for (const Box& d : damage) {
                 repaint.add(d.intersection(full));
@@ -1838,9 +2095,9 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
 
         QuadPipeline& quad = impl_->quad_pipeline(t.format);
         // Built on the first frame that needs this pass and kept on the target.
-        std::optional<vk::raii::Framebuffer>& cached = partial ? t.fb_load : t.fb_clear;
+        std::optional<vk::raii::Framebuffer>& cached = partial ? *t.fb_load : *t.fb_clear;
         if (!cached.has_value()) {
-            vk::ImageView fb_attachment = *t.view;
+            vk::ImageView fb_attachment = t.view;
             cached.emplace(device,
                            vk::FramebufferCreateInfo{{},
                                                      partial ? *quad.load_pass : *quad.clear_pass,
@@ -1860,17 +2117,22 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             impl_->queue_foreign ? impl_->queue_family : VK_QUEUE_FAMILY_IGNORED;
         const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
 
-        // Take the target back from the display engine. On a partial repaint the
-        // untouched pixels must survive, so we come in from the layout it left
-        // rather than from Undefined.
+        // Take the target back from whoever had it. On a partial repaint the
+        // untouched pixels must survive, so we come in from the layout they were
+        // left in rather than from Undefined — which for a scanout target means
+        // taking it back off the display engine's queue, and for an offscreen
+        // one means taking it back from the pass that sampled it. A full repaint
+        // keeps nothing either way, so it comes in from Undefined.
+        const bool reclaim_from_display = partial && t.scanout;
         vk::ImageMemoryBarrier reacquire{{},
                                          vk::AccessFlagBits::eColorAttachmentWrite,
-                                         partial ? vk::ImageLayout::eGeneral
-                                                 : vk::ImageLayout::eUndefined,
+                                         !partial ? vk::ImageLayout::eUndefined
+                                         : t.scanout ? vk::ImageLayout::eGeneral
+                                                     : vk::ImageLayout::eShaderReadOnlyOptimal,
                                          vk::ImageLayout::eColorAttachmentOptimal,
-                                         partial ? foreign : VK_QUEUE_FAMILY_IGNORED,
-                                         partial ? self : VK_QUEUE_FAMILY_IGNORED,
-                                         *t.image,
+                                         reclaim_from_display ? foreign : VK_QUEUE_FAMILY_IGNORED,
+                                         reclaim_from_display ? self : VK_QUEUE_FAMILY_IGNORED,
+                                         t.image,
                                          whole};
         cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
                             vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, {}, {},
@@ -1971,6 +2233,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             push.uv23[1] = uv[2][1];
             push.uv23[2] = uv[3][0];
             push.uv23[3] = uv[3][1];
+            push.alpha = tf.alpha;
 
             // Written once per texture, then only bound. The same window drawn
             // every frame costs one bindDescriptorSets and nothing else.
@@ -1985,7 +2248,10 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
                     {});
             }
             cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0, tex.set, {});
-            cmd.pushConstants<QuadPush>(*quad.layout, vk::ShaderStageFlagBits::eVertex, 0, push);
+            cmd.pushConstants<QuadPush>(*quad.layout,
+                                        vk::ShaderStageFlagBits::eVertex |
+                                            vk::ShaderStageFlagBits::eFragment,
+                                        0, push);
             // One draw per visible box: the vertex work is four vertices, and
             // the fragments outside the scissor never happen.
             for (const Box& b : visible[i].rects()) {
@@ -1995,18 +2261,24 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         }
         cmd.endRenderPass();
 
-        // Release the target back to the foreign owner: the display engine reads
-        // it next, not us.
-        vk::ImageMemoryBarrier release{vk::AccessFlagBits::eColorAttachmentWrite,
-                                       {},
-                                       vk::ImageLayout::eColorAttachmentOptimal,
-                                       vk::ImageLayout::eGeneral,
-                                       self,
-                                       foreign,
-                                       *t.image,
-                                       whole};
+        // Hand the target on. A scanout target goes back to the foreign owner —
+        // the display engine reads it next, not us. An offscreen one stays ours
+        // and is sampled by the pass that draws it onto the output, so it is
+        // parked in exactly the layout the loop above expects of a source
+        // texture: that next pass then needs no transition at all.
+        vk::ImageMemoryBarrier release{
+            vk::AccessFlagBits::eColorAttachmentWrite,
+            t.scanout ? vk::AccessFlags{} : vk::AccessFlags{vk::AccessFlagBits::eShaderRead},
+            vk::ImageLayout::eColorAttachmentOptimal,
+            t.scanout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+            t.scanout ? self : VK_QUEUE_FAMILY_IGNORED,
+            t.scanout ? foreign : VK_QUEUE_FAMILY_IGNORED,
+            t.image,
+            whole};
         cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                            vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, release);
+                            t.scanout ? vk::PipelineStageFlagBits::eBottomOfPipe
+                                      : vk::PipelineStageFlagBits::eFragmentShader,
+                            {}, {}, {}, release);
         cmd.end();
 
         // --- explicit sync: wait on the GPU, not on the CPU ---
@@ -2038,7 +2310,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         for (int fd : sync.wait_fds) {
             add_wait(fd);
         }
-        add_wait(t.acquire_fence.get());
+        add_wait(t.acquire_fence->get());
 
         const bool want_out_fence = sync.out_fence_fd != nullptr && impl_->sync_fd_ok;
         std::optional<vk::raii::Semaphore> out_sem;
@@ -2066,8 +2338,8 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
 
         // The waits consumed the target's fence; a stale one must not be waited
         // on twice.
-        t.acquire_fence.reset();
-        t.has_content = true;
+        t.acquire_fence->reset();
+        *t.has_content = true;
 
         if (out_sem.has_value()) {
             *sync.out_fence_fd = device.getSemaphoreFdKHR(vk::SemaphoreGetFdInfoKHR{
@@ -2096,7 +2368,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         }
         return ok();
     } catch (const std::exception& e) {
-        return fail(std::string{"vulkan render_to: "} + e.what());
+        return fail(std::string{"vulkan render pass: "} + e.what());
     }
 }
 

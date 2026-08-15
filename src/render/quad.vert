@@ -5,9 +5,10 @@
 // decides which source corner each destination corner reads.
 
 layout(push_constant) uniform Push {
-    vec4 rect; // clip space: x0, y0, x1, y1
-    vec4 uv01; // uv of corner 0 (xy) and corner 1 (zw)
-    vec4 uv23; // uv of corner 2 (xy) and corner 3 (zw)
+    vec4 rect;   // clip space: x0, y0, x1, y1
+    vec4 uv01;   // uv of corner 0 (xy) and corner 1 (zw)
+    vec4 uv23;   // uv of corner 2 (xy) and corner 3 (zw)
+    float alpha; // read by the fragment stage; declared here so the block matches
 } pc;
 
 layout(location = 0) out vec2 v_uv;

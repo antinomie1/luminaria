@@ -210,6 +210,24 @@ target("luminaria-gpu")
             end
         end
     end)
+    -- on_load runs only when xmake configures. Keep the same stale check in
+    -- the build path as well: changing a shader must regenerate the embedded
+    -- SPIR-V before compiling vulkan.cppm, even when the developer just runs
+    -- `xmake build` after an earlier configure.
+    before_build(function (target)
+        local function stale(src, dst)
+            return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
+        end
+        for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
+                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"}}) do
+            local src = path.join(os.projectdir(), "src", "render", shader[1])
+            local dst = path.join(os.projectdir(), "build", "generated", shader[3])
+            if stale(src, dst) then
+                os.mkdir(path.directory(dst))
+                os.iorunv("glslangValidator", {"-V", "--vn", shader[2], "-o", dst, src})
+            end
+        end
+    end)
 
 target("luminaria-desktop")
     set_kind("static")
@@ -250,7 +268,7 @@ target("luminaria-tty")
 local gpu_tests = {
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
     test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
-    test_frame_damage = true,
+    test_frame_damage = true, test_offscreen = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,
     test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,
     test_screencopy_bounds = true, test_session = true, test_syncobj = true,

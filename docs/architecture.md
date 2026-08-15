@@ -18,7 +18,9 @@
 - **protocol** — 每个 Wayland global 一个分区，见 [features.md](./features.md)。
 - **render** — Vulkan。GPU 路径：客户端 dmabuf 零拷贝导入成纹理 → 合成进一块导出为 dmabuf 的
   `ScanoutTarget` → KMS 直接扫描输出，全程无 CPU 读回。CPU 路径（`composite()`）保留给无
-  dmabuf 的后端与截图。
+  dmabuf 的后端与截图。整窗特效的中间结果落在 `OffscreenTarget`：它既是 render target 也是
+  `GpuTexture`，写完停在 shader-read layout，下一趟可直接采样；两个路径共用 render pass、
+  damage、遮挡剔除与显式同步，区别只在 scanout target 需要交还 display queue（ADR 0005）。
 - **shell** — 外壳层，即时模式，没有树（见 [ADR 0001](./adr/0001-no-retained-scene-graph.md)）。
   `Frame` 是每个输出一份的帧账本：混成器每帧 `begin(view)` + 逐窗口 `place()` 排出一串
   **摆位**，这串摆位既用来画也用来命中测试（`surface_at()`），所以点击不可能跟像素对不上；

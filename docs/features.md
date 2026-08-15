@@ -65,6 +65,8 @@
 | present | `Output::set_cursor/move_cursor/hide_cursor` —— **硬件光标平面**：移动指针不重绘任何东西。光标状态优先折进下一次 primary plane 翻页；屏幕空闲时（按需帧下根本没有下一次翻页）后端自己用屏上那块 fb 再提交一次，只更新 cursor plane，并靠 `flip_pending` 压到刷新率 | drm（需 tty） |
 | present | `Output::present` 信号 —— 帧上屏时刻（DRM 给真 vblank 时间戳 + 序号，其余后端给 CLOCK_MONOTONIC）。`wl_surface.frame` 与 `wp_presentation` 都由它驱动 | frame-timing |
 | render | **damage 渲染**：`render_to(..., damage)` 把脏区折成不相交 `Region`，**逐矩形 `setScissor`** 各画一次 —— 两块分散的小脏区就是两个小 scissor，不是横跨它们的大矩形。未触及的像素原样保留；双缓冲下调用方需并上上一帧的 damage（buffer age） | frame-timing, gpu-scanout |
+| render | **离屏合成**：`OffscreenTarget` 是可写也可采样的 RGBA GPU image；`render_offscreen()` 和 `render_to()` 共用 pass/遮挡/damage 路径，写完就停在 shader-read layout，可直接作为下一趟 `GpuTextureFill`。整窗淡入淡出不会把重叠子表面混合两次（ADR 0005） | offscreen |
+| render | **预乘 alpha**：`GpuTextureFill::alpha` 作用于整张 quad，片元颜色与 alpha 一起缩放，再由 `ONE / ONE_MINUS_SRC_ALPHA` 混合；半透明内容正确叠加，离屏的整窗结果可一次淡入淡出 | offscreen |
 | render | **遮挡剔除**：`GpuTextureFill::opaque` 声明的不透明区从前往后累积，被完全盖住的表面一次都不采样 —— 最大化窗口下的壁纸不进 GPU | gpu-scanout |
 | render | **异步提交**：`RenderSync` 让 `render_to` 等一组 sync_file（客户端 acquire point）并吐出 out-fence，自己不阻塞；未完成的提交挂在 in-flight 列表上按 fence 回收 | gpu-scanout |
 | render | **纹理缓存**：`Frame` 的 GPU bridge 按 `SurfaceId` + `wl_buffer` 缓存。dmabuf 导入是客户端内存的实时视图，跨帧保留；shm 上传是快照，客户端重绘时才重传；表面销毁后旧 id 立即失效，旧 placement 再 submit 也不会碰悬空纹理 | frame, texture-cache |
