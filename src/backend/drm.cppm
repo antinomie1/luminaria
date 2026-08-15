@@ -117,6 +117,20 @@ uint8_t clamp8(float c) {
     return static_cast<uint8_t>(v * 255.0f + 0.5f);
 }
 
+// Every libdrm query hands back a struct with its own free function, and the
+// scans below are loops full of early exits — the shape that grows a leak the
+// next time a `return` is added. The `Drm` prefix is the partition-prefix rule
+// for namespace-scope aliases in an implementation half.
+using DrmResPtr = CUnique<drmModeRes, drmModeFreeResources>;
+using DrmConnectorPtr = CUnique<drmModeConnector, drmModeFreeConnector>;
+using DrmEncoderPtr = CUnique<drmModeEncoder, drmModeFreeEncoder>;
+using DrmCrtcPtr = CUnique<drmModeCrtc, drmModeFreeCrtc>;
+using DrmPlanePtr = CUnique<drmModePlane, drmModeFreePlane>;
+using DrmPlaneResPtr = CUnique<drmModePlaneRes, drmModeFreePlaneResources>;
+using DrmPropPtr = CUnique<drmModePropertyRes, drmModeFreeProperty>;
+using DrmBlobPtr = CUnique<drmModePropertyBlobRes, drmModeFreePropertyBlob>;
+using DrmObjPropsPtr = CUnique<drmModeObjectProperties, drmModeFreeObjectProperties>;
+
 // --- property plumbing -------------------------------------------------------
 //
 // Atomic addresses everything by (object, property-id, value), and property ids
@@ -124,14 +138,14 @@ uint8_t clamp8(float c) {
 
 uint32_t find_prop(int fd, uint32_t obj_id, uint32_t obj_type, const char* name,
                    uint64_t* value = nullptr) {
-    drmModeObjectProperties* props = drmModeObjectGetProperties(fd, obj_id, obj_type);
-    if (props == nullptr) {
+    DrmObjPropsPtr props{drmModeObjectGetProperties(fd, obj_id, obj_type)};
+    if (!props) {
         return 0;
     }
     uint32_t id = 0;
     for (uint32_t i = 0; i < props->count_props && id == 0; ++i) {
-        drmModePropertyRes* p = drmModeGetProperty(fd, props->props[i]);
-        if (p == nullptr) {
+        DrmPropPtr p{drmModeGetProperty(fd, props->props[i])};
+        if (!p) {
             continue;
         }
         if (std::strcmp(p->name, name) == 0) {
@@ -140,9 +154,7 @@ uint32_t find_prop(int fd, uint32_t obj_id, uint32_t obj_type, const char* name,
                 *value = props->prop_values[i];
             }
         }
-        drmModeFreeProperty(p);
     }
-    drmModeFreeObjectProperties(props);
     return id;
 }
 
@@ -269,7 +281,7 @@ public:
     uint32_t mode_blob = 0;
     bool modeset_done = false;
 
-    drmModeCrtc* saved_crtc = nullptr; // restored when this output goes away
+    DrmCrtcPtr saved_crtc; // restored when this output goes away
     DumbFb fbs[2]; // CPU path (solid colour / read-back frames)
     int front = 0;
     std::vector<ImportedFb> imported; // GPU path (renderer scanout targets, client buffers)
@@ -421,10 +433,9 @@ public:
           plane_id(plane), connector_crtc_id_prop(0), mode(mode) {}
 
     ~DrmOutput() override {
-        if (saved_crtc != nullptr) {
+        if (saved_crtc) {
             drmModeSetCrtc(fd, saved_crtc->crtc_id, saved_crtc->buffer_id, saved_crtc->x,
                            saved_crtc->y, nullptr, 0, nullptr);
-            drmModeFreeCrtc(saved_crtc);
         }
         for (const std::vector<ImportedFb>& list : {imported, retired}) {
             for (const ImportedFb& fb : list) {
@@ -576,8 +587,8 @@ public:
         if (find_prop(fd, plane_id, DRM_MODE_OBJECT_PLANE, "IN_FORMATS", &blob_id) == 0) {
             return {DRM_FORMAT_MOD_LINEAR};
         }
-        drmModePropertyBlobRes* blob = drmModeGetPropertyBlob(fd, static_cast<uint32_t>(blob_id));
-        if (blob == nullptr) {
+        DrmBlobPtr blob{drmModeGetPropertyBlob(fd, static_cast<uint32_t>(blob_id))};
+        if (!blob) {
             return {DRM_FORMAT_MOD_LINEAR};
         }
         const auto* data = static_cast<const char*>(blob->data);
@@ -598,7 +609,6 @@ public:
                 }
             }
         }
-        drmModeFreePropertyBlob(blob);
         if (out.empty()) {
             out.push_back(DRM_FORMAT_MOD_LINEAR);
         }
@@ -844,31 +854,27 @@ bool pick_crtc(int fd, drmModeRes* res, drmModeConnector* connector,
         return std::find(taken.begin(), taken.end(), res->crtcs[i]) == taken.end();
     };
     // Prefer the CRTC the connector is already lit by: no flicker, no reshuffle.
-    if (drmModeEncoder* enc = drmModeGetEncoder(fd, connector->encoder_id); enc != nullptr) {
+    if (DrmEncoderPtr enc{drmModeGetEncoder(fd, connector->encoder_id)}; enc) {
         for (int i = 0; i < res->count_crtcs; ++i) {
             if (res->crtcs[i] == enc->crtc_id && free_crtc(i)) {
                 crtc_id = res->crtcs[i];
                 crtc_index = i;
-                drmModeFreeEncoder(enc);
                 return true;
             }
         }
-        drmModeFreeEncoder(enc);
     }
     for (int e = 0; e < connector->count_encoders; ++e) {
-        drmModeEncoder* enc = drmModeGetEncoder(fd, connector->encoders[e]);
-        if (enc == nullptr) {
+        DrmEncoderPtr enc{drmModeGetEncoder(fd, connector->encoders[e])};
+        if (!enc) {
             continue;
         }
         for (int i = 0; i < res->count_crtcs; ++i) {
             if ((enc->possible_crtcs & (1u << i)) != 0 && free_crtc(i)) {
                 crtc_id = res->crtcs[i];
                 crtc_index = i;
-                drmModeFreeEncoder(enc);
                 return true;
             }
         }
-        drmModeFreeEncoder(enc);
     }
     return false;
 }
@@ -876,14 +882,14 @@ bool pick_crtc(int fd, drmModeRes* res, drmModeConnector* connector,
 /// A plane of `want_type` for `crtc_index` that no other output claimed.
 uint32_t pick_plane(int fd, int crtc_index, uint64_t want_type,
                     const std::vector<uint32_t>& taken) {
-    drmModePlaneRes* planes = drmModeGetPlaneResources(fd);
-    if (planes == nullptr) {
+    DrmPlaneResPtr planes{drmModeGetPlaneResources(fd)};
+    if (!planes) {
         return 0;
     }
     uint32_t chosen = 0;
     for (uint32_t i = 0; i < planes->count_planes && chosen == 0; ++i) {
-        drmModePlane* plane = drmModeGetPlane(fd, planes->planes[i]);
-        if (plane == nullptr) {
+        DrmPlanePtr plane{drmModeGetPlane(fd, planes->planes[i])};
+        if (!plane) {
             continue;
         }
         uint64_t type = 0;
@@ -893,9 +899,7 @@ uint32_t pick_plane(int fd, int crtc_index, uint64_t want_type,
             type == want_type) {
             chosen = plane->plane_id;
         }
-        drmModeFreePlane(plane);
     }
-    drmModeFreePlaneResources(planes);
     return chosen;
 }
 
@@ -1012,7 +1016,7 @@ struct DrmBackend::Impl {
         std::vector<uint32_t> claimed = taken_planes();
         claimed.push_back(plane_id);
         setup_cursor_plane(fd, *out, crtc_index, claimed);
-        out->saved_crtc = drmModeGetCrtc(fd, crtc_id);
+        out->saved_crtc = DrmCrtcPtr{drmModeGetCrtc(fd, crtc_id)};
         return out;
     }
 
@@ -1093,15 +1097,15 @@ Result<DrmBackend> DrmBackend::create(EventLoop loop, std::string device, Sessio
 
 void DrmBackend::scan_connectors() {
     Impl& impl = *impl_;
-    drmModeRes* res = drmModeGetResources(impl.fd);
-    if (res == nullptr) {
+    DrmResPtr res{drmModeGetResources(impl.fd)};
+    if (!res) {
         return;
     }
 
     std::vector<uint32_t> connected;
     for (int i = 0; i < res->count_connectors; ++i) {
-        drmModeConnector* connector = drmModeGetConnector(impl.fd, res->connectors[i]);
-        if (connector == nullptr) {
+        DrmConnectorPtr connector{drmModeGetConnector(impl.fd, res->connectors[i])};
+        if (!connector) {
             continue;
         }
         const bool usable =
@@ -1110,7 +1114,7 @@ void DrmBackend::scan_connectors() {
             connected.push_back(connector->connector_id);
         }
         if (usable && !impl.has_connector(connector->connector_id)) {
-            if (std::unique_ptr<DrmOutput> out = impl.make_output(res, connector)) {
+            if (std::unique_ptr<DrmOutput> out = impl.make_output(res.get(), connector.get())) {
                 DrmOutput& added = *out;
                 impl.outputs.push_back(std::move(out));
                 // Before start(), the initial set is announced and lit there —
@@ -1122,9 +1126,7 @@ void DrmBackend::scan_connectors() {
                 }
             }
         }
-        drmModeFreeConnector(connector);
     }
-    drmModeFreeResources(res);
 
     // Anything no longer connected goes away; ~DrmOutput emits Output::destroy,
     // which is how the compositor learns to drop its per-output state.

@@ -1,9 +1,11 @@
 // luminaria/core/display.cppm — owning RAII wrapper over wl_display.
 //
 // This is the root object: it owns the wl_display and its event loop, hosts the
-// Wayland socket, and runs the main loop. Move-only; the C handle is destroyed
-// exactly once, in the destructor. Importing luminaria pulls in no libwayland headers (the
-// wl_display type is opaque here; all libwayland calls live in display.cpp).
+// Wayland socket, and runs the main loop. Move-only; the C handle lives in a
+// CUnique, so it is destroyed exactly once and this class needs no destructor
+// of its own. Importing luminaria pulls in no libwayland headers — the
+// wl_display type is opaque here, and every libwayland call is below the
+// implementation divider.
 
 module;
 
@@ -16,11 +18,12 @@ export module luminaria:display;
 
 import :event_loop;
 import :expected;
+import :handle;
 
 export namespace luminaria {
 
 class Display {
-    wl_display* display_ = nullptr; // owned
+    CUnique<wl_display, wl_display_destroy> display_;
 
     explicit Display(wl_display* display) noexcept : display_(display) {}
 
@@ -28,9 +31,11 @@ public:
     /// Create a fresh display + event loop. Fails only on allocation failure.
     [[nodiscard]] static Result<Display> create();
 
-    ~Display();
-    Display(Display&& o) noexcept : display_(o.display_) { o.display_ = nullptr; }
-    Display& operator=(Display&& o) noexcept;
+    // Rule of zero: the handle destroys itself exactly once, so move is just a
+    // pointer steal and there is nothing for a destructor to do.
+    ~Display() = default;
+    Display(Display&&) noexcept = default;
+    Display& operator=(Display&&) noexcept = default;
     Display(const Display&) = delete;
     Display& operator=(const Display&) = delete;
 
@@ -50,7 +55,7 @@ public:
     void terminate();
 
     /// Escape hatch for code that still needs the raw handle (backends, protocols).
-    [[nodiscard]] wl_display* c_ptr() const noexcept { return display_; }
+    [[nodiscard]] wl_display* c_ptr() const noexcept { return display_.get(); }
 };
 
 } // namespace luminaria
@@ -66,29 +71,12 @@ Result<Display> Display::create() {
     return Display{d};
 }
 
-Display::~Display() {
-    if (display_ != nullptr) {
-        wl_display_destroy(display_);
-    }
-}
-
-Display& Display::operator=(Display&& o) noexcept {
-    if (this != &o) {
-        if (display_ != nullptr) {
-            wl_display_destroy(display_);
-        }
-        display_ = o.display_;
-        o.display_ = nullptr;
-    }
-    return *this;
-}
-
 EventLoop Display::event_loop() const {
-    return EventLoop{wl_display_get_event_loop(display_)};
+    return EventLoop{wl_display_get_event_loop(display_.get())};
 }
 
 Result<std::string> Display::add_socket_auto() {
-    const char* name = wl_display_add_socket_auto(display_);
+    const char* name = wl_display_add_socket_auto(display_.get());
     if (name == nullptr) {
         return fail("wl_display_add_socket_auto() failed");
     }
@@ -96,18 +84,18 @@ Result<std::string> Display::add_socket_auto() {
 }
 
 Status Display::init_shm() {
-    if (wl_display_init_shm(display_) != 0) {
+    if (wl_display_init_shm(display_.get()) != 0) {
         return fail("wl_display_init_shm() failed");
     }
     return ok();
 }
 
 void Display::run() {
-    wl_display_run(display_);
+    wl_display_run(display_.get());
 }
 
 void Display::terminate() {
-    wl_display_terminate(display_);
+    wl_display_terminate(display_.get());
 }
 
 } // namespace luminaria
