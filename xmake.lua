@@ -8,13 +8,40 @@
 -- xmake rather than Meson because Meson's module dependency scanner still emits
 -- MSVC-shaped `.ifc` outputs and cannot drive GCC's modules at all.
 
-set_project("luminaria")
-set_version("0.0.1")
-set_languages("c11", "c++23")
-set_policy("build.c++.modules", true)
+-- Is luminaria the project being built, or a subtree of somebody else's? It is
+-- meant to be vendored and pulled in with includes(), and an included xmake.lua
+-- shares root scope with its host: anything set here lands on the HOST's targets
+-- too. So the file is split along that line.
+--
+--   * Whatever configures the *project* — its name, the build modes, the
+--     sanitizer option, the examples, the test suite — is the top-level build's
+--     to decide, and is guarded on `standalone` below. A parent brings its own.
+--   * Whatever a luminaria target needs in order to compile at all — C++23,
+--     modules, the warning set — moves onto the targets, via luminaria_defaults()
+--     immediately after each set_kind(). At root scope `set_warnings(..., "error")`
+--     would compile the host's own code with -Werror -pedantic, which is not
+--     ours to impose.
+--
+-- Adding a target to this file? Call luminaria_defaults() in it. Adding a
+-- root-scope setting? Decide which half it belongs to first.
+local standalone = path.normalize(os.scriptdir()) == path.normalize(os.projectdir())
 
-add_rules("mode.debug", "mode.release")
-set_defaultmode("debug")
+if standalone then
+    set_project("luminaria")
+    set_version("0.0.1")
+    add_rules("mode.debug", "mode.release")
+    set_defaultmode("debug")
+end
+
+local function luminaria_defaults()
+    set_languages("c11", "c++23")
+    set_policy("build.c++.modules", true)
+    -- Partial designated-init of libwayland's C *_interface vtables is idiomatic;
+    -- unlisted request slots are intentionally null. Silence that one warning,
+    -- keep everything else fatal.
+    set_warnings("all", "extra", "pedantic", "error")
+    add_cxxflags("-Wno-missing-field-initializers")
+end
 
 -- Sanitizers, off by default (both are slow, and switching rebuilds every
 -- module unit from scratch):
@@ -37,23 +64,22 @@ set_defaultmode("debug")
 -- suppresses libwayland-client and nothing else:
 --
 --   LSAN_OPTIONS=suppressions=tests/lsan.supp xmake test
-option("sanitize")
-    set_default("none")
-    set_values("none", "address", "undefined")
-    set_description("Build with a sanitizer (address|undefined)")
-option_end()
+--
+-- Both the option and the policy are project-wide, so a host build owns this
+-- decision for its whole tree, luminaria included.
+if standalone then
+    option("sanitize")
+        set_default("none")
+        set_values("none", "address", "undefined")
+        set_description("Build with a sanitizer (address|undefined)")
+    option_end()
 
-if get_config("sanitize") == "address" then
-    set_policy("build.sanitizer.address", true)
-elseif get_config("sanitize") == "undefined" then
-    set_policy("build.sanitizer.undefined", true)
+    if get_config("sanitize") == "address" then
+        set_policy("build.sanitizer.address", true)
+    elseif get_config("sanitize") == "undefined" then
+        set_policy("build.sanitizer.undefined", true)
+    end
 end
-
--- Partial designated-init of libwayland's C *_interface vtables is idiomatic;
--- unlisted request slots are intentionally null. Silence that one warning, keep
--- everything else fatal.
-set_warnings("all", "extra", "pedantic", "error")
-add_cxxflags("-Wno-missing-field-initializers")
 
 -- We build ON libwayland-server; the wire protocol is never reimplemented.
 local pkgs = {"wayland-server", "wayland-client", "vulkan", "xkbcommon", "xcb",
@@ -75,6 +101,7 @@ local gpu_packages = {"vulkan", "libdrm", "libinput", "libudev", "gbm", "libseat
 
 target("luminaria")
     set_kind("static")
+    luminaria_defaults()
     add_files("src/luminaria.cppm", "src/core/**.cppm", "src/util/**.cppm", {public = true})
     add_files("src/backend/backend.cppm", "src/backend/headless.cppm",
               "src/backend/input_event.cppm", "src/backend/output.cppm",
@@ -195,6 +222,7 @@ target("luminaria")
 
 target("luminaria-gpu")
     set_kind("static")
+    luminaria_defaults()
     add_deps("luminaria")
     add_files("src/luminaria.gpu.cppm", "src/backend/drm.cppm",
               "src/backend/libinput.cppm", "src/backend/session.cppm",
@@ -241,6 +269,7 @@ target("luminaria-gpu")
 
 target("luminaria-desktop")
     set_kind("static")
+    luminaria_defaults()
     add_deps("luminaria")
     add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
               "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
@@ -249,31 +278,43 @@ target("luminaria-desktop")
 
 target("luminaria-xwayland")
     set_kind("static")
+    luminaria_defaults()
     add_deps("luminaria")
     add_files("src/xwayland/xwayland.cppm", {public = true})
     add_packages("xcb", {public = true})
 
 -- --------------------------------------------------------------------- examples
+-- ------------------------------------------------------------------------ tests
+--
+-- Both only exist for the top-level build. A host that vendors luminaria wants
+-- the four library targets and nothing else: the examples default to being built,
+-- so a bare `xmake` up there would compile somebody else's demo compositors, and
+-- `xmake test` would run somebody else's suite. Declaring them at all is what
+-- costs — set_default(false) still leaves the target defined and its on_load
+-- running — so they are not declared.
+
+if standalone then
 
 target("tinyluminaria")
     set_kind("binary")
+    luminaria_defaults()
     add_files("examples/tinyluminaria.cpp")
     add_deps("luminaria-gpu", "luminaria-desktop")
 
 target("luminaria-drm-demo")
     set_kind("binary")
+    luminaria_defaults()
     add_files("examples/drm_demo.cpp")
     add_deps("luminaria-gpu")
 
 target("luminaria-tty")
     set_kind("binary")
+    luminaria_defaults()
     add_files("examples/tty_compositor.cpp")
     add_deps("luminaria-gpu")
 
--- ------------------------------------------------------------------------ tests
---
--- One binary per file, same as before. Several skip themselves with exit 77 when
--- the machine has no GPU / no free VT / no seat, so that counts as a pass.
+-- One test binary per file, same as before. Several skip themselves with exit 77
+-- when the machine has no GPU / no free VT / no seat, so that counts as a pass.
 
 local gpu_tests = {
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
@@ -298,6 +339,7 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
     local name = path.basename(file)
     target(name)
         set_kind("binary")
+        luminaria_defaults()
         set_default(false)
         add_files(file)
         if gpu_tests[name] then
@@ -325,3 +367,5 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
             return code == 0
         end)
 end
+
+end -- if standalone
