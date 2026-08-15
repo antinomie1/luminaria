@@ -12,6 +12,7 @@
 // same placement list that gets rendered, and the cursor rides the KMS cursor
 // plane. TODO: windows cascade at fixed offsets — no move/resize/stacking UI.
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -469,8 +470,16 @@ int main(int argc, char** argv) {
                     if (placement.surface != parent.id()) {
                         continue;
                     }
-                    parent_box = luminaria::Box{placement.x, placement.y, placement.width,
-                                                placement.height};
+                    // Popup constraints are integer logical boxes, while an
+                    // animated placement may sit between pixels. Cover every
+                    // touched pixel rather than truncating its right/bottom
+                    // edge and constraining a menu against a smaller parent.
+                    const int left = static_cast<int>(std::floor(placement.x));
+                    const int top = static_cast<int>(std::floor(placement.y));
+                    const int right = static_cast<int>(std::ceil(placement.x + placement.width));
+                    const int bottom =
+                        static_cast<int>(std::ceil(placement.y + placement.height));
+                    parent_box = luminaria::Box{left, top, right - left, bottom - top};
                     usable = layout.box_of(*sc.output);
                     return !usable.empty();
                 }

@@ -265,6 +265,30 @@ int main() {
             assert(sx == 1 && sy == 1);
             assert(!frame.surface_at(kOutW - 1, kOutH - 1, sx, sy).valid());
 
+            // --- transformed client tree -----------------------------------
+            // A client tree uses the same wrapper as a compositor texture.
+            // Each child is scaled from the root coordinates and hit-testing
+            // reverses that scale before asking the client's input region.
+            frame.begin(view);
+            const auto transformed =
+                luminaria::PlacementTransform::at(10.5f, 5.5f, kParentW, kParentH)
+                    .rescale(0.5f, 0.5f)
+                    .relocate(10.5f, 5.5f);
+            frame.place(*parent, transformed);
+            const std::span<const luminaria::Placement> transformed_list = frame.placements();
+            assert(transformed_list.size() == 2);
+            assert(transformed_list[0].x == 10.5f && transformed_list[0].y == 5.5f);
+            assert(transformed_list[0].width == 16.0f && transformed_list[0].height == 8.0f);
+            assert(transformed_list[1].x == 15.5f && transformed_list[1].y == 15.5f);
+            assert(transformed_list[1].width == 4.0f && transformed_list[1].height == 4.0f);
+            // The transformed opaque region is deliberately conservative: it
+            // is omitted rather than rounded inward and hiding another window.
+            assert(frame.opaque_of(transformed_list[0]).empty());
+            assert(frame.surface_at(11, 6, sx, sy) == parent->id());
+            assert(sx == 1 && sy == 1);
+            assert(frame.surface_at(16, 16, sx, sy) == transformed_list[1].surface);
+            assert(sx == 1 && sy == 1);
+
             // --- view culling -----------------------------------------------
             // A window on another monitor contributes nothing to this frame.
             frame.begin(view);

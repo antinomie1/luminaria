@@ -177,21 +177,37 @@ int main() {
         const auto group = frame.begin_group();
         frame.place(*tex_a, 0, 0, kQuadW, kQuadH);
         frame.place(*tex_b, kBx, 0, kQuadW, kQuadH);
-        assert(frame.compose_group(group, *offscreen, {0, 0, win_w, kQuadH}, 0.5f).has_value());
+        // These are deliberately chained: a window animation can crop its
+        // intermediate image, scale it, move it on subpixels, then fade it
+        // without a special renderer flag for every combination.
+        const auto animated = luminaria::PlacementTransform::at(0, 0, win_w, kQuadH)
+                                  .crop(0.5f, 0.0f, 0.5f, 1.0f)
+                                  .rescale(0.5f, 0.5f)
+                                  .relocate(0.75f, 0.75f)
+                                  .opacity(0.5f);
+        assert(frame.compose_group(group, *offscreen, {0, 0, win_w, kQuadH}, animated)
+                   .has_value());
         // The two source placements survive as input records, then the final
         // offscreen quad appears after them as the one drawable member.
         assert(frame.placements().size() == 3);
         assert(!frame.placements()[0].draw && !frame.placements()[1].draw);
         assert(frame.placements()[2].draw);
+        const auto& final = frame.placements()[2];
+        assert(final.x == 0.75f && final.y == 0.75f);
+        assert(final.width == 24.0f && final.height == 16.0f);
+        assert(final.u0 == 0.5f && final.v0 == 0.0f && final.u1 == 1.0f && final.v1 == 1.0f);
+        assert(final.alpha == 0.5f);
         assert(frame.submit(black).has_value());
         auto readback = frame.read_back();
         assert(readback.has_value());
         const auto at = [&](int x, int y) {
             return (*readback)[static_cast<std::size_t>(y) * kW + x];
         };
-        assert(near(at(kOnlyA, kRow).r, 128));
-        assert(near(at(kOverlap, kRow).r, 128));
-        assert(near(at(kOnlyB, kRow).r, 128));
+        // The transformed group is one cropped, scaled, subpixel-relocated
+        // image; opacity still applies once, so its visible pixels are half
+        // white while the old right edge has returned to the background.
+        assert(near(at(1, 1).r, 128));
+        assert(near(at(25, kRow).r, 0));
     }
 
     return 0;

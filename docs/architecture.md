@@ -30,7 +30,9 @@
   唤醒由 `Frame` 自己负责——它盯着自己画过的每个表面的 commit，`invalidate()`、`damage_all()`
   与 `reset()` 也各要一帧。
   整窗特效用 `begin_group()` / `compose_group()`：源摆位仍在同一串里做命中测试，却只把离屏结果作为
-  一个纹理摆位画到输出；该 prepass 的 acquire/release fence 与整窗 damage 自动接回 `submit()`。
+  一个纹理摆位画到输出；`PlacementTransform` 可链式裁剪、缩放、位移、淡入淡出该结果，也可直接用于
+  客户端表面树或 compositor-owned texture（树的 hit-test 自动反变换；树的 alpha 则应走离屏组），而
+  该 prepass 的 acquire/release fence 与整窗 damage 自动接回 `submit()`。
   **窗口开、关、移动、缩放、换层次的 damage 由 `submit()` 对比出来**：它把这一帧的摆位串
   与上一次真正上屏的那一串逐位比较（位置也算身份的一部分，因为串是有 z 序的），差异处的
   旧矩形与新矩形各记一笔。没有客户端会为「它被放到别处了」报 damage，而这件事完整地写在

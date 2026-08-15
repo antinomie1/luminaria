@@ -72,6 +72,11 @@ struct Placement {
     float x = 0, y = 0;          ///< top-left, layout coordinates
     float width = 0, height = 0; ///< surface coordinates, not buffer pixels
 
+    // The inverse map used only for a transformed client surface's input.
+    // Ordinary placements retain the defaults: `(layout - x) * 1 + 0`.
+    float input_x = 0.0f, input_y = 0.0f;
+    float input_scale_x = 1.0f, input_scale_y = 1.0f;
+
     Transform transform = Transform::normal;
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
 
@@ -92,6 +97,49 @@ struct Placement {
     /// this layer exists to not pay.
     std::uint32_t opaque_first = 0;
     std::uint32_t opaque_count = 0;
+};
+
+/// A visual placement's transform. It is a small immutable value object so an
+/// animation can build crop, scale, move and opacity in one place, then hand
+/// the finished result to `Frame` for a surface tree or a compositor texture.
+///
+/// `crop()`'s rectangle is normalized to the transform's CURRENT visible
+/// source rectangle: `(0,0,1,1)` keeps it all, `(0.25,0,0.5,1)` keeps its
+/// middle half. This makes repeated crops compose instead of replacing one
+/// another. `rescale()` is around the top-left; call `relocate()` afterwards
+/// when the animation needs a different anchor.
+class PlacementTransform {
+public:
+    [[nodiscard]] static PlacementTransform at(float x, float y, float width,
+                                               float height) noexcept {
+        PlacementTransform result{};
+        result.x_ = x;
+        result.y_ = y;
+        result.width_ = width;
+        result.height_ = height;
+        return result;
+    }
+
+    /// Keep a normalized sub-rectangle of the currently visible texture.
+    [[nodiscard]] PlacementTransform crop(float x, float y, float width,
+                                          float height) const noexcept;
+
+    /// Move the destination rectangle without changing its size or crop.
+    [[nodiscard]] PlacementTransform relocate(float x, float y) const noexcept;
+
+    /// Scale the destination rectangle around its top-left corner.
+    [[nodiscard]] PlacementTransform rescale(float x, float y) const noexcept;
+
+    /// Set whole-quad opacity, clamped to `[0, 1]`.
+    [[nodiscard]] PlacementTransform opacity(float alpha) const noexcept;
+
+private:
+    friend class Frame;
+
+    float x_ = 0.0f, y_ = 0.0f;
+    float width_ = 0.0f, height_ = 0.0f;
+    float u0_ = 0.0f, v0_ = 0.0f, u1_ = 1.0f, v1_ = 1.0f;
+    float alpha_ = 1.0f;
 };
 
 /// A marker returned by `Frame::begin_group()`. It names the suffix of the
@@ -161,6 +209,14 @@ public:
     /// output's view entirely are dropped here rather than carried to the GPU.
     void place(Surface& surface, int x, int y);
 
+    /// Place a surface tree through a composable crop / scale / move transform.
+    /// An explicit crop is in the root surface's normalized logical coordinates;
+    /// an uncropped transform retains children outside the root. Hit-testing
+    /// applies the inverse scale before consulting each surface's input region.
+    /// For opacity below one use `compose_group()` instead: applying it per
+    /// child exposes seams wherever subsurfaces or popups overlap.
+    void place(Surface& surface, const PlacementTransform& transform);
+
     /// Place a texture the compositor owns — a themed cursor on a backend with
     /// no cursor plane. It is not hit-testable, and it reports no damage of its
     /// own; moving it or swapping the texture is nevertheless picked up, because
@@ -176,6 +232,10 @@ public:
     /// outward to pixels, so a subpixel move cannot leave a stale edge.
     void place(const GpuTexture& texture, float x, float y, float width, float height,
                float alpha = 1.0f);
+
+    /// Place a compositor-owned texture through a composable crop / scale /
+    /// move / opacity transform. Invalid or empty transforms draw nothing.
+    void place(const GpuTexture& texture, const PlacementTransform& transform);
 
     /// Mark the start of a window-sized group. Add the window's surface tree,
     /// its popups, and any other visual members with `place()`, then hand the
@@ -196,6 +256,14 @@ public:
     /// effect itself needs a fresh image.
     [[nodiscard]] Status compose_group(PlacementGroup group, OffscreenTarget& target,
                                        const Box& bounds, float alpha = 1.0f);
+
+    /// As above, but place the finished offscreen texture through `transform`.
+    /// `bounds` still describes the source image and therefore the required
+    /// target allocation; the transform describes only how that image appears
+    /// on this output.
+    [[nodiscard]] Status compose_group(PlacementGroup group, OffscreenTarget& target,
+                                       const Box& bounds,
+                                       const PlacementTransform& transform);
 
     /// This frame's list, back-to-front. Valid until the next `begin()`.
     [[nodiscard]] std::span<const Placement> placements() const noexcept;
@@ -275,6 +343,48 @@ private:
 // --------------------------------------------------------------- implementation
 
 namespace luminaria {
+
+PlacementTransform PlacementTransform::crop(float x, float y, float width,
+                                            float height) const noexcept {
+    PlacementTransform result = *this;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(width) ||
+        !std::isfinite(height)) {
+        result.width_ = 0.0f;
+        result.height_ = 0.0f;
+        return result;
+    }
+    const float left = std::clamp(x, 0.0f, 1.0f);
+    const float top = std::clamp(y, 0.0f, 1.0f);
+    const float right = std::clamp(x + width, 0.0f, 1.0f);
+    const float bottom = std::clamp(y + height, 0.0f, 1.0f);
+    const float source_width = u1_ - u0_;
+    const float source_height = v1_ - v0_;
+    result.u0_ = u0_ + source_width * left;
+    result.v0_ = v0_ + source_height * top;
+    result.u1_ = u0_ + source_width * right;
+    result.v1_ = v0_ + source_height * bottom;
+    return result;
+}
+
+PlacementTransform PlacementTransform::relocate(float x, float y) const noexcept {
+    PlacementTransform result = *this;
+    result.x_ = x;
+    result.y_ = y;
+    return result;
+}
+
+PlacementTransform PlacementTransform::rescale(float x, float y) const noexcept {
+    PlacementTransform result = *this;
+    result.width_ *= x;
+    result.height_ *= y;
+    return result;
+}
+
+PlacementTransform PlacementTransform::opacity(float alpha) const noexcept {
+    PlacementTransform result = *this;
+    result.alpha_ = std::isfinite(alpha) ? std::clamp(alpha, 0.0f, 1.0f) : 0.0f;
+    return result;
+}
 
 // A cached bridge from one Surface's current wl_buffer to a GPU texture. Kept
 // in the GPU shell rather than Surface so the core compositor has no Vulkan
@@ -680,6 +790,89 @@ void Frame::place(Surface& surface, int x, int y) {
     }
 }
 
+void Frame::place(Surface& surface, const PlacementTransform& transform) {
+    Impl& impl = *impl_;
+    if (!std::isfinite(transform.x_) || !std::isfinite(transform.y_) ||
+        !std::isfinite(transform.width_) || !std::isfinite(transform.height_) ||
+        !std::isfinite(transform.u0_) || !std::isfinite(transform.v0_) ||
+        !std::isfinite(transform.u1_) || !std::isfinite(transform.v1_) ||
+        transform.width_ <= 0.0f || transform.height_ <= 0.0f ||
+        transform.u1_ <= transform.u0_ || transform.v1_ <= transform.v0_) {
+        return;
+    }
+    const float root_width = static_cast<float>(surface.surface_width());
+    const float root_height = static_cast<float>(surface.surface_height());
+    if (root_width <= 0.0f || root_height <= 0.0f) {
+        return;
+    }
+    const float crop_x0 = transform.u0_ * root_width;
+    const float crop_y0 = transform.v0_ * root_height;
+    const float crop_x1 = transform.u1_ * root_width;
+    const float crop_y1 = transform.v1_ * root_height;
+    const float crop_width = crop_x1 - crop_x0;
+    const float crop_height = crop_y1 - crop_y0;
+    if (crop_width <= 0.0f || crop_height <= 0.0f) {
+        return;
+    }
+    // A bare transform moves/scales the whole tree, including a subsurface
+    // which legitimately extends beyond its parent's rectangle. An explicit
+    // crop, on the other hand, is defined in the root's coordinates and clips
+    // the tree to that root rectangle.
+    const bool full_root_crop = transform.u0_ == 0.0f && transform.v0_ == 0.0f &&
+                                transform.u1_ == 1.0f && transform.v1_ == 1.0f;
+
+    impl.tree.clear();
+    surface.surface_tree(impl.tree);
+    for (const SurfaceAt& at : impl.tree) {
+        Surface& s = *at.surface;
+        const float child_x0 = static_cast<float>(at.x);
+        const float child_y0 = static_cast<float>(at.y);
+        const float child_width = static_cast<float>(s.surface_width());
+        const float child_height = static_cast<float>(s.surface_height());
+        const float child_x1 = child_x0 + child_width;
+        const float child_y1 = child_y0 + child_height;
+        const float clip_x0 = full_root_crop ? child_x0 : std::max(child_x0, crop_x0);
+        const float clip_y0 = full_root_crop ? child_y0 : std::max(child_y0, crop_y0);
+        const float clip_x1 = full_root_crop ? child_x1 : std::min(child_x1, crop_x1);
+        const float clip_y1 = full_root_crop ? child_y1 : std::min(child_y1, crop_y1);
+        if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) {
+            continue;
+        }
+
+        const float input_x = clip_x0 - child_x0;
+        const float input_y = clip_y0 - child_y0;
+        const float input_width = clip_x1 - clip_x0;
+        const float input_height = clip_y1 - clip_y0;
+        Placement p{};
+        p.surface = s.id();
+        p.x = transform.x_ + (clip_x0 - crop_x0) * transform.width_ / crop_width;
+        p.y = transform.y_ + (clip_y0 - crop_y0) * transform.height_ / crop_height;
+        p.width = input_width * transform.width_ / crop_width;
+        p.height = input_height * transform.height_ / crop_height;
+        const Box coverage = fr_coverage(p.x, p.y, p.width, p.height);
+        if (coverage.empty() || impl.view.intersection(coverage).empty()) {
+            continue;
+        }
+        p.input_x = input_x;
+        p.input_y = input_y;
+        p.input_scale_x = input_width / p.width;
+        p.input_scale_y = input_height / p.height;
+        p.transform = s.buffer_transform();
+        float source_u0 = 0.0f, source_v0 = 0.0f, source_u1 = 1.0f, source_v1 = 1.0f;
+        s.buffer_source_uv(source_u0, source_v0, source_u1, source_v1);
+        p.u0 = source_u0 + (source_u1 - source_u0) * input_x / child_width;
+        p.v0 = source_v0 + (source_v1 - source_v0) * input_y / child_height;
+        p.u1 = source_u0 + (source_u1 - source_u0) * (input_x + input_width) / child_width;
+        p.v1 = source_v0 + (source_v1 - source_v0) * (input_y + input_height) / child_height;
+        p.alpha = transform.alpha_;
+        // Scaling an arbitrary client opaque region would need a fractional
+        // region representation. Leaving it non-opaque is conservative: it
+        // costs some overdraw but never hides wallpaper or another client.
+        p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
+        impl.placements.push_back(p);
+    }
+}
+
 void Frame::place(const GpuTexture& texture, int x, int y, int width, int height) {
     place(texture, x, y, width, height, 1.0f);
 }
@@ -691,18 +884,34 @@ void Frame::place(const GpuTexture& texture, int x, int y, int width, int height
 
 void Frame::place(const GpuTexture& texture, float x, float y, float width, float height,
                   float alpha) {
+    place(texture, PlacementTransform::at(x, y, width, height).opacity(alpha));
+}
+
+void Frame::place(const GpuTexture& texture, const PlacementTransform& transform) {
     Impl& impl = *impl_;
-    const Box box = fr_coverage(x, y, width, height);
+    if (!std::isfinite(transform.x_) || !std::isfinite(transform.y_) ||
+        !std::isfinite(transform.width_) || !std::isfinite(transform.height_) ||
+        !std::isfinite(transform.u0_) || !std::isfinite(transform.v0_) ||
+        !std::isfinite(transform.u1_) || !std::isfinite(transform.v1_) ||
+        transform.width_ <= 0.0f || transform.height_ <= 0.0f ||
+        transform.u1_ <= transform.u0_ || transform.v1_ <= transform.v0_) {
+        return;
+    }
+    const Box box = fr_coverage(transform.x_, transform.y_, transform.width_, transform.height_);
     if (box.empty() || impl.view.intersection(box).empty()) {
         return;
     }
     Placement p{};
     p.texture = &texture;
-    p.x = x;
-    p.y = y;
-    p.width = width;
-    p.height = height;
-    p.alpha = std::clamp(alpha, 0.0f, 1.0f);
+    p.x = transform.x_;
+    p.y = transform.y_;
+    p.width = transform.width_;
+    p.height = transform.height_;
+    p.u0 = transform.u0_;
+    p.v0 = transform.v0_;
+    p.u1 = transform.u1_;
+    p.v1 = transform.v1_;
+    p.alpha = transform.alpha_;
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
 }
@@ -713,6 +922,16 @@ PlacementGroup Frame::begin_group() const noexcept {
 
 Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const Box& bounds,
                             float alpha) {
+    return compose_group(group, target, bounds,
+                         PlacementTransform::at(static_cast<float>(bounds.x),
+                                                static_cast<float>(bounds.y),
+                                                static_cast<float>(bounds.width),
+                                                static_cast<float>(bounds.height))
+                             .opacity(alpha));
+}
+
+Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const Box& bounds,
+                            const PlacementTransform& transform) {
     Impl& impl = *impl_;
     if (group.generation_ != impl.generation || group.first_ >= impl.placements.size()) {
         return fail("offscreen group is empty or belongs to an earlier frame");
@@ -798,17 +1017,14 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const
         }
     }
 
-    Placement final{};
-    final.texture = &target.texture();
-    final.x = bounds.x;
-    final.y = bounds.y;
-    final.width = bounds.width;
-    final.height = bounds.height;
-    final.alpha = std::clamp(alpha, 0.0f, 1.0f);
-    final.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
-    impl.placements.push_back(final);
-    impl.prepass_damage.push_back(
-        Box{bounds.x - impl.view.x, bounds.y - impl.view.y, bounds.width, bounds.height});
+    const std::size_t before = impl.placements.size();
+    place(target.texture(), transform);
+    if (impl.placements.size() != before) {
+        const Placement& final = impl.placements.back();
+        impl.prepass_damage.push_back(fr_coverage(final.x - static_cast<float>(impl.view.x),
+                                                  final.y - static_cast<float>(impl.view.y),
+                                                  final.width, final.height));
+    }
     return ok();
 }
 
@@ -826,8 +1042,8 @@ SurfaceId Frame::surface_at(double x, double y, double& sx, double& sy) const {
         if (surface == nullptr) {
             continue;
         }
-        const double lx = x - it->x;
-        const double ly = y - it->y;
+        const double lx = it->input_x + (x - it->x) * it->input_scale_x;
+        const double ly = it->input_y + (y - it->y) * it->input_scale_y;
         if (surface->accepts_input(lx, ly)) {
             sx = lx;
             sy = ly;
@@ -890,10 +1106,12 @@ Result<Presented> Frame::submit(Color background) {
     // The cursor has to be on its own plane, or it would not appear — nothing is
     // compositing it in.
     if (impl.direct.has_value() && output.has_cursor_plane() && impl.placements.size() == 1 &&
-        impl.placements[0].surface.valid()) {
+        impl.placements[0].draw && impl.placements[0].surface.valid()) {
         const Placement& only = impl.placements[0];
         if (only.x == impl.view.x && only.y == impl.view.y &&
-            only.width == output.logical_width() && only.height == output.logical_height()) {
+            only.width == output.logical_width() && only.height == output.logical_height() &&
+            only.transform == Transform::normal && only.u0 == 0.0f && only.v0 == 0.0f &&
+            only.u1 == 1.0f && only.v1 == 1.0f && only.alpha == 1.0f) {
             Surface* surface = surface_from_id(only.surface);
             if (surface != nullptr) {
                 if (auto id = impl.direct->id_for(*surface)) {

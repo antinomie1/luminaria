@@ -7,6 +7,7 @@
 #include "detail/wayland_fwd.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -468,7 +469,11 @@ int main() {
                 if (p.surface != parent.id()) {
                     continue;
                 }
-                parent_box = luminaria::Box{p.x, p.y, p.width, p.height};
+                const int left = static_cast<int>(std::floor(p.x));
+                const int top = static_cast<int>(std::floor(p.y));
+                const int right = static_cast<int>(std::ceil(p.x + p.width));
+                const int bottom = static_cast<int>(std::ceil(p.y + p.height));
+                parent_box = luminaria::Box{left, top, right - left, bottom - top};
                 usable = layout.box_of(*output);
                 return !usable.empty();
             }

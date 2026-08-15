@@ -68,6 +68,7 @@
 | render | **离屏合成**：`OffscreenTarget` 是可写也可采样的 RGBA GPU image；`render_offscreen()` 和 `render_to()` 共用 pass/遮挡/damage 路径，写完就停在 shader-read layout，可直接作为下一趟 `GpuTextureFill`。整窗淡入淡出不会把重叠子表面混合两次（ADR 0005） | offscreen |
 | render | **预乘 alpha**：`GpuTextureFill::alpha` 作用于整张 quad，片元颜色与 alpha 一起缩放，再由 `ONE / ONE_MINUS_SRC_ALPHA` 混合；半透明内容正确叠加，离屏的整窗结果可一次淡入淡出 | offscreen |
 | render | **连续几何**：`GpuTextureFill` 与 compositor-owned `Placement` 用 float x/y/width/height；vertex shader 保留小数，damage 与 scissor 对覆盖范围向外取整，所以半像素动画既平滑也不会留下旧像素 | gpu-scanout, offscreen |
+| render | **可组合摆位变换**：`PlacementTransform::at(...).crop(...).rescale(...).relocate(...).opacity(...)` 把 normalized crop、缩放、位移与整张纹理透明度收成不可变值对象；客户端表面树、普通 compositor texture 与 `compose_group()` 的离屏整窗结果共用一条路径，缩放树的命中测试会反变换回客户端坐标 | frame, offscreen |
 | render | **遮挡剔除**：`GpuTextureFill::opaque` 声明的不透明区从前往后累积，被完全盖住的表面一次都不采样 —— 最大化窗口下的壁纸不进 GPU | gpu-scanout |
 | render | **异步提交**：`RenderSync` 让 `render_to` 等一组 sync_file（客户端 acquire point）并吐出 out-fence，自己不阻塞；未完成的提交挂在 in-flight 列表上按 fence 回收 | gpu-scanout |
 | render | **纹理缓存**：`Frame` 的 GPU bridge 按 `SurfaceId` + `wl_buffer` 缓存。dmabuf 导入是客户端内存的实时视图，跨帧保留；shm 上传是快照，客户端重绘时才重传；表面销毁后旧 id 立即失效，旧 placement 再 submit 也不会碰悬空纹理 | frame, texture-cache |
@@ -100,7 +101,7 @@
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。`begin_group` / `compose_group` 将一组摆位离屏化并贴回成一个整窗纹理，源摆位仍负责命中测试。稳态重排零堆分配 | frame, offscreen |
+| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。`PlacementTransform` 可直接摆客户端树或 texture，或交给 `compose_group` 决定离屏整窗的裁剪、缩放、位移与透明度；源摆位仍负责命中测试。稳态重排零堆分配 | frame, offscreen |
 | shell | **摆位串 diff 出 damage** —— `submit()` 把这一帧的摆位串与上一次上屏的那串逐位比较（位置进身份，所以换 z 序也算变），差异处旧矩形与新矩形各记一笔。窗口开 / 关 / 移动 / 缩放 / 换层次没有任何客户端会报 damage，但全写在摆位串里，所以混成器只欠一次 `invalidate()` 唤醒；移动一个窗口的代价是它跨过的两个矩形而非一屏。`damage_all()` 退为钝器（底色变了、直出后合成缓冲失效） | frame-damage |
 | shell | **无 damage 不提交** —— `submit()` 发现这一帧与屏上那一帧完全一致时答 `unchanged`：不渲染、不翻页、不轮换缓冲，输出随即安静。唤醒是 `Frame` 自己的事——它盯着自己画过的每个表面的 commit，`invalidate()` / `damage_all()` 与 `reset()` 也各要一帧；混成器只需在收到 `unchanged` 时补发帧回调（那一帧没有 `present`） | idle-wake, frame |
 | xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |
