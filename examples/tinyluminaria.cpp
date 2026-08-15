@@ -196,11 +196,10 @@ int main() {
 
     // A named-cursor request replaces the client's cursor surface; we have no
     // theme loader, so record the name and keep drawing the built-in arrow.
+    // (The connection itself is made below, once there is a frame to repaint.)
     const char* cursor_name = "default";
-    auto cursor_shape_conn =
-        cursor_shape.request().connect([&](luminaria::CursorShapeRequest& r) {
-            cursor_name = r.name;
-        });
+    luminaria::Signal<luminaria::CursorShapeRequest>::Connection cursor_shape_conn;
+    luminaria::Signal<luminaria::SeatCursorChange>::Connection cursor_changed_conn;
 
     // Screencopy: allow tools like grim/slurp to capture the output.
     auto screencopy = must(luminaria::ScreencopyManager::create(display), "screencopy");
@@ -215,6 +214,32 @@ int main() {
         luminaria::Signal<luminaria::PresentEvent>::Connection on_present;
     };
     std::map<luminaria::Output*, PerOutput> per_output;
+
+    // "Something changed that no client reported": a window appearing or
+    // vanishing, a popup, the pointer moving over a composited cursor. None of
+    // those produce surface damage, and none of them would otherwise reach the
+    // screen — outputs only deliver a frame when someone asks, and this is the
+    // asking. A client redrawing its own window needs nothing here; the frame
+    // is already watching every surface it draws.
+    auto damage_everything = [&per_output] {
+        for (auto& [output, po] : per_output) {
+            if (po.frame.has_value()) {
+                po.frame->damage_all();
+            }
+        }
+    };
+
+    // The pointer's picture is drawn by us, so every change to it is one of
+    // those unreported changes — the shape a client asked for by name, or the
+    // client swapping in a cursor surface of its own, which the frame is not
+    // watching until it has drawn it once.
+    cursor_shape_conn = cursor_shape.request().connect(
+        [&cursor_name, &damage_everything](luminaria::CursorShapeRequest& r) {
+            cursor_name = r.name;
+            damage_everything();
+        });
+    cursor_changed_conn = seat.cursor_changed().connect(
+        [&damage_everything](luminaria::SeatCursorChange&) { damage_everything(); });
 
     output_global.on_bind([&](wl_resource* res) {
         screencopy.add_output(res, output_global.width(), output_global.height(),
@@ -564,8 +589,10 @@ int main() {
         w.x = w.saved_x = 40 + 30 * n;
         w.y = w.saved_y = 40 + 30 * n;
         w.on_map = e.toplevel.map.connect(
-            [&w, &focus_window, &fractional, &output_global](luminaria::ToplevelMap&) {
+            [&w, &focus_window, &fractional, &output_global,
+             &damage_everything](luminaria::ToplevelMap&) {
                 w.mapped = true;
+                damage_everything();
                 focus_window(&w);
                 // Tell the client what density to render at, both ways: the
                 // integer hint every client understands, and the exact scale
@@ -575,16 +602,18 @@ int main() {
                 surface.set_preferred_buffer_transform(output_global.transform());
                 fractional.set_scale(surface, output_global.scale() * 120);
             });
-        w.on_unmap = e.toplevel.unmap.connect([&w](luminaria::ToplevelUnmap&) {
+        w.on_unmap = e.toplevel.unmap.connect([&w, &damage_everything](luminaria::ToplevelUnmap&) {
             w.mapped = false;
+            damage_everything();
         });
         w.on_destroy = e.toplevel.destroy.connect(
-            [&w, &focused, &focus_window](luminaria::ToplevelDestroy&) {
+            [&w, &focused, &focus_window, &damage_everything](luminaria::ToplevelDestroy&) {
                 if (focused == w.toplevel) {
                     focus_window(nullptr);
                 }
                 w.mapped = false;
                 w.toplevel = nullptr;
+                damage_everything();
             });
         // Window state: we grant maximize/fullscreen and tell the client what
         // size to take. Both cover the whole output here — there's no panel.
@@ -625,11 +654,18 @@ int main() {
     auto new_popup = shell.new_popup().connect([&](luminaria::NewPopup& e) {
         PopupEntry& p = popups.emplace_back();
         p.popup = &e.popup;
-        p.on_map = e.popup.map.connect([&p](luminaria::PopupMap&) { p.mapped = true; });
-        p.on_unmap = e.popup.unmap.connect([&p](luminaria::PopupUnmap&) { p.mapped = false; });
-        p.on_destroy = e.popup.destroy.connect([&p](luminaria::PopupDestroy&) {
+        p.on_map = e.popup.map.connect([&p, &damage_everything](luminaria::PopupMap&) {
+            p.mapped = true;
+            damage_everything();
+        });
+        p.on_unmap = e.popup.unmap.connect([&p, &damage_everything](luminaria::PopupUnmap&) {
+            p.mapped = false;
+            damage_everything();
+        });
+        p.on_destroy = e.popup.destroy.connect([&p, &damage_everything](luminaria::PopupDestroy&) {
             p.mapped = false;
             p.popup = nullptr;
+            damage_everything();
         });
     });
 
@@ -681,6 +717,13 @@ int main() {
         };
 
         on_ptr_motion = nested->pointer_motion.connect([&](luminaria::PointerMotionAbsEvent& e) {
+            // The cursor is composited here (a nested output has no cursor
+            // plane), and a placed texture reports no damage of its own — so
+            // the pointer moving at all is a repaint this compositor has to
+            // ask for. A whole output for a 24-pixel sprite is more than it
+            // takes; damaging the two cursor rects is what a compositor that
+            // cares would do.
+            damage_everything();
             if (e.x < 0) { // pointer left our window
                 ptr_inside = false;
                 ptr_focus = {};
