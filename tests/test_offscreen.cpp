@@ -162,6 +162,27 @@ int main() {
         assert(renderer->render_to(*target, black, {}, fills).has_value());
         assert(renderer->read_scanout(*target, pixels).has_value());
         assert(near(red_at(pixels, kOverlap, kRow), 128));
+
+        // Frame is the normal shell-layer caller. It must preserve the one
+        // whole-window alpha too: placing the offscreen result at 50% through
+        // Frame produces the same seam-free middle as calling render_to()
+        // directly above.
+        auto display = luminaria::Display::create();
+        assert(display.has_value());
+        luminaria::HeadlessOutput output(display->event_loop(), kW, kH, 16);
+        luminaria::Frame frame(output, *renderer);
+        assert(frame.reset(DRM_FORMAT_XRGB8888).has_value());
+        frame.begin({0, 0, kW, kH});
+        frame.place(offscreen->texture(), 0, 0, win_w, kQuadH, 0.5f);
+        assert(frame.submit(black).has_value());
+        auto readback = frame.read_back();
+        assert(readback.has_value());
+        const auto at = [&](int x, int y) {
+            return (*readback)[static_cast<std::size_t>(y) * kW + x];
+        };
+        assert(near(at(kOnlyA, kRow).r, 128));
+        assert(near(at(kOverlap, kRow).r, 128));
+        assert(near(at(kOnlyB, kRow).r, 128));
     }
 
     return 0;

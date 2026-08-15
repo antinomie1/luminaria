@@ -73,6 +73,11 @@ struct Placement {
     Transform transform = Transform::normal;
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
 
+    /// Whole-placement opacity. Client surfaces always use 1; compositor-owned
+    /// textures may use less, normally after a whole window was first composed
+    /// into an OffscreenTarget. A translucent placement must not claim opacity.
+    float alpha = 1.0f;
+
     /// The opaque region, in layout coordinates, as `[first, first+count)` in
     /// the frame's arena — ask `Frame::opaque_of()`. It lives here as a pair of
     /// indices rather than a `Region` because a `Region` per surface per frame
@@ -139,7 +144,8 @@ public:
     /// no cursor plane. It is not hit-testable, and it reports no damage of its
     /// own; moving it or swapping the texture is nevertheless picked up, because
     /// `submit()` diffs this frame's list against the last one it drew.
-    void place(const GpuTexture& texture, int x, int y, int width, int height);
+    void place(const GpuTexture& texture, int x, int y, int width, int height,
+               float alpha = 1.0f);
 
     /// This frame's list, back-to-front. Valid until the next `begin()`.
     [[nodiscard]] std::span<const Placement> placements() const noexcept;
@@ -266,6 +272,7 @@ struct FrPlacementKey {
     Box box{};
     Transform transform = Transform::normal;
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+    float alpha = 1.0f;
 
     // Member and not a hidden friend: a defaulted hidden-friend operator== in a
     // module interface ICEs gcc 16.
@@ -273,7 +280,8 @@ struct FrPlacementKey {
         return surface == other.surface && texture == other.texture &&
                box.x == other.box.x && box.y == other.box.y && box.width == other.box.width &&
                box.height == other.box.height && transform == other.transform &&
-               u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1;
+               u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1 &&
+               alpha == other.alpha;
     }
 };
 
@@ -334,6 +342,7 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
     key.v0 = p.v0;
     key.u1 = p.u1;
     key.v1 = p.v1;
+    key.alpha = p.alpha;
     return key;
 }
 
@@ -589,7 +598,7 @@ void Frame::place(Surface& surface, int x, int y) {
     }
 }
 
-void Frame::place(const GpuTexture& texture, int x, int y, int width, int height) {
+void Frame::place(const GpuTexture& texture, int x, int y, int width, int height, float alpha) {
     Impl& impl = *impl_;
     const Box box{x, y, width, height};
     if (box.empty() || impl.view.intersection(box).empty()) {
@@ -601,6 +610,7 @@ void Frame::place(const GpuTexture& texture, int x, int y, int width, int height
     p.y = y;
     p.width = width;
     p.height = height;
+    p.alpha = std::clamp(alpha, 0.0f, 1.0f);
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
 }
@@ -779,13 +789,16 @@ Result<Presented> Frame::submit(Color background) {
         fill.v0 = p.v0;
         fill.u1 = p.u1;
         fill.v1 = p.v1;
+        fill.alpha = p.alpha;
         // The placement's opaque region, moved from layout coordinates into
         // this output's. Borrowed by the fill, so it goes into its own buffer:
         // the arena is what `opaque_of()` still answers from.
         const std::size_t first = impl.fill_opaque.size();
-        for (const Box& b : opaque_of(p)) {
-            impl.fill_opaque.push_back(Box{b.x - impl.view.x, b.y - impl.view.y, b.width,
-                                           b.height});
+        if (p.alpha == 1.0f) {
+            for (const Box& b : opaque_of(p)) {
+                impl.fill_opaque.push_back(Box{b.x - impl.view.x, b.y - impl.view.y, b.width,
+                                               b.height});
+            }
         }
         fill.opaque =
             std::span<const Box>{impl.fill_opaque}.subspan(first, impl.fill_opaque.size() - first);
