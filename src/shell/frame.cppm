@@ -136,8 +136,9 @@ public:
     void place(Surface& surface, int x, int y);
 
     /// Place a texture the compositor owns — a themed cursor on a backend with
-    /// no cursor plane. It is not hit-testable and reports no damage, so a frame
-    /// that only moved it needs `damage_all()`.
+    /// no cursor plane. It is not hit-testable, and it reports no damage of its
+    /// own; moving it or swapping the texture is nevertheless picked up, because
+    /// `submit()` diffs this frame's list against the last one it drew.
     void place(const GpuTexture& texture, int x, int y, int width, int height);
 
     /// This frame's list, back-to-front. Valid until the next `begin()`.
@@ -152,12 +153,26 @@ public:
     /// region, so it agrees with the pixels by construction.
     [[nodiscard]] SurfaceId surface_at(double x, double y, double& sx, double& sy) const;
 
-    /// "Pixels changed that no client reported." A window appearing, vanishing
-    /// or moving is invisible to per-surface damage, and so is a frame that was
-    /// direct-scanned-out; every one of those has to force a full repaint.
+    /// "My model changed — work out what that costs." A window opened, closed,
+    /// moved, resized or changed depth: none of that is visible to per-surface
+    /// damage, but all of it IS visible in the placement list, so `submit()`
+    /// recovers the damage by diffing this frame's list against the last one it
+    /// drew. What the compositor still owes is the wake-up, because the diff
+    /// only runs once a frame arrives and an idle output emits none.
     ///
-    /// It also asks the output for a frame, so this is what wakes a screen that
-    /// has gone idle. Clients redrawing wake it by themselves.
+    /// So: call this whenever the layout changes, and place the new layout on
+    /// the next frame. It is cheap and idempotent — one `schedule_frame()` — and
+    /// it is deliberately NOT a full repaint. Only the pixels that actually
+    /// moved are drawn.
+    void invalidate() noexcept;
+
+    /// "Every pixel of this output is stale, and the list does not say why."
+    /// The blunt instrument, for the things the diff cannot see: the background
+    /// colour changing, or a target whose contents were invalidated from
+    /// outside. A frame that was direct-scanned-out sets it internally, because
+    /// the composited buffers then hold something that was never on screen.
+    ///
+    /// Prefer `invalidate()`. This one repaints the whole output.
     void damage_all() noexcept;
 
     /// Compose the placement list onto the output and put it on screen.
@@ -234,6 +249,34 @@ struct FrSurfaceTexture {
     }
 };
 
+// One frame's worth of "what was drawn here, and where" — everything about a
+// placement that changes the pixels, in OUTPUT-local coordinates. Comparing
+// this frame's list against the last one is where the damage for moving,
+// opening, closing, resizing and restacking windows comes from; none of that is
+// reported by any client, and asking the compositor to report it by hand is the
+// bookkeeping that immediate mode exists to avoid.
+//
+// `texture` is compared and never dereferenced — by the time it is looked at,
+// the surface it belonged to may be gone. It is in the key because a texture
+// swapped at an unchanged rectangle (the compositor's own cursor image) is a
+// visible change that no client damage covers.
+struct FrPlacementKey {
+    SurfaceId surface;
+    const GpuTexture* texture = nullptr;
+    Box box{};
+    Transform transform = Transform::normal;
+    float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+
+    // Member and not a hidden friend: a defaulted hidden-friend operator== in a
+    // module interface ICEs gcc 16.
+    [[nodiscard]] bool operator==(const FrPlacementKey& other) const noexcept {
+        return surface == other.surface && texture == other.texture &&
+               box.x == other.box.x && box.y == other.box.y && box.width == other.box.width &&
+               box.height == other.box.height && transform == other.transform &&
+               u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1;
+    }
+};
+
 struct Frame::Impl {
     Output* output = nullptr;
     VulkanRenderer* renderer = nullptr;
@@ -267,9 +310,70 @@ struct Frame::Impl {
     std::vector<std::vector<Box>> debt;
     bool full_redraw = true;
 
+    // The list as it was at the last submit that reached the screen, and the
+    // view it was placed against. Not the last `begin()`/`place()` rebuild:
+    // hit-testing rebuilds the list too, and those rebuilds draw nothing.
+    std::vector<FrPlacementKey> last;
+    Box last_view{};
+    bool last_valid = false;
+
     void rotate_debt();
+    void diff_damage();
+    void keep_list();
+    [[nodiscard]] FrPlacementKey key_of(const Placement& p) const noexcept;
     [[nodiscard]] GpuTexture* texture_for(Surface& surface);
 };
+
+FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
+    FrPlacementKey key{};
+    key.surface = p.surface;
+    key.texture = p.texture;
+    key.box = Box{p.x - view.x, p.y - view.y, p.width, p.height};
+    key.transform = p.transform;
+    key.u0 = p.u0;
+    key.v0 = p.v0;
+    key.u1 = p.u1;
+    key.v1 = p.v1;
+    return key;
+}
+
+void Frame::Impl::diff_damage() {
+    // Walk the two lists index by index. A placement's position in the list is
+    // part of its identity, because the list is z-ordered: two windows swapping
+    // depth are identical field for field and still change every pixel where
+    // they overlap. Comparing by index catches that, and costs one pass.
+    //
+    // Anything that differs damages both rectangles — where it was and where it
+    // is — because both have to be repainted: one to reveal what was behind it,
+    // one to draw it. A placement carrying no texture drew nothing, so that side
+    // contributes no box.
+    const std::size_t n = std::max(placements.size(), last.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool had = i < last.size();
+        const bool has = i < placements.size();
+        const FrPlacementKey now = has ? key_of(placements[i]) : FrPlacementKey{};
+        if (had && has && last[i] == now) {
+            continue; // unchanged: only this surface's own damage applies
+        }
+        if (had && last[i].texture != nullptr) {
+            damage.push_back(last[i].box);
+        }
+        if (has && now.texture != nullptr) {
+            damage.push_back(now.box);
+        }
+    }
+}
+
+void Frame::Impl::keep_list() {
+    // `assign` over a vector that has been here before keeps its capacity, so a
+    // steady-state frame does not allocate to remember itself.
+    last.clear();
+    for (const Placement& p : placements) {
+        last.push_back(key_of(p));
+    }
+    last_view = view;
+    last_valid = true;
+}
 
 GpuTexture* Frame::Impl::texture_for(Surface& surface) {
     std::erase_if(texture_cache, [](const std::unique_ptr<FrSurfaceTexture>& entry) {
@@ -526,10 +630,17 @@ SurfaceId Frame::surface_at(double x, double y, double& sx, double& sy) const {
     return {};
 }
 
+void Frame::invalidate() noexcept {
+    // No damage is recorded here on purpose. The layout the compositor just
+    // changed is not in this frame yet — it arrives with the next `begin()` /
+    // `place()` — and `submit()` will find it by diffing. All that is owed now
+    // is the wake-up, because an output nobody is committing to emits no frames
+    // and would otherwise sit on the old picture forever.
+    impl_->output->schedule_frame();
+}
+
 void Frame::damage_all() noexcept {
     impl_->full_redraw = true;
-    // Whatever moved, appeared or vanished, no client is going to report it —
-    // so this is also the only chance to wake an output that has gone idle.
     impl_->output->schedule_frame();
 }
 
@@ -591,6 +702,11 @@ Result<Presented> Frame::submit(Color background) {
                         // The composited buffers no longer hold what is on screen,
                         // so the next composited frame must be a complete one.
                         impl.full_redraw = true;
+                        // Nothing was composited, so there is no list to diff
+                        // the next one against — and importing this buffer just
+                        // to record it would undo the saving direct scanout is
+                        // here for. The full redraw above covers it.
+                        impl.last_valid = false;
                         return Presented::scanout;
                     }
                 }
@@ -605,6 +721,13 @@ Result<Presented> Frame::submit(Color background) {
     impl.fills.clear();
     impl.drawn.clear();
     impl.damage.clear();
+    // The diff below compares against boxes recorded in this output's own
+    // coordinates. A view that has moved or resized makes every one of them
+    // describe somewhere else, so there is nothing to compare against.
+    if (!impl.last_valid || impl.view.x != impl.last_view.x || impl.view.y != impl.last_view.y ||
+        impl.view.width != impl.last_view.width || impl.view.height != impl.last_view.height) {
+        impl.full_redraw = true;
+    }
     // A forced redraw is not only about the target selected this frame. Every
     // other buffer in the rotation still contains the old scene and must carry
     // a full-output debt until it comes round. Without recording this box,
@@ -670,6 +793,13 @@ Result<Presented> Frame::submit(Color background) {
     }
     output.set_tearing(wants_tearing);
 
+    // What no client reported, and what the compositor no longer has to: the
+    // windows that opened, closed, moved, resized or changed depth since the
+    // last frame that reached the screen.
+    if (!impl.full_redraw) {
+        impl.diff_damage();
+    }
+
     // --- how much of it -----------------------------------------------------
     //
     // An empty repaint list means "everything"; one empty box means "nothing at
@@ -706,6 +836,9 @@ Result<Presented> Frame::submit(Color background) {
                     surface->notify_rendered(-1);
                 }
             }
+            // The list is unchanged by construction — that is what an empty
+            // repaint means — so this only refreshes the resolved textures.
+            impl.keep_list();
             return Presented::unchanged;
         }
     }
@@ -772,6 +905,10 @@ Result<Presented> Frame::submit(Color background) {
     // round again, and start the clients accumulating afresh.
     impl.rotate_debt();
     impl.full_redraw = false;
+    // Remember what reached the screen, so the next frame can tell what moved.
+    // Deliberately not done on the failure paths above: a frame that never got
+    // there must be diffed against again, or its damage is simply lost.
+    impl.keep_list();
     for (SurfaceId id : impl.drawn) {
         if (Surface* surface = surface_from_id(id); surface != nullptr) {
             surface->clear_damage();

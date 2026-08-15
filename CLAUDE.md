@@ -207,10 +207,22 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   frame's client damage plus the damage the buffer being drawn into still owes (buffer age),
   thread the display's out-fence and the clients' acquire fences through the GPU, flip, and
   clear the surfaces' damage. It answers `Presented::{composited,scanout,unchanged,fallback}`;
-  `unchanged` is what step 3 needs to stop flipping over a still screen. **Nothing about a
+  `unchanged` is what step 3 needs to stop flipping over a still screen.
+  **The damage no client reports is diffed out of the placement list.** A window that opened,
+  closed, moved, resized or changed depth damages nothing, but all of it is written in the
+  list, so `submit()` compares this frame's list against the last one that reached the screen
+  — index by index, because the list is z-ordered and a placement's position in it is part of
+  its identity — and damages the old rectangle and the new one wherever they differ. The
+  compositor therefore owes only the *wake-up*, `Frame::invalidate()`, since an idle output
+  emits no frames and the diff runs inside `submit()`. Moving a window costs the two
+  rectangles it moved between rather than a screen. `damage_all()` remains for what the list
+  cannot express: the background colour changing, or the composited buffers being invalidated
+  wholesale after a direct-scanned-out frame. `tests/test_frame_damage.cpp` guards both halves
+  by changing the background between frames — a full repaint and a correct partial one are
+  indistinguishable from the window alone. **Nothing about a
   window survives a frame** — what survives is the memory (every vector is cleared, never
   freed; `Placement::opaque` is an index range into the frame's arena, never a `Region`
-  copy) and the damage debt. `tests/test_frame.cpp` asserts zero heap allocations across a
+  copy), the damage debt, and the comparison keys of the last list drawn. `tests/test_frame.cpp` asserts zero heap allocations across a
   steady-state rebuild by replacing global `operator new`.
   `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits
   in the global coordinate space, in *logical* units (`transform.cppm` holds the

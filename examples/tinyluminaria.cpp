@@ -231,10 +231,14 @@ int main() {
     // screen — outputs only deliver a frame when someone asks, and this is the
     // asking. A client redrawing its own window needs nothing here; the frame
     // is already watching every surface it draws.
-    auto damage_everything = [&per_output] {
+    //
+    // Only the asking: what actually changed is worked out by the frame, which
+    // compares the list it is about to draw against the one it drew last. So
+    // moving a window costs the two rectangles it moved between, not a screen.
+    auto layout_changed = [&per_output] {
         for (auto& [output, po] : per_output) {
             if (po.frame.has_value()) {
-                po.frame->damage_all();
+                po.frame->invalidate();
             }
         }
     };
@@ -244,12 +248,12 @@ int main() {
     // client swapping in a cursor surface of its own, which the frame is not
     // watching until it has drawn it once.
     cursor_shape_conn = cursor_shape.request().connect(
-        [&cursor_name, &damage_everything](luminaria::CursorShapeRequest& r) {
+        [&cursor_name, &layout_changed](luminaria::CursorShapeRequest& r) {
             cursor_name = r.name;
-            damage_everything();
+            layout_changed();
         });
     cursor_changed_conn = seat.cursor_changed().connect(
-        [&damage_everything](luminaria::SeatCursorChange&) { damage_everything(); });
+        [&layout_changed](luminaria::SeatCursorChange&) { layout_changed(); });
 
     output_global.on_bind([&](wl_resource* res) {
         screencopy.add_output(res, output_global.width(), output_global.height(),
@@ -600,9 +604,9 @@ int main() {
         w.y = w.saved_y = 40 + 30 * n;
         w.on_map = e.toplevel.map.connect(
             [&w, &focus_window, &fractional, &output_global,
-             &damage_everything](luminaria::ToplevelMap&) {
+             &layout_changed](luminaria::ToplevelMap&) {
                 w.mapped = true;
-                damage_everything();
+                layout_changed();
                 focus_window(&w);
                 // Tell the client what density to render at, both ways: the
                 // integer hint every client understands, and the exact scale
@@ -612,18 +616,18 @@ int main() {
                 surface.set_preferred_buffer_transform(output_global.transform());
                 fractional.set_scale(surface, output_global.scale() * 120);
             });
-        w.on_unmap = e.toplevel.unmap.connect([&w, &damage_everything](luminaria::ToplevelUnmap&) {
+        w.on_unmap = e.toplevel.unmap.connect([&w, &layout_changed](luminaria::ToplevelUnmap&) {
             w.mapped = false;
-            damage_everything();
+            layout_changed();
         });
         w.on_destroy = e.toplevel.destroy.connect(
-            [&w, &focused, &focus_window, &damage_everything](luminaria::ToplevelDestroy&) {
+            [&w, &focused, &focus_window, &layout_changed](luminaria::ToplevelDestroy&) {
                 if (focused == w.toplevel) {
                     focus_window(nullptr);
                 }
                 w.mapped = false;
                 w.toplevel = nullptr;
-                damage_everything();
+                layout_changed();
             });
         // Window state: we grant maximize/fullscreen and tell the client what
         // size to take. Both cover the whole output here — there's no panel.
@@ -664,18 +668,18 @@ int main() {
     auto new_popup = shell.new_popup().connect([&](luminaria::NewPopup& e) {
         PopupEntry& p = popups.emplace_back();
         p.popup = &e.popup;
-        p.on_map = e.popup.map.connect([&p, &damage_everything](luminaria::PopupMap&) {
+        p.on_map = e.popup.map.connect([&p, &layout_changed](luminaria::PopupMap&) {
             p.mapped = true;
-            damage_everything();
+            layout_changed();
         });
-        p.on_unmap = e.popup.unmap.connect([&p, &damage_everything](luminaria::PopupUnmap&) {
+        p.on_unmap = e.popup.unmap.connect([&p, &layout_changed](luminaria::PopupUnmap&) {
             p.mapped = false;
-            damage_everything();
+            layout_changed();
         });
-        p.on_destroy = e.popup.destroy.connect([&p, &damage_everything](luminaria::PopupDestroy&) {
+        p.on_destroy = e.popup.destroy.connect([&p, &layout_changed](luminaria::PopupDestroy&) {
             p.mapped = false;
             p.popup = nullptr;
-            damage_everything();
+            layout_changed();
         });
     });
 
@@ -733,7 +737,7 @@ int main() {
             // ask for. A whole output for a 24-pixel sprite is more than it
             // takes; damaging the two cursor rects is what a compositor that
             // cares would do.
-            damage_everything();
+            layout_changed();
             if (e.x < 0) { // pointer left our window
                 ptr_inside = false;
                 ptr_focus = {};

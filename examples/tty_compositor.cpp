@@ -551,9 +551,11 @@ int main(int argc, char** argv) {
                 }
             }
             // Whatever the cursor was covering has to be repainted when it
-            // stops being the hardware's problem, or starts being it.
+            // stops being the hardware's problem, or starts being it. Which
+            // rectangles those are is the frame's business: moving on or off
+            // the plane adds or removes a placement, and it diffs for that.
             if (!sc.cursor_on_plane || was_on_plane != sc.cursor_on_plane) {
-                sc.frame->damage_all();
+                sc.frame->invalidate();
             }
         }
     };
@@ -562,12 +564,14 @@ int main(int argc, char** argv) {
     luminaria::Signal<luminaria::SurfaceCommit>::Connection cursor_commit_conn;
 
     // A window appearing or vanishing changes pixels nobody reported damage for.
-    auto damage_everything = [&screens] {
+    // All that is owed is the wake-up: the frame finds the rectangles itself by
+    // comparing the list it is about to draw against the one it drew.
+    auto layout_changed = [&screens] {
         for (Screen& sc : screens) {
-            sc.frame->damage_all();
+            sc.frame->invalidate();
         }
     };
-    window_changed = damage_everything;
+    window_changed = layout_changed;
     auto set_window_covering_layout = [&](Window& window, bool enabled, bool fullscreen) {
         if (window.toplevel == nullptr) {
             return;
@@ -650,7 +654,7 @@ int main(int argc, char** argv) {
         if (seat->pointer_focus() == window.toplevel->surface().id()) {
             seat->pointer_clear_focus();
         }
-        damage_everything();
+        layout_changed();
         std::printf("luminaria-tty: window minimized — \"%s\"\n",
                     window.toplevel->title().c_str());
     };
@@ -894,11 +898,11 @@ int main(int argc, char** argv) {
             if (!sc.cursor_on_plane) {
                 // Composited: the screen the pointer is on has to be repainted,
                 // and so does the one it just left — the cursor it was covering
-                // is still drawn there. A whole screen for a 24-pixel sprite is
-                // more than it takes; damaging the two cursor rects is what a
-                // compositor that cares would do.
+                // is still drawn there. Both only need waking; the two rects the
+                // sprite moved between are what the frame's diff works out, so a
+                // 24-pixel cursor costs 24 pixels rather than a screen.
                 if (here || sc.output == cursor_prev_output) {
-                    sc.frame->damage_all();
+                    sc.frame->invalidate();
                 }
                 continue;
             }

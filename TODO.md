@@ -76,6 +76,50 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 三个核心协议已注册进 `tinyluminaria`；两个 desktop 协议按 ADR 0003 只在 `luminaria.desktop`
 里，需要 compositor 自己创建。剩下的收尾在下面「已知的天花板」里。
 
+### 4. 视觉特效地基 —— 给「带模糊与轻动画的混成器」用
+
+目标形态：bspwm 那样的平铺 + sxhkd 式快捷键，外加背景模糊、圆角、淡入淡出与移动动画。
+摆放逻辑仍然是混成器自己的事（见「明确不做」），库要补的是每个这类混成器都会重写一遍的部分。
+
+参考实现的分工是这么摆的：Hyprland 拒绝了 wlroots 的场景图，于是 damage 全靠手工
+（`damageWindow`/`damageBox` 撒满全树，模糊还要单独按半径膨胀），渲染器从一开始就绕过，
+最后整个 wlroots 被换掉。niri 走 smithay 的**渲染元素**路线：每帧一串带 id 的元素，
+`OutputDamageTracker` 靠比对相邻两帧自动出 damage，另有 crop/rescale/relocate 元素包装器、
+bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布局、动画和模糊的 pass。
+
+我们拒绝场景图的决定和 Hyprland 一样，所以必须主动补上 damage 那一半，否则边界迟早失效。
+`Frame` 的摆位串本来就等于 smithay 的元素串，差的是盖在它上面的四层：
+
+- **(a) 摆位串 diff 出 damage —— 已完成（2026-08-15）**。`submit()` 比对相邻两次上屏的摆位
+  串，窗口开 / 关 / 移动 / 缩放 / 换 z 序的 damage 不再需要混成器记账，`invalidate()` 只负责
+  唤醒。`damage_all()` 退为钝器。`test_frame_damage` 用「帧间换底色」同时守住"有 damage"
+  与"damage 最小"两头。两个示例混成器都已改到 `invalidate()`，光标移动因此从「重画一屏」
+  变成「重画两个 24 像素矩形」。
+- **(b) crop / rescale / relocate 型的摆位包装**。动画要的平移、缩放、裁剪应当是串这一层的
+  组合，不是往 shader 里加参数。`Placement` 需要浮点几何（整数会让滑动逐帧抖）与 alpha。
+- **(c) 把一棵表面树合成到离屏纹理，再当一个摆位贴回**。Hyprland 与 niri 都被迫做了同一件
+  事，理由相同：子表面 / popup 重叠处各自乘 alpha 会露接缝。淡入淡出、缩放动画与模糊三者
+  共用这套离屏基础设施，所以它比「给 `Placement` 加个 alpha 字段」更底层。**要单开 ADR**：
+  它是第一个打破「一帧一 pass」的东西。
+- **(d) 模糊，入口是协议而不是渲染特性**。`ext-background-effect-v1`（staging，KDE 6.7+ /
+  niri / Mutter 已实现，Foot / Kitty / Ghostty / Quickshell 客户端侧已跟进）让客户端自己声明
+  背后哪块要模糊，接口就是 `Surface::blur_region()` 一个粘性双缓冲状态——按 ADR 0003 的准入
+  规则属于核心模块，和 `content_type` 同形。混成器拿到 region 决定画不画，库不猜窗口形状
+  （niri 的手动配置那条路对复杂表面形状效果不好，正是"猜"的代价）。
+  实现先只做 **x-ray**：把静态背景（壁纸 + layer surface）模糊一次缓存起来，窗口采样它。
+  这条不需要读回已合成内容，对现有单 render pass 结构冲击最小；真正采样下层窗口的非 x-ray
+  再补。无论哪档，模糊半径都会让 damage 扩散——协议本身就要求把模糊采样区纳入重绘裁剪，
+  这也是 (a) 必须先落地的原因。
+
+还需要的两件小事，都卡在同一个洞上：`FrameEvent` 里没有时间戳（只有 `Output&`），而
+`unchanged` 那一帧根本没有 `present`，于是动画时钟无处可取。补法照 niri 的重绘状态机：
+`FrameEvent` 带**预计呈现时刻**，外加一个估算 vblank 的定时器，让没有真实翻页时动画也能推进。
+另外 `submit()` 需要知道「本帧在动画中」，否则它会答 `unchanged` 把动画掐死。
+
+niri 的一个现成教训：自定义 shader 目前只能挂在短动画上，不能长期挂在窗口或输出上，卡的正是
+damage——长期运行的 shader 必须声明「我不影响 damage / 我要求全量 damage / 我要求全量 damage
+且我在动」。真要开 shader 钩子，钩子与这个声明得一起设计。
+
 ---
 
 ## 明确不做
