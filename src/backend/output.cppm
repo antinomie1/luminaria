@@ -58,6 +58,25 @@ struct PresentEvent {
     }
 };
 
+/// One video mode a display can be driven at. `refresh_mhz` is millihertz —
+/// the unit wl_output.mode uses, and the only one that can tell 59.94 from 60.
+struct OutputMode {
+    int width = 0;
+    int height = 0;
+    int refresh_mhz = 0;
+    bool preferred = false; ///< the monitor's own idea of its native mode
+
+    [[nodiscard]] bool operator==(const OutputMode&) const = default;
+};
+
+/// "This output is now driven at a different mode." Everything sized for the
+/// old one is stale: render targets, scanout imports, the wl_output the clients
+/// see, and this output's box in the layout.
+struct OutputModeChange {
+    Output& output;
+    OutputMode mode;
+};
+
 class Output {
 public:
     virtual ~Output() {
@@ -99,6 +118,34 @@ public:
     Signal<FrameEvent> frame;
     Signal<PresentEvent> present;
     Signal<OutputDestroy> destroy;
+    Signal<OutputModeChange> mode_changed;
+
+    // --- video modes ---
+
+    /// Every mode this display reports, preferred first. Empty for backends
+    /// with no fixed mode list at all (headless, nested), which take whatever
+    /// size they were made with.
+    [[nodiscard]] virtual std::vector<OutputMode> modes() const { return {}; }
+
+    /// The mode currently driving the display. Backends with no mode list
+    /// still answer with their size, so a caller never has to special-case it.
+    [[nodiscard]] virtual OutputMode current_mode() const {
+        return OutputMode{width_, height_, 0, true};
+    }
+
+    /// Drive this output at a different mode, matched against `modes()`. Pass
+    /// `refresh_mhz = 0` to take the highest refresh rate at that size.
+    ///
+    /// On success `width()`/`height()` have changed and `mode_changed` has
+    /// fired — every scanout id handed out before is invalid, and anything the
+    /// compositor sized for this output has to be rebuilt. Switching to the
+    /// mode already in use is a successful no-op and fires nothing.
+    virtual Status set_mode(int width, int height, int refresh_mhz = 0) {
+        (void)refresh_mhz;
+        return width == width_ && height == height_
+                   ? ok()
+                   : fail("this output cannot change mode");
+    }
 
     /// Ask for the next commits to be shown without waiting for vblank
     /// (wp_tearing_control_v1). Backends that can't tear ignore it.

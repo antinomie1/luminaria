@@ -20,7 +20,8 @@
 // a repaint. A client's own buffer can go straight onto the primary plane —
 // see `DirectScanout` in scene/direct_scanout.cppm, which does the eligibility
 // and lifetime bookkeeping on top of `import_scanout`/`release_scanout`.
-// TODO: no mode switching — each output uses its connector's preferred mode.
+// Each output starts on its connector's preferred mode; `set_mode()` re-drives
+// the CRTC at any other mode the connector reports.
 
 module;
 
@@ -261,6 +262,9 @@ public:
     CrtcProps crtc_props;
     PlaneProps plane_props;
     drmModeModeInfo mode;
+    // Everything the connector reported, copied: the drmModeConnector it came
+    // from is freed as soon as the output exists.
+    std::vector<drmModeModeInfo> available_modes;
     uint32_t mode_blob = 0;
     bool modeset_done = false;
 
@@ -278,12 +282,134 @@ public:
     int present_fence = -1; // OUT_FENCE_PTR from the last commit, owned until taken
 
     /// Nominal frame duration in nanoseconds, straight from the mode timings.
-    [[nodiscard]] uint32_t refresh_ns() const noexcept {
-        const uint64_t pixels = static_cast<uint64_t>(mode.htotal) * mode.vtotal;
-        if (mode.clock == 0 || pixels == 0) {
+    [[nodiscard]] uint32_t refresh_ns() const noexcept { return mode_refresh_ns(mode); }
+
+    /// The same timings the other way up: millihertz, which is what
+    /// wl_output.mode reports and the only unit that separates 59.94 from 60.
+    static uint32_t mode_refresh_ns(const drmModeModeInfo& m) noexcept {
+        const uint64_t pixels = static_cast<uint64_t>(m.htotal) * m.vtotal;
+        if (m.clock == 0 || pixels == 0) {
             return 0;
         }
-        return static_cast<uint32_t>(pixels * 1000000ULL / mode.clock);
+        return static_cast<uint32_t>(pixels * 1000000ULL / m.clock);
+    }
+    static int mode_refresh_mhz(const drmModeModeInfo& m) noexcept {
+        const uint64_t pixels = static_cast<uint64_t>(m.htotal) * m.vtotal;
+        if (m.clock == 0 || pixels == 0) {
+            return 0;
+        }
+        // clock is in kHz; kHz * 1e6 / pixels lands on millihertz.
+        return static_cast<int>(static_cast<uint64_t>(m.clock) * 1000000ULL / pixels);
+    }
+    static OutputMode to_output_mode(const drmModeModeInfo& m) noexcept {
+        return OutputMode{m.hdisplay, m.vdisplay, mode_refresh_mhz(m),
+                          (m.type & DRM_MODE_TYPE_PREFERRED) != 0};
+    }
+
+    [[nodiscard]] std::vector<OutputMode> modes() const override {
+        std::vector<OutputMode> out;
+        out.reserve(available_modes.size());
+        for (const drmModeModeInfo& m : available_modes) {
+            out.push_back(to_output_mode(m));
+        }
+        return out;
+    }
+
+    [[nodiscard]] OutputMode current_mode() const override { return to_output_mode(mode); }
+
+    /// Re-drive the CRTC at a different mode. The dumb buffers are the wrong
+    /// size afterwards and so is every framebuffer the compositor imported, so
+    /// both are torn down — a stale scanout id then fails cleanly rather than
+    /// putting a mis-sized buffer on the screen.
+    Status set_mode(int w, int h, int refresh_mhz) override {
+        if (w == width_ && h == height_ &&
+            (refresh_mhz == 0 || refresh_mhz == mode_refresh_mhz(mode))) {
+            return ok();
+        }
+        // Highest refresh at that size when the caller did not name one; an
+        // exact match when they did.
+        const drmModeModeInfo* pick = nullptr;
+        for (const drmModeModeInfo& m : available_modes) {
+            if (m.hdisplay != w || m.vdisplay != h) {
+                continue;
+            }
+            if (refresh_mhz != 0) {
+                if (mode_refresh_mhz(m) == refresh_mhz) {
+                    pick = &m;
+                    break;
+                }
+                continue;
+            }
+            if (pick == nullptr || mode_refresh_mhz(m) > mode_refresh_mhz(*pick)) {
+                pick = &m;
+            }
+        }
+        if (pick == nullptr) {
+            return fail("drm: no such mode on this connector");
+        }
+        if (suspended) {
+            return fail("drm: cannot change mode while the VT is away");
+        }
+
+        uint32_t blob = 0;
+        if (drmModeCreatePropertyBlob(fd, pick, sizeof(*pick), &blob) != 0) {
+            return fail("drm: drmModeCreatePropertyBlob failed");
+        }
+        // Build the new pair before touching the old: a failure here leaves the
+        // output exactly as it was, still lit.
+        DumbFb next[2];
+        if (!create_fb(fd, pick->hdisplay, pick->vdisplay, next[0]) ||
+            !create_fb(fd, pick->hdisplay, pick->vdisplay, next[1])) {
+            destroy_fb(fd, next[0]);
+            destroy_fb(fd, next[1]);
+            drmModeDestroyPropertyBlob(fd, blob);
+            return fail("drm: could not allocate framebuffers for the new mode");
+        }
+
+        const drmModeModeInfo previous = mode;
+        const uint32_t previous_blob = mode_blob;
+        mode = *pick;
+        mode_blob = blob;
+        width_ = pick->hdisplay;
+        height_ = pick->vdisplay;
+        fill(next[0], Color{0, 0, 0, 1});
+
+        // A blocking modeset: the next frame must land on the new timings, and
+        // the old framebuffers cannot be freed until nothing is scanning them.
+        flip_pending = false;
+        const Status s = atomic(next[0].fb_id, true);
+        if (!s) {
+            mode = previous;
+            mode_blob = previous_blob;
+            width_ = previous.hdisplay;
+            height_ = previous.vdisplay;
+            destroy_fb(fd, next[0]);
+            destroy_fb(fd, next[1]);
+            drmModeDestroyPropertyBlob(fd, blob);
+            return s;
+        }
+        drmModeDestroyPropertyBlob(fd, previous_blob);
+        destroy_fb(fd, fbs[0]);
+        destroy_fb(fd, fbs[1]);
+        fbs[0] = next[0];
+        fbs[1] = next[1];
+        front = 0;
+        modeset_done = true;
+        pending_fb = fbs[0].fb_id;
+        // Imports made for the old mode are all the wrong size now. They are
+        // the compositor's to re-create; mode_changed is its cue.
+        for (const std::vector<ImportedFb>& list : {imported, retired}) {
+            for (const ImportedFb& fb : list) {
+                drmModeRmFB(fd, fb.fb_id);
+                drmCloseBufferHandle(fd, fb.handle);
+            }
+        }
+        imported.clear();
+        retired.clear();
+
+        OutputModeChange event{*this, current_mode()};
+        mode_changed.emit(event);
+        return ok();
     }
 
     void set_tearing(bool async) override { tearing = async; }
@@ -891,6 +1017,9 @@ struct DrmBackend::Impl {
         }
         const drmModeModeInfo mode = connector->modes[0]; // preferred mode first
         auto out = std::make_unique<DrmOutput>(fd, crtc_id, connector->connector_id, plane_id, mode);
+        // The connector is freed by the caller, so the mode list is copied out
+        // rather than pointed at. It is what set_mode() matches against.
+        out->available_modes.assign(connector->modes, connector->modes + connector->count_modes);
         if (!resolve_props(fd, *out)) {
             return nullptr;
         }

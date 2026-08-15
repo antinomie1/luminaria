@@ -129,9 +129,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `scanout_modifiers` returns what the parent advertised, empty when it advertised nothing,
   which is how a caller knows to fall back to the wl_shm path), `DrmBackend` (KMS atomic modeset, one Output per connected connector kept live
   by a udev hotplug monitor, `import_scanout`/`commit_scanout(id, in_fence)` for GPU dmabuf
-  framebuffers, plus an optional hardware cursor plane), `LibinputBackend` (bare-metal input
+  framebuffers, plus an optional hardware cursor plane and `set_mode()` over the
+  connector's mode list), `LibinputBackend` (bare-metal input
   signals). Every `Output` carries a `scale` and a `Transform`; `Output::destroy` fires when a
-  monitor goes away. `Session` (libseat, `session.cppm`) owns the device fds and tells
+  monitor goes away and `Output::mode_changed` when a `set_mode()` lands — everything
+  sized for the old mode (scanout targets, scanout imports, the layout box, the
+  `OutputGlobal`) has to be rebuilt there. `Session` (libseat, `session.cppm`) owns the device fds and tells
   both bare-metal backends when the VT is taken away.
 - **protocol types** — one partition per Wayland global: `compositor` (`wl_compositor`/`wl_surface`,
   including the subsurface tree), `subcompositor`, `xdg_shell` (toplevels + popups +

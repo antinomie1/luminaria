@@ -29,6 +29,7 @@ export module luminaria:output_global;
 
 import :display;
 import :expected;
+import :output;
 import :transform;
 
 export namespace luminaria {
@@ -68,6 +69,17 @@ public:
     /// from an OutputLayout so tools that arrange screenshots get real numbers.
     void set_logical_position(int x, int y);
 
+    /// Every mode this display can be driven at, so clients (and a display
+    /// settings panel) can see what is on offer. Optional: with no list, only
+    /// the current mode is advertised, flagged preferred.
+    void set_modes(std::vector<OutputMode> modes);
+
+    /// The mode changed — a different resolution or refresh rate is now
+    /// driving the display. Re-sends geometry and the mode list to every bound
+    /// client, so `wl_output` never describes a mode that is no longer on.
+    /// Wire it to `Output::mode_changed`.
+    void set_mode(int width, int height, int refresh_mhz = 0);
+
     /// Integer output scale (wl_output.scale). A HiDPI client renders at this
     /// scale and the compositor no longer has to upscale a blurry buffer.
     void set_scale(int scale);
@@ -100,6 +112,8 @@ struct OutputGlobal::Impl {
     wl_global* xdg_output_global = nullptr;
     int width = 0;
     int height = 0;
+    int refresh_mhz = 60000;      // 60Hz unless the backend says otherwise
+    std::vector<OutputMode> modes; // empty: advertise only the current one
     int logical_x = 0;
     int logical_y = 0;
     int scale = 1;
@@ -141,6 +155,28 @@ void output_resource_destroy(wl_resource* resource) {
     std::erase(self->resources, resource);
 }
 
+// wl_output.mode is sent once per mode, and exactly one of them carries
+// CURRENT. With no list from the backend, the current mode is all there is —
+// and it is then also the preferred one, because nothing else is on offer.
+void send_modes(OutputGlobal::Impl& impl, wl_resource* resource) {
+    bool sent_current = false;
+    for (const OutputMode& m : impl.modes) {
+        uint32_t flags = m.preferred ? WL_OUTPUT_MODE_PREFERRED : 0u;
+        if (!sent_current && m.width == impl.width && m.height == impl.height &&
+            m.refresh_mhz == impl.refresh_mhz) {
+            flags |= WL_OUTPUT_MODE_CURRENT;
+            sent_current = true;
+        }
+        wl_output_send_mode(resource, flags, m.width, m.height, m.refresh_mhz);
+    }
+    if (!sent_current) {
+        wl_output_send_mode(resource,
+                            WL_OUTPUT_MODE_CURRENT |
+                                (impl.modes.empty() ? WL_OUTPUT_MODE_PREFERRED : 0u),
+                            impl.width, impl.height, impl.refresh_mhz);
+    }
+}
+
 void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     auto* self = static_cast<OutputGlobal::Impl*>(data);
     wl_resource* resource =
@@ -157,8 +193,7 @@ void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     wl_output_send_geometry(resource, 0, 0, self->width, self->height, WL_OUTPUT_SUBPIXEL_UNKNOWN,
                             "luminaria", "virtual",
                             static_cast<int32_t>(self->transform));
-    wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED, self->width,
-                        self->height, 60000);
+    send_modes(*self, resource);
     if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
         wl_output_send_scale(resource, self->scale);
     }
@@ -292,6 +327,7 @@ void broadcast(OutputGlobal::Impl& impl) {
         const auto version = static_cast<uint32_t>(wl_resource_get_version(r));
         wl_output_send_geometry(r, 0, 0, impl.width, impl.height, WL_OUTPUT_SUBPIXEL_UNKNOWN,
                                 "luminaria", "virtual", static_cast<int32_t>(impl.transform));
+        send_modes(impl, r);
         if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
             wl_output_send_scale(r, impl.scale);
         }
@@ -306,6 +342,20 @@ void broadcast(OutputGlobal::Impl& impl) {
 void OutputGlobal::set_logical_position(int x, int y) {
     impl_->logical_x = x;
     impl_->logical_y = y;
+    broadcast(*impl_);
+}
+
+void OutputGlobal::set_modes(std::vector<OutputMode> modes) {
+    impl_->modes = std::move(modes);
+    broadcast(*impl_);
+}
+
+void OutputGlobal::set_mode(int width, int height, int refresh_mhz) {
+    impl_->width = width;
+    impl_->height = height;
+    if (refresh_mhz > 0) {
+        impl_->refresh_mhz = refresh_mhz;
+    }
     broadcast(*impl_);
 }
 

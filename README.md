@@ -289,8 +289,12 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 - ✓ **多输出 + 热插拔 + output layout + 每输出 scale/transform** — DRM 后端枚举全部已连接
       connector 并用 udev 跟踪插拔，每屏独立 CRTC/plane/scanout buffer/damage；`OutputLayout`
       提供全局坐标系与跨屏裁剪；`Output::set_scale()` / `set_transform()` 贯穿协议（wl_output +
-      xdg-output）、布局与渲染（纹理四边形管线做真旋转）。**仍缺**：小数缩放（见 HiDPI 条）、
-      模式切换（当前固定用 connector 的首选模式）
+      xdg-output）、布局与渲染（纹理四边形管线做真旋转）。**模式切换已做**：`Output::modes()`
+      列出 connector 报的全部模式，`set_mode(w, h, refresh_mhz)` 重新驱动 CRTC（refresh 传 0
+      表示该分辨率下取最高刷新率），失败时原样保留旧模式仍在亮；成功后 `mode_changed` 通知
+      compositor 重建一切按旧模式算过尺寸的东西（scanout 目标、直出缓存、layout 里的位置、
+      wl_output）。`wl_output` 广播完整模式列表并只有一个 CURRENT。`luminaria-tty` 用
+      `LUMINARIA_MODE=1920x1080@60` 指定。**仍缺**：小数缩放（见 HiDPI 条）
 - ✓ **`xdg-decoration`** — **两侧都做了**。客户端一侧：嵌套后端向父 compositor 请求
       server-side 装饰，我们的窗口在宿主桌面上有原生标题栏
       （`WaylandBackend::decoration_mode()` 报告协商结果）。服务端一侧：
@@ -382,7 +386,6 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
   覆盖（`output-layout` / `output-scale` / `gpu-scanout` / `region` / `cursor-theme`），
   但"真实显示器上的翻页"只能在真机上确认。`session` 测试在没有 seat 的环境里 skip。
 - **热插拔只覆盖 connector 状态**：GPU 本身热插拔（拔掉整块显卡 / DRM 设备消失）不处理。
-  也不做模式切换 —— 每个输出固定用 connector 报的首选模式。
 - **headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
   13ms debug）。这是 wl_shm 呈现的代价。嵌套后端只在父 compositor 没有
   `zwp_linux_dmabuf_v1` 时才付这个代价，DRM 后端从来不付 —— 两者都直接扫描输出 dmabuf。

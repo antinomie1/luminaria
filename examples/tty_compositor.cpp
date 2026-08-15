@@ -57,6 +57,23 @@ int env_int(const char* name, int fallback) {
     return parsed > 0 ? parsed : fallback;
 }
 
+/// LUMINARIA_MODE=WxH or WxH@R (R in Hz, fractional allowed). A zero width
+/// means "unset": keep the connector's preferred mode.
+luminaria::OutputMode env_mode() {
+    const char* spec = std::getenv("LUMINARIA_MODE");
+    if (spec == nullptr) {
+        return {};
+    }
+    int w = 0, h = 0;
+    double hz = 0.0;
+    const int fields = std::sscanf(spec, "%dx%d@%lf", &w, &h, &hz);
+    if (fields < 2 || w <= 0 || h <= 0) {
+        std::fprintf(stderr, "luminaria-tty: LUMINARIA_MODE: expected WxH or WxH@Hz\n");
+        return {};
+    }
+    return luminaria::OutputMode{w, h, static_cast<int>(hz * 1000.0 + 0.5), false};
+}
+
 luminaria::Transform env_transform() {
     const int value = env_int("LUMINARIA_TRANSFORM", 0);
     return value >= 0 && value <= 7 ? static_cast<luminaria::Transform>(value)
@@ -203,6 +220,7 @@ int main(int argc, char** argv) {
         luminaria::Signal<luminaria::FrameEvent>::Connection frame_conn;
         luminaria::Signal<luminaria::PresentEvent>::Connection present_conn;
         luminaria::Signal<luminaria::OutputDestroy>::Connection destroy_conn;
+        luminaria::Signal<luminaria::OutputModeChange>::Connection mode_conn;
     };
     std::list<Screen> screens; // stable addresses: the callbacks capture Screen&
     luminaria::OutputLayout layout;
@@ -215,39 +233,30 @@ int main(int argc, char** argv) {
     };
     window_changed = damage_everything;
 
-    auto out_conn = drm->new_output.connect([&](luminaria::NewOutput& e) {
-        const int ow = e.output.width();
-        const int oh = e.output.height();
-        Screen& screen = screens.emplace_back();
-        screen.output = &e.output;
-        // Panel rotation and HiDPI are compositor policy; here they come from the
-        // environment so the path can be exercised without a config file.
-        e.output.set_scale(env_int("LUMINARIA_SCALE", 1));
-        e.output.set_transform(env_transform());
-        layout.add_auto(e.output);
-        const luminaria::Box view = layout.box_of(e.output);
-        std::printf("luminaria-tty: output %dx%d at (%d,%d)\n", ow, oh, view.x, view.y);
+    // (Re)build everything that is sized for an output's current mode: the pair
+    // of GPU scanout buffers, the direct-scanout cache, its box in the layout
+    // and what its wl_output tells clients. Run when the output appears, and
+    // again every time its mode changes — after a switch, every one of those is
+    // describing a resolution that is no longer on the wire.
+    auto rebuild_screen = [&](Screen& screen) {
+        luminaria::Output& output = *screen.output;
+        const int ow = output.width();
+        const int oh = output.height();
 
-        if (auto og = luminaria::OutputGlobal::create(*display, ow, oh,
-                                                      "luminaria-" + std::to_string(screens.size()))) {
-            screen.global = std::make_unique<luminaria::OutputGlobal>(std::move(*og));
-            screen.global->set_scale(e.output.scale());
-            screen.global->set_transform(e.output.transform());
-            screen.global->set_logical_position(view.x, view.y);
+        screen.targets.clear();
+        screen.ids.clear();
+        if (screen.direct.has_value()) {
+            screen.direct->clear();
+        } else {
+            screen.direct.emplace(output);
         }
-
-        // Unplugged: drop everything hanging off this output. The Output is
-        // already half-destroyed here, so we may only compare its address.
-        screen.destroy_conn =
-            e.output.destroy.connect([&screens, &layout, out = &e.output](luminaria::OutputDestroy&) {
-                std::printf("luminaria-tty: output removed\n");
-                layout.remove(*out);
-                std::erase_if(screens, [out](const Screen& sc) { return sc.output == out; });
-            });
+        screen.back = 0;
+        screen.previous_damage.clear();
+        screen.needs_full_redraw = true;
 
         // Double-buffered GPU scanout: composite into a dmabuf the GPU renders
         // to and KMS scans out. Nothing on this path travels through the CPU.
-        const std::vector<std::uint64_t> mods = usable_modifiers(*renderer, e.output);
+        const std::vector<std::uint64_t> mods = usable_modifiers(*renderer, output);
         while (screen.targets.size() < 2) {
             auto target = renderer->create_scanout(ow, oh, kScanoutFormat, mods);
             if (!target) {
@@ -255,7 +264,7 @@ int main(int argc, char** argv) {
                              target.error().message.c_str());
                 break;
             }
-            auto id = e.output.import_scanout(target->plane());
+            auto id = output.import_scanout(target->plane());
             if (!id) {
                 std::fprintf(stderr, "luminaria-tty: scanout import: %s\n",
                              id.error().message.c_str());
@@ -269,7 +278,65 @@ int main(int argc, char** argv) {
             screen.targets.clear();
             screen.ids.clear();
         }
-        screen.direct.emplace(e.output);
+
+        // The output occupies a different amount of the layout at a new mode,
+        // so its place in it is recomputed rather than kept.
+        layout.remove(output);
+        layout.add_auto(output);
+        const luminaria::Box view = layout.box_of(output);
+        if (screen.global) {
+            screen.global->set_modes(output.modes());
+            screen.global->set_mode(ow, oh, output.current_mode().refresh_mhz);
+            screen.global->set_scale(output.scale());
+            screen.global->set_transform(output.transform());
+            screen.global->set_logical_position(view.x, view.y);
+        }
+        std::printf("luminaria-tty: output %dx%d@%.3gHz at (%d,%d)\n", ow, oh,
+                    output.current_mode().refresh_mhz / 1000.0, view.x, view.y);
+    };
+
+    auto out_conn = drm->new_output.connect([&](luminaria::NewOutput& e) {
+        Screen& screen = screens.emplace_back();
+        screen.output = &e.output;
+        // Panel rotation, HiDPI and the mode are compositor policy; here they
+        // come from the environment so the paths can be exercised without a
+        // config file. LUMINARIA_MODE=1920x1080 or =1920x1080@60.
+        e.output.set_scale(env_int("LUMINARIA_SCALE", 1));
+        e.output.set_transform(env_transform());
+        if (const luminaria::OutputMode want = env_mode(); want.width > 0) {
+            if (auto s = e.output.set_mode(want.width, want.height, want.refresh_mhz); !s) {
+                std::fprintf(stderr, "luminaria-tty: LUMINARIA_MODE: %s\n",
+                             s.error().message.c_str());
+                for (const luminaria::OutputMode& m : e.output.modes()) {
+                    std::fprintf(stderr, "  available: %dx%d@%.3gHz%s\n", m.width, m.height,
+                                 m.refresh_mhz / 1000.0, m.preferred ? " (preferred)" : "");
+                }
+            }
+        }
+
+        if (auto og = luminaria::OutputGlobal::create(*display, e.output.width(),
+                                                      e.output.height(),
+                                                      "luminaria-" + std::to_string(screens.size()))) {
+            screen.global = std::make_unique<luminaria::OutputGlobal>(std::move(*og));
+        }
+
+        // Unplugged: drop everything hanging off this output. The Output is
+        // already half-destroyed here, so we may only compare its address.
+        screen.destroy_conn =
+            e.output.destroy.connect([&screens, &layout, out = &e.output](luminaria::OutputDestroy&) {
+                std::printf("luminaria-tty: output removed\n");
+                layout.remove(*out);
+                std::erase_if(screens, [out](const Screen& sc) { return sc.output == out; });
+            });
+
+        // A mode switch invalidates every buffer we sized for the old one, and
+        // the backend has already dropped its side of them.
+        screen.mode_conn = e.output.mode_changed.connect(
+            [&rebuild_screen, &screen = screen](luminaria::OutputModeChange&) {
+                rebuild_screen(screen);
+            });
+
+        rebuild_screen(screen);
 
         // A frame is on screen: pace the clients that drew it, and answer their
         // presentation feedback with the vblank timestamp the kernel gave us.
