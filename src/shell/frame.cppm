@@ -144,8 +144,11 @@ public:
     /// no cursor plane. It is not hit-testable, and it reports no damage of its
     /// own; moving it or swapping the texture is nevertheless picked up, because
     /// `submit()` diffs this frame's list against the last one it drew.
-    void place(const GpuTexture& texture, int x, int y, int width, int height,
-               float alpha = 1.0f);
+    void place(const GpuTexture& texture, int x, int y, int width, int height);
+
+    /// As above, with whole-quad opacity. Use this for a compositor-owned
+    /// texture such as an OffscreenTarget's finished window.
+    void place(const GpuTexture& texture, int x, int y, int width, int height, float alpha);
 
     /// This frame's list, back-to-front. Valid until the next `begin()`.
     [[nodiscard]] std::span<const Placement> placements() const noexcept;
@@ -596,6 +599,10 @@ void Frame::place(Surface& surface, int x, int y) {
             static_cast<std::uint32_t>(impl.opaque_arena.size()) - p.opaque_first;
         impl.placements.push_back(p);
     }
+}
+
+void Frame::place(const GpuTexture& texture, int x, int y, int width, int height) {
+    place(texture, x, y, width, height, 1.0f);
 }
 
 void Frame::place(const GpuTexture& texture, int x, int y, int width, int height, float alpha) {
