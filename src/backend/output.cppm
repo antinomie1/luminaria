@@ -121,10 +121,15 @@ public:
 
     /// DRM modifiers this output's scanout hardware accepts for `drm_format`.
     /// Intersect with VulkanRenderer::scanout_modifiers() before allocating a
-    /// ScanoutTarget. Default: LINEAR only.
+    /// ScanoutTarget; an empty intersection means this output has no zero-copy
+    /// path and the frame has to go through `commit_frame` instead.
+    ///
+    /// Default: empty, which is the honest answer for an output that does not
+    /// override `import_scanout` either. Claiming LINEAR here would only send
+    /// the caller off to allocate a target it is then refused.
     [[nodiscard]] virtual std::vector<std::uint64_t> scanout_modifiers(std::uint32_t drm_format) {
         (void)drm_format;
-        return {0}; // DRM_FORMAT_MOD_LINEAR
+        return {};
     }
 
     /// Register a dmabuf as a scanout framebuffer, returning an opaque id valid

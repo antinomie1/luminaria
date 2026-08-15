@@ -1,9 +1,13 @@
 // luminaria/backend/wayland.cppm — nested backend: run as a client inside a parent
 // Wayland compositor. Each output is a parent window (xdg_toplevel); frames are
-// driven by the parent's frame callbacks; content is presented via wl_shm.
+// driven by the parent's frame callbacks.
 //
-// Requires a running parent compositor (WAYLAND_DISPLAY). TODO: wl_shm CPU
-// present + per-frame buffer alloc; upgrade to linux-dmabuf zero-copy if it matters.
+// Requires a running parent compositor (WAYLAND_DISPLAY). There are two ways to
+// present: `commit_scanout()` hands the parent a dmabuf the renderer drew into
+// (zero copy — nothing is ever read back or memcpy'd), and `commit_frame()`
+// packs CPU pixels into a fresh wl_shm buffer. The first needs the parent to
+// implement zwp_linux_dmabuf_v1; `scanout_modifiers()` returns an empty list
+// when it does not, which is how a caller knows to take the shm path instead.
 
 module;
 
@@ -14,11 +18,14 @@ module;
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -26,6 +33,7 @@ export module luminaria:wayland;
 
 import :backend;
 import :color;
+import :dmabuf;
 import :event_loop;
 import :expected;
 import :input_event;
@@ -174,6 +182,13 @@ public:
     wl_display* parent;
     wl_shm* shm;
     wl_surface* surface;
+    // The parent's linux-dmabuf, if it has one, and every (format, modifier)
+    // pair it advertised. Copied from the backend at add_output(): the registry
+    // roundtrip in create() is already done by then, so the list is complete.
+    zwp_linux_dmabuf_v1* dmabuf = nullptr;
+    std::vector<std::pair<uint32_t, uint64_t>> dmabuf_formats;
+    // Buffers wrapping renderer scanout targets; the index is the scanout id.
+    std::vector<wl_buffer*> scanout_buffers;
     xdg_surface* xsurf = nullptr;
     xdg_toplevel* toplevel = nullptr;
     zxdg_toplevel_decoration_v1* decoration = nullptr;
@@ -187,6 +202,11 @@ public:
         : Output(w, h), parent(parent), shm(shm), surface(surface) {}
 
     ~WaylandOutput() override {
+        // The dmabufs themselves belong to the renderer's scanout targets; only
+        // the parent-side wl_buffer wrappers are ours.
+        for (wl_buffer* buffer : scanout_buffers) {
+            wl_buffer_destroy(buffer);
+        }
         // Innermost first: the decoration hangs off the toplevel.
         if (decoration != nullptr) {
             zxdg_toplevel_decoration_v1_destroy(decoration);
@@ -241,6 +261,70 @@ public:
         return ok();
     }
 
+    // --- zero-copy path: hand the parent the renderer's dmabuf directly ---
+
+    /// Every modifier the parent advertised for this format, and nothing else:
+    /// what the parent will accept is not ours to guess. Empty when the parent
+    /// has no linux-dmabuf at all, which is what tells the caller to take the
+    /// shm path instead.
+    [[nodiscard]] std::vector<std::uint64_t> scanout_modifiers(std::uint32_t drm_format) override {
+        std::vector<std::uint64_t> mods;
+        for (const auto& [format, modifier] : dmabuf_formats) {
+            if (format == drm_format) {
+                mods.push_back(modifier);
+            }
+        }
+        return mods;
+    }
+
+    [[nodiscard]] Result<std::uint32_t> import_scanout(const DmabufPlane& plane) override {
+        if (dmabuf == nullptr) {
+            return fail("nested: parent has no zwp_linux_dmabuf_v1");
+        }
+        zwp_linux_buffer_params_v1* params = zwp_linux_dmabuf_v1_create_params(dmabuf);
+        // `plane.fd` is borrowed — libwayland-client sends a copy over the
+        // socket and leaves ours alone, so there is nothing to close here.
+        zwp_linux_buffer_params_v1_add(params, plane.fd, 0, plane.offset, plane.stride,
+                                       static_cast<uint32_t>(plane.modifier >> 32),
+                                       static_cast<uint32_t>(plane.modifier & 0xffffffffu));
+        // create_immed (v2+) rather than create: no round trip, and a parent
+        // that dislikes the buffer kills the connection instead of replying,
+        // which is the right outcome for a bug on our side.
+        wl_buffer* buffer = zwp_linux_buffer_params_v1_create_immed(
+            params, plane.width, plane.height, plane.format, 0);
+        zwp_linux_buffer_params_v1_destroy(params);
+        if (buffer == nullptr) {
+            return fail("nested: zwp_linux_buffer_params_v1.create_immed failed");
+        }
+        scanout_buffers.push_back(buffer);
+        return static_cast<std::uint32_t>(scanout_buffers.size() - 1);
+    }
+
+    Status commit_scanout(std::uint32_t id, int in_fence_fd) override {
+        if (id >= scanout_buffers.size()) {
+            if (in_fence_fd >= 0) {
+                close(in_fence_fd);
+            }
+            return fail("nested: unknown scanout id");
+        }
+        if (in_fence_fd >= 0) {
+            // There is no explicit-sync channel to the parent on this path
+            // (linux-drm-syncobj is a compositor-side protocol, and we are the
+            // client here), so the wait has to happen on our CPU. Callers that
+            // do not ask render_to() for a fence never get here: it blocks
+            // internally and passes -1.
+            pollfd pfd{in_fence_fd, POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            close(in_fence_fd);
+        }
+        wl_surface_attach(surface, scanout_buffers[id], 0, 0);
+        wl_surface_damage_buffer(surface, 0, 0, width_, height_);
+        request_frame();
+        wl_surface_commit(surface);
+        wl_display_flush(parent);
+        return ok();
+    }
+
     void request_frame() {
         wl_callback* cb = wl_surface_frame(surface);
         wl_callback_add_listener(cb, &frame_listener_, this);
@@ -266,6 +350,9 @@ struct WaylandBackend::Impl {
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
     wl_shm* shm = nullptr;
+    // Optional: the parent may be shm-only. Filled by the listener below.
+    zwp_linux_dmabuf_v1* dmabuf = nullptr;
+    std::vector<std::pair<uint32_t, uint64_t>> dmabuf_formats;
     wl_seat* seat = nullptr;
     wl_pointer* pointer = nullptr;
     wl_keyboard* keyboard = nullptr;
@@ -293,6 +380,9 @@ struct WaylandBackend::Impl {
         }
         if (wm_base != nullptr) {
             xdg_wm_base_destroy(wm_base);
+        }
+        if (dmabuf != nullptr) {
+            zwp_linux_dmabuf_v1_destroy(dmabuf);
         }
         if (shm != nullptr) {
             wl_shm_destroy(shm);
@@ -444,8 +534,19 @@ void seat_caps(void* data, wl_seat* seat, uint32_t caps) {
 void seat_name(void*, wl_seat*, const char*) {}
 const wl_seat_listener kSeatListener{seat_caps, seat_name};
 
+// zwp_linux_dmabuf_v1 v3 advertises what it can import as a burst of `modifier`
+// events at bind time. The bare `format` event is the v1 form and carries no
+// modifier; v3 compositors do not send it, but the slot must not be null.
+void dmabuf_format(void*, zwp_linux_dmabuf_v1*, uint32_t) {}
+void dmabuf_modifier(void* data, zwp_linux_dmabuf_v1*, uint32_t format, uint32_t hi, uint32_t lo) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    impl->dmabuf_formats.emplace_back(format,
+                                      (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo));
+}
+const zwp_linux_dmabuf_v1_listener kDmabufListener{dmabuf_format, dmabuf_modifier};
+
 void registry_global(void* data, wl_registry* registry, uint32_t name, const char* interface,
-                     uint32_t) {
+                     uint32_t version) {
     auto* impl = static_cast<WaylandBackend::Impl*>(data);
     if (std::strcmp(interface, "wl_compositor") == 0) {
         impl->compositor = static_cast<wl_compositor*>(
@@ -456,6 +557,15 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
         xdg_wm_base_add_listener(impl->wm_base, &kWmBaseListener, impl);
     } else if (std::strcmp(interface, "wl_shm") == 0) {
         impl->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+    } else if (std::strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
+        // Cap at 3: that is the last version that advertises formats up front.
+        // v4 replaces them with per-surface feedback, which a nested window
+        // does not need — and binding 3 against a v4 global is legal.
+        if (version >= 3) {
+            impl->dmabuf = static_cast<zwp_linux_dmabuf_v1*>(
+                wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 3));
+            zwp_linux_dmabuf_v1_add_listener(impl->dmabuf, &kDmabufListener, impl);
+        }
     } else if (std::strcmp(interface, "zxdg_decoration_manager_v1") == 0) {
         // Optional: only compositors that do server-side decorations advertise it.
         impl->decoration_manager = static_cast<zxdg_decoration_manager_v1*>(
@@ -512,6 +622,10 @@ Result<WaylandBackend> WaylandBackend::create(EventLoop loop) {
     impl->registry = wl_display_get_registry(parent);
     wl_registry_add_listener(impl->registry, &kRegistryListener, impl.get());
     wl_display_roundtrip(parent); // receive globals
+    // A second one: the seat capabilities and the linux-dmabuf modifier list
+    // are only sent once we have bound those globals, which happened during
+    // the roundtrip above.
+    wl_display_roundtrip(parent);
 
     if (impl->compositor == nullptr || impl->wm_base == nullptr || impl->shm == nullptr) {
         return fail("nested: parent lacks wl_compositor/xdg_wm_base/wl_shm");
@@ -523,6 +637,8 @@ Output& WaylandBackend::add_output(int width, int height, std::string title) {
     auto out = std::make_unique<WaylandOutput>(impl_->parent, impl_->shm,
                                                wl_compositor_create_surface(impl_->compositor),
                                                width, height);
+    out->dmabuf = impl_->dmabuf;
+    out->dmabuf_formats = impl_->dmabuf_formats;
     out->xsurf = xdg_wm_base_get_xdg_surface(impl_->wm_base, out->surface);
     xdg_surface_add_listener(out->xsurf, &kXdgSurfaceListener, out.get());
     out->toplevel = xdg_surface_get_toplevel(out->xsurf);

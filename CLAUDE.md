@@ -125,7 +125,9 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
 - **backend** — `Backend` emits `new_output`; `Output` emits `frame` and accepts
   `commit(Color)` / `commit_frame(rgba)`. Implementations: `HeadlessBackend` (software frame
   pump), `WaylandBackend` (nested window in a parent compositor, forwards parent input AND
-  its keymap), `DrmBackend` (KMS atomic modeset, one Output per connected connector kept live
+  its keymap; presents through the parent's `zwp_linux_dmabuf_v1` when it has one —
+  `scanout_modifiers` returns what the parent advertised, empty when it advertised nothing,
+  which is how a caller knows to fall back to the wl_shm path), `DrmBackend` (KMS atomic modeset, one Output per connected connector kept live
   by a udev hotplug monitor, `import_scanout`/`commit_scanout(id, in_fence)` for GPU dmabuf
   framebuffers, plus an optional hardware cursor plane), `LibinputBackend` (bare-metal input
   signals). Every `Output` carries a `scale` and a `Transform`; `Output::destroy` fires when a

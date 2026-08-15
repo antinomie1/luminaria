@@ -178,7 +178,7 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | backend | 抽象 `Backend` + `HeadlessBackend`（软件帧泵，无 GPU/显示） | headless |
-| backend | `WaylandBackend`（嵌套）：连父 compositor 开窗、wl_shm 呈现合成帧；**转发父 compositor 输入**（指针 enter/leave/motion/button、滚轮 axis/discrete/stop 按 `wl_pointer.frame` 聚合、键盘按键 + 修饰键），经命中测试路由到 seat；**原生窗口装饰**：以 `xdg-decoration-unstable-v1` 客户端身份向父 compositor 请求 server-side 装饰（附 title + app_id），拿到宿主桌面的真标题栏，协商结果由 `decoration_mode()` 报告 | wayland-nested |
+| backend | `WaylandBackend`（嵌套）：连父 compositor 开窗；**零拷贝呈现** —— 绑父 compositor 的 `zwp_linux_dmabuf_v1` (v3)，把渲染目标的 dmabuf 用 `create_immed` 包成 wl_buffer 直接 attach，合成帧一个像素都不经过 CPU；父 compositor 没有该 global 时 `scanout_modifiers()` 返回空表，调用方退回 wl_shm 路径；**转发父 compositor 输入**（指针 enter/leave/motion/button、滚轮 axis/discrete/stop 按 `wl_pointer.frame` 聚合、键盘按键 + 修饰键），经命中测试路由到 seat；**原生窗口装饰**：以 `xdg-decoration-unstable-v1` 客户端身份向父 compositor 请求 server-side 装饰（附 title + app_id），拿到宿主桌面的真标题栏，协商结果由 `decoration_mode()` 报告 | wayland-nested |
 | backend | `DrmBackend`（裸机 KMS）：**多输出 + 热插拔** —— 每个已连接 connector 各分一套 CRTC + primary plane，各自 modeset/翻页；udev netlink 监听 `drm` 子系统的 `HOTPLUG=1` 事件后重扫 connector 并做差集，新显示器发 `new_output`、拔掉的发 `Output::destroy`（并还原它自己的 CRTC）；**atomic 模式设置**（connector CRTC_ID + CRTC MODE_ID/ACTIVE + primary plane 全套 property，一次 `drmModeAtomicCommit`）、非阻塞翻页 + `page_flip_handler2` vblank 帧泵；scanout buffer 走 dmabuf 导入（`IN_FORMATS` 交出硬件真实支持的 modifier 列表），dumb buffer 仅作降级路径（真机未验证，测试 skip） | drm（需 tty） |
 | backend | `LibinputBackend`（裸机输入）：发出 KeyEvent / PointerMotion / PointerButton 信号；给了 `Session` 就经 libseat 开设备，VT 切换时 `libinput_suspend/resume` | libinput |
 | session | `Session`（libseat）—— 谁现在有权碰 GPU 和输入设备。VT 切走时 DRM 后端 `drmDropMaster` 并停止提交，切回时重取 master + 重新 modeset。没有它也能从已登录 VT 跑，只是切 VT 不安全 | session（需 seat） |
@@ -379,8 +379,9 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
   但"真实显示器上的翻页"只能在真机上确认。`session` 测试在没有 seat 的环境里 skip。
 - **热插拔只覆盖 connector 状态**：GPU 本身热插拔（拔掉整块显卡 / DRM 设备消失）不处理。
   也不做模式切换 —— 每个输出固定用 connector 报的首选模式。
-- **嵌套/headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
-  13ms debug）。这是 wl_shm 呈现的代价，DRM 后端没有 —— 它直接扫描输出 dmabuf。
+- **headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
+  13ms debug）。这是 wl_shm 呈现的代价。嵌套后端只在父 compositor 没有
+  `zwp_linux_dmabuf_v1` 时才付这个代价，DRM 后端从来不付 —— 两者都直接扫描输出 dmabuf。
 - **默认构建是 debug（`-O0`）**，逐像素转换会慢 5 倍。跑真实负载用 `xmake f -m release`。
 - **模块化踩到两个 gcc 16 的坑**：接口单元里 defaulted 的 hidden-friend `operator==` 会
   ICE（改成成员形式），`std::function` / `std::make_shared` 要求每个实例化点都能看见

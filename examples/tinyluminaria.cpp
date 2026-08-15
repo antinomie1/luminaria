@@ -31,6 +31,23 @@ T must(luminaria::Result<T> r, const char* what) {
     return std::move(*r);
 }
 
+constexpr std::uint32_t kScanoutFormat = DRM_FORMAT_XRGB8888;
+
+/// Modifiers both the renderer can draw into and the output can present. An
+/// empty result means there is no zero-copy path to this output at all, and the
+/// caller has to composite into a plain target and read it back.
+std::vector<std::uint64_t> usable_modifiers(luminaria::VulkanRenderer& renderer,
+                                            luminaria::Output& output) {
+    const std::vector<std::uint64_t> display = output.scanout_modifiers(kScanoutFormat);
+    std::vector<std::uint64_t> both;
+    for (std::uint64_t m : renderer.scanout_modifiers(kScanoutFormat)) {
+        if (std::find(display.begin(), display.end(), m) != display.end()) {
+            both.push_back(m);
+        }
+    }
+    return both;
+}
+
 /// Output size, overridable with LUMINARIA_OUTPUT=WxH. Anything unparseable
 /// falls back to the default rather than producing a degenerate output.
 void output_size(int& width, int& height) {
@@ -215,8 +232,13 @@ int main() {
     struct PerOutput {
         std::shared_ptr<std::vector<luminaria::Pixel>> last_frame =
             std::make_shared<std::vector<luminaria::Pixel>>();
-        std::vector<std::uint8_t> readback; // reused every frame, never reallocated
-        std::optional<luminaria::ScanoutTarget> scanout;
+        std::vector<std::uint8_t> readback; // reused every capture, never reallocated
+        // Render targets. Two of them, flipped between, when the output can
+        // scan a dmabuf out directly (`ids` non-empty); one otherwise, drawn
+        // into and then read back for commit_frame().
+        std::vector<luminaria::ScanoutTarget> targets;
+        std::vector<std::uint32_t> ids;
+        std::size_t next = 0;
         luminaria::Signal<luminaria::OutputDestroy>::Connection on_destroy;
         luminaria::Signal<luminaria::FrameEvent>::Connection on_frame;
         luminaria::Signal<luminaria::PresentEvent>::Connection on_present;
@@ -225,11 +247,23 @@ int main() {
 
     output_global.on_bind([&](wl_resource* res) {
         screencopy.add_output(res, output_global.width(), output_global.height(),
-            [&per_output, ow = output_global.width(), oh = output_global.height()]
+            [&per_output, &renderer, ow = output_global.width(), oh = output_global.height()]
             (int x, int y, int w, int h, std::vector<uint8_t>& rgba) -> bool {
                 if (per_output.empty()) return false;
                 // Single-output compositor: use the first (only) output's frame.
-                auto& frame = *per_output.begin()->second.last_frame;
+                auto& po = per_output.begin()->second;
+                // On the direct-scanout path nothing is read back per frame, so
+                // do it here — only when something actually asks for a capture.
+                // `next` already points at the target for the NEXT frame, so the
+                // one before it holds what is on screen.
+                if (renderer && !po.ids.empty()) {
+                    const std::size_t shown = (po.next + po.targets.size() - 1) % po.targets.size();
+                    if (auto r = renderer->read_scanout(po.targets[shown], po.readback)) {
+                        po.last_frame->resize(po.readback.size() / 4);
+                        std::memcpy(po.last_frame->data(), po.readback.data(), po.readback.size());
+                    }
+                }
+                auto& frame = *po.last_frame;
                 if (frame.empty()) return false;
                 // Extract subregion from the cached full-frame pixels.
                 rgba.resize(static_cast<size_t>(w) * h * 4);
@@ -389,11 +423,43 @@ int main() {
         // frame would leak GPU memory.
         auto& po = per_output[&e.output];
         if (renderer) {
-            if (auto t = renderer->create_scanout(ow, oh, DRM_FORMAT_XRGB8888, {})) {
-                po.scanout.emplace(std::move(*t));
-            } else {
-                std::fprintf(stderr, "tinyluminaria: scanout target: %s\n",
-                             t.error().message.c_str());
+            // Zero-copy first: allocate two targets in a layout both the
+            // renderer and the output accept and hand them straight over, so a
+            // frame never touches the CPU. Two of them because the one on
+            // screen must not be drawn into. An empty modifier list means the
+            // output has no such path (headless, or a parent compositor with no
+            // linux-dmabuf), and we go the read-back route below.
+            const std::vector<std::uint64_t> mods = usable_modifiers(*renderer, e.output);
+            while (!mods.empty() && po.targets.size() < 2) {
+                auto t = renderer->create_scanout(ow, oh, kScanoutFormat, mods);
+                if (!t) {
+                    std::fprintf(stderr, "tinyluminaria: scanout target: %s\n",
+                                 t.error().message.c_str());
+                    break;
+                }
+                auto id = e.output.import_scanout(t->plane());
+                if (!id) {
+                    std::fprintf(stderr, "tinyluminaria: scanout import: %s\n",
+                                 id.error().message.c_str());
+                    break;
+                }
+                po.targets.push_back(std::move(*t));
+                po.ids.push_back(*id);
+            }
+            if (po.targets.size() < 2) {
+                po.targets.clear();
+                po.ids.clear();
+            }
+            std::printf("tinyluminaria: present = %s\n",
+                        po.ids.empty() ? "GPU composite + CPU read-back"
+                                       : "direct dmabuf scanout (zero copy)");
+            if (po.targets.empty()) {
+                if (auto t = renderer->create_scanout(ow, oh, kScanoutFormat, {})) {
+                    po.targets.push_back(std::move(*t));
+                } else {
+                    std::fprintf(stderr, "tinyluminaria: scanout target: %s\n",
+                                 t.error().message.c_str());
+                }
             }
         }
         // Output unplugged: drop it from the layout and free its state.
@@ -432,10 +498,9 @@ int main() {
             // --- GPU compositing path ---
             // Client dmabufs are imported with zero copy; compositing and
             // blending happen entirely on the GPU. Only the final frame is read
-            // back to the CPU (once, for screencopy & commit_frame), not every
-            // client buffer. Falls through to the CPU path when the scanout
-            // target is unavailable.
-            if (renderer && po.scanout.has_value()) {
+            // back to the CPU, and only when the output cannot take the dmabuf
+            // itself. Falls through to the CPU path when there is no target.
+            if (renderer && !po.targets.empty()) {
                 // The textures are owned by the surfaces and cached there, so
                 // this is a list of borrowed pointers — no per-frame re-import,
                 // and nothing to keep alive here.
@@ -492,14 +557,28 @@ int main() {
                     layer.surface->clear_damage();
                 }
 
-                if (auto s = renderer->render_to(*po.scanout, kBg, {}, gpu_fills)) {
+                luminaria::ScanoutTarget& target = po.targets[po.next];
+                if (auto s = renderer->render_to(target, kBg, {}, gpu_fills)) {
+                    // Zero-copy present: the output takes the dmabuf we just
+                    // drew into. Nothing is copied, mapped or read back — not
+                    // the client buffers, not the composited frame.
+                    if (!po.ids.empty()) {
+                        const std::uint32_t id = po.ids[po.next];
+                        po.next = (po.next + 1) % po.targets.size();
+                        if (auto s2 = fe.output.commit_scanout(id)) {
+                            return;
+                        } else {
+                            std::fprintf(stderr, "tinyluminaria: commit_scanout: %s\n",
+                                         s2.error().message.c_str());
+                        }
+                    }
                     // Read the composited frame back once, for screencopy and
                     // commit_frame. This is the ONLY CPU readback on this path —
                     // client buffers never left the GPU. `read_scanout` copies
                     // from the target's own image through a staging buffer it
                     // keeps mapped; re-importing the dmabuf every frame instead
                     // cost ~90ms, which is exactly what a laggy pointer is.
-                    if (auto r = renderer->read_scanout(*po.scanout, po.readback)) {
+                    else if (auto r = renderer->read_scanout(target, po.readback)) {
                         po.last_frame->resize(po.readback.size() / 4);
                         std::memcpy(po.last_frame->data(), po.readback.data(),
                                     po.readback.size());
