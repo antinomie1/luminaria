@@ -67,6 +67,7 @@
 | render | **纹理四边形管线**（取代原先的 blit）：每个 surface 一次 draw，位置/UV 全走 push constant。由此一并拿到 **整数 scale**、**8 种 transform 全部（含 90/270 转置）**、以及**真正的 alpha 混合**（预乘 `ONE`/`ONE_MINUS_SRC_ALPHA`）。SPIR-V 由 `glslangValidator --vn` 编进二进制 | gpu-scanout |
 | present | `Output::commit_frame(pixels)` 呈现渲染帧（headless 存帧，DRM 写 dumb buffer）—— 保留给无 dmabuf 的降级路径 | render-output |
 | render | **描述符集按纹理缓存**：一个纹理绑定的 image view 终生不变，所以描述符集只在它第一次被画时写一次，之后每帧只是 `bindDescriptorSets`。此前是每帧新建一个描述符池、每个 fill 分配并重写一次描述符 —— 一屏没动过的窗口每秒重写六十遍。纹理销毁后描述符集进空闲表复用，但要等到所有可能仍在采样它的提交都完成（按提交序号比对 in-flight 队列），否则会改掉正在飞行中的那一帧 | texture-cache |
+| render | **每帧零堆分配**：`render_to()` 的 region 是渲染器自己的 scratch，framebuffer 按 render pass 挂在 `ScanoutTarget` 上建一次，command buffer 与 fence 走按提交 fence 回收的空闲表，连导入信号量的那个 vector 都跟着提交槽复用。`Region` 的 subtract/intersect 也改成两块缓冲乒乓——原先每次都是一次分配加一次释放，而遮挡剔除每个表面要做好几次 | render-alloc |
 | render | `read_scanout()` —— 需要 CPU 像素时（嵌套 wl_shm 呈现、screencopy）从渲染目标**自己的 VkImage** 拷出，暂存 buffer 建一次并常驻映射，优先要 HOST_CACHED 内存。之前每帧重新 import 一遍自己的 dmabuf 再从非缓存内存逐像素读，800×600 要 90ms —— 指针拖动卡顿就是它 | gpu-scanout |
 
 ## 后端

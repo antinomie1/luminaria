@@ -243,7 +243,7 @@ local gpu_tests = {
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
     test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,
-    test_libinput_uinput = true, test_render_output = true,
+    test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,
     test_screencopy_bounds = true, test_session = true, test_syncobj = true,
     test_texture = true, test_texture_cache = true, test_vulkan = true,
     test_wayland_nested = true,

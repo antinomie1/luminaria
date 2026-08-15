@@ -31,6 +31,20 @@ public:
     Region() = default;
     explicit Region(const Box& box) { add(box); }
 
+    // The scratch buffer below is storage, not state: it never travels with the
+    // region, and two regions holding the same boxes are equal whatever is left
+    // in it. Hence the hand-written five rather than defaults.
+    Region(const Region& other) : rects_(other.rects_) {}
+    Region& operator=(const Region& other) {
+        if (this != &other) {
+            rects_ = other.rects_;
+        }
+        return *this;
+    }
+    Region(Region&&) noexcept = default;
+    Region& operator=(Region&&) noexcept = default;
+    ~Region() = default;
+
     /// The disjoint boxes covering this region. Order is unspecified.
     [[nodiscard]] const std::vector<Box>& rects() const noexcept { return rects_; }
     [[nodiscard]] bool empty() const noexcept { return rects_.empty(); }
@@ -56,7 +70,8 @@ public:
         if (box.empty() || rects_.empty()) {
             return;
         }
-        std::vector<Box> out;
+        std::vector<Box>& out = scratch_;
+        out.clear();
         out.reserve(rects_.size());
         for (const Box& r : rects_) {
             const Box hit = r.intersection(box);
@@ -80,7 +95,10 @@ public:
                                   hit.height});
             }
         }
-        rects_ = std::move(out);
+        // Swap rather than move-assign: the two buffers ping-pong, so neither
+        // is ever freed and a steady-state frame allocates nothing here. This
+        // is the innermost loop of occlusion culling, once per surface.
+        rects_.swap(out);
         coalesce();
     }
 
@@ -92,14 +110,15 @@ public:
 
     /// Drop everything outside `box`.
     void intersect(const Box& box) {
-        std::vector<Box> out;
+        std::vector<Box>& out = scratch_;
+        out.clear();
         out.reserve(rects_.size());
         for (const Box& r : rects_) {
             if (const Box hit = r.intersection(box); !hit.empty()) {
                 out.push_back(hit);
             }
         }
-        rects_ = std::move(out);
+        rects_.swap(out);
         coalesce();
     }
 
@@ -138,8 +157,9 @@ public:
     }
 
     // Member rather than hidden friend: gcc 16 ICEs on a defaulted friend
-    // operator== inside a module interface unit.
-    [[nodiscard]] bool operator==(const Region&) const = default;
+    // operator== inside a module interface unit. Written out rather than
+    // defaulted because the scratch buffer is not part of the value.
+    [[nodiscard]] bool operator==(const Region& other) const { return rects_ == other.rects_; }
 
 private:
     /// Merge every pair of boxes that shares a full edge, until none is left.
@@ -173,6 +193,10 @@ private:
     }
 
     std::vector<Box> rects_; // pairwise disjoint, and maximally coalesced
+    // The other half of the ping-pong. Not part of the region's value: it holds
+    // whatever the last subtract/intersect left behind, and exists only so that
+    // neither buffer is ever released.
+    std::vector<Box> scratch_;
 };
 
 } // namespace luminaria

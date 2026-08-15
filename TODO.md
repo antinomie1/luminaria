@@ -47,10 +47,14 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 `test_idle_frame` 守后端契约，`test_idle_wake` 用一个按帧回调节流的客户端守「不空转也不冻住」
 （20 轮 20ms，20 帧；自由运行的 1ms 帧泵是 400 帧）。
 
+渲染器那一半的每帧零分配也做了：`Region` 的 subtract/intersect 改成两块缓冲乒乓（原先每次
+`rects_ = std::move(out)` 都是一次分配加一次释放），`render_to()` 的 region 全部改成渲染器
+自己的 scratch，framebuffer 按 render pass 挂在 `ScanoutTarget` 上建一次，command buffer
+与 fence 走按提交 fence 回收的空闲表。`test_render_alloc` 守着：稳态 32 帧，两条路径都是
+**0 次** C++ 堆分配。
+
 仍未做：
 
-- **`VulkanRenderer::render_to()` 每帧仍在堆上建** `Region`、`vk::raii::Framebuffer`、
-  `CommandBuffers`。外壳层那一半的每帧零分配已经由 `test_frame` 守住了，渲染器这一半没有。
 - 真机复核：第 0 步的 tty 验证要重跑一遍，看空闲时 `frames/s` 那行是不是真的不再出现。
 
 ### 3. 协议补齐

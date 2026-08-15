@@ -298,10 +298,16 @@ struct QuadPipeline {
 /// One submitted-but-not-waited-for render. Without the fence stall the command
 /// buffer, its descriptors and its semaphores are still in use after render_to
 /// returns, so they live here until the fence says otherwise.
+///
+/// The command buffer and the fence then go back on free lists rather than
+/// being destroyed: allocating a command buffer and creating a fence are two
+/// heap allocations per frame, sixty times a second, for objects that are
+/// identical every time. The semaphores really are per-frame — they are
+/// imported from whatever fds this frame's clients handed over — but the vector
+/// holding them is recycled with the slot.
 struct InFlight {
     vk::raii::Fence fence;
-    vk::raii::CommandBuffers cmds;
-    vk::raii::Framebuffer framebuffer;
+    vk::raii::CommandBuffer cmd;
     std::vector<vk::raii::Semaphore> semaphores;
     std::uint64_t index = 0; ///< submission order, for retiring descriptor sets
 };
@@ -329,6 +335,56 @@ struct VulkanRenderer::Impl {
     std::vector<QuadPipeline> pipelines;
     std::vector<InFlight> in_flight;
     std::uint64_t submits = 0;
+
+    // --- per-frame objects, recycled ---
+    //
+    // Everything render_to needs and nothing it keeps: taken here at the top of
+    // a frame and handed back when the GPU is done with the submit. The point
+    // is that a steady-state frame allocates nothing at all, on the CPU heap or
+    // in the driver.
+    std::vector<vk::raii::CommandBuffer> free_cmds;
+    std::vector<vk::raii::Fence> free_fences;
+    std::vector<std::vector<vk::raii::Semaphore>> free_sem_lists;
+    // Scratch for render_to: cleared per frame, never released.
+    Region repaint;
+    Region covered;
+    Region backdrop;
+    std::vector<Region> visible; ///< one per texture; only ever grows
+    std::vector<vk::ClearRect> clear_rects;
+    std::vector<vk::Semaphore> wait_handles;
+    std::vector<vk::PipelineStageFlags> wait_stages;
+
+    vk::raii::CommandBuffer acquire_cmd() {
+        if (!free_cmds.empty()) {
+            vk::raii::CommandBuffer cmd = std::move(free_cmds.back());
+            free_cmds.pop_back();
+            cmd.reset(); // the pool allows it; see eResetCommandBuffer
+            return cmd;
+        }
+        vk::raii::CommandBuffers fresh{
+            device, vk::CommandBufferAllocateInfo{*command_pool, vk::CommandBufferLevel::ePrimary,
+                                                  1}};
+        return std::move(fresh.front());
+    }
+
+    vk::raii::Fence acquire_fence_object() {
+        if (!free_fences.empty()) {
+            vk::raii::Fence fence = std::move(free_fences.back());
+            free_fences.pop_back();
+            device.resetFences(*fence);
+            return fence;
+        }
+        return vk::raii::Fence{device, vk::FenceCreateInfo{}};
+    }
+
+    std::vector<vk::raii::Semaphore> acquire_sem_list() {
+        if (free_sem_lists.empty()) {
+            return {};
+        }
+        std::vector<vk::raii::Semaphore> list = std::move(free_sem_lists.back());
+        free_sem_lists.pop_back();
+        return list;
+    }
 
     // --- descriptor sets, cached per texture ---
     //
@@ -362,8 +418,18 @@ struct VulkanRenderer::Impl {
     /// Drop everything the GPU has finished with. Cheap and called once per
     /// render; the list is bounded by how many frames the display is behind.
     void reap() {
-        std::erase_if(in_flight,
-                      [](const InFlight& f) { return f.fence.getStatus() == vk::Result::eSuccess; });
+        std::erase_if(in_flight, [this](InFlight& f) {
+            if (f.fence.getStatus() != vk::Result::eSuccess) {
+                return false;
+            }
+            // The GPU is done with this submit: the imported semaphores have
+            // served their purpose and die here, everything else is reusable.
+            f.semaphores.clear();
+            free_sem_lists.push_back(std::move(f.semaphores));
+            free_cmds.push_back(std::move(f.cmd));
+            free_fences.push_back(std::move(f.fence));
+            return true;
+        });
         // A retired set is safe to rewrite once every submit that could still
         // reference it has completed. in_flight is in submission order, so the
         // oldest survivor is the whole test.
@@ -477,8 +543,14 @@ Result<VulkanRenderer> VulkanRenderer::create() {
         device_info.setPEnabledExtensionNames(exts);
         vk::raii::Device device{physical, device_info};
         vk::raii::Queue queue{device, queue_family, 0};
+        // eResetCommandBuffer: render_to recycles its command buffer rather
+        // than allocating one per frame, and a buffer can only be re-recorded
+        // if it can be reset on its own.
         vk::raii::CommandPool command_pool{
-            device, vk::CommandPoolCreateInfo{vk::CommandPoolCreateFlagBits::eTransient, queue_family}};
+            device,
+            vk::CommandPoolCreateInfo{vk::CommandPoolCreateFlagBits::eTransient |
+                                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+                                      queue_family}};
 
         auto impl = std::make_unique<Impl>(Impl{std::move(context), std::move(instance),
                                                 std::move(physical), queue_family, std::move(device),
@@ -567,7 +639,7 @@ Result<Pixel> VulkanRenderer::render_clear_readback(int width, int height, Color
                             {}, {}, {}, to_host);
         cmd.end();
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         impl_->queue.submit(submit, *fence);
@@ -777,7 +849,7 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
                             {}, {});
         cmd.end();
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         impl_->queue.submit(submit, *fence);
@@ -982,7 +1054,7 @@ Result<std::vector<std::uint8_t>> VulkanRenderer::import_dmabuf(int fd, int widt
                             {}, {});
         cmd.end();
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         impl_->queue.submit(submit, *fence);
@@ -1090,7 +1162,7 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height, std::uint32_
                             vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, release);
         cmd.end();
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         impl_->queue.submit(submit, *fence);
@@ -1098,6 +1170,7 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height, std::uint32_
             vk::Result::eSuccess) {
             return fail("fence wait failed");
         }
+        impl_->free_fences.push_back(std::move(fence));
         return ok();
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan dmabuf export: "} + e.what());
@@ -1138,6 +1211,13 @@ struct ScanoutTarget::Impl {
     DmabufPlane plane;        // plane.fd is owned here
     bool has_content = false; // false until the first full render
     UniqueFd acquire_fence;   // sync_file from the flip still scanning us out
+
+    // The two framebuffers over `view` — one per render pass, since a partial
+    // repaint loads and a full one clears. Nothing about either changes after
+    // the first frame (the view and the size are fixed for the life of the
+    // target), so they are built once here instead of per frame.
+    std::optional<vk::raii::Framebuffer> fb_load;
+    std::optional<vk::raii::Framebuffer> fb_clear;
 
     // Staging buffer for read_scanout(), created on first use and kept. It is
     // mapped once and stays mapped: re-creating and re-mapping it per frame was
@@ -1245,7 +1325,7 @@ Status VulkanRenderer::read_scanout(ScanoutTarget& target, std::vector<std::uint
                             vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, back);
         cmd.end();
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         impl_->queue.submit(submit, *fence);
@@ -1541,7 +1621,7 @@ Result<GpuTexture> VulkanRenderer::upload_texture(int width, int height,
                             vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_read);
         cmd.end();
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         impl_->queue.submit(submit, *fence);
@@ -1656,8 +1736,8 @@ Result<ScanoutTarget> VulkanRenderer::create_scanout(int width, int height,
         // which costs it the implicit move constructor.
         return ScanoutTarget{std::unique_ptr<ScanoutTarget::Impl>(
             new ScanoutTarget::Impl{std::move(image), std::move(memory), std::move(view), fmt,
-                                    plane, false, UniqueFd{}, std::nullopt, std::nullopt, nullptr,
-                                    true})};
+                                    plane, false, UniqueFd{}, std::nullopt, std::nullopt,
+                                    std::nullopt, std::nullopt, nullptr, true})};
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan scanout alloc: "} + e.what());
     }
@@ -1692,7 +1772,11 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         // rects would blend a translucent surface into the same pixel twice, and
         // the render pass needs one area that covers them all.
         const Box full{0, 0, logical_w, logical_h};
-        Region repaint;
+        // Every region below is the renderer's scratch, cleared rather than
+        // built: a frame's worth of set arithmetic must not cost a frame's
+        // worth of heap traffic.
+        Region& repaint = impl_->repaint;
+        repaint.clear();
         const bool partial = !damage.empty() && t.has_content;
         if (partial) {
             for (const Box& d : damage) {
@@ -1708,8 +1792,15 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         // Occlusion: walk front to back and remember what is already covered by
         // something the caller declared opaque. A maximised window over a
         // wallpaper means the wallpaper is never sampled at all.
-        std::vector<Region> visible(textures.size());
-        Region covered;
+        std::vector<Region>& visible = impl_->visible;
+        if (visible.size() < textures.size()) {
+            visible.resize(textures.size()); // grows to the busiest frame, never shrinks
+        }
+        for (size_t i = 0; i < textures.size(); ++i) {
+            visible[i].clear();
+        }
+        Region& covered = impl_->covered;
+        covered.clear();
         for (size_t i = textures.size(); i-- > 0;) {
             const GpuTextureFill& tf = textures[i];
             if (tf.texture == nullptr || tf.w <= 0 || tf.h <= 0) {
@@ -1727,25 +1818,28 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             }
         }
         // Whatever is left over is background and solid rects, the very back.
-        Region backdrop = repaint;
+        Region& backdrop = impl_->backdrop;
+        backdrop = repaint;
         backdrop.subtract(covered);
 
         const Box device_area = to_device(repaint.extents());
 
         QuadPipeline& quad = impl_->quad_pipeline(t.format);
-        vk::ImageView fb_attachment = *t.view;
-        vk::raii::Framebuffer framebuffer{
-            device, vk::FramebufferCreateInfo{{},
-                                              partial ? *quad.load_pass : *quad.clear_pass,
-                                              fb_attachment,
-                                              static_cast<std::uint32_t>(device_w),
-                                              static_cast<std::uint32_t>(device_h),
-                                              1}};
+        // Built on the first frame that needs this pass and kept on the target.
+        std::optional<vk::raii::Framebuffer>& cached = partial ? t.fb_load : t.fb_clear;
+        if (!cached.has_value()) {
+            vk::ImageView fb_attachment = *t.view;
+            cached.emplace(device,
+                           vk::FramebufferCreateInfo{{},
+                                                     partial ? *quad.load_pass : *quad.clear_pass,
+                                                     fb_attachment,
+                                                     static_cast<std::uint32_t>(device_w),
+                                                     static_cast<std::uint32_t>(device_h),
+                                                     1});
+        }
+        const vk::raii::Framebuffer& framebuffer = *cached;
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
         const std::uint32_t foreign =
@@ -1801,8 +1895,9 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         // On a partial repaint loadOp is eLoad, so the background has to be
         // painted explicitly — over each damage box, not over the box spanning
         // them, and not at all where an opaque surface will cover it anyway.
+        std::vector<vk::ClearRect>& clear_rects = impl_->clear_rects;
         if (partial) {
-            std::vector<vk::ClearRect> clear_rects;
+            clear_rects.clear();
             clear_rects.reserve(backdrop.rects().size());
             for (const Box& b : backdrop.rects()) {
                 clear_rects.push_back(vk::ClearRect{to_rect2d(to_device(b)), 0, 1});
@@ -1816,7 +1911,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             }
         }
         for (const RectFill& rf : rects) {
-            std::vector<vk::ClearRect> clear_rects;
+            clear_rects.clear();
             for (const Box& b : backdrop.rects()) {
                 if (const Box hit = rf.box.intersection(b); !hit.empty()) {
                     clear_rects.push_back(vk::ClearRect{to_rect2d(to_device(hit)), 0, 1});
@@ -1907,9 +2002,11 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
         // Every fence a client gave us for its buffer, plus whatever the display
         // engine still owes on this target, becomes a semaphore the queue waits
         // on. The finished render becomes a sync_file the caller hands to KMS.
-        std::vector<vk::raii::Semaphore> semaphores;
-        std::vector<vk::Semaphore> wait_handles;
-        std::vector<vk::PipelineStageFlags> wait_stages;
+        std::vector<vk::raii::Semaphore> semaphores = impl_->acquire_sem_list();
+        std::vector<vk::Semaphore>& wait_handles = impl_->wait_handles;
+        std::vector<vk::PipelineStageFlags>& wait_stages = impl_->wait_stages;
+        wait_handles.clear();
+        wait_stages.clear();
         auto add_wait = [&](int fd) {
             if (fd < 0 || !impl_->sync_fd_ok) {
                 return;
@@ -1941,7 +2038,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             out_sem.emplace(device, ci);
         }
 
-        vk::raii::Fence fence{device, vk::FenceCreateInfo{}};
+        vk::raii::Fence fence = impl_->acquire_fence_object();
         vk::SubmitInfo submit;
         submit.setCommandBuffers(*cmd);
         if (!wait_handles.empty()) {
@@ -1967,16 +2064,22 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             // Nothing is waited on here: the command buffer, its descriptors and
             // these semaphores stay alive in the in-flight list until the fence
             // says the GPU is done with them.
-            impl_->in_flight.push_back(InFlight{std::move(fence), std::move(command_buffers),
-                                                std::move(framebuffer), std::move(semaphores),
-                                                ++impl_->submits});
+            impl_->in_flight.push_back(InFlight{std::move(fence), std::move(cmd),
+                                                std::move(semaphores), ++impl_->submits});
             return ok();
         }
         if (sync.out_fence_fd != nullptr) {
             *sync.out_fence_fd = -1; // asked for a fence the device cannot give
         }
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
+        const vk::Result waited =
+            device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+        // Waited for, so nothing is reading either of them any more: straight
+        // back on the free lists rather than out through the destructor.
+        semaphores.clear();
+        impl_->free_sem_lists.push_back(std::move(semaphores));
+        impl_->free_cmds.push_back(std::move(cmd));
+        impl_->free_fences.push_back(std::move(fence));
+        if (waited != vk::Result::eSuccess) {
             return fail("fence wait failed");
         }
         return ok();

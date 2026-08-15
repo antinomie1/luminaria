@@ -188,6 +188,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `GpuTexture` (the view it binds never changes); dead textures' sets go back on a free
   list, but only once every submit that could still be sampling through them has
   retired — `Impl::reap()` gates that on the oldest surviving `in_flight` index.
+  **A steady-state `render_to` allocates nothing** (`tests/test_render_alloc.cpp` counts it,
+  the same way `test_frame` does for the shell): the regions are `Impl` scratch, the
+  framebuffers are built once per render pass on the `ScanoutTarget`, and command buffers,
+  fences and the semaphore list come off free lists that `reap()` refills when a submit's
+  fence clears. `Region::subtract`/`intersect` ping-pong two buffers for the same reason —
+  they used to move-assign a fresh vector, which is an allocation per call per surface.
 - **shell** — the opinionated half, and deliberately immediate-mode: there is no retained
   tree (ADR 0001). `Frame` (`shell/frame.cppm`) is the per-output ledger a compositor
   refills every frame — `begin(view)` then `place(surface, x, y)` per window, giving a
