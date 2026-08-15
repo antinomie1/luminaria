@@ -99,7 +99,7 @@
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。稳态重排零堆分配 | frame |
+| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。`begin_group` / `compose_group` 将一组摆位离屏化并贴回成一个整窗纹理，源摆位仍负责命中测试。稳态重排零堆分配 | frame, offscreen |
 | shell | **摆位串 diff 出 damage** —— `submit()` 把这一帧的摆位串与上一次上屏的那串逐位比较（位置进身份，所以换 z 序也算变），差异处旧矩形与新矩形各记一笔。窗口开 / 关 / 移动 / 缩放 / 换层次没有任何客户端会报 damage，但全写在摆位串里，所以混成器只欠一次 `invalidate()` 唤醒；移动一个窗口的代价是它跨过的两个矩形而非一屏。`damage_all()` 退为钝器（底色变了、直出后合成缓冲失效） | frame-damage |
 | shell | **无 damage 不提交** —— `submit()` 发现这一帧与屏上那一帧完全一致时答 `unchanged`：不渲染、不翻页、不轮换缓冲，输出随即安静。唤醒是 `Frame` 自己的事——它盯着自己画过的每个表面的 commit，`invalidate()` / `damage_all()` 与 `reset()` 也各要一帧；混成器只需在收到 `unchanged` 时补发帧回调（那一帧没有 `present`） | idle-wake, frame |
 | xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |

@@ -163,17 +163,26 @@ int main() {
         assert(renderer->read_scanout(*target, pixels).has_value());
         assert(near(red_at(pixels, kOverlap, kRow), 128));
 
-        // Frame is the normal shell-layer caller. It must preserve the one
-        // whole-window alpha too: placing the offscreen result at 50% through
-        // Frame produces the same seam-free middle as calling render_to()
-        // directly above.
+        // Frame is the normal shell-layer caller. It owns the source texture
+        // bridge, keeps the source placements for hit-testing, composes their
+        // group offscreen, and puts back one alpha'd texture. The observed
+        // pixels must still be seam-free — this crosses the public group seam,
+        // rather than manually placing the already-finished texture.
         auto display = luminaria::Display::create();
         assert(display.has_value());
         luminaria::HeadlessOutput output(display->event_loop(), kW, kH, 16);
         luminaria::Frame frame(output, *renderer);
         assert(frame.reset(DRM_FORMAT_XRGB8888).has_value());
         frame.begin({0, 0, kW, kH});
-        frame.place(offscreen->texture(), 0, 0, win_w, kQuadH, 0.5f);
+        const auto group = frame.begin_group();
+        frame.place(*tex_a, 0, 0, kQuadW, kQuadH);
+        frame.place(*tex_b, kBx, 0, kQuadW, kQuadH);
+        assert(frame.compose_group(group, *offscreen, {0, 0, win_w, kQuadH}, 0.5f).has_value());
+        // The two source placements survive as input records, then the final
+        // offscreen quad appears after them as the one drawable member.
+        assert(frame.placements().size() == 3);
+        assert(!frame.placements()[0].draw && !frame.placements()[1].draw);
+        assert(frame.placements()[2].draw);
         assert(frame.submit(black).has_value());
         auto readback = frame.read_back();
         assert(readback.has_value());

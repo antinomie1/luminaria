@@ -1,7 +1,7 @@
 # ADR 0005：整窗特效走离屏合成，一帧因此不再只有一个 pass
 
 日期：2026-08-15
-状态：已接受（渲染器一侧已实现，`Frame` 一侧待做）
+状态：已实现
 
 ## 背景
 
@@ -43,6 +43,9 @@ Hyprland 与 niri 各自独立地得出了同一个结论并且都实现了它�
   输出时透出壁纸。
 - 没有 `OutputMapping`。离屏图像是它自己的像素空间；输出的缩放与旋转在**贴回时**施加一次，
   作用于合成好的整窗，而不是作用于每个表面——这本来就是离屏存在的理由之一。
+- `Frame::begin_group()` / `compose_group()` —— group marker 之后的摆位先合成进目标；源摆位留在
+  列表里做命中测试但不再画，目标纹理以一个最终摆位替代它们的像素。prepass 的 out-fence 自动并入
+  最后上屏的 render wait 链，client acquire / release 与 damage 仍归 `Frame`，不落给混成器手工接线。
 
 实现上之所以便宜，是因为现有 render pass 的 initial/final layout 就是
 `eColorAttachmentOptimal`，进出显示引擎（foreign 队列 / `eGeneral`）全部由 pass **之外**的

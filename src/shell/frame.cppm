@@ -34,6 +34,7 @@
 
 module;
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -78,6 +79,11 @@ struct Placement {
     /// into an OffscreenTarget. A translucent placement must not claim opacity.
     float alpha = 1.0f;
 
+    /// False only for a placement absorbed into a composed group. It stays in
+    /// the list for hit-testing, but its pixels are represented by the group's
+    /// one texture placement instead.
+    bool draw = true;
+
     /// The opaque region, in layout coordinates, as `[first, first+count)` in
     /// the frame's arena — ask `Frame::opaque_of()`. It lives here as a pair of
     /// indices rather than a `Region` because a `Region` per surface per frame
@@ -85,6 +91,20 @@ struct Placement {
     /// this layer exists to not pay.
     std::uint32_t opaque_first = 0;
     std::uint32_t opaque_count = 0;
+};
+
+/// A marker returned by `Frame::begin_group()`. It names the suffix of the
+/// current placement list added after the marker; it is invalid after `begin()`.
+class PlacementGroup {
+public:
+    PlacementGroup() = default;
+
+private:
+    friend class Frame;
+    std::size_t first_ = 0;
+    std::uint64_t generation_ = 0;
+    PlacementGroup(std::size_t first, std::uint64_t generation) noexcept
+        : first_(first), generation_(generation) {}
 };
 
 /// What `Frame::submit()` did with the frame.
@@ -149,6 +169,26 @@ public:
     /// As above, with whole-quad opacity. Use this for a compositor-owned
     /// texture such as an OffscreenTarget's finished window.
     void place(const GpuTexture& texture, int x, int y, int width, int height, float alpha);
+
+    /// Mark the start of a window-sized group. Add the window's surface tree,
+    /// its popups, and any other visual members with `place()`, then hand the
+    /// marker to `compose_group()`. The original placements remain hit-testable
+    /// while the group becomes one drawable texture, so input follows the
+    /// window rather than the intermediate image.
+    [[nodiscard]] PlacementGroup begin_group() const noexcept;
+
+    /// Composite every placement added since `group` into `target`, then replace
+    /// their pixels with one texture at `bounds`. `target` must be `bounds`
+    /// wide and high in this output's logical pixels times its scale. The group
+    /// is normally a window plus its subsurfaces/popups; applying `alpha` here
+    /// fades that whole tree once, with no overlap seam.
+    ///
+    /// The intermediate submit joins the final submit through a sync_file, so
+    /// neither pass waits on the CPU. The group is repainted as one box; callers
+    /// cache/reuse the target and only call this when its tree changed or the
+    /// effect itself needs a fresh image.
+    [[nodiscard]] Status compose_group(PlacementGroup group, OffscreenTarget& target,
+                                       const Box& bounds, float alpha = 1.0f);
 
     /// This frame's list, back-to-front. Valid until the next `begin()`.
     [[nodiscard]] std::span<const Placement> placements() const noexcept;
@@ -276,6 +316,7 @@ struct FrPlacementKey {
     Transform transform = Transform::normal;
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
     float alpha = 1.0f;
+    bool draw = true;
 
     // Member and not a hidden friend: a defaulted hidden-friend operator== in a
     // module interface ICEs gcc 16.
@@ -284,7 +325,7 @@ struct FrPlacementKey {
                box.x == other.box.x && box.y == other.box.y && box.width == other.box.width &&
                box.height == other.box.height && transform == other.transform &&
                u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1 &&
-               alpha == other.alpha;
+               alpha == other.alpha && draw == other.draw;
     }
 };
 
@@ -306,12 +347,19 @@ struct Frame::Impl {
     std::vector<SurfaceAt> tree;          // scratch for place()
     std::vector<GpuTextureFill> fills;
     std::vector<Box> fill_opaque;         // the same boxes, output-local
+    std::vector<GpuTextureFill> group_fills;
+    std::vector<Box> group_opaque;
+    std::vector<int> group_acquire_fences;
+    std::vector<UniqueFd> prepass_fences; // owned, joined to the final render
+    std::vector<Box> prepass_damage;      // output-local, one box per group
+    std::vector<SurfaceId> prepass_drawn;
     std::vector<SurfaceId> drawn;
     std::vector<std::unique_ptr<FrSurfaceTexture>> texture_cache;
     Signal<SurfaceInvalidated>::Connection surface_invalidated;
     std::vector<Box> damage;              // this frame's, output-local
     std::vector<Box> repaint;             // damage + what the target still owes
     std::vector<int> acquire_fences;      // borrowed from the surfaces
+    std::vector<int> wait_fences;         // borrowed, incl. prepass_fences
     std::vector<std::uint8_t> readback;   // CPU path only
     std::vector<Pixel> frame_pixels;      // CPU path only
 
@@ -327,6 +375,7 @@ struct Frame::Impl {
     std::vector<FrPlacementKey> last;
     Box last_view{};
     bool last_valid = false;
+    std::uint64_t generation = 0;
 
     void rotate_debt();
     void diff_damage();
@@ -338,7 +387,11 @@ struct Frame::Impl {
 FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
     FrPlacementKey key{};
     key.surface = p.surface;
-    key.texture = p.texture;
+    // Hit-test-only members of a composed group do not contribute pixels to
+    // the output. Their surface identity must still be retained for input, but
+    // treating their texture as drawable here would manufacture output damage
+    // beside the group's one final texture.
+    key.texture = p.draw ? p.texture : nullptr;
     key.box = Box{p.x - view.x, p.y - view.y, p.width, p.height};
     key.transform = p.transform;
     key.u0 = p.u0;
@@ -346,6 +399,7 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
     key.u1 = p.u1;
     key.v1 = p.v1;
     key.alpha = p.alpha;
+    key.draw = p.draw;
     return key;
 }
 
@@ -559,7 +613,14 @@ Status Frame::reset(std::uint32_t drm_format) {
 
 void Frame::begin(const Box& view) {
     Impl& impl = *impl_;
+    // A caller that abandoned a build after composing a group owns no fence:
+    // the GPU imported it into the prepass already, so closing our sync_file
+    // copy is safe. The next begun list starts with no unsubmitted group work.
+    impl.prepass_fences.clear();
+    impl.prepass_damage.clear();
+    impl.prepass_drawn.clear();
     impl.view = view;
+    ++impl.generation;
     impl.placements.clear();
     impl.opaque_arena.clear();
 }
@@ -620,6 +681,111 @@ void Frame::place(const GpuTexture& texture, int x, int y, int width, int height
     p.alpha = std::clamp(alpha, 0.0f, 1.0f);
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
+}
+
+PlacementGroup Frame::begin_group() const noexcept {
+    return PlacementGroup{impl_->placements.size(), impl_->generation};
+}
+
+Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const Box& bounds,
+                            float alpha) {
+    Impl& impl = *impl_;
+    if (group.generation_ != impl.generation || group.first_ >= impl.placements.size()) {
+        return fail("offscreen group is empty or belongs to an earlier frame");
+    }
+    const int scale = std::max(1, impl.output->scale());
+    if (bounds.empty() || target.width() != bounds.width * scale ||
+        target.height() != bounds.height * scale) {
+        return fail("offscreen target dimensions do not match the group bounds and output scale");
+    }
+
+    impl.group_fills.clear();
+    impl.group_opaque.clear();
+    impl.group_acquire_fences.clear();
+    const std::size_t drawn_first = impl.prepass_drawn.size();
+    impl.group_opaque.reserve(impl.opaque_arena.size());
+    for (std::size_t i = group.first_; i < impl.placements.size(); ++i) {
+        Placement& p = impl.placements[i];
+        if (!p.draw) {
+            return fail("an offscreen group cannot contain an already-composed group");
+        }
+        Surface* surface = surface_from_id(p.surface);
+        if (p.surface.valid()) {
+            p.texture = surface != nullptr ? impl.texture_for(*surface) : nullptr;
+        }
+        if (p.texture == nullptr) {
+            p.draw = false;
+            continue;
+        }
+
+        GpuTextureFill fill{};
+        fill.texture = p.texture;
+        fill.x = p.x - bounds.x;
+        fill.y = p.y - bounds.y;
+        fill.w = p.width;
+        fill.h = p.height;
+        fill.transform = p.transform;
+        fill.u0 = p.u0;
+        fill.v0 = p.v0;
+        fill.u1 = p.u1;
+        fill.v1 = p.v1;
+        fill.alpha = p.alpha;
+        const std::size_t first = impl.group_opaque.size();
+        if (p.alpha == 1.0f) {
+            for (const Box& b : opaque_of(p)) {
+                impl.group_opaque.push_back(
+                    Box{b.x - bounds.x, b.y - bounds.y, b.width, b.height});
+            }
+        }
+        fill.opaque = std::span<const Box>{impl.group_opaque}.subspan(
+            first, impl.group_opaque.size() - first);
+        impl.group_fills.push_back(fill);
+        if (surface != nullptr) {
+            if (const int fence = surface->acquire_fence_fd(); fence >= 0) {
+                impl.group_acquire_fences.push_back(fence);
+            }
+            impl.prepass_drawn.push_back(p.surface);
+        }
+        // Keep this item for input, but only the final group texture below may
+        // paint it on the output.
+        p.draw = false;
+    }
+    if (impl.group_fills.empty()) {
+        return fail("offscreen group has no drawable texture");
+    }
+
+    int fence = -1;
+    const RenderSync sync{impl.group_acquire_fences, &fence};
+    const Color transparent{0, 0, 0, 0};
+    if (auto rendered = impl.renderer->render_offscreen(target, transparent, {}, impl.group_fills,
+                                                         {}, scale, sync);
+        !rendered) {
+        if (fence >= 0) {
+            ::close(fence);
+        }
+        return fail(rendered.error().message);
+    }
+    if (fence >= 0) {
+        impl.prepass_fences.emplace_back(fence);
+    }
+    for (std::size_t i = drawn_first; i < impl.prepass_drawn.size(); ++i) {
+        if (Surface* surface = surface_from_id(impl.prepass_drawn[i]); surface != nullptr) {
+            surface->notify_rendered(fence);
+        }
+    }
+
+    Placement final{};
+    final.texture = &target.texture();
+    final.x = bounds.x;
+    final.y = bounds.y;
+    final.width = bounds.width;
+    final.height = bounds.height;
+    final.alpha = std::clamp(alpha, 0.0f, 1.0f);
+    final.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
+    impl.placements.push_back(final);
+    impl.prepass_damage.push_back(
+        Box{bounds.x - impl.view.x, bounds.y - impl.view.y, bounds.width, bounds.height});
+    return ok();
 }
 
 std::span<const Placement> Frame::placements() const noexcept { return impl_->placements; }
@@ -738,6 +904,10 @@ Result<Presented> Frame::submit(Color background) {
     impl.fills.clear();
     impl.drawn.clear();
     impl.damage.clear();
+    // A composed group has already rendered its source tree into its private
+    // target. Its final texture is the only output placement, but any new
+    // pixels in that target make the group's whole destination stale.
+    impl.damage.insert(impl.damage.end(), impl.prepass_damage.begin(), impl.prepass_damage.end());
     // The diff below compares against boxes recorded in this output's own
     // coordinates. A view that has moved or resized makes every one of them
     // describe somewhere else, so there is nothing to compare against.
@@ -762,6 +932,9 @@ Result<Presented> Frame::submit(Color background) {
     impl.fill_opaque.reserve(impl.opaque_arena.size());
     bool wants_tearing = false;
     for (Placement& p : impl.placements) {
+        if (!p.draw) {
+            continue;
+        }
         Surface* surface = surface_from_id(p.surface);
         if (p.surface.valid()) {
             // This was a client placement. A non-resolving id means the client
@@ -867,15 +1040,25 @@ Result<Presented> Frame::submit(Color background) {
     if (!impl.targets.empty()) {
         ScanoutTarget& target = impl.targets[impl.back];
         const OutputMapping mapping{output.transform(), output.scale()};
+        impl.wait_fences.assign(impl.acquire_fences.begin(), impl.acquire_fences.end());
+        for (const UniqueFd& fence : impl.prepass_fences) {
+            if (fence.get() >= 0) {
+                impl.wait_fences.push_back(fence.get());
+            }
+        }
         if (!impl.ids.empty()) {
             // The buffer about to be drawn into may still be on screen; the
             // flip's out-fence says when it is not. Waiting for that on the GPU
             // is the point — nothing here blocks.
             target.set_acquire_fence(output.take_present_fence());
             int render_fence = -1;
-            const RenderSync sync{impl.acquire_fences, &render_fence};
+            const RenderSync sync{impl.wait_fences, &render_fence};
             auto rendered =
                 impl.renderer->render_to(target, background, {}, impl.fills, repaint, mapping, sync);
+            // render_to imported every wait fd before returning. This Frame-owned
+            // subset may now close even though the output's render itself is
+            // still in flight.
+            impl.prepass_fences.clear();
             if (!rendered) {
                 if (render_fence >= 0) {
                     ::close(render_fence);
@@ -901,8 +1084,10 @@ Result<Presented> Frame::submit(Color background) {
         } else {
             // No zero-copy path. The composite still happens on the GPU; only
             // the finished frame crosses to the CPU, once.
-            auto rendered =
-                impl.renderer->render_to(target, background, {}, impl.fills, repaint, mapping);
+            const RenderSync sync{impl.wait_fences};
+            auto rendered = impl.renderer->render_to(target, background, {}, impl.fills, repaint,
+                                                      mapping, sync);
+            impl.prepass_fences.clear();
             if (!rendered) {
                 return fail(rendered.error().message);
             }
@@ -934,6 +1119,13 @@ Result<Presented> Frame::submit(Color background) {
             surface->clear_damage();
         }
     }
+    for (SurfaceId id : impl.prepass_drawn) {
+        if (Surface* surface = surface_from_id(id); surface != nullptr) {
+            surface->clear_damage();
+        }
+    }
+    impl.prepass_damage.clear();
+    impl.prepass_drawn.clear();
     return result;
 }
 

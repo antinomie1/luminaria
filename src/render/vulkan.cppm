@@ -323,11 +323,14 @@ public:
     ///
     /// `background` is normally fully transparent. What is composited here is a
     /// window and not a screen: the pixels it does not cover have to let the
-    /// wallpaper through once it is drawn.
+    /// wallpaper through once it is drawn. `scale` is the intermediate image's
+    /// pixel density; use the output scale for a full-resolution window while
+    /// keeping output rotation for the final placement pass.
     [[nodiscard]] Status render_offscreen(OffscreenTarget& target, Color background,
                                           std::span<const RectFill> rects,
                                           std::span<const GpuTextureFill> textures,
                                           std::span<const Box> damage = {},
+                                          int scale = 1,
                                           const RenderSync& sync = {});
 
     // --- linux-dmabuf import/export (any DRM modifier the GPU supports) ---
@@ -2002,7 +2005,8 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
 Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color background,
                                         std::span<const RectFill> rects,
                                         std::span<const GpuTextureFill> textures,
-                                        std::span<const Box> damage, const RenderSync& sync) {
+                                        std::span<const Box> damage, int scale,
+                                        const RenderSync& sync) {
     OffscreenTarget::Impl& o = *target.impl_;
     const GpuTexture::Impl& tex = *o.texture.impl_;
     // No OutputMapping: this image is its own pixel space, and the output's
@@ -2010,7 +2014,8 @@ Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color backgroun
     VulkanRenderTarget t{*tex.image,     *tex.view,  o.format,    tex.width, tex.height,
                          &o.has_content, &o.fb_load, &o.fb_clear, &o.acquire_fence,
                          /*scanout=*/false};
-    return render_pass_to(t, background, rects, textures, damage, OutputMapping{}, sync);
+    return render_pass_to(t, background, rects, textures, damage,
+                          OutputMapping{Transform::normal, scale}, sync);
 }
 
 Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,

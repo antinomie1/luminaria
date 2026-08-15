@@ -97,9 +97,10 @@ bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布
   变成「重画两个 24 像素矩形」。
 - **(b) crop / rescale / relocate 型的摆位包装**。动画要的平移、缩放、裁剪应当是串这一层的
   组合，不是往 shader 里加参数。`Placement` 需要浮点几何（整数会让滑动逐帧抖）与 alpha。
-- **(c) 把一棵表面树合成到离屏纹理，再当一个摆位贴回**。渲染器基础已完成（2026-08-15）：
+- **(c) 把一棵表面树合成到离屏纹理，再当一个摆位贴回 —— 已完成（2026-08-15）**。
   `OffscreenTarget` + `render_offscreen()` 复用现有合成 pass，`GpuTextureFill::alpha` 支持把结果
-  作为一个 quad 淡入淡出；`Frame` 还缺「选取一组摆位并替成这个 quad」的外壳 API。Hyprland 与 niri 都被迫做了同一件
+  作为一个 quad 淡入淡出；`Frame::begin_group()` / `compose_group()` 把 marker 后的摆位离屏化，保留
+  源摆位作命中测试、以最终 texture 摆位绘制，并把 prepass fence/damage 接回最终提交。Hyprland 与 niri 都被迫做了同一件
   事，理由相同：子表面 / popup 重叠处各自乘 alpha 会露接缝。淡入淡出、缩放动画与模糊三者
   共用这套离屏基础设施，所以它比「给 `Placement` 加个 alpha 字段」更底层。**要单开 ADR**：
   它是第一个打破「一帧一 pass」的东西。
