@@ -161,7 +161,10 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   box), skips anything hidden behind a `GpuTextureFill::opaque` rect, and — given a
   `RenderSync` — waits on client acquire fences as `VkSemaphore`s and hands back a
   sync_file instead of stalling. Unfinished submits live in `Impl::in_flight` until their
-  fence clears.
+  fence clears. Each texture's descriptor set is written once and cached on the
+  `GpuTexture` (the view it binds never changes); dead textures' sets go back on a free
+  list, but only once every submit that could still be sampling through them has
+  retired — `Impl::reap()` gates that on the oldest surviving `in_flight` index.
 - **`scene`** — retained tree (Tree/Rect/Surface), positioning, hit-testing, flattening to
   `RectFill`s and `GpuTextureFill`s, and damage (`scene_damage()` →
   `scene_rects(root, damage)` / `scene_textures(root, renderer, damage)` →

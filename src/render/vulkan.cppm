@@ -273,6 +273,9 @@ public:
                                        const std::vector<std::uint8_t>& rgba);
 
 private:
+    // A GpuTexture caches a descriptor set the renderer owns, and hands it back
+    // when it dies; that needs to name the renderer's Impl.
+    friend class GpuTexture;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit VulkanRenderer(std::unique_ptr<Impl> impl) noexcept;
@@ -288,7 +291,6 @@ namespace luminaria {
 /// frame would cost more than the frame.
 struct QuadPipeline {
     vk::Format format;
-    vk::raii::DescriptorSetLayout set_layout;
     vk::raii::PipelineLayout layout;
     vk::raii::RenderPass load_pass;  // partial repaint: keep what is there
     vk::raii::RenderPass clear_pass; // full repaint: contents are undefined
@@ -301,9 +303,17 @@ struct QuadPipeline {
 struct InFlight {
     vk::raii::Fence fence;
     vk::raii::CommandBuffers cmds;
-    vk::raii::DescriptorPool pool;
     vk::raii::Framebuffer framebuffer;
     std::vector<vk::raii::Semaphore> semaphores;
+    std::uint64_t index = 0; ///< submission order, for retiring descriptor sets
+};
+
+/// A descriptor set whose texture is gone. It cannot go back on the free list
+/// until every submit that might still be reading it has finished, which is
+/// what `after` records.
+struct RetiredSet {
+    vk::DescriptorSet set;
+    std::uint64_t after;
 };
 
 struct VulkanRenderer::Impl {
@@ -320,14 +330,54 @@ struct VulkanRenderer::Impl {
     std::optional<vk::raii::Sampler> sampler;
     std::vector<QuadPipeline> pipelines;
     std::vector<InFlight> in_flight;
+    std::uint64_t submits = 0;
+
+    // --- descriptor sets, cached per texture ---
+    //
+    // Every quad binds one combined image sampler, and the binding for a given
+    // texture never changes: the image and its view are created once and live
+    // as long as the texture does. So the set is written once, when the texture
+    // is first drawn, and simply re-bound afterwards. What used to happen was a
+    // fresh pool per frame plus one allocate-and-write per *fill*, which for a
+    // screen full of unchanging windows is the same descriptor rewritten sixty
+    // times a second.
+    //
+    // The layout is shared rather than per-pipeline: it is the same single
+    // binding whatever the target format, and one layout means one free list.
+    std::optional<vk::raii::DescriptorSetLayout> set_layout;
+    std::vector<vk::raii::DescriptorPool> set_pools;
+    std::vector<vk::DescriptorSet> free_sets;
+    std::vector<RetiredSet> retiring;
+    std::uint32_t sets_in_pool = 0; ///< allocated out of set_pools.back()
 
     QuadPipeline& quad_pipeline(vk::Format format);
+    vk::DescriptorSetLayout quad_set_layout();
+    vk::DescriptorSet acquire_set();
+
+    /// A texture is gone; its set can be reused once nothing is reading it.
+    void retire_set(vk::DescriptorSet set) {
+        if (set) {
+            retiring.push_back(RetiredSet{set, submits});
+        }
+    }
 
     /// Drop everything the GPU has finished with. Cheap and called once per
     /// render; the list is bounded by how many frames the display is behind.
     void reap() {
         std::erase_if(in_flight,
                       [](const InFlight& f) { return f.fence.getStatus() == vk::Result::eSuccess; });
+        // A retired set is safe to rewrite once every submit that could still
+        // reference it has completed. in_flight is in submission order, so the
+        // oldest survivor is the whole test.
+        const std::uint64_t oldest =
+            in_flight.empty() ? submits + 1 : in_flight.front().index;
+        std::erase_if(retiring, [&](const RetiredSet& r) {
+            if (r.after >= oldest) {
+                return false;
+            }
+            free_sets.push_back(r.set);
+            return true;
+        });
     }
 };
 
@@ -1071,6 +1121,15 @@ struct GpuTexture::Impl {
     int width;
     int height;
     bool external; // imported dmabuf: acquire from the foreign queue on each use
+
+    // The descriptor set that binds this texture, written the first time it is
+    // drawn and re-bound from then on. It describes `view`, which never changes
+    // for a given Impl, so there is nothing to invalidate. Mutable because a
+    // GpuTextureFill borrows the texture by const pointer and this is a cache.
+    // Owned by the renderer's pools, hence a raw handle and the back-pointer
+    // that returns it when the texture dies.
+    mutable vk::DescriptorSet set{};
+    mutable VulkanRenderer::Impl* owner = nullptr;
 };
 
 struct ScanoutTarget::Impl {
@@ -1101,7 +1160,11 @@ struct ScanoutTarget::Impl {
 };
 
 GpuTexture::GpuTexture(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-GpuTexture::~GpuTexture() = default;
+GpuTexture::~GpuTexture() {
+    if (impl_ && impl_->owner != nullptr) {
+        impl_->owner->retire_set(impl_->set);
+    }
+}
 GpuTexture::GpuTexture(GpuTexture&&) noexcept = default;
 GpuTexture& GpuTexture::operator=(GpuTexture&&) noexcept = default;
 int GpuTexture::width() const noexcept { return impl_->width; }
@@ -1283,6 +1346,43 @@ vk::raii::RenderPass make_pass(const vk::raii::Device& device, vk::Format format
 
 } // namespace
 
+// One binding, one sampler, the same for every target format — so there is one
+// layout for the whole renderer and every cached set is interchangeable.
+vk::DescriptorSetLayout VulkanRenderer::Impl::quad_set_layout() {
+    if (!set_layout.has_value()) {
+        vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eCombinedImageSampler, 1,
+                                               vk::ShaderStageFlagBits::eFragment};
+        set_layout.emplace(device, vk::DescriptorSetLayoutCreateInfo{{}, binding});
+    }
+    return **set_layout;
+}
+
+/// A set for one texture, reused from a dead texture's if there is one. Pools
+/// are grown, never freed: a set costs a handful of bytes and the count is
+/// bounded by how many client buffers are on screen at once.
+vk::DescriptorSet VulkanRenderer::Impl::acquire_set() {
+    if (!free_sets.empty()) {
+        const vk::DescriptorSet set = free_sets.back();
+        free_sets.pop_back();
+        return set;
+    }
+    constexpr std::uint32_t kPerPool = 64;
+    if (set_pools.empty() || sets_in_pool == kPerPool) {
+        vk::DescriptorPoolSize size{vk::DescriptorType::eCombinedImageSampler, kPerPool};
+        set_pools.emplace_back(device, vk::DescriptorPoolCreateInfo{{}, kPerPool, size});
+        sets_in_pool = 0;
+    }
+    vk::DescriptorSetLayout raw_layout = quad_set_layout();
+    vk::raii::DescriptorSets sets{
+        device, vk::DescriptorSetAllocateInfo{*set_pools.back(), raw_layout}};
+    ++sets_in_pool;
+    // The pool owns the set for the renderer's lifetime; the raii wrapper must
+    // not try to give it back.
+    const vk::DescriptorSet raw = *sets.front();
+    sets.front().release();
+    return raw;
+}
+
 QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
     for (QuadPipeline& p : pipelines) {
         if (p.format == format) {
@@ -1290,11 +1390,8 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
         }
     }
 
-    vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eCombinedImageSampler, 1,
-                                           vk::ShaderStageFlagBits::eFragment};
-    vk::raii::DescriptorSetLayout set_layout{device, vk::DescriptorSetLayoutCreateInfo{{}, binding}};
     vk::PushConstantRange push{vk::ShaderStageFlagBits::eVertex, 0, sizeof(QuadPush)};
-    vk::DescriptorSetLayout raw_set_layout = *set_layout;
+    vk::DescriptorSetLayout raw_set_layout = quad_set_layout();
     vk::raii::PipelineLayout layout{
         device, vk::PipelineLayoutCreateInfo{{}, raw_set_layout, push}};
 
@@ -1338,9 +1435,8 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
                                         *layout, *clear_pass, 0};
     vk::raii::Pipeline pipeline{device, nullptr, info};
 
-    pipelines.push_back(QuadPipeline{format, std::move(set_layout), std::move(layout),
-                                     std::move(load_pass), std::move(clear_pass),
-                                     std::move(pipeline)});
+    pipelines.push_back(QuadPipeline{format, std::move(layout), std::move(load_pass),
+                                     std::move(clear_pass), std::move(pipeline)});
     return pipelines.back();
 }
 
@@ -1649,14 +1745,6 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
                                               static_cast<std::uint32_t>(device_h),
                                               1}};
 
-        // ponytail: a fresh descriptor pool per frame. Caching sets per texture
-        // needs invalidation we do not have yet, and pool creation is cheap.
-        const std::uint32_t texture_count =
-            static_cast<std::uint32_t>(std::max<size_t>(1, textures.size()));
-        vk::DescriptorPoolSize pool_size{vk::DescriptorType::eCombinedImageSampler, texture_count};
-        vk::raii::DescriptorPool descriptor_pool{
-            device, vk::DescriptorPoolCreateInfo{{}, texture_count, pool_size}};
-
         vk::raii::CommandBuffers command_buffers{
             device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
                                                   vk::CommandBufferLevel::ePrimary, 1}};
@@ -1780,17 +1868,19 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             push.uv23[2] = uv[3][0];
             push.uv23[3] = uv[3][1];
 
-            vk::DescriptorSetLayout raw_layout = *quad.set_layout;
-            vk::raii::DescriptorSets sets{
-                device, vk::DescriptorSetAllocateInfo{*descriptor_pool, raw_layout}};
-            vk::DescriptorImageInfo image_info{**impl_->sampler, *tex.view,
-                                               vk::ImageLayout::eShaderReadOnlyOptimal};
-            device.updateDescriptorSets(
-                vk::WriteDescriptorSet{*sets.front(), 0, 0,
-                                       vk::DescriptorType::eCombinedImageSampler, image_info},
-                {});
-            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0,
-                                   *sets.front(), {});
+            // Written once per texture, then only bound. The same window drawn
+            // every frame costs one bindDescriptorSets and nothing else.
+            if (!tex.set) {
+                tex.set = impl_->acquire_set();
+                tex.owner = impl_.get();
+                vk::DescriptorImageInfo image_info{**impl_->sampler, *tex.view,
+                                                   vk::ImageLayout::eShaderReadOnlyOptimal};
+                device.updateDescriptorSets(
+                    vk::WriteDescriptorSet{tex.set, 0, 0,
+                                           vk::DescriptorType::eCombinedImageSampler, image_info},
+                    {});
+            }
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0, tex.set, {});
             cmd.pushConstants<QuadPush>(*quad.layout, vk::ShaderStageFlagBits::eVertex, 0, push);
             // One draw per visible box: the vertex work is four vertices, and
             // the fragments outside the scissor never happen.
@@ -1798,8 +1888,6 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
                 cmd.setScissor(0, to_rect2d(to_device(b)));
                 cmd.draw(4, 1, 0, 0);
             }
-            // The set must outlive the submit; the pool below owns it either way.
-            sets.front().release();
         }
         cmd.endRenderPass();
 
@@ -1886,8 +1974,8 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
             // these semaphores stay alive in the in-flight list until the fence
             // says the GPU is done with them.
             impl_->in_flight.push_back(InFlight{std::move(fence), std::move(command_buffers),
-                                                std::move(descriptor_pool),
-                                                std::move(framebuffer), std::move(semaphores)});
+                                                std::move(framebuffer), std::move(semaphores),
+                                                ++impl_->submits});
             return ok();
         }
         if (sync.out_fence_fd != nullptr) {
