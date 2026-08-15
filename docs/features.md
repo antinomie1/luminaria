@@ -4,14 +4,14 @@
 
 （下表的"测试"列是 `tests/test_*.cpp` 的名字，`xmake test test_<名>/*` 可单独跑。）
 
-### 核心底层
+## 核心底层
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | core | `Result<T>` / `Error`、`CUnique` 句柄 RAII、`Signal<Event>` + RAII `Connection`（emit 期间 connect/disconnect 安全）、`Display`、`EventLoop` + `EventSource` | signal, core |
 | util | `Box`、`Color`、`Pixel`、`Rect`（constexpr） | box |
 
-### 协议对象（服务端）
+## 协议对象（服务端）
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
@@ -47,7 +47,7 @@
 | 协议 | `xdg-output-unstable-v1`（`zxdg_output_manager_v1` v3）— 输出的**逻辑**位置与尺寸（mode ÷ scale，旋转时长宽互换），随 scale/transform/位置变化实时更新。wl_output 只描述物理模式；要把截图摆到画布上的工具（grim / slurp / 录屏器）读的是这个。缺了它 `grim` 只会警告并写出 0×0 的 PNG | — |
 | 协议 | 截图/录屏 — `wlr-screencopy-unstable-v1` (v3) + `ext-image-copy-capture-v1` + `ext-image-capture-source-v1`：客户端捕获整块输出到 **wl_shm 或 dmabuf** buffer（`grim` 截图、`wf-recorder` 录屏），逐帧回调 GPU 合成结果；dmabuf 目标 LINEAR 走 mmap，tiled 走 Vulkan 导出，ext 路径广告 dmabuf device + modifier。**光标捕获会话**（`create_pointer_cursor_session`）：把指针作为独立捕获源，录屏可以把光标排除在视频外、播放时再按自己的帧率合成 —— enter/leave、position、hotspot 齐全，buffer 约束按光标自己的尺寸而非输出尺寸广告；compositor 经 `set_cursor_source()` 提供像素、`notify_cursor_changed()` 通知移动；未注册光标源时会话仍然正常创建并立刻发 `stopped`（此前是静默 no-op，客户端下一个请求就会因 invalid object 被踢） | cursor-capture, dmabuf |
 
-### 渲染
+## 渲染
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
@@ -67,7 +67,7 @@
 | render | **描述符集按纹理缓存**：一个纹理绑定的 image view 终生不变，所以描述符集只在它第一次被画时写一次，之后每帧只是 `bindDescriptorSets`。此前是每帧新建一个描述符池、每个 fill 分配并重写一次描述符 —— 一屏没动过的窗口每秒重写六十遍。纹理销毁后描述符集进空闲表复用，但要等到所有可能仍在采样它的提交都完成（按提交序号比对 in-flight 队列），否则会改掉正在飞行中的那一帧 | texture-cache |
 | render | `read_scanout()` —— 需要 CPU 像素时（嵌套 wl_shm 呈现、screencopy）从渲染目标**自己的 VkImage** 拷出，暂存 buffer 建一次并常驻映射，优先要 HOST_CACHED 内存。之前每帧重新 import 一遍自己的 dmabuf 再从非缓存内存逐像素读，800×600 要 90ms —— 指针拖动卡顿就是它 | gpu-scanout |
 
-### 后端
+## 后端
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
@@ -77,14 +77,14 @@
 | backend | `LibinputBackend`（裸机输入）：发出 KeyEvent / PointerMotion / PointerButton 信号；给了 `Session` 就经 libseat 开设备，VT 切换时 `libinput_suspend/resume` | libinput |
 | session | `Session`（libseat）—— 谁现在有权碰 GPU 和输入设备。VT 切走时 DRM 后端 `drmDropMaster` 并停止提交，切回时重取 master + 重新 modeset。没有它也能从已登录 VT 跑，只是切 VT 不安全 | session（需 seat） |
 
-### 布局
+## 布局
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | layout | `OutputLayout` —— 输出在全局坐标系里的位置：`add_auto()` 横向排列、`box_of()` / `bounds()` / `at(x,y)` 命中、`intersecting(box)` 求窗口跨屏时各屏该画哪一块。用的是**逻辑尺寸**，所以旋转/HiDPI 输出占的格子跟它的 mode 不一样 | output-layout |
 | layout | `Transform` + `Output::scale()` —— 每输出旋转/翻转（值与 `WL_OUTPUT_TRANSFORM_*` 一致）与整数缩放。`transform_box()` 是逻辑坐标 → 帧缓冲像素的唯一映射，`transform_invert()` 供输入反向映射 | output-layout, output-scale |
 
-### 场景 / Xwayland / 示例
+## 场景 / Xwayland / 示例
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
