@@ -36,22 +36,7 @@
 - 顺带：`VulkanRenderer::render_to()` 每帧仍在堆上建 `Region`、`vk::raii::Framebuffer`、
   `CommandBuffers`。外壳层那一半的每帧零分配已经由 `test_frame` 守住了，渲染器这一半没有。
 
-### 3. 模块切分
-
-见 [ADR 0003](docs/adr/0003-module-split-and-protocol-admission.md)。
-`luminaria`（协议 + 核心 + headless）/ `luminaria.gpu` / `luminaria.xwayland` /
-`luminaria.desktop`，后者收下 `workspace`、`foreign_toplevel`、`data_control`
-——它们只服务桌面外壳组件，且语义都是"操作别人的窗口"，不该默认注册。
-
-### 4. `Surface` 代际句柄 + 模糊测试
-
-见 [ADR 0002](docs/adr/0002-surface-generational-handle.md)。外壳层重写已经把
-`scene` 那一处悬空指针的账清掉了；剩下的是 seat / cursor / drag focus 那几处订阅。
-
-配套：畸形协议流的模糊测试客户端常态化跑。`f103082`（客户端声明的 buffer layout 越界）
-那一类洞靠人审是漏的。
-
-### 5. 协议补齐
+### 3. 协议补齐
 
 按低功耗价值排序：
 

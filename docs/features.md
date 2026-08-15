@@ -9,7 +9,9 @@
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | core | `Result<T>` / `Error`、`CUnique` 句柄 RAII、`Signal<Event>` + RAII `Connection`（emit 期间 connect/disconnect 安全）、`Display`、`EventLoop` + `EventSource` | signal, core |
+| core | `SurfaceId{index,generation}` + `surface_from_id()`：销毁后清槽并推进代际，槽复用也不会让旧身份指向新客户端；焦点、拖放、帧摆位、纹理缓存和直出 hold 全部按 id 留存 | surface-handle, seat-input, dnd-surface-destroy, frame |
 | util | `Box`、`Color`、`Pixel`、`Rect`（constexpr） | box |
+| 测试防线 | 常态化畸形协议流客户端：48 条固定种子状态机交错 surface / region / buffer 生命周期，覆盖非法 scale / transform、重复 xdg role、自父 subsurface 与 libwayland 会放行的短 stride | protocol-fuzz |
 
 ## 协议对象（服务端）
 
@@ -25,7 +27,7 @@
 | 协议 | `wp_viewporter` — 裁剪 + 拉伸一块 buffer。视频播放器免重编码加黑边；小数缩放的客户端用它声明"我这块整数 buffer 代表多大的逻辑尺寸" | scaling |
 | 协议 | `wp_fractional_scale_v1` — 输出的真实缩放，以 120 分之一为单位（180 = 1.5x）。`wl_output.scale` 是整数，说不出 150% | scaling |
 | 协议 | `wl_subcompositor` / `wl_subsurface` — 子表面树、相对定位、`place_above`/`place_below` 堆叠、**sync/desync 语义**（同步子表面的 commit 缓存到父级 commit 时原子提交）；`Surface::surface_tree()` / `surface_at()` 供渲染与命中测试共用 | subsurface |
-| 协议 | `wl_seat` v5 — 键盘（xkb keymap）+ 指针 + 触摸，焦点 enter/leave + 事件路由；滚轮（平滑 axis / 离散 notch / axis_stop）、`set_cursor`（发信号给 compositor 合成光标）；**焦点安全**：seat 订阅 `Surface::destroy`，被销毁的聚焦表面自动清空，无悬空指针 | seat, seat-input |
+| 协议 | `wl_seat` v5 — 键盘（xkb keymap）+ 指针 + 触摸，焦点 enter/leave + 事件路由；滚轮（平滑 axis / 离散 notch / axis_stop）、`set_cursor`（发信号给 compositor 合成光标）；**焦点安全**：键盘/指针/触摸/光标都留 `SurfaceId`，每次发送前解析，被销毁的聚焦表面自动失效 | seat, seat-input |
 | 协议 | `wl_data_device_manager` v3 — 剪贴板（选区随键盘焦点转移）+ 拖放（drag 期间 seat 把指针交给 data device，enter/motion/drop 全流程，dnd actions）；数据经管道在客户端之间直传，compositor 不读内容 | data-device, dnd |
 | 协议 | `zwp_primary_selection_device_manager_v1` — X11 式中键粘贴选区 | data-device |
 | 协议 | `wp_single_pixel_buffer_v1` — 1×1 纯色 `wl_buffer`，无 shm pool、无 GPU 分配。客户端画背景/压暗层/黑边不必再为一块纯色开整屏 buffer | single-pixel |
@@ -60,7 +62,7 @@
 | render | **damage 渲染**：`render_to(..., damage)` 把脏区折成不相交 `Region`，**逐矩形 `setScissor`** 各画一次 —— 两块分散的小脏区就是两个小 scissor，不是横跨它们的大矩形。未触及的像素原样保留；双缓冲下调用方需并上上一帧的 damage（buffer age） | frame-timing, gpu-scanout |
 | render | **遮挡剔除**：`GpuTextureFill::opaque` 声明的不透明区从前往后累积，被完全盖住的表面一次都不采样 —— 最大化窗口下的壁纸不进 GPU | gpu-scanout |
 | render | **异步提交**：`RenderSync` 让 `render_to` 等一组 sync_file（客户端 acquire point）并吐出 out-fence，自己不阻塞；未完成的提交挂在 in-flight 列表上按 fence 回收 | gpu-scanout |
-| render | **纹理缓存**：`Frame` 的 GPU bridge 按 `Surface` + `wl_buffer` 缓存。dmabuf 导入是客户端内存的实时视图，跨帧保留；shm 上传是快照，客户端重绘时才重传 | — |
+| render | **纹理缓存**：`Frame` 的 GPU bridge 按 `SurfaceId` + `wl_buffer` 缓存。dmabuf 导入是客户端内存的实时视图，跨帧保留；shm 上传是快照，客户端重绘时才重传；表面销毁后旧 id 立即失效，旧 placement 再 submit 也不会碰悬空纹理 | frame, texture-cache |
 | render | **光标主题**：自带 XCursor 解析器（`cursor_theme.cpp`），读 `/usr/share/icons/<主题>/cursors`，支持主题继承与动画帧。不依赖 libXcursor / X11 | cursor-theme |
 | render | **纹理四边形管线**（取代原先的 blit）：每个 surface 一次 draw，位置/UV 全走 push constant。由此一并拿到 **整数 scale**、**8 种 transform 全部（含 90/270 转置）**、以及**真正的 alpha 混合**（预乘 `ONE`/`ONE_MINUS_SRC_ALPHA`）。SPIR-V 由 `glslangValidator --vn` 编进二进制 | gpu-scanout |
 | present | `Output::commit_frame(pixels)` 呈现渲染帧（headless 存帧，DRM 写 dumb buffer）—— 保留给无 dmabuf 的降级路径 | render-output |
@@ -88,7 +90,7 @@
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份列表）、`surface_at()` 命中、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。稳态重排零堆分配 | frame |
+| shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。稳态重排零堆分配 | frame |
 | xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |
 | example | `tinyluminaria`（嵌套/headless 参考 compositor）、`luminaria-drm-demo`、`luminaria-tty`（裸机 compositor） | tinyluminaria-smoke |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |

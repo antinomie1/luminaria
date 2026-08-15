@@ -8,20 +8,19 @@ Luminaria: a minimal Wayland compositor **library** in modern C++23, built on to
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
 built with xmake. Roughly wlroots-shaped but far smaller (25 protocol types vs wlroots' 73).
 
-It ships as a **C++20 named module**. `import luminaria;` is the entire interface — there are
-no public headers.
+It ships as four **C++23 named modules** with no public headers: `luminaria` is the
+dependency-light protocol/core interface, with opt-in `luminaria.gpu`, `luminaria.desktop`
+and `luminaria.xwayland` extensions.
 All prose docs are in Chinese. `README.md` is the introduction only — no technical detail.
 `CONTEXT.md` is the glossary (what "混成器"/"合成"/"布局" mean here, and what they don't);
 `docs/architecture.md` is the layering, module structure and the rules that bite;
 `docs/features.md` is the feature matrix; `docs/adr/` holds the irreversible design
 decisions and why; `TODO.md` is the open work in execution order.
 
-**Four ADRs set the current direction, and parts of this file describe code they retire:**
-no retained scene graph (**done** — the scene tree is gone and the shell layer is
-immediate-mode `Placement`/`Frame` in `src/shell/`), surfaces reached through generational
-handles rather than raw `Surface*` + destroy subscriptions, a four-way module split with an
-admission rule for the core module, and no API stability before 1.0. Read `docs/adr/` before
-designing anything structural.
+**Four ADRs set the current direction:** no retained scene graph, generational identities for
+retained surfaces, a four-way module split with an admission rule for the core module, and no
+API stability before 1.0. The first three are implemented. Read `docs/adr/` before designing
+anything structural.
 
 ## Build / test / run
 
@@ -59,19 +58,22 @@ There is no `include/`. Nothing here is a header, so nothing is split
 interface-from-implementation; `src/` is grouped by responsibility instead:
 
 ```
-src/luminaria.cppm       primary interface unit — nothing but `export import`
+src/luminaria.cppm       core primary interface — protocol + nested/headless
+src/luminaria.gpu.cppm   GPU primary interface — Vulkan/DRM/input/session
+src/luminaria.desktop.cppm desktop primary interface — privileged shell protocols
 src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
 src/shell/               frame output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
-src/xwayland/            the X11 bridge
+src/xwayland/            `luminaria.xwayland`, the X11 bridge
 src/detail/wayland_fwd.h the one remaining header
 ```
 
-- `src/**/<name>.cppm` is one **partition** per concept, named after the *file* and not its
-  path: `util/box.cppm` is `luminaria:box`. Directories organise the tree for humans;
+- Most `src/**/<name>.cppm` files are one **partition** per concept, named after the *file*
+  and not its path: `util/box.cppm` is `luminaria:box`, while GPU and desktop concepts use
+  `luminaria.gpu:<name>` and `luminaria.desktop:<name>`. Directories organise the tree for humans;
   partition names are flat, so moving a file between folders is not an API change.
   Each file holds its interface *and* its implementation — the exported declarations in
   `export namespace luminaria { … }`, then a `// --- implementation` divider, then the pimpl
@@ -80,10 +82,10 @@ src/detail/wayland_fwd.h the one remaining header
 - **Partitions must import what they use, and the import graph must stay acyclic.** This is
   the one thing the old layout hid: implementation units got the whole primary interface for
   free, so nothing ever declared a dependency. Now `seat.cppm` needs an explicit
-  `import :compositor;` to see `Surface`. The graph is currently a DAG eight levels deep —
-  `box`/`signal`/`expected` at the bottom, `data_control` at the top — and a new edge that
-  closes a cycle will not compile. If two partitions genuinely need each other, the shared
-  type belongs in a third, lower one.
+  `import :compositor;` to see `Surface`. Each module's partition graph must remain a DAG;
+  extension partitions import `luminaria` for core types. A new edge that closes a cycle will
+  not compile. If two partitions genuinely need each other, the shared type belongs in a
+  third, lower one or in the core module when it crosses an extension boundary.
 - Anything a unit `#include`s belongs in its **global module fragment**: `module;` first, then
   the includes, then `export module …`. Declaring a C type after `export module` attaches it
   to module luminaria and makes it a *different type* from the one the C headers declare.
@@ -204,28 +206,23 @@ Per-frame flow in a compositor built on this (see `examples/tinyluminaria.cpp`,
 `examples/tty_compositor.cpp`): `Output::frame` fires → `Frame::begin(view)` → one
 `Frame::place(surface, x, y)` per mapped toplevel (which expands its subsurface tree),
 then popups anchored to their parents, then the cursor when there is no cursor plane →
-`Frame::submit(background)`. Inside that: `Surface::buffer_texture()` puts each client
-buffer on the GPU, `VulkanRenderer::render_to(ScanoutTarget)` composites, and
+`Frame::submit(background)`. Inside that: Frame's GPU bridge imports or uploads each client
+buffer, `VulkanRenderer::render_to(ScanoutTarget)` composites, and
 `Output::commit_scanout()` flips — or the whole composite is skipped and one client's own
 buffer goes to the CRTC. Outputs without dmabuf scanout (headless, nested) still composite
 on the GPU and only the finished frame crosses to the CPU: `read_scanout()` →
 `commit_frame()`. Input goes the other way: backend input signal → `Frame::surface_at()`
 → `Seat` focus + event routing.
 
-Two bridges out of client buffers, and new code should prefer the first:
-`Surface::current_buffer_texture()` (dmabuf → `VulkanRenderer::import_texture`, everything else
-uploaded) never reads pixels back; `Surface::current_buffer_rgba()` (shm, then single-pixel, then
-`dmabuf_buffer_to_rgba()`) does, and exists for screencopy and the non-dmabuf backends.
-A third bridge skips the renderer entirely: `Surface::current_buffer_dmabuf()` describes a
-client buffer well enough to hand to `Output::import_scanout()`, and `DirectScanout`
+Two bridges expose client buffers: `Surface::current_buffer_dmabuf()` lets Frame import dmabuf
+straight into `VulkanRenderer` with no readback; `Surface::current_buffer_rgba()` handles shm and
+single-pixel buffers for upload, screencopy and non-dmabuf backends. The dmabuf description also
+skips the renderer entirely when handed to `Output::import_scanout()`, and `DirectScanout`
 (`shell/direct_scanout.cppm`) decides when that is allowed — one fullscreen, unrotated,
 uncropped surface whose buffer is in a layout the display advertised — caches the imports per
 wl_buffer (a client rotates a swapchain; importing per frame would leak framebuffers), and
 holds the buffer through `Surface::hold_buffer()` so the client is not told it may redraw
 into a frame the display hardware is still scanning out. `luminaria-tty` uses it.
-
-What is still missing on the GPU path: passing fences instead of blocking on them
-(`render_to` waits on a fence today).
 
 **Surface coordinates are not buffer pixels.** A client can hand over a denser buffer
 (`set_buffer_scale`), a rotated one (`set_buffer_transform`), or crop and stretch it
@@ -234,8 +231,8 @@ What is still missing on the GPU path: passing fences instead of blocking on the
 `buffer_width()`. Hit-testing goes through `Surface::accepts_input()` so the client's input
 region decides, not the buffer rectangle.
 
-**The renderer must outlive the Display.** `Surface::buffer_texture()` caches a `GpuTexture`
-owned by the `VulkanRenderer`, so the renderer has to be declared *before* the `Display`
+**The renderer must outlive the Display.** Each `Frame` caches `GpuTexture`s owned by the
+`VulkanRenderer`, so the renderer has to be declared *before* the `Display`
 (locals are destroyed in reverse order). Both examples do this with a comment; getting it
 wrong aborts inside `vk::raii` at shutdown.
 
@@ -286,13 +283,12 @@ calls `clear_damage()`.
   explicit no-op functions (`surface_noop_*` in `compositor.cppm`, `tl_set_parent` /
   `tl_show_window_menu`). When adding a protocol, fill every slot in the interface vtable.
   `-Wno-missing-field-initializers` is set project-wide for exactly this idiom.
-- **Raw `Surface*` needs a `Surface::destroy` subscription.** Anything caching a surface
-  pointer (seat focus, cursor, drag focus) connects to `Surface::destroy` and
-  clears the pointer there; the `Signal::Connection` is RAII so it can't outlive the holder.
-  `seat.cppm` is the reference for the pattern. Seat clearing *its* copy is not enough —
-  `data_device.cppm`'s `drag_focus` needs its own subscription, and has a regression test.
-  A `Frame`'s placement list is exempt because it is not retained: rebuild it (`begin` +
-  `place`) rather than holding a `Placement` across a dispatch.
+- **Retain `SurfaceId`, never `Surface*`, across dispatch.** Resolve with `surface_from_id()`
+  immediately before use; destruction clears the slot and increments its generation, so an old
+  id cannot resolve to a later surface that reused the slot. `Surface::destroy` remains useful
+  for semantic teardown tied to that surface, but it is not the memory-safety boundary. Seat,
+  data-device, Frame and DirectScanout are the reference implementations. The deterministic
+  malformed-stream client in `tests/test_protocol_fuzz.cpp` runs in every ordinary suite.
 - **Any retained `wl_resource*` owned by a CLIENT needs a destroy listener.** Buffers are
   the sharp edge: toolkits drop their whole swapchain on resize / hide / re-show, so a
   committed `wl_buffer` dies under you and the next `wl_buffer.release` or readback
@@ -310,10 +306,12 @@ calls `clear_damage()`.
    which halves to generate — `s` server header, `c` private code, `l` client header for
    tests that act as clients.
 3. Write `src/protocol/<name>.cppm`: the exported interface, the `// --- implementation`
-   divider, then the glue — following the pimpl + `Result` pattern above. Add an
-   `import :<dep>;` for every partition you use, and keep the graph acyclic. The file is
-   picked up by the existing glob; nothing else to register.
-4. Add `export import :<name>;` to `src/luminaria.cppm`.
+   divider, then the glue — following the pimpl + `Result` pattern above. Apply ADR 0003's
+   admission rule first: core protocols use `luminaria:<name>` and partition imports;
+   GPU/desktop extensions use their module name, `import luminaria;`, and sibling partition
+   imports as needed. Keep the graph acyclic.
+4. Add the file to the corresponding xmake target and `export import :<name>;` to that
+   target's primary interface (`src/luminaria*.cppm`). Xwayland is a standalone primary unit.
 5. Drop a test in `tests/` — `xmake.lua` turns every `tests/test_*.cpp` into its own binary
    automatically. Exit 77 to skip when the machine cannot run it.
 

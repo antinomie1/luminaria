@@ -25,7 +25,18 @@
 
 ## 后果
 
-`surface.commit()` 这类写法变成先查表。API 的直白程度有损失，这是明知的代价。
+跨 dispatch 留存表面身份时要先查表。API 的直白程度有损失，这是明知的代价；当前 dispatch
+里拿到的 `Surface&` 仍可直接使用，不需要为了形式把每一次局部访问都绕成句柄。
 
-配套（同一个目标的另一半）：畸形协议流的**模糊测试客户端**常态化跑。
-`f103082`（客户端声明的 buffer layout 越界）那一类洞靠人审是漏的。
+## 落地
+
+- 每个 `Surface` 创建时登记 `SurfaceId{index, generation}`；销毁先清槽再递增 generation，
+  `surface_from_id()` 同时核对两项，旧 id 不会误认复用同一槽的新表面。
+- seat 的键盘/指针/触摸/光标焦点、data-device 的 drag focus / drag icon、`Frame` 的摆位、
+  命中结果、纹理缓存和直出 hold 全部只留 id。`SurfaceInvalidated` 只负责行为清理，内存安全不
+  依赖监听者有没有订阅。
+- `test_surface_handle` 覆盖销毁、槽复用和 ABA；`test_frame` 把旧摆位留过客户端销毁后再次
+  命中与 submit；`test_seat_input` 验证焦点身份自动失效。
+- 配套的 `test_protocol_fuzz` 在每次普通 `xmake test` 中跑 48 条固定种子流：随机交错
+  surface / region / buffer 生命周期，并注入非法 scale、transform、重复 xdg role、自父
+  subsurface 与短 stride。`f103082` 那一类洞由常态测试守住，不再只靠人审。

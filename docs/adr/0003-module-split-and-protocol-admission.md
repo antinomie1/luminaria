@@ -1,4 +1,4 @@
-# 切成三个 module，并给核心 module 定一条协议准入标准
+# 切成四个 module，并给核心 module 定一条协议准入标准
 
 `import luminaria;` 不再意味着链上 Vulkan + libdrm + libinput + libseat + xcb 全家桶。
 交付面切成：

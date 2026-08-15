@@ -33,7 +33,7 @@
 → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()`；或者整个合成
 被跳过，某个客户端的 buffer 直接进 CRTC。不能直出 dmabuf 的输出（headless、嵌套）照样在 GPU
 上合成，只有成品帧过一次 CPU：`read_scanout()` → `commit_frame()`。输入反向走：后端输入信号
-→ `Frame::surface_at()` → `Seat` 焦点与路由。
+→ `Frame::surface_at()` 得到 `SurfaceId` → 当场 `surface_from_id()` → `Seat` 焦点与路由。
 
 参考实现见 `examples/tty_compositor.cpp`（裸机）与 `examples/tinyluminaria.cpp`（嵌套/无头）。
 
@@ -50,10 +50,10 @@
   `GpuTexture`；参考混成器仍把渲染器声明在 `Display` 前面，让所有输出和帧账本先析构。
 - **绝不听客户端的话去索引内存。** 宽高、stride、offset 是客户端独立声明的四个整数，上游
   谁也没有按真正的单位交叉验证过。碰像素之前先过 `layout_fits()` / `layout_length()`。
-- **缓存了裸 `Surface*` 就得订阅 `Surface::destroy`。**（这条正在被
-  [ADR 0002](./adr/0002-surface-generational-handle.md) 的代际句柄取代。）`Frame` 的摆位列表
-  不在此列——它不保留：需要时重排一遍（`begin` + `place`，零堆分配），不要跨 dispatch 持有
-  `Placement`。
+- **跨 dispatch 留表面身份只留 `SurfaceId`。** 每次使用前经 `surface_from_id()` 解析；表面
+  已销毁或槽位已被下一代复用时返回 null。`Surface::destroy` 仍可做绑定在表面本身的语义清理，
+  但不再是防 use-after-free 的边界。`Frame` 仍应在需要时重排（`begin` + `place`，零堆分配），
+  即使误留了旧 `Placement`，其中的代际 id 也只能解析失败。
 
 ## 模块结构
 

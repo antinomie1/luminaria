@@ -1,16 +1,17 @@
 // luminaria — a minimal Wayland compositor library.
 //
-//     import luminaria;
+//     import luminaria;          // core protocols + nested/headless backends
+//     import luminaria.gpu;      // Vulkan, DRM/input/session and GPU protocols
+//     import luminaria.desktop;  // privileged desktop-shell protocols
+//     import luminaria.xwayland; // X11 bridge
 //
-// is the whole interface. Everything below is a partition, one per concept,
-// and each partition file holds both its interface and its implementation —
-// there is no header/source split, because a module unit is not a header.
-// Consumers never name a partition: they are an implementation detail of how
-// this module is split up.
+// This is the dependency-light primary interface. Everything below is one of
+// its partitions, one per concept, and each partition file holds both its
+// interface and implementation. Consumers name one of the four public modules,
+// never a partition.
 //
-// The C libraries this is built on (libwayland-server, Vulkan, libdrm, xcb)
-// stay in each unit's global module fragment, so importing luminaria pulls in
-// none of them. Code that wants to talk to libwayland directly — a test acting
+// C libraries stay in each unit's global module fragment, so importing a module
+// exports none of their declarations. Code that talks to libwayland directly — a test acting
 // as a client, say — includes those headers itself, and gets the same types:
 // the opaque forward declarations here live in the global module fragment for
 // exactly that reason.
