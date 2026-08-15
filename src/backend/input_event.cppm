@@ -37,5 +37,14 @@ struct PointerAxisEvent {
     int32_t dx_steps = 0, dy_steps = 0;
     bool stop_horizontal = false, stop_vertical = false;
 };
+// What kinds of device the backend currently has open. Hand it straight to
+// `Seat::set_capabilities()`: a wl_seat that advertises a pointer no device can
+// produce makes clients wait for events that never come, and one that hides a
+// keyboard the user is typing on is worse.
+struct InputCapabilities {
+    bool keyboard = false, pointer = false, touch = false;
+
+    bool operator==(const InputCapabilities&) const noexcept = default;
+};
 
 } // namespace luminaria

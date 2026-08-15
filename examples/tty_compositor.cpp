@@ -437,6 +437,12 @@ int main(int argc, char** argv) {
         }
     };
 
+    // The backend computes modifier masks against ITS keymap, so the seat has to
+    // hand clients the same one — otherwise Shift means one thing here and
+    // another in the client, and anything but a US layout types the wrong keys.
+    if (!seat->set_keymap(input->keymap())) {
+        std::fprintf(stderr, "luminaria-tty: backend keymap rejected, keeping ours\n");
+    }
     auto key_conn = input->key().connect([&](luminaria::KeyEvent& e) {
         if (e.pressed && e.keycode == KEY_ESC) {
             display->terminate();
@@ -444,6 +450,29 @@ int main(int argc, char** argv) {
             seat->notify_key(e.keycode, e.pressed);
         }
     });
+    auto mods_conn = input->modifiers().connect([&](luminaria::ModifiersEvent& e) {
+        seat->notify_modifiers(e.depressed, e.latched, e.locked, e.group);
+    });
+    auto axis_conn = input->pointer_axis().connect([&](luminaria::PointerAxisEvent& e) {
+        // Wheel notches win over the smooth deltas that accompany them:
+        // forwarding both would scroll twice.
+        if (e.dx_steps != 0 || e.dy_steps != 0) {
+            seat->pointer_axis_discrete(e.dx_steps, e.dy_steps);
+        } else if (e.dx != 0.0 || e.dy != 0.0) {
+            seat->pointer_axis(e.dx, e.dy);
+        }
+        if (e.stop_horizontal || e.stop_vertical) {
+            seat->pointer_axis_stop(e.stop_horizontal, e.stop_vertical);
+        }
+    });
+    // What the seat advertises follows what is actually plugged in — a client
+    // that binds a wl_pointer no device can drive waits forever. Touch stays off
+    // regardless: this compositor routes none, and saying otherwise is a lie
+    // clients act on.
+    auto caps_conn =
+        input->capabilities_changed().connect([&](luminaria::InputCapabilities& caps) {
+            seat->set_capabilities(caps.keyboard, caps.pointer, /*touch=*/false);
+        });
     auto motion_conn = input->pointer_motion().connect([&](luminaria::PointerMotionEvent& e) {
         cursor_x += e.dx;
         cursor_y += e.dy;
