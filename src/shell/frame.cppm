@@ -237,6 +237,11 @@ public:
     /// move / opacity transform. Invalid or empty transforms draw nothing.
     void place(const GpuTexture& texture, const PlacementTransform& transform);
 
+    /// As above, but run `shader` as the fragment stage. The shader's mandatory
+    /// ShaderDamage declaration controls full repaint and continuous frames.
+    void place(const GpuTexture& texture, const PlacementTransform& transform,
+               const FragmentShader& shader);
+
     /// Draw the x-ray blur cache only under the blur regions a surface tree
     /// declared through ext-background-effect-v1. Call immediately before the
     /// ordinary `place(surface, x, y)`: these texture placements are part of
@@ -275,6 +280,12 @@ public:
     [[nodiscard]] Status compose_group(PlacementGroup group, OffscreenTarget& target,
                                        const Box& bounds,
                                        const PlacementTransform& transform);
+
+    /// As above, with a fragment shader applied once to the completed group.
+    [[nodiscard]] Status compose_group(PlacementGroup group, OffscreenTarget& target,
+                                       const Box& bounds,
+                                       const PlacementTransform& transform,
+                                       const FragmentShader& shader);
 
     /// This frame's list, back-to-front. Valid until the next `begin()`.
     [[nodiscard]] std::span<const Placement> placements() const noexcept;
@@ -452,6 +463,7 @@ struct FrSurfaceTexture {
 struct FrPlacementKey {
     SurfaceId surface;
     const GpuTexture* texture = nullptr;
+    std::uint64_t shader_id = 0;
     Box box{};
     Transform transform = Transform::normal;
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
@@ -461,7 +473,7 @@ struct FrPlacementKey {
     // Member and not a hidden friend: a defaulted hidden-friend operator== in a
     // module interface ICEs gcc 16.
     [[nodiscard]] bool operator==(const FrPlacementKey& other) const noexcept {
-        return surface == other.surface && texture == other.texture &&
+        return surface == other.surface && texture == other.texture && shader_id == other.shader_id &&
                box.x == other.box.x && box.y == other.box.y && box.width == other.box.width &&
                box.height == other.box.height && transform == other.transform &&
                u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1 &&
@@ -484,9 +496,16 @@ struct Frame::Impl {
     // Rebuilt every frame, never reallocated.
     Box view{};
     std::vector<Placement> placements;
+    struct Effect {
+        std::size_t placement = 0;
+        const FragmentShader* shader = nullptr;
+        std::uint64_t id = 0;
+    };
+    std::vector<Effect> effects;
     std::vector<Box> opaque_arena;        // layout coordinates
     std::vector<SurfaceAt> tree;          // scratch for place()
     std::vector<GpuTextureFill> fills;
+    std::vector<const FragmentShader*> fill_shaders;
     std::vector<Box> fill_opaque;         // the same boxes, output-local
     std::vector<GpuTextureFill> group_fills;
     std::vector<Box> group_opaque;
@@ -521,7 +540,8 @@ struct Frame::Impl {
     void rotate_debt();
     void diff_damage();
     void keep_list();
-    [[nodiscard]] FrPlacementKey key_of(const Placement& p) const noexcept;
+    [[nodiscard]] const Effect* effect_at(std::size_t placement) const noexcept;
+    [[nodiscard]] FrPlacementKey key_of(const Placement& p, std::size_t placement) const noexcept;
     [[nodiscard]] GpuTexture* texture_for(Surface& surface);
 };
 
@@ -535,7 +555,16 @@ struct Frame::Impl {
     return Box{left, top, right - left, bottom - top};
 }
 
-FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
+const Frame::Impl::Effect* Frame::Impl::effect_at(std::size_t placement) const noexcept {
+    for (const Effect& effect : effects) {
+        if (effect.placement == placement) {
+            return &effect;
+        }
+    }
+    return nullptr;
+}
+
+FrPlacementKey Frame::Impl::key_of(const Placement& p, std::size_t placement) const noexcept {
     FrPlacementKey key{};
     key.surface = p.surface;
     // Hit-test-only members of a composed group do not contribute pixels to
@@ -543,6 +572,11 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
     // treating their texture as drawable here would manufacture output damage
     // beside the group's one final texture.
     key.texture = p.draw ? p.texture : nullptr;
+    if (p.draw) {
+        if (const Effect* effect = effect_at(placement); effect != nullptr) {
+            key.shader_id = effect->id;
+        }
+    }
     key.box = fr_coverage(p.x - static_cast<float>(view.x), p.y - static_cast<float>(view.y),
                           p.width, p.height);
     key.transform = p.transform;
@@ -569,7 +603,7 @@ void Frame::Impl::diff_damage() {
     for (std::size_t i = 0; i < n; ++i) {
         const bool had = i < last.size();
         const bool has = i < placements.size();
-        const FrPlacementKey now = has ? key_of(placements[i]) : FrPlacementKey{};
+        const FrPlacementKey now = has ? key_of(placements[i], i) : FrPlacementKey{};
         if (had && has && last[i] == now) {
             continue; // unchanged: only this surface's own damage applies
         }
@@ -586,8 +620,8 @@ void Frame::Impl::keep_list() {
     // `assign` over a vector that has been here before keeps its capacity, so a
     // steady-state frame does not allocate to remember itself.
     last.clear();
-    for (const Placement& p : placements) {
-        last.push_back(key_of(p));
+    for (std::size_t i = 0; i < placements.size(); ++i) {
+        last.push_back(key_of(placements[i], i));
     }
     last_view = view;
     last_valid = true;
@@ -775,6 +809,7 @@ void Frame::begin(const Box& view) {
     impl.view = view;
     ++impl.generation;
     impl.placements.clear();
+    impl.effects.clear();
     impl.opaque_arena.clear();
 }
 
@@ -941,6 +976,15 @@ void Frame::place(const GpuTexture& texture, const PlacementTransform& transform
     impl.placements.push_back(p);
 }
 
+void Frame::place(const GpuTexture& texture, const PlacementTransform& transform,
+                  const FragmentShader& shader) {
+    const std::size_t before = impl_->placements.size();
+    place(texture, transform);
+    if (impl_->placements.size() != before) {
+        impl_->effects.push_back(Impl::Effect{impl_->placements.size() - 1, &shader, shader.id()});
+    }
+}
+
 void Frame::place_xray_blur(const GpuTexture& texture, const Box& background,
                             Surface& surface, int x, int y) {
     Impl& impl = *impl_;
@@ -1094,6 +1138,18 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const
     return ok();
 }
 
+Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const Box& bounds,
+                            const PlacementTransform& transform, const FragmentShader& shader) {
+    const std::size_t before = impl_->placements.size();
+    if (auto status = compose_group(group, target, bounds, transform); !status) {
+        return status;
+    }
+    if (impl_->placements.size() != before) {
+        impl_->effects.push_back(Impl::Effect{impl_->placements.size() - 1, &shader, shader.id()});
+    }
+    return ok();
+}
+
 std::span<const Placement> Frame::placements() const noexcept { return impl_->placements; }
 
 std::span<const Box> Frame::opaque_of(const Placement& placement) const noexcept {
@@ -1164,6 +1220,28 @@ Result<Presented> Frame::submit(Color background) {
     Impl& impl = *impl_;
     Output& output = *impl.output;
 
+    // A shader is opaque to the placement diff: if it says its result changes
+    // beyond ordinary texture/client damage, make that cost explicit before
+    // considering direct scanout or deciding this frame is unchanged.
+    for (std::size_t i = 0; i < impl.placements.size(); ++i) {
+        const Placement& p = impl.placements[i];
+        const Impl::Effect* effect = impl.effect_at(i);
+        if (!p.draw || effect == nullptr || effect->shader == nullptr) {
+            continue;
+        }
+        switch (effect->shader->damage()) {
+        case ShaderDamage::none:
+            break;
+        case ShaderDamage::full:
+            impl.full_redraw = true;
+            break;
+        case ShaderDamage::continuous:
+            impl.full_redraw = true;
+            impl.animating = true;
+            break;
+        }
+    }
+
     // --- direct scanout ------------------------------------------------------
     //
     // One window, covering the whole monitor, handing us a buffer the display
@@ -1174,7 +1252,8 @@ Result<Presented> Frame::submit(Color background) {
     // The cursor has to be on its own plane, or it would not appear — nothing is
     // compositing it in.
     if (!impl.animating && impl.direct.has_value() && output.has_cursor_plane() && impl.placements.size() == 1 &&
-        impl.placements[0].draw && impl.placements[0].surface.valid()) {
+        impl.placements[0].draw && impl.placements[0].surface.valid() &&
+        impl.effect_at(0) == nullptr) {
         const Placement& only = impl.placements[0];
         if (only.x == impl.view.x && only.y == impl.view.y &&
             only.width == output.logical_width() && only.height == output.logical_height() &&
@@ -1212,6 +1291,7 @@ Result<Presented> Frame::submit(Color background) {
     // Textures are cached in this frame's GPU bridge and owned by the renderer;
     // this is a list of borrowed pointers, and an unchanged buffer costs nothing.
     impl.fills.clear();
+    impl.fill_shaders.clear();
     impl.drawn.clear();
     impl.damage.clear();
     // A composed group has already rendered its source tree into its private
@@ -1241,7 +1321,9 @@ Result<Presented> Frame::submit(Color background) {
     // it already has capacity for allocates nothing.
     impl.fill_opaque.reserve(impl.opaque_arena.size());
     bool wants_tearing = false;
-    for (Placement& p : impl.placements) {
+    for (std::size_t placement_index = 0; placement_index < impl.placements.size();
+         ++placement_index) {
+        Placement& p = impl.placements[placement_index];
         if (!p.draw) {
             continue;
         }
@@ -1293,6 +1375,8 @@ Result<Presented> Frame::submit(Color background) {
         fill.opaque =
             std::span<const Box>{impl.fill_opaque}.subspan(first, impl.fill_opaque.size() - first);
         impl.fills.push_back(fill);
+        const Impl::Effect* effect = impl.effect_at(placement_index);
+        impl.fill_shaders.push_back(effect != nullptr ? effect->shader : nullptr);
     }
     output.set_tearing(wants_tearing);
 
@@ -1364,7 +1448,8 @@ Result<Presented> Frame::submit(Color background) {
             int render_fence = -1;
             const RenderSync sync{impl.wait_fences, &render_fence};
             auto rendered =
-                impl.renderer->render_to(target, background, {}, impl.fills, repaint, mapping, sync);
+                impl.renderer->render_to_with_shaders(target, background, {}, impl.fills,
+                                                      impl.fill_shaders, repaint, mapping, sync);
             // render_to imported every wait fd before returning. This Frame-owned
             // subset may now close even though the output's render itself is
             // still in flight.
@@ -1395,8 +1480,9 @@ Result<Presented> Frame::submit(Color background) {
             // No zero-copy path. The composite still happens on the GPU; only
             // the finished frame crosses to the CPU, once.
             const RenderSync sync{impl.wait_fences};
-            auto rendered = impl.renderer->render_to(target, background, {}, impl.fills, repaint,
-                                                      mapping, sync);
+            auto rendered = impl.renderer->render_to_with_shaders(target, background, {}, impl.fills,
+                                                                   impl.fill_shaders, repaint, mapping,
+                                                                   sync);
             impl.prepass_fences.clear();
             if (!rendered) {
                 return fail(rendered.error().message);

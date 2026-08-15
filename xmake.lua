@@ -203,7 +203,8 @@ target("luminaria-gpu")
             return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
         end
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
-                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"}}) do
+                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
+                                 {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.projectdir(), "src", "render", shader[1])
             local dst = path.join(os.projectdir(), "build", "generated", shader[3])
             if stale(src, dst) then
@@ -221,7 +222,8 @@ target("luminaria-gpu")
             return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
         end
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
-                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"}}) do
+                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
+                                 {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.projectdir(), "src", "render", shader[1])
             local dst = path.join(os.projectdir(), "build", "generated", shader[3])
             if stale(src, dst) then
@@ -271,6 +273,7 @@ local gpu_tests = {
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
     test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
     test_frame_animation = true,
+    test_fragment_shader = true,
     test_frame_xray_blur = true,
     test_xray_blur = true,
     test_frame_damage = true, test_offscreen = true,

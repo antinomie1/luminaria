@@ -21,6 +21,8 @@
   dmabuf 的后端与截图。整窗特效的中间结果落在 `OffscreenTarget`：它既是 render target 也是
   `GpuTexture`，写完停在 shader-read layout，下一趟可直接采样；两个路径共用 render pass、
   damage、遮挡剔除与显式同步，区别只在 scanout target 需要交还 display queue（ADR 0005）。
+  compositor-owned texture 还能换成自定义 SPIR-V fragment stage；`ShaderDamage` 是强制契约，
+  `full` 让 `Frame` 整帧失效，`continuous` 再预约下一帧，任何这类摆位都不能 direct scanout（ADR 0006）。
 - **shell** — 外壳层，即时模式，没有树（见 [ADR 0001](./adr/0001-no-retained-scene-graph.md)）。
   `Frame` 是每个输出一份的帧账本：混成器每帧 `begin(view)` + 逐窗口 `place()` 排出一串
   **摆位**，这串摆位既用来画也用来命中测试（`surface_at()`），所以点击不可能跟像素对不上；
@@ -136,10 +138,11 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
 - **popup 的 `constraint_adjustment` 需要 compositor 配合**：必须调
   `XdgShell::set_popup_constraint_query()` 告诉 shell 父窗口在哪，否则贴边菜单仍会溢出
   —— shell 层无从知道窗口摆在哪个位置。`tinyluminaria` 已接线。
-- **DRM 路径在当前环境未在真机上验证**（无裸 VT）—— 含 atomic 提交、`IN_FENCE_FD` /
-  `OUT_FENCE_PTR`、多输出分配、udev 热插拔、硬件光标平面与 VT 切换。渲染与几何这一侧有测试
-  覆盖（`output-layout` / `output-scale` / `gpu-scanout` / `region` / `cursor-theme`），
-  但"真实显示器上的翻页"只能在真机上确认。`session` 测试在没有 seat 的环境里 skip。
+- **DRM 真机覆盖尚未完成**：一台 1920×1080@60Hz 显示器已经验证 atomic 翻页、`IN_FENCE_FD` /
+  `OUT_FENCE_PTR`、libinput、硬件光标平面和 VT 切换；多输出分配、udev connector 热插拔、模式切换
+  的所有 per-output 重建，以及客户端 dmabuf direct scanout 仍须在空闲 VT 上验收。渲染与几何有
+  `output-layout` / `output-scale` / `gpu-scanout` / `region` / `cursor-theme` 覆盖；`session` 测试在
+  没有 seat 的环境里 skip。
 - **热插拔只覆盖 connector 状态**：GPU 本身热插拔（拔掉整块显卡 / DRM 设备消失）不处理。
 - **headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
   13ms debug）。这是 wl_shm 呈现的代价。嵌套后端只在父 compositor 没有

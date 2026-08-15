@@ -68,6 +68,7 @@
 | present | `Output::present` 信号 —— 帧上屏时刻（DRM 给真 vblank 时间戳 + 序号，其余后端给 CLOCK_MONOTONIC）。`wl_surface.frame` 与 `wp_presentation` 都由它驱动 | frame-timing |
 | render | **damage 渲染**：`render_to(..., damage)` 把脏区折成不相交 `Region`，**逐矩形 `setScissor`** 各画一次 —— 两块分散的小脏区就是两个小 scissor，不是横跨它们的大矩形。未触及的像素原样保留；双缓冲下调用方需并上上一帧的 damage（buffer age） | frame-timing, gpu-scanout |
 | render | **离屏合成**：`OffscreenTarget` 是可写也可采样的 RGBA GPU image；`render_offscreen()` 和 `render_to()` 共用 pass/遮挡/damage 路径，写完就停在 shader-read layout，可直接作为下一趟 `GpuTextureFill`。整窗淡入淡出不会把重叠子表面混合两次（ADR 0005） | offscreen |
+| render | **自定义片元阶段**：`create_fragment_shader(SPIR-V, ShaderDamage)` 为 compositor-owned texture 或离屏整窗结果替换 fragment stage，复用 quad 的 sampler / push constant ABI；`none` / `full` / `continuous` 分别声明无额外 damage、每帧整屏重绘、以及整屏重绘并持续请求下一帧。shader placement 一律不直出，renderer 持有 pipeline cache 直到安全销毁（ADR 0006） | fragment-shader |
 | render | **预乘 alpha**：`GpuTextureFill::alpha` 作用于整张 quad，片元颜色与 alpha 一起缩放，再由 `ONE / ONE_MINUS_SRC_ALPHA` 混合；半透明内容正确叠加，离屏的整窗结果可一次淡入淡出 | offscreen |
 | render | **连续几何**：`GpuTextureFill` 与 compositor-owned `Placement` 用 float x/y/width/height；vertex shader 保留小数，damage 与 scissor 对覆盖范围向外取整，所以半像素动画既平滑也不会留下旧像素 | gpu-scanout, offscreen |
 | render | **可组合摆位变换**：`PlacementTransform::at(...).crop(...).rescale(...).relocate(...).opacity(...)` 把 normalized crop、缩放、位移与整张纹理透明度收成不可变值对象；客户端表面树、普通 compositor texture 与 `compose_group()` 的离屏整窗结果共用一条路径，缩放树的命中测试会反变换回客户端坐标 | frame, offscreen |

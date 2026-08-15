@@ -74,6 +74,42 @@ private:
     explicit GpuTexture(std::unique_ptr<Impl> impl) noexcept;
 };
 
+/// What a custom fragment shader does to the frame's damage accounting. The
+/// declaration is mandatory because a shader can depend on time or data the
+/// placement list cannot see.
+enum class ShaderDamage {
+    /// A static, local effect: ordinary placement diff and client damage suffice.
+    none,
+    /// Repaint the full output whenever this placement is built; the compositor
+    /// still decides when to wake the output.
+    full,
+    /// As `full`, and keep requesting output frames after every successful flip.
+    continuous,
+};
+
+/// An immutable custom fragment stage for a compositor-owned texture. Create
+/// it with VulkanRenderer::create_fragment_shader(); it must not outlive that
+/// renderer. Its SPIR-V has the quad shader ABI documented in ADR 0006.
+class FragmentShader {
+public:
+    ~FragmentShader();
+    FragmentShader(FragmentShader&&) noexcept;
+    FragmentShader& operator=(FragmentShader&&) noexcept;
+    FragmentShader(const FragmentShader&) = delete;
+    FragmentShader& operator=(const FragmentShader&) = delete;
+
+    [[nodiscard]] ShaderDamage damage() const noexcept;
+
+    struct Impl;
+
+private:
+    friend class VulkanRenderer;
+    friend class Frame;
+    std::unique_ptr<Impl> impl_;
+    explicit FragmentShader(std::unique_ptr<Impl> impl) noexcept;
+    [[nodiscard]] std::uint64_t id() const noexcept;
+};
+
 /// A GPU render target that is also a dmabuf, so KMS can scan it out directly:
 /// the compositing result never touches system memory. Move-only, and it must
 /// not outlive the VulkanRenderer that made it.
@@ -291,6 +327,11 @@ public:
     [[nodiscard]] Result<GpuTexture> upload_texture(int width, int height,
                                                      std::span<const std::uint8_t> rgba);
 
+    /// Compile-ready SPIR-V for a texture quad's fragment stage. `damage` is a
+    /// required declaration consumed by Frame when this shader is placed.
+    [[nodiscard]] Result<FragmentShader> create_fragment_shader(
+        std::span<const std::uint32_t> spirv, ShaderDamage damage);
+
     /// DRM modifiers this GPU can render into *and* export as a dmabuf for
     /// `drm_format`. Intersect with what the display hardware can scan out.
     [[nodiscard]] std::vector<std::uint64_t> scanout_modifiers(std::uint32_t drm_format);
@@ -424,6 +465,8 @@ private:
     // A GpuTexture caches a descriptor set the renderer owns, and hands it back
     // when it dies; that needs to name the renderer's Impl.
     friend class GpuTexture;
+    friend class FragmentShader;
+    friend class Frame;
 
     /// The one render pass, written once for both destinations. A member and not
     /// a free function because it reaches into GpuTexture's innards, and the
@@ -431,8 +474,15 @@ private:
     [[nodiscard]] Status render_pass_to(VulkanRenderTarget& target, Color background,
                                         std::span<const RectFill> rects,
                                         std::span<const GpuTextureFill> textures,
+                                        std::span<const FragmentShader* const> shaders,
                                         std::span<const Box> damage,
                                         const OutputMapping& mapping, const RenderSync& sync);
+
+    [[nodiscard]] Status render_to_with_shaders(
+        ScanoutTarget& target, Color background, std::span<const RectFill> rects,
+        std::span<const GpuTextureFill> textures,
+        std::span<const FragmentShader* const> shaders, std::span<const Box> damage,
+        const OutputMapping& mapping, const RenderSync& sync);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -452,6 +502,14 @@ struct QuadPipeline {
     vk::raii::PipelineLayout layout;
     vk::raii::RenderPass load_pass;  // partial repaint: keep what is there
     vk::raii::RenderPass clear_pass; // full repaint: contents are undefined
+    vk::raii::Pipeline pipeline;
+};
+
+/// Renderer-owned so a pipeline cannot die while an asynchronous submit still
+/// references it. `shader` is a monotonic identity local to this renderer.
+struct EffectPipeline {
+    std::uint64_t shader = 0;
+    vk::Format format;
     vk::raii::Pipeline pipeline;
 };
 
@@ -493,8 +551,10 @@ struct VulkanRenderer::Impl {
     bool sync_fd_ok = false;     // VK_KHR_external_semaphore_fd: fences in and out
     std::optional<vk::raii::Sampler> sampler;
     std::vector<QuadPipeline> pipelines;
+    std::vector<EffectPipeline> effect_pipelines;
     std::vector<InFlight> in_flight;
     std::uint64_t submits = 0;
+    std::uint64_t next_shader = 0;
 
     // --- per-frame objects, recycled ---
     //
@@ -565,6 +625,7 @@ struct VulkanRenderer::Impl {
     std::uint32_t sets_in_pool = 0; ///< allocated out of set_pools.back()
 
     QuadPipeline& quad_pipeline(vk::Format format);
+    vk::raii::Pipeline& effect_pipeline(const FragmentShader& shader, QuadPipeline& quad);
     vk::DescriptorSetLayout quad_set_layout();
     vk::DescriptorSet acquire_set();
 
@@ -642,6 +703,22 @@ VulkanRenderer::~VulkanRenderer() {
 }
 VulkanRenderer::VulkanRenderer(VulkanRenderer&&) noexcept = default;
 VulkanRenderer& VulkanRenderer::operator=(VulkanRenderer&&) noexcept = default;
+
+struct FragmentShader::Impl {
+    VulkanRenderer::Impl* owner = nullptr;
+    std::uint64_t id = 0;
+    ShaderDamage damage = ShaderDamage::none;
+    std::vector<std::uint32_t> spirv;
+};
+
+FragmentShader::FragmentShader(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+FragmentShader::~FragmentShader() = default;
+FragmentShader::FragmentShader(FragmentShader&&) noexcept = default;
+FragmentShader& FragmentShader::operator=(FragmentShader&&) noexcept = default;
+ShaderDamage FragmentShader::damage() const noexcept {
+    return impl_ != nullptr ? impl_->damage : ShaderDamage::none;
+}
+std::uint64_t FragmentShader::id() const noexcept { return impl_ != nullptr ? impl_->id : 0; }
 
 Result<VulkanRenderer> VulkanRenderer::create() {
     try {
@@ -1784,6 +1861,51 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
     return pipelines.back();
 }
 
+vk::raii::Pipeline& VulkanRenderer::Impl::effect_pipeline(const FragmentShader& shader,
+                                                           QuadPipeline& quad) {
+    if (shader.impl_ == nullptr || shader.impl_->owner != this) {
+        throw std::runtime_error("fragment shader belongs to another renderer");
+    }
+    for (EffectPipeline& p : effect_pipelines) {
+        if (p.shader == shader.id() && p.format == quad.format) {
+            return p.pipeline;
+        }
+    }
+
+    vk::raii::ShaderModule vert{
+        device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadVertSpv), kQuadVertSpv}};
+    vk::raii::ShaderModule frag{device,
+                                vk::ShaderModuleCreateInfo{{},
+                                                         shader.impl_->spirv.size() *
+                                                             sizeof(std::uint32_t),
+                                                         shader.impl_->spirv.data()}};
+    const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
+        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
+        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag, "main"}};
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vk::PipelineInputAssemblyStateCreateInfo assembly{{}, vk::PrimitiveTopology::eTriangleStrip};
+    vk::PipelineViewportStateCreateInfo viewport{{}, 1, nullptr, 1, nullptr};
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.lineWidth = 1.0f;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    vk::PipelineColorBlendAttachmentState blend{
+        VK_TRUE, vk::BlendFactor::eOne, vk::BlendFactor::eOneMinusSrcAlpha,
+        vk::BlendOp::eAdd, vk::BlendFactor::eOne, vk::BlendFactor::eOneMinusSrcAlpha,
+        vk::BlendOp::eAdd, vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                             vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    vk::PipelineColorBlendStateCreateInfo blending{{}, VK_FALSE, vk::LogicOp::eCopy, blend};
+    const std::array<vk::DynamicState, 2> dynamic_states{vk::DynamicState::eViewport,
+                                                          vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamic{{}, dynamic_states};
+    vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr, &viewport,
+                                        &raster, &multisample, nullptr, &blending, &dynamic,
+                                        *quad.layout, *quad.clear_pass, 0};
+    effect_pipelines.push_back(
+        EffectPipeline{shader.id(), quad.format, vk::raii::Pipeline{device, nullptr, info}});
+    return effect_pipelines.back().pipeline;
+}
+
 Result<GpuTexture> VulkanRenderer::import_texture(const DmabufPlane& p) {
     if (!impl_->dmabuf_ok) {
         return fail("dmabuf import unsupported by GPU");
@@ -1909,6 +2031,23 @@ Result<GpuTexture> VulkanRenderer::upload_texture(int width, int height,
             std::move(image), std::move(memory), std::move(view), width, height, false})};
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan texture upload: "} + e.what());
+    }
+}
+
+Result<FragmentShader> VulkanRenderer::create_fragment_shader(
+    std::span<const std::uint32_t> spirv, ShaderDamage damage) {
+    if (spirv.size() < 5 || spirv.front() != 0x07230203u) {
+        return fail("fragment shader is not a SPIR-V module");
+    }
+    try {
+        auto shader = std::make_unique<FragmentShader::Impl>();
+        shader->owner = impl_.get();
+        shader->id = ++impl_->next_shader;
+        shader->damage = damage;
+        shader->spirv.assign(spirv.begin(), spirv.end());
+        return FragmentShader{std::move(shader)};
+    } catch (const std::exception& e) {
+        return fail(std::string{"fragment shader: "} + e.what());
     }
 }
 
@@ -2099,7 +2238,7 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
     VulkanRenderTarget t{*s.image,     *s.view,   s.format,        s.plane.width, s.plane.height,
                          &s.has_content, &s.fb_load, &s.fb_clear, &s.acquire_fence,
                          /*scanout=*/true};
-    return render_pass_to(t, background, rects, textures, damage, mapping, sync);
+    return render_pass_to(t, background, rects, textures, {}, damage, mapping, sync);
 }
 
 Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color background,
@@ -2114,8 +2253,22 @@ Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color backgroun
     VulkanRenderTarget t{*tex.image,     *tex.view,  o.format,    tex.width, tex.height,
                          &o.has_content, &o.fb_load, &o.fb_clear, &o.acquire_fence,
                          /*scanout=*/false};
-    return render_pass_to(t, background, rects, textures, damage,
+    return render_pass_to(t, background, rects, textures, {}, damage,
                           OutputMapping{Transform::normal, scale}, sync);
+}
+
+Status VulkanRenderer::render_to_with_shaders(
+    ScanoutTarget& target, Color background, std::span<const RectFill> rects,
+    std::span<const GpuTextureFill> textures, std::span<const FragmentShader* const> shaders,
+    std::span<const Box> damage, const OutputMapping& mapping, const RenderSync& sync) {
+    if (shaders.size() != textures.size()) {
+        return fail("fragment shader list does not match texture fills");
+    }
+    ScanoutTarget::Impl& s = *target.impl_;
+    VulkanRenderTarget t{*s.image,     *s.view,   s.format,        s.plane.width, s.plane.height,
+                         &s.has_content, &s.fb_load, &s.fb_clear, &s.acquire_fence,
+                         /*scanout=*/true};
+    return render_pass_to(t, background, rects, textures, shaders, damage, mapping, sync);
 }
 
 Result<XrayBlur> VulkanRenderer::create_xray_blur(int width, int height, unsigned downsample) {
@@ -2160,6 +2313,7 @@ Status VulkanRenderer::update_xray_blur(XrayBlur& blur, Color background,
 Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                                       std::span<const RectFill> rects,
                                       std::span<const GpuTextureFill> textures,
+                                      std::span<const FragmentShader* const> shaders,
                                       std::span<const Box> damage, const OutputMapping& mapping,
                                       const RenderSync& sync) {
     try {
@@ -2346,7 +2500,6 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             cmd.clearAttachments(clear_att, clear_rects);
         }
 
-        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *quad.pipeline);
         cmd.setViewport(0, vk::Viewport{0.0f, 0.0f, static_cast<float>(device_w),
                                         static_cast<float>(device_h), 0.0f, 1.0f});
 
@@ -2391,6 +2544,11 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                                            vk::DescriptorType::eCombinedImageSampler, image_info},
                     {});
             }
+            const FragmentShader* shader = shaders.empty() ? nullptr : shaders[i];
+            vk::raii::Pipeline& pipeline = shader != nullptr
+                                                ? impl_->effect_pipeline(*shader, quad)
+                                                : quad.pipeline;
+            cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
             cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0, tex.set, {});
             cmd.pushConstants<QuadPush>(*quad.layout,
                                         vk::ShaderStageFlagBits::eVertex |

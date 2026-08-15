@@ -129,9 +129,13 @@ bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布
 节拍定时器。构建帧时调用 `Frame::animate()`，它会禁用直出、令本帧完整重绘并只预约一个下一帧；
 最后一帧不调用即自动回到 `unchanged` 的零唤醒路径。`test_frame_animation` 守住这条状态机。
 
-niri 的一个现成教训：自定义 shader 目前只能挂在短动画上，不能长期挂在窗口或输出上，卡的正是
-damage——长期运行的 shader 必须声明「我不影响 damage / 我要求全量 damage / 我要求全量 damage
-且我在动」。真要开 shader 钩子，钩子与这个声明得一起设计。
+**自定义 shader 钩子已完成（2026-08-16）**：`VulkanRenderer::create_fragment_shader()` 接受
+编译好的 SPIR-V，替换 compositor-owned texture / `compose_group()` 最终纹理的片元阶段；它复用
+现有 descriptor、push constant、同步和预乘混合 ABI。创建时强制声明 `ShaderDamage::{none,full,continuous}`：
+普通静态效果走摆位 diff，`full` 强制本帧整屏重绘，`continuous` 还会持续预约下一帧。任意 shader
+placement 都拒绝 direct scanout，shader identity 也进 placement diff。pipeline cache 归 renderer，
+避免异步 submit 期间提前销毁。`test_fragment_shader` 同时守住真实 SPIR-V 像素替换和无 client damage
+时的全量重绘；取舍见 ADR 0006。
 
 ---
 
