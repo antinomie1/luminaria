@@ -159,6 +159,11 @@ public:
     /// surface, which no finite region can express.
     [[nodiscard]] const Region& input_region() const noexcept { return input_; }
     [[nodiscard]] bool has_input_region() const noexcept { return has_input_region_; }
+    /// Surface-local region whose background the client asks the compositor to
+    /// blur (ext-background-effect-v1). Empty means no requested blur. This is
+    /// a hint: the compositor remains free to choose its algorithm or ignore
+    /// it under its visual policy.
+    [[nodiscard]] const Region& blur_region() const noexcept { return blur_; }
     /// True once this surface has been used as a pointer cursor
     /// (`wl_pointer.set_cursor`) or a drag icon. Both are drawn ON the pointer,
     /// and the protocol says their input region is ignored — so they must not
@@ -251,6 +256,12 @@ public:
     [[nodiscard]] std::uint32_t content_type() const noexcept { return content_type_; }
     /// Called by the wp_content_type_v1 glue; applied on the next commit.
     void set_pending_content_type(std::uint32_t type) noexcept { pending_.content_type = type; }
+
+    /// Called by ext-background-effect glue; copied now because wl_region may
+    /// be destroyed immediately. Applied on the next wl_surface.commit.
+    void set_pending_blur_region(const Region* region) {
+        pending_.blur = region != nullptr ? *region : Region{};
+    }
 
     // --- deferred commits (wp_fifo_v1, wp_commit_timing_v1) ---
     //
@@ -419,6 +430,7 @@ private:
         Transform transform = Transform::normal;
         Region opaque;
         Region input;
+        Region blur;
         bool has_input = false;
         Viewport viewport;
         int offset_x = 0, offset_y = 0; // accumulated since the last commit
@@ -448,6 +460,7 @@ private:
     Transform buffer_transform_ = Transform::normal; // buffer -> surface
     Region opaque_;
     Region input_;
+    Region blur_;
     bool has_input_region_ = false;
     bool input_transparent_ = false; // cursor / drag-icon role
     Viewport viewport_;
@@ -1110,6 +1123,7 @@ void Surface::merge_state(State& into, State&& from) {
     into.transform = from.transform;
     into.opaque = std::move(from.opaque);
     into.input = std::move(from.input);
+    into.blur = std::move(from.blur);
     into.has_input = from.has_input;
     into.viewport = from.viewport;
     into.offset_x += from.offset_x;
@@ -1128,6 +1142,7 @@ void Surface::reset_pending(const State& applied) {
     pending_.transform = applied.transform;
     pending_.opaque = applied.opaque;
     pending_.input = applied.input;
+    pending_.blur = applied.blur;
     pending_.has_input = applied.has_input;
     pending_.viewport = applied.viewport;
 }
@@ -1215,6 +1230,7 @@ void Surface::commit_state(State state) {
     buffer_transform_ = state.transform;
     opaque_ = state.opaque;
     input_ = state.input;
+    blur_ = state.blur;
     has_input_region_ = state.has_input;
     viewport_ = state.viewport;
     offset_x_ += state.offset_x;

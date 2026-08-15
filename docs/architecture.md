@@ -28,7 +28,8 @@
   fence 编排、翻页，返回 `Presented::{composited,scanout,unchanged,fallback}`。
   `unchanged` 是「这一帧跟屏上那一帧一个样」：既不画也不提交，输出随即安静下来。
   唤醒由 `Frame` 自己负责——它盯着自己画过的每个表面的 commit，`invalidate()`、`damage_all()`
-  与 `reset()` 也各要一帧。
+  与 `reset()` 也各要一帧。`FrameEvent` 在建帧前给出预计呈现的 CLOCK_MONOTONIC 时间；连续动画在
+  该帧调用 `animate()`，由账本保留一个下一帧请求并全量重绘，最终帧不调用即回到 `unchanged` 的 idle。
   整窗特效用 `begin_group()` / `compose_group()`：源摆位仍在同一串里做命中测试，却只把离屏结果作为
   一个纹理摆位画到输出；`PlacementTransform` 可链式裁剪、缩放、位移、淡入淡出该结果，也可直接用于
   客户端表面树或 compositor-owned texture（树的 hit-test 自动反变换；树的 alpha 则应走离屏组），而

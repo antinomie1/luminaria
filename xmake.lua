@@ -81,6 +81,7 @@ target("luminaria")
               "src/backend/wayland.cppm", {public = true})
     add_files("src/protocol/client_buffer.cppm", "src/protocol/commit_timing.cppm",
               "src/protocol/compositor.cppm", "src/protocol/content_type.cppm",
+              "src/protocol/background_effect.cppm",
               "src/protocol/cursor_shape.cppm", "src/protocol/data_device.cppm",
               "src/protocol/fifo.cppm",
               "src/protocol/fractional_scale.cppm", "src/protocol/idle_inhibit.cppm",
@@ -140,6 +141,7 @@ target("luminaria")
             {"fifo-v1",                       "staging/fifo/fifo-v1.xml",                                   "scl"},
             {"commit-timing-v1",              "staging/commit-timing/commit-timing-v1.xml",                 "scl"},
             {"content-type-v1",               "staging/content-type/content-type-v1.xml",                   "scl"},
+            {"ext-background-effect-v1",      "staging/ext-background-effect/ext-background-effect-v1.xml", "scl"},
             {"ext-session-lock-v1",           "staging/ext-session-lock/ext-session-lock-v1.xml",           "scl"},
         }
         -- Protocols upstream does not ship; the XML lives in protocol/.
@@ -268,6 +270,7 @@ target("luminaria-tty")
 local gpu_tests = {
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
     test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
+    test_frame_animation = true,
     test_frame_damage = true, test_offscreen = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,
     test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,

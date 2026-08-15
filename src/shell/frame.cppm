@@ -299,6 +299,18 @@ public:
     /// Prefer `invalidate()`. This one repaints the whole output.
     void damage_all() noexcept;
 
+    /// This frame is part of a compositor-owned animation. Call while building
+    /// each animated frame, after `begin()` and before `submit()`. Frame then
+    /// repaints even when client damage is empty and asks the output for the
+    /// next paced event. Stop calling it on the final frame and the output
+    /// returns to its ordinary on-demand idle behaviour.
+    ///
+    /// Start an animation with `invalidate()` (or another change that asks for
+    /// a frame), then use `FrameEvent::predicted_presentation_ns` to evaluate
+    /// it at this call site. Keeping the clock at the output seam lets DRM,
+    /// nested and headless backends choose their own pacing source.
+    void animate() noexcept;
+
     /// Compose the placement list onto the output and put it on screen.
     ///
     /// In order: try to hand a fullscreen client's own buffer to the display
@@ -456,6 +468,7 @@ struct Frame::Impl {
     std::vector<std::uint32_t> ids; // empty on the read-back path
     std::optional<DirectScanout> direct;
     std::size_t back = 0;
+    bool animating = false;
 
     // Rebuilt every frame, never reallocated.
     Box view{};
@@ -747,6 +760,7 @@ void Frame::begin(const Box& view) {
     impl.prepass_fences.clear();
     impl.prepass_damage.clear();
     impl.prepass_drawn.clear();
+    impl.animating = false;
     impl.view = view;
     ++impl.generation;
     impl.placements.clear();
@@ -1067,6 +1081,8 @@ void Frame::damage_all() noexcept {
     impl_->output->schedule_frame();
 }
 
+void Frame::animate() noexcept { impl_->animating = true; }
+
 Result<std::span<const Pixel>> Frame::read_back() {
     Impl& impl = *impl_;
     if (impl.targets.empty()) {
@@ -1105,7 +1121,7 @@ Result<Presented> Frame::submit(Color background) {
     //
     // The cursor has to be on its own plane, or it would not appear — nothing is
     // compositing it in.
-    if (impl.direct.has_value() && output.has_cursor_plane() && impl.placements.size() == 1 &&
+    if (!impl.animating && impl.direct.has_value() && output.has_cursor_plane() && impl.placements.size() == 1 &&
         impl.placements[0].draw && impl.placements[0].surface.valid()) {
         const Placement& only = impl.placements[0];
         if (only.x == impl.view.x && only.y == impl.view.y &&
@@ -1162,7 +1178,7 @@ Result<Presented> Frame::submit(Color background) {
     // a full-output debt until it comes round. Without recording this box,
     // closing a window alternates between the cleared target and a stale target
     // for one cycle — seen as the destroyed rectangle flickering back.
-    if (impl.full_redraw) {
+    if (impl.full_redraw || impl.animating) {
         impl.damage.push_back(
             Box{0, 0, output.logical_width(), output.logical_height()});
     }
@@ -1368,6 +1384,12 @@ Result<Presented> Frame::submit(Color background) {
     }
     impl.prepass_damage.clear();
     impl.prepass_drawn.clear();
+    if (impl.animating) {
+        // Committing does not buy another frame. Keep this request inside the
+        // shell layer so animation callers cannot accidentally freeze at the
+        // first successful flip.
+        output.schedule_frame();
+    }
     return result;
 }
 

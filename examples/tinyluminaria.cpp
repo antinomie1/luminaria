@@ -164,6 +164,11 @@ int main() {
     // "I am playing a video" / "I am a game", for whoever decides refresh rate
     // and scanout policy. Read it off the Surface.
     auto content_type = must(luminaria::ContentTypeManager::create(display), "content-type");
+    // Client-declared background blur regions. Frame exposes the committed
+    // Surface::blur_region(); this tiny compositor keeps its simple flat
+    // background, while a visual shell can feed those regions to x-ray blur.
+    auto background_effect =
+        must(luminaria::BackgroundEffectManager::create(display), "background-effect");
     // Named cursors, so clients stop shipping their own bitmaps.
     auto cursor_shape = must(luminaria::CursorShapeManager::create(display), "cursor-shape");
     // Crop/stretch a buffer, and tell clients the true (fractional) output

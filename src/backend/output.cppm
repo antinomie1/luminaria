@@ -29,6 +29,19 @@ class Output;
 /// "Time to draw a new frame on `output`."
 struct FrameEvent {
     Output& output;
+
+    /// CLOCK_MONOTONIC instant at which this work is expected to reach the
+    /// display, in nanoseconds. It is an estimate: hardware-backed outputs
+    /// derive it from the previous vblank, while nested/headless outputs use
+    /// their pacing interval. 0 means the backend has no interval to offer.
+    ///
+    /// This is deliberately on the draw event rather than `PresentEvent`:
+    /// compositor-owned animations need a time *before* they build the frame.
+    std::uint64_t predicted_presentation_ns = 0;
+    /// Nominal interval used for the prediction, or 0 when unknown.
+    std::uint32_t refresh_ns = 0;
+    /// True only when the prediction was anchored to a hardware vblank clock.
+    bool hw_clock = false;
 };
 
 /// "This output is going away" — a monitor was unplugged, or the backend shut
@@ -294,11 +307,26 @@ protected:
     /// handler asking for another one must be able to get it.
     void frame_delivered() noexcept { frame_scheduled_ = false; }
 
+    /// Deliver a frame whose prediction is anchored at `presented_ns`. Backends
+    /// call this after spending a scheduled request; the FrameEvent's estimate
+    /// is the next nominal vblank, not the old frame's timestamp.
+    void emit_frame(std::uint64_t presented_ns = 0, std::uint32_t refresh_ns = 0,
+                    bool hw_clock = false) {
+        frame_delivered();
+        if (presented_ns == 0) {
+            timespec ts{};
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            presented_ns = static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull +
+                           static_cast<std::uint32_t>(ts.tv_nsec);
+        }
+        FrameEvent next{*this, presented_ns + refresh_ns, refresh_ns, hw_clock};
+        frame.emit(next);
+    }
+
     /// Report a frame with a software timestamp, then ask for the next one.
     /// For backends with no vblank of their own (headless, nested): the clock is
     /// still CLOCK_MONOTONIC, so clients get usable timing, just not hw_clock.
     void emit_software_frame(std::uint32_t refresh_ns = 0) {
-        frame_delivered();
         timespec ts{};
         clock_gettime(CLOCK_MONOTONIC, &ts);
         PresentEvent presented{*this,
@@ -309,8 +337,9 @@ protected:
                                true,
                                false};
         present.emit(presented);
-        FrameEvent next{*this};
-        frame.emit(next);
+        emit_frame(static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull +
+                       static_cast<std::uint32_t>(ts.tv_nsec),
+                   refresh_ns, false);
     }
 
     bool frame_scheduled_ = false;

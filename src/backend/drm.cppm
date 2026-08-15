@@ -435,10 +435,9 @@ public:
 
     /// Hand out one frame event. Every path that does this goes through here so
     /// that a pending `schedule_frame()` is spent exactly once.
-    void emit_frame() {
-        frame_delivered();
-        FrameEvent event{*this};
-        frame.emit(event);
+    void emit_frame(std::uint64_t presented_ns = 0, std::uint32_t refresh_ns = 0,
+                    bool hw_clock = false) {
+        Output::emit_frame(presented_ns, refresh_ns, hw_clock);
         // The handler may have committed a frame, which carries the cursor with
         // it. If it decided nothing had changed, it committed nothing, and the
         // cursor is still ours to deliver.
@@ -868,7 +867,8 @@ void on_page_flip(int /*fd*/, unsigned seq, unsigned sec, unsigned usec, unsigne
                            !out->tearing,
                            true};
     out->present.emit(presented);
-    out->emit_frame();
+    out->emit_frame(static_cast<std::uint64_t>(sec) * 1000000000ull + usec * 1000ull,
+                    out->refresh_ns(), true);
 }
 
 

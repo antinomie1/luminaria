@@ -109,20 +109,22 @@ bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布
   事，理由相同：子表面 / popup 重叠处各自乘 alpha 会露接缝。淡入淡出、缩放动画与模糊三者
   共用这套离屏基础设施，所以它比「给 `Placement` 加个 alpha 字段」更底层。**要单开 ADR**：
   它是第一个打破「一帧一 pass」的东西。
-- **(d) 模糊，入口是协议而不是渲染特性**。`ext-background-effect-v1`（staging，KDE 6.7+ /
+- **(d) 模糊，入口是协议而不是渲染特性 —— 协议状态已完成（2026-08-15）**。`ext-background-effect-v1`（staging，KDE 6.7+ /
   niri / Mutter 已实现，Foot / Kitty / Ghostty / Quickshell 客户端侧已跟进）让客户端自己声明
   背后哪块要模糊，接口就是 `Surface::blur_region()` 一个粘性双缓冲状态——按 ADR 0003 的准入
-  规则属于核心模块，和 `content_type` 同形。混成器拿到 region 决定画不画，库不猜窗口形状
+  规则属于核心模块，和 `content_type` 同形。`BackgroundEffectManager` 已把它发布为一个 core global，
+  `Surface::blur_region()` 是粘性双缓冲状态，`test_background_effect` 守住 set / NULL / object destroy
+  三种提交语义。混成器拿到 region 决定画不画，库不猜窗口形状
   （niri 的手动配置那条路对复杂表面形状效果不好，正是"猜"的代价）。
   实现先只做 **x-ray**：把静态背景（壁纸 + layer surface）模糊一次缓存起来，窗口采样它。
   这条不需要读回已合成内容，对现有单 render pass 结构冲击最小；真正采样下层窗口的非 x-ray
   再补。无论哪档，模糊半径都会让 damage 扩散——协议本身就要求把模糊采样区纳入重绘裁剪，
   这也是 (a) 必须先落地的原因。
 
-还需要的两件小事，都卡在同一个洞上：`FrameEvent` 里没有时间戳（只有 `Output&`），而
-`unchanged` 那一帧根本没有 `present`，于是动画时钟无处可取。补法照 niri 的重绘状态机：
-`FrameEvent` 带**预计呈现时刻**，外加一个估算 vblank 的定时器，让没有真实翻页时动画也能推进。
-另外 `submit()` 需要知道「本帧在动画中」，否则它会答 `unchanged` 把动画掐死。
+动画时钟与持续重绘已完成（2026-08-15）：`FrameEvent` 带 CLOCK_MONOTONIC 的
+`predicted_presentation_ns` 和估算 `refresh_ns`；DRM 用上一 vblank 锚定，嵌套/无头后端用自己的
+节拍定时器。构建帧时调用 `Frame::animate()`，它会禁用直出、令本帧完整重绘并只预约一个下一帧；
+最后一帧不调用即自动回到 `unchanged` 的零唤醒路径。`test_frame_animation` 守住这条状态机。
 
 niri 的一个现成教训：自定义 shader 目前只能挂在短动画上，不能长期挂在窗口或输出上，卡的正是
 damage——长期运行的 shader 必须声明「我不影响 damage / 我要求全量 damage / 我要求全量 damage
