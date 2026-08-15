@@ -1,0 +1,10 @@
+# LeakSanitizer suppressions for the test suite.
+#
+# The tests act as real Wayland clients in-process (see tests/test_compositor.cpp
+# for the pattern) and disconnect without destroying every wl_proxy first, which
+# LSan reports as a leak inside libwayland-client. That is the harness being
+# terse, not the library leaking: nothing here is allocated by luminaria.
+#
+# Deliberately narrow — one library, by name. Anything luminaria itself leaks
+# still gets reported.
+leak:libwayland-client

@@ -23,6 +23,10 @@ xmake test                # run all tests
 xmake test test_dmabuf/*  # run one
 xmake build tinyluminaria # one target
 xmake f -m release        # optimised build; debug is the default
+
+# under a sanitizer — see the comment in xmake.lua for what each does NOT catch
+xmake f --sanitize=address --toolchain=clang && xmake build -a
+LSAN_OPTIONS=suppressions=tests/lsan.supp xmake test
 ```
 
 Warnings are fatal (`all`, `extra`, `pedantic`, `error`), minus
@@ -47,7 +51,7 @@ interface-from-implementation; `src/` is grouped by responsibility instead:
 ```
 src/luminaria.cppm       primary interface unit — nothing but `export import`
 src/core/                display event_loop expected handle signal
-src/util/                box color dmabuf pixel rect_fill region transform
+src/util/                box color dmabuf pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
 src/scene/               scene output_layout direct_scanout
@@ -241,6 +245,20 @@ calls `clear_damage()`.
   by value. The exported signatures stay `int` — `set_acquire_fence(int)`,
   `commit_scanout(id, int)`, `take_present_fence()` — because they are the C boundary, and
   the implementation wraps or `release()`s on the first line.
+- **Never index client memory on a client's word.** A client declares width,
+  height, stride and offset as four independent integers and nothing upstream cross-checks
+  them in the units that matter: libwayland validates `wl_shm_pool.create_buffer` as
+  `stride >= width` — *bytes against pixels* — and `zwp_linux_buffer_params_v1.add` validates
+  the stride not at all. Every CPU pixel loop here indexes `row[x * 4 + 3]`, so a stride a
+  quarter of the real row length walks off the mapping: reading leaks adjacent process memory
+  back through screencopy, and the capture protocols *write*, which is corruption in another
+  client's address space. Both were reachable by an unprivileged client.
+  So: run the layout through `layout_fits()` / `layout_length()` (`util/pixel_layout.cppm`)
+  before touching the pixels — at the protocol request, where a real error can be posted, AND
+  again at the loop, so a later caller cannot reintroduce the hole by taking a shortcut.
+  `tests/test_buffer_bounds.cpp` and `tests/test_screencopy_bounds.cpp` guard this; the second
+  works by canary rather than by fault, because ASan does not shadow mmap'd regions and so
+  catches none of this class.
 - **Null request slots abort libwayland.** Real GTK/Qt clients call requests we haven't
   implemented, and libwayland aborts on a null slot — so unimplemented requests are wired to
   explicit no-op functions (`surface_noop_*` in `compositor.cppm`, `tl_set_parent` /
@@ -249,7 +267,9 @@ calls `clear_damage()`.
 - **Raw `Surface*` needs a `Surface::destroy` subscription.** Anything caching a surface
   pointer (seat focus, cursor, drag focus, scene nodes) connects to `Surface::destroy` and
   clears the pointer there; the `Signal::Connection` is RAII so it can't outlive the holder.
-  `seat.cppm` is the reference for the pattern.
+  `seat.cppm` is the reference for the pattern. Seat clearing *its* copy is not enough —
+  `data_device.cppm`'s `drag_focus` and `scene.cppm`'s `SceneSurface` each need their own
+  subscription, and each has a regression test.
 - **Any retained `wl_resource*` owned by a CLIENT needs a destroy listener.** Buffers are
   the sharp edge: toolkits drop their whole swapchain on resize / hide / re-show, so a
   committed `wl_buffer` dies under you and the next `wl_buffer.release` or readback

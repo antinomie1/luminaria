@@ -23,7 +23,16 @@ import :handle;
 export namespace luminaria {
 
 class Display {
-    CUnique<wl_display, wl_display_destroy> display_;
+    /// wl_display_destroy() leaves still-connected clients alone: their
+    /// wl_resources are never destroyed, so our resource-destroy handlers never
+    /// run and everything hanging off them (Surface, the per-protocol glue we
+    /// `new` into resource user-data) is leaked. Clients have to go first.
+    static void destroy_display(wl_display* d) noexcept {
+        wl_display_destroy_clients(d);
+        wl_display_destroy(d);
+    }
+
+    CUnique<wl_display, &Display::destroy_display> display_;
 
     explicit Display(wl_display* display) noexcept : display_(display) {}
 

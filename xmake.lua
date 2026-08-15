@@ -18,6 +18,39 @@ set_policy("build.c++.modules", true)
 add_rules("mode.debug", "mode.release")
 set_defaultmode("debug")
 
+-- Sanitizers, off by default (both are slow, and switching rebuilds every
+-- module unit from scratch):
+--
+--   xmake f --sanitize=address --toolchain=clang && xmake build -a && xmake test
+--   xmake f --sanitize=undefined --toolchain=clang && ...
+--
+-- Worth knowing what ASan does and does NOT buy here. It catches use-after-free
+-- and heap overruns — the dangling-Surface* class, which is why
+-- tests/test_dnd_surface_destroy.cpp is worth running under it. It does NOT
+-- catch a read or write past the end of an mmap'd region, which is exactly what
+-- a client's short buffer stride produces; ASan only shadows heap, stack and
+-- globals. That class is covered by tests/test_buffer_bounds.cpp and
+-- tests/test_screencopy_bounds.cpp, which fault or trip a canary by
+-- construction rather than relying on a sanitizer.
+--
+-- LeakSanitizer (on by default with ASan) reports wl_proxy allocations made by
+-- the in-process test clients, which disconnect without tearing every proxy
+-- down. Those are harness artefacts, not library defects, so tests/lsan.supp
+-- suppresses libwayland-client and nothing else:
+--
+--   LSAN_OPTIONS=suppressions=tests/lsan.supp xmake test
+option("sanitize")
+    set_default("none")
+    set_values("none", "address", "undefined")
+    set_description("Build with a sanitizer (address|undefined)")
+option_end()
+
+if get_config("sanitize") == "address" then
+    set_policy("build.sanitizer.address", true)
+elseif get_config("sanitize") == "undefined" then
+    set_policy("build.sanitizer.undefined", true)
+end
+
 -- Partial designated-init of libwayland's C *_interface vtables is idiomatic;
 -- unlisted request slots are intentionally null. Silence that one warning, keep
 -- everything else fatal.
