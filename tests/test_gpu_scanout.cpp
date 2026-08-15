@@ -58,6 +58,18 @@ int main() {
     assert((at(1, 1) == std::vector<std::uint8_t>{255, 0, 0})); // texture
     assert((at(6, 6) == std::vector<std::uint8_t>{0, 0, 255})); // background
 
+    // Animation geometry is continuous. A half-pixel shift must be consumed by
+    // the vertex shader, not truncated to the old integer rect: fragment
+    // centres (0.5, 0.5) remain outside while (1.5, 1.5) is inside.
+    const luminaria::GpuTextureFill half_fill{&*texture, 0.75f, 0.75f, 2.0f, 2.0f};
+    status = renderer->render_to(*target, luminaria::Color{0, 0, 1, 1}, {}, {&half_fill, 1});
+    assert(status.has_value());
+    pixels = renderer->import_dmabuf(p.fd, p.width, p.height, p.format, p.offset, p.stride,
+                                     p.modifier);
+    assert(pixels.has_value());
+    assert((at(0, 0) == std::vector<std::uint8_t>{0, 0, 255}));
+    assert((at(1, 1) == std::vector<std::uint8_t>{255, 0, 0}));
+
     // Rotated output: the same logical top-left quad must land top-RIGHT on a
     // framebuffer rotated 90 degrees.
     status = renderer->render_to(*target, luminaria::Color{0, 0, 1, 1}, {}, {&fill, 1}, {},

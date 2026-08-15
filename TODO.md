@@ -95,8 +95,10 @@ bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布
   唤醒。`damage_all()` 退为钝器。`test_frame_damage` 用「帧间换底色」同时守住"有 damage"
   与"damage 最小"两头。两个示例混成器都已改到 `invalidate()`，光标移动因此从「重画一屏」
   变成「重画两个 24 像素矩形」。
-- **(b) crop / rescale / relocate 型的摆位包装**。动画要的平移、缩放、裁剪应当是串这一层的
-  组合，不是往 shader 里加参数。`Placement` 需要浮点几何（整数会让滑动逐帧抖）与 alpha。
+- **(b) crop / rescale / relocate 型的摆位包装**。连续几何已完成（2026-08-15）：`Placement` /
+  `GpuTextureFill` 保存 float rect，shader 消费原始小数，damage/occlusion 向外取整；离屏整窗纹理
+  因而可无抖动地平移、缩放和淡入淡出。仍需把同一语义做成可组合的 crop / rescale wrapper，供
+  客户端表面树和非离屏动画使用，而不是往 shader 继续堆专用参数。
 - **(c) 把一棵表面树合成到离屏纹理，再当一个摆位贴回 —— 已完成（2026-08-15）**。
   `OffscreenTarget` + `render_offscreen()` 复用现有合成 pass，`GpuTextureFill::alpha` 支持把结果
   作为一个 quad 淡入淡出；`Frame::begin_group()` / `compose_group()` 把 marker 后的摆位离屏化，保留

@@ -41,6 +41,7 @@ module;
 #include <vector>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -68,8 +69,8 @@ struct Placement {
     /// yet, in which case the placement is still hit-testable but not drawn.
     const GpuTexture* texture = nullptr;
 
-    int x = 0, y = 0;          ///< top-left, layout coordinates
-    int width = 0, height = 0; ///< surface coordinates, not buffer pixels
+    float x = 0, y = 0;          ///< top-left, layout coordinates
+    float width = 0, height = 0; ///< surface coordinates, not buffer pixels
 
     Transform transform = Transform::normal;
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
@@ -169,6 +170,12 @@ public:
     /// As above, with whole-quad opacity. Use this for a compositor-owned
     /// texture such as an OffscreenTarget's finished window.
     void place(const GpuTexture& texture, int x, int y, int width, int height, float alpha);
+
+    /// Floating-point variant for an animated compositor-owned texture. The
+    /// GPU consumes the exact geometry; damage and culling round its coverage
+    /// outward to pixels, so a subpixel move cannot leave a stale edge.
+    void place(const GpuTexture& texture, float x, float y, float width, float height,
+               float alpha = 1.0f);
 
     /// Mark the start of a window-sized group. Add the window's surface tree,
     /// its popups, and any other visual members with `place()`, then hand the
@@ -384,6 +391,16 @@ struct Frame::Impl {
     [[nodiscard]] GpuTexture* texture_for(Surface& surface);
 };
 
+// Damage/scissor boxes must cover every pixel a subpixel quad can touch. The
+// geometry itself remains float all the way to the vertex push constants.
+[[nodiscard]] Box fr_coverage(float x, float y, float width, float height) noexcept {
+    const int left = static_cast<int>(std::floor(x));
+    const int top = static_cast<int>(std::floor(y));
+    const int right = static_cast<int>(std::ceil(x + width));
+    const int bottom = static_cast<int>(std::ceil(y + height));
+    return Box{left, top, right - left, bottom - top};
+}
+
 FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
     FrPlacementKey key{};
     key.surface = p.surface;
@@ -392,7 +409,8 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p) const noexcept {
     // treating their texture as drawable here would manufacture output damage
     // beside the group's one final texture.
     key.texture = p.draw ? p.texture : nullptr;
-    key.box = Box{p.x - view.x, p.y - view.y, p.width, p.height};
+    key.box = fr_coverage(p.x - static_cast<float>(view.x), p.y - static_cast<float>(view.y),
+                          p.width, p.height);
     key.transform = p.transform;
     key.u0 = p.u0;
     key.v0 = p.v0;
@@ -667,8 +685,14 @@ void Frame::place(const GpuTexture& texture, int x, int y, int width, int height
 }
 
 void Frame::place(const GpuTexture& texture, int x, int y, int width, int height, float alpha) {
+    place(texture, static_cast<float>(x), static_cast<float>(y), static_cast<float>(width),
+          static_cast<float>(height), alpha);
+}
+
+void Frame::place(const GpuTexture& texture, float x, float y, float width, float height,
+                  float alpha) {
     Impl& impl = *impl_;
-    const Box box{x, y, width, height};
+    const Box box = fr_coverage(x, y, width, height);
     if (box.empty() || impl.view.intersection(box).empty()) {
         return;
     }

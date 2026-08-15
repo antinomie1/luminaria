@@ -15,6 +15,7 @@ module;
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -149,7 +150,7 @@ private:
 /// LOGICAL coordinates — the renderer applies scale and rotation.
 struct GpuTextureFill {
     const GpuTexture* texture;
-    int x, y, w, h;
+    float x, y, w, h;
 
     /// How the source buffer is oriented relative to the surface — pass
     /// `Surface::buffer_transform()`. Folded into the output's own rotation so
@@ -1568,6 +1569,42 @@ struct QuadPush {
     float alpha;
 };
 
+struct FloatBox {
+    float x, y, width, height;
+};
+
+[[nodiscard]] Box coverage_of(const GpuTextureFill& fill) noexcept {
+    const int left = static_cast<int>(std::floor(fill.x));
+    const int top = static_cast<int>(std::floor(fill.y));
+    const int right = static_cast<int>(std::ceil(fill.x + fill.w));
+    const int bottom = static_cast<int>(std::ceil(fill.y + fill.h));
+    return Box{left, top, right - left, bottom - top};
+}
+
+[[nodiscard]] FloatBox transform_float_box(Transform t, int scale, FloatBox logical,
+                                           int device_w, int device_h) noexcept {
+    const float s = static_cast<float>(std::max(1, scale));
+    if (transform_flipped(t)) {
+        const float logical_w = static_cast<float>(transform_swaps_axes(t) ? device_h : device_w) / s;
+        logical.x = logical_w - (logical.x + logical.width);
+    }
+    const FloatBox scaled{logical.x * s, logical.y * s, logical.width * s, logical.height * s};
+    switch (transform_rotation(t)) {
+    case 90:
+        return FloatBox{static_cast<float>(device_w) - (scaled.y + scaled.height), scaled.x,
+                        scaled.height, scaled.width};
+    case 180:
+        return FloatBox{static_cast<float>(device_w) - (scaled.x + scaled.width),
+                        static_cast<float>(device_h) - (scaled.y + scaled.height), scaled.width,
+                        scaled.height};
+    case 270:
+        return FloatBox{scaled.y, static_cast<float>(device_h) - (scaled.x + scaled.width),
+                        scaled.height, scaled.width};
+    default:
+        return scaled;
+    }
+}
+
 vk::raii::RenderPass make_pass(const vk::raii::Device& device, vk::Format format, bool load) {
     vk::AttachmentDescription attachment{
         {},
@@ -2080,13 +2117,14 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             if (tf.texture == nullptr || tf.w <= 0 || tf.h <= 0) {
                 continue;
             }
+            const Box texture_box = coverage_of(tf);
             visible[i] = repaint;
-            visible[i].intersect(Box{tf.x, tf.y, tf.w, tf.h});
+            visible[i].intersect(texture_box);
             visible[i].subtract(covered);
             // Clipped to the destination rect box by box: a Region copy here
             // would be one heap allocation per texture per frame.
             for (const Box& b : tf.opaque) {
-                if (const Box hit = b.intersection(Box{tf.x, tf.y, tf.w, tf.h}); !hit.empty()) {
+                if (const Box hit = b.intersection(texture_box); !hit.empty()) {
                     covered.add(hit);
                 }
             }
@@ -2220,16 +2258,15 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             // The quad covers the whole destination rect; the scissor does the
             // clipping. The source is sampled through the buffer transform folded
             // into the output's, so one draw handles both rotations.
-            const Box dev = to_device(Box{tf.x, tf.y, tf.w, tf.h});
+            const FloatBox dev = transform_float_box(
+                transform, scale, FloatBox{tf.x, tf.y, tf.w, tf.h}, device_w, device_h);
             const auto uv =
                 corner_uvs(transform_compose(transform, tf.transform), tf.u0, tf.v0, tf.u1, tf.v1);
             QuadPush push{};
-            push.rect[0] = 2.0f * static_cast<float>(dev.x) / static_cast<float>(device_w) - 1.0f;
-            push.rect[1] = 2.0f * static_cast<float>(dev.y) / static_cast<float>(device_h) - 1.0f;
-            push.rect[2] =
-                2.0f * static_cast<float>(dev.x + dev.width) / static_cast<float>(device_w) - 1.0f;
-            push.rect[3] =
-                2.0f * static_cast<float>(dev.y + dev.height) / static_cast<float>(device_h) - 1.0f;
+            push.rect[0] = 2.0f * dev.x / static_cast<float>(device_w) - 1.0f;
+            push.rect[1] = 2.0f * dev.y / static_cast<float>(device_h) - 1.0f;
+            push.rect[2] = 2.0f * (dev.x + dev.width) / static_cast<float>(device_w) - 1.0f;
+            push.rect[3] = 2.0f * (dev.y + dev.height) / static_cast<float>(device_h) - 1.0f;
             push.uv01[0] = uv[0][0];
             push.uv01[1] = uv[0][1];
             push.uv01[2] = uv[1][0];
