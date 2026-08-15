@@ -439,6 +439,37 @@ public:
         frame_delivered();
         FrameEvent event{*this};
         frame.emit(event);
+        // The handler may have committed a frame, which carries the cursor with
+        // it. If it decided nothing had changed, it committed nothing, and the
+        // cursor is still ours to deliver.
+        flush_cursor();
+    }
+
+    /// Get a moved cursor onto its plane when no primary-plane commit is going
+    /// to do it for us.
+    ///
+    /// Cursor state is folded into the next primary flip on purpose (see
+    /// `atomic`), and for a screen that redraws that is free. A screen where
+    /// only the pointer is moving does not redraw at all — that is the whole
+    /// point of the idle path — so it has to be flipped here instead: the same
+    /// framebuffer that is already on screen, re-submitted with the cursor plane
+    /// updated. `flip_pending` makes it coalesce at the refresh rate, so a
+    /// stream of motion events cannot outrun the display.
+    void flush_cursor() {
+        if (!cursor_dirty || suspended || flip_pending || !modeset_done || !has_cursor_plane() ||
+            pending_fb == 0) {
+            return;
+        }
+        // Not as an async flip, whatever wp_tearing_control asked for: the
+        // kernel only takes an async commit that changes the primary plane's
+        // FB_ID, and this one changes the cursor plane and nothing else.
+        const bool was_tearing = tearing;
+        tearing = false;
+        const Status flipped = atomic(pending_fb, false);
+        tearing = was_tearing;
+        if (!flipped) {
+            retry_timer.arm(16); // the cursor is still dirty; try on the next tick
+        }
     }
 
     // A page flip already owes us a frame event, and so does a modeset — every
@@ -736,17 +767,16 @@ public:
         return cursor.plane_id != 0 && cursor.fb.map != nullptr;
     }
 
-    /// Queue the latest cursor state for the next primary-plane atomic commit.
-    /// The one-shot timer starts a frame when the display is otherwise idle;
-    /// while a flip is pending its completion already starts that next frame.
+    /// Queue the latest cursor state. While a flip is pending, its completion
+    /// carries the cursor with it and there is nothing to do; otherwise it goes
+    /// out now, without waking the compositor for a frame it would only answer
+    /// "nothing changed" to. Moving the pointer must not cost a repaint.
     Status commit_cursor() {
         if (suspended || !has_cursor_plane()) {
             return ok();
         }
         cursor_dirty = true;
-        if (modeset_done && !flip_pending) {
-            retry_timer.arm(1);
-        }
+        flush_cursor();
         return ok();
     }
 

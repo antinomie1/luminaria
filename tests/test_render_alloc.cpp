@@ -23,6 +23,7 @@
 #include <span>
 #include <vector>
 
+#include <poll.h>
 #include <unistd.h>
 
 #include <drm_fourcc.h>
@@ -114,24 +115,31 @@ int main() {
     // have to come back round there too.
     int out_fence = -1;
     const luminaria::RenderSync sync{{}, &out_fence};
+    // Stand in for the display: wait for the render's own sync_file before
+    // asking for the next frame, the way a page flip paces a real compositor.
+    // Without that this loop submits as fast as the CPU can and the in-flight
+    // list grows to a depth no display would ever produce.
+    auto flip = [&] {
+        if (out_fence < 0) {
+            return;
+        }
+        pollfd pfd{out_fence, POLLIN, 0};
+        (void)poll(&pfd, 1, 1000);
+        close(out_fence);
+        out_fence = -1;
+    };
     for (int i = 0; i < 8; ++i) {
         auto s = renderer->render_to(*target, bg, {}, fills, damage, mapping, sync);
         assert(s.has_value());
-        if (out_fence >= 0) {
-            close(out_fence);
-            out_fence = -1;
-        }
+        flip();
     }
     const std::size_t before_async = g_allocs.load(std::memory_order_relaxed);
     int fences = 0;
     for (int i = 0; i < 32; ++i) {
         auto s = renderer->render_to(*target, bg, {}, fills, damage, mapping, sync);
         assert(s.has_value());
-        if (out_fence >= 0) {
-            ++fences;
-            close(out_fence);
-            out_fence = -1;
-        }
+        fences += out_fence >= 0 ? 1 : 0;
+        flip();
     }
     const std::size_t async_spent = g_allocs.load(std::memory_order_relaxed) - before_async;
     std::fprintf(stderr,

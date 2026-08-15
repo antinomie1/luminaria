@@ -557,6 +557,18 @@ Result<VulkanRenderer> VulkanRenderer::create() {
                                                 std::move(queue), std::move(command_pool),
                                                 dmabuf_ok, queue_foreign, sync_fd_ok, std::nullopt,
                                                 {}, {}});
+        // How many submits can be outstanding before the display catches up.
+        // Reserved rather than grown: without this the in-flight list and the
+        // free lists reallocate the first time the queue runs a frame or two
+        // deeper than usual, which is a heap allocation in the middle of a
+        // frame that is supposed to have none. A deeper backlog than this costs
+        // one reallocation and then settles again.
+        constexpr std::size_t kPipelineDepth = 8;
+        impl->in_flight.reserve(kPipelineDepth);
+        impl->free_cmds.reserve(kPipelineDepth);
+        impl->free_fences.reserve(kPipelineDepth);
+        impl->free_sem_lists.reserve(kPipelineDepth);
+
         // Linear filtering with clamped edges: a scaled or rotated surface must
         // not smear its opposite edge in along the seam.
         impl->sampler.emplace(
