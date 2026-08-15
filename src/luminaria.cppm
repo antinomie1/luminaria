@@ -45,6 +45,7 @@ export import :output;
 export import :output_global;
 export import :output_layout;
 export import :pixel;
+export import :pixel_layout;
 export import :pointer_constraints;
 export import :presentation_time;
 export import :rect_fill;

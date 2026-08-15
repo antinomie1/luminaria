@@ -32,6 +32,7 @@ import :dmabuf;
 import :expected;
 import :handle;
 import :linux_dmabuf;
+import :pixel_layout;
 import :region;
 import :signal;
 import :single_pixel_buffer;
@@ -492,6 +493,14 @@ bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, in
     const int h = wl_shm_buffer_get_height(shm);
     const int stride = wl_shm_buffer_get_stride(shm);
     const bool opaque = format == WL_SHM_FORMAT_XRGB8888;
+    // libwayland accepted this buffer having only checked `stride >= width`,
+    // comparing bytes against pixels. A client that declares stride == width
+    // for a 4-byte format sends the loop below off the end of the pool, so the
+    // buffer is unreadable to us — say so rather than touch it. libwayland
+    // guarantees the pool holds `stride * height`, which is all we then need.
+    if (!layout_fits(w, h, stride)) {
+        return false;
+    }
 
     wl_shm_buffer_begin_access(shm);
     const auto* data = static_cast<const uint8_t*>(wl_shm_buffer_get_data(shm));

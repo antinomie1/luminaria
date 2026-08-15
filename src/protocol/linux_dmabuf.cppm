@@ -39,6 +39,7 @@ export module luminaria:linux_dmabuf;
 import :display;
 import :dmabuf;
 import :expected;
+import :pixel_layout;
 import :vulkan;
 
 export namespace luminaria {
@@ -222,6 +223,15 @@ wl_resource* build_buffer(wl_client* client, wl_resource* params_resource, uint3
     if (width <= 0 || height <= 0) {
         return fail(ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS, "invalid dimensions");
     }
+    // `add` took the stride on trust — the protocol has no validation for it at
+    // all. This is the one chokepoint both consumers pass through (the CPU
+    // mmap path below and VulkanRenderer::import_texture), so a stride too
+    // short for a row of `width` 4-byte pixels is refused here and neither has
+    // to defend itself against a layout that never existed.
+    if (!layout_fits(width, height, p->plane0.stride, p->plane0.offset)) {
+        return fail(ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS,
+                    "stride too small for width, or offset/stride out of range");
+    }
 
     wl_resource* buffer = wl_resource_create(client, &wl_buffer_interface, 1, buffer_id);
     if (buffer == nullptr) {
@@ -385,7 +395,12 @@ bool linear_to_rgba(const DmabufBuffer* buf, std::vector<std::uint8_t>& out, int
                     int& height) {
     const int w = buf->width;
     const int h = buf->height;
-    const size_t map_len = static_cast<size_t>(buf->offset) + static_cast<size_t>(buf->stride) * h;
+    // build_buffer() already refused a short stride; check again rather than
+    // trust that every future path into a DmabufBuffer came through it.
+    const size_t map_len = layout_length(w, h, buf->stride, buf->offset);
+    if (map_len == 0) {
+        return false;
+    }
     // dma-buf mmap requires MAP_SHARED (no private copy-on-write mapping).
     void* map = mmap(nullptr, map_len, PROT_READ, MAP_SHARED, buf->fd, 0);
     if (map == MAP_FAILED) {

@@ -34,6 +34,7 @@ export module luminaria:screencopy;
 import :display;
 import :expected;
 import :linux_dmabuf;
+import :pixel_layout;
 import :vulkan;
 
 export namespace luminaria {
@@ -225,6 +226,20 @@ bool write_shm_rgba(wl_resource* buffer, const std::vector<uint8_t>& rgba,
     wl_shm_buffer* shm = wl_shm_buffer_get(buffer);
     if (!shm) { return false; }
 
+    // This writes into a client's memory, so a bad layout here is corruption,
+    // not a bad read. Re-derive the destination's own geometry instead of
+    // trusting the caller's: the buffer must be at least as large as the
+    // capture in both axes, and its stride must actually hold a row of
+    // `width` 4-byte pixels. libwayland only checked `stride >= width`.
+    const int dst_w = wl_shm_buffer_get_width(shm);
+    const int dst_h = wl_shm_buffer_get_height(shm);
+    const int dst_stride = wl_shm_buffer_get_stride(shm);
+    if (dst_stride != shm_stride || dst_w < width || dst_h < height ||
+        !layout_fits(width, height, dst_stride) ||
+        rgba.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4) {
+        return false;
+    }
+
     wl_shm_buffer_begin_access(shm);
     auto* dst = static_cast<uint8_t*>(wl_shm_buffer_get_data(shm));
     if (!dst) { wl_shm_buffer_end_access(shm); return false; }
@@ -261,9 +276,15 @@ bool write_dmabuf_rgba(VulkanRenderer* renderer, wl_resource* buffer,
         (info.format != DRM_FORMAT_ARGB8888 && info.format != DRM_FORMAT_XRGB8888)) {
         return false;
     }
+    if (rgba.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4) {
+        return false;
+    }
     if (dmabuf_is_linear(info.modifier)) {
-        const size_t len =
-            static_cast<size_t>(info.offset) + static_cast<size_t>(info.stride) * height;
+        // Same reasoning as the shm path: this is a write into client memory.
+        const size_t len = layout_length(width, height, info.stride, info.offset);
+        if (len == 0) {
+            return false;
+        }
         void* map = mmap(nullptr, len, PROT_WRITE, MAP_SHARED, info.fd, 0);
         if (map == MAP_FAILED) {
             return false;
@@ -318,6 +339,16 @@ void wlr_frame_do_copy(WlrFrame* f, wl_resource* buffer, bool with_damage) {
                 cap_h, bw, bh, fmt);
             return;
         }
+        // Width and height matching is not enough: libwayland validated the
+        // stride as `stride >= width`, bytes against pixels, so a stride a
+        // quarter of the row length is still in play and we are about to write
+        // `width * 4` bytes per row into this client's pool.
+        if (!layout_fits(cap_w, cap_h, shm_stride)) {
+            wl_resource_post_error(f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
+                                   "buffer stride %d is too small for %d pixels per row",
+                                   shm_stride, cap_w);
+            return;
+        }
     } else {
         DmabufInfo info;
         if (!dmabuf_buffer_info(buffer, info)) {
@@ -328,6 +359,15 @@ void wlr_frame_do_copy(WlrFrame* f, wl_resource* buffer, bool with_damage) {
             wl_resource_post_error(f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
                                    "dmabuf size mismatch: expected %dx%d, got %dx%d", cap_w, cap_h,
                                    info.width, info.height);
+            return;
+        }
+        // zwp_linux_buffer_params_v1.add validates no stride at all upstream;
+        // LinuxDmabuf::build_buffer refuses a short one, but screencopy accepts
+        // any wl_buffer the client hands it, so re-check at the write.
+        if (!layout_fits(cap_w, cap_h, info.stride, info.offset)) {
+            wl_resource_post_error(f->resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
+                                   "dmabuf stride %u is too small for %d pixels per row",
+                                   info.stride, cap_w);
             return;
         }
     }
@@ -642,12 +682,22 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
         }
     }
 
+    // attach_buffer accepts any wl_buffer without inspecting it, and the size
+    // captured here (the output's, or the cursor's) is not one the client
+    // chose — so nothing so far has established that what it attached can hold
+    // this frame. A 1x1 buffer against a full-screen capture would be a
+    // screen-sized write into someone else's pool. Check before writing.
     wl_shm_buffer* shm = wl_shm_buffer_get(f->attached_buffer);
     bool wrote = false;
     if (shm) {
-        int stride = wl_shm_buffer_get_stride(shm);
-        wrote = write_shm_rgba(f->attached_buffer, rgba, cap_w, cap_h, stride);
+        const int stride = wl_shm_buffer_get_stride(shm);
+        if (wl_shm_buffer_get_width(shm) >= cap_w && wl_shm_buffer_get_height(shm) >= cap_h &&
+            wl_shm_buffer_get_format(shm) == WL_SHM_FORMAT_ARGB8888 &&
+            layout_fits(cap_w, cap_h, stride)) {
+            wrote = write_shm_rgba(f->attached_buffer, rgba, cap_w, cap_h, stride);
+        }
     } else {
+        // write_dmabuf_rgba() re-derives and validates the dmabuf's own layout.
         wrote = write_dmabuf_rgba(f->mgr->renderer, f->attached_buffer, rgba, cap_w, cap_h);
     }
     if (!wrote) {
