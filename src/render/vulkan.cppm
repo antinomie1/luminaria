@@ -146,6 +146,38 @@ private:
     explicit OffscreenTarget(std::unique_ptr<Impl> impl) noexcept;
 };
 
+/// A cached x-ray blur source. `update_xray_blur()` renders the compositor's
+/// static backdrop at reduced resolution; drawing `texture()` back at output
+/// size lets the existing linear sampler turn it into a cheap, soft backdrop.
+///
+/// It deliberately contains no client surfaces. That is the defining x-ray
+/// policy: translucent clients see wallpaper/layer content blurred, never a
+/// lower window. Keep one per output, update it when that static scene changes,
+/// then use Frame::place_xray_blur() for the regions clients requested through
+/// ext-background-effect-v1.
+class XrayBlur {
+public:
+    ~XrayBlur();
+    XrayBlur(XrayBlur&&) noexcept;
+    XrayBlur& operator=(XrayBlur&&) noexcept;
+    XrayBlur(const XrayBlur&) = delete;
+    XrayBlur& operator=(const XrayBlur&) = delete;
+
+    /// The reduced-resolution cached backdrop, ready for an ordinary textured
+    /// quad. Its normalized UV coordinates still describe the full output.
+    [[nodiscard]] const GpuTexture& texture() const noexcept;
+    [[nodiscard]] int output_width() const noexcept;
+    [[nodiscard]] int output_height() const noexcept;
+    [[nodiscard]] unsigned downsample() const noexcept;
+
+    struct Impl;
+
+private:
+    friend class VulkanRenderer;
+    std::unique_ptr<Impl> impl_;
+    explicit XrayBlur(std::unique_ptr<Impl> impl) noexcept;
+};
+
 /// A GpuTexture stretched into the destination rect (x,y,w,h), in the output's
 /// LOGICAL coordinates — the renderer applies scale and rotation.
 struct GpuTextureFill {
@@ -333,6 +365,20 @@ public:
                                           std::span<const Box> damage = {},
                                           int scale = 1,
                                           const RenderSync& sync = {});
+
+    /// Allocate an x-ray blur cache for an output. `downsample` is the blur
+    /// radius knob: 2 is subtle, 4 is the normal light desktop blur; values
+    /// above 8 are clamped to avoid turning text behind glass into large blocks.
+    [[nodiscard]] Result<XrayBlur> create_xray_blur(int width, int height,
+                                                     unsigned downsample = 4);
+
+    /// Refresh an x-ray cache from static output-local layers. `textures` use
+    /// normal output logical coordinates; this method scales them into the
+    /// reduced target and owns the scratch list. On success call
+    /// Frame::damage_all() before the next output frame so placements sampling
+    /// the changed cache are repainted.
+    [[nodiscard]] Status update_xray_blur(XrayBlur& blur, Color background,
+                                          std::span<const GpuTextureFill> textures);
 
     // --- linux-dmabuf import/export (any DRM modifier the GPU supports) ---
 
@@ -1413,6 +1459,23 @@ const GpuTexture& OffscreenTarget::texture() const noexcept { return impl_->text
 int OffscreenTarget::width() const noexcept { return impl_->texture.width(); }
 int OffscreenTarget::height() const noexcept { return impl_->texture.height(); }
 
+struct XrayBlur::Impl {
+    OffscreenTarget target;
+    int output_width = 0;
+    int output_height = 0;
+    unsigned downsample = 1;
+    std::vector<GpuTextureFill> fills;
+};
+
+XrayBlur::XrayBlur(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+XrayBlur::~XrayBlur() = default;
+XrayBlur::XrayBlur(XrayBlur&&) noexcept = default;
+XrayBlur& XrayBlur::operator=(XrayBlur&&) noexcept = default;
+const GpuTexture& XrayBlur::texture() const noexcept { return impl_->target.texture(); }
+int XrayBlur::output_width() const noexcept { return impl_->output_width; }
+int XrayBlur::output_height() const noexcept { return impl_->output_height; }
+unsigned XrayBlur::downsample() const noexcept { return impl_->downsample; }
+
 ScanoutTarget::ScanoutTarget(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 ScanoutTarget::~ScanoutTarget() = default;
 ScanoutTarget::ScanoutTarget(ScanoutTarget&&) noexcept = default;
@@ -2053,6 +2116,45 @@ Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color backgroun
                          /*scanout=*/false};
     return render_pass_to(t, background, rects, textures, damage,
                           OutputMapping{Transform::normal, scale}, sync);
+}
+
+Result<XrayBlur> VulkanRenderer::create_xray_blur(int width, int height, unsigned downsample) {
+    if (width <= 0 || height <= 0) {
+        return fail("invalid x-ray blur dimensions");
+    }
+    const unsigned factor = std::clamp(downsample, 1u, 8u);
+    const int reduced_width = (width + static_cast<int>(factor) - 1) / static_cast<int>(factor);
+    const int reduced_height =
+        (height + static_cast<int>(factor) - 1) / static_cast<int>(factor);
+    auto target = create_offscreen(reduced_width, reduced_height);
+    if (!target) {
+        return fail(target.error().message);
+    }
+    return XrayBlur{std::make_unique<XrayBlur::Impl>(
+        XrayBlur::Impl{std::move(*target), width, height, factor, {}})};
+}
+
+Status VulkanRenderer::update_xray_blur(XrayBlur& blur, Color background,
+                                        std::span<const GpuTextureFill> textures) {
+    XrayBlur::Impl& impl = *blur.impl_;
+    const float factor = static_cast<float>(impl.downsample);
+    impl.fills.clear();
+    impl.fills.reserve(textures.size());
+    for (const GpuTextureFill& source : textures) {
+        if (source.texture == nullptr || source.w <= 0.0f || source.h <= 0.0f) {
+            continue;
+        }
+        GpuTextureFill reduced = source;
+        reduced.x /= factor;
+        reduced.y /= factor;
+        reduced.w /= factor;
+        reduced.h /= factor;
+        // Opaque coordinates would need the same float transformation; leaving
+        // them empty only costs static-backdrop overdraw and cannot hide a layer.
+        reduced.opaque = {};
+        impl.fills.push_back(reduced);
+    }
+    return render_offscreen(impl.target, background, {}, impl.fills);
 }
 
 Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,

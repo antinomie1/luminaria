@@ -34,6 +34,9 @@
   一个纹理摆位画到输出；`PlacementTransform` 可链式裁剪、缩放、位移、淡入淡出该结果，也可直接用于
   客户端表面树或 compositor-owned texture（树的 hit-test 自动反变换；树的 alpha 则应走离屏组），而
   该 prepass 的 acquire/release fence 与整窗 damage 自动接回 `submit()`。
+  透明客户端的 x-ray blur 也走这条纹理路径：每输出一个 `XrayBlur` 把静态底图缩小缓存，更新后
+  `place_xray_blur()` 依据 `Surface::blur_region()` 在普通 surface 前插入对应的无输入纹理摆位；这些摆位
+  和窗口一样由 list diff 计 damage，静态缓存本身变更则由 compositor `damage_all()`。
   **窗口开、关、移动、缩放、换层次的 damage 由 `submit()` 对比出来**：它把这一帧的摆位串
   与上一次真正上屏的那一串逐位比较（位置也算身份的一部分，因为串是有 z 序的），差异处的
   旧矩形与新矩形各记一笔。没有客户端会为「它被放到别处了」报 damage，而这件事完整地写在

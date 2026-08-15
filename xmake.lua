@@ -271,6 +271,7 @@ local gpu_tests = {
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
     test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
     test_frame_animation = true,
+    test_xray_blur = true,
     test_frame_damage = true, test_offscreen = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,
     test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,

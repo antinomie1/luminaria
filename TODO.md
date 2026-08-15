@@ -116,10 +116,12 @@ bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布
   `Surface::blur_region()` 是粘性双缓冲状态，`test_background_effect` 守住 set / NULL / object destroy
   三种提交语义。混成器拿到 region 决定画不画，库不猜窗口形状
   （niri 的手动配置那条路对复杂表面形状效果不好，正是"猜"的代价）。
-  实现先只做 **x-ray**：把静态背景（壁纸 + layer surface）模糊一次缓存起来，窗口采样它。
-  这条不需要读回已合成内容，对现有单 render pass 结构冲击最小；真正采样下层窗口的非 x-ray
-  再补。无论哪档，模糊半径都会让 damage 扩散——协议本身就要求把模糊采样区纳入重绘裁剪，
-  这也是 (a) 必须先落地的原因。
+  **x-ray 路径已完成（2026-08-16）**：`VulkanRenderer::create_xray_blur()` 建一张按 2–8 倍
+  降采样的静态背景缓存，`update_xray_blur()` 重画壁纸 + layer texture；现有线性采样把它放回原尺寸，
+  以低成本得到柔和的背景。`Frame::place_xray_blur()` 在普通 `place(surface, x, y)` 前把缓存精确贴到
+  `blur_region()`，因此 blur rect 自身也进入摆位 diff/damage。静态层变了以后调用者重建缓存并照常
+  `damage_all()`；它不读回已合成内容。真正采样下层窗口的非 x-ray 再补。`test_xray_blur` 守住缓存
+  确实软化硬边；无论哪档，模糊半径都会让动态底图的 damage 扩散，这也是 (a) 必须先落地的原因。
 
 动画时钟与持续重绘已完成（2026-08-15）：`FrameEvent` 带 CLOCK_MONOTONIC 的
 `predicted_presentation_ns` 和估算 `refresh_ns`；DRM 用上一 vblank 锚定，嵌套/无头后端用自己的

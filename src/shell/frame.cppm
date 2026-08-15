@@ -237,6 +237,17 @@ public:
     /// move / opacity transform. Invalid or empty transforms draw nothing.
     void place(const GpuTexture& texture, const PlacementTransform& transform);
 
+    /// Draw the x-ray blur cache only under the blur regions a surface tree
+    /// declared through ext-background-effect-v1. Call immediately before the
+    /// ordinary `place(surface, x, y)`: these texture placements are part of
+    /// the same diff/damage ledger but intentionally have no input target.
+    ///
+    /// `background` is the cache's full logical output rectangle. This first
+    /// x-ray path is for untransformed surface trees; use an offscreen group
+    /// when an animated tree needs both blur and a transform.
+    void place_xray_blur(const GpuTexture& texture, const Box& background,
+                         Surface& surface, int x, int y);
+
     /// Mark the start of a window-sized group. Add the window's surface tree,
     /// its popups, and any other visual members with `place()`, then hand the
     /// marker to `compose_group()`. The original placements remain hit-testable
@@ -928,6 +939,47 @@ void Frame::place(const GpuTexture& texture, const PlacementTransform& transform
     p.alpha = transform.alpha_;
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
+}
+
+void Frame::place_xray_blur(const GpuTexture& texture, const Box& background,
+                            Surface& surface, int x, int y) {
+    Impl& impl = *impl_;
+    if (background.empty()) {
+        return;
+    }
+    impl.tree.clear();
+    surface.surface_tree(impl.tree);
+    for (const SurfaceAt& at : impl.tree) {
+        const Surface& child = *at.surface;
+        const int origin_x = x + at.x;
+        const int origin_y = y + at.y;
+        const Box child_box{origin_x, origin_y, child.surface_width(), child.surface_height()};
+        for (const Box& local : child.blur_region().rects()) {
+            const Box visible = Box{origin_x + local.x, origin_y + local.y, local.width, local.height}
+                                    .intersection(child_box)
+                                    .intersection(impl.view)
+                                    .intersection(background);
+            if (visible.empty()) {
+                continue;
+            }
+            Placement p{};
+            p.texture = &texture;
+            p.x = static_cast<float>(visible.x);
+            p.y = static_cast<float>(visible.y);
+            p.width = static_cast<float>(visible.width);
+            p.height = static_cast<float>(visible.height);
+            p.u0 = static_cast<float>(visible.x - background.x) /
+                   static_cast<float>(background.width);
+            p.v0 = static_cast<float>(visible.y - background.y) /
+                   static_cast<float>(background.height);
+            p.u1 = static_cast<float>(visible.x + visible.width - background.x) /
+                   static_cast<float>(background.width);
+            p.v1 = static_cast<float>(visible.y + visible.height - background.y) /
+                   static_cast<float>(background.height);
+            p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
+            impl.placements.push_back(p);
+        }
+    }
 }
 
 PlacementGroup Frame::begin_group() const noexcept {

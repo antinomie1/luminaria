@@ -37,6 +37,7 @@
 | 协议 | `wp_commit_timing_v1` — 另一半节拍：直接指定这次 commit 最早何时生效（CLOCK_MONOTONIC）。同一个闸门，多一个时间条件；到点的唤醒由这个 global 自带的 EventLoop 定时器发起（按最近的截止时间重整），compositor 除了创建 global 什么都不用做 | commit-timing |
 | 协议 | `wp_content_type_v1` — 客户端一句「我在放视频 / 我是游戏」。compositor 自己推不出来的东西：据此选刷新率、决定要不要直出、要不要别息屏。粘性双缓冲状态，读 `Surface::content_type()` | content-type |
 | 协议 | `ext_background_effect_v1` — 客户端精确声明 surface-local 的背景模糊区；`BackgroundEffectManager` 发布 blur capability，状态在 `Surface::blur_region()`，随 commit 生效。它是视觉策略的输入，不把某一种模糊算法硬编码进协议层 | background-effect |
+| GPU / shell | x-ray blur：`create_xray_blur()` 将壁纸和静态 layer texture 缓存在 2–8 倍缩小的离屏图，`update_xray_blur()` 更新它；`Frame::place_xray_blur()` 随后按客户端 `blur_region()` 在窗口前贴回缓存。它不采样下层窗口，静态层变更后由 compositor 更新缓存并 `damage_all()` | xray-blur |
 | 协议 | `wp_cursor_shape_v1` (v2) — 客户端说要哪种光标（`text` / `ns-resize` / …）而非自带位图；36 种 shape 全部映射到 XDG 光标名，交给 compositor 画 | cursor-shape |
 | `luminaria.desktop` 协议 | `ext_workspace_v1` — 工作区列表 / 切换（面板、pager）。服务端拥有工作区集合，客户端只能请求；group ↔ output 关联、state（active/urgent/hidden）、请求经 `commit` 批量下发 | workspace |
 | 协议 | `zwlr_layer_shell_v1` (v5) — 桌面自己的表面：面板 / 状态栏 / 壁纸 / 通知 / 锁屏层。四个 layer 各有 z 序，锚定到输出边缘；exclusive zone 从可用区里切出一条谁也不许盖的带子。layer / anchor / size / margin / exclusive zone 全是双缓冲状态，随 `wl_surface.commit` 生效并发 `state_change`；映射流程与 xdg-shell 同规矩（先无 buffer 提交、configure、再贴 buffer）。`arrange_layer_surface()` 一次算完摆放 + 收缩可用区 + 下发 configure —— 这段锚点算术每个 compositor 都得写一遍，写错就是面板互相压 | layer-shell |
