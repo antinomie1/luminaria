@@ -326,7 +326,7 @@ int main() {
         if (!ptr_inside) {
             return false;
         }
-        if (luminaria::Surface* c = seat.cursor_surface(); c != nullptr) {
+        if (luminaria::Surface* c = luminaria::surface_from_id(seat.cursor_surface()); c != nullptr) {
             int w = 0, h = 0;
             if (!c->current_buffer_rgba(out.rgba, w, h)) {
                 return false;
@@ -396,7 +396,8 @@ int main() {
         if (!ptr_inside) {
             return;
         }
-        if (luminaria::Surface* cursor = seat.cursor_surface(); cursor != nullptr) {
+        if (luminaria::Surface* cursor = luminaria::surface_from_id(seat.cursor_surface());
+            cursor != nullptr) {
             frame.place(*cursor, ptr_x - seat.cursor_hotspot_x(),
                         ptr_y - seat.cursor_hotspot_y());
         } else if (ensure_cursor_texture()) {

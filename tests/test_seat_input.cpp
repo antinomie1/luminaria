@@ -177,13 +177,14 @@ int main() {
     int surfaces = 0;
 
     auto cc = seat->cursor_changed().connect([&](luminaria::SeatCursorChange& e) {
-        if (e.surface == nullptr) {
+        luminaria::Surface* cursor = luminaria::surface_from_id(e.surface);
+        if (cursor == nullptr) {
             return; // the "cursor is gone" notification at teardown
         }
         cursor_set = true;
         cursor_hotspot_x = e.hotspot_x;
         cursor_hotspot_y = e.hotspot_y;
-        cursor_surface_is_first = e.surface == first_surface;
+        cursor_surface_is_first = cursor == first_surface;
     });
 
     std::vector<luminaria::Signal<luminaria::SurfaceCommit>::Connection> conns;
@@ -233,5 +234,10 @@ int main() {
     assert(cursor_set);
     assert(cursor_surface_is_first);
     assert(cursor_hotspot_x == kHotspotX && cursor_hotspot_y == kHotspotY);
+    // Client teardown invalidates every retained identity in the seat. None of
+    // these may resolve to a future surface that reuses the registry slot.
+    assert(!seat->keyboard_focus().valid());
+    assert(!seat->pointer_focus().valid());
+    assert(!seat->cursor_surface().valid());
     return 0;
 }

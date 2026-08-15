@@ -65,10 +65,16 @@ struct SurfaceCommit {
     Surface& surface;
 };
 
-/// Fired just before a Surface is destroyed. Anything holding a `Surface*`
-/// (seat focus, scene nodes, window lists) must drop it here.
+/// Fired just before a Surface is destroyed. Use for surface-local teardown;
+/// long-lived references should retain SurfaceId and resolve it on each use.
 struct SurfaceDestroy {
     Surface& surface;
+};
+
+/// Emitted after a SurfaceId has stopped resolving. Long-lived components may
+/// listen once for behavioural cleanup; memory safety does not depend on it.
+struct SurfaceInvalidated {
+    SurfaceId surface;
 };
 
 /// "The GPU work that samples this surface's buffer has been submitted."
@@ -102,7 +108,8 @@ public:
     /// For a subsurface in effective sync mode this is deferred to the commit
     /// of its parent, as the protocol requires.
     Signal<SurfaceCommit> commit;
-    /// Fires just before this Surface goes away. Drop every pointer to it here.
+    /// Fires just before this Surface goes away. This is for surface-local
+    /// teardown; retain id() rather than this object's address across dispatch.
     Signal<SurfaceDestroy> destroy;
     /// Fires when the compositor has submitted the render that reads this
     /// surface (see SurfaceRendered).
@@ -402,6 +409,9 @@ private:
 /// Resolve a generational id, or null once that exact Surface has gone away.
 [[nodiscard]] Surface* surface_from_id(SurfaceId id) noexcept;
 
+/// Process-wide invalidation stream for generational surface identities.
+[[nodiscard]] Signal<SurfaceInvalidated>& surface_invalidated() noexcept;
+
 /// The Region behind a `wl_region` resource (null in, null out). Protocols that
 /// take a wl_region of their own — pointer-constraints' confinement area — read
 /// it through this rather than re-implementing wl_region.
@@ -509,6 +519,11 @@ Surface* surface_from_id(SurfaceId id) noexcept {
     }
     const SurfaceSlot& slot = registry.slots[id.index];
     return slot.generation == id.generation ? slot.surface : nullptr;
+}
+
+Signal<SurfaceInvalidated>& surface_invalidated() noexcept {
+    static Signal<SurfaceInvalidated> signal;
+    return signal;
 }
 
 struct Compositor::Impl {
@@ -915,7 +930,10 @@ Surface::~Surface() {
         std::erase(parent_->above_, this);
         parent_ = nullptr;
     }
-    unregister_surface(id_);
+    const SurfaceId dead = id_;
+    unregister_surface(dead);
+    SurfaceInvalidated invalidated{dead};
+    surface_invalidated().emit(invalidated);
 }
 
 bool Surface::effective_sync() const noexcept {

@@ -591,7 +591,7 @@ Result<TextInputManager> TextInputManager::create(Display& display, Seat& seat) 
     }
     Impl* raw = impl.get();
     impl->focus_conn = seat.keyboard_focus_changed().connect(
-        [raw](SeatKeyboardFocus& e) { raw->set_focus(e.surface); });
+        [raw](SeatKeyboardFocus& e) { raw->set_focus(surface_from_id(e.surface)); });
     return TextInputManager{std::move(impl)};
 }
 

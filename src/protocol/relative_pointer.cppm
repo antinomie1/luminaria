@@ -164,7 +164,7 @@ Result<RelativePointerManager> RelativePointerManager::create(Display& display, 
 
 void RelativePointerManager::send_motion(std::uint64_t time_us, double dx, double dy,
                                          double dx_unaccel, double dy_unaccel) {
-    Surface* focus = impl_->seat->pointer_focus();
+    Surface* focus = surface_from_id(impl_->seat->pointer_focus());
     if (focus == nullptr || impl_->relative_pointers.empty()) {
         return;
     }

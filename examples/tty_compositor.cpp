@@ -461,7 +461,7 @@ int main(int argc, char** argv) {
     // A surface that dies while the pointer is over it must not stay cached.
     auto pointer_focus_conn =
         seat->pointer_focus_changed().connect([&](luminaria::SeatPointerFocus& e) {
-            if (e.surface == nullptr) {
+            if (!e.surface.valid()) {
                 pointer_focus = nullptr;
             }
         });

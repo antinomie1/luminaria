@@ -233,7 +233,7 @@ public:
             return;
         }
         // The security rule, enforced here so no compositor can forget it.
-        if (mgr_->seat->pointer_focus() != surface_) {
+        if (mgr_->seat->pointer_focus() != surface_->id()) {
             return;
         }
         if (mgr_->active != nullptr && mgr_->active != this) {
@@ -481,7 +481,7 @@ Result<PointerConstraints> PointerConstraints::create(Display& display, Seat& se
     // somewhere else.
     Impl* raw = impl.get();
     impl->focus_conn = seat.pointer_focus_changed().connect([raw](SeatPointerFocus& e) {
-        if (raw->active != nullptr && raw->active->surface_ != e.surface) {
+        if (raw->active != nullptr && raw->active->surface_->id() != e.surface) {
             raw->active->deactivate();
         }
     });

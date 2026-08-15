@@ -6,9 +6,9 @@
 // hit-testing) and calls the notify_*/pointer_* methods; the seat handles the
 // wire events.
 //
-// Focus pointers are kept safe: the seat listens for Surface destruction and
-// clears the focus itself, so a client destroying a focused surface can never
-// leave a dangling pointer here.
+// Retained focus and cursor state is represented by SurfaceId. Every event
+// resolves the id immediately before touching the surface, so client teardown
+// cannot leave a dangling pointer in the input path.
 
 module;
 
@@ -40,19 +40,17 @@ export namespace luminaria {
 class Display;
 class Surface;
 
-/// Keyboard focus moved (surface may be null).
+/// Keyboard focus moved (an invalid id means no surface).
 struct SeatKeyboardFocus {
-    Surface* surface;
+    SurfaceId surface;
 };
-/// Pointer focus moved (surface may be null).
+/// Pointer focus moved (an invalid id means no surface).
 struct SeatPointerFocus {
-    Surface* surface;
+    SurfaceId surface;
 };
-/// The pointer-focused client set its cursor image. `surface` is null when the
-/// client asked to hide the cursor. The compositor composites it at the pointer
-/// position minus the hotspot.
+/// The pointer-focused client set its cursor image. An invalid id hides it.
 struct SeatCursorChange {
-    Surface* surface;
+    SurfaceId surface;
     int hotspot_x;
     int hotspot_y;
 };
@@ -61,8 +59,8 @@ struct SeatCursorChange {
 /// seat. While a drag is active the seat sends no wl_pointer events to clients;
 /// it drives these instead, as the protocol requires.
 struct SeatDragHooks {
-    /// Pointer moved onto `surface` (null = left every surface).
-    std::function<void(Surface* surface, double sx, double sy)> focus;
+    /// Pointer moved onto `surface` (invalid = left every surface).
+    std::function<void(SurfaceId surface, double sx, double sy)> focus;
     std::function<void(double sx, double sy)> motion;
     /// Button released — the drop happens (or is cancelled) here.
     std::function<void()> drop;
@@ -98,7 +96,7 @@ public:
     // --- keyboard ---
     /// Give keyboard focus to `surface` (nullptr clears focus). Sends leave/enter.
     void set_keyboard_focus(Surface* surface);
-    [[nodiscard]] Surface* keyboard_focus() const noexcept;
+    [[nodiscard]] SurfaceId keyboard_focus() const noexcept;
     /// Send a key event to the keyboard-focused client. `pressed` = down.
     void notify_key(uint32_t key, bool pressed);
     /// Send the current modifier state (Shift/Ctrl/…) to the keyboard-focused client.
@@ -110,7 +108,7 @@ public:
     void pointer_enter(Surface& surface, double sx, double sy);
     /// Drop pointer focus entirely (cursor left every surface): sends leave.
     void pointer_clear_focus();
-    [[nodiscard]] Surface* pointer_focus() const noexcept;
+    [[nodiscard]] SurfaceId pointer_focus() const noexcept;
     /// Send motion to the pointer-focused client.
     void pointer_motion(double sx, double sy);
     /// Send a button event to the pointer-focused client. `pressed` = down.
@@ -125,8 +123,8 @@ public:
 
     /// Fires when the focused client sets (or hides) its cursor image.
     [[nodiscard]] Signal<SeatCursorChange>& cursor_changed() noexcept;
-    /// Current client cursor surface (null = hidden or never set).
-    [[nodiscard]] Surface* cursor_surface() const noexcept;
+    /// Current client cursor surface (invalid = hidden or never set).
+    [[nodiscard]] SurfaceId cursor_surface() const noexcept;
     [[nodiscard]] int cursor_hotspot_x() const noexcept;
     [[nodiscard]] int cursor_hotspot_y() const noexcept;
     [[nodiscard]] Signal<SeatPointerFocus>& pointer_focus_changed() noexcept;
@@ -170,17 +168,11 @@ struct Seat::Impl {
     std::vector<wl_resource*> touches;
     uint32_t capabilities = WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER;
 
-    Surface* kb_focus = nullptr;
-    Surface* ptr_focus = nullptr;
-    Surface* touch_focus = nullptr;
-    // Focus pointers are raw, so we hold a destroy subscription for each and
-    // clear the focus from it. This is what keeps them from dangling.
-    Signal<SurfaceDestroy>::Connection kb_focus_gone;
-    Signal<SurfaceDestroy>::Connection ptr_focus_gone;
-    Signal<SurfaceDestroy>::Connection touch_focus_gone;
-
-    Surface* cursor = nullptr;
-    Signal<SurfaceDestroy>::Connection cursor_gone;
+    SurfaceId kb_focus;
+    SurfaceId ptr_focus;
+    SurfaceId touch_focus;
+    SurfaceId cursor;
+    Signal<SurfaceInvalidated>::Connection invalidated;
     int cursor_hotspot_x = 0;
     int cursor_hotspot_y = 0;
 
@@ -208,8 +200,8 @@ uint32_t now_ms() {
     return static_cast<uint32_t>(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
-wl_client* client_of(Surface* surface) {
-    return wl_resource_get_client(surface->c_resource());
+wl_client* client_of(Surface& surface) {
+    return wl_resource_get_client(surface.c_resource());
 }
 
 void send_keymap(Seat::Impl* seat, wl_resource* keyboard) {
@@ -247,24 +239,17 @@ void pointer_set_cursor(wl_client* client, wl_resource* resource, uint32_t /*ser
                         wl_resource* surface_resource, int32_t hotspot_x, int32_t hotspot_y) {
     auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource));
     // Only the client that currently holds pointer focus may set the cursor.
-    if (seat->ptr_focus == nullptr || client_of(seat->ptr_focus) != client) {
+    Surface* focus = surface_from_id(seat->ptr_focus);
+    if (focus == nullptr || client_of(*focus) != client) {
         return;
     }
     auto* surface = surface_resource != nullptr
                         ? static_cast<Surface*>(wl_resource_get_user_data(surface_resource))
                         : nullptr;
-    seat->cursor = surface;
+    seat->cursor = surface != nullptr ? surface->id() : SurfaceId{};
     seat->cursor_hotspot_x = hotspot_x;
     seat->cursor_hotspot_y = hotspot_y;
-    seat->cursor_gone.disconnect();
-    if (surface != nullptr) {
-        seat->cursor_gone = surface->destroy.connect([seat](SurfaceDestroy&) {
-            seat->cursor = nullptr;
-            SeatCursorChange gone{nullptr, 0, 0};
-            seat->cursor_changed.emit(gone);
-        });
-    }
-    SeatCursorChange event{surface, hotspot_x, hotspot_y};
+    SeatCursorChange event{seat->cursor, hotspot_x, hotspot_y};
     seat->cursor_changed.emit(event);
 }
 constexpr struct wl_pointer_interface pointer_impl = {.set_cursor = pointer_set_cursor,
@@ -389,6 +374,35 @@ Result<Seat> Seat::create(Display& display, std::string name) {
     if (impl->global == nullptr) {
         return fail("wl_global_create(wl_seat) failed");
     }
+    Impl* raw = impl.get();
+    impl->invalidated = surface_invalidated().connect([raw](SurfaceInvalidated& event) {
+        if (raw->kb_focus == event.surface) {
+            raw->kb_focus = {};
+            SeatKeyboardFocus changed{};
+            raw->keyboard_focus_changed.emit(changed);
+        }
+
+        const bool pointer_lost = raw->ptr_focus == event.surface;
+        if (pointer_lost) {
+            raw->ptr_focus = {};
+            if (!raw->dragging) {
+                SeatPointerFocus changed{};
+                raw->pointer_focus_changed.emit(changed);
+            }
+        }
+
+        if (raw->touch_focus == event.surface) {
+            raw->touch_focus = {};
+        }
+
+        if (raw->cursor == event.surface || (pointer_lost && raw->cursor.valid())) {
+            raw->cursor = {};
+            raw->cursor_hotspot_x = 0;
+            raw->cursor_hotspot_y = 0;
+            SeatCursorChange changed{};
+            raw->cursor_changed.emit(changed);
+        }
+    });
     return Seat{std::move(impl)};
 }
 
@@ -445,11 +459,12 @@ void Seat::set_capabilities(bool keyboard, bool pointer, bool touch) {
 // --- keyboard ---
 
 void Seat::set_keyboard_focus(Surface* surface) {
-    if (impl_->kb_focus == surface) {
+    const SurfaceId next = surface != nullptr ? surface->id() : SurfaceId{};
+    if (impl_->kb_focus == next) {
         return;
     }
-    if (impl_->kb_focus != nullptr) {
-        wl_resource* old = impl_->kb_focus->c_resource();
+    if (Surface* previous = surface_from_id(impl_->kb_focus); previous != nullptr) {
+        wl_resource* old = previous->c_resource();
         wl_client* old_client = wl_resource_get_client(old);
         const uint32_t serial = impl_->next_serial();
         for (wl_resource* kb : impl_->keyboards) {
@@ -458,18 +473,8 @@ void Seat::set_keyboard_focus(Surface* surface) {
             }
         }
     }
-    impl_->kb_focus = surface;
-    impl_->kb_focus_gone.disconnect();
+    impl_->kb_focus = next;
     if (surface != nullptr) {
-        Impl* impl = impl_.get();
-        impl_->kb_focus_gone = surface->destroy.connect([impl](SurfaceDestroy&) {
-            // The focused surface is going away; drop the pointer without
-            // sending leave (the resource is already being torn down).
-            impl->kb_focus = nullptr;
-            impl->kb_focus_gone.disconnect();
-            SeatKeyboardFocus event{nullptr};
-            impl->keyboard_focus_changed.emit(event);
-        });
         wl_resource* res = surface->c_resource();
         wl_client* client = wl_resource_get_client(res);
         wl_array keys;
@@ -483,11 +488,11 @@ void Seat::set_keyboard_focus(Surface* surface) {
         }
         wl_array_release(&keys);
     }
-    SeatKeyboardFocus event{surface};
+    SeatKeyboardFocus event{next};
     impl_->keyboard_focus_changed.emit(event);
 }
 
-Surface* Seat::keyboard_focus() const noexcept {
+SurfaceId Seat::keyboard_focus() const noexcept {
     return impl_->kb_focus;
 }
 
@@ -496,10 +501,11 @@ Signal<SeatKeyboardFocus>& Seat::keyboard_focus_changed() noexcept {
 }
 
 void Seat::notify_key(uint32_t key, bool pressed) {
-    if (impl_->kb_focus == nullptr) {
+    Surface* focus = surface_from_id(impl_->kb_focus);
+    if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(impl_->kb_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t serial = impl_->next_serial();
     const uint32_t state =
         pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED;
@@ -511,10 +517,11 @@ void Seat::notify_key(uint32_t key, bool pressed) {
 }
 
 void Seat::notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
-    if (impl_->kb_focus == nullptr) {
+    Surface* focus = surface_from_id(impl_->kb_focus);
+    if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(impl_->kb_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t serial = impl_->next_serial();
     for (wl_resource* kb : impl_->keyboards) {
         if (wl_resource_get_client(kb) == client) {
@@ -526,44 +533,26 @@ void Seat::notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locke
 // --- pointer ---
 
 void Seat::pointer_enter(Surface& surface, double sx, double sy) {
+    const SurfaceId target = surface.id();
     if (impl_->dragging) {
         // During a drag the pointer belongs to the drag: no wl_pointer events.
-        if (impl_->ptr_focus != &surface) {
-            impl_->ptr_focus = &surface;
-            Impl* impl = impl_.get();
-            impl_->ptr_focus_gone = surface.destroy.connect([impl](SurfaceDestroy&) {
-                impl->ptr_focus = nullptr;
-                impl->ptr_focus_gone.disconnect();
-            });
+        if (impl_->ptr_focus != target) {
+            impl_->ptr_focus = target;
             if (impl_->drag.focus) {
-                impl_->drag.focus(&surface, sx, sy);
+                impl_->drag.focus(target, sx, sy);
             }
         } else if (impl_->drag.motion) {
             impl_->drag.motion(sx, sy);
         }
         return;
     }
-    if (impl_->ptr_focus == &surface) {
+    if (impl_->ptr_focus == target) {
         pointer_motion(sx, sy);
         return;
     }
     pointer_clear_focus();
 
-    impl_->ptr_focus = &surface;
-    Impl* impl = impl_.get();
-    impl_->ptr_focus_gone = surface.destroy.connect([impl](SurfaceDestroy&) {
-        impl->ptr_focus = nullptr;
-        impl->ptr_focus_gone.disconnect();
-        // A cursor set by that client is meaningless now.
-        if (impl->cursor != nullptr) {
-            impl->cursor = nullptr;
-            impl->cursor_gone.disconnect();
-            SeatCursorChange gone{nullptr, 0, 0};
-            impl->cursor_changed.emit(gone);
-        }
-        SeatPointerFocus event{nullptr};
-        impl->pointer_focus_changed.emit(event);
-    });
+    impl_->ptr_focus = target;
 
     wl_resource* res = surface.c_resource();
     wl_client* client = wl_resource_get_client(res);
@@ -575,45 +564,44 @@ void Seat::pointer_enter(Surface& surface, double sx, double sy) {
             pointer_frame_if_supported(p);
         }
     }
-    SeatPointerFocus event{&surface};
+    SeatPointerFocus event{target};
     impl_->pointer_focus_changed.emit(event);
 }
 
 void Seat::pointer_clear_focus() {
-    if (impl_->ptr_focus == nullptr) {
+    if (!impl_->ptr_focus.valid()) {
         return;
     }
     if (impl_->dragging) {
-        impl_->ptr_focus = nullptr;
-        impl_->ptr_focus_gone.disconnect();
+        impl_->ptr_focus = {};
         if (impl_->drag.focus) {
-            impl_->drag.focus(nullptr, 0, 0);
+            impl_->drag.focus({}, 0, 0);
         }
         return;
     }
-    wl_resource* res = impl_->ptr_focus->c_resource();
-    wl_client* client = wl_resource_get_client(res);
-    const uint32_t serial = impl_->next_serial();
-    for (wl_resource* p : impl_->pointers) {
-        if (wl_resource_get_client(p) == client) {
-            wl_pointer_send_leave(p, serial, res);
-            pointer_frame_if_supported(p);
+    if (Surface* focus = surface_from_id(impl_->ptr_focus); focus != nullptr) {
+        wl_resource* res = focus->c_resource();
+        wl_client* client = wl_resource_get_client(res);
+        const uint32_t serial = impl_->next_serial();
+        for (wl_resource* p : impl_->pointers) {
+            if (wl_resource_get_client(p) == client) {
+                wl_pointer_send_leave(p, serial, res);
+                pointer_frame_if_supported(p);
+            }
         }
     }
-    impl_->ptr_focus = nullptr;
-    impl_->ptr_focus_gone.disconnect();
+    impl_->ptr_focus = {};
     // The cursor image belonged to that client.
-    if (impl_->cursor != nullptr) {
-        impl_->cursor = nullptr;
-        impl_->cursor_gone.disconnect();
-        SeatCursorChange gone{nullptr, 0, 0};
+    if (impl_->cursor.valid()) {
+        impl_->cursor = {};
+        SeatCursorChange gone{};
         impl_->cursor_changed.emit(gone);
     }
-    SeatPointerFocus event{nullptr};
+    SeatPointerFocus event{};
     impl_->pointer_focus_changed.emit(event);
 }
 
-Surface* Seat::pointer_focus() const noexcept {
+SurfaceId Seat::pointer_focus() const noexcept {
     return impl_->ptr_focus;
 }
 
@@ -622,7 +610,8 @@ Signal<SeatPointerFocus>& Seat::pointer_focus_changed() noexcept {
 }
 
 void Seat::pointer_motion(double sx, double sy) {
-    if (impl_->ptr_focus == nullptr) {
+    Surface* focus = surface_from_id(impl_->ptr_focus);
+    if (focus == nullptr) {
         return;
     }
     if (impl_->dragging) {
@@ -631,7 +620,7 @@ void Seat::pointer_motion(double sx, double sy) {
         }
         return;
     }
-    wl_client* client = client_of(impl_->ptr_focus);
+    wl_client* client = client_of(*focus);
     for (wl_resource* p : impl_->pointers) {
         if (wl_resource_get_client(p) == client) {
             wl_pointer_send_motion(p, now_ms(), wl_fixed_from_double(sx),
@@ -648,10 +637,11 @@ void Seat::pointer_button(uint32_t button, bool pressed) {
         }
         return;
     }
-    if (impl_->ptr_focus == nullptr) {
+    Surface* focus = surface_from_id(impl_->ptr_focus);
+    if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(impl_->ptr_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t serial = impl_->next_serial();
     const uint32_t state =
         pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
@@ -664,10 +654,11 @@ void Seat::pointer_button(uint32_t button, bool pressed) {
 }
 
 void Seat::pointer_axis(double dx, double dy) {
-    if (impl_->ptr_focus == nullptr || impl_->dragging || (dx == 0.0 && dy == 0.0)) {
+    Surface* focus = surface_from_id(impl_->ptr_focus);
+    if (focus == nullptr || impl_->dragging || (dx == 0.0 && dy == 0.0)) {
         return;
     }
-    wl_client* client = client_of(impl_->ptr_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t time = now_ms();
     for (wl_resource* p : impl_->pointers) {
         if (wl_resource_get_client(p) != client) {
@@ -689,13 +680,13 @@ void Seat::pointer_axis(double dx, double dy) {
 }
 
 void Seat::pointer_axis_discrete(int32_t dx_steps, int32_t dy_steps) {
-    if (impl_->ptr_focus == nullptr || impl_->dragging ||
-        (dx_steps == 0 && dy_steps == 0)) {
+    Surface* focus = surface_from_id(impl_->ptr_focus);
+    if (focus == nullptr || impl_->dragging || (dx_steps == 0 && dy_steps == 0)) {
         return;
     }
     // One wheel notch is 10 surface units by convention (what GTK/Qt expect).
     constexpr double kStep = 10.0;
-    wl_client* client = client_of(impl_->ptr_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t time = now_ms();
     for (wl_resource* p : impl_->pointers) {
         if (wl_resource_get_client(p) != client) {
@@ -724,10 +715,11 @@ void Seat::pointer_axis_discrete(int32_t dx_steps, int32_t dy_steps) {
 }
 
 void Seat::pointer_axis_stop(bool horizontal, bool vertical) {
-    if (impl_->ptr_focus == nullptr || impl_->dragging || (!horizontal && !vertical)) {
+    Surface* focus = surface_from_id(impl_->ptr_focus);
+    if (focus == nullptr || impl_->dragging || (!horizontal && !vertical)) {
         return;
     }
-    wl_client* client = client_of(impl_->ptr_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t time = now_ms();
     for (wl_resource* p : impl_->pointers) {
         if (wl_resource_get_client(p) != client ||
@@ -747,7 +739,7 @@ void Seat::pointer_axis_stop(bool horizontal, bool vertical) {
 Signal<SeatCursorChange>& Seat::cursor_changed() noexcept {
     return impl_->cursor_changed;
 }
-Surface* Seat::cursor_surface() const noexcept {
+SurfaceId Seat::cursor_surface() const noexcept {
     return impl_->cursor;
 }
 int Seat::cursor_hotspot_x() const noexcept {
@@ -760,14 +752,7 @@ int Seat::cursor_hotspot_y() const noexcept {
 // --- touch ---
 
 void Seat::touch_down(Surface& surface, int32_t id, double x, double y) {
-    if (impl_->touch_focus != &surface) {
-        impl_->touch_focus = &surface;
-        Impl* impl = impl_.get();
-        impl_->touch_focus_gone = surface.destroy.connect([impl](SurfaceDestroy&) {
-            impl->touch_focus = nullptr;
-            impl->touch_focus_gone.disconnect();
-        });
-    }
+    impl_->touch_focus = surface.id();
     wl_resource* res = surface.c_resource();
     wl_client* client = wl_resource_get_client(res);
     const uint32_t serial = impl_->next_serial();
@@ -781,10 +766,11 @@ void Seat::touch_down(Surface& surface, int32_t id, double x, double y) {
 }
 
 void Seat::touch_motion(int32_t id, double x, double y) {
-    if (impl_->touch_focus == nullptr) {
+    Surface* focus = surface_from_id(impl_->touch_focus);
+    if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(impl_->touch_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t time = now_ms();
     for (wl_resource* t : impl_->touches) {
         if (wl_resource_get_client(t) == client) {
@@ -794,10 +780,11 @@ void Seat::touch_motion(int32_t id, double x, double y) {
 }
 
 void Seat::touch_up(int32_t id) {
-    if (impl_->touch_focus == nullptr) {
+    Surface* focus = surface_from_id(impl_->touch_focus);
+    if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(impl_->touch_focus);
+    wl_client* client = client_of(*focus);
     const uint32_t serial = impl_->next_serial();
     const uint32_t time = now_ms();
     for (wl_resource* t : impl_->touches) {
@@ -821,8 +808,7 @@ void Seat::touch_cancel() {
             wl_touch_send_cancel(t);
         }
     }
-    impl_->touch_focus = nullptr;
-    impl_->touch_focus_gone.disconnect();
+    impl_->touch_focus = {};
 }
 
 // --- drag and drop ---
@@ -830,17 +816,12 @@ void Seat::touch_cancel() {
 void Seat::begin_drag(SeatDragHooks hooks) {
     // The pointer leaves the client for the duration of the drag: from here on
     // it only sees wl_data_device events.
-    Surface* focus = impl_->ptr_focus;
+    const SurfaceId focus = impl_->ptr_focus;
     pointer_clear_focus();
     impl_->drag = std::move(hooks);
     impl_->dragging = true;
-    if (focus != nullptr && impl_->drag.focus) {
+    if (focus.valid() && impl_->drag.focus) {
         impl_->ptr_focus = focus;
-        Impl* impl = impl_.get();
-        impl_->ptr_focus_gone = focus->destroy.connect([impl](SurfaceDestroy&) {
-            impl->ptr_focus = nullptr;
-            impl->ptr_focus_gone.disconnect();
-        });
         impl_->drag.focus(focus, 0, 0);
     }
 }
@@ -852,11 +833,10 @@ void Seat::end_drag() {
     impl_->dragging = false;
     impl_->drag = SeatDragHooks{};
     // Hand the pointer back to whatever it is over.
-    Surface* focus = impl_->ptr_focus;
-    impl_->ptr_focus = nullptr;
-    impl_->ptr_focus_gone.disconnect();
-    if (focus != nullptr) {
-        pointer_enter(*focus, 0, 0);
+    const SurfaceId focus = impl_->ptr_focus;
+    impl_->ptr_focus = {};
+    if (Surface* surface = surface_from_id(focus); surface != nullptr) {
+        pointer_enter(*surface, 0, 0);
     }
 }
 

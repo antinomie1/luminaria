@@ -173,21 +173,12 @@ struct DataDeviceManager::Impl {
     Signal<SelectionChange> selection_changed;
     const std::vector<std::string> no_mimes;
 
-    // Drag state (all null when no drag is running).
+    // Drag state (invalid ids / null resources when no drag is running).
     Source* drag_source = nullptr;
-    // The drag image. Nothing reads it yet — a compositor that wants to draw it
-    // will — but it is a client's surface either way, so it is kept as a
-    // Surface* with a destroy subscription rather than as a raw wl_resource*
-    // that would quietly dangle the day someone does read it.
-    Surface* drag_icon = nullptr;
-    Signal<SurfaceDestroy>::Connection drag_icon_gone;
-    Surface* drag_focus = nullptr;     // surface under the cursor
+    SurfaceId drag_icon;
+    SurfaceId drag_focus;              // surface under the cursor
     wl_resource* drag_offer = nullptr; // offer handed to drag_focus's client
-    // drag_focus is a raw Surface* that outlives nothing on its own: a client
-    // may destroy the surface it is dragging over, mid-drag, and Seat's own
-    // destroy handler only clears Seat's copy. Everything downstream
-    // (drag_motion, drag_drop) dereferences this to find the target client.
-    Signal<SurfaceDestroy>::Connection drag_focus_gone;
+    Signal<SurfaceInvalidated>::Connection surface_invalidated_conn;
 
     ~Impl() {
         if (global != nullptr) {
@@ -354,7 +345,7 @@ void send_selection_to_client(DdMgr* mgr, wl_client* client) {
 }
 
 void broadcast_selection(DdMgr* mgr) {
-    Surface* focus = mgr->seat->keyboard_focus();
+    Surface* focus = surface_from_id(mgr->seat->keyboard_focus());
     if (focus == nullptr) {
         return; // nobody is focused; the next focus change will deliver it
     }
@@ -427,13 +418,15 @@ void source_resource_destroy(wl_resource* resource) {
 
 // ---- drag and drop ----
 void drag_send_leave(DdMgr* mgr) {
-    if (mgr->drag_focus == nullptr) {
+    if (!mgr->drag_focus.valid()) {
         return;
     }
-    wl_client* client = wl_resource_get_client(mgr->drag_focus->c_resource());
-    for (wl_resource* device : mgr->devices) {
-        if (wl_resource_get_client(device) == client) {
-            wl_data_device_send_leave(device);
+    if (Surface* focus = surface_from_id(mgr->drag_focus); focus != nullptr) {
+        wl_client* client = wl_resource_get_client(focus->c_resource());
+        for (wl_resource* device : mgr->devices) {
+            if (wl_resource_get_client(device) == client) {
+                wl_data_device_send_leave(device);
+            }
         }
     }
     if (mgr->drag_offer != nullptr) {
@@ -441,15 +434,15 @@ void drag_send_leave(DdMgr* mgr) {
         mgr->drag_offer = nullptr;
         wl_resource_destroy(offer);
     }
-    mgr->drag_focus = nullptr;
-    mgr->drag_focus_gone.disconnect();
+    mgr->drag_focus = {};
 }
 
-void drag_focus(DdMgr* mgr, Surface* surface, double sx, double sy) {
-    if (mgr->drag_focus == surface) {
+void drag_focus(DdMgr* mgr, SurfaceId surface_id, double sx, double sy) {
+    if (mgr->drag_focus == surface_id) {
         return;
     }
     drag_send_leave(mgr);
+    Surface* surface = surface_from_id(surface_id);
     if (surface == nullptr || mgr->drag_source == nullptr) {
         return;
     }
@@ -465,27 +458,15 @@ void drag_focus(DdMgr* mgr, Surface* surface, double sx, double sy) {
         wl_data_device_send_enter(device, serial, surface_resource, wl_fixed_from_double(sx),
                                   wl_fixed_from_double(sy), offer);
     }
-    mgr->drag_focus = surface;
-    mgr->drag_focus_gone = surface->destroy.connect([mgr](SurfaceDestroy&) {
-        // No leave is sent: the surface is already being torn down, exactly as
-        // Seat does for a focus that dies. The offer is a resource of that
-        // client and stays valid, but it refers to a drop target that no longer
-        // exists, so it goes too.
-        mgr->drag_focus = nullptr;
-        if (mgr->drag_offer != nullptr) {
-            wl_resource* offer = mgr->drag_offer;
-            mgr->drag_offer = nullptr;
-            wl_resource_destroy(offer);
-        }
-        mgr->drag_focus_gone.disconnect();
-    });
+    mgr->drag_focus = surface_id;
 }
 
 void drag_motion(DdMgr* mgr, double sx, double sy) {
-    if (mgr->drag_focus == nullptr) {
+    Surface* focus = surface_from_id(mgr->drag_focus);
+    if (focus == nullptr) {
         return;
     }
-    wl_client* client = wl_resource_get_client(mgr->drag_focus->c_resource());
+    wl_client* client = wl_resource_get_client(focus->c_resource());
     const uint32_t time = now_ms();
     for (wl_resource* device : mgr->devices) {
         if (wl_resource_get_client(device) == client) {
@@ -506,19 +487,19 @@ void end_drag(DdMgr* mgr, bool cancelled) {
         mgr->drag_source->is_drag = false;
         mgr->drag_source = nullptr;
     }
-    mgr->drag_icon = nullptr;
-    mgr->drag_icon_gone.disconnect();
-    mgr->drag_focus = nullptr;
+    mgr->drag_icon = {};
+    mgr->drag_focus = {};
     mgr->drag_offer = nullptr;
     mgr->seat->end_drag();
 }
 
 void drag_drop(DdMgr* mgr) {
-    if (mgr->drag_focus == nullptr || mgr->drag_source == nullptr) {
+    Surface* focus = surface_from_id(mgr->drag_focus);
+    if (focus == nullptr || mgr->drag_source == nullptr) {
         end_drag(mgr, true);
         return;
     }
-    wl_client* client = wl_resource_get_client(mgr->drag_focus->c_resource());
+    wl_client* client = wl_resource_get_client(focus->c_resource());
     for (wl_resource* device : mgr->devices) {
         if (wl_resource_get_client(device) == client) {
             wl_data_device_send_drop(device);
@@ -533,9 +514,8 @@ void drag_drop(DdMgr* mgr) {
         mgr->drag_source->is_drag = false;
         mgr->drag_source = nullptr;
     }
-    mgr->drag_icon = nullptr;
-    mgr->drag_icon_gone.disconnect();
-    mgr->drag_focus = nullptr;
+    mgr->drag_icon = {};
+    mgr->drag_focus = {};
     mgr->drag_offer = nullptr;
     mgr->seat->end_drag();
 }
@@ -553,16 +533,11 @@ void device_start_drag(wl_client*, wl_resource* resource, wl_resource* source_re
     Source* source = source_of(source_resource);
     source->is_drag = true;
     mgr->drag_source = source;
-    mgr->drag_icon = icon != nullptr ? surface_from_resource(icon) : nullptr;
-    if (mgr->drag_icon != nullptr) {
-        mgr->drag_icon_gone = mgr->drag_icon->destroy.connect([mgr](SurfaceDestroy&) {
-            mgr->drag_icon = nullptr;
-            mgr->drag_icon_gone.disconnect();
-        });
-    }
+    Surface* drag_icon = icon != nullptr ? surface_from_resource(icon) : nullptr;
+    mgr->drag_icon = drag_icon != nullptr ? drag_icon->id() : SurfaceId{};
 
     SeatDragHooks hooks;
-    hooks.focus = [mgr](Surface* surface, double sx, double sy) {
+    hooks.focus = [mgr](SurfaceId surface, double sx, double sy) {
         drag_focus(mgr, surface, sx, sy);
     };
     hooks.motion = [mgr](double sx, double sy) { drag_motion(mgr, sx, sy); };
@@ -618,7 +593,7 @@ void manager_get_data_device(wl_client* client, wl_resource* resource, uint32_t 
     wl_resource_set_implementation(device, &device_impl, mgr, device_resource_destroy);
     mgr->devices.push_back(device);
     // If this client already holds focus, hand it the clipboard right away.
-    Surface* focus = mgr->seat->keyboard_focus();
+    Surface* focus = surface_from_id(mgr->seat->keyboard_focus());
     if (focus != nullptr && wl_resource_get_client(focus->c_resource()) == client) {
         send_selection_to_client(mgr, client);
     }
@@ -660,10 +635,25 @@ Result<DataDeviceManager> DataDeviceManager::create(Display& display, Seat& seat
     impl->focus_conn = seat.keyboard_focus_changed().connect([raw](SeatKeyboardFocus& e) {
         // The clipboard follows keyboard focus: the newly focused client is the
         // one allowed to see (and paste) the selection.
-        if (e.surface != nullptr) {
-            send_selection_to_client(raw, wl_resource_get_client(e.surface->c_resource()));
+        if (Surface* surface = surface_from_id(e.surface); surface != nullptr) {
+            send_selection_to_client(raw, wl_resource_get_client(surface->c_resource()));
         }
     });
+    impl->surface_invalidated_conn =
+        surface_invalidated().connect([raw](SurfaceInvalidated& event) {
+            if (raw->drag_icon == event.surface) {
+                raw->drag_icon = {};
+            }
+            if (raw->drag_focus != event.surface) {
+                return;
+            }
+            raw->drag_focus = {};
+            if (raw->drag_offer != nullptr) {
+                wl_resource* offer = raw->drag_offer;
+                raw->drag_offer = nullptr;
+                wl_resource_destroy(offer);
+            }
+        });
     return DataDeviceManager{std::move(impl)};
 }
 
@@ -826,7 +816,7 @@ void primary_send_selection_to_client(PrimaryMgr* mgr, wl_client* client) {
 }
 
 void primary_broadcast(PrimaryMgr* mgr) {
-    Surface* focus = mgr->seat->keyboard_focus();
+    Surface* focus = surface_from_id(mgr->seat->keyboard_focus());
     if (focus != nullptr) {
         primary_send_selection_to_client(mgr, wl_resource_get_client(focus->c_resource()));
     }
@@ -919,7 +909,7 @@ void primary_manager_get_device(wl_client* client, wl_resource* resource, uint32
     wl_resource_set_implementation(device, &primary_device_impl, mgr,
                                    primary_device_resource_destroy);
     mgr->devices.push_back(device);
-    Surface* focus = mgr->seat->keyboard_focus();
+    Surface* focus = surface_from_id(mgr->seat->keyboard_focus());
     if (focus != nullptr && wl_resource_get_client(focus->c_resource()) == client) {
         primary_send_selection_to_client(mgr, client);
     }
@@ -963,8 +953,8 @@ Result<PrimarySelectionManager> PrimarySelectionManager::create(Display& display
     }
     Impl* raw = impl.get();
     impl->focus_conn = seat.keyboard_focus_changed().connect([raw](SeatKeyboardFocus& e) {
-        if (e.surface != nullptr) {
-            primary_send_selection_to_client(raw, wl_resource_get_client(e.surface->c_resource()));
+        if (Surface* surface = surface_from_id(e.surface); surface != nullptr) {
+            primary_send_selection_to_client(raw, wl_resource_get_client(surface->c_resource()));
         }
     });
     return PrimarySelectionManager{std::move(impl)};
