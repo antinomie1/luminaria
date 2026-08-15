@@ -313,9 +313,10 @@ int main(int argc, char** argv) {
 
     // What the frames actually did, reported once a second and only when it
     // changed — this is what a real-hardware run leaves in the log. `scanout`
-    // means a client's own buffer reached the CRTC untouched; a screen reporting
-    // ~60 `unchanged` per second is the idle flipping that the next step is
-    // meant to kill, and when it does, this line will simply stop appearing.
+    // means a client's own buffer reached the CRTC untouched; `unchanged` means
+    // a frame was asked for and turned out to be identical to the one on screen,
+    // so nothing was drawn or flipped. An idle screen asks for no frames at all,
+    // and this line then simply stops appearing — which is the point.
     struct FrameLog {
         unsigned composited = 0, scanout = 0, unchanged = 0, fallback = 0;
 
