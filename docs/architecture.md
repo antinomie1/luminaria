@@ -29,8 +29,8 @@
 ## 一帧长什么样
 
 `Output::frame` 触发 → `Frame::begin(view)` → 逐窗口 `Frame::place()` 排出这一帧的摆位 →
-`Frame::submit(background)`。submit 内部：`Surface::buffer_texture()` 把客户端 buffer 放上
-GPU → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()`；或者整个合成
+`Frame::submit(background)`。submit 内部：`Frame` 的 GPU bridge 把客户端 buffer 缓存成纹理
+→ `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()`；或者整个合成
 被跳过，某个客户端的 buffer 直接进 CRTC。不能直出 dmabuf 的输出（headless、嵌套）照样在 GPU
 上合成，只有成品帧过一次 CPU：`read_scanout()` → `commit_frame()`。输入反向走：后端输入信号
 → `Frame::surface_at()` → `Seat` 焦点与路由。
@@ -46,8 +46,8 @@ GPU → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()
   永远不上屏的帧。它攒着，直到混成器在 `Output::present` 里调 `Surface::send_frame_done()`。
   忘了调，所有客户端画完第一帧就冻住。damage 同理：`Surface::damage()` 一直累积到
   `clear_damage()`。
-- **渲染器必须比 Display 活得久。** `Surface` 缓存的 `GpuTexture` 属于 `VulkanRenderer`，
-  所以渲染器要声明在 `Display` 之前（局部变量逆序析构）。搞反了会在 `vk::raii` 里 abort。
+- **`Frame` 必须比渲染器先销毁。** `Frame` 的 GPU bridge 缓存着属于 `VulkanRenderer` 的
+  `GpuTexture`；参考混成器仍把渲染器声明在 `Display` 前面，让所有输出和帧账本先析构。
 - **绝不听客户端的话去索引内存。** 宽高、stride、offset 是客户端独立声明的四个整数，上游
   谁也没有按真正的单位交叉验证过。碰像素之前先过 `layout_fits()` / `layout_length()`。
 - **缓存了裸 `Surface*` 就得订阅 `Surface::destroy`。**（这条正在被
@@ -61,16 +61,23 @@ GPU → `VulkanRenderer::render_to(ScanoutTarget)` → `Output::commit_scanout()
 `src/` 按职责分目录，分区名则是扁平的（跟文件名走，不跟路径走），所以挪动文件不构成 API 变化。
 
 ```
-src/luminaria.cppm       主接口单元，只做 export import
+src/luminaria.cppm       基础接口单元（协议 + core + 嵌套/headless）
+src/luminaria.gpu.cppm   Vulkan / DRM / libinput / session / GPU 协议
+src/luminaria.desktop.cppm  workspace / foreign-toplevel / data-control
 src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag}
 src/shell/               frame output_layout direct_scanout
 src/protocol/            25 个 Wayland global，一个一文件
-src/xwayland/            X11 桥
+src/xwayland/            `luminaria.xwayland`，X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件
 ```
+
+四个公开 module 的边界见 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)：
+只用 `import luminaria;` 不会编译或链接 Vulkan、libdrm、libinput、libseat、GBM 或 xcb；
+桌面专用的三个高权限协议也不会进入基础接口。扩展 module 会 `export import luminaria`，
+所以需要 GPU 的下游只写 `import luminaria.gpu;` 即可。
 
 每个 `.cppm` **接口与实现同文件**：先是 `export namespace luminaria { … }`，然后一条
 `// --- implementation` 分隔线，之后是 pimpl 的 `struct X::Impl`、匿名 namespace 里的
@@ -78,9 +85,9 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
 
 分区之间必须**显式 `import` 且不能成环**。旧布局把这件事藏起来了——实现单元白拿整个主
 接口，所以谁也不用声明依赖；现在 `seat.cppm` 想看见 `Surface` 就得写
-`import :compositor;`。当前的依赖图是一个八层的 DAG，底层是 `box` / `signal` /
-`expected`，顶层是 `data_control`；新加一条闭合成环的边会直接编译不过，这时候该做的是把
-共用的类型下沉到第三个更低的分区里。
+`import :compositor;`。扩展 module 的分区先 `import luminaria;`，再按需导入自己 module 内的
+分区。新加一条闭合成环的边会直接编译不过，这时候该做的是把共用类型下沉到基础 module，
+或同一扩展里的第三个更低分区。
 
 合并之后还有两条只有编译器会告诉你的规矩：**模块链接的声明不能在签名里出现匿名 namespace
 里的类型**（`Impl::light_up(DrmOutput&)` 这种，`-WTU-local-entity-exposure`），把那个类型

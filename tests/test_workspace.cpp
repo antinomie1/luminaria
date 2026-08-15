@@ -17,7 +17,7 @@
 
 #include "ext-workspace-v1-client-protocol.h"
 
-import luminaria;
+import luminaria.desktop;
 
 namespace {
 

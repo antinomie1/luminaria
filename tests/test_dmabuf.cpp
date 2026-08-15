@@ -22,7 +22,7 @@
 
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
-import luminaria;
+import luminaria.gpu;
 
 namespace {
 

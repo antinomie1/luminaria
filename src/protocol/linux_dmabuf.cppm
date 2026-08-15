@@ -34,19 +34,12 @@ module;
 #include <wayland-server-protocol.h>
 #include "linux-dmabuf-unstable-v1-protocol.h"
 
-export module luminaria:linux_dmabuf;
+export module luminaria.gpu:linux_dmabuf;
 
-import :client_buffer;
-import :display;
-import :dmabuf;
-import :expected;
-import :pixel_layout;
+import luminaria;
 import :vulkan;
 
 export namespace luminaria {
-
-class Display;
-class VulkanRenderer;
 
 /// The zwp_linux_dmabuf_v1 global (protocol version 3). Move-only; pointer-stable
 /// state so the libwayland global can hold a pointer to it.

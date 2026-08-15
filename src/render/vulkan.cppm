@@ -26,17 +26,9 @@ module;
 #include "quad_frag_spv.h"
 #include "quad_vert_spv.h"
 
-export module luminaria:vulkan;
+export module luminaria.gpu:vulkan;
 
-import :box;
-import :color;
-import :dmabuf;
-import :expected;
-import :handle;
-import :pixel;
-import :rect_fill;
-import :region;
-import :transform;
+import luminaria;
 
 export namespace luminaria {
 

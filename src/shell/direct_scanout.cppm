@@ -38,13 +38,9 @@ module;
 #include <vector>
 #include <wayland-server-core.h>
 
-export module luminaria:direct_scanout;
+export module luminaria.gpu:direct_scanout;
 
-import :compositor;
-import :dmabuf;
-import :output;
-import :signal;
-import :transform;
+import luminaria;
 
 export namespace luminaria {
 

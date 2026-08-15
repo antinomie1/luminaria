@@ -29,18 +29,13 @@ module;
 #include "ext-image-copy-capture-v1-protocol.h"
 #include "ext-image-capture-source-v1-protocol.h"
 
-export module luminaria:screencopy;
+export module luminaria.gpu:screencopy;
 
-import :display;
-import :expected;
+import luminaria;
 import :linux_dmabuf;
-import :pixel_layout;
 import :vulkan;
 
 export namespace luminaria {
-
-class Display;
-class VulkanRenderer;
 
 /// Callback to capture pixels from an output region.
 /// Fill `rgba` with tightly-packed RGBA8, row-major, top-to-bottom.

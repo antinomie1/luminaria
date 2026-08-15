@@ -26,7 +26,7 @@
 
 #include "linux-drm-syncobj-v1-client-protocol.h"
 
-import luminaria;
+import luminaria.gpu;
 
 namespace {
 

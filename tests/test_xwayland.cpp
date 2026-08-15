@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-import luminaria;
+import luminaria.xwayland;
 
 int main() {
     auto display = luminaria::Display::create();

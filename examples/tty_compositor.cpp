@@ -24,7 +24,7 @@
 
 #include <drm_fourcc.h>
 
-import luminaria;
+import luminaria.gpu;
 
 namespace {
 constexpr uint32_t KEY_ESC = 1;

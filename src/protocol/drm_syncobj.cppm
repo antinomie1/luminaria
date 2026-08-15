@@ -24,16 +24,11 @@ module;
 #include <xf86drm.h>
 #include "linux-drm-syncobj-v1-protocol.h"
 
-export module luminaria:drm_syncobj;
+export module luminaria.gpu:drm_syncobj;
 
-import :compositor;
-import :display;
-import :expected;
-import :signal;
+import luminaria;
 
 export namespace luminaria {
-
-class Display;
 
 /// The wp_linux_drm_syncobj_manager_v1 global (version 1). Move-only;
 /// pointer-stable state so the libwayland global can hold a pointer to it.

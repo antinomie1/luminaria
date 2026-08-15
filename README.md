@@ -1,8 +1,8 @@
 # Luminaria
 
 用现代 C++ 写 Wayland 混成器的库。架在 `libwayland-server` 上（不重造线协议），
-Vulkan 渲染，以 C++20 named module 交付 —— `import luminaria;` 就是全部接口，
-没有公开头文件。
+Vulkan 渲染，以四个 C++20 named module 按能力交付：`luminaria` 是无 GPU 的基础接口，
+`luminaria.gpu`、`luminaria.desktop`、`luminaria.xwayland` 分别按需加入；没有公开头文件。
 
 **它想成为的东西**：一个**有主见的库**，抽象程度落在"基于 wlroots 写"和"手写一个 X11
 窗口管理器"之间。凡是每个混成器都得写一遍、写错就是 bug 的公共账本（帧调度、damage 记账、
@@ -18,8 +18,8 @@ Vulkan 渲染，以 C++20 named module 交付 —— `import luminaria;` 就是�
 - **内存安全靠构造，不靠小心** — 每个 C 句柄 RAII 包装，每个信号监听析构自动摘链，
   没有一处手写 `wl_list_remove`。目标是让悬空指针那一族错误**写不出来**，而不是靠代码评审
   逮住。
-- **API 简洁明了** — 25 个协议对象（wlroots 是 73 个），一个 `import`，一层 `Result<T>`，
-  异常不跨 C 边界。
+- **API 简洁明了** — 25 个协议对象（wlroots 是 73 个），四个按能力付费的 module，
+  一层 `Result<T>`，异常不跨 C 边界。
 - **完整到能日常用** — 而不是停在"能跑个 demo"。
 
 ## 现在能跑到哪
@@ -59,6 +59,5 @@ WAYLAND_DISPLAY=wayland-0 ./build/examples/tinyluminaria    # 嵌套跑，打印
 ## 稳定性
 
 **1.0 之前不承诺任何 API / ABI 稳定性**，下游请锁 commit。原因写在
-[ADR 0004](docs/adr/0004-no-api-stability-before-1.0.md)：已经排上日程的几件事
-（切模块、表面换代际句柄）每一条都是 break——删场景树那一条已经落地了——现在承诺稳定
-等于把简化永远留在原地。
+[ADR 0004](docs/adr/0004-no-api-stability-before-1.0.md)：1.0 前仍会主动做破坏性简化，
+现在承诺稳定等于把错误的边界永远留在原地。

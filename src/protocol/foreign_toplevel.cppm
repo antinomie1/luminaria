@@ -27,20 +27,11 @@ module;
 #include <wayland-server-core.h>
 #include "wlr-foreign-toplevel-management-unstable-v1-protocol.h"
 
-export module luminaria:foreign_toplevel;
+export module luminaria.desktop:foreign_toplevel;
 
-import :display;
-import :expected;
-import :output_global;
-import :signal;
-import :xdg_shell;
+import luminaria;
 
 export namespace luminaria {
-
-class Display;
-class OutputGlobal;
-class Toplevel;
-class XdgShell;
 
 /// A window-list client asked for something. Nothing happens until the
 /// compositor acts on it — this is a request, not a command.

@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-import luminaria;
+import luminaria.gpu;
 
 int main(int argc, char** argv) {
     // Device: argv[1], else $LUMINARIA_DRM_DEVICE, else /dev/dri/card0.

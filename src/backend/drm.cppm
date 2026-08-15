@@ -42,23 +42,12 @@ module;
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-export module luminaria:drm;
+export module luminaria.gpu:drm;
 
-import :backend;
-import :box;
-import :color;
-import :dmabuf;
-import :event_loop;
-import :expected;
-import :handle;
-import :output;
-import :pixel;
+import luminaria;
 import :session;
-import :signal;
 
 export namespace luminaria {
-
-class Session;
 
 class DrmBackend final : public Backend {
 public:

@@ -3,7 +3,7 @@
 #include <cassert>
 #include <cstdio>
 
-import luminaria;
+import luminaria.gpu;
 
 int main() {
     auto renderer = luminaria::VulkanRenderer::create();

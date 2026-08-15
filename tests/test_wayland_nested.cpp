@@ -16,7 +16,7 @@
 
 #include <drm_fourcc.h>
 
-import luminaria;
+import luminaria.gpu;
 
 int main() {
     if (std::getenv("WAYLAND_DISPLAY") == nullptr) {

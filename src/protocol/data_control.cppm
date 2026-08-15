@@ -38,18 +38,11 @@ module;
 #include <wayland-server-protocol.h>
 #include "wlr-data-control-unstable-v1-protocol.h"
 
-export module luminaria:data_control;
+export module luminaria.desktop:data_control;
 
-import :data_device;
-import :display;
-import :expected;
-import :signal;
+import luminaria;
 
 export namespace luminaria {
-
-class Display;
-class DataDeviceManager;
-class PrimarySelectionManager;
 
 /// The zwlr_data_control_manager_v1 global. Move-only; pointer-stable state.
 class DataControlManager {

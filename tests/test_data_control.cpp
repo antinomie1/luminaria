@@ -27,7 +27,7 @@
 
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 
-import luminaria;
+import luminaria.desktop;
 
 namespace {
 

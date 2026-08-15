@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <vector>
 
-import luminaria;
+import luminaria.gpu;
 
 using namespace luminaria;
 

@@ -19,7 +19,8 @@
 #include <string>
 #include <vector>
 
-import luminaria;
+import luminaria.gpu;
+import luminaria.desktop;
 
 namespace {
 template <class T>

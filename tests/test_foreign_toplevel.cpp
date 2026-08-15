@@ -21,7 +21,7 @@
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-import luminaria;
+import luminaria.desktop;
 
 namespace {
 

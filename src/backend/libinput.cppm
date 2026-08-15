@@ -22,17 +22,12 @@ module;
 #include <libinput.h>
 #include <libudev.h>
 
-export module luminaria:libinput;
+export module luminaria.gpu:libinput;
 
-import :event_loop;
-import :expected;
-import :input_event;
+import luminaria;
 import :session;
-import :signal;
 
 export namespace luminaria {
-
-class Session;
 
 class LibinputBackend {
 public:

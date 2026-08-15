@@ -27,11 +27,9 @@ extern "C" {
 #include <libseat.h>
 }
 
-export module luminaria:session;
+export module luminaria.gpu:session;
 
-import :event_loop;
-import :expected;
-import :signal;
+import luminaria;
 
 export namespace luminaria {
 

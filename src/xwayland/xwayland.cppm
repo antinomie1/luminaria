@@ -21,18 +21,11 @@ module;
 #include <unistd.h>
 #include <xcb/xcb.h>
 
-export module luminaria:xwayland;
+export module luminaria.xwayland;
 
-import :compositor;
-import :display;
-import :event_loop;
-import :expected;
-import :signal;
+export import luminaria;
 
 export namespace luminaria {
-
-class Display;
-class Compositor;
 
 struct XwaylandReady {
     std::string display_name; // e.g. ":1"

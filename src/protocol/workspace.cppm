@@ -24,17 +24,11 @@ module;
 #include <wayland-server-core.h>
 #include "ext-workspace-v1-protocol.h"
 
-export module luminaria:workspace;
+export module luminaria.desktop:workspace;
 
-import :display;
-import :expected;
-import :output_global;
-import :signal;
+import luminaria;
 
 export namespace luminaria {
-
-class Display;
-class OutputGlobal;
 
 /// ext_workspace_handle_v1 state bits.
 enum WorkspaceState : std::uint32_t {

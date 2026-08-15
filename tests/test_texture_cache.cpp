@@ -23,7 +23,7 @@
 
 #include <drm_fourcc.h>
 
-import luminaria;
+import luminaria.gpu;
 
 namespace {
 

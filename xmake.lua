@@ -1,11 +1,9 @@
 -- Luminaria — a minimal Wayland compositor library.
 --
--- Built as a C++23 *module*: `import luminaria;` is the whole interface. Every
--- partition lives in src/**/*.cppm — one file per concept, holding both its
--- interface and its implementation — and they are marked public so dependent
--- targets can import them. There is no include/: nothing here is a header, so
--- the tree is grouped by responsibility (core, util, backend, render, shell,
--- protocol, xwayland) rather than split interface-from-implementation.
+-- Built as four C++23 named modules: the dependency-light `luminaria` core and
+-- opt-in `luminaria.gpu`, `luminaria.desktop`, `luminaria.xwayland` extensions.
+-- Every partition lives in src/**/*.cppm — one file per concept, holding both
+-- interface and implementation. There is no public include/ tree.
 --
 -- xmake rather than Meson because Meson's module dependency scanner still emits
 -- MSVC-shaped `.ifc` outputs and cannot drive GCC's modules at all.
@@ -63,10 +61,8 @@ local pkgs = {"wayland-server", "wayland-client", "vulkan", "xkbcommon", "xcb",
 for _, name in ipairs(pkgs) do
     add_requires("pkgconfig::" .. name, {alias = (name:gsub("-", "_"))})
 end
-local pkg_aliases = {}
-for _, name in ipairs(pkgs) do
-    table.insert(pkg_aliases, (name:gsub("-", "_")))
-end
+local base_packages = {"wayland_server", "wayland_client", "xkbcommon"}
+local gpu_packages = {"vulkan", "libdrm", "libinput", "libudev", "gbm", "libseat"}
 
 -- ---------------------------------------------------------------- code generation
 --
@@ -79,13 +75,25 @@ end
 
 target("luminaria")
     set_kind("static")
-    -- Every module unit: public so anything depending on us can import them.
-    -- The implementation now lives in the partitions, so there are no .cpp files
-    -- of our own left — only wayland-scanner's C glue, added in on_load below.
-    add_files("src/**.cppm", {public = true})
+    add_files("src/luminaria.cppm", "src/core/**.cppm", "src/util/**.cppm", {public = true})
+    add_files("src/backend/backend.cppm", "src/backend/headless.cppm",
+              "src/backend/input_event.cppm", "src/backend/output.cppm",
+              "src/backend/wayland.cppm", {public = true})
+    add_files("src/protocol/client_buffer.cppm", "src/protocol/compositor.cppm",
+              "src/protocol/cursor_shape.cppm", "src/protocol/data_device.cppm",
+              "src/protocol/fractional_scale.cppm", "src/protocol/idle_inhibit.cppm",
+              "src/protocol/idle_notify.cppm", "src/protocol/layer_shell.cppm",
+              "src/protocol/output_global.cppm", "src/protocol/pointer_constraints.cppm",
+              "src/protocol/presentation_time.cppm", "src/protocol/relative_pointer.cppm",
+              "src/protocol/seat.cppm", "src/protocol/single_pixel_buffer.cppm",
+              "src/protocol/subcompositor.cppm", "src/protocol/tearing_control.cppm",
+              "src/protocol/text_input.cppm", "src/protocol/viewporter.cppm",
+              "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
+              "src/protocol/xdg_shell.cppm", {public = true})
+    add_files("src/render/cursor_theme.cppm", "src/shell/output_layout.cppm", {public = true})
     -- for detail/wayland_fwd.h, included in the units' GMF
     add_includedirs("src", {public = true})
-    add_packages(pkg_aliases, {public = true})
+    add_packages(base_packages, {public = true})
     on_load(function (target)
         -- os.iorunv is only exposed in script scope, so the generator lives
         -- here rather than next to the tables above.
@@ -167,42 +175,81 @@ target("luminaria")
             scan(p[1], path.join(os.projectdir(), "protocol", p[1] .. ".xml"), p[2])
         end
 
-        -- Shaders: --vn emits the SPIR-V as a C array, so the pipeline is
-        -- compiled into the binary and there is no shader file to ship.
-        for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
-                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"}}) do
-            local src = path.join(os.projectdir(), "src", "render", shader[1])
-            local dst = path.join(gendir, shader[3])
-            if stale(src, dst) then
-                run("glslangValidator", {"-V", "--vn", shader[2], "-o", dst, src}, dst)
-            end
-        end
-
         target:add("files", sources)
         target:add("includedirs", gendir, {public = true})
     end)
+
+target("luminaria-gpu")
+    set_kind("static")
+    add_deps("luminaria")
+    add_files("src/luminaria.gpu.cppm", "src/backend/drm.cppm",
+              "src/backend/libinput.cppm", "src/backend/session.cppm",
+              "src/protocol/drm_syncobj.cppm", "src/protocol/linux_dmabuf.cppm",
+              "src/protocol/screencopy.cppm", "src/render/vulkan.cppm",
+              "src/shell/direct_scanout.cppm", "src/shell/frame.cppm", {public = true})
+    add_includedirs("src", "build/generated", {public = true})
+    add_packages(gpu_packages, {public = true})
+    on_load(function (target)
+        local function stale(src, dst)
+            return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
+        end
+        for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
+                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"}}) do
+            local src = path.join(os.projectdir(), "src", "render", shader[1])
+            local dst = path.join(os.projectdir(), "build", "generated", shader[3])
+            if stale(src, dst) then
+                os.mkdir(path.directory(dst))
+                os.iorunv("glslangValidator", {"-V", "--vn", shader[2], "-o", dst, src})
+            end
+        end
+    end)
+
+target("luminaria-desktop")
+    set_kind("static")
+    add_deps("luminaria")
+    add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
+              "src/protocol/foreign_toplevel.cppm", "src/protocol/workspace.cppm",
+              {public = true})
+
+target("luminaria-xwayland")
+    set_kind("static")
+    add_deps("luminaria")
+    add_files("src/xwayland/xwayland.cppm", {public = true})
+    add_packages("xcb", {public = true})
 
 -- --------------------------------------------------------------------- examples
 
 target("tinyluminaria")
     set_kind("binary")
     add_files("examples/tinyluminaria.cpp")
-    add_deps("luminaria")
+    add_deps("luminaria-gpu", "luminaria-desktop")
 
 target("luminaria-drm-demo")
     set_kind("binary")
     add_files("examples/drm_demo.cpp")
-    add_deps("luminaria")
+    add_deps("luminaria-gpu")
 
 target("luminaria-tty")
     set_kind("binary")
     add_files("examples/tty_compositor.cpp")
-    add_deps("luminaria")
+    add_deps("luminaria-gpu")
 
 -- ------------------------------------------------------------------------ tests
 --
 -- One binary per file, same as before. Several skip themselves with exit 77 when
 -- the machine has no GPU / no free VT / no seat, so that counts as a pass.
+
+local gpu_tests = {
+    test_client_texture = true, test_composite = true, test_cursor_capture = true,
+    test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
+    test_gpu_scanout = true, test_libinput = true, test_render_output = true,
+    test_screencopy_bounds = true, test_session = true, test_syncobj = true,
+    test_texture = true, test_texture_cache = true, test_vulkan = true,
+    test_wayland_nested = true,
+}
+local desktop_tests = {
+    test_data_control = true, test_foreign_toplevel = true, test_workspace = true,
+}
 
 for _, file in ipairs(os.files("tests/test_*.cpp")) do
     local name = path.basename(file)
@@ -210,7 +257,15 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
         set_kind("binary")
         set_default(false)
         add_files(file)
-        add_deps("luminaria")
+        if gpu_tests[name] then
+            add_deps("luminaria-gpu")
+        elseif desktop_tests[name] then
+            add_deps("luminaria-desktop")
+        elseif name == "test_xwayland" then
+            add_deps("luminaria-xwayland")
+        else
+            add_deps("luminaria")
+        end
         add_tests("default")
         -- xmake has no notion of a skipped test, so implement the exit-77
         -- convention here: a test that cannot run (no GPU, no free VT, no seat)

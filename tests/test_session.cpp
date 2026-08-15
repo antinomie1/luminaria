@@ -6,7 +6,7 @@
 #include <cassert>
 #include <cstdio>
 
-import luminaria;
+import luminaria.gpu;
 
 int main() {
     auto display = luminaria::Display::create();
