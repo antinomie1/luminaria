@@ -175,7 +175,12 @@ struct DataDeviceManager::Impl {
 
     // Drag state (all null when no drag is running).
     Source* drag_source = nullptr;
-    wl_resource* drag_icon = nullptr;  // wl_surface used as the drag image
+    // The drag image. Nothing reads it yet — a compositor that wants to draw it
+    // will — but it is a client's surface either way, so it is kept as a
+    // Surface* with a destroy subscription rather than as a raw wl_resource*
+    // that would quietly dangle the day someone does read it.
+    Surface* drag_icon = nullptr;
+    Signal<SurfaceDestroy>::Connection drag_icon_gone;
     Surface* drag_focus = nullptr;     // surface under the cursor
     wl_resource* drag_offer = nullptr; // offer handed to drag_focus's client
     // drag_focus is a raw Surface* that outlives nothing on its own: a client
@@ -502,6 +507,7 @@ void end_drag(DdMgr* mgr, bool cancelled) {
         mgr->drag_source = nullptr;
     }
     mgr->drag_icon = nullptr;
+    mgr->drag_icon_gone.disconnect();
     mgr->drag_focus = nullptr;
     mgr->drag_offer = nullptr;
     mgr->seat->end_drag();
@@ -528,6 +534,7 @@ void drag_drop(DdMgr* mgr) {
         mgr->drag_source = nullptr;
     }
     mgr->drag_icon = nullptr;
+    mgr->drag_icon_gone.disconnect();
     mgr->drag_focus = nullptr;
     mgr->drag_offer = nullptr;
     mgr->seat->end_drag();
@@ -546,7 +553,13 @@ void device_start_drag(wl_client*, wl_resource* resource, wl_resource* source_re
     Source* source = source_of(source_resource);
     source->is_drag = true;
     mgr->drag_source = source;
-    mgr->drag_icon = icon;
+    mgr->drag_icon = icon != nullptr ? surface_from_resource(icon) : nullptr;
+    if (mgr->drag_icon != nullptr) {
+        mgr->drag_icon_gone = mgr->drag_icon->destroy.connect([mgr](SurfaceDestroy&) {
+            mgr->drag_icon = nullptr;
+            mgr->drag_icon_gone.disconnect();
+        });
+    }
 
     SeatDragHooks hooks;
     hooks.focus = [mgr](Surface* surface, double sx, double sy) {
