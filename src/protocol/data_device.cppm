@@ -534,6 +534,11 @@ void device_start_drag(wl_client*, wl_resource* resource, wl_resource* source_re
     source->is_drag = true;
     mgr->drag_source = source;
     Surface* drag_icon = icon != nullptr ? surface_from_resource(icon) : nullptr;
+    if (drag_icon != nullptr) {
+        // Drawn under the pointer for the whole drag, so it must not be what
+        // the hit test finds there — the drop target is.
+        drag_icon->set_input_transparent();
+    }
     mgr->drag_icon = drag_icon != nullptr ? drag_icon->id() : SurfaceId{};
 
     SeatDragHooks hooks;

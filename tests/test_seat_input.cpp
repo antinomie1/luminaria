@@ -28,6 +28,7 @@ struct ClientState {
     wl_touch* touch = nullptr;
     wl_surface* cursor_surface = nullptr;
     uint32_t capabilities = 0;
+    uint32_t enter_serial = 0;
 
     bool got_axis = false;
     bool got_axis_source = false;
@@ -48,6 +49,7 @@ ClientState g_client;
 void ptr_enter(void* data, wl_pointer* pointer, uint32_t serial, wl_surface*, wl_fixed_t,
                wl_fixed_t) {
     auto* st = static_cast<ClientState*>(data);
+    st->enter_serial = serial;
     // Now that we hold pointer focus we're allowed to set the cursor image.
     wl_pointer_set_cursor(pointer, serial, st->cursor_surface, kHotspotX, kHotspotY);
 }
@@ -65,9 +67,13 @@ void ptr_frame(void*, wl_pointer*) {}
 void ptr_axis_source(void* data, wl_pointer*, uint32_t) {
     static_cast<ClientState*>(data)->got_axis_source = true;
 }
-void ptr_axis_stop(void* data, wl_pointer*, uint32_t, uint32_t axis) {
+void ptr_axis_stop(void* data, wl_pointer* pointer, uint32_t, uint32_t axis) {
+    auto* st = static_cast<ClientState*>(data);
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        static_cast<ClientState*>(data)->got_axis_stop = true;
+        st->got_axis_stop = true;
+        // ...and now hide the pointer entirely, the way a video player or an
+        // editor does. A null surface is NOT "never mind", it is "draw nothing".
+        wl_pointer_set_cursor(pointer, st->enter_serial, nullptr, 0, 0);
     }
 }
 void ptr_axis_discrete(void* data, wl_pointer*, uint32_t axis, int32_t discrete) {
@@ -176,15 +182,28 @@ int main() {
     luminaria::Surface* first_surface = nullptr;
     int surfaces = 0;
 
+    // Every cursor transition, in order: which one it is matters as much as
+    // that it happened.
+    struct CursorEvent {
+        bool has_surface;
+        bool hidden;
+    };
+    std::vector<CursorEvent> cursor_events;
+    bool cursor_input_transparent = false;
+
     auto cc = seat->cursor_changed().connect([&](luminaria::SeatCursorChange& e) {
         luminaria::Surface* cursor = luminaria::surface_from_id(e.surface);
+        cursor_events.push_back(CursorEvent{cursor != nullptr, e.hidden});
         if (cursor == nullptr) {
-            return; // the "cursor is gone" notification at teardown
+            return; // hidden, or the "cursor is gone" notification at teardown
         }
         cursor_set = true;
         cursor_hotspot_x = e.hotspot_x;
         cursor_hotspot_y = e.hotspot_y;
         cursor_surface_is_first = cursor == first_surface;
+        // A cursor surface is drawn ON the pointer, so a hit test at the
+        // pointer would find it instead of the window under it.
+        cursor_input_transparent = cursor->input_transparent() && !cursor->accepts_input(0.0, 0.0);
     });
 
     std::vector<luminaria::Signal<luminaria::SurfaceCommit>::Connection> conns;
@@ -234,6 +253,15 @@ int main() {
     assert(cursor_set);
     assert(cursor_surface_is_first);
     assert(cursor_hotspot_x == kHotspotX && cursor_hotspot_y == kHotspotY);
+    assert(cursor_input_transparent);
+    // The client set a cursor, then hid the pointer. Both have to reach the
+    // compositor as distinct states — a hidden pointer that reads as "never
+    // set" gets the compositor's own arrow drawn over it.
+    assert(cursor_events.size() >= 2);
+    assert(cursor_events[0].has_surface && !cursor_events[0].hidden);
+    assert(!cursor_events[1].has_surface && cursor_events[1].hidden);
+    // ...and the client's opinion dies with the client.
+    assert(!seat->cursor_hidden());
     // Client teardown invalidates every retained identity in the seat. None of
     // these may resolve to a future surface that reuses the registry slot.
     assert(!seat->keyboard_focus().valid());

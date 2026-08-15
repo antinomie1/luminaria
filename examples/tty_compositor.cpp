@@ -19,6 +19,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -179,6 +180,9 @@ int main(int argc, char** argv) {
         luminaria::Output* output = nullptr;
         std::unique_ptr<luminaria::OutputGlobal> global;
         std::optional<luminaria::Frame> frame;
+        // Whether this screen's hardware is carrying the pointer. False means
+        // the cursor is a placement in the frame like any other window.
+        bool cursor_on_plane = false;
         luminaria::Signal<luminaria::FrameEvent>::Connection frame_conn;
         luminaria::Signal<luminaria::PresentEvent>::Connection present_conn;
         luminaria::Signal<luminaria::OutputDestroy>::Connection destroy_conn;
@@ -187,19 +191,152 @@ int main(int argc, char** argv) {
     std::list<Screen> screens; // stable addresses: the callbacks capture Screen&
     luminaria::OutputLayout layout;
 
+    // --- the pointer's picture ------------------------------------------------
+    //
+    // Three states, and collapsing any two of them is visible on screen: the
+    // focused client's own cursor surface, the theme image for "the client
+    // hasn't said anything", and NOTHING for a client that asked for no pointer
+    // (`Seat::cursor_hidden()`) — a fullscreen video player or a text editor
+    // hiding the pointer while you type.
+    //
+    // The picture goes on the KMS cursor plane when the display has one: that is
+    // what lets the pointer move at input rate without repainting the screen
+    // behind it. When it doesn't, or when the image is bigger than the plane
+    // (64x64 as a rule, and client sprites are not bound by that), it is
+    // composited as an ordinary placement instead — the alternative is a
+    // compositor with no visible pointer at all.
+    double cursor_x = 0, cursor_y = 0;
+    bool cursor_placed = false;
+    luminaria::Output* cursor_prev_output = nullptr; // which screen last drew it
+    auto cursor_theme = luminaria::CursorTheme::load();
+    const char* cursor_name = "default";
+    auto themed_cursor = [&]() -> const luminaria::CursorImage* {
+        return cursor_theme ? cursor_theme->frame(cursor_name, 0) : nullptr;
+    };
+    // The theme image on the GPU, for screens that composite the cursor.
+    // Uploaded when the shape changes, not per frame — the pointer moves
+    // constantly but its picture almost never does.
+    std::optional<luminaria::GpuTexture> cursor_texture;
+    const char* cursor_texture_name = nullptr;
+    const luminaria::CursorImage* cursor_texture_image = nullptr;
+    auto ensure_cursor_texture = [&]() -> bool {
+        const luminaria::CursorImage* image = themed_cursor();
+        if (image == nullptr) {
+            return false;
+        }
+        if (cursor_texture.has_value() && cursor_texture_name == cursor_name) {
+            return true;
+        }
+        auto tex = renderer->upload_texture(image->width, image->height, image->rgba);
+        if (!tex) {
+            return false;
+        }
+        cursor_texture.emplace(std::move(*tex));
+        cursor_texture_name = cursor_name;
+        cursor_texture_image = image;
+        return true;
+    };
+    std::vector<std::uint8_t> cursor_pixels; // client sprite, read back once per change
+
     // Refill one screen's placement list: one z-ordered pass over the windows,
     // each contributing its whole subsurface tree. This is the list the frame
     // both draws and hit-tests, so a click can never land somewhere the pixels
     // aren't — which is why it is rebuilt on input as well as on frame. It
     // allocates nothing once the vectors have grown.
-    auto build_placements = [&windows, &layout](Screen& screen) {
+    auto build_placements = [&](Screen& screen) {
         screen.frame->begin(layout.box_of(*screen.output));
         for (Window& w : windows) {
             if (w.mapped && w.toplevel != nullptr) {
                 screen.frame->place(w.toplevel->surface(), w.x, w.y);
             }
         }
+        // The cursor last, so it is on top — and only where the hardware isn't
+        // already carrying it. A client sprite wins over the theme image; a
+        // hidden pointer draws neither. Placements are in layout coordinates,
+        // the same space the hit test runs in, and the sprite never answers that
+        // hit test: the library marks cursor surfaces input-transparent.
+        if (screen.cursor_on_plane || !cursor_placed || seat->cursor_hidden()) {
+            return;
+        }
+        if (luminaria::Surface* sprite = luminaria::surface_from_id(seat->cursor_surface());
+            sprite != nullptr) {
+            screen.frame->place(*sprite, static_cast<int>(cursor_x) - seat->cursor_hotspot_x(),
+                                static_cast<int>(cursor_y) - seat->cursor_hotspot_y());
+        } else if (ensure_cursor_texture()) {
+            screen.frame->place(*cursor_texture,
+                                static_cast<int>(cursor_x) - cursor_texture_image->hotspot_x,
+                                static_cast<int>(cursor_y) - cursor_texture_image->hotspot_y,
+                                cursor_texture_image->width, cursor_texture_image->height);
+        }
     };
+
+    // Everything about the pointer's picture that is NOT its position: which
+    // image, and whether each screen's plane can carry it. Called when the
+    // picture changes — a client setting or hiding its cursor, a named-shape
+    // request, focus moving to another client, the sprite committing a new
+    // buffer, a screen appearing — and never on plain motion, which only needs
+    // move_cursor().
+    //
+    // `force` is for the cases the picture changed without any of that being
+    // visible from here: the sprite redrew itself, or a screen just appeared.
+    struct PushedCursor {
+        const char* name = nullptr;
+        luminaria::SurfaceId sprite;
+        bool hidden = false;
+        bool valid = false;
+    } pushed;
+    auto sync_cursor = [&](bool force = false) {
+        const bool hidden = seat->cursor_hidden();
+        luminaria::Surface* sprite = luminaria::surface_from_id(seat->cursor_surface());
+        // Clients repeat themselves; re-uploading the same picture would spend
+        // an atomic commit per request for no change on screen.
+        if (!force && pushed.valid && pushed.hidden == hidden &&
+            pushed.sprite == seat->cursor_surface() && pushed.name == cursor_name) {
+            return;
+        }
+        pushed = PushedCursor{cursor_name, seat->cursor_surface(), hidden, true};
+        int width = 0, height = 0, hotspot_x = 0, hotspot_y = 0;
+        std::span<const std::uint8_t> rgba;
+        if (!hidden && sprite != nullptr) {
+            if (sprite->current_buffer_rgba(cursor_pixels, width, height)) {
+                rgba = cursor_pixels;
+                hotspot_x = seat->cursor_hotspot_x();
+                hotspot_y = seat->cursor_hotspot_y();
+            }
+        } else if (!hidden) {
+            if (const luminaria::CursorImage* image = themed_cursor(); image != nullptr) {
+                rgba = image->rgba;
+                width = image->width;
+                height = image->height;
+                hotspot_x = image->hotspot_x;
+                hotspot_y = image->hotspot_y;
+            }
+        }
+        for (Screen& sc : screens) {
+            const bool was_on_plane = sc.cursor_on_plane;
+            sc.cursor_on_plane = false;
+            if (sc.output->has_cursor_plane()) {
+                if (rgba.empty()) {
+                    (void)sc.output->hide_cursor();
+                    sc.cursor_on_plane = true; // nothing to draw, hardware agrees
+                } else if (sc.output->set_cursor(rgba, width, height, hotspot_x, hotspot_y)) {
+                    sc.cursor_on_plane = true;
+                } else {
+                    // Too big for the plane, or the commit failed: composite it
+                    // rather than leave the last picture stuck there.
+                    (void)sc.output->hide_cursor();
+                }
+            }
+            // Whatever the cursor was covering has to be repainted when it
+            // stops being the hardware's problem, or starts being it.
+            if (!sc.cursor_on_plane || was_on_plane != sc.cursor_on_plane) {
+                sc.frame->damage_all();
+            }
+        }
+    };
+    // A client that redraws its cursor sprite (an animated one, or the first
+    // buffer arriving after set_cursor) has to reach the plane too.
+    luminaria::Signal<luminaria::SurfaceCommit>::Connection cursor_commit_conn;
 
     // A window appearing or vanishing changes pixels nobody reported damage for.
     auto damage_everything = [&screens] {
@@ -287,6 +424,9 @@ int main(int argc, char** argv) {
             });
 
         rebuild_screen(screen);
+        // A monitor that just appeared has an empty cursor plane and a
+        // cursor_on_plane nobody has decided yet.
+        sync_cursor(/*force=*/true);
 
         // A frame is on screen: pace the clients that drew it, and answer their
         // presentation feedback with the vblank timestamp the kernel gave us.
@@ -321,39 +461,28 @@ int main(int argc, char** argv) {
 
     // --- libinput -> seat -----------------------------------------------------
     //
-    // libinput reports relative motion; the compositor owns the cursor position.
-    // It lives in layout coordinates so it can cross between monitors, and the
-    // hit test runs against the same layer list the renderer draws.
-    double cursor_x = 0, cursor_y = 0;
-    bool cursor_placed = false;
-    // Real cursor images from the user's theme, put on the KMS cursor plane.
-    // That plane is why the pointer can move at input rate without recompositing
-    // the screen behind it — the display hardware overlays it for free.
-    auto cursor_theme = luminaria::CursorTheme::load();
-    const char* cursor_name = "default";
-    const char* cursor_uploaded = nullptr;
-    auto push_cursor_image = [&] {
-        if (!cursor_theme) {
-            return;
-        }
-        const luminaria::CursorImage* image = cursor_theme->frame(cursor_name, 0);
-        if (image == nullptr || cursor_uploaded == cursor_name) {
-            return;
-        }
-        for (Screen& sc : screens) {
-            if (sc.output->has_cursor_plane()) {
-                (void)sc.output->set_cursor(image->rgba, image->width, image->height,
-                                            image->hotspot_x, image->hotspot_y);
-            }
-        }
-        cursor_uploaded = cursor_name;
-    };
+    // libinput reports relative motion; the compositor owns the cursor position
+    // (declared with the rest of the cursor state above). It lives in layout
+    // coordinates so it can cross between monitors, and the hit test runs
+    // against the same layer list the renderer draws.
+    //
     // A client asking for a named shape (wp_cursor_shape_v1) just changes which
-    // theme image we upload.
+    // theme image we show.
     auto cursor_shape_conn =
         cursor_shape->request().connect([&](luminaria::CursorShapeRequest& r) {
             cursor_name = r.name;
-            push_cursor_image();
+            sync_cursor();
+        });
+    // The focused client setting its own cursor surface, or hiding the pointer.
+    auto cursor_change_conn =
+        seat->cursor_changed().connect([&](luminaria::SeatCursorChange& e) {
+            cursor_commit_conn = {};
+            if (luminaria::Surface* sprite = luminaria::surface_from_id(e.surface);
+                sprite != nullptr) {
+                cursor_commit_conn = sprite->commit.connect(
+                    [&](luminaria::SurfaceCommit&) { sync_cursor(/*force=*/true); });
+            }
+            sync_cursor();
         });
     auto clamp_cursor = [&] {
         const luminaria::Box bounds = layout.bounds();
@@ -404,21 +533,33 @@ int main(int argc, char** argv) {
     luminaria::SurfaceId pointer_focus;
     auto deliver_motion = [&] {
         clamp_cursor();
-        // Hardware cursor: one small atomic commit per output, no repaint.
-        push_cursor_image();
+        luminaria::Output* cursor_now_on = nullptr;
         for (Screen& sc : screens) {
-            if (!sc.output->has_cursor_plane()) {
+            const luminaria::Box view = layout.box_of(*sc.output);
+            const bool here = view.contains(static_cast<int>(cursor_x), static_cast<int>(cursor_y));
+            if (here) {
+                cursor_now_on = sc.output;
+            }
+            if (!sc.cursor_on_plane) {
+                // Composited: the screen the pointer is on has to be repainted,
+                // and so does the one it just left — the cursor it was covering
+                // is still drawn there. A whole screen for a 24-pixel sprite is
+                // more than it takes; damaging the two cursor rects is what a
+                // compositor that cares would do.
+                if (here || sc.output == cursor_prev_output) {
+                    sc.frame->damage_all();
+                }
                 continue;
             }
-            const luminaria::Box view = layout.box_of(*sc.output);
-            const int lx_out = static_cast<int>(cursor_x) - view.x;
-            const int ly_out = static_cast<int>(cursor_y) - view.y;
-            if (view.contains(static_cast<int>(cursor_x), static_cast<int>(cursor_y))) {
-                (void)sc.output->move_cursor(lx_out, ly_out);
+            // Hardware cursor: one small atomic commit, no repaint at all.
+            if (here) {
+                (void)sc.output->move_cursor(static_cast<int>(cursor_x) - view.x,
+                                             static_cast<int>(cursor_y) - view.y);
             } else {
                 (void)sc.output->hide_cursor();
             }
         }
+        cursor_prev_output = cursor_now_on;
         double lx = 0, ly = 0;
         const luminaria::SurfaceId hit = hit_test(cursor_x, cursor_y, lx, ly);
         luminaria::Surface* surface = luminaria::surface_from_id(hit);
@@ -492,6 +633,11 @@ int main(int argc, char** argv) {
     auto pointer_focus_conn =
         seat->pointer_focus_changed().connect([&](luminaria::SeatPointerFocus& e) {
             pointer_focus = e.surface;
+            // A named shape belongs to the client that asked for it. Leave its
+            // window and the pointer goes back to the plain arrow, otherwise a
+            // text field's I-beam follows the pointer across the whole screen.
+            cursor_name = "default";
+            sync_cursor();
         });
 
     if (auto socket = display->add_socket_auto()) {

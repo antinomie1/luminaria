@@ -158,6 +158,12 @@ public:
     /// surface, which no finite region can express.
     [[nodiscard]] const Region& input_region() const noexcept { return input_; }
     [[nodiscard]] bool has_input_region() const noexcept { return has_input_region_; }
+    /// True once this surface has been used as a pointer cursor
+    /// (`wl_pointer.set_cursor`) or a drag icon. Both are drawn ON the pointer,
+    /// and the protocol says their input region is ignored — so they must not
+    /// take input, or the hit test under the pointer answers "the cursor" and
+    /// the window beneath it never sees the pointer at all.
+    [[nodiscard]] bool input_transparent() const noexcept { return input_transparent_; }
     /// True if (sx,sy) in surface coordinates should reach this surface.
     [[nodiscard]] bool accepts_input(double sx, double sy) const noexcept;
 
@@ -296,6 +302,10 @@ public:
     void add_frame_callback(wl_resource* callback) { pending_.frame_callbacks.push_back(callback); }
     void set_pending_opaque_region(const Region* region);
     void set_pending_input_region(const Region* region);
+    /// Called by the seat (cursor) and the data device (drag icon) when this
+    /// surface takes on a role that rides the pointer. One-way: a role is
+    /// permanent for the life of the surface.
+    void set_input_transparent() noexcept { input_transparent_ = true; }
     void set_pending_buffer_scale(int scale);
     void set_pending_buffer_transform(int transform);
     void add_pending_offset(int dx, int dy);
@@ -373,6 +383,7 @@ private:
     Region opaque_;
     Region input_;
     bool has_input_region_ = false;
+    bool input_transparent_ = false; // cursor / drag-icon role
     Viewport viewport_;
     // Buffers someone is scanning out, and the releases that are waiting on
     // them. Both are tiny — a client's swapchain is two or three buffers.
@@ -891,6 +902,9 @@ void Surface::buffer_source_uv(float& u0, float& v0, float& u1, float& v1) const
 }
 
 bool Surface::accepts_input(double sx, double sy) const noexcept {
+    if (input_transparent_) {
+        return false;
+    }
     if (sx < 0 || sy < 0 || sx >= surface_width() || sy >= surface_height()) {
         return false;
     }

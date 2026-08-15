@@ -316,7 +316,7 @@ int main() {
     // video and draw it back at its own frame rate. A client-set cursor surface
     // wins over the theme, same as when we composite it.
     auto cursor_capture = [&](wl_resource*, luminaria::CursorCapture& out) {
-        if (!ptr_inside) {
+        if (!ptr_inside || seat.cursor_hidden()) {
             return false;
         }
         if (luminaria::Surface* c = luminaria::surface_from_id(seat.cursor_surface()); c != nullptr) {
@@ -385,8 +385,9 @@ int main() {
         }
         // The cursor, composited in: there is no cursor plane on a nested or
         // headless output, so it is a placement like any other. A client sprite
-        // wins over the theme image.
-        if (!ptr_inside) {
+        // wins over the theme image, and a client that asked for no pointer at
+        // all gets none — the theme arrow is for "the client never said".
+        if (!ptr_inside || seat.cursor_hidden()) {
             return;
         }
         if (luminaria::Surface* cursor = luminaria::surface_from_id(seat.cursor_surface());

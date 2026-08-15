@@ -48,11 +48,19 @@ struct SeatKeyboardFocus {
 struct SeatPointerFocus {
     SurfaceId surface;
 };
-/// The pointer-focused client set its cursor image. An invalid id hides it.
+/// The pointer-focused client set its cursor image.
+///
+/// The two ways of having no surface are NOT the same and a compositor has to
+/// act on both: `hidden` means the client asked for no pointer at all (a video
+/// player going fullscreen, an editor hiding it while you type) and the
+/// compositor must draw nothing, while an invalid `surface` with `hidden` false
+/// means the client has not said anything and the compositor's own cursor
+/// applies.
 struct SeatCursorChange {
     SurfaceId surface;
     int hotspot_x;
     int hotspot_y;
+    bool hidden;
 };
 
 /// Callbacks a drag-and-drop implementation (wl_data_device) installs on the
@@ -123,8 +131,11 @@ public:
 
     /// Fires when the focused client sets (or hides) its cursor image.
     [[nodiscard]] Signal<SeatCursorChange>& cursor_changed() noexcept;
-    /// Current client cursor surface (invalid = hidden or never set).
+    /// Current client cursor surface (invalid = hidden, or never set).
     [[nodiscard]] SurfaceId cursor_surface() const noexcept;
+    /// The focused client asked for NO cursor. Draw nothing — not the theme's
+    /// arrow, which is what "never set" means.
+    [[nodiscard]] bool cursor_hidden() const noexcept;
     [[nodiscard]] int cursor_hotspot_x() const noexcept;
     [[nodiscard]] int cursor_hotspot_y() const noexcept;
     [[nodiscard]] Signal<SeatPointerFocus>& pointer_focus_changed() noexcept;
@@ -175,6 +186,21 @@ struct Seat::Impl {
     Signal<SurfaceInvalidated>::Connection invalidated;
     int cursor_hotspot_x = 0;
     int cursor_hotspot_y = 0;
+    bool cursor_hidden = false;
+
+    /// Back to "the compositor's own cursor applies" — the client that had an
+    /// opinion is no longer the focused one.
+    void forget_cursor() {
+        if (!cursor.valid() && !cursor_hidden) {
+            return;
+        }
+        cursor = {};
+        cursor_hotspot_x = 0;
+        cursor_hotspot_y = 0;
+        cursor_hidden = false;
+        SeatCursorChange gone{};
+        cursor_changed.emit(gone);
+    }
 
     Signal<SeatKeyboardFocus> keyboard_focus_changed;
     Signal<SeatPointerFocus> pointer_focus_changed;
@@ -246,10 +272,18 @@ void pointer_set_cursor(wl_client* client, wl_resource* resource, uint32_t /*ser
     auto* surface = surface_resource != nullptr
                         ? static_cast<Surface*>(wl_resource_get_user_data(surface_resource))
                         : nullptr;
+    if (surface != nullptr) {
+        // The cursor rides the pointer, so a hit test at the pointer would
+        // otherwise find the cursor itself instead of the window under it.
+        surface->set_input_transparent();
+    }
     seat->cursor = surface != nullptr ? surface->id() : SurfaceId{};
     seat->cursor_hotspot_x = hotspot_x;
     seat->cursor_hotspot_y = hotspot_y;
-    SeatCursorChange event{seat->cursor, hotspot_x, hotspot_y};
+    // A null surface is the client saying "no pointer", which is not the same
+    // as never having said anything.
+    seat->cursor_hidden = surface == nullptr;
+    SeatCursorChange event{seat->cursor, hotspot_x, hotspot_y, seat->cursor_hidden};
     seat->cursor_changed.emit(event);
 }
 constexpr struct wl_pointer_interface pointer_impl = {.set_cursor = pointer_set_cursor,
@@ -395,12 +429,8 @@ Result<Seat> Seat::create(Display& display, std::string name) {
             raw->touch_focus = {};
         }
 
-        if (raw->cursor == event.surface || (pointer_lost && raw->cursor.valid())) {
-            raw->cursor = {};
-            raw->cursor_hotspot_x = 0;
-            raw->cursor_hotspot_y = 0;
-            SeatCursorChange changed{};
-            raw->cursor_changed.emit(changed);
+        if (raw->cursor == event.surface || pointer_lost) {
+            raw->forget_cursor();
         }
     });
     return Seat{std::move(impl)};
@@ -591,12 +621,9 @@ void Seat::pointer_clear_focus() {
         }
     }
     impl_->ptr_focus = {};
-    // The cursor image belonged to that client.
-    if (impl_->cursor.valid()) {
-        impl_->cursor = {};
-        SeatCursorChange gone{};
-        impl_->cursor_changed.emit(gone);
-    }
+    // The cursor image belonged to that client, and so did its decision to hide
+    // the pointer: neither survives the focus leaving.
+    impl_->forget_cursor();
     SeatPointerFocus event{};
     impl_->pointer_focus_changed.emit(event);
 }
@@ -738,6 +765,9 @@ void Seat::pointer_axis_stop(bool horizontal, bool vertical) {
 
 Signal<SeatCursorChange>& Seat::cursor_changed() noexcept {
     return impl_->cursor_changed;
+}
+bool Seat::cursor_hidden() const noexcept {
+    return impl_->cursor_hidden;
 }
 SurfaceId Seat::cursor_surface() const noexcept {
     return impl_->cursor;

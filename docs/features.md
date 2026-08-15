@@ -27,7 +27,7 @@
 | 协议 | `wp_viewporter` — 裁剪 + 拉伸一块 buffer。视频播放器免重编码加黑边；小数缩放的客户端用它声明"我这块整数 buffer 代表多大的逻辑尺寸" | scaling |
 | 协议 | `wp_fractional_scale_v1` — 输出的真实缩放，以 120 分之一为单位（180 = 1.5x）。`wl_output.scale` 是整数，说不出 150% | scaling |
 | 协议 | `wl_subcompositor` / `wl_subsurface` — 子表面树、相对定位、`place_above`/`place_below` 堆叠、**sync/desync 语义**（同步子表面的 commit 缓存到父级 commit 时原子提交）；`Surface::surface_tree()` / `surface_at()` 供渲染与命中测试共用 | subsurface |
-| 协议 | `wl_seat` v5 — 键盘（xkb keymap）+ 指针 + 触摸，焦点 enter/leave + 事件路由；滚轮（平滑 axis / 离散 notch / axis_stop）、`set_cursor`（发信号给 compositor 合成光标）；**焦点安全**：键盘/指针/触摸/光标都留 `SurfaceId`，每次发送前解析，被销毁的聚焦表面自动失效 | seat, seat-input |
+| 协议 | `wl_seat` v5 — 键盘（xkb keymap）+ 指针 + 触摸，焦点 enter/leave + 事件路由；滚轮（平滑 axis / 离散 notch / axis_stop）、`set_cursor`（发信号给 compositor 合成光标；**"客户端要求不显示指针"与"客户端没表态"是两种状态**，`cursor_hidden()` 分开报告，合成器据此决定画不画自己的箭头；光标表面自动标记为 `input_transparent()` —— 它就画在指针上，不排除的话指针下面的命中测试永远命中光标自己）；**焦点安全**：键盘/指针/触摸/光标都留 `SurfaceId`，每次发送前解析，被销毁的聚焦表面自动失效 | seat, seat-input |
 | 协议 | `wl_data_device_manager` v3 — 剪贴板（选区随键盘焦点转移）+ 拖放（drag 期间 seat 把指针交给 data device，enter/motion/drop 全流程，dnd actions）；数据经管道在客户端之间直传，compositor 不读内容 | data-device, dnd |
 | 协议 | `zwp_primary_selection_device_manager_v1` — X11 式中键粘贴选区 | data-device |
 | 协议 | `wp_single_pixel_buffer_v1` — 1×1 纯色 `wl_buffer`，无 shm pool、无 GPU 分配。客户端画背景/压暗层/黑边不必再为一块纯色开整屏 buffer | single-pixel |
