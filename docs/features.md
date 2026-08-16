@@ -4,6 +4,13 @@
 
 （下表的"测试"列是 `tests/test_*.cpp` 的名字，`xmake test test_<名>/*` 可单独跑。）
 
+## 当前状态
+
+真实客户端（Firefox、konsole、weston-terminal）可以连上来、映射窗口、GPU 合成、交互。
+合成走纯 GPU 链路且全程无 CPU 停等：客户端 dmabuf 零拷贝导入成 Vulkan 纹理，合成进一块
+导出为 dmabuf 的渲染目标，由 DRM atomic 扫描输出；explicit sync 全链路异步。裸机侧有
+libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale/transform 与模式切换。
+
 ## 核心底层
 
 | 模块 | 内容 | 测试 |
