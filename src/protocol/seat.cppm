@@ -15,8 +15,6 @@ module;
 #include <cstdint>
 #include <typeinfo>
 
-#include <cstring>
-#include <ctime>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -218,9 +216,10 @@ struct Seat::Impl {
 namespace {
 
 uint32_t now_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint32_t>(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 }
 
 wl_client* client_of(Surface& surface) {
@@ -388,9 +387,9 @@ Result<Seat> Seat::create(Display& display, std::string name) {
         xkb_context_unref(ctx);
         return fail("xkb_keymap_new_from_names failed");
     }
-    char* keymap_str = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
-    std::string keymap_string = keymap_str != nullptr ? keymap_str : "";
-    free(keymap_str);
+    std::unique_ptr<char, decltype(&std::free)> keymap_str{
+        xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1), std::free};
+    std::string keymap_string = keymap_str ? keymap_str.get() : "";
     xkb_keymap_unref(keymap);
     xkb_context_unref(ctx);
     if (keymap_string.empty()) {

@@ -37,7 +37,6 @@ module;
 
 #include <cstdint>
 
-#include <cstring>
 #include <sys/mman.h>
 #include <typeinfo>
 #include <unistd.h>

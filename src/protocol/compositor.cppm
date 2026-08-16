@@ -14,9 +14,7 @@ module;
 #include "detail/wayland_fwd.h"
 #include <cstdint>
 
-#include <cmath>
 #include <cstddef>
-#include <ctime>
 #include <unistd.h> // close
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -537,10 +535,9 @@ namespace {
 /// CLOCK_MONOTONIC in nanoseconds — the clock wp_commit_timing_v1 timestamps
 /// are expressed in, and the same one presentation-time reports.
 std::uint64_t monotonic_ns() noexcept {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
-           static_cast<std::uint64_t>(ts.tv_nsec);
+    return std::chrono::duration_cast<std::chrono::duration<std::uint64_t, std::nano>>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 struct SurfaceSlot {

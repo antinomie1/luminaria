@@ -14,8 +14,6 @@ module;
 #include <typeinfo>
 
 #include <cstddef>
-#include <cstring>
-#include <ctime>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <drm_fourcc.h>
@@ -125,12 +123,14 @@ struct Timespec {
     uint32_t tv_nsec;
 };
 Timespec monotonic_time() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const auto ns =
+        std::chrono::duration_cast<std::chrono::duration<std::uint64_t, std::nano>>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     return {
-        static_cast<uint32_t>(static_cast<uint64_t>(ts.tv_sec) >> 32),
-        static_cast<uint32_t>(ts.tv_sec & 0xFFFFFFFF),
-        static_cast<uint32_t>(ts.tv_nsec),
+        static_cast<uint32_t>(ns / 1'000'000'000ULL >> 32),
+        static_cast<uint32_t>((ns / 1'000'000'000ULL) & 0xFFFFFFFF),
+        static_cast<uint32_t>(ns % 1'000'000'000ULL),
     };
 }
 } // namespace

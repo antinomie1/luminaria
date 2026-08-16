@@ -8,7 +8,6 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <cstdint>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>

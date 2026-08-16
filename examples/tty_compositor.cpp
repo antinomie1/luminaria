@@ -11,10 +11,9 @@
 // file decides only where windows go. Pointer input is hit-tested against the
 // same placement list that gets rendered, and the cursor rides the KMS cursor
 // plane. TODO: windows cascade at fixed offsets — no move/resize/stacking UI.
-#include <cmath>
 #include <cstdint>
+#include <stdlib.h>
 #include <cstdio>
-#include <cstdlib>
 #include <ctime>
 
 #include <drm_fourcc.h>

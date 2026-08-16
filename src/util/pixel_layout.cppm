@@ -24,8 +24,6 @@
 
 module;
 
-#include <cstddef>
-#include <cstdint>
 
 export module luminaria:pixel_layout;
 

@@ -2,9 +2,7 @@
 // luminaria-drm-demo — run from a bare VT (Ctrl+Alt+F3, log in, stop your desktop).
 // Modesets the first connected monitor and fades its color via page-flips.
 // Exits after ~3s (or set LUMINARIA_EXIT_MS).
-#include <cmath>
 #include <cstdio>
-#include <cstdlib>
 
 import luminaria.gpu;
 import std;

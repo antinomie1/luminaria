@@ -13,7 +13,6 @@ module;
 
 
 #include <cstdint>
-#include <cstring>
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -509,8 +508,9 @@ void kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd, uint32_t s
         void* p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p != MAP_FAILED) {
             // The payload is NUL-terminated; don't take the terminator itself.
-            const char* text = static_cast<const char*>(p);
-            impl->keymap.assign(text, strnlen(text, size));
+            const std::string_view text{static_cast<const char*>(p), size};
+            const auto len = text.find('\0');
+            impl->keymap.assign(text.data(), len == std::string_view::npos ? size : len);
             munmap(p, size);
             if (impl->owner != nullptr) {
                 KeymapChange e{impl->keymap};
@@ -569,16 +569,16 @@ const zwp_linux_dmabuf_v1_listener kDmabufListener{dmabuf_format, dmabuf_modifie
 void registry_global(void* data, wl_registry* registry, uint32_t name, const char* interface,
                      uint32_t version) {
     auto* impl = static_cast<WaylandBackend::Impl*>(data);
-    if (std::strcmp(interface, "wl_compositor") == 0) {
+    if (std::string_view(interface) == "wl_compositor") {
         impl->compositor = static_cast<wl_compositor*>(
             wl_registry_bind(registry, name, &wl_compositor_interface, 4));
-    } else if (std::strcmp(interface, "xdg_wm_base") == 0) {
+    } else if (std::string_view(interface) == "xdg_wm_base") {
         impl->wm_base = static_cast<xdg_wm_base*>(
             wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
         xdg_wm_base_add_listener(impl->wm_base, &kWmBaseListener, impl);
-    } else if (std::strcmp(interface, "wl_shm") == 0) {
+    } else if (std::string_view(interface) == "wl_shm") {
         impl->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
-    } else if (std::strcmp(interface, "zwp_linux_dmabuf_v1") == 0) {
+    } else if (std::string_view(interface) == "zwp_linux_dmabuf_v1") {
         // Cap at 3: that is the last version that advertises formats up front.
         // v4 replaces them with per-surface feedback, which a nested window
         // does not need — and binding 3 against a v4 global is legal.
@@ -587,11 +587,11 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
                 wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, 3));
             zwp_linux_dmabuf_v1_add_listener(impl->dmabuf, &kDmabufListener, impl);
         }
-    } else if (std::strcmp(interface, "zxdg_decoration_manager_v1") == 0) {
+    } else if (std::string_view(interface) == "zxdg_decoration_manager_v1") {
         // Optional: only compositors that do server-side decorations advertise it.
         impl->decoration_manager = static_cast<zxdg_decoration_manager_v1*>(
             wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1));
-    } else if (std::strcmp(interface, "wl_seat") == 0) {
+    } else if (std::string_view(interface) == "wl_seat") {
         // Bind v5: that is what gives us scroll (axis_source/discrete/stop) and
         // wl_pointer.frame. Every listener slot up to v5 is filled below —
         // libwayland aborts on a null slot for an event the parent sends.

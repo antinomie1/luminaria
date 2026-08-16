@@ -17,7 +17,6 @@
 module;
 
 
-#include <ctime>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -140,9 +139,10 @@ namespace luminaria {
 namespace {
 
 uint32_t now_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint32_t>(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 }
 
 } // namespace

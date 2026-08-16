@@ -6,8 +6,6 @@
 
 module;
 
-#include <cstdint>
-#include <ctime>
 #include <unistd.h> // close, for the fences that cross this interface
 
 export module luminaria:output;
@@ -21,6 +19,14 @@ import :expected;
 import :pixel;
 import :signal;
 import :transform;
+
+namespace luminaria::detail {
+inline std::uint64_t monotonic_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::duration<std::uint64_t, std::nano>>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace luminaria::detail
 
 export namespace luminaria {
 
@@ -314,10 +320,7 @@ protected:
                     bool hw_clock = false) {
         frame_delivered();
         if (presented_ns == 0) {
-            timespec ts{};
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            presented_ns = static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull +
-                           static_cast<std::uint32_t>(ts.tv_nsec);
+            presented_ns = detail::monotonic_ns();
         }
         FrameEvent next{*this, presented_ns + refresh_ns, refresh_ns, hw_clock};
         frame.emit(next);
@@ -327,19 +330,16 @@ protected:
     /// For backends with no vblank of their own (headless, nested): the clock is
     /// still CLOCK_MONOTONIC, so clients get usable timing, just not hw_clock.
     void emit_software_frame(std::uint32_t refresh_ns = 0) {
-        timespec ts{};
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const auto now_ns = detail::monotonic_ns();
         PresentEvent presented{*this,
-                               static_cast<std::uint64_t>(ts.tv_sec),
-                               static_cast<std::uint32_t>(ts.tv_nsec),
+                               now_ns / 1'000'000'000ULL,
+                               static_cast<std::uint32_t>(now_ns % 1'000'000'000ULL),
                                refresh_ns,
                                0,
                                true,
                                false};
         present.emit(presented);
-        emit_frame(static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull +
-                       static_cast<std::uint32_t>(ts.tv_nsec),
-                   refresh_ns, false);
+        emit_frame(now_ns, refresh_ns, false);
     }
 
     bool frame_scheduled_ = false;

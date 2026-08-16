@@ -9,10 +9,8 @@ module;
 
 
 #include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <csignal>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -105,16 +103,16 @@ void unset_cloexec(int fd) {
 // Minimal window manager event pump: map whatever asks to be mapped, and honor
 // configure requests as-is. Enough for X clients to show a window.
 void handle_xcb_events(Xwayland::Impl* xwm) {
-    xcb_generic_event_t* event = nullptr;
-    while ((event = xcb_poll_for_event(xwm->xcb)) != nullptr) {
+    using EventPtr = std::unique_ptr<xcb_generic_event_t, decltype(&std::free)>;
+    while (EventPtr event{xcb_poll_for_event(xwm->xcb), std::free}) {
         switch (event->response_type & 0x7f) {
         case XCB_MAP_REQUEST: {
-            auto* e = reinterpret_cast<xcb_map_request_event_t*>(event);
+            auto* e = reinterpret_cast<xcb_map_request_event_t*>(event.get());
             xcb_map_window(xwm->xcb, e->window);
             break;
         }
         case XCB_CONFIGURE_REQUEST: {
-            auto* e = reinterpret_cast<xcb_configure_request_event_t*>(event);
+            auto* e = reinterpret_cast<xcb_configure_request_event_t*>(event.get());
             const uint32_t values[] = {static_cast<uint32_t>(e->x), static_cast<uint32_t>(e->y),
                                        e->width, e->height, e->border_width, e->sibling,
                                        e->stack_mode};
@@ -124,7 +122,6 @@ void handle_xcb_events(Xwayland::Impl* xwm) {
         default:
             break;
         }
-        free(event);
     }
     xcb_flush(xwm->xcb);
 }
@@ -159,7 +156,8 @@ void on_display_ready(Xwayland::Impl* xwm) {
         return;
     }
     // Payload is the number then a newline, e.g. "1\n".
-    int display_number = std::atoi(buffer);
+    int display_number = 0;
+    std::from_chars(buffer, buffer + n, display_number);
     xwm->display_name = ":" + std::to_string(display_number);
     setenv("DISPLAY", xwm->display_name.c_str(), 1);
 
@@ -206,7 +204,7 @@ Result<Xwayland> Xwayland::create(Display& display, Compositor& /*compositor*/) 
         std::string displayfd_arg = std::to_string(display_pipe[1]);
         execlp("Xwayland", "Xwayland", "-rootless", "-terminate", "-wm", wm_arg.c_str(),
                "-displayfd", displayfd_arg.c_str(), static_cast<char*>(nullptr));
-        std::fprintf(stderr, "xwayland: execlp failed: %s\n", std::strerror(errno));
+        std::println(std::cerr, "xwayland: execlp failed: {}", std::generic_category().message(errno));
         _exit(127);
     }
 

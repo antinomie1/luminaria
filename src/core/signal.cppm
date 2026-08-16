@@ -14,8 +14,6 @@
 
 module;
 
-#include <cstddef>
-#include <cstdint>
 #include <typeinfo>
 
 export module luminaria:signal;

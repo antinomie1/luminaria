@@ -15,7 +15,6 @@ module;
 
 
 #include <cstdint>
-#include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -190,10 +189,11 @@ int export_acquire(SyncSurface* sync) {
     if (int fd = export_point(drm_fd, handle, point); fd >= 0) {
         return fd;
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const int64_t timeout_ns = static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec +
-                               static_cast<int64_t>(sync->mgr->acquire_timeout_ms) * 1000000;
+    const int64_t timeout_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count() +
+        static_cast<int64_t>(sync->mgr->acquire_timeout_ms) * 1000000;
     uint32_t h = handle;
     uint64_t p = point;
     drmSyncobjTimelineWait(drm_fd, &h, &p, 1, timeout_ns,

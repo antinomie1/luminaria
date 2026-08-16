@@ -18,7 +18,6 @@ module;
 #include "detail/wayland_fwd.h"
 #include <cstdint>
 
-#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>

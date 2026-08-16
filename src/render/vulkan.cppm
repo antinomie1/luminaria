@@ -9,8 +9,6 @@ module;
 
 #include <cstdint>
 
-#include <cstring>
-#include <cmath>
 #include <unistd.h> // dup
 #include <drm_fourcc.h>
 #include <vulkan/vulkan_raii.hpp>
@@ -736,7 +734,7 @@ Result<VulkanRenderer> VulkanRenderer::create() {
         const auto avail = physical.enumerateDeviceExtensionProperties();
         auto has = [&](const char* name) {
             return std::any_of(avail.begin(), avail.end(), [&](const auto& e) {
-                return std::strcmp(e.extensionName, name) == 0;
+                return std::string_view(e.extensionName) == name;
             });
         };
         std::vector<const char*> exts;

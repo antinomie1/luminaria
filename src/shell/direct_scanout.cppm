@@ -29,9 +29,7 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <cstdint>
 
-#include <cstddef>
 #include <wayland-server-core.h>
 
 export module luminaria.gpu:direct_scanout;

@@ -17,7 +17,6 @@
 module;
 
 #include <cstdint>
-#include <cstdlib>
 
 #include <cerrno>
 #include <fcntl.h>
@@ -369,16 +368,16 @@ bool default_keymap(xkb_context*& ctx, xkb_keymap*& map, std::string& text) {
         ctx = nullptr;
         return false;
     }
-    char* as_text = xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1);
-    if (as_text == nullptr) {
+    std::unique_ptr<char, decltype(&std::free)> as_text{
+        xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1), std::free};
+    if (!as_text) {
         xkb_keymap_unref(map);
         xkb_context_unref(ctx);
         map = nullptr;
         ctx = nullptr;
         return false;
     }
-    text = as_text;
-    free(as_text);
+    text = as_text.get();
     return true;
 }
 

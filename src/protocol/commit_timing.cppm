@@ -17,7 +17,6 @@ module;
 #include <cstddef>
 #include <cstdint>
 
-#include <ctime>
 #include <typeinfo>
 #include <wayland-server-core.h>
 #include "commit-timing-v1-protocol.h"
@@ -102,10 +101,9 @@ struct CommitTimer {
 namespace {
 
 std::uint64_t monotonic_ns() noexcept {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
-           static_cast<std::uint64_t>(ts.tv_nsec);
+    return std::chrono::duration_cast<std::chrono::duration<std::uint64_t, std::nano>>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 void timer_set_timestamp(wl_client*, wl_resource* resource, uint32_t tv_sec_hi,

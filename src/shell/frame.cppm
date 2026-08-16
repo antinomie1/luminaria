@@ -34,11 +34,7 @@
 
 module;
 
-#include <cstddef>
-#include <cstdint>
 
-#include <cmath>
-#include <cstring>
 #include <unistd.h> // dup, close — the fences handed between GPU and display
 
 export module luminaria.gpu:frame;

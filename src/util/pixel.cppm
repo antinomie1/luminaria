@@ -3,9 +3,10 @@
 
 module;
 
-#include <cstdint>
 
 export module luminaria:pixel;
+
+import std;
 export namespace luminaria {
 
 struct Pixel {

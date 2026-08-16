@@ -17,7 +17,6 @@
 
 module;
 
-#include <cstddef>
 
 export module luminaria:region;
 

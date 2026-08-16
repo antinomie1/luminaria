@@ -12,12 +12,6 @@
 
 module;
 
-#include <cstdint>
-
-#include <cstddef>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <sys/stat.h>
 
 export module luminaria:cursor_theme;
@@ -194,20 +188,18 @@ std::vector<RawImage> parse_xcursor(const std::vector<std::uint8_t>& bytes) {
 // ---- finding themes on disk -------------------------------------------------
 
 bool read_file(const std::string& path, std::vector<std::uint8_t>& out) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
         return false;
     }
-    std::fseek(f, 0, SEEK_END);
-    const long length = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    bool ok_read = length > 0;
-    if (ok_read) {
-        out.resize(static_cast<std::size_t>(length));
-        ok_read = std::fread(out.data(), 1, out.size(), f) == out.size();
+    const auto pos = f.tellg();
+    if (pos == std::streampos(-1)) {
+        return false;
     }
-    std::fclose(f);
-    return ok_read;
+    const std::streamsize size = pos;
+    f.seekg(0, std::ios::beg);
+    out.resize(static_cast<std::size_t>(size));
+    return size == 0 || f.read(reinterpret_cast<char*>(out.data()), size).gcount() == size;
 }
 
 bool is_directory(const std::string& path) {

@@ -7,9 +7,10 @@
 
 module;
 
-#include <cstdint>
 
 export module luminaria:dmabuf;
+
+import std;
 export namespace luminaria {
 
 struct DmabufPlane {

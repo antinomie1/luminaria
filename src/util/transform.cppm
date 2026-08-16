@@ -11,9 +11,10 @@
 
 module;
 
-#include <cstdint>
 
 export module luminaria:transform;
+
+import std;
 
 import :box;
 

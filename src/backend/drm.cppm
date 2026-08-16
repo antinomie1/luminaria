@@ -28,7 +28,6 @@ module;
 
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -135,7 +134,7 @@ uint32_t find_prop(int fd, uint32_t obj_id, uint32_t obj_type, const char* name,
         if (!p) {
             continue;
         }
-        if (std::strcmp(p->name, name) == 0) {
+        if (std::string_view(p->name) == name) {
             id = p->prop_id;
             if (value != nullptr) {
                 *value = props->prop_values[i];
@@ -1253,7 +1252,7 @@ Status DrmBackend::start() {
             udev_device_unref(dev);
             // Re-scan on any DRM hotplug: the event says "something changed",
             // not what, and a full re-scan is cheap at monitor-plug rates.
-            if (hotplug != nullptr && std::strcmp(hotplug, "1") == 0) {
+            if (hotplug != nullptr && std::string_view(hotplug) == "1") {
                 scan_connectors();
             }
         });
