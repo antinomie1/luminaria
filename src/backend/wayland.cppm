@@ -48,6 +48,12 @@ struct KeymapChange {
     const std::string& text;
 };
 
+/// The parent compositor asked our window to close — its titlebar button, its
+/// window menu, or the user's window-manager binding. Advisory: nothing here
+/// acts on it, because whether that ends the session is the compositor's
+/// decision and not the backend's.
+struct HostCloseRequest {};
+
 enum class HostDecorationMode {
     None,       ///< the parent has no xdg-decoration global: no frame at all
     ClientSide, ///< the parent insists WE draw it (GTK-style CSD); we don't
@@ -96,6 +102,12 @@ public:
     Signal<PointerButtonEvent> pointer_button;
     /// One scroll frame, accumulated across the parent's axis events.
     Signal<PointerAxisEvent> pointer_axis;
+
+    /// The parent compositor asked our window to close — its titlebar button, its
+    /// window menu, or the user's window-manager binding. Advisory: nothing here
+    /// acts on it, because whether that ends the session is the compositor's
+    /// decision and not the backend's.
+    Signal<HostCloseRequest> close_requested;
 
     struct Impl;
 
@@ -186,6 +198,11 @@ public:
     std::vector<wl_buffer*> scanout_buffers;
     xdg_surface* xsurf = nullptr;
     xdg_toplevel* toplevel = nullptr;
+    // The backend this window belongs to, so the xdg_toplevel listener can find
+    // the signal. A pointer to an incomplete type on purpose: WaylandOutput is
+    // defined above WaylandBackend::Impl, and only the listener below — which is
+    // not — ever dereferences it.
+    WaylandBackend::Impl* backend = nullptr;
     zxdg_toplevel_decoration_v1* decoration = nullptr;
     bool configured = false;
     // True once the decoration has told us who draws the frame. Starts true so
@@ -611,7 +628,15 @@ void xdg_surface_configure(void* data, xdg_surface* xsurf, uint32_t serial) {
 const xdg_surface_listener kXdgSurfaceListener{xdg_surface_configure};
 
 void toplevel_configure(void*, xdg_toplevel*, int32_t, int32_t, wl_array*) {}
-void toplevel_close(void*, xdg_toplevel*) {}
+void toplevel_close(void* data, xdg_toplevel*) {
+    auto* out = static_cast<WaylandOutput*>(data);
+    // `owner` is only set in start(), and a compositor that never connected
+    // the signal is the ordinary case — neither is an error.
+    if (out->backend != nullptr && out->backend->owner != nullptr) {
+        HostCloseRequest event{};
+        out->backend->owner->close_requested.emit(event);
+    }
+}
 const xdg_toplevel_listener kToplevelListener{toplevel_configure, toplevel_close};
 
 // The parent's answer to our set_mode: it may hand us SERVER_SIDE (what we
@@ -660,6 +685,7 @@ Output& WaylandBackend::add_output(int width, int height, std::string title) {
                                                width, height);
     out->dmabuf = impl_->dmabuf;
     out->dmabuf_formats = impl_->dmabuf_formats;
+    out->backend = impl_.get();
     out->xsurf = xdg_wm_base_get_xdg_surface(impl_->wm_base, out->surface);
     xdg_surface_add_listener(out->xsurf, &kXdgSurfaceListener, out.get());
     out->toplevel = xdg_surface_get_toplevel(out->xsurf);
