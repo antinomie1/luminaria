@@ -62,10 +62,10 @@ src/luminaria.cppm       core primary interface — protocol + nested/headless
 src/luminaria.gpu.cppm   GPU primary interface — Vulkan/DRM/input/session
 src/luminaria.desktop.cppm desktop primary interface — privileged shell protocols
 src/core/                display event_loop expected handle signal
-src/util/                box color dmabuf pixel pixel_layout rect_fill region transform
+src/util/                box color dmabuf keymap pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
-src/render/              vulkan cursor_theme + quad.{vert,frag}
-src/shell/               frame output_layout direct_scanout
+src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
+src/shell/               cpu_compositor frame output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
 src/xwayland/            `luminaria.xwayland`, the X11 bridge
 src/detail/wayland_fwd.h the one remaining header
@@ -224,6 +224,18 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   freed; `Placement::opaque` is an index range into the frame's arena, never a `Region`
   copy), the damage debt, and the comparison keys of the last list drawn. `tests/test_frame.cpp` asserts zero heap allocations across a
   steady-state rebuild by replacing global `operator new`.
+  `Frame::place_rect(x, y, w, h, color)` places a compositor-owned solid rectangle as an
+  ordinary z-ordered placement (no hit-testing, damage recovered by the same diff); it draws
+  through a textureless `solid.frag` pipeline. Frame-callback release is batched, one stamp
+  for the whole frame, by `Frame::send_frame_done(time_ms)`.
+  Without a GPU the same immediate-mode list is composited on the CPU by
+  `CpuCompositor` (`shell/cpu_compositor.cppm`, core module): surface trees (subsurface,
+  scale, transform, viewport) and `RectFill` solids over a background, premultiplied
+  source-over, into an RGBA buffer a headless/nested output can present. Its items are
+  `CpuItem = variant<RectFill, CpuView>` with generational ids; non-Frame compositors
+  release callbacks via the free `send_frame_done(ids, time_ms)`. `KeymapState`
+  (`util/keymap.cppm`) is the shared RAII xkb wrapper both `LibinputBackend`
+  (`keymap_state()`) and compositor shortcut handling read keysyms/modifiers from.
   `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits
   in the global coordinate space, in *logical* units (`transform.cppm` holds the
   logical↔device mapping and nothing else does). `region.cppm` is the disjoint-box set both

@@ -18,6 +18,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | core | `Result<T>` / `Error`、`CUnique` 句柄 RAII、`Signal<Event>` + RAII `Connection`（emit 期间 connect/disconnect 安全）、`Display`、`EventLoop` + `EventSource` | signal, core |
 | core | `SurfaceId{index,generation}` + `surface_from_id()`：销毁后清槽并推进代际，槽复用也不会让旧身份指向新客户端；焦点、拖放、帧摆位、纹理缓存和直出 hold 全部按 id 留存 | surface-handle, seat-input, dnd-surface-destroy, frame |
 | util | `Box`、`Color`、`Pixel`、`Rect`（constexpr） | box |
+| util | `KeymapState` —— RAII 的 xkb 包装：按布局名 / 文本编译 keymap，喂 evdev 键码读出 keysym 与修饰键掩码。只给键盘**状态**，不给绑定与动作；`LibinputBackend` 内部就持有一个（`keymap_state()` 可读），与 `Seat::set_keymap()` 共用同一份布局，keysym 与客户端看到的按键不会各算各的 | keymap |
 | 测试防线 | 常态化畸形协议流客户端：48 条固定种子状态机交错 surface / region / buffer 生命周期，覆盖非法 scale / transform、重复 xdg role、自父 subsurface 与 libwayland 会放行的短 stride | protocol-fuzz |
 
 ## 协议对象（服务端）
@@ -114,6 +115,9 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | shell | `Frame` —— 每输出的帧账本：`begin`/`place` 排摆位（画与命中测试同一份 `SurfaceId` 列表）、`surface_at()` 返回代际身份、`submit()` 一手包办直出判断 / damage 记账（含 buffer age 债务）/ fence 编排 / 翻页，`read_back()` 供截屏。`PlacementTransform` 可直接摆客户端树或 texture，或交给 `compose_group` 决定离屏整窗的裁剪、缩放、位移与透明度；源摆位仍负责命中测试。稳态重排零堆分配 | frame, offscreen |
 | shell | **摆位串 diff 出 damage** —— `submit()` 把这一帧的摆位串与上一次上屏的那串逐位比较（位置进身份，所以换 z 序也算变），差异处旧矩形与新矩形各记一笔。窗口开 / 关 / 移动 / 缩放 / 换层次没有任何客户端会报 damage，但全写在摆位串里，所以混成器只欠一次 `invalidate()` 唤醒；移动一个窗口的代价是它跨过的两个矩形而非一屏。`damage_all()` 退为钝器（底色变了、直出后合成缓冲失效） | frame-damage |
 | shell | **无 damage 不提交** —— `submit()` 发现这一帧与屏上那一帧完全一致时答 `unchanged`：不渲染、不翻页、不轮换缓冲，输出随即安静。唤醒是 `Frame` 自己的事——它盯着自己画过的每个表面的 commit，`invalidate()` / `damage_all()` 与 `reset()` 也各要一帧；混成器只需在收到 `unchanged` 时补发帧回调（那一帧没有 `present`） | idle-wake, frame |
+| shell | **CPU 合成器 `CpuCompositor`** —— 无 GPU 的通用合成路径（headless / 嵌套 / 测试）：把一棵表面树（含 subsurface）+ 混成器自己的纯色矩形按 z 序混合进 CPU RGBA buffer，处理 buffer scale / transform / viewport，预乘 alpha source-over；与 `Frame` 同一种立即模式图元列表（`CpuItem` = `RectFill` \| `CpuView`），图元身份是代际 `SurfaceId`，误留的列表也安全 | cpu_compositor |
+| shell | **批量帧回调** —— `Frame::send_frame_done(time)`（本帧摆位里的全部表面，同一时间戳）与自由函数 `send_frame_done(ids, time)`（任意表面列表），把每个 compositor 都要手写的遍历收进库；`Presented::unchanged` 分支同样用它补发（没 `present` 的那帧，客户端不能饿死） | cpu_compositor |
+| shell | **纯色矩形图元 `Frame::place_rect(x, y, w, h, color)`** —— 混成器-owned 的立即模式原语（边框、背景面板、遮罩、光标底）：不参与命中测试、不报自己的 damage，移动 / 换色由摆位 diff 恢复，代价恰好两个矩形；与表面同 z 序，GPU 侧走无纹理的 solid pipeline，CPU 侧就是 `RectFill` 图元 | frame |
 | xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |
 | example | `tinyluminaria`（嵌套/headless 参考 compositor）、`luminaria-drm-demo`、`luminaria-tty`（裸机 compositor） | tinyluminaria-smoke |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |

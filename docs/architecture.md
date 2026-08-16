@@ -64,8 +64,20 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   （底色变了、直出之后合成缓冲整个失效）。
   跨帧不保存任何窗口信息，只保存**内存**（所有 vector 只清空不释放，摆位的不透明区是指向
   帧内 arena 的下标区间而不是 `Region` 拷贝）、damage 债务，以及上一帧那串摆位的比较键。
+  `Frame::place_rect(x, y, w, h, color)` 把纯色矩形作为与表面同 z 序的图元摆进来：
+  不命中、不报 damage，移动 / 换色由同一个摆位 diff 恢复；GPU 侧走无纹理的 solid
+  pipeline（`GpuTextureFill::solid`），与表面共用遮挡剔除与 damage scissor。
+  帧回调的批量发送也是外壳层的：`Frame::send_frame_done(time)` 对本帧摆位里的全部表面
+  按同一时间戳发 `wl_surface.frame`，`Presented::unchanged` 分支同样用它补发。
   另有 `OutputLayout`（输出在全局坐标系里的位置，逻辑单位）与 `DirectScanout`（全屏单窗口
   免合成的直出决策）。
+
+  没有 Vulkan 时，同一套图元语义由 **CPU 合成器** 提供：`CpuCompositor`（核心模块，
+  headless / 嵌套 / 测试通用）把一棵表面树（含 subsurface、buffer scale / transform /
+  viewport）与 `RectFill` 纯色矩形按 z 序混合进 CPU RGBA buffer，预乘 alpha source-over。
+  它的图元列表 `CpuItem = variant<RectFill, CpuView>` 是立即模式的——每帧现搭、用完即弃，
+  身份是代际 `SurfaceId`，误留的列表只会解析失败、不会悬空。非 `Frame` 的混成器用自由函数
+  `send_frame_done(ids, time)` 批量答帧回调。
 
 ## 一帧长什么样
 
@@ -85,6 +97,8 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   偏移一律用 `surface_width()/surface_height()`；只有真的要碰像素时才用 `buffer_width()`。
 - **帧回调是混成器的责任。** `wl_surface.frame` **不**在 commit 时应答——那样客户端会画出
   永远不上屏的帧。它攒着，直到混成器在 `Output::present` 里调 `Surface::send_frame_done()`。
+  批量版本 `Frame::send_frame_done(time)` / `send_frame_done(ids, time)` 把"本帧画过的
+  全部表面、同一个时间戳"收成一次调用。
   忘了调，所有客户端画完第一帧就冻住。damage 同理：`Surface::damage()` 一直累积到
   `clear_damage()`。
   **`submit()` 答 `unchanged` 时没有 `present`**——这一帧没提交，也就没有翻页可等。那次
@@ -109,10 +123,10 @@ src/luminaria.cppm       基础接口单元（协议 + core + 嵌套/headless）
 src/luminaria.gpu.cppm   Vulkan / DRM / libinput / session / GPU 协议
 src/luminaria.desktop.cppm  workspace / foreign-toplevel / data-control
 src/core/                display event_loop expected handle signal
-src/util/                box color dmabuf pixel rect_fill region transform
+src/util/                box color dmabuf keymap pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
-src/render/              vulkan cursor_theme + quad.{vert,frag}
-src/shell/               frame output_layout direct_scanout
+src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
+src/shell/               cpu_compositor frame output_layout direct_scanout
 src/protocol/            30 个 Wayland global，一个一文件
 src/xwayland/            `luminaria.xwayland`，X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件

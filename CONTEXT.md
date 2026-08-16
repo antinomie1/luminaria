@@ -25,6 +25,12 @@ _Avoid_: 布局（"布局"在本库里专指 `OutputLayout`，即输出在全局
 
 **合成 (Compositing)**：
 把多个表面的像素混合进一块渲染目标这一步，由渲染器完成。不是"混成器"这个程序的同义词。
+有两条路径：GPU（`Frame`，零拷贝）与 CPU（`CpuCompositor`，无 GPU 时用）。
+_Avoid_: 混成器
+
+**帧回调 (Frame callback)**：
+`wl_surface.frame` 的应答——"你画的那帧上屏了，可以画下一帧"。不在 commit 时发，
+由混成器在 present（或 `unchanged`）时批量发，见「节拍」。
 
 **摆位 (Placement)**：
 一次"把某个表面画在这里、这么大、带这个变换"的记录。混成器每帧现搭一串摆位交给外壳层。
