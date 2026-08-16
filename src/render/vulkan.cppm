@@ -14,6 +14,7 @@ module;
 #include <vulkan/vulkan_raii.hpp>
 #include "quad_frag_spv.h"
 #include "quad_vert_spv.h"
+#include "solid_frag_spv.h"
 
 export module luminaria.gpu:vulkan;
 
@@ -247,6 +248,14 @@ struct GpuTextureFill {
     /// nothing, so leave that empty, or the occlusion pass will cull what should
     /// be showing through.
     float alpha = 1.0f;
+
+    /// Solid fill: when set, this quad paints `color` instead of sampling
+    /// `texture` (which must then be null). Compositor-owned rectangles —
+    /// borders, masks, cursor backdrops. The colour is straight alpha;
+    /// pre-multiplication happens here, and a solid fill never culls what is
+    /// behind it (correct, and cheaper than the alternative).
+    bool solid = false;
+    Color color{};
 };
 
 /// How an output's logical coordinates map onto its framebuffer: the integer
@@ -493,6 +502,7 @@ struct QuadPipeline {
     vk::raii::RenderPass load_pass;  // partial repaint: keep what is there
     vk::raii::RenderPass clear_pass; // full repaint: contents are undefined
     vk::raii::Pipeline pipeline;
+    vk::raii::Pipeline solid; // solid-colour quads: no descriptor binding
 };
 
 /// Renderer-owned so a pipeline cannot die while an asynchronous submit still
@@ -1808,11 +1818,6 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
 
     vk::raii::ShaderModule vert{
         device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadVertSpv), kQuadVertSpv}};
-    vk::raii::ShaderModule frag{
-        device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadFragSpv), kQuadFragSpv}};
-    const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
-        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
-        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag, "main"}};
 
     vk::PipelineVertexInputStateCreateInfo vertex_input{}; // positions come from push constants
     vk::PipelineInputAssemblyStateCreateInfo assembly{{}, vk::PrimitiveTopology::eTriangleStrip};
@@ -1841,13 +1846,27 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
     vk::raii::RenderPass load_pass = make_pass(device, format, true);
     vk::raii::RenderPass clear_pass = make_pass(device, format, false);
 
-    vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr, &viewport,
-                                        &raster, &multisample, nullptr, &blending, &dynamic,
-                                        *layout, *clear_pass, 0};
-    vk::raii::Pipeline pipeline{device, nullptr, info};
+    // One factory for both fragment stages: the textured quad and the
+    // solid-colour quad share every fixed-function state and the push block,
+    // differing only in the shader. The solid one's shader has no sampler, so
+    // it never binds a descriptor set.
+    auto make = [&](const std::uint32_t* spv, std::size_t size) {
+        vk::raii::ShaderModule frag{device, vk::ShaderModuleCreateInfo{{}, size, spv}};
+        const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
+            vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
+            vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag,
+                                              "main"}};
+        vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr,
+                                            &viewport, &raster, &multisample, nullptr, &blending,
+                                            &dynamic, *layout, *clear_pass, 0};
+        return vk::raii::Pipeline{device, nullptr, info};
+    };
+    vk::raii::Pipeline pipeline = make(kQuadFragSpv, sizeof(kQuadFragSpv));
+    vk::raii::Pipeline solid = make(kSolidFragSpv, sizeof(kSolidFragSpv));
 
     pipelines.push_back(QuadPipeline{format, std::move(layout), std::move(load_pass),
-                                     std::move(clear_pass), std::move(pipeline)});
+                                     std::move(clear_pass), std::move(pipeline),
+                                     std::move(solid)});
     return pipelines.back();
 }
 
@@ -2360,13 +2379,16 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
         covered.clear();
         for (size_t i = textures.size(); i-- > 0;) {
             const GpuTextureFill& tf = textures[i];
-            if (tf.texture == nullptr || tf.w <= 0 || tf.h <= 0) {
+            if ((tf.texture == nullptr && !tf.solid) || tf.w <= 0 || tf.h <= 0) {
                 continue;
             }
             const Box texture_box = coverage_of(tf);
             visible[i] = repaint;
             visible[i].intersect(texture_box);
             visible[i].subtract(covered);
+            if (tf.solid) {
+                continue; // a solid rect never hides what is behind it
+            }
             // Clipped to the destination rect box by box: a Region copy here
             // would be one heap allocation per texture per frame.
             for (const Box& b : tf.opaque) {
@@ -2498,48 +2520,62 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             if (visible[i].empty()) {
                 continue; // fully occluded, off-screen, or outside the damage
             }
-            const GpuTexture::Impl& tex = *tf.texture->impl_;
 
             // The quad covers the whole destination rect; the scissor does the
             // clipping. The source is sampled through the buffer transform folded
             // into the output's, so one draw handles both rotations.
             const FloatBox dev = transform_float_box(
                 transform, scale, FloatBox{tf.x, tf.y, tf.w, tf.h}, device_w, device_h);
-            const auto uv =
-                corner_uvs(transform_compose(transform, tf.transform), tf.u0, tf.v0, tf.u1, tf.v1);
             QuadPush push{};
             push.rect[0] = 2.0f * dev.x / static_cast<float>(device_w) - 1.0f;
             push.rect[1] = 2.0f * dev.y / static_cast<float>(device_h) - 1.0f;
             push.rect[2] = 2.0f * (dev.x + dev.width) / static_cast<float>(device_w) - 1.0f;
             push.rect[3] = 2.0f * (dev.y + dev.height) / static_cast<float>(device_h) - 1.0f;
-            push.uv01[0] = uv[0][0];
-            push.uv01[1] = uv[0][1];
-            push.uv01[2] = uv[1][0];
-            push.uv01[3] = uv[1][1];
-            push.uv23[0] = uv[2][0];
-            push.uv23[1] = uv[2][1];
-            push.uv23[2] = uv[3][0];
-            push.uv23[3] = uv[3][1];
-            push.alpha = tf.alpha;
 
-            // Written once per texture, then only bound. The same window drawn
-            // every frame costs one bindDescriptorSets and nothing else.
-            if (!tex.set) {
-                tex.set = impl_->acquire_set();
-                tex.owner = impl_.get();
-                vk::DescriptorImageInfo image_info{**impl_->sampler, *tex.view,
-                                                   vk::ImageLayout::eShaderReadOnlyOptimal};
-                device.updateDescriptorSets(
-                    vk::WriteDescriptorSet{tex.set, 0, 0,
-                                           vk::DescriptorType::eCombinedImageSampler, image_info},
-                    {});
+            if (tf.solid) {
+                // Solid rectangle: no texture, no descriptor binding. The colour
+                // is pre-multiplied here to feed the fixed-function blend, and
+                // carried where the fragment stage reads it.
+                push.uv01[0] = tf.color.r * tf.color.a;
+                push.uv01[1] = tf.color.g * tf.color.a;
+                push.uv01[2] = tf.color.b * tf.color.a;
+                push.alpha = tf.color.a;
+                cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *quad.solid);
+            } else {
+                const GpuTexture::Impl& tex = *tf.texture->impl_;
+                const auto uv = corner_uvs(transform_compose(transform, tf.transform), tf.u0,
+                                           tf.v0, tf.u1, tf.v1);
+                push.uv01[0] = uv[0][0];
+                push.uv01[1] = uv[0][1];
+                push.uv01[2] = uv[1][0];
+                push.uv01[3] = uv[1][1];
+                push.uv23[0] = uv[2][0];
+                push.uv23[1] = uv[2][1];
+                push.uv23[2] = uv[3][0];
+                push.uv23[3] = uv[3][1];
+                push.alpha = tf.alpha;
+
+                // Written once per texture, then only bound. The same window
+                // drawn every frame costs one bindDescriptorSets and nothing else.
+                if (!tex.set) {
+                    tex.set = impl_->acquire_set();
+                    tex.owner = impl_.get();
+                    vk::DescriptorImageInfo image_info{**impl_->sampler, *tex.view,
+                                                       vk::ImageLayout::eShaderReadOnlyOptimal};
+                    device.updateDescriptorSets(
+                        vk::WriteDescriptorSet{tex.set, 0, 0,
+                                               vk::DescriptorType::eCombinedImageSampler,
+                                               image_info},
+                        {});
+                }
+                const FragmentShader* shader = shaders.empty() ? nullptr : shaders[i];
+                vk::raii::Pipeline& pipeline = shader != nullptr
+                                                    ? impl_->effect_pipeline(*shader, quad)
+                                                    : quad.pipeline;
+                cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+                cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0, tex.set,
+                                       {});
             }
-            const FragmentShader* shader = shaders.empty() ? nullptr : shaders[i];
-            vk::raii::Pipeline& pipeline = shader != nullptr
-                                                ? impl_->effect_pipeline(*shader, quad)
-                                                : quad.pipeline;
-            cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0, tex.set, {});
             cmd.pushConstants<QuadPush>(*quad.layout,
                                         vk::ShaderStageFlagBits::eVertex |
                                             vk::ShaderStageFlagBits::eFragment,

@@ -295,16 +295,19 @@ int main() {
             // --- steady-state cost ------------------------------------------
             // Rebuilding the list must allocate nothing at all: the vectors are
             // cleared, not freed. One warm-up round to let them reach their
-            // size, then the count has to stay put.
+            // size, then the count has to stay put. A solid rectangle is a
+            // placement like any other, so it is part of the budget.
             for (int i = 0; i < 4; ++i) {
                 frame.begin(view);
                 frame.place(*parent, kWinX, kWinY);
+                frame.place_rect(1, 1, 8, 8, luminaria::Color{1, 1, 1, 1});
             }
             const std::size_t before = g_allocs.load(std::memory_order_relaxed);
             assert(before > 0); // the operator new replacement really is live
             for (int i = 0; i < 16; ++i) {
                 frame.begin(view);
                 frame.place(*parent, kWinX, kWinY);
+                frame.place_rect(1, 1, 8, 8, luminaria::Color{1, 1, 1, 1});
                 double hx = 0, hy = 0;
                 (void)frame.surface_at(kWinX + 1, kWinY + 1, hx, hy);
             }
@@ -356,6 +359,31 @@ int main() {
             auto forced = frame.submit(luminaria::Color{0, 0, 1, 1});
             assert(forced.has_value());
             assert(*forced == luminaria::Presented::composited);
+
+            // --- a compositor-owned solid rectangle -------------------------
+            // place_rect is a primitive like any placement: it draws in list
+            // order (here behind the window), is not hit-testable, and a change
+            // to it is recovered by the placement diff.
+            frame.begin(view);
+            frame.place_rect(1, 1, 8, 8, luminaria::Color{1, 1, 1, 1});
+            frame.place(*parent, kWinX, kWinY);
+            auto solids = frame.submit(luminaria::Color{0, 0, 1, 1});
+            assert(solids.has_value());
+            assert(*solids == luminaria::Presented::composited);
+            // Inside the rectangle, outside the window: the solid colour.
+            assert((output.last_frame()[1 * kOutW + 1] == luminaria::Pixel{255, 255, 255, 255}));
+            // The window sits above it where they overlap.
+            assert((output.last_frame()[(kWinY + 1) * kOutW + kWinX + 1] ==
+                    luminaria::Pixel{255, 0, 0, 255}));
+            // Changing the rectangle's colour repaints exactly its box, found by
+            // the diff — no client reported anything.
+            frame.begin(view);
+            frame.place_rect(1, 1, 8, 8, luminaria::Color{0, 1, 1, 1});
+            frame.place(*parent, kWinX, kWinY);
+            auto recoloured = frame.submit(luminaria::Color{0, 0, 1, 1});
+            assert(recoloured.has_value());
+            assert(*recoloured == luminaria::Presented::composited);
+            assert((output.last_frame()[1 * kOutW + 1] == luminaria::Pixel{0, 255, 255, 255}));
         }));
     });
 

@@ -514,10 +514,13 @@ int main() {
                 return;
             }
             build_placements(*po.frame, pe.output);
+            // Frame callbacks are the compositor's job, and one stamp for the
+            // whole batch is the point: every client that drew this frame paces
+            // to the same presentation.
+            po.frame->send_frame_done(pe.time_ms());
             for (const luminaria::Placement& p : po.frame->placements()) {
                 if (luminaria::Surface* surface = luminaria::surface_from_id(p.surface);
                     surface != nullptr) {
-                    surface->send_frame_done(pe.time_ms());
                     presentation.notify_presented(*surface, pe);
                 }
             }
@@ -555,13 +558,7 @@ int main() {
                         clock_gettime(CLOCK_MONOTONIC, &now);
                         const auto time_ms = static_cast<std::uint32_t>(
                             now.tv_sec * 1000 + now.tv_nsec / 1000000);
-                        for (const luminaria::Placement& p : po.frame->placements()) {
-                            if (luminaria::Surface* surface =
-                                    luminaria::surface_from_id(p.surface);
-                                surface != nullptr) {
-                                surface->send_frame_done(time_ms);
-                            }
-                        }
+                        po.frame->send_frame_done(time_ms);
                     }
                     return;
                 } else {

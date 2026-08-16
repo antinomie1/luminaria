@@ -120,7 +120,8 @@ target("luminaria")
               "src/protocol/text_input.cppm", "src/protocol/viewporter.cppm",
               "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
               "src/protocol/xdg_shell.cppm", {public = true})
-    add_files("src/render/cursor_theme.cppm", "src/shell/output_layout.cppm", {public = true})
+    add_files("src/render/cursor_theme.cppm", "src/shell/cpu_compositor.cppm",
+              "src/shell/output_layout.cppm", {public = true})
     -- for detail/wayland_fwd.h, included in the units' GMF
     add_includedirs("src", {public = true})
     add_packages(base_packages, {public = true})
@@ -238,6 +239,7 @@ target("luminaria-gpu")
         -- os.scriptdir() for the same reason as the protocol scanner above.
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
+                                 {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
             local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
@@ -257,6 +259,7 @@ target("luminaria-gpu")
         end
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
+                                 {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
             local dst = path.join(os.scriptdir(), "build", "generated", shader[3])

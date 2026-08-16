@@ -82,6 +82,14 @@ struct Placement {
     /// one texture placement instead.
     bool draw = true;
 
+    /// Solid rectangle: when set, this placement paints `color` instead of a
+    /// surface or texture (which must then be absent). Compositor-owned —
+    /// borders, masks, cursor backdrops. Not hit-testable, and it participates
+    /// in the placement diff like any other primitive, so moving it or changing
+    /// its colour costs exactly the two rectangles.
+    bool solid = false;
+    Color color{};
+
     /// The opaque region, in layout coordinates, as `[first, first+count)` in
     /// the frame's arena — ask `Frame::opaque_of()`. It lives here as a pair of
     /// indices rather than a `Region` because a `Region` per surface per frame
@@ -234,6 +242,14 @@ public:
     void place(const GpuTexture& texture, const PlacementTransform& transform,
                const FragmentShader& shader);
 
+    /// Place a solid rectangle the compositor owns — a background panel, a
+    /// border, a mask, a cursor backdrop. It is not hit-testable and reports no
+    /// damage of its own; moving it or changing its colour is nevertheless
+    /// picked up, because `submit()` diffs this frame's list against the last
+    /// one it drew. It sits in the z-order like anything else: place it where
+    /// it belongs among the surfaces.
+    void place_rect(int x, int y, int width, int height, Color color);
+
     /// Draw the x-ray blur cache only under the blur regions a surface tree
     /// declared through ext-background-effect-v1. Call immediately before the
     /// ordinary `place(surface, x, y)`: these texture placements are part of
@@ -342,6 +358,14 @@ public:
     /// its buffer back. Frame callbacks and presentation feedback stay the
     /// compositor's job — it knows which surfaces are its own.
     void presented();
+
+    /// Batch-send frame callbacks to every surface in this frame's placement
+    /// list at one `time_ms` stamp — the `Surface::send_frame_done()` loop a
+    /// present handler would otherwise write by hand. Call it from the
+    /// `present` handler, and again when `submit()` answers
+    /// `Presented::unchanged`, because that frame never presents. Surfaces
+    /// that died since `begin()` are skipped.
+    void send_frame_done(std::uint32_t time_ms) const;
 
     /// The frame that is on screen now, read back as tightly-packed RGBA
     /// pixels, `output.width() * output.height()` of them. This is what
@@ -461,6 +485,8 @@ struct FrPlacementKey {
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
     float alpha = 1.0f;
     bool draw = true;
+    bool solid = false;
+    Color color{};
 
     // Member and not a hidden friend: a defaulted hidden-friend operator== in a
     // module interface ICEs gcc 16.
@@ -469,7 +495,8 @@ struct FrPlacementKey {
                box.x == other.box.x && box.y == other.box.y && box.width == other.box.width &&
                box.height == other.box.height && transform == other.transform &&
                u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1 &&
-               alpha == other.alpha && draw == other.draw;
+               alpha == other.alpha && draw == other.draw && solid == other.solid &&
+               color == other.color;
     }
 };
 
@@ -578,6 +605,8 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p, std::size_t placement) co
     key.v1 = p.v1;
     key.alpha = p.alpha;
     key.draw = p.draw;
+    key.solid = p.solid;
+    key.color = p.color;
     return key;
 }
 
@@ -590,7 +619,7 @@ void Frame::Impl::diff_damage() {
     // Anything that differs damages both rectangles — where it was and where it
     // is — because both have to be repainted: one to reveal what was behind it,
     // one to draw it. A placement carrying no texture drew nothing, so that side
-    // contributes no box.
+    // contributes no box — unless it is a solid rectangle, which drew a colour.
     const std::size_t n = std::max(placements.size(), last.size());
     for (std::size_t i = 0; i < n; ++i) {
         const bool had = i < last.size();
@@ -599,10 +628,10 @@ void Frame::Impl::diff_damage() {
         if (had && has && last[i] == now) {
             continue; // unchanged: only this surface's own damage applies
         }
-        if (had && last[i].texture != nullptr) {
+        if (had && (last[i].texture != nullptr || last[i].solid)) {
             damage.push_back(last[i].box);
         }
-        if (has && now.texture != nullptr) {
+        if (has && (now.texture != nullptr || now.solid)) {
             damage.push_back(now.box);
         }
     }
@@ -977,6 +1006,24 @@ void Frame::place(const GpuTexture& texture, const PlacementTransform& transform
     }
 }
 
+void Frame::place_rect(int x, int y, int width, int height, Color color) {
+    Impl& impl = *impl_;
+    const Box box{x, y, width, height};
+    // Nothing of it lands on this output: not drawn, and not hit-testable here
+    // either — the pointer is somewhere else entirely.
+    if (box.empty() || impl.view.intersection(box).empty()) {
+        return;
+    }
+    Placement p{};
+    p.solid = true;
+    p.color = color;
+    p.x = static_cast<float>(x);
+    p.y = static_cast<float>(y);
+    p.width = static_cast<float>(width);
+    p.height = static_cast<float>(height);
+    impl.placements.push_back(p);
+}
+
 void Frame::place_xray_blur(const GpuTexture& texture, const Box& background,
                             Surface& surface, int x, int y) {
     Impl& impl = *impl_;
@@ -1208,6 +1255,14 @@ void Frame::presented() {
     }
 }
 
+void Frame::send_frame_done(std::uint32_t time_ms) const {
+    for (const Placement& p : impl_->placements) {
+        if (Surface* surface = surface_from_id(p.surface); surface != nullptr) {
+            surface->send_frame_done(time_ms);
+        }
+    }
+}
+
 Result<Presented> Frame::submit(Color background) {
     Impl& impl = *impl_;
     Output& output = *impl.output;
@@ -1325,6 +1380,20 @@ Result<Presented> Frame::submit(Color background) {
             // destroyed it after begin(); do not retain a texture pointer from
             // an earlier submit of the same placement list.
             p.texture = surface != nullptr ? impl.texture_for(*surface) : nullptr;
+        }
+        if (p.solid) {
+            // Compositor-owned rectangle: a fill with no texture, drawn in list
+            // order like any other placement.
+            GpuTextureFill fill{};
+            fill.solid = true;
+            fill.color = p.color;
+            fill.x = p.x - impl.view.x;
+            fill.y = p.y - impl.view.y;
+            fill.w = p.width;
+            fill.h = p.height;
+            impl.fills.push_back(fill);
+            impl.fill_shaders.push_back(nullptr);
+            continue;
         }
         if (p.texture == nullptr) {
             continue;

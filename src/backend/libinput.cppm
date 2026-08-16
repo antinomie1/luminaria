@@ -9,7 +9,9 @@
 // The backend also owns an xkb state machine, because libinput reports keycodes
 // and nothing else: whether Shift is down is a question only the keymap can
 // answer. Hand `keymap()` to `Seat::set_keymap()` and the modifier masks emitted
-// here are computed against the same layout the clients were told about.
+// here are computed against the same layout the clients were told about. The
+// machine itself is a `KeymapState` — the same object a compositor reads
+// keysyms off, so bindings and masks can never disagree with what is sent.
 //
 // SAFETY: create() only builds the context; start() opens the devices (and thus
 // grabs input). Never call start() under another compositor or you steal input.
@@ -79,6 +81,12 @@ public:
     /// friends select, which is what the user configured for the console.
     [[nodiscard]] const std::string& keymap() const noexcept;
 
+    /// The backend's live keyboard state — kept up to date by every key event,
+    /// so read keysyms and modifier masks off it rather than re-feeding the key
+    /// signal into a second xkb state that could drift from the one clients are
+    /// told about.
+    [[nodiscard]] const KeymapState& keymap_state() const noexcept;
+
     /// What the currently open devices can do. Empty until `start()`, then kept
     /// up to date as devices come and go.
     [[nodiscard]] InputCapabilities capabilities() const noexcept;
@@ -110,6 +118,9 @@ private:
 namespace luminaria {
 
 struct LibinputBackend::Impl {
+    Impl(EventLoop loop_, Session* session_, KeymapState keymap_)
+        : loop(loop_), session(session_), keymap(std::move(keymap_)) {}
+
     EventLoop loop;
     udev* udev_ctx = nullptr; // null on a path context
     libinput* li = nullptr;
@@ -124,11 +135,9 @@ struct LibinputBackend::Impl {
     Signal<SessionActive>::Connection session_conn;
 
     // The keymap is ours, not libinput's: libinput reports keycodes and the
-    // xkb state machine turns the modifier keys among them into masks.
-    xkb_context* xkb_ctx = nullptr;
-    xkb_keymap* xkb_map = nullptr;
-    xkb_state* xkb = nullptr;
-    std::string keymap_text;
+    // xkb state machine turns the modifier keys among them into masks. It is a
+    // KeymapState — RAII, and shared with the compositor via keymap_state().
+    KeymapState keymap;
     ModifiersEvent last_mods{};
 
     // Devices are counted rather than OR'd, so unplugging the mouse while a
@@ -157,50 +166,16 @@ struct LibinputBackend::Impl {
         if (udev_ctx != nullptr) {
             udev_unref(udev_ctx);
         }
-        reset_keymap();
-    }
-
-    void reset_keymap() {
-        if (xkb != nullptr) {
-            xkb_state_unref(xkb);
-            xkb = nullptr;
-        }
-        if (xkb_map != nullptr) {
-            xkb_keymap_unref(xkb_map);
-            xkb_map = nullptr;
-        }
-        if (xkb_ctx != nullptr) {
-            xkb_context_unref(xkb_ctx);
-            xkb_ctx = nullptr;
-        }
-    }
-
-    /// Adopt `map` (ownership taken) plus a fresh state for it. The pressed-key
-    /// state is deliberately NOT carried over: masks from the old layout mean
-    /// nothing under the new one, and clients get told the truth on the next key.
-    void adopt_keymap(xkb_context* ctx, xkb_keymap* map, std::string text) {
-        reset_keymap();
-        xkb_ctx = ctx;
-        xkb_map = map;
-        xkb = xkb_state_new(map);
-        keymap_text = std::move(text);
-        last_mods = ModifiersEvent{};
     }
 
     void update_modifiers() {
-        if (xkb == nullptr) {
+        ModifiersEvent now = keymap.modifiers();
+        if (now.depressed == last_mods.depressed && now.latched == last_mods.latched &&
+            now.locked == last_mods.locked && now.group == last_mods.group) {
             return;
         }
-        ModifiersEvent e{xkb_state_serialize_mods(xkb, XKB_STATE_MODS_DEPRESSED),
-                         xkb_state_serialize_mods(xkb, XKB_STATE_MODS_LATCHED),
-                         xkb_state_serialize_mods(xkb, XKB_STATE_MODS_LOCKED),
-                         xkb_state_serialize_layout(xkb, XKB_STATE_LAYOUT_EFFECTIVE)};
-        if (e.depressed == last_mods.depressed && e.latched == last_mods.latched &&
-            e.locked == last_mods.locked && e.group == last_mods.group) {
-            return;
-        }
-        last_mods = e;
-        modifiers.emit(e);
+        last_mods = now;
+        modifiers.emit(now);
     }
 
     void device_added(libinput_device* device) {
@@ -240,11 +215,8 @@ struct LibinputBackend::Impl {
         key.emit(e);
         // After the key, the way wl_keyboard is specified: the mask applies to
         // what the user types NEXT, not to the modifier key itself.
-        if (xkb != nullptr) {
-            // evdev codes sit 8 below xkb's.
-            xkb_state_update_key(xkb, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
-            update_modifiers();
-        }
+        keymap.update_key(code, pressed);
+        update_modifiers();
     }
 
     void handle_scroll(libinput_event* event, libinput_event_type type) {
@@ -354,47 +326,17 @@ void close_restricted(int fd, void* data) {
 }
 constexpr libinput_interface kInterface{open_restricted, close_restricted};
 
-/// The layout the console is configured for: xkb reads XKB_DEFAULT_LAYOUT and
-/// friends when the names are all null. `Seat::create()` builds the same one,
-/// so the two agree until someone changes either.
-bool default_keymap(xkb_context*& ctx, xkb_keymap*& map, std::string& text) {
-    ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (ctx == nullptr) {
-        return false;
-    }
-    map = xkb_keymap_new_from_names(ctx, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if (map == nullptr) {
-        xkb_context_unref(ctx);
-        ctx = nullptr;
-        return false;
-    }
-    std::unique_ptr<char, decltype(&std::free)> as_text{
-        xkb_keymap_get_as_string(map, XKB_KEYMAP_FORMAT_TEXT_V1), std::free};
-    if (!as_text) {
-        xkb_keymap_unref(map);
-        xkb_context_unref(ctx);
-        map = nullptr;
-        ctx = nullptr;
-        return false;
-    }
-    text = as_text.get();
-    return true;
-}
-
-/// The half of construction both context flavours share. Null means the keymap
-/// would not compile, which is the only way this can fail.
+/// The half of construction both context flavours share. The keymap is the
+/// environment default — the layout the console is configured for — which is
+/// what Seat::create() sends to clients, so the two agree until someone
+/// changes either. Null means the keymap would not compile, the only way this
+/// can fail.
 std::unique_ptr<LibinputBackend::Impl> make_impl(EventLoop loop, Session* session) {
-    xkb_context* ctx = nullptr;
-    xkb_keymap* map = nullptr;
-    std::string text;
-    if (!default_keymap(ctx, map, text)) {
+    auto keymap = KeymapState::from_layout();
+    if (!keymap) {
         return nullptr;
     }
-    auto impl = std::make_unique<LibinputBackend::Impl>();
-    impl->loop = loop;
-    impl->session = session;
-    impl->adopt_keymap(ctx, map, std::move(text));
-    return impl;
+    return std::make_unique<LibinputBackend::Impl>(loop, session, std::move(*keymap));
 }
 
 } // namespace
@@ -473,25 +415,23 @@ Status LibinputBackend::start() {
 }
 
 bool LibinputBackend::set_keymap(const std::string& xkb_text) {
-    if (xkb_text.empty() || xkb_text == impl_->keymap_text) {
+    if (xkb_text.empty() || xkb_text == impl_->keymap.text()) {
         return !xkb_text.empty();
     }
-    xkb_context* ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (ctx == nullptr) {
-        return false;
-    }
-    xkb_keymap* map = xkb_keymap_new_from_string(ctx, xkb_text.c_str(),
-                                                 XKB_KEYMAP_FORMAT_TEXT_V1,
-                                                 XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if (map == nullptr) {
-        xkb_context_unref(ctx);
+    auto fresh = KeymapState::from_text(xkb_text);
+    if (!fresh) {
         return false; // the old layout stays
     }
-    impl_->adopt_keymap(ctx, map, xkb_text);
+    // The pressed-key state is deliberately NOT carried over: masks from the
+    // old layout mean nothing under the new one, and clients get told the truth
+    // on the next key.
+    impl_->keymap = std::move(*fresh);
     return true;
 }
 
-const std::string& LibinputBackend::keymap() const noexcept { return impl_->keymap_text; }
+const std::string& LibinputBackend::keymap() const noexcept { return impl_->keymap.text(); }
+
+const KeymapState& LibinputBackend::keymap_state() const noexcept { return impl_->keymap; }
 
 InputCapabilities LibinputBackend::capabilities() const noexcept { return impl_->caps; }
 

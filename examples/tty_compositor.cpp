@@ -768,11 +768,11 @@ int main(int argc, char** argv) {
             // screen and its client can have it back.
             screen.frame->presented();
             build_placements(screen);
+            screen.frame->send_frame_done(pe.time_ms());
             for (const luminaria::Placement& placement : screen.frame->placements()) {
                 if (luminaria::Surface* surface =
                         luminaria::surface_from_id(placement.surface);
                     surface != nullptr) {
-                    surface->send_frame_done(pe.time_ms());
                     presentation->notify_presented(*surface, pe);
                 }
             }
@@ -805,13 +805,7 @@ int main(int argc, char** argv) {
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 const auto time_ms = static_cast<std::uint32_t>(
                     now.tv_sec * 1000 + now.tv_nsec / 1000000);
-                for (const luminaria::Placement& placement : screen.frame->placements()) {
-                    if (luminaria::Surface* surface =
-                            luminaria::surface_from_id(placement.surface);
-                        surface != nullptr) {
-                        surface->send_frame_done(time_ms);
-                    }
-                }
+                screen.frame->send_frame_done(time_ms);
             }
         });
     });

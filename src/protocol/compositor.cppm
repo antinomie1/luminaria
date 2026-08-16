@@ -495,6 +495,15 @@ private:
 /// Resolve a generational id, or null once that exact Surface has gone away.
 [[nodiscard]] Surface* surface_from_id(SurfaceId id) noexcept;
 
+/// Batch-send frame callbacks: fire `wl_surface.frame` for every surface in
+/// `surfaces` at one CLOCK_MONOTONIC `time_ms` stamp. Call once the frame the
+/// surfaces contributed to has actually been presented — pacing clients to
+/// the display is the whole point — and again when nothing was presented
+/// (`Presented::unchanged`), so a client that committed without damaging
+/// anything is not frozen waiting for a callback that never comes. Surfaces
+/// that died since the list was built resolve to nothing and are skipped.
+void send_frame_done(std::span<const SurfaceId> surfaces, std::uint32_t time_ms);
+
 /// Process-wide invalidation stream for generational surface identities.
 [[nodiscard]] Signal<SurfaceInvalidated>& surface_invalidated() noexcept;
 
@@ -613,6 +622,14 @@ Surface* surface_from_id(SurfaceId id) noexcept {
     }
     const SurfaceSlot& slot = registry.slots[id.index];
     return slot.generation == id.generation ? slot.surface : nullptr;
+}
+
+void send_frame_done(std::span<const SurfaceId> surfaces, std::uint32_t time_ms) {
+    for (const SurfaceId id : surfaces) {
+        if (Surface* surface = surface_from_id(id); surface != nullptr) {
+            surface->send_frame_done(time_ms);
+        }
+    }
 }
 
 Signal<SurfaceInvalidated>& surface_invalidated() noexcept {
