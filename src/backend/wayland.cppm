@@ -11,15 +11,9 @@
 
 module;
 
-#include <memory>
-#include <string>
 
-#include <span>
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <utility>
-#include <vector>
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -30,6 +24,8 @@ module;
 #include "xdg-shell-client-protocol.h"
 
 export module luminaria:wayland;
+
+import std;
 
 import :backend;
 import :color;

@@ -24,21 +24,17 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <functional>
-#include <memory>
 
-#include <algorithm>
 #include <cstdint>
-#include <string>
 #include <typeinfo>
-#include <utility>
-#include <vector>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "wlr-data-control-unstable-v1-protocol.h"
 
 export module luminaria.desktop:data_control;
+
+import std;
 
 import luminaria;
 

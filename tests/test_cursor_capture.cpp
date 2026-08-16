@@ -18,8 +18,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -33,6 +31,7 @@
 #include "ext-image-copy-capture-v1-client-protocol.h"
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

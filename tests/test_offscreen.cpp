@@ -19,11 +19,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
 
 #include <drm_fourcc.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

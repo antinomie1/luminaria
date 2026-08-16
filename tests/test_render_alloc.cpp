@@ -13,15 +13,11 @@
 // why it is worth pinning the part we do control.)
 //
 // Skips (77) without a Vulkan device.
-#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <new>
-#include <span>
-#include <vector>
 
 #include <poll.h>
 #include <unistd.h>
@@ -29,6 +25,7 @@
 #include <drm_fourcc.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 std::atomic<std::size_t> g_allocs{0};

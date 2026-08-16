@@ -11,12 +11,8 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <functional>
 #include <typeinfo>
-#include <memory>
-#include <vector>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <ctime>
@@ -30,6 +26,8 @@ module;
 #include "ext-image-capture-source-v1-protocol.h"
 
 export module luminaria.gpu:screencopy;
+
+import std;
 
 import luminaria;
 import :linux_dmabuf;

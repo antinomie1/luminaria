@@ -15,16 +15,15 @@
 module;
 
 #include <cstddef>
-#include <memory>
 
-#include <algorithm>
 #include <typeinfo>
-#include <vector>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "idle-inhibit-unstable-v1-protocol.h"
 
 export module luminaria:idle_inhibit;
+
+import std;
 
 import :compositor;
 import :display;

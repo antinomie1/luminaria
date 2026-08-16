@@ -26,9 +26,10 @@ module;
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 
 export module luminaria:pixel_layout;
+
+import std;
 export namespace luminaria {
 
 /// Every format this library touches on the CPU (ARGB8888 / XRGB8888) is four

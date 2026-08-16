@@ -13,12 +13,12 @@
 
 module;
 
-#include <memory>
-#include <utility>
 
 #include <unistd.h>
 
 export module luminaria:handle;
+
+import std;
 export namespace luminaria {
 
 /// Deleter that invokes the free function `Fn` on a non-null pointer.

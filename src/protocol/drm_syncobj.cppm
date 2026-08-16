@@ -13,11 +13,9 @@
 
 module;
 
-#include <memory>
 
 #include <cstdint>
 #include <ctime>
-#include <string>
 #include <fcntl.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -25,6 +23,8 @@ module;
 #include "linux-drm-syncobj-v1-protocol.h"
 
 export module luminaria.gpu:drm_syncobj;
+
+import std;
 
 import luminaria;
 

@@ -1,5 +1,4 @@
 #include <typeinfo>
-#include <string>
 // Step 3: Xwayland bring-up. Launch Xwayland against our compositor, attach the
 // window manager, and assert the ready signal fires with a display name.
 // Skips (exit 77) if Xwayland can't start in this environment.
@@ -8,6 +7,7 @@
 #include <cstdlib>
 
 import luminaria.xwayland;
+import std;
 
 int main() {
     auto display = luminaria::Display::create();

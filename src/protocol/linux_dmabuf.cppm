@@ -17,14 +17,8 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
-#include <vector>
 
-#include <algorithm>
-#include <array>
 #include <cstring>
-#include <string>
-#include <utility>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -35,6 +29,8 @@ module;
 #include "linux-dmabuf-unstable-v1-protocol.h"
 
 export module luminaria.gpu:linux_dmabuf;
+
+import std;
 
 import luminaria;
 import :vulkan;

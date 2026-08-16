@@ -8,19 +8,9 @@
 module;
 
 #include <cstdint>
-#include <memory>
-#include <span>
-#include <vector>
 
-#include <algorithm>
-#include <array>
 #include <cstring>
 #include <cmath>
-#include <exception>
-#include <limits>
-#include <optional>
-#include <string>
-#include <utility>
 #include <unistd.h> // dup
 #include <drm_fourcc.h>
 #include <vulkan/vulkan_raii.hpp>
@@ -28,6 +18,8 @@ module;
 #include "quad_vert_spv.h"
 
 export module luminaria.gpu:vulkan;
+
+import std;
 
 import luminaria;
 

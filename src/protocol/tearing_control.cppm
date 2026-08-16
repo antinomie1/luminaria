@@ -10,13 +10,13 @@
 
 module;
 
-#include <memory>
 
-#include <utility>
 #include <wayland-server-core.h>
 #include "tearing-control-v1-protocol.h"
 
 export module luminaria:tearing_control;
+
+import std;
 
 import :compositor;
 import :display;

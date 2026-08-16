@@ -6,12 +6,11 @@
 // When the monitor offers a second mode, it is switched to and back: a modeset
 // is the one operation that invalidates every framebuffer at once, so the
 // interesting part is that the output keeps flipping afterwards.
-#include <algorithm>
 #include <cassert>
 #include <cstdio>
-#include <vector>
 
 import luminaria.gpu;
+import std;
 
 int main() {
     auto display = luminaria::Display::create();

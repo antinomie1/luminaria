@@ -11,16 +11,14 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <memory>
 
 #include <ctime>
-#include <map>
-#include <utility>
-#include <vector>
 #include <wayland-server-core.h>
 #include "presentation-time-protocol.h"
 
 export module luminaria:presentation_time;
+
+import std;
 
 import :compositor;
 import :display;

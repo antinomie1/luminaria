@@ -5,12 +5,9 @@
 
 module;
 
-#include <expected>
-#include <string>
-#include <string_view>
-#include <utility>
-
 export module luminaria:expected;
+
+import std;
 export namespace luminaria {
 
 /// A failure value. `code` is an optional errno-style hint (0 == none).

@@ -14,13 +14,13 @@
 module;
 
 #include <cstdint>
-#include <memory>
 
-#include <utility>
 #include <wayland-server-core.h>
 #include "content-type-v1-protocol.h"
 
 export module luminaria:content_type;
+
+import std;
 
 import :compositor;
 import :display;

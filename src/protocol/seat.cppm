@@ -13,15 +13,10 @@
 module;
 
 #include <cstdint>
-#include <functional>
 #include <typeinfo>
-#include <memory>
-#include <string>
 
-#include <algorithm>
 #include <cstring>
 #include <ctime>
-#include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -29,6 +24,8 @@ module;
 #include <xkbcommon/xkbcommon.h>
 
 export module luminaria:seat;
+
+import std;
 
 import :compositor;
 import :display;

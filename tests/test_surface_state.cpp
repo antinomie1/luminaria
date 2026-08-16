@@ -5,7 +5,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
-#include <thread>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -16,6 +15,7 @@
 #include <wayland-server-core.h>
 
 import luminaria;
+import std;
 
 namespace {
 

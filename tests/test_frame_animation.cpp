@@ -6,6 +6,7 @@
 #include <cstdio>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 // DRM_FORMAT_XRGB8888. Keep this test on the public C++ module surface rather

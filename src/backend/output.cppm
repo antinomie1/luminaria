@@ -8,11 +8,11 @@ module;
 
 #include <cstdint>
 #include <ctime>
-#include <span>
-#include <vector>
 #include <unistd.h> // close, for the fences that cross this interface
 
 export module luminaria:output;
+
+import std;
 
 import :box;
 import :color;

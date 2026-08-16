@@ -18,9 +18,10 @@
 module;
 
 #include <cstddef>
-#include <vector>
 
 export module luminaria:region;
+
+import std;
 
 import :box;
 

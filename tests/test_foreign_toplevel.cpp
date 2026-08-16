@@ -6,9 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -22,6 +19,7 @@
 #include "xdg-shell-client-protocol.h"
 
 import luminaria.desktop;
+import std;
 
 namespace {
 

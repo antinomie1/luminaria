@@ -15,17 +15,15 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <functional>
 #include <typeinfo>
-#include <memory>
-#include <string>
 
-#include <vector>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "xdg-output-unstable-v1-protocol.h"
 
 export module luminaria:output_global;
+
+import std;
 
 import :display;
 import :expected;

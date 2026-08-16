@@ -10,16 +10,12 @@
 // measurement happens.
 //
 // Skips (77) without a Vulkan device.
-#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <new>
-#include <thread>
-#include <vector>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -32,6 +28,7 @@
 #include <wayland-server-core.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

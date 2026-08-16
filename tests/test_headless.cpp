@@ -3,9 +3,9 @@
 // Validates Backend->new_output, the software frame pump, commit, and event-loop
 // integration end to end — no GPU. Solid color stands in for a rendered buffer.
 #include <cassert>
-#include <vector>
 
 import luminaria;
+import std;
 
 int main() {
     auto display = luminaria::Display::create();

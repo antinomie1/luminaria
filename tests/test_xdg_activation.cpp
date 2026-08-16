@@ -6,9 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -20,6 +17,7 @@
 #include "xdg-activation-v1-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

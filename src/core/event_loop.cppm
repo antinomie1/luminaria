@@ -7,13 +7,13 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <functional>
 #include <typeinfo>
 
-#include <utility>
 #include <wayland-server-core.h>
 
 export module luminaria:event_loop;
+
+import std;
 export namespace luminaria {
 
 /// RAII owner of a persistent loop source (e.g. a timer). Removes it on destroy.

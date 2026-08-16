@@ -7,8 +7,6 @@
 
 module;
 
-#include <memory>
-#include <string>
 
 #include <cerrno>
 #include <cstdio>
@@ -22,6 +20,8 @@ module;
 #include <xcb/xcb.h>
 
 export module luminaria.xwayland;
+
+import std;
 
 export import luminaria;
 

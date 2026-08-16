@@ -9,15 +9,14 @@
 
 module;
 
-#include <memory>
 
-#include <algorithm>
 #include <cstdint>
-#include <vector>
 #include <wayland-server-core.h>
 #include "fractional-scale-v1-protocol.h"
 
 export module luminaria:fractional_scale;
+
+import std;
 
 import :compositor;
 import :display;

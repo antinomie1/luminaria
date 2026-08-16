@@ -16,18 +16,15 @@ module;
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 
-#include <algorithm>
 #include <ctime>
-#include <limits>
 #include <typeinfo>
-#include <utility>
-#include <vector>
 #include <wayland-server-core.h>
 #include "commit-timing-v1-protocol.h"
 
 export module luminaria:commit_timing;
+
+import std;
 
 import :compositor;
 import :display;

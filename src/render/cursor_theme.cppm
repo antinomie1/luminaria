@@ -13,20 +13,16 @@
 module;
 
 #include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
 
 #include <cstddef>
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
-#include <optional>
 #include <sys/stat.h>
 
 export module luminaria:cursor_theme;
+
+import std;
 
 import :expected;
 

@@ -4,6 +4,7 @@
 #include <cstdio>
 
 import luminaria.gpu;
+import std;
 
 int main() {
     auto renderer = luminaria::VulkanRenderer::create();

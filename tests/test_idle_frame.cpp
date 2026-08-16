@@ -10,9 +10,9 @@
 // come from page-flip completions and the nested backend's from the parent's
 // callbacks, so both stop on their own once the commits stop.
 #include <cassert>
-#include <vector>
 
 import luminaria;
+import std;
 
 int main() {
     auto display = luminaria::Display::create();

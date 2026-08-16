@@ -16,17 +16,14 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <functional>
 #include <typeinfo>
-#include <memory>
-#include <string>
 
-#include <algorithm>
-#include <vector>
 #include <wayland-server-core.h>
 #include "xdg-shell-protocol.h"
 
 export module luminaria:xdg_shell;
+
+import std;
 
 import :box;
 import :compositor;

@@ -16,11 +16,7 @@
 
 module;
 
-#include <memory>
-#include <string>
-#include <vector>
 
-#include <algorithm>
 #include <ctime>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -28,6 +24,8 @@ module;
 #include "primary-selection-unstable-v1-protocol.h"
 
 export module luminaria:data_device;
+
+import std;
 
 import :compositor;
 import :display;

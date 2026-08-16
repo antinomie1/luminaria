@@ -14,8 +14,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -25,6 +23,7 @@
 #include <wayland-server-core.h>
 
 import luminaria;
+import std;
 
 namespace {
 

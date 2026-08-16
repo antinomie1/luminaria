@@ -4,9 +4,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 
 import luminaria.gpu;
+import std;
 
 using namespace luminaria;
 

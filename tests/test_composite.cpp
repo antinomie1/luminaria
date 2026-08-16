@@ -3,9 +3,9 @@
 // Skips (exit 77) if no Vulkan device.
 #include <cassert>
 #include <cstdio>
-#include <vector>
 
 import luminaria.gpu;
+import std;
 
 using namespace luminaria;
 

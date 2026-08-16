@@ -16,13 +16,11 @@ module;
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <typeinfo>
-#include <list>
-#include <memory>
-#include <utility>
 
 export module luminaria:signal;
+
+import std;
 export namespace luminaria {
 
 template <class Event>

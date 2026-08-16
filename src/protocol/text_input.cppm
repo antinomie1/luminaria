@@ -28,17 +28,15 @@
 module;
 
 #include <cstdint>
-#include <memory>
-#include <string>
 
-#include <algorithm>
 #include <typeinfo>
-#include <vector>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "text-input-unstable-v3-protocol.h"
 
 export module luminaria:text_input;
+
+import std;
 
 import :box;
 import :compositor;

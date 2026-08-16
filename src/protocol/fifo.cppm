@@ -27,17 +27,14 @@ module;
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <memory>
 
-#include <algorithm>
 #include <typeinfo>
-#include <utility>
-#include <vector>
 #include <wayland-server-core.h>
 #include "fifo-v1-protocol.h"
 
 export module luminaria:fifo;
+
+import std;
 
 import :compositor;
 import :display;

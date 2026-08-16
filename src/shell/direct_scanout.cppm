@@ -30,15 +30,13 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
-#include <optional>
 
-#include <algorithm>
 #include <cstddef>
-#include <vector>
 #include <wayland-server-core.h>
 
 export module luminaria.gpu:direct_scanout;
+
+import std;
 
 import luminaria;
 

@@ -11,25 +11,17 @@
 // file decides only where windows go. Pointer input is hit-tested against the
 // same placement list that gets rendered, and the cursor rides the KMS cursor
 // plane. TODO: windows cascade at fixed offsets — no move/resize/stacking UI.
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <functional>
-#include <list>
-#include <memory>
-#include <optional>
-#include <span>
-#include <string>
-#include <utility>
-#include <vector>
 
 #include <drm_fourcc.h>
 #include <linux/input-event-codes.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 // XRGB8888: opaque 32-bit, the one format every KMS primary plane scans out.

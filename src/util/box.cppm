@@ -6,9 +6,9 @@
 
 module;
 
-#include <algorithm>
-
 export module luminaria:box;
+
+import std;
 export namespace luminaria {
 
 /// An axis-aligned rectangle in integer coordinates. Empty iff width/height <= 0.

@@ -2,9 +2,9 @@
 // surface painted twice over the same pixel blends twice, and damage that
 // double-counts is exactly how that happens.
 #include <cassert>
-#include <numeric>
 
 import luminaria;
+import std;
 
 namespace {
 

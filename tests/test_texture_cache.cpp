@@ -17,13 +17,13 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 
 #include <unistd.h>
 
 #include <drm_fourcc.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

@@ -17,7 +17,6 @@
 
 module;
 
-#include <memory>
 
 // libseat.h has no extern "C" guard of its own, so C++ would mangle every
 // symbol in it. This is the same treatment the other C headers get implicitly.
@@ -28,6 +27,8 @@ extern "C" {
 }
 
 export module luminaria.gpu:session;
+
+import std;
 
 import luminaria;
 

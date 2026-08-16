@@ -3,11 +3,9 @@
 // WITHOUT the client saying anything else. Nobody else is going to wake up for
 // it, so the global's own timer has to.
 #include <cassert>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
-#include <thread>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -19,6 +17,7 @@
 #include "commit-timing-v1-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

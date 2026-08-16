@@ -3,6 +3,7 @@
 #include <cassert>
 
 import luminaria;
+import std;
 
 int main() {
     auto display = luminaria::Display::create();

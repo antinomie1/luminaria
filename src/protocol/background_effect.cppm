@@ -8,15 +8,13 @@
 
 module;
 
-#include <memory>
-#include <vector>
 
-#include <algorithm>
-#include <utility>
 #include <wayland-server-core.h>
 #include "ext-background-effect-v1-protocol.h"
 
 export module luminaria:background_effect;
+
+import std;
 
 import :compositor;
 import :display;

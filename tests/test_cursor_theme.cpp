@@ -1,4 +1,3 @@
-#include <vector>
 // Cursor theme loading: turning a name like "default" or "text" into real
 // pixels, out of the XCursor files every desktop ships. Skips (77) on a machine
 // with no cursor themes installed at all.
@@ -7,6 +6,7 @@
 #include <cstdlib>
 
 import luminaria;
+import std;
 
 int main() {
     auto theme = luminaria::CursorTheme::load({}, 24);

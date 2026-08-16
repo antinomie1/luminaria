@@ -12,16 +12,15 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
 #include <typeinfo>
-#include <vector>
 
-#include <utility>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "single-pixel-buffer-v1-protocol.h"
 
 export module luminaria:single_pixel_buffer;
+
+import std;
 
 import :client_buffer;
 import :display;

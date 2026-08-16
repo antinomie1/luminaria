@@ -3,9 +3,9 @@
 // a hostile layout "valid" fails the build rather than the run.
 #include <cassert>
 #include <cstdint>
-#include <limits>
 
 import luminaria;
+import std;
 
 using luminaria::kBytesPerPixel;
 using luminaria::layout_fits;

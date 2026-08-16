@@ -20,20 +20,17 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
-#include <string>
 
-#include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cstddef>
-#include <vector>
 #include <sys/random.h>
 #include <sys/types.h>
 #include <wayland-server-core.h>
 #include "xdg-activation-v1-protocol.h"
 
 export module luminaria:xdg_activation;
+
+import std;
 
 import :compositor;
 import :display;

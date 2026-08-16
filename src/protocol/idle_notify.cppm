@@ -20,11 +20,8 @@ module;
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 
-#include <algorithm>
 #include <typeinfo>
-#include <vector>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -32,6 +29,8 @@ module;
 #include "ext-idle-notify-v1-protocol.h"
 
 export module luminaria:idle_notify;
+
+import std;
 
 import :display;
 import :event_loop;

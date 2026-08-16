@@ -5,9 +5,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -20,6 +17,7 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

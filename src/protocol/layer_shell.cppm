@@ -19,14 +19,13 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
-#include <string>
 
-#include <algorithm>
 #include <wayland-server-core.h>
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 
 export module luminaria:layer_shell;
+
+import std;
 
 import :box;
 import :compositor;

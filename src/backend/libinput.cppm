@@ -18,18 +18,17 @@ module;
 
 #include <cstdint>
 #include <cstdlib>
-#include <memory>
 
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
-#include <map>
-#include <string>
 #include <libinput.h>
 #include <libudev.h>
 #include <xkbcommon/xkbcommon.h>
 
 export module luminaria.gpu:libinput;
+
+import std;
 
 import luminaria;
 import :session;

@@ -11,9 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -27,6 +24,7 @@
 #include "linux-drm-syncobj-v1-client-protocol.h"
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

@@ -11,11 +11,11 @@
 
 module;
 
-#include <vector>
 
-#include <algorithm>
 
 export module luminaria:output_layout;
+
+import std;
 
 import :box;
 import :output;

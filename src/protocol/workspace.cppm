@@ -14,17 +14,13 @@
 module;
 
 #include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
 
-#include <algorithm>
-#include <map>
-#include <utility>
 #include <wayland-server-core.h>
 #include "ext-workspace-v1-protocol.h"
 
 export module luminaria.desktop:workspace;
+
+import std;
 
 import luminaria;
 

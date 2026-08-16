@@ -11,12 +11,13 @@
 
 module;
 
-#include <memory>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
 export module luminaria:subcompositor;
+
+import std;
 
 import :compositor;
 import :display;

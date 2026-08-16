@@ -15,14 +15,13 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
 
-#include <array>
-#include <utility>
 #include <wayland-server-core.h>
 #include "cursor-shape-v1-protocol.h"
 
 export module luminaria:cursor_shape;
+
+import std;
 
 import :display;
 import :expected;

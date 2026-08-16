@@ -36,21 +36,18 @@
 module;
 
 #include <cstdint>
-#include <memory>
-#include <string>
 
-#include <algorithm>
 #include <cstring>
 #include <sys/mman.h>
 #include <typeinfo>
 #include <unistd.h>
-#include <utility>
-#include <vector>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "input-method-unstable-v2-protocol.h"
 
 export module luminaria.desktop:input_method;
+
+import std;
 
 import luminaria;
 

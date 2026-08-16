@@ -10,14 +10,14 @@
 
 module;
 
-#include <memory>
-#include <optional>
 
 #include <cstdint>
 #include <wayland-server-core.h>
 #include "xdg-decoration-unstable-v1-protocol.h"
 
 export module luminaria:xdg_decoration;
+
+import std;
 
 import :display;
 import :expected;

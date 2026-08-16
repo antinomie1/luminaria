@@ -20,15 +20,14 @@
 module;
 
 #include <cstdint>
-#include <memory>
 
-#include <algorithm>
-#include <vector>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "relative-pointer-unstable-v1-protocol.h"
 
 export module luminaria:relative_pointer;
+
+import std;
 
 import :compositor;
 import :display;

@@ -1,11 +1,9 @@
 // Self-checks for Signal<Event> — the memory-safety centerpiece.
 // No framework: assert-based, returns non-zero on failure.
 #include <cassert>
-#include <memory>
-#include <optional>
-#include <vector>
 
 import luminaria;
+import std;
 
 using luminaria::Signal;
 

@@ -6,7 +6,6 @@
 // sets the output size, LUMINARIA_EXIT_MS auto-terminates after N ms (smoke test).
 #include "detail/wayland_fwd.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -14,15 +13,10 @@
 #include <cstring>
 #include <ctime>
 #include <drm_fourcc.h>
-#include <list>
-#include <map>
-#include <memory>
-#include <optional>
-#include <string>
-#include <vector>
 
 import luminaria.gpu;
 import luminaria.desktop;
+import std;
 
 namespace {
 template <class T>

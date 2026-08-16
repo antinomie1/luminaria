@@ -5,13 +5,11 @@
 
 module;
 
-#include <memory>
-#include <span>
-#include <vector>
 
-#include <utility>
 
 export module luminaria:headless;
+
+import std;
 
 import :backend;
 import :color;
@@ -80,7 +78,7 @@ Status HeadlessOutput::commit(Color color) {
 
 Status HeadlessOutput::commit_frame(std::span<const Pixel> rgba, int width, int height) {
     if (width != width_ || height != height_ ||
-        rgba.size() != static_cast<size_t>(width) * height) {
+        rgba.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
         return fail("headless: frame size mismatch");
     }
     last_frame_.assign(rgba.begin(), rgba.end());

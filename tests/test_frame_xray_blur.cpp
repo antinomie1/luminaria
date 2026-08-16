@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #include <sys/socket.h>
 #include <sys/mman.h>
@@ -18,6 +16,7 @@
 #include "ext-background-effect-v1-client-protocol.h"
 
 import luminaria.gpu;
+import std;
 
 namespace {
 constexpr std::uint32_t kXrgb8888 = 0x34325258u; // DRM_FORMAT_XRGB8888

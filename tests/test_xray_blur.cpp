@@ -3,9 +3,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 constexpr int kWidth = 16;

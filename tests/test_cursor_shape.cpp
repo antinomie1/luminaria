@@ -4,8 +4,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
-#include <string>
-#include <thread>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,6 +15,7 @@
 #include "cursor-shape-v1-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

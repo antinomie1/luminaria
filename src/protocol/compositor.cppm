@@ -13,13 +13,7 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <limits>
-#include <memory>
-#include <new>
-#include <optional>
-#include <vector>
 
-#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <ctime>
@@ -28,6 +22,8 @@ module;
 #include <wayland-server-protocol.h>
 
 export module luminaria:compositor;
+
+import std;
 
 import :box;
 import :client_buffer;

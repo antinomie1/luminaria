@@ -25,15 +25,10 @@
 
 module;
 
-#include <memory>
-#include <string>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <span>
-#include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -44,6 +39,8 @@ module;
 #include <xf86drmMode.h>
 
 export module luminaria.gpu:drm;
+
+import std;
 
 import luminaria;
 import :session;

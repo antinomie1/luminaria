@@ -5,6 +5,7 @@
 #include <cstdio>
 
 import luminaria.gpu;
+import std;
 
 int main() {
     auto display = luminaria::Display::create();

@@ -28,16 +28,14 @@
 module;
 
 #include <cstdint>
-#include <memory>
 
-#include <algorithm>
 #include <typeinfo>
-#include <utility>
-#include <vector>
 #include <wayland-server-core.h>
 #include "ext-session-lock-v1-protocol.h"
 
 export module luminaria.desktop:session_lock;
+
+import std;
 
 import luminaria;
 

@@ -6,8 +6,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -18,6 +16,7 @@
 #include <wayland-server-core.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

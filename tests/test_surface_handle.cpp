@@ -2,6 +2,7 @@
 #include <cstdint>
 
 import luminaria;
+import std;
 
 int main() {
     luminaria::SurfaceId stale;

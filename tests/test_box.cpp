@@ -2,6 +2,7 @@
 #include <cassert>
 
 import luminaria;
+import std;
 
 using luminaria::Box;
 

@@ -36,18 +36,14 @@ module;
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <span>
-#include <vector>
 
-#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <optional>
-#include <string>
 #include <unistd.h> // dup, close — the fences handed between GPU and display
 
 export module luminaria.gpu:frame;
+
+import std;
 
 import luminaria;
 import :direct_scanout;

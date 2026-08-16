@@ -5,11 +5,11 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 
 #include <drm_fourcc.h>
 
 import luminaria.gpu;
+import std;
 
 int main() {
     auto renderer = luminaria::VulkanRenderer::create();

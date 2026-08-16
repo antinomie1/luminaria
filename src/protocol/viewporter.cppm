@@ -10,13 +10,14 @@
 
 module;
 
-#include <memory>
 
 #include <cstdint>
 #include <wayland-server-core.h>
 #include "viewporter-protocol.h"
 
 export module luminaria:viewporter;
+
+import std;
 
 import :compositor;
 import :display;

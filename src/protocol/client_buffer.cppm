@@ -9,13 +9,13 @@ module;
 
 #include "detail/wayland_fwd.h"
 #include <cstdint>
-#include <memory>
-#include <vector>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 
 export module luminaria:client_buffer;
+
+import std;
 
 import :dmabuf;
 

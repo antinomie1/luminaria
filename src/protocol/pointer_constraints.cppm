@@ -28,17 +28,16 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <memory>
 
-#include <algorithm>
 #include <cstdint>
 #include <typeinfo>
-#include <vector>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "pointer-constraints-unstable-v1-protocol.h"
 
 export module luminaria:pointer_constraints;
+
+import std;
 
 import :compositor;
 import :display;

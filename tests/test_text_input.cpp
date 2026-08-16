@@ -8,9 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -22,6 +19,7 @@
 #include "text-input-unstable-v3-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

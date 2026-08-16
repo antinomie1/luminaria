@@ -4,8 +4,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -18,6 +16,7 @@
 #include "xdg-shell-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

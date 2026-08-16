@@ -17,17 +17,14 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <memory>
 
-#include <algorithm>
 #include <cstdint>
-#include <map>
-#include <utility>
-#include <vector>
 #include <wayland-server-core.h>
 #include "wlr-foreign-toplevel-management-unstable-v1-protocol.h"
 
 export module luminaria.desktop:foreign_toplevel;
+
+import std;
 
 import luminaria;
 

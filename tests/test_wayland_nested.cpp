@@ -7,16 +7,15 @@
 // handed straight to the parent as a wl_buffer with no pixel ever copied. Both
 // halves of that are optional at runtime, so the check is conditional rather
 // than a skip — the shm path above is tested either way.
-#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
 
 #include <drm_fourcc.h>
 
 import luminaria.gpu;
+import std;
 
 int main() {
     if (std::getenv("WAYLAND_DISPLAY") == nullptr) {

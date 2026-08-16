@@ -18,8 +18,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <string>
-#include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -31,6 +29,7 @@
 #include <unistd.h>
 
 import luminaria.gpu;
+import std;
 
 namespace {
 

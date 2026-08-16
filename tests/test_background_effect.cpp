@@ -3,8 +3,6 @@
 // with the carrying wl_surface.commit and disappear on NULL/object destruction.
 #include <cassert>
 #include <cstring>
-#include <thread>
-#include <vector>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -16,6 +14,7 @@
 #include "ext-background-effect-v1-client-protocol.h"
 
 import luminaria;
+import std;
 
 namespace {
 

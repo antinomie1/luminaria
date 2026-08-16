@@ -10,11 +10,12 @@
 module;
 
 #include "detail/wayland_fwd.h"
-#include <string>
 
 #include <wayland-server-core.h>
 
 export module luminaria:display;
+
+import std;
 
 import :event_loop;
 import :expected;

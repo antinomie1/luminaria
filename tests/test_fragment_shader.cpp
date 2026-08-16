@@ -4,11 +4,11 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
-#include <vector>
 
 #include "tint_frag_spv.h"
 
 import luminaria.gpu;
+import std;
 
 namespace {
 constexpr std::uint32_t kXrgb8888 = 0x34325258u;
