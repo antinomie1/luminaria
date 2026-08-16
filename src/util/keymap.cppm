@@ -46,6 +46,14 @@ public:
     /// the xkb offset is applied here. Updates the modifier masks.
     void update_key(std::uint32_t evdev_code, bool pressed) noexcept;
 
+    /// Adopt externally-observed modifier state wholesale — a nested compositor
+    /// whose host changed focus while a modifier was held, or any feed that is
+    /// not derived from the key events this state saw. The masks and layout
+    /// group replace the current depressed/latched/locked state, so the next
+    /// `keysym` is computed against what the rest of the world is actually
+    /// holding.
+    void update_modifiers(ModifiersEvent modifiers) noexcept;
+
     /// The keysym `evdev_code` produces right now, honouring the current layout
     /// and modifier state (so shift+key answers capital, dead keys compose).
     /// 0 when nothing sensible maps.
@@ -147,6 +155,15 @@ void KeymapState::update_key(std::uint32_t evdev_code, bool pressed) noexcept {
     // libinput (and the evdev protocol generally) reports keycodes 8 below
     // xkb's.
     xkb_state_update_key(impl_->state, evdev_code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+}
+
+void KeymapState::update_modifiers(ModifiersEvent modifiers) noexcept {
+    // The masks are already in xkb's bit numbering; `group` is the effective
+    // layout index, applied as the locked layout the way wl_keyboard.modifiers
+    // round-trips through wlroots' deserialization. Base/latched layouts stay
+    // untouched: an injected mask feed has no opinion about them.
+    xkb_state_update_mask(impl_->state, modifiers.depressed, modifiers.latched,
+                          modifiers.locked, 0, 0, modifiers.group);
 }
 
 std::uint32_t KeymapState::keysym(std::uint32_t evdev_code) const noexcept {

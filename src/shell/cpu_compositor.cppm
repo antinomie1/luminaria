@@ -38,10 +38,17 @@ export namespace luminaria {
 /// One client surface tree in the draw list: the root at (x,y), which drags
 /// its whole subsurface tree along. Resolved at draw time, so the tree is
 /// read as it stands now.
+///
+/// `clip` is a device-space box every surface of the tree is confined to — a
+/// tiling compositor clips each window to its tile so an old-size surface
+/// never paints over its neighbour. Empty means "no clip": the framebuffer
+/// bounds are the only limit, which is what the whole-output case (a cursor
+/// tree, a maximized window) wants.
 struct CpuView {
     SurfaceId surface;
     int x = 0;
     int y = 0;
+    Box clip;
 };
 
 /// One z-ordered draw item: a solid rectangle the compositor owns, or a client
@@ -65,7 +72,7 @@ public:
 private:
     void fill_rect(const RectFill& fill);
     void draw_view(const CpuView& view);
-    void draw_surface(Surface& surface, int x, int y);
+    void draw_surface(Surface& surface, int x, int y, const Box& clip);
 
     int width_ = 0;
     int height_ = 0;
@@ -168,14 +175,21 @@ void CpuCompositor::draw_view(const CpuView& view) {
     if (surface == nullptr) {
         return;
     }
+    // The view clip and the framebuffer bounds both apply; the tree is drawn
+    // only where they overlap, so a clip that pokes off the edge is safe.
+    const Box framebuffer{0, 0, width_, height_};
+    const Box clip = view.clip.empty() ? framebuffer : view.clip.intersection(framebuffer);
+    if (clip.empty()) {
+        return;
+    }
     tree_.clear();
     surface->surface_tree(tree_);
     for (const SurfaceAt& at : tree_) {
-        draw_surface(*at.surface, view.x + at.x, view.y + at.y);
+        draw_surface(*at.surface, view.x + at.x, view.y + at.y, clip);
     }
 }
 
-void CpuCompositor::draw_surface(Surface& surface, int x, int y) {
+void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip) {
     int buffer_w = 0;
     int buffer_h = 0;
     if (!surface.current_buffer_rgba(rgba_, buffer_w, buffer_h)) {
@@ -189,8 +203,11 @@ void CpuCompositor::draw_surface(Surface& surface, int x, int y) {
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
     surface.buffer_source_uv(u0, v0, u1, v1);
     const Transform transform = surface.buffer_transform();
-    const Box clip = Box{x, y, surface_w, surface_h}.intersection(Box{0, 0, width_, height_});
-    if (clip.empty()) {
+    // The surface's own rectangle, confined to the view clip: pixels the tree
+    // would paint outside it are simply never touched, so whatever was already
+    // there (a neighbour, the compositor's own rects) stays byte for byte.
+    const Box box = Box{x, y, surface_w, surface_h}.intersection(clip);
+    if (box.empty()) {
         return;
     }
     // Nearest-neighbour sampling: surface point -> normalized crop (u,v) ->
@@ -198,9 +215,9 @@ void CpuCompositor::draw_surface(Surface& surface, int x, int y) {
     // folded into the UVs by buffer_source_uv, exactly as for the GPU path.
     const double du = (u1 - u0) / surface_w;
     const double dv = (v1 - v0) / surface_h;
-    for (int py = clip.y; py < clip.y + clip.height; ++py) {
+    for (int py = box.y; py < box.y + box.height; ++py) {
         const double v = v0 + (py - y + 0.5) * dv;
-        for (int px = clip.x; px < clip.x + clip.width; ++px) {
+        for (int px = box.x; px < box.x + box.width; ++px) {
             double u = u0 + (px - x + 0.5) * du;
             double w = v;
             unit_point(transform, u, w);

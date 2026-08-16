@@ -232,8 +232,10 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `CpuCompositor` (`shell/cpu_compositor.cppm`, core module): surface trees (subsurface,
   scale, transform, viewport) and `RectFill` solids over a background, premultiplied
   source-over, into an RGBA buffer a headless/nested output can present. Its items are
-  `CpuItem = variant<RectFill, CpuView>` with generational ids; non-Frame compositors
-  release callbacks via the free `send_frame_done(ids, time_ms)`. `KeymapState`
+  `CpuItem = variant<RectFill, CpuView>` with generational ids; each `CpuView` carries a
+  device-space `clip` box (empty = whole framebuffer) that confines every surface of the
+  tree, so a tiler clips windows to their tiles without background-rect cleanup, and
+  non-Frame compositors release callbacks via the free `send_frame_done(ids, time_ms)`. `KeymapState`
   (`util/keymap.cppm`) is the shared RAII xkb wrapper both `LibinputBackend`
   (`keymap_state()`) and compositor shortcut handling read keysyms/modifiers from.
   `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits

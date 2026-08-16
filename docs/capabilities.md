@@ -34,16 +34,24 @@ using CpuItem = std::variant<RectFill, CpuView>; // CPU 路径的图元
 `CpuView` 是一棵客户端表面树的根（拖带全部 subsurface），`RectFill` 是混成器
 自己的纯色矩形。`CpuCompositor` 处理 subsurface 树、buffer scale（HiDPI 抽稀）、
 `set_buffer_transform` 旋转、`wp_viewporter` 裁剪，全部最近邻采样 + 预乘 alpha
-source-over：
+source-over。每个 `CpuView` 还带一个**设备坐标 clip**（空 = 整块 framebuffer）：
+树里每一张 surface 的像素都裁到它与 framebuffer 的交集里，clip 外的既有像素
+原样保留——平铺混成器用它把每棵窗口树限制在自家 tile 内，旧尺寸 surface 不会
+画到邻居身上，也不用自己画背景矩形去擦溢出：
 
 ```cpp
 CpuCompositor cpu;
 std::vector<CpuItem> items;
 items.emplace_back(RectFill{{0, 0, 800, 600}, kWallpaper}); // 混成器自己的底色
-for (const Window& w : windows) items.emplace_back(CpuView{w.id, w.x, w.y});
+items.emplace_back(CpuView{w.id, w.x, w.y, tile_box});       // 树只画在 tile 内
 cpu.composite(800, 600, kBackground, items);
 output.commit_frame(cpu.pixels(), cpu.width(), cpu.height()); // 交给 wl_shm 呈现
 ```
+
+clip 是设备坐标（合成输出的像素坐标）。CPU 路径按 surface 的**逻辑尺寸**画树，
+所以当前它只在 scale=1 / normal transform 的输出上与原图逐字节一致——输出级的
+scale/transform 是 GPU 路径 `Frame` 的事；现有 headless / 嵌套后端都是
+scale=1，不存在的输出不会被声称支持。
 
 ## 图元（Primitives）
 

@@ -198,6 +198,53 @@ int main() {
                 assert(px(4, 4) == (luminaria::Pixel{0, 0, 255, 255}));
                 assert(px(5, 5) == (luminaria::Pixel{255, 0, 0, 255}));
 
+                // A view clip confines the whole tree: everything it would
+                // paint outside the box must leave the underlying pixels byte
+                // for byte — the tree's own corner stays white because the
+                // clip (not the tree) decides where the red may land.
+                std::vector<luminaria::CpuItem> clipped_items;
+                clipped_items.push_back(
+                    luminaria::RectFill{{1, 1, 4, 4}, luminaria::Color{1, 1, 1, 1}});
+                // Tree at (2,2) — red 4x4, blue 2x2 at +1,+1 — clipped to the
+                // device box (3,3)-(6,6): only its bottom-right 3x3 may draw.
+                clipped_items.push_back(luminaria::CpuView{surfaces[0]->id(), 2, 2,
+                                                           luminaria::Box{3, 3, 3, 3}});
+                luminaria::CpuCompositor cpu2;
+                cpu2.composite(kWidth, kHeight, luminaria::Color{0, 1, 0, 1}, clipped_items);
+                const auto cpx = [&](int x, int y) {
+                    return cpu2.pixels()[static_cast<std::size_t>(y) * kWidth + x];
+                };
+                // Outside the clip the tree never painted: the red corner that
+                // would cover (2,2) is absent, and the white rect underneath is
+                // untouched. (2,5)/(5,2) sit outside both the clip and the
+                // rect, so the red the tree would have put there never landed
+                // and the background stayed.
+                assert(cpx(2, 2) == (luminaria::Pixel{255, 255, 255, 255}));
+                assert(cpx(2, 5) == (luminaria::Pixel{0, 255, 0, 255}));
+                assert(cpx(5, 2) == (luminaria::Pixel{0, 255, 0, 255}));
+                // Outside both the clip and the rect: the background.
+                assert(cpx(6, 6) == (luminaria::Pixel{0, 255, 0, 255}));
+                // Inside the clip the tree draws exactly as unclipped: the
+                // subsurface still wins over its parent where they overlap.
+                assert(cpx(3, 3) == (luminaria::Pixel{0, 0, 255, 255}));
+                assert(cpx(4, 4) == (luminaria::Pixel{0, 0, 255, 255}));
+                assert(cpx(5, 5) == (luminaria::Pixel{255, 0, 0, 255}));
+
+                // A clip that pokes past the framebuffer edge is clamped to it:
+                // tree at (9,9) would paint a 4x4, but only (9,9) is on screen.
+                std::vector<luminaria::CpuItem> edge_items;
+                edge_items.push_back(luminaria::CpuView{surfaces[0]->id(), 9, 9,
+                                                        luminaria::Box{8, 8, 10, 10}});
+                luminaria::CpuCompositor cpu3;
+                cpu3.composite(kWidth, kHeight, luminaria::Color{0, 1, 0, 1}, edge_items);
+                const auto epx = [&](int x, int y) {
+                    return cpu3.pixels()[static_cast<std::size_t>(y) * kWidth + x];
+                };
+                assert(epx(9, 9) == (luminaria::Pixel{255, 0, 0, 255}));
+                assert(epx(8, 8) == (luminaria::Pixel{0, 255, 0, 255}));
+                assert(epx(9, 8) == (luminaria::Pixel{0, 255, 0, 255}));
+                assert(epx(8, 9) == (luminaria::Pixel{0, 255, 0, 255}));
+
                 // Batch frame-callback release: one stamp for the whole frame.
                 const std::array<luminaria::SurfaceId, 2> ids{surfaces[0]->id(),
                                                               surfaces[1]->id()};
