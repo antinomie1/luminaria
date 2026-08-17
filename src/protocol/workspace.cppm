@@ -119,13 +119,8 @@ struct WorkspaceInfo {
     std::uint32_t state = 0;
 };
 
-namespace {
-
-} // namespace
-
 struct WorkspaceManager::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     Signal<WorkspaceRequest> request;
     std::vector<GroupInfo> groups;
     std::vector<WorkspaceInfo> workspaces;
@@ -140,12 +135,6 @@ struct WorkspaceManager::Impl {
         std::vector<WorkspaceRequest> queued;
     };
     std::vector<std::unique_ptr<Binding>> bindings;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 
     GroupInfo* group(std::uint32_t id) {
         auto it = std::find_if(groups.begin(), groups.end(),
@@ -186,39 +175,43 @@ Handle* handle_of(wl_resource* resource) {
 
 void handle_resource_destroy(wl_resource* resource) {
     Handle* h = handle_of(resource);
-    auto& map = h->is_group ? h->binding->group_handles : h->binding->workspace_handles;
-    map.erase(h->id);
+    if (h->is_group) {
+        h->binding->group_handles.erase(h->id);
+    } else {
+        h->binding->workspace_handles.erase(h->id);
+    }
     delete h;
-}
-
-void handle_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 
 // --- ext_workspace_handle_v1 -------------------------------------------------
 
-void queue(wl_resource* resource, WorkspaceRequest::Kind kind, std::uint32_t group = 0,
-           std::string name = {}) {
+void workspace_activate(wl_client*, wl_resource* resource) {
     Handle* h = handle_of(resource);
     h->binding->queued.push_back(
-        WorkspaceRequest{kind, h->is_group ? 0u : h->id, group, std::move(name)});
+        WorkspaceRequest{WorkspaceRequest::Kind::activate, h->id, 0, ""});
 }
 
-void workspace_activate(wl_client*, wl_resource* resource) {
-    queue(resource, WorkspaceRequest::Kind::activate);
-}
 void workspace_deactivate(wl_client*, wl_resource* resource) {
-    queue(resource, WorkspaceRequest::Kind::deactivate);
+    Handle* h = handle_of(resource);
+    h->binding->queued.push_back(
+        WorkspaceRequest{WorkspaceRequest::Kind::deactivate, h->id, 0, ""});
 }
+
 void workspace_remove(wl_client*, wl_resource* resource) {
-    queue(resource, WorkspaceRequest::Kind::remove);
+    Handle* h = handle_of(resource);
+    h->binding->queued.push_back(
+        WorkspaceRequest{WorkspaceRequest::Kind::remove, h->id, 0, ""});
 }
+
 void workspace_assign(wl_client*, wl_resource* resource, wl_resource* group_resource) {
-    queue(resource, WorkspaceRequest::Kind::assign, handle_of(group_resource)->id);
+    Handle* h = handle_of(resource);
+    Handle* gh = handle_of(group_resource);
+    h->binding->queued.push_back(
+        WorkspaceRequest{WorkspaceRequest::Kind::assign, h->id, gh->id, ""});
 }
 
 constexpr struct ext_workspace_handle_v1_interface workspace_handle_impl = {
-    .destroy = handle_destroy_request,
+    .destroy = resource_destroy_request,
     .activate = workspace_activate,
     .deactivate = workspace_deactivate,
     .assign = workspace_assign,
@@ -235,7 +228,7 @@ void group_create_workspace(wl_client*, wl_resource* resource, const char* name)
 
 constexpr struct ext_workspace_group_handle_v1_interface group_handle_impl = {
     .create_workspace = group_create_workspace,
-    .destroy = handle_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 // --- ext_workspace_manager_v1 ------------------------------------------------
@@ -376,12 +369,12 @@ Signal<WorkspaceRequest>& WorkspaceManager::request() noexcept { return impl_->r
 
 Result<WorkspaceManager> WorkspaceManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->display = display.c_ptr();
-    impl->global = wl_global_create(impl->display, &ext_workspace_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(ext_workspace_manager_v1) failed");
+    auto global = create_wl_global<&ext_workspace_manager_v1_interface, manager_bind>(
+        display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return WorkspaceManager{std::move(impl)};
 }
 

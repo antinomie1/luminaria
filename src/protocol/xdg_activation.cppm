@@ -35,6 +35,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -110,8 +111,7 @@ private:
 namespace luminaria {
 
 struct XdgActivation::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     Signal<ActivationTokenRequest> new_token;
     Signal<ActivationRequest> request_activate;
 
@@ -133,12 +133,6 @@ struct XdgActivation::Impl {
     // Held by pointer: each entry's surface-destroy subscription captures its
     // own address, and the list is erased from the middle when a token is used.
     std::vector<std::unique_ptr<Issued>> issued;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 
     /// 128 random bits in hex. Unguessable is the whole security property — a
     /// client that can guess a token can raise its own window whenever it likes
@@ -247,36 +241,20 @@ void token_commit(wl_client* client, wl_resource* resource) {
     xdg_activation_token_v1_send_done(resource, b->impl->issued.back()->token.c_str());
 }
 
-void token_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct xdg_activation_token_v1_interface token_impl = {
     .set_serial = token_set_serial,
     .set_app_id = token_set_app_id,
     .set_surface = token_set_surface,
     .commit = token_commit,
-    .destroy = token_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void token_resource_destroy(wl_resource* resource) {
-    delete builder_of(resource);
-}
-
-void activation_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void activation_get_token(wl_client* client, wl_resource* resource, uint32_t id) {
     auto* impl = static_cast<XaImpl*>(wl_resource_get_user_data(resource));
-    wl_resource* token = wl_resource_create(client, &xdg_activation_token_v1_interface,
-                                            wl_resource_get_version(resource), id);
-    if (token == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(token, &token_impl, new TokenBuilder{.impl = impl},
-                                   token_resource_destroy);
+    auto builder = std::make_unique<TokenBuilder>();
+    builder->impl = impl;
+    create_user_resource<TokenBuilder, &xdg_activation_token_v1_interface, &token_impl>(
+        client, wl_resource_get_version(resource), id, std::move(builder));
 }
 
 void activation_activate(wl_client*, wl_resource* resource, const char* token,
@@ -306,20 +284,10 @@ void activation_activate(wl_client*, wl_resource* resource, const char* token,
 }
 
 constexpr struct xdg_activation_v1_interface activation_impl = {
-    .destroy = activation_destroy_request,
+    .destroy = resource_destroy_request,
     .get_activation_token = activation_get_token,
     .activate = activation_activate,
 };
-
-void activation_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource =
-        wl_resource_create(client, &xdg_activation_v1_interface, static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &activation_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -330,12 +298,13 @@ XdgActivation& XdgActivation::operator=(XdgActivation&&) noexcept = default;
 
 Result<XdgActivation> XdgActivation::create(Display& display) {
     auto impl = std::make_unique<XaImpl>();
-    impl->display = display.c_ptr();
-    impl->global = wl_global_create(impl->display, &xdg_activation_v1_interface, 1, impl.get(),
-                                    activation_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(xdg_activation_v1) failed");
+    auto global = create_wl_global<&xdg_activation_v1_interface,
+                                   default_bind<&xdg_activation_v1_interface,
+                                                &activation_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return XdgActivation{std::move(impl)};
 }
 

@@ -32,6 +32,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :seat;
 
 export namespace luminaria {
@@ -76,36 +77,22 @@ private:
 namespace luminaria {
 
 struct RelativePointerManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     Seat* seat = nullptr;
     std::vector<wl_resource*> relative_pointers;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 namespace {
 
 using RpMgr = RelativePointerManager::Impl;
 
-void relative_pointer_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct zwp_relative_pointer_v1_interface relative_pointer_impl = {
-    .destroy = relative_pointer_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 void relative_pointer_resource_destroy(wl_resource* resource) {
     auto* mgr = static_cast<RpMgr*>(wl_resource_get_user_data(resource));
     std::erase(mgr->relative_pointers, resource);
-}
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 
 void manager_get_relative_pointer(wl_client* client, wl_resource* manager_resource, uint32_t id,
@@ -127,19 +114,9 @@ void manager_get_relative_pointer(wl_client* client, wl_resource* manager_resour
 }
 
 constexpr struct zwp_relative_pointer_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_relative_pointer = manager_get_relative_pointer,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zwp_relative_pointer_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -153,11 +130,13 @@ RelativePointerManager::operator=(RelativePointerManager&&) noexcept = default;
 Result<RelativePointerManager> RelativePointerManager::create(Display& display, Seat& seat) {
     auto impl = std::make_unique<Impl>();
     impl->seat = &seat;
-    impl->global = wl_global_create(display.c_ptr(), &zwp_relative_pointer_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_relative_pointer_manager_v1) failed");
+    auto global = create_wl_global<&zwp_relative_pointer_manager_v1_interface,
+                                   default_bind<&zwp_relative_pointer_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return RelativePointerManager{std::move(impl)};
 }
 

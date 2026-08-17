@@ -42,6 +42,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :region;
 import :seat;
 import :signal;
@@ -185,19 +186,13 @@ namespace luminaria {
 class ConstraintImpl;
 
 struct PointerConstraints::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     Seat* seat = nullptr;
     std::vector<ConstraintImpl*> constraints;
     ConstraintImpl* active = nullptr;
 
     Signal<NewPointerConstraint> new_constraint;
     Signal<SeatPointerFocus>::Connection focus_conn;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using PcMgr = PointerConstraints::Impl;
@@ -336,10 +331,6 @@ ConstraintImpl* constraint_of(wl_resource* resource) {
     return static_cast<ConstraintImpl*>(wl_resource_get_user_data(resource));
 }
 
-void constraint_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void constraint_set_region(wl_client*, wl_resource* resource, wl_resource* region) {
     constraint_of(resource)->stage_region(region_from_resource(region));
 }
@@ -350,13 +341,13 @@ void locked_set_cursor_position_hint(wl_client*, wl_resource* resource, wl_fixed
 }
 
 constexpr struct zwp_locked_pointer_v1_interface locked_impl = {
-    .destroy = constraint_destroy_request,
+    .destroy = resource_destroy_request,
     .set_cursor_position_hint = locked_set_cursor_position_hint,
     .set_region = constraint_set_region,
 };
 
 constexpr struct zwp_confined_pointer_v1_interface confined_impl = {
-    .destroy = constraint_destroy_request,
+    .destroy = resource_destroy_request,
     .set_region = constraint_set_region,
 };
 
@@ -370,10 +361,6 @@ void constraint_resource_destroy(wl_resource* resource) {
     }
     std::erase(mgr->constraints, constraint);
     delete constraint;
-}
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 
 PointerConstraintLifetime lifetime_from_wire(uint32_t lifetime) {
@@ -450,20 +437,10 @@ void manager_confine_pointer(wl_client* client, wl_resource* manager_resource, u
 }
 
 constexpr struct zwp_pointer_constraints_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .lock_pointer = manager_lock_pointer,
     .confine_pointer = manager_confine_pointer,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zwp_pointer_constraints_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -476,11 +453,13 @@ PointerConstraints& PointerConstraints::operator=(PointerConstraints&&) noexcept
 Result<PointerConstraints> PointerConstraints::create(Display& display, Seat& seat) {
     auto impl = std::make_unique<Impl>();
     impl->seat = &seat;
-    impl->global = wl_global_create(display.c_ptr(), &zwp_pointer_constraints_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_pointer_constraints_v1) failed");
+    auto global = create_wl_global<&zwp_pointer_constraints_v1_interface,
+                                   default_bind<&zwp_pointer_constraints_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     // Losing pointer focus ends the constraint, always. Leaving that to the
     // compositor is how a client keeps the mouse after the user has clicked
     // somewhere else.

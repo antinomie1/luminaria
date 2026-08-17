@@ -173,17 +173,11 @@ class LockImpl;
 class LockSurfaceImpl;
 
 struct SessionLockManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     LockImpl* current = nullptr;
     bool session_locked = false;
 
     Signal<NewSessionLock> new_lock;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using SlMgr = SessionLockManager::Impl;
@@ -302,10 +296,6 @@ namespace {
 
 // --- ext_session_lock_surface_v1 ---
 
-void lock_surface_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void lock_surface_ack_configure(wl_client*, wl_resource* resource, uint32_t serial) {
     auto* ls = static_cast<LockSurfaceImpl*>(wl_resource_get_user_data(resource));
     auto it = std::ranges::find(ls->pending_serials_, serial);
@@ -320,7 +310,7 @@ void lock_surface_ack_configure(wl_client*, wl_resource* resource, uint32_t seri
 }
 
 constexpr struct ext_session_lock_surface_v1_interface lock_surface_impl = {
-    .destroy = lock_surface_destroy_request,
+    .destroy = resource_destroy_request,
     .ack_configure = lock_surface_ack_configure,
 };
 
@@ -417,10 +407,6 @@ void lock_resource_destroy(wl_resource* resource) {
 
 // --- ext_session_lock_manager_v1 ---
 
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void manager_lock(wl_client* client, wl_resource* manager, uint32_t id) {
     auto* mgr = static_cast<SlMgr*>(wl_resource_get_user_data(manager));
     wl_resource* resource = wl_resource_create(client, &ext_session_lock_v1_interface,
@@ -444,19 +430,9 @@ void manager_lock(wl_client* client, wl_resource* manager, uint32_t id) {
 }
 
 constexpr struct ext_session_lock_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .lock = manager_lock,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &ext_session_lock_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -468,11 +444,13 @@ SessionLockManager& SessionLockManager::operator=(SessionLockManager&&) noexcept
 
 Result<SessionLockManager> SessionLockManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &ext_session_lock_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(ext_session_lock_manager_v1) failed");
+    auto global = create_wl_global<&ext_session_lock_manager_v1_interface,
+                                   default_bind<&ext_session_lock_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return SessionLockManager{std::move(impl)};
 }
 
