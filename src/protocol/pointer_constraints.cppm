@@ -93,6 +93,8 @@ public:
     Signal<PointerConstraintRegionChange> region_change;
 
     [[nodiscard]] virtual Surface& surface() noexcept = 0;
+    [[nodiscard]] virtual const Surface& surface() const noexcept = 0;
+
     /// The wl_pointer the client named. Only that client's pointer is
     /// constrained; the seat itself is not exclusive.
     [[nodiscard]] virtual wl_resource* pointer_resource() const noexcept = 0;
@@ -156,6 +158,8 @@ public:
     /// The constraint that currently owns the pointer, or null. While this is
     /// non-null and locked, do not move the cursor.
     [[nodiscard]] PointerConstraint* active_constraint() noexcept;
+    [[nodiscard]] const PointerConstraint* active_constraint() const noexcept;
+
 
     struct Impl;
 
@@ -215,6 +219,8 @@ public:
     }
 
     Surface& surface() noexcept override { return *surface_; }
+    const Surface& surface() const noexcept override { return *surface_; }
+
     [[nodiscard]] wl_resource* pointer_resource() const noexcept override { return pointer_; }
     [[nodiscard]] PointerConstraintType type() const noexcept override { return type_; }
     [[nodiscard]] PointerConstraintLifetime lifetime() const noexcept override {
@@ -500,5 +506,10 @@ PointerConstraint* PointerConstraints::constraint_for(Surface& surface) noexcept
 PointerConstraint* PointerConstraints::active_constraint() noexcept {
     return impl_->active;
 }
+
+const PointerConstraint* PointerConstraints::active_constraint() const noexcept {
+    return impl_->active;
+}
+
 
 } // namespace luminaria

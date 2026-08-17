@@ -25,17 +25,8 @@ import :vulkan;
 
 export namespace luminaria {
 
-/// The cursor, drawn over everything else: either a client surface tree
-/// (`wl_pointer.set_cursor`) or a compositor-owned image (a themed cursor on a
-/// backend with no cursor plane). Visual only, and therefore never in the scene
-/// list and never hit-tested.
-struct SceneCursor {
-    SurfaceId surface{};
-    const CursorImage* image = nullptr;
-    int x = 0, y = 0;
-};
-
 /// What `SceneRenderer::present()` did. `unchanged` means nothing was committed
+
 /// and no `present` event will follow, so whatever the compositor does there —
 /// `send_frame_done()` above all — it must do on this answer too.
 enum class SceneOutcome { committed, unchanged };

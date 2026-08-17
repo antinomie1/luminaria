@@ -27,9 +27,19 @@ import std;
 import :box;
 import :color;
 import :compositor;
+import :cursor_theme;
 import :pixel;
 
 export namespace luminaria {
+
+/// A software cursor drawn above the scene. Visual only, and therefore never in
+/// the scene list and never hit-tested.
+struct SceneCursor {
+    SurfaceId surface{};
+    const CursorImage* image = nullptr;
+    int x = 0, y = 0;
+};
+
 
 /// How much a blur blurs.
 ///

@@ -122,8 +122,10 @@ target("luminaria")
               "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
               "src/protocol/xdg_shell.cppm", {public = true})
     add_files("src/render/cursor_theme.cppm", "src/shell/cpu_compositor.cppm",
-              "src/shell/layer.cppm", "src/shell/popup.cppm",
+              "src/shell/cursor_manager.cppm", "src/shell/layer.cppm",
+              "src/shell/pointer.cppm", "src/shell/popup.cppm",
               "src/shell/output_layout.cppm", "src/shell/scene.cppm", {public = true})
+
 
     -- for detail/wayland_fwd.h, included in the units' GMF
     add_includedirs("src", {public = true})
@@ -285,11 +287,13 @@ target("luminaria-gpu")
 target("luminaria-desktop")
     set_kind("static")
     luminaria_defaults()
-    add_deps("luminaria")
+    add_deps("luminaria", "luminaria-gpu")
     add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
+              "src/protocol/desktop_globals.cppm",
               "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
               "src/protocol/session_lock.cppm", "src/protocol/workspace.cppm",
               {public = true})
+
 
 target("luminaria-xwayland")
     set_kind("static")

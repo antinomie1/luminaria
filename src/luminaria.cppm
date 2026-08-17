@@ -26,6 +26,7 @@ export import :commit_timing;
 export import :compositor;
 export import :content_type;
 export import :cpu_compositor;
+export import :cursor_manager;
 export import :cursor_shape;
 export import :cursor_theme;
 export import :data_device;
@@ -40,6 +41,7 @@ export import :headless;
 export import :idle_inhibit;
 export import :idle_notify;
 export import :input_event;
+export import :input_router;
 export import :keymap;
 export import :layer;
 export import :layer_shell;
@@ -48,9 +50,11 @@ export import :output_global;
 export import :output_layout;
 export import :pixel;
 export import :pixel_layout;
+export import :pointer;
 export import :pointer_constraints;
 export import :popup;
 export import :presentation_time;
+
 
 export import :rect_fill;
 export import :region;
