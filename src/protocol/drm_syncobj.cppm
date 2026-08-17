@@ -63,14 +63,11 @@ namespace luminaria {
 
 struct DrmSyncobjManager::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     int drm_fd = -1;
     unsigned acquire_timeout_ms = 50;
 
     ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
         if (drm_fd >= 0) {
             close(drm_fd);
         }
@@ -92,11 +89,8 @@ Timeline* timeline_of(wl_resource* r) {
     return static_cast<Timeline*>(wl_resource_get_user_data(r));
 }
 
-void timeline_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 constexpr struct wp_linux_drm_syncobj_timeline_v1_interface timeline_impl = {
-    .destroy = timeline_destroy_request,
+    .destroy = resource_destroy_request,
 };
 void timeline_resource_destroy(wl_resource* resource) {
     Timeline* timeline = timeline_of(resource);
@@ -238,9 +232,6 @@ void on_rendered(SyncSurface* sync, int fence_fd) {
     signal_release(sync); // no usable fence: the work is done, say so
 }
 
-void sync_surface_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void sync_surface_set_acquire_point(wl_client*, wl_resource* resource, wl_resource* timeline,
                                     uint32_t point_hi, uint32_t point_lo) {
     SyncSurface* sync = sync_surface_of(resource);
@@ -274,7 +265,7 @@ void sync_surface_set_release_point(wl_client*, wl_resource* resource, wl_resour
     sync->pending_release_point = point;
 }
 constexpr struct wp_linux_drm_syncobj_surface_v1_interface sync_surface_impl = {
-    .destroy = sync_surface_destroy_request,
+    .destroy = resource_destroy_request,
     .set_acquire_point = sync_surface_set_acquire_point,
     .set_release_point = sync_surface_set_release_point,
 };
@@ -286,9 +277,6 @@ void sync_surface_resource_destroy(wl_resource* resource) {
 }
 
 // ---- manager ----
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void manager_get_surface(wl_client* client, wl_resource* resource, uint32_t id,
                          wl_resource* surface_resource) {
@@ -342,21 +330,10 @@ void manager_import_timeline(wl_client* client, wl_resource* resource, uint32_t 
 }
 
 constexpr struct wp_linux_drm_syncobj_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_surface = manager_get_surface,
     .import_timeline = manager_import_timeline,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource =
-        wl_resource_create(client, &wp_linux_drm_syncobj_manager_v1_interface,
-                           static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 /// A render node whose kernel driver supports timeline syncobjs.
 int open_syncobj_render_node() {
@@ -390,11 +367,13 @@ Result<DrmSyncobjManager> DrmSyncobjManager::create(Display& display) {
     if (impl->drm_fd < 0) {
         return fail("linux-drm-syncobj: no render node with timeline syncobj support");
     }
-    impl->global = wl_global_create(impl->display, &wp_linux_drm_syncobj_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_linux_drm_syncobj_manager_v1) failed");
+    auto global = create_wl_global<&wp_linux_drm_syncobj_manager_v1_interface,
+                                   default_bind<&wp_linux_drm_syncobj_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return DrmSyncobjManager{std::move(impl)};
 }
 

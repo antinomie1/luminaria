@@ -157,8 +157,6 @@ struct Params {
 
 Params* params_of(wl_resource* r) { return static_cast<Params*>(wl_resource_get_user_data(r)); }
 
-void params_destroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
-
 void params_add(wl_client*, wl_resource* resource, int32_t fd, uint32_t plane_idx, uint32_t offset,
                 uint32_t stride, uint32_t modifier_hi, uint32_t modifier_lo) {
     Params* p = params_of(resource);
@@ -253,7 +251,7 @@ void params_create_immed(wl_client* client, wl_resource* resource, uint32_t buff
 }
 
 constexpr struct zwp_linux_buffer_params_v1_interface params_impl = {
-    .destroy = params_destroy,
+    .destroy = resource_destroy_request,
     .add = params_add,
     .create = params_create,
     .create_immed = params_create_immed,
@@ -264,8 +262,6 @@ void params_resource_destroy(wl_resource* resource) { delete params_of(resource)
 // --- zwp_linux_dmabuf_v1 global ---
 
 GlobalData* global_of(wl_resource* r) { return static_cast<GlobalData*>(wl_resource_get_user_data(r)); }
-
-void dmabuf_destroy(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 
 void dmabuf_create_params(wl_client* client, wl_resource* resource, uint32_t params_id) {
     wl_resource* r = wl_resource_create(client, &zwp_linux_buffer_params_v1_interface,
@@ -280,7 +276,7 @@ void dmabuf_create_params(wl_client* client, wl_resource* resource, uint32_t par
 }
 
 constexpr struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
-    .destroy = dmabuf_destroy,
+    .destroy = resource_destroy_request,
     .create_params = dmabuf_create_params,
     // get_default_feedback / get_surface_feedback are v4+; we bind at v3.
 };
@@ -312,12 +308,9 @@ void dmabuf_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
 struct LinuxDmabuf::Impl {
     int drm_fd = -1;
     GlobalData data;
-    wl_global* global = nullptr;
+    WlGlobal global;
 
     ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
         if (data.gbm != nullptr) {
             gbm_device_destroy(data.gbm);
         }
@@ -372,11 +365,11 @@ Result<LinuxDmabuf> LinuxDmabuf::create(Display& display, VulkanRenderer* render
         impl->data.formats.push_back(FormatMods{fourcc, std::move(mods)});
     }
 
-    impl->global = wl_global_create(display.c_ptr(), &zwp_linux_dmabuf_v1_interface, 3, &impl->data,
-                                    dmabuf_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_linux_dmabuf_v1) failed");
+    auto global = create_wl_global<&zwp_linux_dmabuf_v1_interface, dmabuf_bind>(display, 3, &impl->data);
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return LinuxDmabuf{std::move(impl)};
 }
 
