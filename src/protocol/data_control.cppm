@@ -93,6 +93,16 @@ private:
 
 namespace luminaria {
 
+using DcMgr = DataControlManager::Impl;
+
+// Which clipboard an offer refers to. Offers are one-shot views of a selection
+// that has since possibly changed, so they carry a validity flag.
+struct ControlOffer {
+    DcMgr* mgr = nullptr;
+    bool primary = false;
+    bool valid = true;
+};
+
 // External linkage: DataControlManager::Impl holds these.
 class ControlSource;
 
@@ -112,6 +122,15 @@ struct DataControlManager::Impl {
     Signal<SelectionChange>::Connection primary_conn;
 
     ~Impl() {
+        for (wl_resource* r : devices) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
+        for (wl_resource* r : offers) {
+            if (auto* o = static_cast<ControlOffer*>(wl_resource_get_user_data(r))) {
+                o->mgr = nullptr;
+            }
+        }
         if (global != nullptr) {
             wl_global_destroy(global);
         }
@@ -120,8 +139,6 @@ struct DataControlManager::Impl {
         }
     }
 };
-
-using DcMgr = DataControlManager::Impl;
 
 // A zwlr_data_control_source_v1 dressed up as an ordinary clipboard owner.
 // Owned by its resource.
@@ -153,14 +170,6 @@ public:
 };
 
 namespace {
-
-// Which clipboard an offer refers to. Offers are one-shot views of a selection
-// that has since possibly changed, so they carry a validity flag.
-struct ControlOffer {
-    DcMgr* mgr = nullptr;
-    bool primary = false;
-    bool valid = true;
-};
 
 ControlOffer* offer_of(wl_resource* r) {
     return static_cast<ControlOffer*>(wl_resource_get_user_data(r));
@@ -200,9 +209,12 @@ constexpr struct zwlr_data_control_offer_v1_interface offer_impl = {
 };
 
 void offer_resource_destroy(wl_resource* resource) {
-    ControlOffer* offer = offer_of(resource);
-    std::erase(offer->mgr->offers, resource);
-    delete offer;
+    if (ControlOffer* offer = offer_of(resource)) {
+        if (offer->mgr != nullptr) {
+            std::erase(offer->mgr->offers, resource);
+        }
+        delete offer;
+    }
 }
 
 // ---- zwlr_data_control_source_v1 ----
@@ -331,8 +343,9 @@ constexpr struct zwlr_data_control_device_v1_interface device_impl = {
 };
 
 void device_resource_destroy(wl_resource* resource) {
-    auto* mgr = static_cast<DcMgr*>(wl_resource_get_user_data(resource));
-    std::erase(mgr->devices, resource);
+    if (auto* mgr = static_cast<DcMgr*>(wl_resource_get_user_data(resource))) {
+        std::erase(mgr->devices, resource);
+    }
 }
 
 // ---- zwlr_data_control_manager_v1 ----

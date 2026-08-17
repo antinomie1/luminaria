@@ -130,6 +130,14 @@ struct OutputGlobal::Impl {
     }
 
     ~Impl() {
+        for (wl_resource* r : resources) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
+        for (wl_resource* r : xdg_resources) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
         if (xdg_output_global != nullptr) {
             wl_global_destroy(xdg_output_global);
         }
@@ -149,8 +157,9 @@ constexpr struct wl_output_interface output_impl = {.release = output_release};
 // A client can unbind a wl_output at any time; drop the weak reference or the
 // next iteration over Impl::resources walks freed memory.
 void output_resource_destroy(wl_resource* resource) {
-    auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource));
-    std::erase(self->resources, resource);
+    if (auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource))) {
+        std::erase(self->resources, resource);
+    }
 }
 
 // wl_output.mode is sent once per mode, and exactly one of them carries
@@ -223,8 +232,9 @@ void xdg_output_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);
 }
 void xdg_output_resource_destroy(wl_resource* resource) {
-    auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource));
-    std::erase(self->xdg_resources, resource);
+    if (auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource))) {
+        std::erase(self->xdg_resources, resource);
+    }
 }
 constexpr struct zxdg_output_v1_interface xdg_output_impl = {
     .destroy = xdg_output_destroy_request,

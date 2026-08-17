@@ -114,6 +114,11 @@ public:
     /// follows it and a client that committed without damage would freeze.
     void send_frame_done(SceneOutput& state, std::uint32_t time_ms);
 
+    /// Read back the last presented frame on `state` as RGBA8 pixels.
+    /// On the GPU path reads back `Frame::read_back()`; on the CPU path returns
+    /// `CpuCompositor::pixels()`.
+    [[nodiscard]] Result<std::span<const Pixel>> read_back(SceneOutput& state);
+
     struct Impl;
 
 private:
@@ -619,6 +624,13 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
     // ask for that one event so frame callbacks are paced to what was shown.
     output.schedule_frame();
     return SceneOutcome::committed;
+}
+
+Result<std::span<const Pixel>> SceneRenderer::read_back(SceneOutput& state) {
+    if (state.impl_->frame.has_value()) {
+        return state.impl_->frame->read_back();
+    }
+    return state.impl_->cpu.pixels();
 }
 
 } // namespace luminaria

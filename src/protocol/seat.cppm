@@ -205,6 +205,22 @@ struct Seat::Impl {
     bool dragging = false;
 
     ~Impl() {
+        for (wl_resource* r : seats) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
+        for (wl_resource* r : keyboards) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
+        for (wl_resource* r : pointers) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
+        for (wl_resource* r : touches) {
+            wl_resource_set_user_data(r, nullptr);
+            wl_resource_set_destructor(r, nullptr);
+        }
         if (global != nullptr) {
             wl_global_destroy(global);
         }
@@ -251,8 +267,9 @@ void resource_release(wl_client*, wl_resource* resource) {
 constexpr struct wl_keyboard_interface keyboard_impl = {.release = resource_release};
 
 void keyboard_destroy(wl_resource* resource) {
-    auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource));
-    std::erase(seat->keyboards, resource);
+    if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
+        std::erase(seat->keyboards, resource);
+    }
 }
 
 // wl_pointer.set_cursor: the focused client hands us the surface to draw as the
@@ -285,14 +302,16 @@ void pointer_set_cursor(wl_client* client, wl_resource* resource, uint32_t /*ser
 constexpr struct wl_pointer_interface pointer_impl = {.set_cursor = pointer_set_cursor,
                                                       .release = resource_release};
 void pointer_destroy(wl_resource* resource) {
-    auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource));
-    std::erase(seat->pointers, resource);
+    if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
+        std::erase(seat->pointers, resource);
+    }
 }
 
 constexpr struct wl_touch_interface touch_impl = {.release = resource_release};
 void touch_destroy(wl_resource* resource) {
-    auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource));
-    std::erase(seat->touches, resource);
+    if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
+        std::erase(seat->touches, resource);
+    }
 }
 
 // ---- wl_seat requests ----
@@ -344,8 +363,9 @@ constexpr struct wl_seat_interface seat_impl = {
 };
 
 void seat_resource_destroy(wl_resource* resource) {
-    auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource));
-    std::erase(seat->seats, resource);
+    if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
+        std::erase(seat->seats, resource);
+    }
 }
 
 void seat_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
