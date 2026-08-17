@@ -28,6 +28,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -164,7 +165,7 @@ namespace luminaria {
 
 struct Seat::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     std::string name;
     std::string keymap; // xkb keymap text (null-terminated payload sent to clients)
 
@@ -221,9 +222,6 @@ struct Seat::Impl {
             wl_resource_set_user_data(r, nullptr);
             wl_resource_set_destructor(r, nullptr);
         }
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
     }
 
     [[nodiscard]] uint32_t next_serial() const { return wl_display_next_serial(display); }
@@ -261,10 +259,7 @@ void send_keymap(Seat::Impl* seat, wl_resource* keyboard) {
 }
 
 // ---- wl_keyboard / wl_pointer / wl_touch resource lifecycle ----
-void resource_release(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-constexpr struct wl_keyboard_interface keyboard_impl = {.release = resource_release};
+constexpr struct wl_keyboard_interface keyboard_impl = {.release = resource_destroy_request};
 
 void keyboard_destroy(wl_resource* resource) {
     if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
@@ -300,14 +295,14 @@ void pointer_set_cursor(wl_client* client, wl_resource* resource, uint32_t /*ser
     seat->cursor_changed.emit(event);
 }
 constexpr struct wl_pointer_interface pointer_impl = {.set_cursor = pointer_set_cursor,
-                                                      .release = resource_release};
+                                                      .release = resource_destroy_request};
 void pointer_destroy(wl_resource* resource) {
     if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
         std::erase(seat->pointers, resource);
     }
 }
 
-constexpr struct wl_touch_interface touch_impl = {.release = resource_release};
+constexpr struct wl_touch_interface touch_impl = {.release = resource_destroy_request};
 void touch_destroy(wl_resource* resource) {
     if (auto* seat = static_cast<Seat::Impl*>(wl_resource_get_user_data(resource))) {
         std::erase(seat->touches, resource);
@@ -352,14 +347,11 @@ void seat_get_touch(wl_client* client, wl_resource* seat_resource, uint32_t id) 
     wl_resource_set_implementation(resource, &touch_impl, seat, touch_destroy);
     seat->touches.push_back(resource);
 }
-void seat_release(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 constexpr struct wl_seat_interface seat_impl = {
     .get_pointer = seat_get_pointer,
     .get_keyboard = seat_get_keyboard,
     .get_touch = seat_get_touch,
-    .release = seat_release,
+    .release = resource_destroy_request,
 };
 
 void seat_resource_destroy(wl_resource* resource) {
@@ -420,10 +412,11 @@ Result<Seat> Seat::create(Display& display, std::string name) {
     impl->display = display.c_ptr();
     impl->name = std::move(name);
     impl->keymap = std::move(keymap_string);
-    impl->global = wl_global_create(impl->display, &wl_seat_interface, 5, impl.get(), seat_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wl_seat) failed");
+    auto global = create_wl_global<&wl_seat_interface, seat_bind>(display, 5, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     Impl* raw = impl.get();
     impl->invalidated = surface_invalidated().connect([raw](SurfaceInvalidated& event) {
         if (raw->kb_focus == event.surface) {
