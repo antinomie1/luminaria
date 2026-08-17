@@ -86,7 +86,9 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   把每种图元实现两次（一次 `Placement`、一次 `CpuItem`），而且没有编译器会告诉你两边什么时候
   开始不一致。降级也全在运行时——没有 Vulkan 设备、某个输出配不出渲染目标、`submit()` 答
   `Presented::fallback`——三条都落到同一个 CPU 分支。`tag` 是调用方自己的身份，库不解释它，只
-  在命中时原样交还。
+  在命中时原样交还。`SceneBlur` 与 `SceneShadow` 是命名空间级类型而不是 `SceneItem` 的嵌套成员：
+  clang 22.1.8 对嵌套在导出聚合体里的这两个类型会在 codegen 阶段 ICE（无关联的
+  `std::vector<Pixel>::data` 实例化），所以这两个公开值类型必须保持命名空间级，`test_scene` 守住这一点。
 
 ## 一帧长什么样
 
