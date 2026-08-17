@@ -289,6 +289,34 @@ public:
     void place_xray_blur(const GpuTexture& texture, const Box& background,
                          Surface& surface, int x, int y);
 
+    /// Composite everything placed since `group` into `target`, blur it into
+    /// `chain`, and leave the placements alone.
+    ///
+    /// This is the expensive kind of blur, and the cost is visible in that
+    /// sentence: unlike `compose_group`, which replaces what it composited,
+    /// the pixels below a blurred window are drawn twice — once to be blurred,
+    /// once for real. What buys is that the blur source is the actual scene, so
+    /// a window blurs the window behind it and not just the wallpaper, which is
+    /// the whole difference from `place_xray_blur`.
+    ///
+    /// `bounds` is what `target` covers, in layout coordinates, and `chain`
+    /// must have been created at `target`'s size. Follow it with `place_blur`
+    /// for each region that shows the result.
+    [[nodiscard]] Status capture_blur(PlacementGroup group, OffscreenTarget& target,
+                                      const Box& bounds, BlurChain& chain,
+                                      const BlurParams& params);
+
+    /// Place a blur backdrop: `texture` — normally `BlurChain::texture()` —
+    /// addressed as covering `background`, shown only inside `box`, with
+    /// `radius` rounded corners so it does not spill outside the window it is
+    /// the backdrop for.
+    ///
+    /// `spread` is `blur_spread()` for the parameters it was made with. It is
+    /// not decoration: it tells `submit()` how far away a change still makes
+    /// this box stale, and getting it wrong leaves a smear on the screen.
+    void place_blur(const GpuTexture& texture, const Box& background, const Box& box,
+                    float radius, int spread);
+
     /// Mark the start of a window-sized group. Add the window's surface tree,
     /// its popups, and any other visual members with `place()`, then hand the
     /// marker to `compose_group()`. The original placements remain hit-testable
@@ -568,6 +596,11 @@ struct Frame::Impl {
     std::vector<int> group_acquire_fences;
     std::vector<UniqueFd> prepass_fences; // owned, joined to the final render
     std::vector<Box> prepass_damage;      // output-local, one box per group
+    struct BlurRegion {
+        Box box;       // output-local
+        int spread = 0;
+    };
+    std::vector<BlurRegion> blur_regions;
     std::vector<SurfaceId> prepass_drawn;
     std::vector<SurfaceId> drawn;
     std::vector<std::unique_ptr<FrSurfaceTexture>> texture_cache;
@@ -599,6 +632,17 @@ struct Frame::Impl {
     [[nodiscard]] const Effect* effect_at(std::size_t placement) const noexcept;
     [[nodiscard]] FrPlacementKey key_of(const Placement& p, std::size_t placement) const noexcept;
     [[nodiscard]] GpuTexture* texture_for(Surface& surface);
+
+    /// Composite `placements[first..]` into `target`, which covers `bounds`.
+    ///
+    /// `consume` is the difference between the two callers. A group is
+    /// consumed: its placements stop drawing themselves because the one texture
+    /// now speaks for them, and the surfaces are told their pixels have been
+    /// read. A blur backdrop is not: the same placements are about to be drawn
+    /// again for real, so marking their buffers as read here would release them
+    /// a pass too early.
+    [[nodiscard]] Status render_group(std::size_t first, OffscreenTarget& target,
+                                      const Box& bounds, int scale, bool consume);
 };
 
 // Damage/scissor boxes must cover every pixel a subpixel quad can touch. The
@@ -689,6 +733,118 @@ void Frame::Impl::keep_list() {
     }
     last_view = view;
     last_valid = true;
+}
+
+Status Frame::Impl::render_group(std::size_t first_placement, OffscreenTarget& target,
+                                 const Box& bounds, int scale, bool consume) {
+    group_fills.clear();
+    group_opaque.clear();
+    group_acquire_fences.clear();
+    const std::size_t drawn_first = prepass_drawn.size();
+    group_opaque.reserve(opaque_arena.size());
+    for (std::size_t i = first_placement; i < placements.size(); ++i) {
+        Placement& p = placements[i];
+        if (!p.draw) {
+            // A composed group's own members are already represented by the
+            // texture that replaced them, so a backdrop skips them and finds
+            // that texture further down the list. A new group cannot contain
+            // one: it would draw those pixels twice.
+            if (consume) {
+                return fail("an offscreen group cannot contain an already-composed group");
+            }
+            continue;
+        }
+        if (p.solid) {
+            // Borders, panels, the bar's backing — a blur backdrop that dropped
+            // them would blur the wallpaper through a window that is actually
+            // covering it. They are not part of a composed group, which is one
+            // window's own surfaces, so this only ever fires for a backdrop.
+            if (consume) {
+                continue;
+            }
+            GpuTextureFill solid{};
+            solid.solid = true;
+            solid.color = p.color;
+            solid.corner_radius = p.corner_radius;
+            solid.feather = p.feather;
+            solid.x = p.x - static_cast<float>(bounds.x);
+            solid.y = p.y - static_cast<float>(bounds.y);
+            solid.w = p.width;
+            solid.h = p.height;
+            group_fills.push_back(solid);
+            continue;
+        }
+        Surface* surface = surface_from_id(p.surface);
+        if (p.surface.valid()) {
+            p.texture = surface != nullptr ? texture_for(*surface) : nullptr;
+        }
+        if (p.texture == nullptr) {
+            if (consume) {
+                p.draw = false;
+            }
+            continue;
+        }
+
+        GpuTextureFill fill{};
+        fill.texture = p.texture;
+        fill.x = p.x - static_cast<float>(bounds.x);
+        fill.y = p.y - static_cast<float>(bounds.y);
+        fill.w = p.width;
+        fill.h = p.height;
+        fill.transform = p.transform;
+        fill.u0 = p.u0;
+        fill.v0 = p.v0;
+        fill.u1 = p.u1;
+        fill.v1 = p.v1;
+        fill.alpha = p.alpha;
+        fill.corner_radius = p.corner_radius;
+        const std::size_t opaque_first = group_opaque.size();
+        if (p.alpha == 1.0f) {
+            for (const Box& b : std::span<const Box>{opaque_arena}.subspan(p.opaque_first,
+                                                                           p.opaque_count)) {
+                group_opaque.push_back(Box{b.x - bounds.x, b.y - bounds.y, b.width, b.height});
+            }
+        }
+        fill.opaque = std::span<const Box>{group_opaque}.subspan(
+            opaque_first, group_opaque.size() - opaque_first);
+        group_fills.push_back(fill);
+        if (surface != nullptr) {
+            if (const int fence = surface->acquire_fence_fd(); fence >= 0) {
+                group_acquire_fences.push_back(fence);
+            }
+            if (consume) {
+                prepass_drawn.push_back(p.surface);
+            }
+        }
+        if (consume) {
+            // Keep this item for input, but only the group texture may paint it.
+            p.draw = false;
+        }
+    }
+    if (group_fills.empty()) {
+        return fail("offscreen group has no drawable texture");
+    }
+
+    int fence = -1;
+    const RenderSync sync{group_acquire_fences, &fence};
+    const Color transparent{0, 0, 0, 0};
+    if (auto rendered =
+            renderer->render_offscreen(target, transparent, {}, group_fills, {}, scale, sync);
+        !rendered) {
+        if (fence >= 0) {
+            ::close(fence);
+        }
+        return fail(rendered.error().message);
+    }
+    if (fence >= 0) {
+        prepass_fences.emplace_back(fence);
+    }
+    for (std::size_t i = drawn_first; i < prepass_drawn.size(); ++i) {
+        if (Surface* surface = surface_from_id(prepass_drawn[i]); surface != nullptr) {
+            surface->notify_rendered(fence);
+        }
+    }
+    return ok();
 }
 
 GpuTexture* Frame::Impl::texture_for(Surface& surface) {
@@ -868,6 +1024,7 @@ void Frame::begin(const Box& view) {
     // copy is safe. The next begun list starts with no unsubmitted group work.
     impl.prepass_fences.clear();
     impl.prepass_damage.clear();
+    impl.blur_regions.clear();
     impl.prepass_drawn.clear();
     impl.animating = false;
     impl.view = view;
@@ -1092,6 +1249,55 @@ void Frame::place_rect(int x, int y, int width, int height, Color color) {
     impl.placements.push_back(p);
 }
 
+Status Frame::capture_blur(PlacementGroup group, OffscreenTarget& target, const Box& bounds,
+                           BlurChain& chain, const BlurParams& params) {
+    Impl& impl = *impl_;
+    if (group.generation_ != impl.generation || group.first_ >= impl.placements.size()) {
+        return fail("blur backdrop is empty or belongs to an earlier frame");
+    }
+    const int scale = std::max(1, impl.output->scale());
+    if (bounds.empty() || target.width() != bounds.width * scale ||
+        target.height() != bounds.height * scale) {
+        return fail("blur target dimensions do not match the bounds and output scale");
+    }
+    if (chain.width() != target.width() || chain.height() != target.height()) {
+        return fail("blur chain was not created at the target's size");
+    }
+    if (Status rendered = impl.render_group(group.first_, target, bounds, scale,
+                                            /*consume=*/false);
+        !rendered) {
+        return rendered;
+    }
+    return impl.renderer->blur(chain, target.texture(), params);
+}
+
+void Frame::place_blur(const GpuTexture& texture, const Box& background, const Box& box,
+                       float radius, int spread) {
+    Impl& impl = *impl_;
+    const Box visible = box.intersection(impl.view).intersection(background);
+    if (background.empty() || visible.empty()) {
+        return;
+    }
+    Placement p{};
+    p.texture = &texture;
+    p.x = static_cast<float>(visible.x);
+    p.y = static_cast<float>(visible.y);
+    p.width = static_cast<float>(visible.width);
+    p.height = static_cast<float>(visible.height);
+    p.u0 = static_cast<float>(visible.x - background.x) / static_cast<float>(background.width);
+    p.v0 = static_cast<float>(visible.y - background.y) / static_cast<float>(background.height);
+    p.u1 = static_cast<float>(visible.x + visible.width - background.x) /
+           static_cast<float>(background.width);
+    p.v1 = static_cast<float>(visible.y + visible.height - background.y) /
+           static_cast<float>(background.height);
+    p.corner_radius = std::max(radius, 0.0f);
+    p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
+    impl.placements.push_back(p);
+    impl.blur_regions.push_back(Impl::BlurRegion{
+        Box{visible.x - impl.view.x, visible.y - impl.view.y, visible.width, visible.height},
+        std::max(spread, 0)});
+}
+
 void Frame::place_xray_blur(const GpuTexture& texture, const Box& background,
                             Surface& surface, int x, int y) {
     Impl& impl = *impl_;
@@ -1159,82 +1365,10 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const
         return fail("offscreen target dimensions do not match the group bounds and output scale");
     }
 
-    impl.group_fills.clear();
-    impl.group_opaque.clear();
-    impl.group_acquire_fences.clear();
-    const std::size_t drawn_first = impl.prepass_drawn.size();
-    impl.group_opaque.reserve(impl.opaque_arena.size());
-    for (std::size_t i = group.first_; i < impl.placements.size(); ++i) {
-        Placement& p = impl.placements[i];
-        if (!p.draw) {
-            return fail("an offscreen group cannot contain an already-composed group");
-        }
-        Surface* surface = surface_from_id(p.surface);
-        if (p.surface.valid()) {
-            p.texture = surface != nullptr ? impl.texture_for(*surface) : nullptr;
-        }
-        if (p.texture == nullptr) {
-            p.draw = false;
-            continue;
-        }
-
-        GpuTextureFill fill{};
-        fill.texture = p.texture;
-        fill.x = p.x - bounds.x;
-        fill.y = p.y - bounds.y;
-        fill.w = p.width;
-        fill.h = p.height;
-        fill.transform = p.transform;
-        fill.u0 = p.u0;
-        fill.v0 = p.v0;
-        fill.u1 = p.u1;
-        fill.v1 = p.v1;
-        fill.alpha = p.alpha;
-        fill.corner_radius = p.corner_radius;
-        const std::size_t first = impl.group_opaque.size();
-        if (p.alpha == 1.0f) {
-            for (const Box& b : opaque_of(p)) {
-                impl.group_opaque.push_back(
-                    Box{b.x - bounds.x, b.y - bounds.y, b.width, b.height});
-            }
-        }
-        fill.opaque = std::span<const Box>{impl.group_opaque}.subspan(
-            first, impl.group_opaque.size() - first);
-        impl.group_fills.push_back(fill);
-        if (surface != nullptr) {
-            if (const int fence = surface->acquire_fence_fd(); fence >= 0) {
-                impl.group_acquire_fences.push_back(fence);
-            }
-            impl.prepass_drawn.push_back(p.surface);
-        }
-        // Keep this item for input, but only the final group texture below may
-        // paint it on the output.
-        p.draw = false;
-    }
-    if (impl.group_fills.empty()) {
-        return fail("offscreen group has no drawable texture");
-    }
-
-    int fence = -1;
-    const RenderSync sync{impl.group_acquire_fences, &fence};
-    const Color transparent{0, 0, 0, 0};
-    if (auto rendered = impl.renderer->render_offscreen(target, transparent, {}, impl.group_fills,
-                                                         {}, scale, sync);
+    if (Status rendered = impl.render_group(group.first_, target, bounds, scale, /*consume=*/true);
         !rendered) {
-        if (fence >= 0) {
-            ::close(fence);
-        }
-        return fail(rendered.error().message);
+        return rendered;
     }
-    if (fence >= 0) {
-        impl.prepass_fences.emplace_back(fence);
-    }
-    for (std::size_t i = drawn_first; i < impl.prepass_drawn.size(); ++i) {
-        if (Surface* surface = surface_from_id(impl.prepass_drawn[i]); surface != nullptr) {
-            surface->notify_rendered(fence);
-        }
-    }
-
     const std::size_t before = impl.placements.size();
     place(target.texture(), transform);
     if (impl.placements.size() != before) {
@@ -1518,6 +1652,23 @@ Result<Presented> Frame::submit(Color background) {
     // last frame that reached the screen.
     if (!impl.full_redraw) {
         impl.diff_damage();
+        // A blurred region shows what is behind it from `spread` pixels away,
+        // so a change that far outside it makes it stale even though nothing
+        // inside it moved. Only what the frame already reported is consulted,
+        // so a frame with no damage at all still adds none — an idle desktop
+        // with blur on stays idle.
+        const std::size_t reported = impl.damage.size();
+        for (const Impl::BlurRegion& region : impl.blur_regions) {
+            const Box reach{region.box.x - region.spread, region.box.y - region.spread,
+                            region.box.width + 2 * region.spread,
+                            region.box.height + 2 * region.spread};
+            for (std::size_t i = 0; i < reported; ++i) {
+                if (!impl.damage[i].intersection(reach).empty()) {
+                    impl.damage.push_back(region.box);
+                    break;
+                }
+            }
+        }
     }
 
     // --- how much of it -----------------------------------------------------
@@ -1654,6 +1805,7 @@ Result<Presented> Frame::submit(Color background) {
         }
     }
     impl.prepass_damage.clear();
+    impl.blur_regions.clear();
     impl.prepass_drawn.clear();
     if (impl.animating) {
         // Committing does not buy another frame. Keep this request inside the

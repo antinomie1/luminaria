@@ -231,6 +231,18 @@ struct BlurParams {
     float saturation = 1.0f;
 };
 
+/// How far a blurred pixel reaches for its input, in source pixels.
+///
+/// Damage, not decoration: a blurred window shows what is behind it from this
+/// far outside itself, so a change anywhere within this distance of it makes it
+/// stale. Deliberately generous — repainting a little too much is a cost, and
+/// repainting too little is a smear that stays on the screen.
+[[nodiscard]] inline int blur_spread(const BlurParams& params) noexcept {
+    const int passes = std::clamp(params.passes, 1, 6);
+    return static_cast<int>(
+        std::ceil(2.0f * std::max(params.offset, 0.0f) * static_cast<float>(1 << passes)));
+}
+
 /// A ladder of half-resolution targets, plus the two Kawase passes that walk
 /// down it and back up. Allocate one per thing that needs blurring and keep it:
 /// the targets are reused every frame, so a steady-state blur allocates nothing.

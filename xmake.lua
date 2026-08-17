@@ -335,6 +335,7 @@ local gpu_tests = {
     test_fragment_shader = true,
     test_frame_xray_blur = true,
     test_blur_chain = true,
+    test_backdrop_blur = true,
     test_rounded_shadow = true,
     test_xray_blur = true,
     test_frame_damage = true, test_offscreen = true,
