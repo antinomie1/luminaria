@@ -16,6 +16,8 @@ module;
 #include "rounded_frag_spv.h"
 #include "quad_vert_spv.h"
 #include "shadow_frag_spv.h"
+#include "kawase_down_frag_spv.h"
+#include "kawase_up_frag_spv.h"
 #include "solid_frag_spv.h"
 
 export module luminaria.gpu:vulkan;
@@ -207,6 +209,62 @@ private:
     explicit XrayBlur(std::unique_ptr<Impl> impl) noexcept;
 };
 
+/// How much a blur blurs.
+///
+/// The names are niri's rather than Hyprland's single `size`, because the two
+/// knobs do not cost the same and one number hides which one is being turned.
+/// `passes` buys radius by halving the resolution again — each one is another
+/// pair of render passes — while `offset` buys radius inside the passes already
+/// paid for and is free. Reach for `offset` first; add a pass when the samples
+/// start to separate into a visible cross.
+struct BlurParams {
+    /// Down/up levels. Clamped to what the chain was built for.
+    int passes = 3;
+    /// Tap distance, in half source texels. Above ~4 the five taps stop
+    /// overlapping and the blur turns into a star.
+    float offset = 2.0f;
+    /// Dither amplitude on the final upsample, 0 for none. A large smooth
+    /// gradient banded into 8-bit is the artefact this exists for.
+    float noise = 0.0f;
+    /// 1.0 leaves colour alone. Above it, undoes the averaging-towards-grey a
+    /// blur necessarily does.
+    float saturation = 1.0f;
+};
+
+/// A ladder of half-resolution targets, plus the two Kawase passes that walk
+/// down it and back up. Allocate one per thing that needs blurring and keep it:
+/// the targets are reused every frame, so a steady-state blur allocates nothing.
+///
+/// This is the real blur, as opposed to `XrayBlur` above: it takes whatever
+/// texture it is handed, so what is behind a window can be an actual window.
+/// The x-ray cache stays because it is cheaper — one shared backdrop for the
+/// whole output, updated only when the static scene changes — and that is a
+/// policy choice for the compositor, not a fallback.
+class BlurChain {
+public:
+    ~BlurChain();
+    BlurChain(BlurChain&&) noexcept;
+    BlurChain& operator=(BlurChain&&) noexcept;
+    BlurChain(const BlurChain&) = delete;
+    BlurChain& operator=(const BlurChain&) = delete;
+
+    /// The finished blur, at the size the chain was created with, ready to be a
+    /// `GpuTextureFill::texture` drawn 1:1 over what it was made from.
+    [[nodiscard]] const GpuTexture& texture() const noexcept;
+
+    [[nodiscard]] int width() const noexcept;
+    [[nodiscard]] int height() const noexcept;
+    /// The most `BlurParams::passes` this chain can run.
+    [[nodiscard]] int max_passes() const noexcept;
+
+    struct Impl;
+
+private:
+    friend class VulkanRenderer;
+    std::unique_ptr<Impl> impl_;
+    explicit BlurChain(std::unique_ptr<Impl> impl) noexcept;
+};
+
 /// A GpuTexture stretched into the destination rect (x,y,w,h), in the output's
 /// LOGICAL coordinates — the renderer applies scale and rotation.
 struct GpuTextureFill {
@@ -274,6 +332,13 @@ struct GpuTextureFill {
     /// The silhouette is analytic — no blur pass, no extra target. Blurring a
     /// shape that is already in closed form buys nothing.
     float feather = 0.0f;
+
+    /// Four floats handed straight to a custom `FragmentShader` as `pc.params`,
+    /// and ignored by every built-in pipeline. The extension point had no way
+    /// to say anything per quad before this — one shader had to mean one set of
+    /// constants — which is what made a pass chain like the blur below need a
+    /// pipeline per level instead of a pipeline per kind of pass.
+    float params[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 /// How an output's logical coordinates map onto its framebuffer: the integer
@@ -430,6 +495,18 @@ public:
     [[nodiscard]] Result<XrayBlur> create_xray_blur(int width, int height,
                                                      unsigned downsample = 4);
 
+    /// Allocate a blur chain for a `width`x`height` source. `max_passes` sizes
+    /// the ladder; each level halves both dimensions, so asking for more than
+    /// about 6 buys nothing at any display size in existence.
+    [[nodiscard]] Result<BlurChain> create_blur_chain(int width, int height, int max_passes = 4);
+
+    /// Run the chain over `source` — down the ladder and back up — leaving the
+    /// result in `chain.texture()`. `source` may be any texture at all: an
+    /// offscreen the compositor just composited the windows below into, or a
+    /// static backdrop. It is only sampled.
+    [[nodiscard]] Status blur(BlurChain& chain, const GpuTexture& source,
+                              const BlurParams& params = {});
+
     /// Refresh an x-ray cache from static output-local layers. `textures` use
     /// normal output logical coordinates; this method scales them into the
     /// reduced target and owns the scratch list. On success call
@@ -494,6 +571,12 @@ private:
                                         std::span<const FragmentShader* const> shaders,
                                         std::span<const Box> damage,
                                         const OutputMapping& mapping, const RenderSync& sync);
+
+    /// One blur pass: `source` stretched over the whole of `target`, through
+    /// `shader`, with `params` reaching it as `pc.params`.
+    [[nodiscard]] Status blur_pass(OffscreenTarget& target, const GpuTexture& source,
+                                   const FragmentShader& shader, float offset, float noise,
+                                   float saturation);
 
     [[nodiscard]] Status render_to_with_shaders(
         ScanoutTarget& target, Color background, std::span<const RectFill> rects,
@@ -1573,6 +1656,28 @@ int XrayBlur::output_width() const noexcept { return impl_->output_width; }
 int XrayBlur::output_height() const noexcept { return impl_->output_height; }
 unsigned XrayBlur::downsample() const noexcept { return impl_->downsample; }
 
+struct BlurChain::Impl {
+    OffscreenTarget result;
+    /// Half, quarter, eighth … of the source. levels[0] is the largest.
+    std::vector<OffscreenTarget> levels;
+    /// One pipeline each, cached by the renderer against the shader's id. Held
+    /// here rather than in the renderer so that the chain owns everything it
+    /// needs and dropping it takes the whole thing with it.
+    FragmentShader down;
+    FragmentShader up;
+    /// Reused every pass: a one-element list the render path can borrow.
+    std::vector<GpuTextureFill> fill;
+};
+
+BlurChain::BlurChain(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+BlurChain::~BlurChain() = default;
+BlurChain::BlurChain(BlurChain&&) noexcept = default;
+BlurChain& BlurChain::operator=(BlurChain&&) noexcept = default;
+const GpuTexture& BlurChain::texture() const noexcept { return impl_->result.texture(); }
+int BlurChain::width() const noexcept { return impl_->result.width(); }
+int BlurChain::height() const noexcept { return impl_->result.height(); }
+int BlurChain::max_passes() const noexcept { return static_cast<int>(impl_->levels.size()); }
+
 ScanoutTarget::ScanoutTarget(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 ScanoutTarget::~ScanoutTarget() = default;
 ScanoutTarget::ScanoutTarget(ScanoutTarget&&) noexcept = default;
@@ -1734,6 +1839,7 @@ struct QuadPush {
     float pad_[3];
     float effect[4]; ///< shader-specific: corner radius, shadow falloff, …
     float shape[4];  ///< xy: quad centre in device px, zw: its half extent
+    float params[4]; ///< GpuTextureFill::params, verbatim
 };
 
 struct FloatBox {
@@ -2357,6 +2463,99 @@ Status VulkanRenderer::update_xray_blur(XrayBlur& blur, Color background,
     return render_offscreen(impl.target, background, {}, impl.fills);
 }
 
+Result<BlurChain> VulkanRenderer::create_blur_chain(int width, int height, int max_passes) {
+    if (width <= 0 || height <= 0) {
+        return fail("invalid blur chain dimensions");
+    }
+    auto result = create_offscreen(width, height);
+    if (!result) {
+        return fail(result.error().message);
+    }
+    std::vector<OffscreenTarget> levels;
+    for (int level = 0; level < std::clamp(max_passes, 1, 6); ++level) {
+        const int w = std::max(1, width >> (level + 1));
+        const int h = std::max(1, height >> (level + 1));
+        auto target = create_offscreen(w, h);
+        if (!target) {
+            return fail(target.error().message);
+        }
+        levels.push_back(std::move(*target));
+        // A level that has stopped shrinking would make every further pass a
+        // same-size copy: radius bought, nothing gained.
+        if (w == 1 || h == 1) {
+            break;
+        }
+    }
+    auto down = create_fragment_shader(kKawaseDownFragSpv, ShaderDamage::none);
+    auto up = create_fragment_shader(kKawaseUpFragSpv, ShaderDamage::none);
+    if (!down || !up) {
+        return fail(down ? up.error().message : down.error().message);
+    }
+    return BlurChain{std::make_unique<BlurChain::Impl>(BlurChain::Impl{
+        std::move(*result), std::move(levels), std::move(*down), std::move(*up), {}})};
+}
+
+Status VulkanRenderer::blur_pass(OffscreenTarget& target, const GpuTexture& source,
+                                 const FragmentShader& shader, float offset, float noise,
+                                 float saturation) {
+    GpuTextureFill fill{};
+    fill.texture = &source;
+    fill.x = 0.0f;
+    fill.y = 0.0f;
+    fill.w = static_cast<float>(target.width());
+    fill.h = static_cast<float>(target.height());
+    // Half a SOURCE texel, times the knob — for both halves of the chain, so
+    // that `offset` means one thing whichever direction the ladder is going.
+    fill.params[0] = 0.5f * offset / static_cast<float>(std::max(1, source.width()));
+    fill.params[1] = 0.5f * offset / static_cast<float>(std::max(1, source.height()));
+    fill.params[2] = noise;
+    fill.params[3] = saturation;
+    const FragmentShader* shaders[] = {&shader};
+
+    OffscreenTarget::Impl& o = *target.impl_;
+    const GpuTexture::Impl& tex = *o.texture.impl_;
+    VulkanRenderTarget t{*tex.image,     *tex.view,  o.format,    tex.width, tex.height,
+                         &o.has_content, &o.fb_load, &o.fb_clear, &o.acquire_fence,
+                         /*scanout=*/false};
+    // Opaque background: every pixel of the target is written by the quad, so
+    // the clear is only there to satisfy the load op.
+    return render_pass_to(t, Color{0, 0, 0, 0}, {}, std::span{&fill, 1}, shaders, {},
+                          OutputMapping{Transform::normal, 1}, {});
+}
+
+Status VulkanRenderer::blur(BlurChain& chain, const GpuTexture& source,
+                            const BlurParams& params) {
+    BlurChain::Impl& impl = *chain.impl_;
+    const int passes = std::clamp(params.passes, 1, static_cast<int>(impl.levels.size()));
+    const float offset = std::clamp(params.offset, 0.0f, 8.0f);
+
+    const GpuTexture* current = &source;
+    for (int level = 0; level < passes; ++level) {
+        if (Status done = blur_pass(impl.levels[static_cast<std::size_t>(level)], *current,
+                                    impl.down, offset, 0.0f, 1.0f);
+            !done) {
+            return done;
+        }
+        current = &impl.levels[static_cast<std::size_t>(level)].texture();
+    }
+    for (int level = passes; level-- > 0;) {
+        const bool last = level == 0;
+        // The last upsample writes the full-size result; the others walk back up
+        // the ladder, overwriting the level they came from on the way down. That
+        // is safe because a pass never samples what it writes.
+        OffscreenTarget& target =
+            last ? impl.result : impl.levels[static_cast<std::size_t>(level - 1)];
+        if (Status done = blur_pass(target, *current, impl.up, offset,
+                                    last ? std::clamp(params.noise, 0.0f, 1.0f) : 0.0f,
+                                    last ? std::max(params.saturation, 0.0f) : 1.0f);
+            !done) {
+            return done;
+        }
+        current = &target.texture();
+    }
+    return ok();
+}
+
 Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                                       std::span<const RectFill> rects,
                                       std::span<const GpuTextureFill> textures,
@@ -2578,6 +2777,7 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             push.shape[3] = dev.height * 0.5f - grow_dev;
             push.effect[0] = tf.corner_radius * static_cast<float>(std::max(1, scale));
             push.effect[1] = grow_dev;
+            std::ranges::copy(tf.params, std::begin(push.params));
             push.rect[0] = 2.0f * dev.x / static_cast<float>(device_w) - 1.0f;
             push.rect[1] = 2.0f * dev.y / static_cast<float>(device_h) - 1.0f;
             push.rect[2] = 2.0f * (dev.x + dev.width) / static_cast<float>(device_w) - 1.0f;

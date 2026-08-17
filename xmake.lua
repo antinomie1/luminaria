@@ -242,6 +242,8 @@ target("luminaria-gpu")
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
                                  {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
                                  {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
+                                 {"kawase_down.frag", "kKawaseDownFragSpv", "kawase_down_frag_spv.h"},
+                                 {"kawase_up.frag", "kKawaseUpFragSpv", "kawase_up_frag_spv.h"},
                                  {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
@@ -264,6 +266,8 @@ target("luminaria-gpu")
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
                                  {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
                                  {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
+                                 {"kawase_down.frag", "kKawaseDownFragSpv", "kawase_down_frag_spv.h"},
+                                 {"kawase_up.frag", "kKawaseUpFragSpv", "kawase_up_frag_spv.h"},
                                  {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
@@ -330,6 +334,7 @@ local gpu_tests = {
     test_frame_animation = true,
     test_fragment_shader = true,
     test_frame_xray_blur = true,
+    test_blur_chain = true,
     test_rounded_shadow = true,
     test_xray_blur = true,
     test_frame_damage = true, test_offscreen = true,
