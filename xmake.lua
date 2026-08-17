@@ -89,6 +89,7 @@ for _, name in ipairs(pkgs) do
 end
 local base_packages = {"wayland_server", "wayland_client", "xkbcommon"}
 local gpu_packages = {"vulkan", "libdrm", "libinput", "libudev", "gbm", "libseat"}
+add_requires("fcft", "pixman", {system = true})
 
 -- ---------------------------------------------------------------- code generation
 --
@@ -294,6 +295,14 @@ target("luminaria-xwayland")
     add_deps("luminaria")
     add_files("src/xwayland/xwayland.cppm", {public = true})
     add_packages("xcb", {public = true})
+
+target("luminaria-text")
+    set_kind("static")
+    luminaria_defaults()
+    add_deps("luminaria")
+    add_packages("fcft", "pixman", {public = true})
+    add_files("src/text/text.cppm", {public = true})
+
 
 -- --------------------------------------------------------------------- examples
 -- ------------------------------------------------------------------------ tests
