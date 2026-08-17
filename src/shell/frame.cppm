@@ -322,6 +322,36 @@ public:
     void place_blur(const GpuTexture& texture, const Box& background, const Box& box,
                     float radius, int spread);
 
+    /// Queue a backdrop capture and add the chain's texture as a blur placement
+    /// covering `box`.
+    ///
+    /// This is `capture_blur` + `place_blur` with the capture moved into
+    /// `submit()`: the placement is in the list from now, so the unchanged diff
+    /// sees it like any other, but the offscreen render and the blur chain only
+    /// run if the frame actually repaints — an unchanged frame must not pay for
+    /// a backdrop it never shows. `target` and `chain` are borrowed and must
+    /// outlive this frame's `submit()`; the queued job owns only values, and
+    /// `begin()` clears every job.
+    ///
+    /// `box` is the blur's visible rectangle, `radius` its corner rounding and
+    /// `spread` its damage reach — the same arguments `place_blur` takes.
+    /// Answers false when the capture could not be queued, in which case no
+    /// placement was added either.
+    [[nodiscard]] bool queue_blur(PlacementGroup group, OffscreenTarget& target,
+                                  BlurChain& chain, const Box& bounds, const BlurParams& params,
+                                  const Box& box, float radius, int spread);
+
+    /// As `queue_blur`, but placing one placement per region the surface tree
+    /// declared through ext-background-effect-v1 — translated by the root's
+    /// origin and clipped to each child's surface, `clip`, the view and
+    /// `bounds`. Answers whether at least one region was placed and a capture
+    /// queued: an empty client request queues nothing and therefore captures
+    /// nothing.
+    [[nodiscard]] bool queue_blur_regions(PlacementGroup group, OffscreenTarget& target,
+                                          BlurChain& chain, const Box& bounds,
+                                          const BlurParams& params, Surface& surface, int x,
+                                          int y, const Box& clip, int spread);
+
     /// Mark the start of a window-sized group. Add the window's surface tree,
     /// its popups, and any other visual members with `place()`, then hand the
     /// marker to `compose_group()`. The original placements remain hit-testable
@@ -606,6 +636,21 @@ struct Frame::Impl {
         int spread = 0;
     };
     std::vector<BlurRegion> blur_regions;
+    /// One deferred backdrop capture, queued while the list is built and
+    /// executed by `submit()` only once the frame is known to repaint. It owns
+    /// only values; `target` and `chain` are borrowed and must outlive that
+    /// `submit()`. `begin()` clears every queued job.
+    struct BlurJob {
+        std::size_t group_first = 0; // capture everything placed since this marker
+        std::size_t capture_end = 0; // ... up to this list index (queue time)
+        OffscreenTarget* target = nullptr;
+        BlurChain* chain = nullptr;
+        Box bounds{};
+        BlurParams params{};
+        std::size_t placement_first = 0; // placements this job owns, for failure
+        std::size_t placement_count = 0;
+    };
+    std::vector<BlurJob> blur_jobs;
     std::vector<SurfaceId> prepass_drawn;
     std::vector<SurfaceId> drawn;
     std::vector<std::unique_ptr<FrSurfaceTexture>> texture_cache;
@@ -646,8 +691,14 @@ struct Frame::Impl {
     /// read. A blur backdrop is not: the same placements are about to be drawn
     /// again for real, so marking their buffers as read here would release them
     /// a pass too early.
-    [[nodiscard]] Status render_group(std::size_t first, OffscreenTarget& target,
-                                      const Box& bounds, int scale, bool consume);
+    ///
+    /// The walk covers `[first, last)` of the placement list: `last` is
+    /// normally the end of the list, and a deferred blur job passes its
+    /// `capture_end` so its backdrop stops where its own (stale) placement
+    /// begins — a capture must never sample the placement it is about to feed.
+    [[nodiscard]] Status render_group(std::size_t first, std::size_t last,
+                                      OffscreenTarget& target, const Box& bounds, int scale,
+                                      bool consume);
 };
 
 // Damage/scissor boxes must cover every pixel a subpixel quad can touch. The
@@ -740,14 +791,15 @@ void Frame::Impl::keep_list() {
     last_valid = true;
 }
 
-Status Frame::Impl::render_group(std::size_t first_placement, OffscreenTarget& target,
-                                 const Box& bounds, int scale, bool consume) {
+Status Frame::Impl::render_group(std::size_t first_placement, std::size_t last_placement,
+                                 OffscreenTarget& target, const Box& bounds, int scale,
+                                 bool consume) {
     group_fills.clear();
     group_opaque.clear();
     group_acquire_fences.clear();
     const std::size_t drawn_first = prepass_drawn.size();
     group_opaque.reserve(opaque_arena.size());
-    for (std::size_t i = first_placement; i < placements.size(); ++i) {
+    for (std::size_t i = first_placement; i < last_placement; ++i) {
         Placement& p = placements[i];
         if (!p.draw) {
             // A composed group's own members are already represented by the
@@ -1030,6 +1082,7 @@ void Frame::begin(const Box& view) {
     impl.prepass_fences.clear();
     impl.prepass_damage.clear();
     impl.blur_regions.clear();
+    impl.blur_jobs.clear();
     impl.prepass_drawn.clear();
     impl.animating = false;
     impl.view = view;
@@ -1268,21 +1321,19 @@ Status Frame::capture_blur(PlacementGroup group, OffscreenTarget& target, const 
     if (chain.width() != target.width() || chain.height() != target.height()) {
         return fail("blur chain was not created at the target's size");
     }
-    if (Status rendered = impl.render_group(group.first_, target, bounds, scale,
-                                            /*consume=*/false);
+    if (Status rendered = impl.render_group(group.first_, impl.placements.size(), target, bounds,
+                                            scale, /*consume=*/false);
         !rendered) {
         return rendered;
     }
     return impl.renderer->blur(chain, target.texture(), params);
 }
 
-void Frame::place_blur(const GpuTexture& texture, const Box& background, const Box& box,
-                       float radius, int spread) {
-    Impl& impl = *impl_;
-    const Box visible = box.intersection(impl.view).intersection(background);
-    if (background.empty() || visible.empty()) {
-        return;
-    }
+/// Add `texture` — addressed against `background` — as a blur placement over
+/// `visible`, and record its damage reach. Shared by `place_blur` and the
+/// placement half of `queue_blur`, so the two cannot drift.
+void append_blur_placement(Frame::Impl& impl, const GpuTexture& texture, const Box& background,
+                           const Box& visible, float radius, int spread) {
     Placement p{};
     p.texture = &texture;
     p.x = static_cast<float>(visible.x);
@@ -1298,9 +1349,84 @@ void Frame::place_blur(const GpuTexture& texture, const Box& background, const B
     p.corner_radius = std::max(radius, 0.0f);
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
-    impl.blur_regions.push_back(Impl::BlurRegion{
+    impl.blur_regions.push_back(Frame::Impl::BlurRegion{
         Box{visible.x - impl.view.x, visible.y - impl.view.y, visible.width, visible.height},
         std::max(spread, 0)});
+}
+
+void Frame::place_blur(const GpuTexture& texture, const Box& background, const Box& box,
+                       float radius, int spread) {
+    Impl& impl = *impl_;
+    const Box visible = box.intersection(impl.view).intersection(background);
+    if (background.empty() || visible.empty()) {
+        return;
+    }
+    append_blur_placement(impl, texture, background, visible, radius, spread);
+}
+
+bool Frame::queue_blur(PlacementGroup group, OffscreenTarget& target, BlurChain& chain,
+                       const Box& bounds, const BlurParams& params, const Box& box,
+                       float radius, int spread) {
+    Impl& impl = *impl_;
+    if (group.generation_ != impl.generation || group.first_ >= impl.placements.size()) {
+        return false;
+    }
+    const int scale = std::max(1, impl.output->scale());
+    if (bounds.empty() || target.width() != bounds.width * scale ||
+        target.height() != bounds.height * scale || chain.width() != target.width() ||
+        chain.height() != target.height()) {
+        return false;
+    }
+    const Box visible = box.intersection(impl.view).intersection(bounds);
+    if (visible.empty()) {
+        return false;
+    }
+    // The capture is everything below the item that is in the list by now —
+    // never the placement this call is about to add.
+    const std::size_t placement_first = impl.placements.size();
+    append_blur_placement(impl, chain.texture(), bounds, visible, radius, spread);
+    impl.blur_jobs.push_back(Impl::BlurJob{
+        .group_first = group.first_,
+        .capture_end = placement_first,
+        .target = &target,
+        .chain = &chain,
+        .bounds = bounds,
+        .params = params,
+        .placement_first = placement_first,
+        .placement_count = impl.placements.size() - placement_first,
+    });
+    return true;
+}
+
+bool Frame::queue_blur_regions(PlacementGroup group, OffscreenTarget& target, BlurChain& chain,
+                               const Box& bounds, const BlurParams& params, Surface& surface,
+                               int x, int y, const Box& clip, int spread) {
+    Impl& impl = *impl_;
+    if (group.generation_ != impl.generation || group.first_ >= impl.placements.size() ||
+        bounds.empty()) {
+        return false;
+    }
+    const int scale = std::max(1, impl.output->scale());
+    if (target.width() != bounds.width * scale || target.height() != bounds.height * scale ||
+        chain.width() != target.width() || chain.height() != target.height()) {
+        return false;
+    }
+    // The region walk is place_blur_regions'; it must not be written twice.
+    const std::size_t placement_first = impl.placements.size();
+    if (!place_blur_regions(chain.texture(), bounds, surface, x, y, clip, spread)) {
+        return false; // nothing placed: an empty request captures nothing
+    }
+    impl.blur_jobs.push_back(Impl::BlurJob{
+        .group_first = group.first_,
+        .capture_end = placement_first,
+        .target = &target,
+        .chain = &chain,
+        .bounds = bounds,
+        .params = params,
+        .placement_first = placement_first,
+        .placement_count = impl.placements.size() - placement_first,
+    });
+    return true;
 }
 
 bool Frame::place_blur_regions(const GpuTexture& texture, const Box& background,
@@ -1379,7 +1505,8 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const
         return fail("offscreen target dimensions do not match the group bounds and output scale");
     }
 
-    if (Status rendered = impl.render_group(group.first_, target, bounds, scale, /*consume=*/true);
+    if (Status rendered = impl.render_group(group.first_, impl.placements.size(), target, bounds,
+                                            scale, /*consume=*/true);
         !rendered) {
         return rendered;
     }
@@ -1725,6 +1852,33 @@ Result<Presented> Frame::submit(Color background) {
             // repaint means — so this only refreshes the resolved textures.
             impl.keep_list();
             return Presented::unchanged;
+        }
+    }
+
+    // --- deferred blur captures ----------------------------------------------
+    //
+    // The captures were queued while the list was built; they run here because
+    // they are GPU work and an unchanged frame must not pay for it. They
+    // execute in queue order, so each capture's backdrop includes the previous
+    // job's just-updated chain texture — the same content the synchronous path
+    // would have rendered at that point in the list. Their out-fences land in
+    // `prepass_fences` and join the final submission below.
+    for (Impl::BlurJob& job : impl.blur_jobs) {
+        const int scale = std::max(1, output.scale());
+        Status status = impl.render_group(job.group_first, job.capture_end, *job.target,
+                                          job.bounds, scale, /*consume=*/false);
+        if (status) {
+            status = impl.renderer->blur(*job.chain, job.target->texture(), job.params);
+        }
+        if (!status) {
+            // One blur failing costs that blur, not the frame: drop the
+            // placements it owns and let the rest of the scene draw. They were
+            // never sampled, so the diff will repaint their boxes next frame.
+            for (std::size_t i = job.placement_first;
+                 i < job.placement_first + job.placement_count && i < impl.placements.size();
+                 ++i) {
+                impl.placements[i].draw = false;
+            }
         }
     }
 

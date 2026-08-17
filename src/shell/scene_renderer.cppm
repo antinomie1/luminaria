@@ -142,6 +142,15 @@ struct SceneGroupCache {
     int width = 0, height = 0;
 };
 
+/// One blurred item's backdrop + blur chain, kept across frames like a group
+/// cache. A real (non-x-ray) blur needs its own pair: a shared pair would make
+/// every placement sample the last capture from the same texture.
+struct SceneBlurCache {
+    std::optional<OffscreenTarget> backdrop;
+    std::optional<BlurChain> chain;
+    int width = 0, height = 0;
+};
+
 struct SceneOutput::Impl {
     std::optional<Frame> frame;
     CpuCompositor cpu;
@@ -155,13 +164,15 @@ struct SceneOutput::Impl {
     // other's bar every frame. Indexed by the image's position among the
     // frame's image items, which is stable for a scene built the same way twice.
     std::vector<SceneImageCache> images;
-    // Allocated the first time a scene actually asks for blur, and dropped with
-    // the rest of the output's targets by reset(). A compositor that never
-    // blurs never pays for either — which is what makes blur-off free rather
-    // than merely cheap.
-    std::optional<OffscreenTarget> backdrop;
-    std::optional<BlurChain> chain;
+    // Allocated the first time a scene actually asks for x-ray blur, and
+    // dropped with the rest of the output's targets by reset(). A compositor
+    // that never blurs never pays for either — which is what makes blur-off
+    // free rather than merely cheap. X-ray is deliberately one shared cache:
+    // one backdrop below the lowest x-ray item feeds the whole stack.
+    SceneBlurCache xray;
     std::vector<SceneGroupCache> groups;
+    // One per non-x-ray blurred item, indexed like the group caches.
+    std::vector<SceneBlurCache> blurs;
 };
 
 struct SceneRenderer::Impl {
@@ -244,14 +255,14 @@ void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
 
 /// Allocate this output's blur targets on first use. Answers false when there
 /// is no memory for them, which costs the blur and nothing else.
-[[nodiscard]] bool ensure_blur(SceneOutput::Impl& self, VulkanRenderer& gpu, int width,
+[[nodiscard]] bool ensure_blur(SceneBlurCache& cache, VulkanRenderer& gpu, int width,
                                int height) {
-    if (self.chain.has_value() && self.chain->width() == width &&
-        self.chain->height() == height) {
+    if (cache.chain.has_value() && cache.chain->width() == width &&
+        cache.chain->height() == height) {
         return true;
     }
-    self.backdrop.reset();
-    self.chain.reset();
+    cache.backdrop.reset();
+    cache.chain.reset();
     Result<OffscreenTarget> backdrop = gpu.create_offscreen(width, height);
     if (!backdrop) {
         return false;
@@ -260,8 +271,8 @@ void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
     if (!chain) {
         return false;
     }
-    self.backdrop.emplace(std::move(*backdrop));
-    self.chain.emplace(std::move(*chain));
+    cache.backdrop.emplace(std::move(*backdrop));
+    cache.chain.emplace(std::move(*chain));
     return true;
 }
 
@@ -377,56 +388,79 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         const PlacementGroup bottom = frame.begin_group();
         bool shared_backdrop = false;
 
+        // The caches below are indexed by position and grow on demand, but the
+        // frame borrows into them across the whole loop: a queued blur job
+        // holds the OffscreenTarget/BlurChain it will capture into at submit()
+        // time, and a composed group or image placement holds the texture it
+        // will draw. Growing a cache vector mid-loop would move those objects
+        // and dangle every borrow taken before the reallocation, so reserve
+        // once, up front — each index increments at most once per scene item,
+        // which makes scene.size() a safe upper bound for all three.
+        self.blurs.reserve(scene.size());
+        self.groups.reserve(scene.size());
+        self.images.reserve(scene.size());
+
         std::size_t image = 0;
         std::size_t group = 0;
+        std::size_t blur = 0; // non-x-ray blurred items so far
         for (const SceneItem& item : scene) {
             if (item.shadow.color.a > 0.0f && item.shadow.feather > 0.0f) {
                 frame.place_shadow(item.box, item.shadow.color, item.corner_radius,
                                    item.shadow.feather);
             }
-            if (wants_blur(item) &&
-                ensure_blur(self, *impl_->gpu, view.width * scale, view.height * scale)) {
+            if (wants_blur(item)) {
                 const int spread = blur_spread(item.blur.params);
                 // `surface_regions` blurs only what the client declared: an
-                // item that declared nothing places nothing and shows nothing,
-                // and the region walk answers that before any capture is paid
-                // for. A non-surface item has no tree to ask, so it takes the
-                // whole-box arm like a compositor that never enabled the
-                // client hints at all.
+                // item that declared nothing places nothing, and an empty
+                // request queues no capture at all. A non-surface item has no
+                // tree to ask, so it takes the whole-box arm like a compositor
+                // that never enabled the client hints.
                 const bool regions =
                     item.blur.surface_regions && item.kind == SceneItem::Kind::surface;
-                bool placed = false;
-                if (regions) {
-                    if (Surface* root = surface_from_id(item.surface); root != nullptr) {
-                        // An x-ray item reuses whatever a previous one already
-                        // captured, so a stack of them shares one backdrop and
-                        // none of them sees the window below it. That IS
-                        // x-ray, and it is why it is the cheap setting.
-                        const bool captured =
-                            (item.blur.xray && shared_backdrop) ||
-                            frame.capture_blur(bottom, *self.backdrop, view, *self.chain,
-                                               item.blur.params)
-                                .has_value();
-                        if (captured) {
-                            placed = frame.place_blur_regions(
-                                self.chain->texture(), view, *root, item.x, item.y, item.box,
-                                spread);
-                        }
-                    }
+                // A real (non-x-ray) blur captures into its own backdrop and
+                // chain, indexed by its position among blurred items like a
+                // group cache — a shared pair would make every placement sample
+                // the last capture from the same texture. X-ray is the one
+                // deliberately shared cache: one backdrop below the lowest
+                // x-ray item feeds the whole stack, and that IS x-ray, because
+                // none of them ever sees the window below it.
+                SceneBlurCache* cache = nullptr;
+                if (item.blur.xray) {
+                    cache = &self.xray;
                 } else {
-                    const bool captured =
-                        (item.blur.xray && shared_backdrop) ||
-                        frame.capture_blur(bottom, *self.backdrop, view, *self.chain,
-                                           item.blur.params)
-                            .has_value();
-                    if (captured) {
-                        placed = true;
-                        frame.place_blur(self.chain->texture(), view, item.box,
+                    if (self.blurs.size() <= blur) {
+                        self.blurs.resize(blur + 1);
+                    }
+                    cache = &self.blurs[blur++];
+                }
+                const bool have_targets =
+                    ensure_blur(*cache, *impl_->gpu, view.width * scale, view.height * scale);
+                if (item.blur.xray && shared_backdrop) {
+                    // The one shared capture is already queued below the lowest
+                    // x-ray item; place only, sampling the same chain texture.
+                    if (regions) {
+                        if (Surface* root = surface_from_id(item.surface); root != nullptr) {
+                            (void)frame.place_blur_regions(self.xray.chain->texture(), view,
+                                                           *root, item.x, item.y, item.box,
+                                                           spread);
+                        }
+                    } else {
+                        frame.place_blur(self.xray.chain->texture(), view, item.box,
                                          item.corner_radius, spread);
                     }
-                }
-                if (placed) {
-                    shared_backdrop = shared_backdrop || item.blur.xray;
+                } else if (regions && have_targets) {
+                    if (Surface* root = surface_from_id(item.surface); root != nullptr &&
+                        frame.queue_blur_regions(bottom, *cache->backdrop, *cache->chain, view,
+                                                 item.blur.params, *root, item.x, item.y,
+                                                 item.box, spread)) {
+                        shared_backdrop = shared_backdrop || item.blur.xray;
+                    }
+                } else if (have_targets) {
+                    if (frame.queue_blur(bottom, *cache->backdrop, *cache->chain, view,
+                                         item.blur.params, item.box, item.corner_radius,
+                                         spread)) {
+                        shared_backdrop = shared_backdrop || item.blur.xray;
+                    }
                 }
             }
             const PlacementGroup window = frame.begin_group();

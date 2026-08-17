@@ -120,6 +120,39 @@ int main() {
         assert(at(px, 32, 2).r < 20);                             // gone by the edge
     }
 
+    // --- blur, two windows --------------------------------------------------
+    // Two real (non-x-ray) blurred items in one scene: each gets its own
+    // backdrop+chain cache, and the second allocation used to move the first
+    // cache out from under its queued capture — the resize-on-demand growth
+    // reallocated the cache vector between the two queue_blur calls, leaving
+    // the first job's OffscreenTarget/BlurChain pointers dangling into freed
+    // storage by the time submit() ran them. This is the first frame that
+    // blurs at all, so the vector really does grow here. Both regions must
+    // actually mix, not merely fail to crash.
+    {
+        const luminaria::SceneItem items[] = {
+            {.kind = luminaria::SceneItem::Kind::rect, .box = {0, 0, 32, kH}, .color = {1, 0, 0, 1}},
+            {.kind = luminaria::SceneItem::Kind::rect,
+             .box = {32, 0, kW - 32, kH},
+             .color = {0, 0, 1, 1}},
+            {.kind = luminaria::SceneItem::Kind::rect,
+             .box = {16, 4, 32, 24},
+             .color = {0, 0, 0, 0}, // draws nothing; the blur is the visible part
+             .blur = {.enabled = true, .params = {.passes = 2, .offset = 2.0f}}},
+            {.kind = luminaria::SceneItem::Kind::rect,
+             .box = {16, 36, 32, 24},
+             .color = {0, 0, 0, 0},
+             .blur = {.enabled = true, .params = {.passes = 2, .offset = 2.0f}}},
+        };
+        assert(show(items).has_value());
+        const std::vector<luminaria::Pixel>& px = output.last_frame();
+        assert(at(px, 4, 32).r > 200 && at(px, 4, 32).b < 40); // outside both, sharp
+        const luminaria::Pixel first = at(px, 35, 10);         // inside the first region
+        const luminaria::Pixel second = at(px, 35, 44);        // inside the second
+        assert(first.r > 30 && first.b > 30);
+        assert(second.r > 30 && second.b > 30);
+    }
+
     // --- blur ----------------------------------------------------------------
     // Two hard-edged halves under a blurred item: inside it the two have mixed,
     // which is the whole point of the backdrop path.

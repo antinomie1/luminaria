@@ -499,6 +499,13 @@ public:
     /// extensions, i.e. import/export below actually work.
     [[nodiscard]] bool dmabuf_supported() const noexcept;
 
+    /// How many GPU submissions this renderer has made since creation.
+    /// Monotonic, and never read by the library itself: it is renderer
+    /// diagnostics — the honest way to prove an unchanged frame submitted
+    /// nothing, and the cheapest way to spot a compositor that submits per
+    /// frame instead of per change.
+    [[nodiscard]] std::uint64_t submission_count() const noexcept;
+
     /// DRM modifiers usable for import+export of `drm_format` (single-plane,
     /// transfer-capable). Always includes DRM_FORMAT_MOD_LINEAR when supported.
     /// Empty if dmabuf is unsupported or the format has no usable modifier.
@@ -784,6 +791,8 @@ VulkanRenderer::~VulkanRenderer() {
 }
 VulkanRenderer::VulkanRenderer(VulkanRenderer&&) noexcept = default;
 VulkanRenderer& VulkanRenderer::operator=(VulkanRenderer&&) noexcept = default;
+
+std::uint64_t VulkanRenderer::submission_count() const noexcept { return impl_->submits; }
 
 struct FragmentShader::Impl {
     VulkanRenderer::Impl* owner = nullptr;

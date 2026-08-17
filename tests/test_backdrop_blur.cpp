@@ -60,18 +60,20 @@ int main() {
     const luminaria::Box view{0, 0, kW, kH};
     const luminaria::Color black{0, 0, 0, 1};
 
-    // Two opaque halves, then the blurred backdrop of everything below.
-    const auto draw = [&] {
+    // Two opaque halves, then a queued blur backdrop of everything below them.
+    // The capture itself is deferred: it runs inside submit(), and only when
+    // the frame actually repaints.
+    const auto draw = [&](int edge) {
         frame.begin(view);
         const luminaria::PlacementGroup below = frame.begin_group();
-        frame.place_rect(0, 0, kEdge, kH, luminaria::Color{1, 0, 0, 1});
-        frame.place_rect(kEdge, 0, kW - kEdge, kH, luminaria::Color{0, 0, 1, 1});
-        assert(frame.capture_blur(below, *backdrop, view, *chain, params).has_value());
-        frame.place_blur(chain->texture(), view, kBlurBox, 0.0f, spread);
+        frame.place_rect(0, 0, edge, kH, luminaria::Color{1, 0, 0, 1});
+        frame.place_rect(edge, 0, kW - edge, kH, luminaria::Color{0, 0, 1, 1});
+        assert(frame.queue_blur(below, *backdrop, *chain, view, params, kBlurBox, 0.0f, spread));
         return frame.submit(black);
     };
 
-    assert(draw() == luminaria::Presented::composited);
+    assert(draw(kEdge) == luminaria::Presented::composited);
+    const std::uint64_t submitted = renderer->submission_count();
     const std::vector<luminaria::Pixel>& px = output.last_frame();
 
     // Outside the blurred region the two halves are untouched: the backdrop is
@@ -89,8 +91,18 @@ int main() {
     assert(other.r > 30 && other.b > 30);
 
     // A second identical frame changes nothing, and the blur must not be what
-    // makes an idle desktop repaint forever.
-    assert(draw() == luminaria::Presented::unchanged);
+    // makes an idle desktop repaint forever: it returns `unchanged` AND makes
+    // no GPU submissions at all — the deferred capture never ran.
+    assert(draw(kEdge) == luminaria::Presented::unchanged);
+    assert(renderer->submission_count() == submitted);
+
+    // Damage below the blur: the backdrop moves under it, so the capture has
+    // to run again and the pixels inside the region have to change with it.
+    // Both the submission count and the output are proof.
+    assert(draw(kEdge + 8) == luminaria::Presented::composited);
+    assert(renderer->submission_count() > submitted);
+    const luminaria::Pixel moved = at(output.last_frame(), kEdge + 3, 32);
+    assert(!(moved == mixed));
 
     return 0;
 }
