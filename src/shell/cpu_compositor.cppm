@@ -51,9 +51,19 @@ struct CpuView {
     Box clip;
 };
 
-/// One z-ordered draw item: a solid rectangle the compositor owns, or a client
-/// surface tree. List order is draw order, back-to-front.
-using CpuItem = std::variant<RectFill, CpuView>;
+/// A block of pixels the compositor itself owns — a rasterized bar, a themed
+/// cursor, anything no client produced. `pixels` is `box.width * box.height`
+/// premultiplied RGBA, tightly packed, and borrowed for the duration of the
+/// `composite()` call.
+struct CpuImage {
+    Box box;
+    std::span<const Pixel> pixels;
+};
+
+/// One z-ordered draw item: a solid rectangle or a block of pixels the
+/// compositor owns, or a client surface tree. List order is draw order,
+/// back-to-front.
+using CpuItem = std::variant<RectFill, CpuView, CpuImage>;
 
 /// Generic CPU compositor. Holds its own scratch, so a steady-state frame
 /// allocates nothing beyond the first.
@@ -71,6 +81,7 @@ public:
 
 private:
     void fill_rect(const RectFill& fill);
+    void draw_image(const CpuImage& image);
     void draw_view(const CpuView& view);
     void draw_surface(Surface& surface, int x, int y, const Box& clip);
 
@@ -151,6 +162,8 @@ void CpuCompositor::composite(int width, int height, Color background,
     for (const CpuItem& item : items) {
         if (const auto* fill = std::get_if<RectFill>(&item); fill != nullptr) {
             fill_rect(*fill);
+        } else if (const auto* image = std::get_if<CpuImage>(&item); image != nullptr) {
+            draw_image(*image);
         } else if (const auto* view = std::get_if<CpuView>(&item); view != nullptr) {
             draw_view(*view);
         }
@@ -166,6 +179,26 @@ void CpuCompositor::fill_rect(const RectFill& fill) {
     for (int y = box.y; y < box.y + box.height; ++y) {
         for (int x = box.x; x < box.x + box.width; ++x) {
             blend(pixels_[static_cast<std::size_t>(y) * width_ + x], color);
+        }
+    }
+}
+
+void CpuCompositor::draw_image(const CpuImage& image) {
+    const Box box = image.box.intersection(Box{0, 0, width_, height_});
+    if (box.empty()) {
+        return;
+    }
+    // The caller's word about its own buffer is still checked: a short span is
+    // a bug, but it must not become a read past the end of one.
+    const auto need = static_cast<std::size_t>(image.box.width) * image.box.height;
+    if (image.box.width <= 0 || image.pixels.size() < need) {
+        return;
+    }
+    for (int y = box.y; y < box.y + box.height; ++y) {
+        const auto row = static_cast<std::size_t>(y - image.box.y) * image.box.width;
+        for (int x = box.x; x < box.x + box.width; ++x) {
+            blend(pixels_[static_cast<std::size_t>(y) * width_ + x],
+                  image.pixels[row + static_cast<std::size_t>(x - image.box.x)]);
         }
     }
 }
