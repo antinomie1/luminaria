@@ -31,6 +31,7 @@ import :box;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 import :xdg_shell;
 
@@ -201,15 +202,9 @@ private:
 namespace luminaria {
 
 struct LayerShell::Impl {
+    WlGlobal global;
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
     Signal<NewLayerSurface> new_layer_surface;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 namespace {
@@ -443,9 +438,6 @@ void ls_ack_configure(wl_client*, wl_resource* resource, uint32_t serial) {
         ls->acked_ = true;
     }
 }
-void ls_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void ls_set_layer(wl_client*, wl_resource* resource, uint32_t layer) {
     if (layer > static_cast<uint32_t>(Layer::overlay)) {
         wl_resource_post_error(resource, ZWLR_LAYER_SHELL_V1_ERROR_INVALID_LAYER,
@@ -471,7 +463,7 @@ constexpr struct zwlr_layer_surface_v1_interface layer_surface_impl = {
     .set_keyboard_interactivity = ls_set_keyboard_interactivity,
     .get_popup = ls_get_popup,
     .ack_configure = ls_ack_configure,
-    .destroy = ls_destroy_request,
+    .destroy = resource_destroy_request,
     .set_layer = ls_set_layer,
     .set_exclusive_edge = ls_set_exclusive_edge,
 };
@@ -542,24 +534,10 @@ void shell_get_layer_surface(wl_client* client, wl_resource* shell_resource, uin
     shell->new_layer_surface.emit(event);
 }
 
-void shell_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct zwlr_layer_shell_v1_interface shell_impl = {
     .get_layer_surface = shell_get_layer_surface,
-    .destroy = shell_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void shell_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zwlr_layer_shell_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &shell_impl, data, nullptr);
-}
 
 /// Which edge an exclusive zone applies to: the one the client named, or the
 /// one its anchors imply — a single edge, or an edge plus both perpendicular
@@ -591,11 +569,13 @@ Result<LayerShell> LayerShell::create(Display& display) {
     impl->display = display.c_ptr();
     // Version 5: set_layer (v2), the destroy request (v3), on_demand keyboard
     // interactivity (v4), set_exclusive_edge (v5). Every slot is implemented.
-    impl->global = wl_global_create(impl->display, &zwlr_layer_shell_v1_interface, 5, impl.get(),
-                                    shell_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwlr_layer_shell_v1) failed");
+    auto global = create_wl_global<&zwlr_layer_shell_v1_interface,
+                                   default_bind<&zwlr_layer_shell_v1_interface,
+                                                &shell_impl>>(display, 5, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return LayerShell{std::move(impl)};
 }
 

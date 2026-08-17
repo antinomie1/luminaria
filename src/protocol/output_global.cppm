@@ -28,6 +28,7 @@ import std;
 import :display;
 import :expected;
 import :output;
+import :protocol_helper;
 import :transform;
 
 export namespace luminaria {
@@ -106,8 +107,8 @@ namespace luminaria {
 
 struct OutputGlobal::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
-    wl_global* xdg_output_global = nullptr;
+    WlGlobal global;
+    WlGlobal xdg_output_global;
     int width = 0;
     int height = 0;
     int refresh_mhz = 60000;      // 60Hz unless the backend says otherwise
@@ -138,21 +139,12 @@ struct OutputGlobal::Impl {
             wl_resource_set_user_data(r, nullptr);
             wl_resource_set_destructor(r, nullptr);
         }
-        if (xdg_output_global != nullptr) {
-            wl_global_destroy(xdg_output_global);
-        }
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
     }
 };
 
 namespace {
 
-void output_release(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource); // wl_output.release (v3+)
-}
-constexpr struct wl_output_interface output_impl = {.release = output_release};
+constexpr struct wl_output_interface output_impl = {.release = resource_destroy_request};
 
 // A client can unbind a wl_output at any time; drop the weak reference or the
 // next iteration over Impl::resources walks freed memory.
@@ -228,21 +220,14 @@ void output_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
 // Logical position comes from the compositor's OutputLayout; logical size is the
 // mode after scale and rotation.
 
-void xdg_output_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void xdg_output_resource_destroy(wl_resource* resource) {
     if (auto* self = static_cast<OutputGlobal::Impl*>(wl_resource_get_user_data(resource))) {
         std::erase(self->xdg_resources, resource);
     }
 }
 constexpr struct zxdg_output_v1_interface xdg_output_impl = {
-    .destroy = xdg_output_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void xdg_output_manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void xdg_output_manager_get_xdg_output(wl_client* client, wl_resource* manager_resource,
                                        uint32_t id, wl_resource* output) {
@@ -277,19 +262,9 @@ void xdg_output_manager_get_xdg_output(wl_client* client, wl_resource* manager_r
 }
 
 constexpr struct zxdg_output_manager_v1_interface xdg_output_manager_impl = {
-    .destroy = xdg_output_manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_xdg_output = xdg_output_manager_get_xdg_output,
 };
-
-void xdg_output_manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zxdg_output_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &xdg_output_manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -307,16 +282,19 @@ Result<OutputGlobal> OutputGlobal::create(Display& display, int width, int heigh
     impl->name = std::move(name);
     // Version 4: geometry/mode/scale/done + name/description (what `grim -o` and
     // other tools address an output by) + release.
-    impl->global =
-        wl_global_create(impl->display, &wl_output_interface, 4, impl.get(), output_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wl_output) failed");
+    auto global = create_wl_global<&wl_output_interface, output_bind>(display, 4, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
-    impl->xdg_output_global = wl_global_create(impl->display, &zxdg_output_manager_v1_interface, 3,
-                                               impl.get(), xdg_output_manager_bind);
-    if (impl->xdg_output_global == nullptr) {
-        return fail("wl_global_create(zxdg_output_manager_v1) failed");
+    impl->global = std::move(*global);
+
+    auto xdg_global = create_wl_global<&zxdg_output_manager_v1_interface,
+                                       default_bind<&zxdg_output_manager_v1_interface,
+                                                    &xdg_output_manager_impl>>(display, 3, impl.get());
+    if (!xdg_global) {
+        return fail(std::move(xdg_global.error().message));
     }
+    impl->xdg_output_global = std::move(*xdg_global);
     return OutputGlobal{std::move(impl)};
 }
 
