@@ -96,6 +96,22 @@ public:
                                                std::span<const SceneItem> scene, Color background,
                                                const SceneCursor& cursor = {});
 
+    /// Put `cursor` on the output's KMS cursor plane, if it has one and can
+    /// take this image. Returns true when hardware owns the pointer.
+    ///
+    /// This is the call that makes moving the mouse cheap. A cursor composited
+    /// into the scene costs a full recomposite and a page flip per motion
+    /// event; on the plane it costs one small atomic commit and no repaint at
+    /// all. So a compositor should call this from its pointer handler and only
+    /// mark the output dirty when it answers false.
+    ///
+    /// `present()` calls it too, and leaves the cursor out of the frame when it
+    /// succeeds — so the pointer is never drawn twice, and an output whose
+    /// plane rejects the image (too large, wrong format) silently goes back to
+    /// being composited.
+    [[nodiscard]] bool set_cursor_plane(SceneOutput& state, Output& output,
+                                        const SceneCursor& cursor);
+
     /// From the output's `present` handler.
     void presented(SceneOutput& state);
 
@@ -147,9 +163,21 @@ struct SceneBlurCache {
     int width = 0, height = 0;
 };
 
+/// What is currently on this output's KMS cursor plane. `source` is the identity
+/// of the pixels up there — a `CursorImage*` for a themed cursor, a
+/// `current_buffer_identity()` for a client one — so a moving pointer with an
+/// unchanged image costs one `move_cursor` and no upload.
+struct SceneCursorPlane {
+    const void* source = nullptr;
+    int x = 0;
+    int y = 0;
+    bool shown = false;
+};
+
 struct SceneOutput::Impl {
     std::optional<Frame> frame;
     CpuCompositor cpu;
+    SceneCursorPlane cursor_plane;
     // Reused every frame; cleared, never freed. `drawn` is the batch
     // frame-callback list the CPU path has to keep for itself, having no
     // `Frame` to remember placements, and `tree` is the per-tree walk scratch.
@@ -356,6 +384,80 @@ Status SceneRenderer::reset(SceneOutput& state, Output& output, std::uint32_t dr
     return ok();
 }
 
+bool SceneRenderer::set_cursor_plane(SceneOutput& state, Output& output,
+                                     const SceneCursor& cursor) {
+    if (!output.has_cursor_plane()) {
+        return false;
+    }
+    SceneCursorPlane& plane = state.impl_->cursor_plane;
+
+    const auto take_down = [&] {
+        if (plane.shown) {
+            std::ignore = output.hide_cursor();
+        }
+        plane = {};
+    };
+
+    // No pointer to draw. Answering true (handled) is only right if the plane
+    // is what was showing it: if the last frame composited the cursor instead —
+    // because the plane refused that image — the caller still owes a repaint to
+    // get it off the screen.
+    Surface* client = surface_from_id(cursor.surface);
+    if (cursor.image == nullptr && client == nullptr) {
+        const bool was_on_plane = plane.shown;
+        take_down();
+        return was_on_plane;
+    }
+
+    // The pixels, resolved only when the source actually changed. A pointer
+    // sliding across the screen keeps the same image, which is the whole reason
+    // the plane is cheap.
+    const void* source = client != nullptr
+                             ? client->current_buffer_identity()
+                             : static_cast<const void*>(cursor.image);
+    if (source == nullptr) {
+        take_down();
+        return true; // a cursor surface with no buffer is a hidden cursor
+    }
+    if (source != plane.source) {
+        std::vector<std::uint8_t> rgba;
+        int width = 0;
+        int height = 0;
+        if (client != nullptr) {
+            if (!client->current_buffer_rgba(rgba, width, height)) {
+                take_down();
+                return false;
+            }
+        } else {
+            width = cursor.image->width;
+            height = cursor.image->height;
+            rgba.assign(cursor.image->rgba.begin(), cursor.image->rgba.end());
+        }
+        // The hotspot is already off: `SceneCursor::x/y` is the image's
+        // top-left, so the plane is told a zero hotspot and the same point.
+        if (!output.set_cursor(rgba, width, height, 0, 0)) {
+            // Too large for the plane, or a format it will not take. Composited
+            // from here on — and taken down first, or the stale image stays up
+            // underneath the one being drawn.
+            take_down();
+            return false;
+        }
+        plane.source = source;
+        plane.shown = false; // position not applied to this image yet
+    }
+
+    if (!plane.shown || plane.x != cursor.x || plane.y != cursor.y) {
+        if (!output.move_cursor(cursor.x, cursor.y)) {
+            take_down();
+            return false;
+        }
+        plane.x = cursor.x;
+        plane.y = cursor.y;
+        plane.shown = true;
+    }
+    return true;
+}
+
 void SceneRenderer::presented(SceneOutput& state) {
     if (state.impl_->frame.has_value()) {
         state.impl_->frame->presented();
@@ -374,6 +476,10 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
                                             std::span<const SceneItem> scene, Color background,
                                             const SceneCursor& cursor) {
     SceneOutput::Impl& self = *state.impl_;
+    // Hardware first: if the plane takes the pointer, it is already on screen
+    // and must not also be composited into the frame.
+    const bool cursor_on_plane = set_cursor_plane(state, output, cursor);
+
     if (self.frame.has_value()) {
         Frame& frame = *self.frame;
         frame.begin({0, 0, output.logical_width(), output.logical_height()});
@@ -510,7 +616,9 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
             }
         }
 
-        if (Surface* root = surface_from_id(cursor.surface); root != nullptr) {
+        if (cursor_on_plane) {
+            // Nothing to place: the KMS plane is showing it.
+        } else if (Surface* root = surface_from_id(cursor.surface); root != nullptr) {
             frame.place(*root, cursor.x, cursor.y);
         } else if (cursor.image != nullptr) {
             if (!impl_->cursor_texture.has_value() || impl_->cursor_texture_of != cursor.image) {
@@ -583,7 +691,9 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         }
     }
 
-    if (Surface* root = surface_from_id(cursor.surface); root != nullptr) {
+    if (cursor_on_plane) {
+        // Already on the KMS plane; compositing it here would double it.
+    } else if (Surface* root = surface_from_id(cursor.surface); root != nullptr) {
         // The cursor is confined by nothing but the framebuffer: an empty clip
         // means the whole output.
         append_tree(self, output, *root, cursor.x, cursor.y, {});

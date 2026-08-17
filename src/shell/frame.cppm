@@ -955,10 +955,20 @@ GpuTexture* Frame::Impl::texture_for(Surface& surface) {
     entry->live = false;
 
     if (DmabufPlane plane{}; surface.current_buffer_dmabuf(plane)) {
-        if (auto imported = renderer->import_texture(plane)) {
+        auto imported = renderer->import_texture(plane);
+        if (imported) {
             entry->texture.emplace(std::move(*imported));
             entry->live = true;
             return &*entry->texture;
+        }
+        // A dmabuf we could not import falls back to a per-frame GPU->CPU
+        // readback + CPU->GPU upload — the most expensive path this library
+        // has. Say so once per surface; a silent fallback is a mystery a
+        // year later.
+        static std::set<std::uint32_t> warned;
+        if (warned.insert(surface.id().index).second) {
+            std::cerr << "luminaria: dmabuf import failed for surface "
+                      << surface.id().index << ": " << imported.error().message << "\n";
         }
     }
 

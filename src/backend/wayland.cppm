@@ -180,6 +180,12 @@ wl_buffer* make_solid_buffer(wl_shm* shm, int w, int h, Color color) {
     return buffer;
 }
 
+} // namespace (anonymous helpers)
+
+// Lifted out of the anonymous namespace: the backend's Impl holds
+// `std::vector<std::unique_ptr<WaylandOutput>>`, and clang instantiates the
+// allocator comparisons at module scope — a TU-local element type in those is
+// ill-formed. Still unexported, so it stays private to module luminaria.gpu.
 class WaylandOutput final : public Output {
 public:
     /// Kick a frame from outside (the very first one, before the parent's
@@ -377,8 +383,6 @@ private:
     }
     static constexpr wl_callback_listener frame_listener_{on_frame};
 };
-
-} // namespace
 
 struct WaylandBackend::Impl {
     EventLoop loop;

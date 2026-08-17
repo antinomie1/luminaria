@@ -63,16 +63,16 @@ private:
 // --------------------------------------------------------------- implementation
 namespace luminaria {
 
-namespace {
+// Lifted out of the anonymous namespace: `FractionalScaleManager::Impl` holds
+// `std::vector<ScaleObject*>`, whose allocator comparisons clang instantiates at
+// module scope — a TU-local element type in those is ill-formed. Still
+// unexported, so it stays private to module luminaria.
 struct ScaleObject;
-}
 
 struct FractionalScaleManager::Impl {
     WlGlobal global;
     std::vector<ScaleObject*> objects; // not owned; each lives on its resource
 };
-
-namespace {
 
 using FsMgr = FractionalScaleManager::Impl;
 
@@ -90,6 +90,8 @@ struct ScaleObject : SurfaceTracker {
         }
     }
 };
+
+namespace {
 
 constexpr struct wp_fractional_scale_v1_interface scale_impl = {
     .destroy = resource_destroy_request,

@@ -52,6 +52,9 @@ public:
     [[nodiscard]] DataControlManager* data_control() noexcept {
         return data_control_.has_value() ? &*data_control_ : nullptr;
     }
+    [[nodiscard]] DrmSyncobjManager* drm_syncobj() noexcept {
+        return drm_syncobj_.has_value() ? &*drm_syncobj_ : nullptr;
+    }
 
     /// Instantiate globals that hold a reference to Seat.
     [[nodiscard]] Status bind_seat_globals(Display& display);
@@ -70,6 +73,7 @@ private:
                    XdgActivation xdg_activation,
                    IdleInhibitManager idle_inhibit, Seat seat,
                    std::optional<LinuxDmabuf> dmabuf,
+                   std::optional<DrmSyncobjManager> drm_syncobj,
                    std::optional<BackgroundEffectManager> background_effect,
                    std::optional<ScreencopyManager> screencopy) noexcept
         : compositor_(std::move(compositor)),
@@ -88,6 +92,7 @@ private:
           primary_selection_{},
           data_control_{},
           dmabuf_(std::move(dmabuf)),
+          drm_syncobj_(std::move(drm_syncobj)),
           background_effect_(std::move(background_effect)),
           screencopy_(std::move(screencopy)) {}
 
@@ -108,6 +113,7 @@ private:
     std::optional<PrimarySelectionManager> primary_selection_{};
     std::optional<DataControlManager> data_control_{};
     std::optional<LinuxDmabuf> dmabuf_{};
+    std::optional<DrmSyncobjManager> drm_syncobj_{};
     std::optional<BackgroundEffectManager> background_effect_{};
     std::optional<ScreencopyManager> screencopy_{};
 };
@@ -176,10 +182,18 @@ Result<DesktopGlobals> DesktopGlobals::create(Display& display,
 
 
     std::optional<LinuxDmabuf> dmabuf;
+    std::optional<DrmSyncobjManager> drm_syncobj;
     std::optional<BackgroundEffectManager> background_effect;
     if (renderer != nullptr) {
         if (Result<LinuxDmabuf> created = LinuxDmabuf::create(display, renderer)) {
             dmabuf.emplace(std::move(*created));
+        }
+        // Explicit sync. Optional on purpose: it needs timeline syncobj support
+        // on the render node, and a client that does not see the global just
+        // keeps using implicit fences on its dmabufs. Modern Mesa binds it and
+        // stops serialising on the compositor's reads when it is there.
+        if (Result<DrmSyncobjManager> sync = DrmSyncobjManager::create(display)) {
+            drm_syncobj.emplace(std::move(*sync));
         }
         if (Result<BackgroundEffectManager> bg = BackgroundEffectManager::create(display)) {
             background_effect.emplace(std::move(*bg));
@@ -195,7 +209,8 @@ Result<DesktopGlobals> DesktopGlobals::create(Display& display,
         *std::move(compositor), *std::move(subcompositor), *std::move(viewporter),
         *std::move(xdg_shell),  *std::move(layer_shell),   *std::move(cursor_shape),
         *std::move(xdg_decoration), *std::move(xdg_activation), *std::move(idle_inhibit),
-        *std::move(seat), std::move(dmabuf), std::move(background_effect), std::move(screencopy)};
+        *std::move(seat), std::move(dmabuf), std::move(drm_syncobj),
+        std::move(background_effect), std::move(screencopy)};
 }
 
 Status DesktopGlobals::bind_seat_globals(Display& display) {

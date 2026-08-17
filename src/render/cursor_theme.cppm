@@ -77,6 +77,19 @@ struct CursorTheme::Impl {
     std::map<std::string, std::vector<CursorImage>> cache;
 };
 
+// Lifted out of the anonymous namespace: `std::vector<RawImage>` instantiates
+// allocator comparisons at module scope, and a TU-local element type in those
+// is ill-formed under clang. Still unexported — private to module luminaria.
+struct RawImage {
+    std::uint32_t nominal_size = 0;
+    CursorImage image;
+};
+
+/// One table-of-contents entry of an XCursor file.
+struct XcursorToc {
+    std::uint32_t type, subtype, position;
+};
+
 namespace {
 
 // ---- the XCursor file format ------------------------------------------------
@@ -114,11 +127,6 @@ struct Reader {
     }
 };
 
-struct RawImage {
-    std::uint32_t nominal_size = 0;
-    CursorImage image;
-};
-
 /// Every image chunk in the file, at every size the theme provides.
 std::vector<RawImage> parse_xcursor(const std::vector<std::uint8_t>& bytes) {
     std::vector<RawImage> out;
@@ -131,20 +139,17 @@ std::vector<RawImage> parse_xcursor(const std::vector<std::uint8_t>& bytes) {
     if (!r.seek(header)) {
         return out;
     }
-    struct Toc {
-        std::uint32_t type, subtype, position;
-    };
-    std::vector<Toc> toc;
+    std::vector<XcursorToc> toc;
     toc.reserve(ntoc);
     for (std::uint32_t i = 0; i < ntoc; ++i) {
-        Toc entry{};
+        XcursorToc entry{};
         if (!r.u32(entry.type) || !r.u32(entry.subtype) || !r.u32(entry.position)) {
             return out;
         }
         toc.push_back(entry);
     }
 
-    for (const Toc& entry : toc) {
+    for (const XcursorToc& entry : toc) {
         if (entry.type != kImageType || !r.seek(entry.position)) {
             continue;
         }

@@ -548,6 +548,14 @@ private:
 // --------------------------------------------------------------- implementation
 namespace luminaria {
 
+// Lifted out of the anonymous namespace: `std::vector<SurfaceSlot>` instantiates
+// allocator comparisons at module scope, and a TU-local element type in those is
+// ill-formed under clang. Still unexported — private to module luminaria.
+struct SurfaceSlot {
+    Surface* surface = nullptr;
+    std::uint32_t generation = 1;
+};
+
 namespace {
 
 /// CLOCK_MONOTONIC in nanoseconds — the clock wp_commit_timing_v1 timestamps
@@ -557,11 +565,6 @@ std::uint64_t monotonic_ns() noexcept {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-
-struct SurfaceSlot {
-    Surface* surface = nullptr;
-    std::uint32_t generation = 1;
-};
 
 struct SurfaceRegistry {
     std::vector<SurfaceSlot> slots;

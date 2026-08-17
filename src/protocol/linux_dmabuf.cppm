@@ -20,6 +20,7 @@ module;
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <drm_fourcc.h>
 #include <gbm.h>
@@ -36,8 +37,14 @@ import :vulkan;
 
 export namespace luminaria {
 
-/// The zwp_linux_dmabuf_v1 global (protocol version 3). Move-only; pointer-stable
+/// The zwp_linux_dmabuf_v1 global (protocol version 4). Move-only; pointer-stable
 /// state so the libwayland global can hold a pointer to it.
+///
+/// Version 4 matters far more than the version number suggests: `main_device` in
+/// the feedback object is the ONLY way left for a client to learn which DRM node
+/// to open. Mesa's EGL/Vulkan Wayland platform used to get that from `wl_drm`,
+/// which is gone; without feedback it initialises with fd -1, fails to create a
+/// DRI screen, and every GL client silently falls back to software rendering.
 class LinuxDmabuf {
 public:
     /// Open a GBM device (default DRM render node) and create the global. If
@@ -79,10 +86,12 @@ using DmabufInfo = DmabufPlane;
 } // namespace luminaria
 
 // --------------------------------------------------------------- implementation
-// Implements zwp_linux_dmabuf_v1 (version 3): clients hand us dmabuf-backed
+// Implements zwp_linux_dmabuf_v1 (version 4): clients hand us dmabuf-backed
 // wl_buffers. LINEAR buffers are mmap'd on the CPU (fast path); any other
 // modifier the GPU supports is imported through Vulkan external-memory. We
-// advertise the modifier list the renderer reports (LINEAR always included).
+// advertise the modifier list the renderer reports (LINEAR always included) —
+// through the v4 feedback object's format table, or the v3 format/modifier
+// events for a client that binds older.
 
 namespace luminaria {
 
@@ -94,6 +103,122 @@ struct FormatMods {
     std::vector<uint64_t> modifiers;
 };
 
+/// One mmap, unmapped by the destructor. Only used while the format table is
+/// being written — the compositor has no reason to keep the mapping alive once
+/// the memfd is sealed, and a mapping that outlives its writer is a leak that
+/// only shows up under pressure.
+class DmabufMapping {
+    void* addr_ = MAP_FAILED;
+    std::size_t size_ = 0;
+
+public:
+    DmabufMapping() noexcept = default;
+    DmabufMapping(int fd, std::size_t size) noexcept
+        : addr_(size == 0 ? MAP_FAILED
+                          : mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)),
+          size_(size) {}
+
+    ~DmabufMapping() { reset(); }
+
+    DmabufMapping(DmabufMapping&& o) noexcept
+        : addr_(std::exchange(o.addr_, MAP_FAILED)), size_(std::exchange(o.size_, 0)) {}
+    DmabufMapping& operator=(DmabufMapping&& o) noexcept {
+        if (this != &o) {
+            reset();
+            addr_ = std::exchange(o.addr_, MAP_FAILED);
+            size_ = std::exchange(o.size_, 0);
+        }
+        return *this;
+    }
+    DmabufMapping(const DmabufMapping&) = delete;
+    DmabufMapping& operator=(const DmabufMapping&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return addr_ != MAP_FAILED; }
+    [[nodiscard]] void* data() const noexcept { return valid() ? addr_ : nullptr; }
+
+    void reset() noexcept {
+        if (addr_ != MAP_FAILED) {
+            munmap(addr_, size_);
+            addr_ = MAP_FAILED;
+        }
+        size_ = 0;
+    }
+};
+
+// Lifted out of the anonymous namespace below: GlobalData names it in a
+// member signature, and a module-linkage declaration may not expose a
+// TU-local type. Still unexported — private to module luminaria.
+/// The `format_table` a v4 feedback object hands to clients: a sealed memfd of
+/// 16-byte { format, padding, modifier } entries, which the client mmaps
+/// read-only and indexes with the u16s in `tranche_formats`. Built once at
+/// startup and shared by every feedback resource — the fd is only ever
+/// duplicated across the wire by libwayland, never handed away.
+class DmabufFormatTable {
+    UniqueFd fd_;
+    std::uint32_t size_ = 0;
+    std::vector<std::uint16_t> indices_; // one tranche: every entry, in order
+
+public:
+    struct Entry {
+        std::uint32_t format;
+        std::uint32_t padding; // must be zeroed: the protocol reserves it
+        std::uint64_t modifier;
+    };
+    static_assert(sizeof(Entry) == 16, "zwp_linux_dmabuf_v1 fixes the entry at 16 bytes");
+
+    [[nodiscard]] bool valid() const noexcept { return fd_.valid(); }
+    [[nodiscard]] int fd() const noexcept { return fd_.get(); }
+    [[nodiscard]] std::uint32_t size() const noexcept { return size_; }
+    [[nodiscard]] const std::vector<std::uint16_t>& indices() const noexcept { return indices_; }
+
+    /// Flatten `formats` into a sealed memfd. An empty table on failure: a
+    /// compositor that cannot build one still runs, clients just get no
+    /// feedback (and fall back to the v3 format/modifier events).
+    static DmabufFormatTable build(const std::vector<FormatMods>& formats) {
+        std::vector<Entry> entries;
+        for (const FormatMods& fm : formats) {
+            for (uint64_t mod : fm.modifiers) {
+                entries.push_back(Entry{fm.format, 0, mod});
+            }
+        }
+        DmabufFormatTable table;
+        if (entries.empty()) {
+            return table;
+        }
+        // `tranche_formats` indexes the table with u16s, so an entry past 65535
+        // is unreachable by any client and must not be written either.
+        entries.resize(std::min<std::size_t>(entries.size(), 0xffff));
+
+        const std::size_t bytes = entries.size() * sizeof(Entry);
+        UniqueFd fd{memfd_create("luminaria-dmabuf-formats", MFD_CLOEXEC | MFD_ALLOW_SEALING)};
+        if (!fd.valid() || ftruncate(fd.get(), static_cast<off_t>(bytes)) != 0) {
+            return table;
+        }
+        {
+            const DmabufMapping map{fd.get(), bytes};
+            if (!map.valid()) {
+                return table;
+            }
+            std::memcpy(map.data(), entries.data(), bytes);
+        } // unmapped here, before the seals go on
+
+        // Sealed so a client that maps it cannot grow, shrink or write it. The
+        // protocol requires the table be read-only to clients, and a seal is
+        // the only thing that actually enforces that on a shared memfd.
+        if (fcntl(fd.get(), F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) != 0) {
+            return table;
+        }
+
+        table.indices_.resize(entries.size());
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            table.indices_[i] = static_cast<std::uint16_t>(i);
+        }
+        table.size_ = static_cast<std::uint32_t>(bytes);
+        table.fd_ = std::move(fd);
+        return table;
+    }
+};
+
 // Lifted out of the anonymous namespace below: GlobalData names it in a
 // member signature, and a module-linkage declaration may not expose a
 // TU-local type. Still unexported — private to module luminaria.
@@ -102,6 +227,8 @@ struct GlobalData {
     gbm_device* gbm = nullptr;
     VulkanRenderer* renderer = nullptr;
     std::vector<FormatMods> formats;
+    DmabufFormatTable table;
+    dev_t main_device = 0; // the render node clients are told to open
 };
 
 namespace {
@@ -275,10 +402,94 @@ void dmabuf_create_params(wl_client* client, wl_resource* resource, uint32_t par
     wl_resource_set_implementation(r, &params_impl, params, params_resource_destroy);
 }
 
+// --- zwp_linux_dmabuf_feedback_v1 (v4) ---
+
+constexpr struct zwp_linux_dmabuf_feedback_v1_interface feedback_impl = {
+    .destroy = resource_destroy_request,
+};
+
+/// A `wl_array` holding exactly one `dev_t`, as `main_device` and
+/// `tranche_target_device` both want it.
+struct DeviceArray {
+    wl_array array{};
+    explicit DeviceArray(dev_t device) {
+        wl_array_init(&array);
+        if (void* slot = wl_array_add(&array, sizeof(dev_t)); slot != nullptr) {
+            std::memcpy(slot, &device, sizeof(dev_t));
+        }
+    }
+    ~DeviceArray() { wl_array_release(&array); }
+    DeviceArray(const DeviceArray&) = delete;
+    DeviceArray& operator=(const DeviceArray&) = delete;
+};
+
+/// Our feedback never changes after startup — one device, one tranche, every
+/// format the GPU reported — so the whole sequence goes out at creation and the
+/// object then just sits there until the client destroys it.
+void send_feedback(wl_resource* resource, const GlobalData& g) {
+    if (!g.table.valid()) {
+        // Nothing to describe. `all_done` still has to go out, or a client that
+        // is waiting on a roundtrip for it hangs forever.
+        zwp_linux_dmabuf_feedback_v1_send_done(resource);
+        return;
+    }
+    zwp_linux_dmabuf_feedback_v1_send_format_table(resource, g.table.fd(), g.table.size());
+    {
+        DeviceArray main{g.main_device};
+        zwp_linux_dmabuf_feedback_v1_send_main_device(resource, &main.array);
+    }
+
+    // One tranche, targeting the same device, with no flags: we composite
+    // everything through the renderer, so there is no scanout-only subset to
+    // promote. `SCANOUT` would be a lie unless the tranche were built from what
+    // KMS actually accepts on a plane.
+    {
+        DeviceArray target{g.main_device};
+        zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(resource, &target.array);
+    }
+    {
+        wl_array formats{};
+        wl_array_init(&formats);
+        const std::size_t bytes = g.table.indices().size() * sizeof(std::uint16_t);
+        if (void* slot = wl_array_add(&formats, bytes); slot != nullptr) {
+            std::memcpy(slot, g.table.indices().data(), bytes);
+        }
+        zwp_linux_dmabuf_feedback_v1_send_tranche_formats(resource, &formats);
+        wl_array_release(&formats);
+    }
+    zwp_linux_dmabuf_feedback_v1_send_tranche_flags(resource, 0);
+    zwp_linux_dmabuf_feedback_v1_send_tranche_done(resource);
+    zwp_linux_dmabuf_feedback_v1_send_done(resource);
+}
+
+void create_feedback(wl_client* client, wl_resource* parent, uint32_t id) {
+    wl_resource* resource = wl_resource_create(client, &zwp_linux_dmabuf_feedback_v1_interface,
+                                               wl_resource_get_version(parent), id);
+    if (resource == nullptr) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource, &feedback_impl, nullptr, nullptr);
+    send_feedback(resource, *global_of(parent));
+}
+
+void dmabuf_get_default_feedback(wl_client* client, wl_resource* resource, uint32_t id) {
+    create_feedback(client, resource, id);
+}
+
+// Per-surface feedback may legally equal the default feedback, and ours does:
+// there is one GPU, one tranche, and no per-surface scanout promotion to
+// report. The surface is accepted and ignored rather than refused.
+void dmabuf_get_surface_feedback(wl_client* client, wl_resource* resource, uint32_t id,
+                                 wl_resource* /*surface*/) {
+    create_feedback(client, resource, id);
+}
+
 constexpr struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
     .destroy = resource_destroy_request,
     .create_params = dmabuf_create_params,
-    // get_default_feedback / get_surface_feedback are v4+; we bind at v3.
+    .get_default_feedback = dmabuf_get_default_feedback,
+    .get_surface_feedback = dmabuf_get_surface_feedback,
 };
 
 void dmabuf_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
@@ -290,6 +501,11 @@ void dmabuf_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     }
     wl_resource_set_implementation(resource, &dmabuf_impl, data, nullptr);
 
+    // v4 replaced these with the feedback object and forbids sending them; a
+    // v4 client learns the formats from the format table instead.
+    if (version >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION) {
+        return;
+    }
     // Advertise every (format, modifier) pair (v3 `modifier` event; also the
     // legacy `format` event for v1/v2 fallback clients).
     auto* g = static_cast<GlobalData*>(data);
@@ -306,16 +522,16 @@ void dmabuf_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
 } // namespace
 
 struct LinuxDmabuf::Impl {
-    int drm_fd = -1;
+    UniqueFd drm_fd;
     GlobalData data;
     WlGlobal global;
 
+    // gbm is the one thing here that is not RAII (a C handle with no wrapper of
+    // its own). It goes in the body, which runs before any member destructor —
+    // so the fd it was created from is still open at this point.
     ~Impl() {
         if (data.gbm != nullptr) {
             gbm_device_destroy(data.gbm);
-        }
-        if (drm_fd >= 0) {
-            close(drm_fd);
         }
     }
 };
@@ -331,16 +547,15 @@ Result<LinuxDmabuf> LinuxDmabuf::create(Display& display, VulkanRenderer* render
     // Open a DRM render node (unprivileged; the GBM allocator/validator device).
     for (int i = 128; i < 128 + 16; ++i) {
         std::string path = "/dev/dri/renderD" + std::to_string(i);
-        int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
-        if (fd < 0) {
+        UniqueFd fd{open(path.c_str(), O_RDWR | O_CLOEXEC)};
+        if (!fd.valid()) {
             continue;
         }
-        gbm_device* dev = gbm_create_device(fd);
+        gbm_device* dev = gbm_create_device(fd.get());
         if (dev == nullptr) {
-            close(fd);
-            continue;
+            continue; // fd closed by UniqueFd on the way round the loop
         }
-        impl->drm_fd = fd;
+        impl->drm_fd = std::move(fd);
         impl->data.gbm = dev;
         break;
     }
@@ -365,7 +580,20 @@ Result<LinuxDmabuf> LinuxDmabuf::create(Display& display, VulkanRenderer* render
         impl->data.formats.push_back(FormatMods{fourcc, std::move(mods)});
     }
 
-    auto global = create_wl_global<&zwp_linux_dmabuf_v1_interface, dmabuf_bind>(display, 3, &impl->data);
+    // The whole point of v4: `main_device` is how a client learns which DRM node
+    // to open. `st_rdev` of the render node we already hold is exactly that, and
+    // without it Mesa initialises EGL with fd -1 and drops to software.
+    if (struct stat info {}; fstat(impl->drm_fd.get(), &info) == 0) {
+        impl->data.main_device = info.st_rdev;
+    }
+    impl->data.table = DmabufFormatTable::build(impl->data.formats);
+
+    // Bind at 4 only when there is something for a v4 client to read; a
+    // feedback object with no format table is worse than none, because the
+    // client stops looking at the v3 events it would otherwise have used.
+    const uint32_t version = (impl->data.table.valid() && impl->data.main_device != 0) ? 4 : 3;
+    auto global =
+        create_wl_global<&zwp_linux_dmabuf_v1_interface, dmabuf_bind>(display, version, &impl->data);
     if (!global) {
         return fail(std::move(global.error().message));
     }

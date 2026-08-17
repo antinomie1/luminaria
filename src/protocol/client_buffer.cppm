@@ -78,11 +78,16 @@ void install_client_buffer(wl_resource* resource, std::unique_ptr<ClientBuffer> 
 // --------------------------------------------------------------- implementation
 
 namespace luminaria {
-namespace {
 
+// Lifted out of the anonymous namespace: `std::make_unique<InstalledClientBuffer>`
+// is a `tuple<InstalledClientBuffer*, default_delete<...>>`, whose comparisons
+// clang instantiates at module scope — a TU-local type in there would be
+// ill-formed. Still unexported, so it stays private to module luminaria.
 struct InstalledClientBuffer {
     std::shared_ptr<ClientBuffer> contents;
 };
+
+namespace {
 
 void client_buffer_destroy_request(wl_client*, wl_resource* resource) {
     wl_resource_destroy(resource);

@@ -109,10 +109,27 @@ public:
 
     // --- pointer ---
     /// Move pointer focus onto `surface` at local (sx,sy) and send enter.
+    ///
+    /// Ignored while an implicit grab is held by a different surface — see
+    /// `pointer_grab()`. A compositor may therefore hit-test and call this on
+    /// every motion without having to know a drag is in progress.
     void pointer_enter(Surface& surface, double sx, double sy);
     /// Drop pointer focus entirely (cursor left every surface): sends leave.
+    /// Ignored while an implicit grab is held.
     void pointer_clear_focus();
     [[nodiscard]] SurfaceId pointer_focus() const noexcept;
+
+    /// The surface holding the implicit pointer grab, or an invalid id.
+    ///
+    /// wl_pointer requires that from the first button press until the last
+    /// release, every pointer event goes to the surface that received the
+    /// press — wherever the cursor actually is. Without it, dragging a
+    /// scrollbar past the edge of its window sends the client a leave and the
+    /// drag dies mid-gesture. The grab is started and ended by
+    /// `pointer_button()`; the compositor only has to ask, because the
+    /// coordinates during a grab are relative to the grab surface and only the
+    /// compositor knows where that is.
+    [[nodiscard]] SurfaceId pointer_grab() const noexcept;
     /// Send motion to the pointer-focused client.
     void pointer_motion(double sx, double sy);
     /// Send a button event to the pointer-focused client. `pressed` = down.
@@ -179,10 +196,23 @@ struct Seat::Impl {
     SurfaceId ptr_focus;
     SurfaceId touch_focus;
     SurfaceId cursor;
+    /// The implicit pointer grab: who took the first press, and which buttons
+    /// are still down. The grab ends on the release of the last one.
+    SurfaceId ptr_grab;
+    std::set<uint32_t> ptr_buttons;
     Signal<SurfaceInvalidated>::Connection invalidated;
     int cursor_hotspot_x = 0;
     int cursor_hotspot_y = 0;
     bool cursor_hidden = false;
+
+    /// Drop the implicit grab once every button is up. The pointer focus is
+    /// deliberately left where it is: re-deriving it needs a hit test, which
+    /// only the compositor can do, and it will on the next motion.
+    void end_grab_if_released() noexcept {
+        if (ptr_buttons.empty()) {
+            ptr_grab = {};
+        }
+    }
 
     /// Back to "the compositor's own cursor applies" — the client that had an
     /// opinion is no longer the focused one.
@@ -425,6 +455,13 @@ Result<Seat> Seat::create(Display& display, std::string name) {
             raw->keyboard_focus_changed.emit(changed);
         }
 
+        // A client that dies mid-drag takes its grab with it, or the pointer
+        // is stuck routing to a surface that no longer exists.
+        if (raw->ptr_grab == event.surface) {
+            raw->ptr_grab = {};
+            raw->ptr_buttons.clear();
+        }
+
         const bool pointer_lost = raw->ptr_focus == event.surface;
         if (pointer_lost) {
             raw->ptr_focus = {};
@@ -573,6 +610,16 @@ void Seat::notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locke
 
 void Seat::pointer_enter(Surface& surface, double sx, double sy) {
     const SurfaceId target = surface.id();
+    // An implicit grab outranks the hit test: the compositor is free to keep
+    // reporting whatever is under the cursor, and we keep sending it to the
+    // surface that took the press. Coordinates are only meaningful for the grab
+    // holder, so a hit on anything else is dropped rather than translated.
+    if (impl_->ptr_grab.valid()) {
+        if (impl_->ptr_grab == target) {
+            pointer_motion(sx, sy);
+        }
+        return;
+    }
     if (impl_->dragging) {
         // During a drag the pointer belongs to the drag: no wl_pointer events.
         if (impl_->ptr_focus != target) {
@@ -608,6 +655,11 @@ void Seat::pointer_enter(Surface& surface, double sx, double sy) {
 }
 
 void Seat::pointer_clear_focus() {
+    // Dragging the cursor off the window is exactly what an implicit grab is
+    // for; the leave that would otherwise go out here is what kills the drag.
+    if (impl_->ptr_grab.valid()) {
+        return;
+    }
     if (!impl_->ptr_focus.valid()) {
         return;
     }
@@ -673,8 +725,22 @@ void Seat::pointer_button(uint32_t button, bool pressed) {
         }
         return;
     }
+    // The first press takes the implicit grab; the last release gives it back.
+    // Tracked before delivery so that the press itself is already inside the
+    // grab, and a release still reaches the holder even if the cursor has since
+    // been dragged over something else entirely.
+    if (pressed) {
+        if (impl_->ptr_buttons.empty() && impl_->ptr_focus.valid()) {
+            impl_->ptr_grab = impl_->ptr_focus;
+        }
+        impl_->ptr_buttons.insert(button);
+    } else {
+        impl_->ptr_buttons.erase(button);
+    }
+
     Surface* focus = surface_from_id(impl_->ptr_focus);
     if (focus == nullptr) {
+        impl_->end_grab_if_released();
         return;
     }
     wl_client* client = client_of(*focus);
@@ -687,6 +753,11 @@ void Seat::pointer_button(uint32_t button, bool pressed) {
             pointer_frame_if_supported(p);
         }
     }
+    impl_->end_grab_if_released();
+}
+
+SurfaceId Seat::pointer_grab() const noexcept {
+    return impl_->ptr_grab;
 }
 
 void Seat::pointer_axis(double dx, double dy) {
