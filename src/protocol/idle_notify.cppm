@@ -33,6 +33,7 @@ import std;
 import :display;
 import :event_loop;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -136,19 +137,13 @@ namespace luminaria {
 class NotificationImpl;
 
 struct IdleNotifier::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     EventLoop loop;
     std::vector<NotificationImpl*> notifications;
     bool inhibited = false;
 
     Signal<NewIdleNotification> new_notification;
     Signal<IdleStateChange> state_change;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using InMgr = IdleNotifier::Impl;
@@ -215,12 +210,8 @@ public:
 
 namespace {
 
-void notification_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 const struct ext_idle_notification_v1_interface notification_impl = {
-    .destroy = notification_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 void notification_resource_destroy(wl_resource* resource) {
@@ -263,25 +254,11 @@ void manager_get_input_idle_notification(wl_client* client, wl_resource* manager
     make_notification(client, manager, id, timeout, true);
 }
 
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 const struct ext_idle_notifier_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_idle_notification = manager_get_idle_notification,
     .get_input_idle_notification = manager_get_input_idle_notification,
 };
-
-void manager_bind(wl_client* client, void* data, std::uint32_t version, std::uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &ext_idle_notifier_v1_interface,
-                                               static_cast<int>(version), static_cast<int>(id));
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -293,11 +270,13 @@ IdleNotifier& IdleNotifier::operator=(IdleNotifier&&) noexcept = default;
 Result<IdleNotifier> IdleNotifier::create(Display& display, EventLoop loop) {
     auto impl = std::make_unique<Impl>();
     impl->loop = loop;
-    impl->global = wl_global_create(display.c_ptr(), &ext_idle_notifier_v1_interface, 2,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(ext_idle_notifier_v1) failed");
+    auto global = create_wl_global<&ext_idle_notifier_v1_interface,
+                                   default_bind<&ext_idle_notifier_v1_interface,
+                                                &manager_impl>>(display, 2, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return IdleNotifier{std::move(impl)};
 }
 

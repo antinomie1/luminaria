@@ -22,6 +22,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -53,14 +54,7 @@ private:
 namespace luminaria {
 
 struct Subcompositor::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
+    WlGlobal global;
 };
 
 namespace {
@@ -80,9 +74,6 @@ Surface* surface_arg(wl_resource* resource) {
     return resource == nullptr ? nullptr : static_cast<Surface*>(wl_resource_get_user_data(resource));
 }
 
-void subsurface_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void subsurface_set_position(wl_client*, wl_resource* resource, int32_t x, int32_t y) {
     if (Surface* s = glue_of(resource)->surface; s != nullptr) {
         s->sub_set_position(x, y);
@@ -121,7 +112,7 @@ void subsurface_set_desync(wl_client*, wl_resource* resource) {
     }
 }
 constexpr struct wl_subsurface_interface subsurface_impl = {
-    .destroy = subsurface_destroy_request,
+    .destroy = resource_destroy_request,
     .set_position = subsurface_set_position,
     .place_above = subsurface_place_above,
     .place_below = subsurface_place_below,
@@ -138,9 +129,6 @@ void subsurface_resource_destroy(wl_resource* resource) {
 }
 
 // ---- wl_subcompositor ----
-void subcompositor_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void subcompositor_get_subsurface(wl_client* client, wl_resource* resource, uint32_t id,
                                   wl_resource* surface_resource, wl_resource* parent_resource) {
@@ -177,19 +165,9 @@ void subcompositor_get_subsurface(wl_client* client, wl_resource* resource, uint
 }
 
 constexpr struct wl_subcompositor_interface subcompositor_impl = {
-    .destroy = subcompositor_destroy_request,
+    .destroy = resource_destroy_request,
     .get_subsurface = subcompositor_get_subsurface,
 };
-
-void subcompositor_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wl_subcompositor_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &subcompositor_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -200,12 +178,13 @@ Subcompositor& Subcompositor::operator=(Subcompositor&&) noexcept = default;
 
 Result<Subcompositor> Subcompositor::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->display = display.c_ptr();
-    impl->global = wl_global_create(impl->display, &wl_subcompositor_interface, 1, impl.get(),
-                                    subcompositor_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wl_subcompositor) failed");
+    auto global = create_wl_global<&wl_subcompositor_interface,
+                                   default_bind<&wl_subcompositor_interface,
+                                                &subcompositor_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return Subcompositor{std::move(impl)};
 }
 

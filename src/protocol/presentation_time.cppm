@@ -24,6 +24,7 @@ import :compositor;
 import :display;
 import :expected;
 import :output;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -71,8 +72,7 @@ private:
 namespace luminaria {
 
 struct Presentation::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     // Feedback objects still waiting, per surface, oldest first. The connection
     // clears the entry if the surface dies before its frame is presented.
     struct Pending {
@@ -80,12 +80,6 @@ struct Presentation::Impl {
         Signal<SurfaceDestroy>::Connection on_destroy;
     };
     std::map<Surface*, Pending> pending;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 
     void add(Surface& surface, wl_resource* feedback) {
         Pending& p = pending[&surface];
@@ -124,10 +118,6 @@ struct Presentation::Impl {
 
 namespace {
 
-void presentation_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void on_feedback_destroy(wl_resource* resource) {
     // A client may drop a feedback object before we present. Nothing to send;
     // just stop tracking it.
@@ -163,7 +153,7 @@ void presentation_feedback(wl_client* client, wl_resource* resource, wl_resource
 }
 
 constexpr struct wp_presentation_interface presentation_impl = {
-    .destroy = presentation_destroy_request,
+    .destroy = resource_destroy_request,
     .feedback = presentation_feedback,
 };
 
@@ -188,12 +178,11 @@ Presentation& Presentation::operator=(Presentation&&) noexcept = default;
 
 Result<Presentation> Presentation::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->display = display.c_ptr();
-    impl->global =
-        wl_global_create(impl->display, &wp_presentation_interface, 2, impl.get(), presentation_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_presentation) failed");
+    auto global = create_wl_global<&wp_presentation_interface, presentation_bind>(display, 2, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return Presentation{std::move(impl)};
 }
 

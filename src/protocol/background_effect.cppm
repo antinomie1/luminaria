@@ -19,6 +19,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :region;
 import :signal;
 
@@ -53,14 +54,8 @@ private:
 namespace luminaria {
 
 struct BackgroundEffectManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     std::vector<SurfaceId> active;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 namespace {
@@ -82,8 +77,6 @@ void effect_set_blur_region(wl_client*, wl_resource* resource, wl_resource* regi
     effect->surface->set_pending_blur_region(region_from_resource(region_resource));
 }
 
-void effect_destroy_request(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
-
 void effect_resource_destroy(wl_resource* resource) {
     auto* effect = static_cast<BackgroundEffectObject*>(wl_resource_get_user_data(resource));
     if (effect->surface != nullptr) {
@@ -97,11 +90,9 @@ void effect_resource_destroy(wl_resource* resource) {
 }
 
 constexpr struct ext_background_effect_surface_v1_interface effect_impl = {
-    .destroy = effect_destroy_request,
+    .destroy = resource_destroy_request,
     .set_blur_region = effect_set_blur_region,
 };
-
-void manager_destroy_request(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 
 void manager_get_background_effect(wl_client* client, wl_resource* manager, std::uint32_t id,
                                    wl_resource* surface_resource) {
@@ -133,7 +124,7 @@ void manager_get_background_effect(wl_client* client, wl_resource* manager, std:
 }
 
 constexpr struct ext_background_effect_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_background_effect = manager_get_background_effect,
 };
 
@@ -159,11 +150,12 @@ BackgroundEffectManager& BackgroundEffectManager::operator=(BackgroundEffectMana
 
 Result<BackgroundEffectManager> BackgroundEffectManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &ext_background_effect_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(ext_background_effect_manager_v1) failed");
+    auto global = create_wl_global<&ext_background_effect_manager_v1_interface, manager_bind>(
+        display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return BackgroundEffectManager{std::move(impl)};
 }
 
