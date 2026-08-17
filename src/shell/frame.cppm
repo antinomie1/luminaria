@@ -923,7 +923,7 @@ GpuTexture* Frame::Impl::texture_for(Surface& surface) {
         texture_cache.push_back(std::move(fresh));
     }
 
-    const void* current = surface.current_buffer();
+    const void* current = surface.current_buffer_identity();
     if (current == nullptr) {
         entry->texture.reset();
         entry->buffer = nullptr;

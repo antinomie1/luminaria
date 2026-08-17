@@ -1,9 +1,10 @@
-// Regression: a client destroys a wl_buffer the compositor still holds.
+// Regression: a client destroys a wl_buffer resource the compositor still uses.
 //
 // Every toolkit does this — Qt/GTK drop the whole swapchain when a window is
-// resized, hidden, or re-shown. The compositor used to keep the raw
-// wl_resource* and then call wl_buffer.release on it (and read pixels from it),
-// which segfaulted. Surface must drop the buffer from every slot instead.
+// resized, hidden, or re-shown; swaybg destroys its proxy immediately after
+// commit. The resource may no longer receive release, but Wayland says that
+// does not revoke attached contents. Surface must retain those without ever
+// reading or releasing the dead wl_resource.
 //
 // Also covers the xdg-shell half of the same report: a configure that carries
 // MAXIMIZED must never name a 0x0 size ("Configure event with maximized or
@@ -143,8 +144,9 @@ void run_client(int fd) {
         wl_display_roundtrip(display);
         wl_display_roundtrip(display);
 
-        // The heart of it: throw away the buffer the compositor is holding,
-        // then hand it a new one. The old code released the freed resource.
+        // The heart of it: throw away the object name for content the
+        // compositor is showing, then hand it a new one. The old resource must
+        // not be released, while its storage remains readable until replaced.
         wl_buffer_destroy(st.first);
         st.first = nullptr;
         wl_display_roundtrip(display); // the server must forget it HERE
@@ -154,8 +156,9 @@ void run_client(int fd) {
         wl_display_roundtrip(display);
         wl_display_roundtrip(display);
 
-        // And again the other way round: attach a buffer, destroy it before the
-        // commit that would apply it, then commit.
+        // Also cover the stricter ordering: attach, destroy the wl_buffer proxy,
+        // then commit. Requests are ordered, so the server retained the contents
+        // when it saw attach even though the resource is gone at commit time.
         wl_buffer* doomed = make_buffer(&st, 32, 32);
         wl_surface_attach(st.surface, doomed, 0, 0);
         wl_buffer_destroy(doomed);
@@ -196,6 +199,7 @@ int main() {
     int commits = 0;
     int reads_with_buffer = 0;
     bool last_commit_had_buffer = true;
+    int last_read_w = 0, last_read_h = 0;
     std::vector<luminaria::Signal<luminaria::SurfaceCommit>::Connection> conns;
     auto ns = compositor->new_surface().connect([&](luminaria::NewSurface& e) {
         luminaria::Surface* surface = &e.surface;
@@ -206,6 +210,8 @@ int main() {
             int w = 0, h = 0;
             if (surface->current_buffer_rgba(rgba, w, h)) {
                 ++reads_with_buffer;
+                last_read_w = w;
+                last_read_h = h;
             }
         }));
     });
@@ -235,10 +241,11 @@ int main() {
     // Surviving at all is the crash test; the counters prove we really did drive
     // commits and readbacks across the destroyed-buffer window.
     assert(commits == 4);      // initial, first buffer, replacement, doomed
-    assert(reads_with_buffer == 2); // only the two commits with a live buffer
-    // The last commit applied a buffer the client had already destroyed: the
-    // surface must have degraded it to "no buffer", not kept a dead resource.
-    assert(!last_commit_had_buffer);
+    assert(reads_with_buffer == 3); // every non-null attach retained its contents
+    // The last commit names no live resource, but its 32x32 storage was retained
+    // at attach time and remains the surface's content.
+    assert(last_commit_had_buffer);
+    assert(last_read_w == 32 && last_read_h == 32);
     assert(!g_client.saw_invalid_maximized_configure);
     assert(g_client.cfg_maximized);
     assert(g_client.cfg_w == kBoundsW && g_client.cfg_h == kBoundsH);

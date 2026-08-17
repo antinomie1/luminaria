@@ -270,7 +270,11 @@ on the GPU and only the finished frame crosses to the CPU: `read_scanout()` →
 
 Two bridges expose client buffers: `Surface::current_buffer_dmabuf()` lets Frame import dmabuf
 straight into `VulkanRenderer` with no readback; `Surface::current_buffer_rgba()` handles shm and
-single-pixel buffers for upload, screencopy and non-dmabuf backends. The dmabuf description also
+single-pixel buffers for upload, screencopy and non-dmabuf backends. Both survive the client
+destroying its `wl_buffer`: `BufferContents` retains storage independently
+because destroying an object name does not revoke pixels already attached to a surface.
+The raw resource is forgotten immediately, so no later read or `release` can touch it.
+The dmabuf description also
 skips the renderer entirely when handed to `Output::import_scanout()`, and `DirectScanout`
 (`shell/direct_scanout.cppm`) decides when that is allowed — one fullscreen, unrotated,
 uncropped surface whose buffer is in a layout the display advertised — caches the imports per

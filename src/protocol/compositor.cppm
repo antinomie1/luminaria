@@ -110,8 +110,9 @@ public:
     /// surface (see SurfaceRendered).
     Signal<SurfaceRendered> rendered;
 
-    /// True once a non-null buffer has been committed.
-    [[nodiscard]] bool has_buffer() const noexcept { return current_buffer_ != nullptr; }
+    /// True once non-null buffer contents have been committed. The client's
+    /// wl_buffer resource may already be gone; that does not revoke a commit.
+    [[nodiscard]] bool has_buffer() const noexcept { return static_cast<bool>(current_contents_); }
 
     /// Size of the committed buffer in pixels (0 if there is none).
     [[nodiscard]] int buffer_width() const noexcept { return buffer_width_; }
@@ -313,6 +314,12 @@ public:
     /// listener, because the client can drop it at any time.
     [[nodiscard]] wl_resource* current_buffer() const noexcept { return current_buffer_; }
 
+    /// Stable identity of the committed contents, including after the client
+    /// destroys its wl_buffer resource. Intended for renderer caches.
+    [[nodiscard]] const void* current_buffer_identity() const noexcept {
+        return current_contents_.identity();
+    }
+
     // --- holding a buffer past its commit ---
     //
     // Normally a buffer is released the moment the next one is committed: the
@@ -374,10 +381,10 @@ public:
     void set_pending_viewport_source(double x, double y, double w, double h);
     void set_pending_viewport_destination(int w, int h);
     void apply_commit();
-    /// Called from the buffer's destroy listener: the client threw the buffer
-    /// away while we still referenced it. Drops it from every slot so nothing
-    /// releases or reads a dead resource. (Clients really do this — a toolkit
-    /// discards its whole swapchain when the window is resized or re-shown.)
+    /// Called from the buffer's destroy listener: forget the dead resource in
+    /// every slot, while retaining the separately-owned contents already
+    /// attached there. (Clients such as swaybg destroy that object immediately
+    /// after commit; doing so does not uncommit its pixels.)
     void forget_buffer(wl_resource* buffer) noexcept;
     /// Called by a wl_callback resource's destroy hook. Frame callbacks are
     /// client-owned resources too: wl_client_destroy may tear one down before
@@ -411,6 +418,7 @@ private:
 
     struct State {
         wl_resource* buffer = nullptr;
+        BufferContents contents;
         bool buffer_dirty = false;
         bool tearing = false;
         std::uint32_t content_type = 0;
@@ -445,6 +453,7 @@ private:
     wl_resource* resource_;
     SurfaceId id_;
     wl_resource* current_buffer_ = nullptr;
+    BufferContents current_contents_;
     int buffer_width_ = 0;
     int buffer_height_ = 0;
     bool tearing_ = false;
@@ -673,54 +682,11 @@ void Surface::unhold_buffer(wl_resource* buffer) {
 }
 
 bool Surface::current_buffer_dmabuf(DmabufPlane& out) const {
-    ClientBuffer* buffer = client_buffer_from_resource(current_buffer_);
-    return buffer != nullptr && buffer->dmabuf(out);
+    return current_contents_.dmabuf(out);
 }
 
 bool Surface::current_buffer_rgba(std::vector<std::uint8_t>& out, int& width, int& height) const {
-    if (current_buffer_ == nullptr) {
-        return false;
-    }
-    wl_shm_buffer* shm = wl_shm_buffer_get(current_buffer_);
-    if (shm == nullptr) {
-        ClientBuffer* buffer = client_buffer_from_resource(current_buffer_);
-        return buffer != nullptr && buffer->rgba(out, width, height);
-    }
-    const uint32_t format = wl_shm_buffer_get_format(shm);
-    if (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888) {
-        return false;
-    }
-    const int w = wl_shm_buffer_get_width(shm);
-    const int h = wl_shm_buffer_get_height(shm);
-    const int stride = wl_shm_buffer_get_stride(shm);
-    const bool opaque = format == WL_SHM_FORMAT_XRGB8888;
-    // libwayland accepted this buffer having only checked `stride >= width`,
-    // comparing bytes against pixels. A client that declares stride == width
-    // for a 4-byte format sends the loop below off the end of the pool, so the
-    // buffer is unreadable to us — say so rather than touch it. libwayland
-    // guarantees the pool holds `stride * height`, which is all we then need.
-    if (!layout_fits(w, h, stride)) {
-        return false;
-    }
-
-    wl_shm_buffer_begin_access(shm);
-    const auto* data = static_cast<const uint8_t*>(wl_shm_buffer_get_data(shm));
-    out.resize(static_cast<size_t>(w) * h * 4);
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* src = data + static_cast<size_t>(y) * stride;
-        uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
-        for (int x = 0; x < w; ++x) {
-            // shm ARGB8888 is little-endian: bytes are B,G,R,A. Emit RGBA.
-            dst[x * 4 + 0] = src[x * 4 + 2];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 0];
-            dst[x * 4 + 3] = opaque ? 255 : src[x * 4 + 3];
-        }
-    }
-    wl_shm_buffer_end_access(shm);
-    width = w;
-    height = h;
-    return true;
+    return current_contents_.rgba(out, width, height);
 }
 
 namespace {
@@ -750,35 +716,12 @@ void Surface::forget_frame_callback(wl_resource* callback) noexcept {
     std::erase(queued_frame_callbacks_, callback);
 }
 
-namespace {
-// Buffer extent without decoding pixels: shm knows it directly, dmabuf carries
-// it in the plane metadata. Used for hit-testing and subsurface layout.
-void buffer_size(wl_resource* buffer, int& w, int& h) {
-    w = 0;
-    h = 0;
-    if (buffer == nullptr) {
-        return;
-    }
-    if (wl_shm_buffer* shm = wl_shm_buffer_get(buffer); shm != nullptr) {
-        w = wl_shm_buffer_get_width(shm);
-        h = wl_shm_buffer_get_height(shm);
-        return;
-    }
-    if (ClientBuffer* contents = client_buffer_from_resource(buffer); contents != nullptr) {
-        w = contents->width();
-        h = contents->height();
-        return;
-    }
-}
-} // namespace
-
 // ---- client buffer lifetime -------------------------------------------------
 //
 // A wl_buffer belongs to the CLIENT, and clients destroy buffers while the
-// compositor still holds them: every toolkit drops its whole swapchain when a
-// window is resized, hidden, or re-shown. Keeping the raw wl_resource* means
-// the next `wl_buffer.release` — or the next readback — touches freed memory.
-// So every buffer we reference carries a destroy subscription.
+// compositor still shows their contents. Every raw wl_resource* therefore has
+// a destroy subscription: the object name and its release obligation disappear,
+// while BufferContents keeps storage from an already-seen attach alive.
 
 struct Surface::BufferWatch {
     wl_listener listener{}; // must stay first: we recover the watch from it
@@ -829,12 +772,12 @@ void Surface::prune_buffer_watches() {
 }
 
 void Surface::forget_buffer(wl_resource* buffer) noexcept {
-    // The client destroyed it out from under every hold. There is nothing left
-    // to release and nothing left to hold.
+    // The object name is dead, so it can no longer receive release and direct
+    // scanout must stop naming it. Its retained contents are deliberately left
+    // in pending/cached/deferred/current state: wl_buffer.destroy does not undo
+    // an attach, and tools such as swaybg destroy the proxy right after commit.
     std::erase(held_buffers_, buffer);
     std::erase(release_due_, buffer);
-    // A pending/cached attach of a now-dead buffer degrades to "attach null",
-    // which is exactly what the surface should show: nothing.
     if (pending_.buffer == buffer) {
         pending_.buffer = nullptr;
     }
@@ -848,8 +791,6 @@ void Surface::forget_buffer(wl_resource* buffer) noexcept {
     }
     if (current_buffer_ == buffer) {
         current_buffer_ = nullptr;
-        buffer_width_ = 0;
-        buffer_height_ = 0;
     }
     std::erase_if(buffer_watches_, [buffer](const std::unique_ptr<BufferWatch>& watch) {
         return watch->buffer == buffer;
@@ -858,6 +799,7 @@ void Surface::forget_buffer(wl_resource* buffer) noexcept {
 
 void Surface::set_pending_buffer(wl_resource* buffer) {
     pending_.buffer = buffer;
+    pending_.contents = retain_client_buffer(buffer);
     pending_.buffer_dirty = true;
     watch_buffer(buffer);
 }
@@ -1112,6 +1054,7 @@ void Surface::merge_state(State& into, State&& from) {
             wl_buffer_send_release(into.buffer);
         }
         into.buffer = from.buffer;
+        into.contents = std::move(from.contents);
         into.buffer_dirty = true;
     }
     into.frame_callbacks.insert(into.frame_callbacks.end(), from.frame_callbacks.begin(),
@@ -1227,7 +1170,9 @@ void Surface::commit_state(State state) {
             }
         }
         current_buffer_ = state.buffer;
-        buffer_size(current_buffer_, buffer_width_, buffer_height_);
+        current_contents_ = std::move(state.contents);
+        buffer_width_ = current_contents_.width();
+        buffer_height_ = current_contents_.height();
     }
     tearing_ = state.tearing;
     content_type_ = state.content_type;
