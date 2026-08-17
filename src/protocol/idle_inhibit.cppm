@@ -28,6 +28,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -115,7 +116,7 @@ namespace luminaria {
 class InhibitorImpl;
 
 struct IdleInhibitManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     std::vector<InhibitorImpl*> inhibitors;
     bool inhibited = false;
 
@@ -173,19 +174,12 @@ inline IdleInhibitManager::Impl::~Impl() {
         delete i;
     }
     inhibitors.clear();
-    if (global != nullptr) {
-        wl_global_destroy(global);
-    }
 }
 
 namespace {
 
-void inhibitor_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct zwp_idle_inhibitor_v1_interface inhibitor_impl = {
-    .destroy = inhibitor_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 void inhibitor_resource_destroy(wl_resource* resource) {
@@ -198,10 +192,6 @@ void inhibitor_resource_destroy(wl_resource* resource) {
         }
         delete inhibitor;
     }
-}
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 
 void manager_create_inhibitor(wl_client* client, wl_resource* manager_resource, uint32_t id,
@@ -234,19 +224,9 @@ void manager_create_inhibitor(wl_client* client, wl_resource* manager_resource, 
 }
 
 constexpr struct zwp_idle_inhibit_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .create_inhibitor = manager_create_inhibitor,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zwp_idle_inhibit_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -269,11 +249,13 @@ IdleInhibitManager& IdleInhibitManager::operator=(IdleInhibitManager&&) noexcept
 
 Result<IdleInhibitManager> IdleInhibitManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &zwp_idle_inhibit_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_idle_inhibit_manager_v1) failed");
+    auto global = create_wl_global<&zwp_idle_inhibit_manager_v1_interface,
+                                   default_bind<&zwp_idle_inhibit_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return IdleInhibitManager{std::move(impl)};
 }
 

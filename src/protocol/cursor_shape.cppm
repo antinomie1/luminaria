@@ -25,6 +25,7 @@ import std;
 
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -108,23 +109,16 @@ void device_set_shape(wl_client* client, wl_resource* resource, uint32_t serial,
     device->request->emit(event);
 }
 
-void device_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
-void device_resource_destroy(wl_resource* resource) {
-    delete static_cast<ShapeDevice*>(wl_resource_get_user_data(resource));
-}
-
 constexpr struct wp_cursor_shape_device_v1_interface device_impl = {
-    .destroy = device_destroy_request,
+    .destroy = resource_destroy_request,
     .set_shape = device_set_shape,
 };
 
-void make_device(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* pointer);
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
+void make_device(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* pointer) {
+    auto* signal = static_cast<Signal<CursorShapeRequest>*>(wl_resource_get_user_data(manager));
+    auto device = std::make_unique<ShapeDevice>(signal, pointer);
+    create_user_resource<ShapeDevice, &wp_cursor_shape_device_v1_interface, &device_impl>(
+        client, wl_resource_get_version(manager), id, std::move(device), manager);
 }
 
 void manager_get_pointer(wl_client* client, wl_resource* manager, uint32_t id,
@@ -140,33 +134,10 @@ void manager_get_tablet_tool_v2(wl_client* client, wl_resource* manager, uint32_
 }
 
 constexpr struct wp_cursor_shape_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_pointer = manager_get_pointer,
     .get_tablet_tool_v2 = manager_get_tablet_tool_v2,
 };
-
-void make_device(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* pointer) {
-    wl_resource* resource = wl_resource_create(client, &wp_cursor_shape_device_v1_interface,
-                                               wl_resource_get_version(manager),
-                                               static_cast<int>(id));
-    if (resource == nullptr) {
-        wl_resource_post_no_memory(manager);
-        return;
-    }
-    auto* signal = static_cast<Signal<CursorShapeRequest>*>(wl_resource_get_user_data(manager));
-    wl_resource_set_implementation(resource, &device_impl, new ShapeDevice{signal, pointer},
-                                   device_resource_destroy);
-}
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wp_cursor_shape_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -181,13 +152,7 @@ struct CursorShapeManager::Impl {
     // First member: the wl_global's user_data points here, and the device glue
     // reads the signal straight off that pointer.
     Signal<CursorShapeRequest> request;
-    wl_global* global = nullptr;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
+    WlGlobal global;
 };
 
 CursorShapeManager::CursorShapeManager(std::unique_ptr<Impl> impl) noexcept
@@ -200,11 +165,13 @@ Signal<CursorShapeRequest>& CursorShapeManager::request() noexcept { return impl
 
 Result<CursorShapeManager> CursorShapeManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &wp_cursor_shape_manager_v1_interface, 2,
-                                    &impl->request, manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_cursor_shape_manager_v1) failed");
+    auto global = create_wl_global<&wp_cursor_shape_manager_v1_interface,
+                                   default_bind<&wp_cursor_shape_manager_v1_interface,
+                                                &manager_impl>>(display, 2, &impl->request);
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return CursorShapeManager{std::move(impl)};
 }
 

@@ -29,6 +29,7 @@ import :compositor;
 import :display;
 import :event_loop;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -73,18 +74,12 @@ namespace luminaria {
 struct CommitTimer;
 
 struct CommitTimingManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     std::vector<CommitTimer*> timers;
     EventSource wakeup;
 
     /// Apply what is due and re-arm for the earliest deadline still ahead.
     void tick();
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using CtMgr = CommitTimingManager::Impl;
@@ -96,6 +91,18 @@ struct CommitTimer {
     CtMgr* mgr = nullptr;
     SurfaceId surface;
     std::uint64_t deadline = 0;
+
+    CommitTimer(CtMgr* mgr, SurfaceId surface, std::uint64_t deadline = 0)
+        : mgr(mgr), surface(surface), deadline(deadline) {}
+
+    ~CommitTimer() {
+        if (Surface* s = surface_from_id(surface); s != nullptr) {
+            s->release_deferred_commit(std::numeric_limits<std::uint64_t>::max());
+        }
+        if (mgr != nullptr) {
+            std::erase(mgr->timers, this);
+        }
+    }
 };
 
 namespace {
@@ -135,29 +142,10 @@ void timer_set_timestamp(wl_client*, wl_resource* resource, uint32_t tv_sec_hi,
     timer->mgr->tick();
 }
 
-void timer_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
-void timer_resource_destroy(wl_resource* resource) {
-    auto* timer = static_cast<CommitTimer*>(wl_resource_get_user_data(resource));
-    // Whatever this timer parked must not stay parked: apply it now rather than
-    // leaving the client's last frame invisible forever.
-    if (Surface* surface = surface_from_id(timer->surface); surface != nullptr) {
-        surface->release_deferred_commit(std::numeric_limits<std::uint64_t>::max());
-    }
-    std::erase(timer->mgr->timers, timer);
-    delete timer;
-}
-
 constexpr struct wp_commit_timer_v1_interface timer_impl = {
     .set_timestamp = timer_set_timestamp,
-    .destroy = timer_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void manager_get_timer(wl_client* client, wl_resource* manager, uint32_t id,
                        wl_resource* surface_resource) {
@@ -180,25 +168,18 @@ void manager_get_timer(wl_client* client, wl_resource* manager, uint32_t id,
         wl_resource_post_no_memory(manager);
         return;
     }
-    auto* timer = new CommitTimer{mgr, surface != nullptr ? surface->id() : SurfaceId{}, 0};
-    mgr->timers.push_back(timer);
-    wl_resource_set_implementation(resource, &timer_impl, timer, timer_resource_destroy);
+    auto timer = std::make_unique<CommitTimer>(mgr, surface != nullptr ? surface->id() : SurfaceId{}, 0);
+    mgr->timers.push_back(timer.get());
+    CommitTimer* raw = timer.release();
+    wl_resource_set_implementation(resource, &timer_impl, raw, [](wl_resource* r) {
+        delete static_cast<CommitTimer*>(wl_resource_get_user_data(r));
+    });
 }
 
 constexpr struct wp_commit_timing_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_timer = manager_get_timer,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wp_commit_timing_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -246,11 +227,13 @@ CommitTimingManager& CommitTimingManager::operator=(CommitTimingManager&&) noexc
 
 Result<CommitTimingManager> CommitTimingManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &wp_commit_timing_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_commit_timing_manager_v1) failed");
+    auto global = create_wl_global<&wp_commit_timing_manager_v1_interface,
+                                   default_bind<&wp_commit_timing_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     Impl* raw = impl.get();
     impl->wakeup = display.event_loop().add_timer([raw] { raw->tick(); });
     if (!impl->wakeup.valid()) {

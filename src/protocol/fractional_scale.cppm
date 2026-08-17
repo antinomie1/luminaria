@@ -21,6 +21,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -63,53 +64,36 @@ private:
 namespace luminaria {
 
 namespace {
-/// One wp_fractional_scale_v1, owned by its resource. `surface` is nulled by the
-/// destroy subscription, so a dead surface can never be sent an event.
-struct ScaleObject {
-    Surface* surface = nullptr;
-    wl_resource* resource = nullptr;
-    int last_sent = 0;
-    Signal<SurfaceDestroy>::Connection destroy_conn;
-};
-} // namespace
+struct ScaleObject;
+}
 
 struct FractionalScaleManager::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     std::vector<ScaleObject*> objects; // not owned; each lives on its resource
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 namespace {
 
 using FsMgr = FractionalScaleManager::Impl;
 
-struct ScaleOwner {
+struct ScaleObject : SurfaceTracker {
     FsMgr* mgr = nullptr;
-    ScaleObject* object = nullptr;
+    wl_resource* resource = nullptr;
+    int last_sent = 0;
+
+    ScaleObject(FsMgr* m, Surface* s, wl_resource* r)
+        : SurfaceTracker(s), mgr(m), resource(r) {}
+
+    ~ScaleObject() override {
+        if (mgr != nullptr) {
+            std::erase(mgr->objects, this);
+        }
+    }
 };
-
-ScaleOwner* owner_of(wl_resource* r) { return static_cast<ScaleOwner*>(wl_resource_get_user_data(r)); }
-
-void scale_destroy_request(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 
 constexpr struct wp_fractional_scale_v1_interface scale_impl = {
-    .destroy = scale_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void scale_resource_destroy(wl_resource* resource) {
-    ScaleOwner* owner = owner_of(resource);
-    std::erase(owner->mgr->objects, owner->object);
-    delete owner->object;
-    delete owner;
-}
-
-void manager_destroy_request(wl_client*, wl_resource* resource) { wl_resource_destroy(resource); }
 
 void manager_get_scale(wl_client* client, wl_resource* resource, uint32_t id,
                        wl_resource* surface_resource) {
@@ -131,32 +115,18 @@ void manager_get_scale(wl_client* client, wl_resource* resource, uint32_t id,
         wl_client_post_no_memory(client);
         return;
     }
-    auto* object = new ScaleObject{};
-    object->surface = surface;
-    object->resource = scale_resource;
-    if (surface != nullptr) {
-        object->destroy_conn =
-            surface->destroy.connect([object](SurfaceDestroy&) { object->surface = nullptr; });
-    }
-    mgr->objects.push_back(object);
-    wl_resource_set_implementation(scale_resource, &scale_impl, new ScaleOwner{mgr, object},
-                                   scale_resource_destroy);
+    auto object = std::make_unique<ScaleObject>(mgr, surface, scale_resource);
+    mgr->objects.push_back(object.get());
+    ScaleObject* raw = object.release();
+    wl_resource_set_implementation(scale_resource, &scale_impl, raw, [](wl_resource* r) {
+        delete static_cast<ScaleObject*>(wl_resource_get_user_data(r));
+    });
 }
 
 constexpr struct wp_fractional_scale_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_fractional_scale = manager_get_scale,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wp_fractional_scale_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -169,12 +139,13 @@ FractionalScaleManager& FractionalScaleManager::operator=(FractionalScaleManager
 
 Result<FractionalScaleManager> FractionalScaleManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->display = display.c_ptr();
-    impl->global = wl_global_create(impl->display, &wp_fractional_scale_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_fractional_scale_manager_v1) failed");
+    auto global = create_wl_global<&wp_fractional_scale_manager_v1_interface,
+                                   default_bind<&wp_fractional_scale_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return FractionalScaleManager{std::move(impl)};
 }
 

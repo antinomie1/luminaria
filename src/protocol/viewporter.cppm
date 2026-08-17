@@ -22,6 +22,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -50,44 +51,28 @@ private:
 // --------------------------------------------------------------- implementation
 namespace luminaria {
 
-struct Viewporter::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
-};
-
 namespace {
 
 /// One wp_viewport. Owned by its resource; the Surface may die first, which is
 /// why the viewport watches it rather than caching blindly.
-struct Viewport {
-    Surface* surface = nullptr;
-    Signal<SurfaceDestroy>::Connection destroy_conn;
-};
+struct Viewport : SurfaceTracker {
+    using SurfaceTracker::SurfaceTracker;
 
-Viewport* viewport_of(wl_resource* r) { return static_cast<Viewport*>(wl_resource_get_user_data(r)); }
+    ~Viewport() override {
+        // Destroying the viewport puts the surface back to "the whole buffer, at
+        // its own size" — otherwise it would keep a crop nobody can change.
+        if (surface != nullptr) {
+            surface->set_pending_viewport_source(0, 0, -1, -1);
+            surface->set_pending_viewport_destination(-1, -1);
+        }
+    }
+};
 
 double from_fixed(wl_fixed_t v) { return wl_fixed_to_double(v); }
 
-void viewport_destroy_request(wl_client*, wl_resource* resource) {
-    Viewport* vp = viewport_of(resource);
-    // Destroying the viewport puts the surface back to "the whole buffer, at
-    // its own size" — otherwise it would keep a crop nobody can change.
-    if (vp->surface != nullptr) {
-        vp->surface->set_pending_viewport_source(0, 0, -1, -1);
-        vp->surface->set_pending_viewport_destination(-1, -1);
-    }
-    wl_resource_destroy(resource);
-}
-
 void viewport_set_source(wl_client*, wl_resource* resource, wl_fixed_t x, wl_fixed_t y,
                          wl_fixed_t width, wl_fixed_t height) {
-    Viewport* vp = viewport_of(resource);
+    auto* vp = static_cast<Viewport*>(wl_resource_get_user_data(resource));
     const double dx = from_fixed(x), dy = from_fixed(y);
     const double dw = from_fixed(width), dh = from_fixed(height);
     // -1,-1,-1,-1 is the protocol's "unset"; anything else must be a real rect.
@@ -106,7 +91,7 @@ void viewport_set_source(wl_client*, wl_resource* resource, wl_fixed_t x, wl_fix
 }
 
 void viewport_set_destination(wl_client*, wl_resource* resource, int32_t width, int32_t height) {
-    Viewport* vp = viewport_of(resource);
+    auto* vp = static_cast<Viewport*>(wl_resource_get_user_data(resource));
     const bool unset = width == -1 && height == -1;
     if (!unset && (width <= 0 || height <= 0)) {
         wl_resource_post_error(resource, WP_VIEWPORT_ERROR_BAD_VALUE,
@@ -122,51 +107,29 @@ void viewport_set_destination(wl_client*, wl_resource* resource, int32_t width, 
 }
 
 constexpr struct wp_viewport_interface viewport_impl = {
-    .destroy = viewport_destroy_request,
+    .destroy = resource_destroy_request,
     .set_source = viewport_set_source,
     .set_destination = viewport_set_destination,
 };
 
-void viewport_resource_destroy(wl_resource* resource) { delete viewport_of(resource); }
-
-void viewporter_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void viewporter_get_viewport(wl_client* client, wl_resource* resource, uint32_t id,
                              wl_resource* surface_resource) {
     Surface* surface = surface_from_resource(surface_resource);
-    wl_resource* vp_resource =
-        wl_resource_create(client, &wp_viewport_interface, wl_resource_get_version(resource), id);
-    if (vp_resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    auto* vp = new Viewport{};
-    vp->surface = surface;
-    if (surface != nullptr) {
-        vp->destroy_conn =
-            surface->destroy.connect([vp](SurfaceDestroy&) { vp->surface = nullptr; });
-    }
-    wl_resource_set_implementation(vp_resource, &viewport_impl, vp, viewport_resource_destroy);
+    auto vp = std::make_unique<Viewport>(surface);
+    create_user_resource<Viewport, &wp_viewport_interface, &viewport_impl>(
+        client, wl_resource_get_version(resource), id, std::move(vp));
 }
 
 constexpr struct wp_viewporter_interface viewporter_impl = {
-    .destroy = viewporter_destroy_request,
+    .destroy = resource_destroy_request,
     .get_viewport = viewporter_get_viewport,
 };
 
-void viewporter_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource =
-        wl_resource_create(client, &wp_viewporter_interface, static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &viewporter_impl, data, nullptr);
-}
-
 } // namespace
+
+struct Viewporter::Impl {
+    WlGlobal global;
+};
 
 Viewporter::Viewporter(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 Viewporter::~Viewporter() = default;
@@ -175,12 +138,13 @@ Viewporter& Viewporter::operator=(Viewporter&&) noexcept = default;
 
 Result<Viewporter> Viewporter::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->display = display.c_ptr();
-    impl->global =
-        wl_global_create(impl->display, &wp_viewporter_interface, 1, impl.get(), viewporter_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_viewporter) failed");
+    auto global = create_wl_global<&wp_viewporter_interface,
+                                   default_bind<&wp_viewporter_interface,
+                                                &viewporter_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return Viewporter{std::move(impl)};
 }
 

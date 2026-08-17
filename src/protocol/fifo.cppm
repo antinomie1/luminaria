@@ -39,6 +39,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -86,14 +87,8 @@ namespace luminaria {
 struct FifoObject;
 
 struct FifoManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     std::vector<FifoObject*> objects;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using FifoMgr = FifoManager::Impl;
@@ -104,6 +99,17 @@ using FifoMgr = FifoManager::Impl;
 struct FifoObject {
     FifoMgr* mgr = nullptr;
     SurfaceId surface;
+
+    FifoObject(FifoMgr* mgr, SurfaceId surface) : mgr(mgr), surface(surface) {}
+
+    ~FifoObject() {
+        if (Surface* s = surface_from_id(surface); s != nullptr) {
+            s->clear_fifo_barrier();
+        }
+        if (mgr != nullptr) {
+            std::erase(mgr->objects, this);
+        }
+    }
 };
 
 namespace {
@@ -136,29 +142,11 @@ void fifo_wait_barrier(wl_client*, wl_resource* resource) {
     surface->set_pending_fifo_wait();
 }
 
-void fifo_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
-void fifo_resource_destroy(wl_resource* resource) {
-    auto* object = static_cast<FifoObject*>(wl_resource_get_user_data(resource));
-    // Destroying the object must not leave a commit parked forever.
-    if (Surface* surface = fifo_surface(object); surface != nullptr) {
-        surface->clear_fifo_barrier();
-    }
-    std::erase(object->mgr->objects, object);
-    delete object;
-}
-
 constexpr struct wp_fifo_v1_interface fifo_impl = {
     .set_barrier = fifo_set_barrier,
     .wait_barrier = fifo_wait_barrier,
-    .destroy = fifo_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void manager_get_fifo(wl_client* client, wl_resource* manager, uint32_t id,
                       wl_resource* surface_resource) {
@@ -181,25 +169,18 @@ void manager_get_fifo(wl_client* client, wl_resource* manager, uint32_t id,
         wl_resource_post_no_memory(manager);
         return;
     }
-    auto* object = new FifoObject{mgr, surface != nullptr ? surface->id() : SurfaceId{}};
-    mgr->objects.push_back(object);
-    wl_resource_set_implementation(resource, &fifo_impl, object, fifo_resource_destroy);
+    auto object = std::make_unique<FifoObject>(mgr, surface != nullptr ? surface->id() : SurfaceId{});
+    mgr->objects.push_back(object.get());
+    FifoObject* raw = object.release();
+    wl_resource_set_implementation(resource, &fifo_impl, raw, [](wl_resource* r) {
+        delete static_cast<FifoObject*>(wl_resource_get_user_data(r));
+    });
 }
 
 constexpr struct wp_fifo_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_fifo = manager_get_fifo,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wp_fifo_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -210,11 +191,13 @@ FifoManager& FifoManager::operator=(FifoManager&&) noexcept = default;
 
 Result<FifoManager> FifoManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &wp_fifo_manager_v1_interface, 1, impl.get(),
-                                    manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_fifo_manager_v1) failed");
+    auto global = create_wl_global<&wp_fifo_manager_v1_interface,
+                                   default_bind<&wp_fifo_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return FifoManager{std::move(impl)};
 }
 
@@ -223,7 +206,7 @@ void FifoManager::unblock_hidden(const std::function<bool(Surface&)>& keep) {
     // can create or destroy fifo objects under us.
     const std::vector<FifoObject*> objects = impl_->objects;
     for (FifoObject* object : objects) {
-        Surface* surface = surface_from_id(object->surface);
+        Surface* surface = fifo_surface(object);
         if (surface != nullptr && surface->fifo_barrier() && !keep(*surface)) {
             surface->clear_fifo_barrier();
         }
