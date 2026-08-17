@@ -41,6 +41,7 @@ export import :idle_inhibit;
 export import :idle_notify;
 export import :input_event;
 export import :keymap;
+export import :layer;
 export import :layer_shell;
 export import :output;
 export import :output_global;
@@ -48,7 +49,9 @@ export import :output_layout;
 export import :pixel;
 export import :pixel_layout;
 export import :pointer_constraints;
+export import :popup;
 export import :presentation_time;
+
 export import :rect_fill;
 export import :region;
 export import :relative_pointer;

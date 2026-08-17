@@ -122,7 +122,9 @@ target("luminaria")
               "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
               "src/protocol/xdg_shell.cppm", {public = true})
     add_files("src/render/cursor_theme.cppm", "src/shell/cpu_compositor.cppm",
+              "src/shell/layer.cppm", "src/shell/popup.cppm",
               "src/shell/output_layout.cppm", "src/shell/scene.cppm", {public = true})
+
     -- for detail/wayland_fwd.h, included in the units' GMF
     add_includedirs("src", {public = true})
     add_packages(base_packages, {public = true})
