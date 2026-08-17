@@ -25,6 +25,7 @@ import std;
 import :client_buffer;
 import :display;
 import :expected;
+import :protocol_helper;
 
 export namespace luminaria {
 
@@ -78,10 +79,6 @@ struct SinglePixel final : ClientBuffer {
     }
 };
 
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void manager_create_u32_rgba_buffer(wl_client* client, wl_resource* manager, uint32_t id,
                                     uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
     wl_resource* resource = wl_resource_create(
@@ -101,30 +98,14 @@ void manager_create_u32_rgba_buffer(wl_client* client, wl_resource* manager, uin
 }
 
 constexpr struct wp_single_pixel_buffer_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .create_u32_rgba_buffer = manager_create_u32_rgba_buffer,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(
-        client, &wp_single_pixel_buffer_manager_v1_interface, static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
 struct SinglePixelBufferManager::Impl {
-    wl_global* global = nullptr;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
+    WlGlobal global;
 };
 
 SinglePixelBufferManager::SinglePixelBufferManager(std::unique_ptr<Impl> impl) noexcept
@@ -136,12 +117,13 @@ SinglePixelBufferManager& SinglePixelBufferManager::operator=(SinglePixelBufferM
 
 Result<SinglePixelBufferManager> SinglePixelBufferManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(),
-                                    &wp_single_pixel_buffer_manager_v1_interface, 1, impl.get(),
-                                    manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_single_pixel_buffer_manager_v1) failed");
+    auto global = create_wl_global<&wp_single_pixel_buffer_manager_v1_interface,
+                                   default_bind<&wp_single_pixel_buffer_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return SinglePixelBufferManager{std::move(impl)};
 }
 

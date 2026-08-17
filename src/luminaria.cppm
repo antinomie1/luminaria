@@ -54,6 +54,7 @@ export import :pointer;
 export import :pointer_constraints;
 export import :popup;
 export import :presentation_time;
+export import :protocol_helper;
 
 
 export import :rect_fill;

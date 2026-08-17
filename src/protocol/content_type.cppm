@@ -25,6 +25,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -69,10 +70,14 @@ namespace luminaria {
 
 namespace {
 
-// One wp_content_type_v1. Turns inert if its surface dies first.
-struct ContentTypeObject {
-    Surface* surface = nullptr;
-    Signal<SurfaceDestroy>::Connection on_surface_destroy;
+struct ContentTypeObject : SurfaceTracker {
+    using SurfaceTracker::SurfaceTracker;
+
+    ~ContentTypeObject() override {
+        if (surface != nullptr) {
+            surface->set_pending_content_type(WP_CONTENT_TYPE_V1_TYPE_NONE);
+        }
+    }
 };
 
 void ct_set_content_type(wl_client*, wl_resource* resource, uint32_t type) {
@@ -82,75 +87,28 @@ void ct_set_content_type(wl_client*, wl_resource* resource, uint32_t type) {
     }
 }
 
-void ct_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
-void ct_resource_destroy(wl_resource* resource) {
-    auto* object = static_cast<ContentTypeObject*>(wl_resource_get_user_data(resource));
-    // "The content type is reset to none" — but not until the next commit, like
-    // every other piece of surface state.
-    if (object->surface != nullptr) {
-        object->surface->set_pending_content_type(WP_CONTENT_TYPE_V1_TYPE_NONE);
-    }
-    delete object;
-}
-
 constexpr struct wp_content_type_v1_interface ct_impl = {
-    .destroy = ct_destroy_request,
+    .destroy = resource_destroy_request,
     .set_content_type = ct_set_content_type,
 };
 
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
-// No `already_constructed` error, for the reason tearing_control.cppm gives:
-// catching a duplicate needs a surface->object map that outlives the surface,
-// and a second object simply wins instead.
 void manager_get_surface_content_type(wl_client* client, wl_resource* manager, uint32_t id,
                                       wl_resource* surface_resource) {
     Surface* surface = surface_from_resource(surface_resource);
-    wl_resource* resource = wl_resource_create(client, &wp_content_type_v1_interface,
-                                               wl_resource_get_version(manager),
-                                               static_cast<int>(id));
-    if (resource == nullptr) {
-        wl_resource_post_no_memory(manager);
-        return;
-    }
-    auto* object = new ContentTypeObject{surface, {}};
-    if (surface != nullptr) {
-        object->on_surface_destroy =
-            surface->destroy.connect([object](SurfaceDestroy&) { object->surface = nullptr; });
-    }
-    wl_resource_set_implementation(resource, &ct_impl, object, ct_resource_destroy);
+    auto object = std::make_unique<ContentTypeObject>(surface);
+    create_user_resource<ContentTypeObject, &wp_content_type_v1_interface, &ct_impl>(
+        client, wl_resource_get_version(manager), id, std::move(object), manager);
 }
 
 constexpr struct wp_content_type_manager_v1_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_surface_content_type = manager_get_surface_content_type,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wp_content_type_manager_v1_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
 struct ContentTypeManager::Impl {
-    wl_global* global = nullptr;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
+    WlGlobal global;
 };
 
 ContentTypeManager::ContentTypeManager(std::unique_ptr<Impl> impl) noexcept
@@ -161,11 +119,13 @@ ContentTypeManager& ContentTypeManager::operator=(ContentTypeManager&&) noexcept
 
 Result<ContentTypeManager> ContentTypeManager::create(Display& display) {
     auto impl = std::make_unique<Impl>();
-    impl->global = wl_global_create(display.c_ptr(), &wp_content_type_manager_v1_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wp_content_type_manager_v1) failed");
+    auto global = create_wl_global<&wp_content_type_manager_v1_interface,
+                                   default_bind<&wp_content_type_manager_v1_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return ContentTypeManager{std::move(impl)};
 }
 
