@@ -296,8 +296,10 @@ void place_image_item(Frame& frame, VulkanRenderer& gpu, SceneImageCache& cache,
     }
     // Through the transform rather than the four-int overload: an image is a
     // single texture, which is the one placement `rounded()` applies to, and
-    // the bar is the caller who wants both.
-    frame.place(*cache.texture, effect_transform(item));
+    // the bar is the caller who wants both. The serial goes with it: the cache
+    // re-uploads in place, so the texture's address alone would tell the damage
+    // diff that a repainted bar is the picture already on screen.
+    frame.place(*cache.texture, effect_transform(item), item.serial);
 }
 
 /// Append one surface tree to the CPU draw list, and record every surface of it

@@ -103,6 +103,15 @@ struct Placement {
     /// this layer exists to not pay.
     std::uint32_t opaque_first = 0;
     std::uint32_t opaque_count = 0;
+
+    /// Which picture a compositor-owned texture is currently holding.
+    ///
+    /// The damage diff identifies a texture by its address, which is right for
+    /// a surface (a new buffer is a new texture) and wrong for a caller that
+    /// re-uploads new pixels into a texture it keeps — a bar redrawn for a
+    /// workspace switch is a different picture at the same address, and without
+    /// this the frame diffs as unchanged and the screen keeps the old one.
+    std::uint64_t content = 0;
 };
 
 /// A visual placement's transform. It is a small immutable value object so an
@@ -251,7 +260,12 @@ public:
 
     /// Place a compositor-owned texture through a composable crop / scale /
     /// move / opacity transform. Invalid or empty transforms draw nothing.
-    void place(const GpuTexture& texture, const PlacementTransform& transform);
+    ///
+    /// `content` names the picture the texture is holding, for a caller that
+    /// re-uploads into the same texture across frames: bump it and the damage
+    /// diff repaints, leave it and an unchanged texture still costs nothing.
+    void place(const GpuTexture& texture, const PlacementTransform& transform,
+               std::uint64_t content = 0);
 
     /// As above, but run `shader` as the fragment stage. The shader's mandatory
     /// ShaderDamage declaration controls full repaint and continuous frames.
@@ -576,6 +590,7 @@ struct FrSurfaceTexture {
 struct FrPlacementKey {
     SurfaceId surface;
     const GpuTexture* texture = nullptr;
+    std::uint64_t content = 0;
     std::uint64_t shader_id = 0;
     Box box{};
     Transform transform = Transform::normal;
@@ -590,7 +605,8 @@ struct FrPlacementKey {
     // Member and not a hidden friend: a defaulted hidden-friend operator== in a
     // module interface ICEs gcc 16.
     [[nodiscard]] bool operator==(const FrPlacementKey& other) const noexcept {
-        return surface == other.surface && texture == other.texture && shader_id == other.shader_id &&
+        return surface == other.surface && texture == other.texture &&
+               content == other.content && shader_id == other.shader_id &&
                box.x == other.box.x && box.y == other.box.y && box.width == other.box.width &&
                box.height == other.box.height && transform == other.transform &&
                u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1 &&
@@ -728,6 +744,7 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p, std::size_t placement) co
     // treating their texture as drawable here would manufacture output damage
     // beside the group's one final texture.
     key.texture = p.draw ? p.texture : nullptr;
+    key.content = p.draw ? p.content : 0;
     if (p.draw) {
         if (const Effect* effect = effect_at(placement); effect != nullptr) {
             key.shader_id = effect->id;
@@ -1226,7 +1243,8 @@ void Frame::place(const GpuTexture& texture, float x, float y, float width, floa
     place(texture, PlacementTransform::at(x, y, width, height).opacity(alpha));
 }
 
-void Frame::place(const GpuTexture& texture, const PlacementTransform& transform) {
+void Frame::place(const GpuTexture& texture, const PlacementTransform& transform,
+                  std::uint64_t content) {
     Impl& impl = *impl_;
     if (!std::isfinite(transform.x_) || !std::isfinite(transform.y_) ||
         !std::isfinite(transform.width_) || !std::isfinite(transform.height_) ||
@@ -1252,6 +1270,7 @@ void Frame::place(const GpuTexture& texture, const PlacementTransform& transform
     p.v1 = transform.v1_;
     p.alpha = transform.alpha_;
     p.corner_radius = transform.radius_;
+    p.content = content;
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
 }

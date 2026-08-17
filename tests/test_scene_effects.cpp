@@ -102,6 +102,32 @@ int main() {
         assert(at(px, 32, 9).r > 200);         // ... and along the top edge
     }
 
+    // --- an image that changed under a stable box ----------------------------
+    // The bar, and the bug it had: the caller re-uploads into the texture it
+    // keeps, so the placement is identical field for field while the picture is
+    // not. Identified by texture address alone, the frame diffs as unchanged
+    // and the screen keeps the old strip until something else damages it —
+    // which is why the serial is part of a placement's identity.
+    {
+        const luminaria::Box box{0, 0, 32, 32};
+        const auto paint = [&](luminaria::Pixel colour, std::uint64_t serial) {
+            const std::vector<luminaria::Pixel> px(static_cast<std::size_t>(32) * 32, colour);
+            const luminaria::SceneItem items[] = {
+                {.kind = luminaria::SceneItem::Kind::image,
+                 .box = box,
+                 .pixels = px,
+                 .serial = serial,
+                 .accepts_input = false},
+            };
+            assert(show(items).has_value());
+        };
+        paint({255, 0, 0, 255}, 1);
+        assert(at(output.last_frame(), 16, 16).r > 200);
+        paint({0, 0, 255, 255}, 2);
+        const luminaria::Pixel& now = at(output.last_frame(), 16, 16);
+        assert(now.b > 200 && now.r < 60);
+    }
+
     // --- shadow --------------------------------------------------------------
     // A feathered shadow under a small opaque rectangle reaches outside the
     // caster and fades. The caster is white so "the shadow is there" cannot be
