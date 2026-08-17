@@ -65,7 +65,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
-src/shell/               cpu_compositor frame output_layout direct_scanout
+src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
 src/xwayland/            `luminaria.xwayland`, the X11 bridge
 src/detail/wayland_fwd.h the one remaining header
@@ -230,12 +230,24 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   for the whole frame, by `Frame::send_frame_done(time_ms)`.
   Without a GPU the same immediate-mode list is composited on the CPU by
   `CpuCompositor` (`shell/cpu_compositor.cppm`, core module): surface trees (subsurface,
-  scale, transform, viewport) and `RectFill` solids over a background, premultiplied
-  source-over, into an RGBA buffer a headless/nested output can present. Its items are
-  `CpuItem = variant<RectFill, CpuView>` with generational ids; each `CpuView` carries a
-  device-space `clip` box (empty = whole framebuffer) that confines every surface of the
-  tree, so a tiler clips windows to their tiles without background-rect cleanup, and
-  non-Frame compositors release callbacks via the free `send_frame_done(ids, time_ms)`. `KeymapState`
+  scale, transform, viewport), `RectFill` solids and `CpuImage` blocks of compositor-owned
+  pixels over a background, premultiplied source-over, into an RGBA buffer a
+  headless/nested output can present. Its items are
+  `CpuItem = variant<RectFill, CpuView, CpuImage>` with generational ids; each `CpuView`
+  carries a device-space `clip` box (empty = whole framebuffer) that confines every surface
+  of the tree, so a tiler clips windows to their tiles without background-rect cleanup, and
+  non-Frame compositors release callbacks via the free `send_frame_done(ids, time_ms)`.
+  **Above both paths is the scene list.** `SceneItem` (`shell/scene.cppm`, core module) is
+  one ordered list of four primitives — client surface tree, solid rect, window border,
+  compositor-owned image — that `SceneRenderer` (`shell/scene_renderer.cppm`,
+  `luminaria.gpu`) feeds to whichever of `Frame` / `CpuCompositor` this machine has, and
+  that `scene_hit_test()` answers "what is under this point" from. It exists because the
+  alternative is every compositor built on this library implementing each primitive twice,
+  once as a `Placement` and once as a `CpuItem`, with nothing to catch the two drifting.
+  All three fallbacks are runtime — no Vulkan device, an output whose targets would not
+  allocate, `submit()` answering `Presented::fallback` — and all three land on the same CPU
+  arm. `SceneItem::tag` is the caller's own identity; luminaria never reads it and only
+  hands it back from a hit. `KeymapState`
   (`util/keymap.cppm`) is the shared RAII xkb wrapper both `LibinputBackend`
   (`keymap_state()`) and compositor shortcut handling read keysyms/modifiers from.
   `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits

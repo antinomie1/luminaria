@@ -75,9 +75,18 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   没有 Vulkan 时，同一套图元语义由 **CPU 合成器** 提供：`CpuCompositor`（核心模块，
   headless / 嵌套 / 测试通用）把一棵表面树（含 subsurface、buffer scale / transform /
   viewport）与 `RectFill` 纯色矩形按 z 序混合进 CPU RGBA buffer，预乘 alpha source-over。
-  它的图元列表 `CpuItem = variant<RectFill, CpuView>` 是立即模式的——每帧现搭、用完即弃，
-  身份是代际 `SurfaceId`，误留的列表只会解析失败、不会悬空。非 `Frame` 的混成器用自由函数
-  `send_frame_done(ids, time)` 批量答帧回调。
+  它的图元列表 `CpuItem = variant<RectFill, CpuView, CpuImage>` 是立即模式的——每帧现搭、
+  用完即弃，身份是代际 `SurfaceId`，误留的列表只会解析失败、不会悬空。非 `Frame` 的混成器用
+  自由函数 `send_frame_done(ids, time)` 批量答帧回调。
+
+  两条路径合起来还有第三样东西：**场景表**。`SceneItem`（`luminaria:scene`，核心模块）是一张
+  有序列表，四种图元——客户端表面树、纯色矩形、窗口边框、混成器自己的像素块——`SceneRenderer`
+  （`luminaria.gpu:scene_renderer`）拿它去喂 `Frame` 或 `CpuCompositor`，`scene_hit_test()`
+  拿同一张表回答"这个点上是什么"。这是为了让上层只写一遍：在它之前，每个基于本库的混成器都得
+  把每种图元实现两次（一次 `Placement`、一次 `CpuItem`），而且没有编译器会告诉你两边什么时候
+  开始不一致。降级也全在运行时——没有 Vulkan 设备、某个输出配不出渲染目标、`submit()` 答
+  `Presented::fallback`——三条都落到同一个 CPU 分支。`tag` 是调用方自己的身份，库不解释它，只
+  在命中时原样交还。
 
 ## 一帧长什么样
 
@@ -126,7 +135,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
-src/shell/               cpu_compositor frame output_layout direct_scanout
+src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
 src/protocol/            30 个 Wayland global，一个一文件
 src/xwayland/            `luminaria.xwayland`，X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件

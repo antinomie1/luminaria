@@ -52,6 +52,7 @@ export import :presentation_time;
 export import :rect_fill;
 export import :region;
 export import :relative_pointer;
+export import :scene;
 export import :seat;
 export import :signal;
 export import :single_pixel_buffer;

@@ -121,7 +121,7 @@ target("luminaria")
               "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
               "src/protocol/xdg_shell.cppm", {public = true})
     add_files("src/render/cursor_theme.cppm", "src/shell/cpu_compositor.cppm",
-              "src/shell/output_layout.cppm", {public = true})
+              "src/shell/output_layout.cppm", "src/shell/scene.cppm", {public = true})
     -- for detail/wayland_fwd.h, included in the units' GMF
     add_includedirs("src", {public = true})
     add_packages(base_packages, {public = true})
@@ -229,7 +229,8 @@ target("luminaria-gpu")
               "src/backend/libinput.cppm", "src/backend/session.cppm",
               "src/protocol/drm_syncobj.cppm", "src/protocol/linux_dmabuf.cppm",
               "src/protocol/screencopy.cppm", "src/render/vulkan.cppm",
-              "src/shell/direct_scanout.cppm", "src/shell/frame.cppm", {public = true})
+              "src/shell/direct_scanout.cppm", "src/shell/frame.cppm",
+              "src/shell/scene_renderer.cppm", {public = true})
     add_includedirs("src", "build/generated", {public = true})
     add_packages(gpu_packages, {public = true})
     on_load(function (target)

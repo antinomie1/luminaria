@@ -9,6 +9,7 @@ export import :drm_syncobj;
 export import :frame;
 export import :libinput;
 export import :linux_dmabuf;
+export import :scene_renderer;
 export import :screencopy;
 export import :session;
 export import :vulkan;
