@@ -102,8 +102,7 @@ private:
 namespace luminaria {
 
 struct ForeignToplevelManager::Impl {
-    wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     Signal<ForeignToplevelRequest> request;
     Signal<NewToplevel>::Connection new_toplevel_conn;
 
@@ -128,12 +127,6 @@ struct ForeignToplevelManager::Impl {
         std::map<Entry*, wl_resource*> handles;
     };
     std::vector<std::unique_ptr<Binding>> bindings;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 
     Entry* entry_for(const Toplevel* toplevel) {
         auto it = std::find_if(entries.begin(), entries.end(),
@@ -209,9 +202,6 @@ void handle_set_rectangle(wl_client*, wl_resource* resource, wl_resource*, int32
                                "set_rectangle: negative size");
     }
 }
-void handle_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void handle_set_fullscreen(wl_client*, wl_resource* resource, wl_resource* output) {
     emit(resource, ForeignToplevelRequest::Kind::fullscreen, nullptr, output);
 }
@@ -227,7 +217,7 @@ constexpr struct zwlr_foreign_toplevel_handle_v1_interface handle_impl = {
     .activate = handle_activate,
     .close = handle_close,
     .set_rectangle = handle_set_rectangle,
-    .destroy = handle_destroy_request,
+    .destroy = resource_destroy_request,
     .set_fullscreen = handle_set_fullscreen,
     .unset_fullscreen = handle_unset_fullscreen,
 };
@@ -445,13 +435,12 @@ ForeignToplevelManager& ForeignToplevelManager::operator=(ForeignToplevelManager
 
 Result<ForeignToplevelManager> ForeignToplevelManager::create(Display& display) {
     auto impl = std::make_unique<FtImpl>();
-    impl->display = display.c_ptr();
-    // Version 3: set_fullscreen (v2) and the parent event (v3).
-    impl->global = wl_global_create(impl->display, &zwlr_foreign_toplevel_manager_v1_interface, 3,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwlr_foreign_toplevel_manager_v1) failed");
+    auto global = create_wl_global<&zwlr_foreign_toplevel_manager_v1_interface, manager_bind>(
+        display, 3, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return ForeignToplevelManager{std::move(impl)};
 }
 

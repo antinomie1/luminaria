@@ -42,6 +42,7 @@ import :box;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :seat;
 import :signal;
 
@@ -228,7 +229,7 @@ namespace luminaria {
 class TextInputImpl;
 
 struct TextInputManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     Seat* seat = nullptr;
     std::vector<TextInputImpl*> text_inputs;
     Surface* focus = nullptr;
@@ -247,12 +248,6 @@ struct TextInputManager::Impl {
     /// The focused surface is going away. Same bookkeeping, no `leave` event.
     void drop_focus_silently();
     void leave_all(Surface& surface, bool send_event);
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using TiMgr = TextInputManager::Impl;
@@ -392,10 +387,6 @@ bool focused(wl_resource* resource) {
     return text_input_of(resource)->focus_ != nullptr;
 }
 
-void text_input_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void text_input_enable(wl_client*, wl_resource* resource) {
     if (!focused(resource)) {
         return;
@@ -461,7 +452,7 @@ void text_input_commit(wl_client*, wl_resource* resource) {
 }
 
 constexpr struct zwp_text_input_v3_interface text_input_impl = {
-    .destroy = text_input_destroy_request,
+    .destroy = resource_destroy_request,
     .enable = text_input_enable,
     .disable = text_input_disable,
     .set_surrounding_text = text_input_set_surrounding_text,
@@ -477,10 +468,6 @@ void text_input_resource_destroy(wl_resource* resource) {
     ti->destroy.emit(event);
     std::erase(ti->mgr_->text_inputs, ti);
     delete ti;
-}
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 
 void manager_get_text_input(wl_client* client, wl_resource* manager_resource, uint32_t id,
@@ -510,19 +497,9 @@ void manager_get_text_input(wl_client* client, wl_resource* manager_resource, ui
 }
 
 constexpr struct zwp_text_input_manager_v3_interface manager_impl = {
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
     .get_text_input = manager_get_text_input,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zwp_text_input_manager_v3_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -582,11 +559,13 @@ TextInputManager& TextInputManager::operator=(TextInputManager&&) noexcept = def
 Result<TextInputManager> TextInputManager::create(Display& display, Seat& seat) {
     auto impl = std::make_unique<Impl>();
     impl->seat = &seat;
-    impl->global = wl_global_create(display.c_ptr(), &zwp_text_input_manager_v3_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_text_input_manager_v3) failed");
+    auto global = create_wl_global<&zwp_text_input_manager_v3_interface,
+                                   default_bind<&zwp_text_input_manager_v3_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     Impl* raw = impl.get();
     impl->focus_conn = seat.keyboard_focus_changed().connect(
         [raw](SeatKeyboardFocus& e) { raw->set_focus(surface_from_id(e.surface)); });

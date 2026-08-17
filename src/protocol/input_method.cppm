@@ -183,7 +183,7 @@ class GrabImpl;
 class PopupImpl;
 
 struct InputMethodManager::Impl {
-    wl_global* global = nullptr;
+    WlGlobal global;
     wl_display* display = nullptr;
     Seat* seat = nullptr;
     TextInputManager* text_inputs = nullptr;
@@ -198,12 +198,6 @@ struct InputMethodManager::Impl {
     /// Copy the focused text input's state to the input method and send `done`.
     void push_state(bool activating);
     void deactivate();
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using ImMgr = InputMethodManager::Impl;
@@ -295,12 +289,8 @@ TextInput* target(ImMgr* mgr) {
 
 // --- zwp_input_method_keyboard_grab_v2 ---
 
-void grab_release(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct zwp_input_method_keyboard_grab_v2_interface grab_impl = {
-    .release = grab_release,
+    .release = resource_destroy_request,
 };
 
 void grab_resource_destroy(wl_resource* resource) {
@@ -338,12 +328,8 @@ void send_keymap(ImMgr* mgr, wl_resource* grab) {
 
 // --- zwp_input_popup_surface_v2 ---
 
-void popup_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct zwp_input_popup_surface_v2_interface popup_impl = {
-    .destroy = popup_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 void popup_resource_destroy(wl_resource* resource) {
@@ -421,11 +407,15 @@ void im_get_input_popup_surface(wl_client* client, wl_resource* resource, uint32
     im->new_popup_surface.emit(event);
 }
 
-void im_grab_keyboard(wl_client* client, wl_resource* resource, uint32_t keyboard) {
+void im_grab_keyboard(wl_client* client, wl_resource* resource, uint32_t id) {
     auto* im = static_cast<InputMethodImpl*>(wl_resource_get_user_data(resource));
+    if (im->grab_ != nullptr) {
+        wl_resource_post_error(resource, 0, "keyboard already grabbed");
+        return;
+    }
     wl_resource* grab_resource =
         wl_resource_create(client, &zwp_input_method_keyboard_grab_v2_interface,
-                           wl_resource_get_version(resource), static_cast<int>(keyboard));
+                           wl_resource_get_version(resource), static_cast<int>(id));
     if (grab_resource == nullptr) {
         wl_resource_post_no_memory(resource);
         return;
@@ -436,10 +426,6 @@ void im_grab_keyboard(wl_client* client, wl_resource* resource, uint32_t keyboar
     im->set_grab(grab);
 }
 
-void im_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct zwp_input_method_v2_interface im_impl = {
     .commit_string = im_commit_string,
     .set_preedit_string = im_set_preedit_string,
@@ -447,7 +433,7 @@ constexpr struct zwp_input_method_v2_interface im_impl = {
     .commit = im_commit,
     .get_input_popup_surface = im_get_input_popup_surface,
     .grab_keyboard = im_grab_keyboard,
-    .destroy = im_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 void im_resource_destroy(wl_resource* resource) {
@@ -469,10 +455,6 @@ void im_resource_destroy(wl_resource* resource) {
 }
 
 // --- zwp_input_method_manager_v2 ---
-
-void manager_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void manager_get_input_method(wl_client* client, wl_resource* manager, wl_resource*,
                               uint32_t input_method) {
@@ -504,18 +486,8 @@ void manager_get_input_method(wl_client* client, wl_resource* manager, wl_resour
 
 constexpr struct zwp_input_method_manager_v2_interface manager_impl = {
     .get_input_method = manager_get_input_method,
-    .destroy = manager_destroy_request,
+    .destroy = resource_destroy_request,
 };
-
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &zwp_input_method_manager_v2_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -574,11 +546,13 @@ Result<InputMethodManager> InputMethodManager::create(Display& display, Seat& se
     impl->display = display.c_ptr();
     impl->seat = &seat;
     impl->text_inputs = &text_inputs;
-    impl->global = wl_global_create(display.c_ptr(), &zwp_input_method_manager_v2_interface, 1,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_input_method_manager_v2) failed");
+    auto global = create_wl_global<&zwp_input_method_manager_v2_interface,
+                                   default_bind<&zwp_input_method_manager_v2_interface,
+                                                &manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
 
     // Every text input, present and future, is watched: which one is focused
     // changes under us, and the input method only ever hears about that one.

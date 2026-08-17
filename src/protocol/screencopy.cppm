@@ -162,12 +162,12 @@ struct ScreencopyManager::Impl {
     std::vector<ExtCursorSession*> cursor_sessions; // live, weak; each unregisters itself
 
     // wlr-screencopy globals
-    wl_global* wlr_manager_global = nullptr;
+    WlGlobal wlr_manager_global;
 
     // ext-image-copy-capture global
-    wl_global* ext_copy_capture_global = nullptr;
+    WlGlobal ext_copy_capture_global;
     // ext-image-capture-source globals
-    wl_global* ext_source_output_manager_global = nullptr;
+    WlGlobal ext_source_output_manager_global;
 
     std::vector<OutputEntry> outputs;
 
@@ -179,12 +179,6 @@ struct ScreencopyManager::Impl {
             }
         }
         return nullptr;
-    }
-
-    ~Impl() {
-        if (wlr_manager_global) wl_global_destroy(wlr_manager_global);
-        if (ext_copy_capture_global) wl_global_destroy(ext_copy_capture_global);
-        if (ext_source_output_manager_global) wl_global_destroy(ext_source_output_manager_global);
     }
 };
 
@@ -207,10 +201,6 @@ struct WlrFrame {
         // Resource is destroyed by libwayland; just clean up pointers.
     }
 };
-
-void wlr_frame_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 /// Write tightly-packed RGBA8 into the shm buffer. The shm buffer has stride
 /// `shm_stride` bytes per row, format WL_SHM_FORMAT_ARGB8888.
@@ -405,7 +395,7 @@ void wlr_frame_copy_with_damage(wl_client*, wl_resource* resource, wl_resource* 
 
 constexpr struct zwlr_screencopy_frame_v1_interface wlr_frame_impl = {
     .copy = wlr_frame_copy,
-    .destroy = wlr_frame_destroy_request,
+    .destroy = resource_destroy_request,
     .copy_with_damage = wlr_frame_copy_with_damage,
 };
 
@@ -599,9 +589,6 @@ void ext_frame_forget_buffer(wl_listener* listener, void*) {
     wl_list_init(&f->buffer_destroy.link); // libwayland already unlinked it
 }
 
-void ext_frame_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void ext_frame_attach_buffer(wl_client*, wl_resource* resource, wl_resource* buffer) {
     auto* f = static_cast<ExtFrame*>(wl_resource_get_user_data(resource));
@@ -709,7 +696,7 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
 }
 
 constexpr struct ext_image_copy_capture_frame_v1_interface ext_frame_impl = {
-    .destroy = ext_frame_destroy_request,
+    .destroy = resource_destroy_request,
     .attach_buffer = ext_frame_attach_buffer,
     .damage_buffer = ext_frame_damage_buffer,
     .capture = ext_frame_capture,
@@ -727,10 +714,6 @@ struct ExtSession {
     ExtCursorSession* cursor = nullptr;
     bool stopped = false;
 };
-
-void ext_session_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 void ext_session_create_frame(wl_client* client, wl_resource* session_resource, uint32_t id) {
     auto* s = static_cast<ExtSession*>(wl_resource_get_user_data(session_resource));
@@ -754,7 +737,7 @@ void ext_session_create_frame(wl_client* client, wl_resource* session_resource, 
 
 constexpr struct ext_image_copy_capture_session_v1_interface ext_session_impl = {
     .create_frame = ext_session_create_frame,
-    .destroy = ext_session_destroy_request,
+    .destroy = resource_destroy_request,
 };
 
 void ext_session_resource_destroy(wl_resource* resource) {
@@ -859,10 +842,6 @@ void ext_cursor_refresh(ExtCursorSession& cs) {
     }
 }
 
-void ext_cursor_session_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 void ext_cursor_session_get_capture_session(wl_client* client, wl_resource* resource, uint32_t id) {
     auto* cs = static_cast<ExtCursorSession*>(wl_resource_get_user_data(resource));
     if (cs->inner != nullptr) {
@@ -904,7 +883,7 @@ void ext_cursor_session_get_capture_session(wl_client* client, wl_resource* reso
 }
 
 constexpr struct ext_image_copy_capture_cursor_session_v1_interface ext_cursor_session_impl = {
-    .destroy = ext_cursor_session_destroy_request,
+    .destroy = resource_destroy_request,
     .get_capture_session = ext_cursor_session_get_capture_session,
 };
 
@@ -946,14 +925,10 @@ void ext_manager_create_pointer_cursor_session(wl_client* client, wl_resource* m
     ext_cursor_refresh(*cs);
 }
 
-void ext_manager_destroy(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct ext_image_copy_capture_manager_v1_interface ext_manager_impl = {
     .create_session = ext_manager_create_session,
     .create_pointer_cursor_session = ext_manager_create_pointer_cursor_session,
-    .destroy = ext_manager_destroy,
+    .destroy = resource_destroy_request,
 };
 
 void ext_manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
@@ -990,18 +965,14 @@ void ext_source_manager_create_source(wl_client* client, wl_resource* mgr_resour
     // Store the OutputEntry pointer as user_data so the copy-capture manager
     // can resolve it later. Provide a minimal implementation so destroy works.
     static constexpr struct ext_image_capture_source_v1_interface source_impl = {
-        .destroy = [](wl_client*, wl_resource* r) { wl_resource_destroy(r); },
+        .destroy = resource_destroy_request,
     };
     wl_resource_set_implementation(source_res, &source_impl, out, nullptr);
 }
 
-void ext_source_manager_destroy(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct ext_output_image_capture_source_manager_v1_interface ext_source_manager_impl = {
     .create_source = ext_source_manager_create_source,
-    .destroy = ext_source_manager_destroy,
+    .destroy = resource_destroy_request,
 };
 
 void ext_source_manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
@@ -1032,28 +1003,28 @@ Result<ScreencopyManager> ScreencopyManager::create(Display& display) {
 
     // wlr-screencopy-unstable-v1 (version 3: shm + dmabuf info, but we only
     // actually support shm for now).
-    impl->wlr_manager_global = wl_global_create(impl->display,
-                                                  &zwlr_screencopy_manager_v1_interface, 3,
-                                                  impl.get(), wlr_manager_bind);
-    if (!impl->wlr_manager_global) {
-        return fail("wl_global_create(zwlr_screencopy_manager_v1) failed");
+    auto global1 = create_wl_global<&zwlr_screencopy_manager_v1_interface, wlr_manager_bind>(
+        display, 3, impl.get());
+    if (!global1) {
+        return fail(std::move(global1.error().message));
     }
+    impl->wlr_manager_global = std::move(*global1);
 
     // ext-image-copy-capture-v1
-    impl->ext_copy_capture_global = wl_global_create(impl->display,
-                                                       &ext_image_copy_capture_manager_v1_interface,
-                                                       1, impl.get(), ext_manager_bind);
-    if (!impl->ext_copy_capture_global) {
-        return fail("wl_global_create(ext_image_copy_capture_manager_v1) failed");
+    auto global2 = create_wl_global<&ext_image_copy_capture_manager_v1_interface, ext_manager_bind>(
+        display, 1, impl.get());
+    if (!global2) {
+        return fail(std::move(global2.error().message));
     }
+    impl->ext_copy_capture_global = std::move(*global2);
 
     // ext-output-image-capture-source-manager-v1
-    impl->ext_source_output_manager_global = wl_global_create(
-        impl->display, &ext_output_image_capture_source_manager_v1_interface,
-        1, impl.get(), ext_source_manager_bind);
-    if (!impl->ext_source_output_manager_global) {
-        return fail("wl_global_create(ext_output_image_capture_source_manager_v1) failed");
+    auto global3 = create_wl_global<&ext_output_image_capture_source_manager_v1_interface, ext_source_manager_bind>(
+        display, 1, impl.get());
+    if (!global3) {
+        return fail(std::move(global3.error().message));
     }
+    impl->ext_source_output_manager_global = std::move(*global3);
 
     return ScreencopyManager{std::move(impl)};
 }

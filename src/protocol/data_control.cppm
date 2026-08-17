@@ -108,7 +108,7 @@ class ControlSource;
 
 struct DataControlManager::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     DataDeviceManager* data_device = nullptr;
     PrimarySelectionManager* primary = nullptr;
 
@@ -130,9 +130,6 @@ struct DataControlManager::Impl {
             if (auto* o = static_cast<ControlOffer*>(wl_resource_get_user_data(r))) {
                 o->mgr = nullptr;
             }
-        }
-        if (global != nullptr) {
-            wl_global_destroy(global);
         }
         if (display != nullptr && filter) {
             wl_display_set_global_filter(display, nullptr, nullptr);
@@ -178,9 +175,6 @@ ControlSource* source_of(wl_resource* r) {
     return static_cast<ControlSource*>(wl_resource_get_user_data(r));
 }
 
-void generic_destroy(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 
 // ---- zwlr_data_control_offer_v1 ----
 void offer_receive(wl_client*, wl_resource* resource, const char* mime, int32_t fd) {
@@ -205,7 +199,7 @@ void offer_receive(wl_client*, wl_resource* resource, const char* mime, int32_t 
 
 constexpr struct zwlr_data_control_offer_v1_interface offer_impl = {
     .receive = offer_receive,
-    .destroy = generic_destroy,
+    .destroy = resource_destroy_request,
 };
 
 void offer_resource_destroy(wl_resource* resource) {
@@ -226,7 +220,7 @@ void source_offer(wl_client*, wl_resource* resource, const char* mime) {
 
 constexpr struct zwlr_data_control_source_v1_interface source_impl = {
     .offer = source_offer,
-    .destroy = generic_destroy,
+    .destroy = resource_destroy_request,
 };
 
 void source_resource_destroy(wl_resource* resource) {
@@ -320,7 +314,7 @@ void device_set_primary_selection(wl_client*, wl_resource* resource,
                                   wl_resource* source_resource) {
     auto* mgr = static_cast<DcMgr*>(wl_resource_get_user_data(resource));
     if (mgr->primary == nullptr) {
-        return;
+        return; // bound at v1, ignore
     }
     if (source_resource == nullptr) {
         mgr->primary->set_selection(nullptr);
@@ -338,7 +332,7 @@ void device_set_primary_selection(wl_client*, wl_resource* resource,
 
 constexpr struct zwlr_data_control_device_v1_interface device_impl = {
     .set_selection = device_set_selection,
-    .destroy = generic_destroy,
+    .destroy = resource_destroy_request,
     .set_primary_selection = device_set_primary_selection,
 };
 
@@ -387,7 +381,7 @@ void manager_get_data_device(wl_client* client, wl_resource* manager_resource, u
 constexpr struct zwlr_data_control_manager_v1_interface manager_impl = {
     .create_data_source = manager_create_data_source,
     .get_data_device = manager_get_data_device,
-    .destroy = generic_destroy,
+    .destroy = resource_destroy_request,
 };
 
 void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
@@ -402,7 +396,7 @@ void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) 
 
 bool global_filter(const wl_client* client, const wl_global* global, void* data) {
     auto* mgr = static_cast<DcMgr*>(data);
-    if (global != mgr->global) {
+    if (global != mgr->global.get()) {
         return true; // not ours; every other global is none of our business
     }
     return mgr->filter(const_cast<wl_client*>(client));
@@ -426,11 +420,12 @@ Result<DataControlManager> DataControlManager::create(Display& display,
     // Version 2 is what adds the primary selection; advertising it without one
     // would promise a clipboard we cannot deliver.
     const uint32_t version = primary != nullptr ? 2 : 1;
-    impl->global = wl_global_create(impl->display, &zwlr_data_control_manager_v1_interface,
-                                    static_cast<int>(version), impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwlr_data_control_manager_v1) failed");
+    auto global = create_wl_global<&zwlr_data_control_manager_v1_interface, manager_bind>(
+        display, version, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
 
     Impl* raw = impl.get();
     impl->selection_conn = data_device.selection_changed().connect(
