@@ -29,6 +29,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :seat;
 import :signal;
 
@@ -157,7 +158,7 @@ struct Offer;
 
 struct DataDeviceManager::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     Seat* seat = nullptr;
 
     std::vector<wl_resource*> devices; // every bound wl_data_device
@@ -177,12 +178,6 @@ struct DataDeviceManager::Impl {
     SurfaceId drag_focus;              // surface under the cursor
     wl_resource* drag_offer = nullptr; // offer handed to drag_focus's client
     Signal<SurfaceInvalidated>::Connection surface_invalidated_conn;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using DdMgr = DataDeviceManager::Impl;
@@ -254,9 +249,6 @@ void offer_receive(wl_client*, wl_resource* resource, const char* mime, int32_t 
     }
     close(fd);
 }
-void offer_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void offer_finish(wl_client*, wl_resource* resource) {
     Offer* offer = offer_of(resource);
     if (offer->source != nullptr && offer->source->external == nullptr && offer->is_drag &&
@@ -290,7 +282,7 @@ void offer_set_actions(wl_client*, wl_resource* resource, uint32_t actions,
 constexpr struct wl_data_offer_interface offer_impl = {
     .accept = offer_accept,
     .receive = offer_receive,
-    .destroy = offer_destroy_request,
+    .destroy = resource_destroy_request,
     .finish = offer_finish,
     .set_actions = offer_set_actions,
 };
@@ -383,15 +375,12 @@ void source_offer(wl_client*, wl_resource* resource, const char* mime) {
         source_of(resource)->mimes.emplace_back(mime);
     }
 }
-void source_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void source_set_actions(wl_client*, wl_resource* resource, uint32_t actions) {
     source_of(resource)->dnd_actions = actions;
 }
 constexpr struct wl_data_source_interface source_impl = {
     .offer = source_offer,
-    .destroy = source_destroy_request,
+    .destroy = resource_destroy_request,
     .set_actions = source_set_actions,
 };
 void source_resource_destroy(wl_resource* resource) {
@@ -554,14 +543,10 @@ void device_set_selection(wl_client*, wl_resource* resource, wl_resource* source
     apply_selection(mgr, source_resource != nullptr ? source_of(source_resource) : nullptr);
 }
 
-void device_release(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
-
 constexpr struct wl_data_device_interface device_impl = {
     .start_drag = device_start_drag,
     .set_selection = device_set_selection,
-    .release = device_release,
+    .release = resource_destroy_request,
 };
 
 void device_resource_destroy(wl_resource* resource) {
@@ -607,16 +592,6 @@ constexpr struct wl_data_device_manager_interface manager_impl = {
     .get_data_device = manager_get_data_device,
 };
 
-void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &wl_data_device_manager_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &manager_impl, data, nullptr);
-}
-
 } // namespace
 
 DataDeviceManager::DataDeviceManager(std::unique_ptr<Impl> impl) noexcept
@@ -629,11 +604,13 @@ Result<DataDeviceManager> DataDeviceManager::create(Display& display, Seat& seat
     auto impl = std::make_unique<Impl>();
     impl->display = display.c_ptr();
     impl->seat = &seat;
-    impl->global = wl_global_create(impl->display, &wl_data_device_manager_interface, 3,
-                                    impl.get(), manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(wl_data_device_manager) failed");
+    auto global = create_wl_global<&wl_data_device_manager_interface,
+                                   default_bind<&wl_data_device_manager_interface,
+                                                &manager_impl>>(display, 3, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     Impl* raw = impl.get();
     impl->focus_conn = seat.keyboard_focus_changed().connect([raw](SeatKeyboardFocus& e) {
         // The clipboard follows keyboard focus: the newly focused client is the
@@ -712,7 +689,7 @@ struct PrimaryOffer;
 
 struct PrimarySelectionManager::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     Seat* seat = nullptr;
     std::vector<wl_resource*> devices;
     Signal<SeatKeyboardFocus>::Connection focus_conn;
@@ -721,12 +698,6 @@ struct PrimarySelectionManager::Impl {
     PrimarySource* external_selection = nullptr;
     Signal<SelectionChange> selection_changed;
     const std::vector<std::string> no_mimes;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 using PrimaryMgr = PrimarySelectionManager::Impl;
@@ -776,12 +747,9 @@ void primary_offer_receive(wl_client*, wl_resource* resource, const char* mime, 
     }
     close(fd);
 }
-void primary_generic_destroy(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 constexpr struct zwp_primary_selection_offer_v1_interface primary_offer_impl = {
     .receive = primary_offer_receive,
-    .destroy = primary_generic_destroy,
+    .destroy = resource_destroy_request,
 };
 void primary_offer_resource_destroy(wl_resource* resource) {
     PrimaryOffer* offer = primary_offer_of(resource);
@@ -832,7 +800,7 @@ void primary_source_offer(wl_client*, wl_resource* resource, const char* mime) {
 }
 constexpr struct zwp_primary_selection_source_v1_interface primary_source_impl = {
     .offer = primary_source_offer,
-    .destroy = primary_generic_destroy,
+    .destroy = resource_destroy_request,
 };
 void primary_source_resource_destroy(wl_resource* resource) {
     PrimarySource* source = primary_source_of(resource);
@@ -877,7 +845,7 @@ void primary_device_set_selection(wl_client*, wl_resource* resource, wl_resource
 }
 constexpr struct zwp_primary_selection_device_v1_interface primary_device_impl = {
     .set_selection = primary_device_set_selection,
-    .destroy = primary_generic_destroy,
+    .destroy = resource_destroy_request,
 };
 void primary_device_resource_destroy(wl_resource* resource) {
     auto* mgr = static_cast<PrimaryMgr*>(wl_resource_get_user_data(resource));
@@ -921,19 +889,8 @@ void primary_manager_get_device(wl_client* client, wl_resource* resource, uint32
 constexpr struct zwp_primary_selection_device_manager_v1_interface primary_manager_impl = {
     .create_source = primary_manager_create_source,
     .get_device = primary_manager_get_device,
-    .destroy = primary_generic_destroy,
+    .destroy = resource_destroy_request,
 };
-
-void primary_manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource =
-        wl_resource_create(client, &zwp_primary_selection_device_manager_v1_interface,
-                           static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &primary_manager_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -948,12 +905,13 @@ Result<PrimarySelectionManager> PrimarySelectionManager::create(Display& display
     auto impl = std::make_unique<Impl>();
     impl->display = display.c_ptr();
     impl->seat = &seat;
-    impl->global =
-        wl_global_create(impl->display, &zwp_primary_selection_device_manager_v1_interface, 1,
-                         impl.get(), primary_manager_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(zwp_primary_selection_device_manager_v1) failed");
+    auto global = create_wl_global<&zwp_primary_selection_device_manager_v1_interface,
+                                   default_bind<&zwp_primary_selection_device_manager_v1_interface,
+                                                &primary_manager_impl>>(display, 1, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     Impl* raw = impl.get();
     impl->focus_conn = seat.keyboard_focus_changed().connect([raw](SeatKeyboardFocus& e) {
         if (Surface* surface = surface_from_id(e.surface); surface != nullptr) {
