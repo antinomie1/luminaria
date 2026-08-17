@@ -29,6 +29,7 @@ import :box;
 import :compositor;
 import :display;
 import :expected;
+import :protocol_helper;
 import :signal;
 
 export namespace luminaria {
@@ -296,18 +297,12 @@ namespace luminaria {
 
 struct XdgShell::Impl {
     wl_display* display = nullptr;
-    wl_global* global = nullptr;
+    WlGlobal global;
     Signal<NewToplevel> new_toplevel;
     Signal<NewPopup> new_popup;
     int bounds_width = 0;
     int bounds_height = 0;
     XdgShell::PopupConstraintQuery constraint_query;
-
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
 };
 
 namespace {
@@ -833,9 +828,6 @@ void on_surface_commit(XdgSurface* xs) {
 ToplevelImpl* toplevel_of(wl_resource* resource) {
     return static_cast<ToplevelImpl*>(wl_resource_get_user_data(resource));
 }
-void toplevel_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 // Transient-for. The shell tracks the relationship (and keeps it consistent
 // when either window dies); stacking and centring are the compositor's call, so
 // it hears about it through the signal.
@@ -927,7 +919,7 @@ void tl_set_minimized(wl_client*, wl_resource* resource) {
     }
 }
 constexpr struct xdg_toplevel_interface toplevel_impl = {
-    .destroy = toplevel_destroy_request,
+    .destroy = resource_destroy_request,
     .set_parent = tl_set_parent,
     .set_title = tl_set_title,
     .set_app_id = tl_set_app_id,
@@ -960,9 +952,6 @@ void toplevel_resource_destroy(wl_resource* resource) {
 // ---- xdg_positioner ----
 Positioner* positioner_of(wl_resource* resource) {
     return static_cast<Positioner*>(wl_resource_get_user_data(resource));
-}
-void generic_destroy(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 void pos_set_size(wl_client*, wl_resource* resource, int32_t width, int32_t height) {
     if (width < 1 || height < 1) {
@@ -1010,7 +999,7 @@ void pos_set_parent_configure(wl_client*, wl_resource* resource, uint32_t serial
     positioner_of(resource)->parent_configure = serial;
 }
 constexpr struct xdg_positioner_interface positioner_impl = {
-    .destroy = generic_destroy,
+    .destroy = resource_destroy_request,
     .set_size = pos_set_size,
     .set_anchor_rect = pos_set_anchor_rect,
     .set_anchor = pos_set_anchor,
@@ -1028,9 +1017,6 @@ void positioner_resource_destroy(wl_resource* resource) {
 // ---- xdg_popup requests ----
 PopupImpl* popup_of(wl_resource* resource) {
     return static_cast<PopupImpl*>(wl_resource_get_user_data(resource));
-}
-void popup_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 void popup_grab(wl_client*, wl_resource* resource, wl_resource*, uint32_t serial) {
     PopupImpl* popup = popup_of(resource);
@@ -1051,7 +1037,7 @@ void popup_reposition(wl_client*, wl_resource* resource, wl_resource* positioner
     popup->reposition.emit(event);
 }
 constexpr struct xdg_popup_interface popup_impl = {
-    .destroy = popup_destroy_request,
+    .destroy = resource_destroy_request,
     .grab = popup_grab,
     .reposition = popup_reposition,
 };
@@ -1076,9 +1062,6 @@ void popup_resource_destroy(wl_resource* resource) {
 // ---- xdg_surface ----
 XdgSurface* xdg_surface_of(wl_resource* resource) {
     return static_cast<XdgSurface*>(wl_resource_get_user_data(resource));
-}
-void xdg_surface_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
 }
 void xdg_surface_get_toplevel(wl_client* client, wl_resource* resource, uint32_t id) {
     auto* xs = xdg_surface_of(resource);
@@ -1165,7 +1148,7 @@ void xdg_surface_ack_configure(wl_client*, wl_resource* resource, uint32_t seria
     xdg_surface_of(resource)->last_acked = serial;
 }
 constexpr struct xdg_surface_interface xdg_surface_impl = {
-    .destroy = xdg_surface_destroy_request,
+    .destroy = resource_destroy_request,
     .get_toplevel = xdg_surface_get_toplevel,
     .get_popup = xdg_surface_get_popup,
     .set_window_geometry = xdg_surface_set_window_geometry,
@@ -1191,9 +1174,6 @@ void xdg_surface_resource_destroy(wl_resource* resource) {
 }
 
 // ---- xdg_wm_base ----
-void wm_base_destroy_request(wl_client*, wl_resource* resource) {
-    wl_resource_destroy(resource);
-}
 void wm_base_get_xdg_surface(wl_client* client, wl_resource* wm_resource, uint32_t id,
                              wl_resource* surface_resource) {
     auto* shell = static_cast<XdgShell::Impl*>(wl_resource_get_user_data(wm_resource));
@@ -1225,21 +1205,11 @@ void wm_base_create_positioner(wl_client* client, wl_resource* resource, uint32_
 }
 void wm_base_pong(wl_client*, wl_resource*, uint32_t) {}
 constexpr struct xdg_wm_base_interface wm_base_impl = {
-    .destroy = wm_base_destroy_request,
+    .destroy = resource_destroy_request,
     .create_positioner = wm_base_create_positioner,
     .get_xdg_surface = wm_base_get_xdg_surface,
     .pong = wm_base_pong,
 };
-
-void wm_base_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
-    wl_resource* resource = wl_resource_create(client, &xdg_wm_base_interface,
-                                               static_cast<int>(version), id);
-    if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    wl_resource_set_implementation(resource, &wm_base_impl, data, nullptr);
-}
 
 } // namespace
 
@@ -1253,11 +1223,13 @@ Result<XdgShell> XdgShell::create(Display& display) {
     impl->display = display.c_ptr();
     // Version 5: popups with reposition (v3), configure_bounds (v4),
     // wm_capabilities (v5). Every request slot up to here is implemented.
-    impl->global = wl_global_create(impl->display, &xdg_wm_base_interface, 5, impl.get(),
-                                    wm_base_bind);
-    if (impl->global == nullptr) {
-        return fail("wl_global_create(xdg_wm_base) failed");
+    auto global = create_wl_global<&xdg_wm_base_interface,
+                                   default_bind<&xdg_wm_base_interface,
+                                                &wm_base_impl>>(display, 5, impl.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
     }
+    impl->global = std::move(*global);
     return XdgShell{std::move(impl)};
 }
 
