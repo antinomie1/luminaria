@@ -13,7 +13,9 @@ module;
 #include <drm_fourcc.h>
 #include <vulkan/vulkan_raii.hpp>
 #include "quad_frag_spv.h"
+#include "rounded_frag_spv.h"
 #include "quad_vert_spv.h"
+#include "shadow_frag_spv.h"
 #include "solid_frag_spv.h"
 
 export module luminaria.gpu:vulkan;
@@ -256,6 +258,22 @@ struct GpuTextureFill {
     /// behind it (correct, and cheaper than the alternative).
     bool solid = false;
     Color color{};
+
+    /// Rounded corners, radius in LOGICAL pixels, clamped to half the shorter
+    /// side. The corner is cut out of this quad rather than painted over,
+    /// because painting over it would need to know what is behind it. Anything
+    /// above 0 also makes `opaque` a lie at the corners — declare the opaque
+    /// region without them, which is what its own note is about.
+    float corner_radius = 0.0f;
+
+    /// Solid fills only: turns the rectangle into a drop shadow that fades out
+    /// over `feather` logical pixels *outside* it, following `corner_radius`.
+    /// The quad the renderer draws is grown by that much on every side, so pass
+    /// the box that casts the shadow, not the area it covers.
+    ///
+    /// The silhouette is analytic — no blur pass, no extra target. Blurring a
+    /// shape that is already in closed form buys nothing.
+    float feather = 0.0f;
 };
 
 /// How an output's logical coordinates map onto its framebuffer: the integer
@@ -502,7 +520,9 @@ struct QuadPipeline {
     vk::raii::RenderPass load_pass;  // partial repaint: keep what is there
     vk::raii::RenderPass clear_pass; // full repaint: contents are undefined
     vk::raii::Pipeline pipeline;
-    vk::raii::Pipeline solid; // solid-colour quads: no descriptor binding
+    vk::raii::Pipeline solid;   // solid-colour quads: no descriptor binding
+    vk::raii::Pipeline rounded; // ... with the corners cut out
+    vk::raii::Pipeline shadow;  // solid, faded by the distance to a rounded box
 };
 
 /// Renderer-owned so a pipeline cannot die while an asynchronous submit still
@@ -1707,17 +1727,32 @@ struct QuadPush {
     float uv01[4];
     float uv23[4];
     float alpha;
+    // GLSL aligns the vec4s below to 16 bytes, so this padding is part of the
+    // ABI rather than an accident of the struct. A custom fragment shader that
+    // declares the block only as far as `alpha` stays byte-for-byte compatible,
+    // which is the whole reason the new fields are appended instead of woven in.
+    float pad_[3];
+    float effect[4]; ///< shader-specific: corner radius, shadow falloff, …
+    float shape[4];  ///< xy: quad centre in device px, zw: its half extent
 };
 
 struct FloatBox {
     float x, y, width, height;
 };
 
+/// How far a fill actually reaches. A shadow's quad extends `feather` beyond the
+/// box that casts it; the occlusion pass and the draw have to agree about that,
+/// or the shadow gets scissored away to its own caster.
+[[nodiscard]] float shadow_grow(const GpuTextureFill& fill) noexcept {
+    return fill.solid ? std::max(fill.feather, 0.0f) : 0.0f;
+}
+
 [[nodiscard]] Box coverage_of(const GpuTextureFill& fill) noexcept {
-    const int left = static_cast<int>(std::floor(fill.x));
-    const int top = static_cast<int>(std::floor(fill.y));
-    const int right = static_cast<int>(std::ceil(fill.x + fill.w));
-    const int bottom = static_cast<int>(std::ceil(fill.y + fill.h));
+    const float grow = shadow_grow(fill);
+    const int left = static_cast<int>(std::floor(fill.x - grow));
+    const int top = static_cast<int>(std::floor(fill.y - grow));
+    const int right = static_cast<int>(std::ceil(fill.x + fill.w + grow));
+    const int bottom = static_cast<int>(std::ceil(fill.y + fill.h + grow));
     return Box{left, top, right - left, bottom - top};
 }
 
@@ -1863,10 +1898,13 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
     };
     vk::raii::Pipeline pipeline = make(kQuadFragSpv, sizeof(kQuadFragSpv));
     vk::raii::Pipeline solid = make(kSolidFragSpv, sizeof(kSolidFragSpv));
+    vk::raii::Pipeline rounded = make(kRoundedFragSpv, sizeof(kRoundedFragSpv));
+    vk::raii::Pipeline shadow = make(kShadowFragSpv, sizeof(kShadowFragSpv));
 
     pipelines.push_back(QuadPipeline{format, std::move(layout), std::move(load_pass),
                                      std::move(clear_pass), std::move(pipeline),
-                                     std::move(solid)});
+                                     std::move(solid), std::move(rounded),
+                                     std::move(shadow)});
     return pipelines.back();
 }
 
@@ -2524,9 +2562,22 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             // The quad covers the whole destination rect; the scissor does the
             // clipping. The source is sampled through the buffer transform folded
             // into the output's, so one draw handles both rotations.
+            const float grow = shadow_grow(tf);
             const FloatBox dev = transform_float_box(
-                transform, scale, FloatBox{tf.x, tf.y, tf.w, tf.h}, device_w, device_h);
+                transform, scale, FloatBox{tf.x - grow, tf.y - grow, tf.w + 2.0f * grow,
+                                           tf.h + 2.0f * grow},
+                device_w, device_h);
             QuadPush push{};
+            // The silhouette the shape shaders measure against, in framebuffer
+            // pixels: the quad's centre, and the half extent of the box that
+            // casts it — which for a shadow is the quad minus what it grew by.
+            const float grow_dev = grow * static_cast<float>(std::max(1, scale));
+            push.shape[0] = dev.x + dev.width * 0.5f;
+            push.shape[1] = dev.y + dev.height * 0.5f;
+            push.shape[2] = dev.width * 0.5f - grow_dev;
+            push.shape[3] = dev.height * 0.5f - grow_dev;
+            push.effect[0] = tf.corner_radius * static_cast<float>(std::max(1, scale));
+            push.effect[1] = grow_dev;
             push.rect[0] = 2.0f * dev.x / static_cast<float>(device_w) - 1.0f;
             push.rect[1] = 2.0f * dev.y / static_cast<float>(device_h) - 1.0f;
             push.rect[2] = 2.0f * (dev.x + dev.width) / static_cast<float>(device_w) - 1.0f;
@@ -2540,7 +2591,8 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                 push.uv01[1] = tf.color.g * tf.color.a;
                 push.uv01[2] = tf.color.b * tf.color.a;
                 push.alpha = tf.color.a;
-                cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *quad.solid);
+                cmd.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                                 grow > 0.0f ? *quad.shadow : *quad.solid);
             } else {
                 const GpuTexture::Impl& tex = *tf.texture->impl_;
                 const auto uv = corner_uvs(transform_compose(transform, tf.transform), tf.u0,
@@ -2569,9 +2621,13 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                         {});
                 }
                 const FragmentShader* shader = shaders.empty() ? nullptr : shaders[i];
-                vk::raii::Pipeline& pipeline = shader != nullptr
-                                                    ? impl_->effect_pipeline(*shader, quad)
-                                                    : quad.pipeline;
+                // A caller's own shader wins over the corner mask: it was handed
+                // the whole fragment stage, and silently composing two of them
+                // would be a surprise it cannot see in its own source.
+                vk::raii::Pipeline& pipeline =
+                    shader != nullptr          ? impl_->effect_pipeline(*shader, quad)
+                    : tf.corner_radius > 0.0f  ? quad.rounded
+                                               : quad.pipeline;
                 cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
                 cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *quad.layout, 0, tex.set,
                                        {});

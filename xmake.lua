@@ -241,6 +241,8 @@ target("luminaria-gpu")
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
                                  {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
+                                 {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
+                                 {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
             local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
@@ -261,6 +263,8 @@ target("luminaria-gpu")
         for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
                                  {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
                                  {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
+                                 {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
+                                 {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
                                  {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
             local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
@@ -326,6 +330,7 @@ local gpu_tests = {
     test_frame_animation = true,
     test_fragment_shader = true,
     test_frame_xray_blur = true,
+    test_rounded_shadow = true,
     test_xray_blur = true,
     test_frame_damage = true, test_offscreen = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,

@@ -90,6 +90,12 @@ struct Placement {
     bool solid = false;
     Color color{};
 
+    /// Rounded corners, radius in layout pixels. A solid placement with
+    /// `feather` above 0 is a drop shadow instead: it fades out over that many
+    /// pixels *outside* its box, following the same corner radius.
+    float corner_radius = 0.0f;
+    float feather = 0.0f;
+
     /// The opaque region, in layout coordinates, as `[first, first+count)` in
     /// the frame's arena — ask `Frame::opaque_of()`. It lives here as a pair of
     /// indices rather than a `Region` because a `Region` per surface per frame
@@ -133,6 +139,15 @@ public:
     /// Set whole-quad opacity, clamped to `[0, 1]`.
     [[nodiscard]] PlacementTransform opacity(float alpha) const noexcept;
 
+    /// Cut rounded corners of `radius` layout pixels out of the destination.
+    ///
+    /// Honoured on a texture placement, ignored on a surface tree: masking each
+    /// surface of a tree separately would round a subsurface's own corners in
+    /// the middle of the window. A client surface therefore gets its corners by
+    /// going through `compose_group()` first and rounding the one texture that
+    /// comes out — the same route, and the same cost, as fading a window.
+    [[nodiscard]] PlacementTransform rounded(float radius) const noexcept;
+
 private:
     friend class Frame;
 
@@ -140,6 +155,7 @@ private:
     float width_ = 0.0f, height_ = 0.0f;
     float u0_ = 0.0f, v0_ = 0.0f, u1_ = 1.0f, v1_ = 1.0f;
     float alpha_ = 1.0f;
+    float radius_ = 0.0f;
 };
 
 /// A marker returned by `Frame::begin_group()`. It names the suffix of the
@@ -241,6 +257,18 @@ public:
     /// ShaderDamage declaration controls full repaint and continuous frames.
     void place(const GpuTexture& texture, const PlacementTransform& transform,
                const FragmentShader& shader);
+
+    /// Place a drop shadow for `box`: a solid `color` fading to nothing over
+    /// `feather` layout pixels outside it, following `radius` at the corners.
+    ///
+    /// The shadow is drawn as the rectangle it surrounds, grown by `feather` —
+    /// so pass the box that casts it, and place it immediately *before* that
+    /// box's own placement. Nothing is painted inside the caster, which is why
+    /// a translucent window is not darkened by its own shadow.
+    ///
+    /// Analytic, not blurred: no extra pass and no extra target, so a shadow
+    /// costs one more quad and nothing else.
+    void place_shadow(const Box& box, Color color, float radius, float feather);
 
     /// Place a solid rectangle the compositor owns — a background panel, a
     /// border, a mask, a cursor backdrop. It is not hit-testable and reports no
@@ -436,6 +464,12 @@ PlacementTransform PlacementTransform::opacity(float alpha) const noexcept {
     return result;
 }
 
+PlacementTransform PlacementTransform::rounded(float radius) const noexcept {
+    PlacementTransform result = *this;
+    result.radius_ = std::isfinite(radius) ? std::max(radius, 0.0f) : 0.0f;
+    return result;
+}
+
 // A cached bridge from one Surface's current wl_buffer to a GPU texture. Kept
 // in the GPU shell rather than Surface so the core compositor has no Vulkan
 // dependency. Entries are pointer-stable because their commit handler captures
@@ -487,6 +521,8 @@ struct FrPlacementKey {
     bool draw = true;
     bool solid = false;
     Color color{};
+    float corner_radius = 0.0f;
+    float feather = 0.0f;
 
     // Member and not a hidden friend: a defaulted hidden-friend operator== in a
     // module interface ICEs gcc 16.
@@ -496,7 +532,8 @@ struct FrPlacementKey {
                box.height == other.box.height && transform == other.transform &&
                u0 == other.u0 && v0 == other.v0 && u1 == other.u1 && v1 == other.v1 &&
                alpha == other.alpha && draw == other.draw && solid == other.solid &&
-               color == other.color;
+               color == other.color && corner_radius == other.corner_radius &&
+               feather == other.feather;
     }
 };
 
@@ -596,8 +633,12 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p, std::size_t placement) co
             key.shader_id = effect->id;
         }
     }
-    key.box = fr_coverage(p.x - static_cast<float>(view.x), p.y - static_cast<float>(view.y),
-                          p.width, p.height);
+    // A shadow reaches past the box that casts it, and the box in the key is
+    // what the damage diff repaints — so it has to be the covered area, or a
+    // moved window leaves its old fringe behind on the screen.
+    key.box = fr_coverage(p.x - static_cast<float>(view.x) - p.feather,
+                          p.y - static_cast<float>(view.y) - p.feather,
+                          p.width + 2.0f * p.feather, p.height + 2.0f * p.feather);
     key.transform = p.transform;
     key.u0 = p.u0;
     key.v0 = p.v0;
@@ -606,6 +647,8 @@ FrPlacementKey Frame::Impl::key_of(const Placement& p, std::size_t placement) co
     key.alpha = p.alpha;
     key.draw = p.draw;
     key.solid = p.solid;
+    key.corner_radius = p.corner_radius;
+    key.feather = p.feather;
     key.color = p.color;
     return key;
 }
@@ -993,6 +1036,7 @@ void Frame::place(const GpuTexture& texture, const PlacementTransform& transform
     p.u1 = transform.u1_;
     p.v1 = transform.v1_;
     p.alpha = transform.alpha_;
+    p.corner_radius = transform.radius_;
     p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
     impl.placements.push_back(p);
 }
@@ -1004,6 +1048,30 @@ void Frame::place(const GpuTexture& texture, const PlacementTransform& transform
     if (impl_->placements.size() != before) {
         impl_->effects.push_back(Impl::Effect{impl_->placements.size() - 1, &shader, shader.id()});
     }
+}
+
+void Frame::place_shadow(const Box& box, Color color, float radius, float feather) {
+    Impl& impl = *impl_;
+    const int grow = static_cast<int>(std::ceil(std::max(feather, 0.0f)));
+    if (box.empty() || grow <= 0 || color.a <= 0.0f) {
+        return;
+    }
+    // Culled against what the shadow actually covers, not against its caster: a
+    // window just off the edge of this output still casts onto it.
+    const Box covered{box.x - grow, box.y - grow, box.width + 2 * grow, box.height + 2 * grow};
+    if (impl.view.intersection(covered).empty()) {
+        return;
+    }
+    Placement p{};
+    p.solid = true;
+    p.color = color;
+    p.x = static_cast<float>(box.x);
+    p.y = static_cast<float>(box.y);
+    p.width = static_cast<float>(box.width);
+    p.height = static_cast<float>(box.height);
+    p.corner_radius = std::max(radius, 0.0f);
+    p.feather = std::max(feather, 0.0f);
+    impl.placements.push_back(p);
 }
 
 void Frame::place_rect(int x, int y, int width, int height, Color color) {
@@ -1122,6 +1190,7 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget& target, const
         fill.u1 = p.u1;
         fill.v1 = p.v1;
         fill.alpha = p.alpha;
+        fill.corner_radius = p.corner_radius;
         const std::size_t first = impl.group_opaque.size();
         if (p.alpha == 1.0f) {
             for (const Box& b : opaque_of(p)) {
@@ -1387,6 +1456,8 @@ Result<Presented> Frame::submit(Color background) {
             GpuTextureFill fill{};
             fill.solid = true;
             fill.color = p.color;
+            fill.corner_radius = p.corner_radius;
+            fill.feather = p.feather;
             fill.x = p.x - impl.view.x;
             fill.y = p.y - impl.view.y;
             fill.w = p.width;
@@ -1423,6 +1494,7 @@ Result<Presented> Frame::submit(Color background) {
         fill.u1 = p.u1;
         fill.v1 = p.v1;
         fill.alpha = p.alpha;
+        fill.corner_radius = p.corner_radius;
         // The placement's opaque region, moved from layout coordinates into
         // this output's. Borrowed by the fill, so it goes into its own buffer:
         // the arena is what `opaque_of()` still answers from.
