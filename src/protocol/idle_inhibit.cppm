@@ -127,11 +127,7 @@ struct IdleInhibitManager::Impl {
     /// every unrelated inhibitor would keep the screen on forever.
     void recompute();
 
-    ~Impl() {
-        if (global != nullptr) {
-            wl_global_destroy(global);
-        }
-    }
+    ~Impl();
 };
 
 using IiMgr = IdleInhibitManager::Impl;
@@ -168,6 +164,20 @@ public:
     Signal<SurfaceDestroy>::Connection surface_gone_;
 };
 
+inline IdleInhibitManager::Impl::~Impl() {
+    for (InhibitorImpl* i : inhibitors) {
+        if (i->resource_ != nullptr) {
+            wl_resource_set_user_data(i->resource_, nullptr);
+            wl_resource_set_destructor(i->resource_, nullptr);
+        }
+        delete i;
+    }
+    inhibitors.clear();
+    if (global != nullptr) {
+        wl_global_destroy(global);
+    }
+}
+
 namespace {
 
 void inhibitor_destroy_request(wl_client*, wl_resource* resource) {
@@ -179,13 +189,15 @@ constexpr struct zwp_idle_inhibitor_v1_interface inhibitor_impl = {
 };
 
 void inhibitor_resource_destroy(wl_resource* resource) {
-    auto* inhibitor = static_cast<InhibitorImpl*>(wl_resource_get_user_data(resource));
-    IdleInhibitorDestroy event{*inhibitor};
-    inhibitor->destroy.emit(event);
-    IiMgr* mgr = inhibitor->mgr_;
-    std::erase(mgr->inhibitors, inhibitor);
-    delete inhibitor;
-    mgr->recompute();
+    if (auto* inhibitor = static_cast<InhibitorImpl*>(wl_resource_get_user_data(resource))) {
+        IdleInhibitorDestroy event{*inhibitor};
+        inhibitor->destroy.emit(event);
+        if (IiMgr* mgr = inhibitor->mgr_) {
+            std::erase(mgr->inhibitors, inhibitor);
+            mgr->recompute();
+        }
+        delete inhibitor;
+    }
 }
 
 void manager_destroy_request(wl_client*, wl_resource* resource) {
