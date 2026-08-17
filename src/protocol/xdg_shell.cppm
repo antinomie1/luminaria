@@ -152,6 +152,15 @@ public:
     virtual void set_fullscreen(bool fullscreen) = 0;
     virtual void set_activated(bool activated) = 0;
     virtual void set_resizing(bool resizing) = 0;
+    /// "Your edges are against something, so take the size I give you exactly."
+    ///
+    /// All four edges at once, because that is the only distinction a tiling
+    /// compositor is making: this window does not choose its own size. It is
+    /// what stops a terminal rounding the height down to a whole cell and
+    /// leaving a strip of background inside its border, and what makes a
+    /// client drop the rounded corners and drop shadow it draws for a free
+    /// floating window. Sent only to clients on xdg_toplevel version 2+.
+    virtual void set_tiled(bool tiled) = 0;
     /// Compositor bookkeeping only: xdg-shell has no minimized state, so nothing
     /// is sent to the client (minimizing a window means not drawing it). It is
     /// tracked here because window-list protocols and taskbars need it, and
@@ -162,6 +171,7 @@ public:
     [[nodiscard]] virtual bool is_fullscreen() const noexcept = 0;
     [[nodiscard]] virtual bool is_activated() const noexcept = 0;
     [[nodiscard]] virtual bool is_resizing() const noexcept = 0;
+    [[nodiscard]] virtual bool is_tiled() const noexcept = 0;
     [[nodiscard]] virtual bool is_minimized() const noexcept = 0;
     /// Size we last asked the client to take (0 if we never asked).
     [[nodiscard]] virtual int pending_width() const noexcept = 0;
@@ -494,6 +504,7 @@ public:
     std::string app_id_;
     int min_w_ = 0, min_h_ = 0, max_w_ = 0, max_h_ = 0;
     bool maximized_ = false, fullscreen_ = false, activated_ = false, resizing_ = false;
+    bool tiled_ = false;
     bool minimized_ = false;
     int pending_w_ = 0, pending_h_ = 0;
 
@@ -577,6 +588,13 @@ public:
         resizing_ = v;
         reconfigure_and_announce();
     }
+    void set_tiled(bool v) override {
+        if (tiled_ == v) {
+            return;
+        }
+        tiled_ = v;
+        reconfigure_and_announce();
+    }
     // No configure: xdg-shell has no minimized state to send.
     void set_minimized(bool v) override {
         if (minimized_ == v) {
@@ -589,6 +607,7 @@ public:
     [[nodiscard]] bool is_fullscreen() const noexcept override { return fullscreen_; }
     [[nodiscard]] bool is_activated() const noexcept override { return activated_; }
     [[nodiscard]] bool is_resizing() const noexcept override { return resizing_; }
+    [[nodiscard]] bool is_tiled() const noexcept override { return tiled_; }
     [[nodiscard]] bool is_minimized() const noexcept override { return minimized_; }
     [[nodiscard]] int pending_width() const noexcept override { return pending_w_; }
     [[nodiscard]] int pending_height() const noexcept override { return pending_h_; }
@@ -721,6 +740,14 @@ uint32_t ToplevelImpl::configure(int width, int height) {
     }
     if (activated_) {
         push(XDG_TOPLEVEL_STATE_ACTIVATED);
+    }
+    // Since version 2, and a client on version 1 must not be sent a state it
+    // has no enum value for.
+    if (tiled_ && version >= XDG_TOPLEVEL_STATE_TILED_LEFT_SINCE_VERSION) {
+        push(XDG_TOPLEVEL_STATE_TILED_LEFT);
+        push(XDG_TOPLEVEL_STATE_TILED_RIGHT);
+        push(XDG_TOPLEVEL_STATE_TILED_TOP);
+        push(XDG_TOPLEVEL_STATE_TILED_BOTTOM);
     }
     xdg_toplevel_send_configure(resource, width, height, &states);
     wl_array_release(&states);

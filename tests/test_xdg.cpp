@@ -55,7 +55,26 @@ void xdg_surface_configure(void* data, xdg_surface* xsurf, uint32_t serial) {
 }
 const xdg_surface_listener kXdgSurfaceListener{xdg_surface_configure};
 
-void toplevel_configure(void*, xdg_toplevel*, int32_t, int32_t, wl_array*) {}
+// The four tiled states, as the client actually sees them. A tiling
+// compositor's whole promise is "take this size exactly", and a terminal that
+// never receives it rounds the height down to a whole cell.
+std::atomic<bool> saw_tiled{false};
+
+void toplevel_configure(void*, xdg_toplevel*, int32_t, int32_t, wl_array* states) {
+    int found = 0;
+    for (const auto* state = static_cast<const std::uint32_t*>(states->data);
+         reinterpret_cast<const std::byte*>(state) <
+         static_cast<const std::byte*>(states->data) + states->size;
+         ++state) {
+        found += *state == XDG_TOPLEVEL_STATE_TILED_LEFT ||
+                 *state == XDG_TOPLEVEL_STATE_TILED_RIGHT ||
+                 *state == XDG_TOPLEVEL_STATE_TILED_TOP ||
+                 *state == XDG_TOPLEVEL_STATE_TILED_BOTTOM;
+    }
+    if (found == 4) {
+        saw_tiled = true;
+    }
+}
 void toplevel_close(void*, xdg_toplevel*) {}
 const xdg_toplevel_listener kToplevelListener{toplevel_configure, toplevel_close};
 
@@ -72,7 +91,7 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
         st->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
     } else if (std::strcmp(interface, "xdg_wm_base") == 0) {
         st->wm_base = static_cast<xdg_wm_base*>(
-            wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
+            wl_registry_bind(registry, name, &xdg_wm_base_interface, 2));
     }
 }
 void registry_global_remove(void*, wl_registry*, uint32_t) {}
@@ -143,7 +162,10 @@ int main() {
     auto nt = shell->new_toplevel().connect([&](luminaria::NewToplevel& e) {
         saw_toplevel = true;
         map_conns.push_back(
-            e.toplevel.map.connect([&](luminaria::ToplevelMap&) { saw_map = true; }));
+            e.toplevel.map.connect([&](luminaria::ToplevelMap& mapped) {
+                saw_map = true;
+                mapped.toplevel.set_tiled(true); // re-configures at the same size
+            }));
     });
 
     wl_client* client = wl_client_create(display->c_ptr(), fds[0]);
@@ -162,5 +184,6 @@ int main() {
 
     assert(saw_toplevel);
     assert(saw_map);
+    assert(saw_tiled);
     return 0;
 }
