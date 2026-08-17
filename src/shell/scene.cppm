@@ -76,6 +76,14 @@ struct SceneBlur {
     /// and it is also exactly x-ray's defining property: a translucent window
     /// shows the wallpaper and the layers behind it, never the window below it.
     bool xray = false;
+    /// For a `surface` item, blur only the regions the client declared through
+    /// ext-background-effect-v1 instead of the whole item box: the committed
+    /// `blur_region()` rectangles of the root and subsurfaces, translated by
+    /// the item's root origin and clipped to each child's surface, the item
+    /// box, the output view and the backdrop. Empty regions blur nothing and
+    /// cost no capture. A non-surface item has no tree to ask, so
+    /// `surface_regions` blurs nothing for one.
+    bool surface_regions = false;
     BlurParams params{};
 
     [[nodiscard]] constexpr bool operator==(const SceneBlur&) const noexcept = default;

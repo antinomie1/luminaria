@@ -386,19 +386,47 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
             }
             if (wants_blur(item) &&
                 ensure_blur(self, *impl_->gpu, view.width * scale, view.height * scale)) {
-                // An x-ray item reuses whatever a previous one already captured,
-                // so a stack of them shares one backdrop and none of them sees
-                // the window below it. That IS x-ray, and it is why it is the
-                // cheap setting.
-                const bool captured =
-                    (item.blur.xray && shared_backdrop) ||
-                    frame.capture_blur(bottom, *self.backdrop, view, *self.chain,
-                                       item.blur.params)
-                        .has_value();
-                if (captured) {
+                const int spread = blur_spread(item.blur.params);
+                // `surface_regions` blurs only what the client declared: an
+                // item that declared nothing places nothing and shows nothing,
+                // and the region walk answers that before any capture is paid
+                // for. A non-surface item has no tree to ask, so it takes the
+                // whole-box arm like a compositor that never enabled the
+                // client hints at all.
+                const bool regions =
+                    item.blur.surface_regions && item.kind == SceneItem::Kind::surface;
+                bool placed = false;
+                if (regions) {
+                    if (Surface* root = surface_from_id(item.surface); root != nullptr) {
+                        // An x-ray item reuses whatever a previous one already
+                        // captured, so a stack of them shares one backdrop and
+                        // none of them sees the window below it. That IS
+                        // x-ray, and it is why it is the cheap setting.
+                        const bool captured =
+                            (item.blur.xray && shared_backdrop) ||
+                            frame.capture_blur(bottom, *self.backdrop, view, *self.chain,
+                                               item.blur.params)
+                                .has_value();
+                        if (captured) {
+                            placed = frame.place_blur_regions(
+                                self.chain->texture(), view, *root, item.x, item.y, item.box,
+                                spread);
+                        }
+                    }
+                } else {
+                    const bool captured =
+                        (item.blur.xray && shared_backdrop) ||
+                        frame.capture_blur(bottom, *self.backdrop, view, *self.chain,
+                                           item.blur.params)
+                            .has_value();
+                    if (captured) {
+                        placed = true;
+                        frame.place_blur(self.chain->texture(), view, item.box,
+                                         item.corner_radius, spread);
+                    }
+                }
+                if (placed) {
                     shared_backdrop = shared_backdrop || item.blur.xray;
-                    frame.place_blur(self.chain->texture(), view, item.box, item.corner_radius,
-                                     blur_spread(item.blur.params));
                 }
             }
             const PlacementGroup window = frame.begin_group();
