@@ -133,6 +133,15 @@ struct SceneImageCache {
     std::uint64_t serial = 0;
 };
 
+/// One window-sized offscreen, kept across frames. A window that fades or
+/// rounds has to be composited before the effect is applied to it (ADR 0005),
+/// and reallocating that target every frame is the allocation an idle desktop
+/// must not make.
+struct SceneGroupCache {
+    std::optional<OffscreenTarget> target;
+    int width = 0, height = 0;
+};
+
 struct SceneOutput::Impl {
     std::optional<Frame> frame;
     CpuCompositor cpu;
@@ -146,6 +155,13 @@ struct SceneOutput::Impl {
     // other's bar every frame. Indexed by the image's position among the
     // frame's image items, which is stable for a scene built the same way twice.
     std::vector<SceneImageCache> images;
+    // Allocated the first time a scene actually asks for blur, and dropped with
+    // the rest of the output's targets by reset(). A compositor that never
+    // blurs never pays for either — which is what makes blur-off free rather
+    // than merely cheap.
+    std::optional<OffscreenTarget> backdrop;
+    std::optional<BlurChain> chain;
+    std::vector<SceneGroupCache> groups;
 };
 
 struct SceneRenderer::Impl {
@@ -178,6 +194,10 @@ void border_rects(const Box& box, int thickness, Emit&& emit) {
     emit(box.x + box.width - x, box.y + y, x, box.height - 2 * y);
 }
 
+[[nodiscard]] bool wants_blur(const SceneItem& item) noexcept {
+    return item.blur.enabled && !item.box.empty();
+}
+
 void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
     const Box surface{item.x, item.y, root.surface_width(), root.surface_height()};
     const Box visible = surface.intersection(item.box);
@@ -195,6 +215,54 @@ void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
                   static_cast<float>(visible.width) / surface.width,
                   static_cast<float>(visible.height) / surface.height);
     frame.place(root, transform);
+}
+
+/// Where a composed window goes back, and what is done to it on the way: its
+/// own opacity and its corner mask, applied to the one finished image.
+[[nodiscard]] PlacementTransform effect_transform(const SceneItem& item) {
+    return PlacementTransform::at(static_cast<float>(item.box.x), static_cast<float>(item.box.y),
+                                  static_cast<float>(item.box.width),
+                                  static_cast<float>(item.box.height))
+        .opacity(std::clamp(item.alpha, 0.0f, 1.0f))
+        .rounded(item.corner_radius);
+}
+
+/// A solid item's colour with the item's own opacity folded in — a rectangle
+/// has nothing to compose offscreen, so its alpha is just less alpha.
+[[nodiscard]] Color faded(const SceneItem& item) noexcept {
+    Color color = item.color;
+    color.a *= std::clamp(item.alpha, 0.0f, 1.0f);
+    return color;
+}
+
+/// True when this item cannot simply be placed: an opacity or a corner mask
+/// has to be applied to the finished window, not to each of its surfaces.
+[[nodiscard]] bool wants_group(const SceneItem& item) noexcept {
+    return item.kind == SceneItem::Kind::surface &&
+           (item.alpha < 1.0f || item.corner_radius > 0.0f);
+}
+
+/// Allocate this output's blur targets on first use. Answers false when there
+/// is no memory for them, which costs the blur and nothing else.
+[[nodiscard]] bool ensure_blur(SceneOutput::Impl& self, VulkanRenderer& gpu, int width,
+                               int height) {
+    if (self.chain.has_value() && self.chain->width() == width &&
+        self.chain->height() == height) {
+        return true;
+    }
+    self.backdrop.reset();
+    self.chain.reset();
+    Result<OffscreenTarget> backdrop = gpu.create_offscreen(width, height);
+    if (!backdrop) {
+        return false;
+    }
+    Result<BlurChain> chain = gpu.create_blur_chain(width, height);
+    if (!chain) {
+        return false;
+    }
+    self.backdrop.emplace(std::move(*backdrop));
+    self.chain.emplace(std::move(*chain));
+    return true;
 }
 
 void place_image_item(Frame& frame, VulkanRenderer& gpu, SceneImageCache& cache,
@@ -215,21 +283,24 @@ void place_image_item(Frame& frame, VulkanRenderer& gpu, SceneImageCache& cache,
         cache.texture.emplace(std::move(*texture));
         cache.serial = item.serial;
     }
-    frame.place(*cache.texture, item.box.x, item.box.y, item.box.width, item.box.height);
+    // Through the transform rather than the four-int overload: an image is a
+    // single texture, which is the one placement `rounded()` applies to, and
+    // the bar is the caller who wants both.
+    frame.place(*cache.texture, effect_transform(item));
 }
 
 /// Append one surface tree to the CPU draw list, and record every surface of it
 /// — roots and subsurfaces — in `drawn`, which is where the CPU path's batch
 /// frame-callback release comes from.
 void append_tree(SceneOutput::Impl& state, const Output& output, Surface& root, int logical_x,
-                 int logical_y, const Box& clip) {
+                 int logical_y, const Box& clip, float alpha = 1.0f) {
     state.tree.clear();
     root.surface_tree(state.tree);
     for (const SurfaceAt& at : state.tree) {
         state.drawn.push_back(at.surface->id());
     }
     const Box origin = output.to_device({logical_x, logical_y, 1, 1});
-    state.items.emplace_back(CpuView{root.id(), origin.x, origin.y, clip});
+    state.items.emplace_back(CpuView{root.id(), origin.x, origin.y, clip, alpha});
 }
 
 } // namespace
@@ -298,16 +369,47 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         Frame& frame = *self.frame;
         frame.begin({0, 0, output.logical_width(), output.logical_height()});
 
+        const Box view{0, 0, output.logical_width(), output.logical_height()};
+        const int scale = std::max(1, output.scale());
+        // Everything is a potential blur backdrop, so the marker is the bottom
+        // of the frame. A blurred item captures what has been placed under it
+        // by the time its turn comes.
+        const PlacementGroup bottom = frame.begin_group();
+        bool shared_backdrop = false;
+
         std::size_t image = 0;
+        std::size_t group = 0;
         for (const SceneItem& item : scene) {
+            if (item.shadow.color.a > 0.0f && item.shadow.feather > 0.0f) {
+                frame.place_shadow(item.box, item.shadow.color, item.corner_radius,
+                                   item.shadow.feather);
+            }
+            if (wants_blur(item) &&
+                ensure_blur(self, *impl_->gpu, view.width * scale, view.height * scale)) {
+                // An x-ray item reuses whatever a previous one already captured,
+                // so a stack of them shares one backdrop and none of them sees
+                // the window below it. That IS x-ray, and it is why it is the
+                // cheap setting.
+                const bool captured =
+                    (item.blur.xray && shared_backdrop) ||
+                    frame.capture_blur(bottom, *self.backdrop, view, *self.chain,
+                                       item.blur.params)
+                        .has_value();
+                if (captured) {
+                    shared_backdrop = shared_backdrop || item.blur.xray;
+                    frame.place_blur(self.chain->texture(), view, item.box, item.corner_radius,
+                                     blur_spread(item.blur.params));
+                }
+            }
+            const PlacementGroup window = frame.begin_group();
             switch (item.kind) {
             case SceneItem::Kind::rect:
                 frame.place_rect(item.box.x, item.box.y, item.box.width, item.box.height,
-                                 item.color);
+                                 faded(item));
                 break;
             case SceneItem::Kind::border:
                 border_rects(item.box, item.thickness, [&](int x, int y, int w, int h) {
-                    frame.place_rect(x, y, w, h, item.color);
+                    frame.place_rect(x, y, w, h, faded(item));
                 });
                 break;
             case SceneItem::Kind::image:
@@ -321,6 +423,30 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
                     place_surface_item(frame, *root, item);
                 }
                 break;
+            }
+            if (!wants_group(item)) {
+                continue;
+            }
+            // Fade or round the finished window rather than each of its
+            // surfaces, or the overlaps blend twice and seam (ADR 0005). A
+            // target that cannot be allocated costs the effect, not the window.
+            if (self.groups.size() <= group) {
+                self.groups.resize(group + 1);
+            }
+            SceneGroupCache& cache = self.groups[group++];
+            const int w = item.box.width * scale;
+            const int h = item.box.height * scale;
+            if (!cache.target.has_value() || cache.width != w || cache.height != h) {
+                cache.target.reset();
+                if (Result<OffscreenTarget> target = impl_->gpu->create_offscreen(w, h); target) {
+                    cache.target.emplace(std::move(*target));
+                    cache.width = w;
+                    cache.height = h;
+                }
+            }
+            if (cache.target.has_value()) {
+                (void)frame.compose_group(window, *cache.target, item.box,
+                                          effect_transform(item));
             }
         }
 
@@ -368,13 +494,13 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         switch (item.kind) {
         case SceneItem::Kind::rect:
             if (!device.empty()) {
-                self.items.emplace_back(RectFill{device, item.color});
+                self.items.emplace_back(RectFill{device, faded(item)});
             }
             break;
         case SceneItem::Kind::border:
             border_rects(device, item.thickness * output.scale(), [&](int x, int y, int w, int h) {
                 if (w > 0 && h > 0) {
-                    self.items.emplace_back(RectFill{{x, y, w, h}, item.color});
+                    self.items.emplace_back(RectFill{{x, y, w, h}, faded(item)});
                 }
             });
             break;
@@ -382,12 +508,16 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
             // The image is rasterized at its logical size, so a scaled output
             // would want it rasterized larger rather than stretched here.
             if (!device.empty()) {
-                self.items.emplace_back(CpuImage{device, item.pixels});
+                self.items.emplace_back(CpuImage{device, item.pixels, item.alpha});
             }
             break;
         case SceneItem::Kind::surface:
             if (Surface* root = surface_from_id(item.surface); root != nullptr) {
-                append_tree(self, output, *root, item.x, item.y, device);
+                // No blur, no shadow and square corners: this path exists so a
+                // machine with no GPU still shows a desktop, and refusing to
+                // draw a window because it asked to be rounded would be the
+                // opposite of that. Opacity does work.
+                append_tree(self, output, *root, item.x, item.y, device, item.alpha);
             }
             break;
         }

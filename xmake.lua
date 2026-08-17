@@ -337,6 +337,7 @@ local gpu_tests = {
     test_blur_chain = true,
     test_backdrop_blur = true,
     test_rounded_shadow = true,
+    test_scene_effects = true,
     test_xray_blur = true,
     test_frame_damage = true, test_offscreen = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,

@@ -49,6 +49,10 @@ struct CpuView {
     int x = 0;
     int y = 0;
     Box clip;
+    /// Whole-tree opacity. Applied per surface, because there is no offscreen
+    /// to composite into here — a tree that overlaps itself seams (ADR 0005),
+    /// which is the price of the path that runs without a GPU at all.
+    float alpha = 1.0f;
 };
 
 /// A block of pixels the compositor itself owns — a rasterized bar, a themed
@@ -58,6 +62,7 @@ struct CpuView {
 struct CpuImage {
     Box box;
     std::span<const Pixel> pixels;
+    float alpha = 1.0f;
 };
 
 /// One z-ordered draw item: a solid rectangle or a block of pixels the
@@ -83,7 +88,7 @@ private:
     void fill_rect(const RectFill& fill);
     void draw_image(const CpuImage& image);
     void draw_view(const CpuView& view);
-    void draw_surface(Surface& surface, int x, int y, const Box& clip);
+    void draw_surface(Surface& surface, int x, int y, const Box& clip, float alpha);
 
     int width_ = 0;
     int height_ = 0;
@@ -110,6 +115,24 @@ namespace {
 /// Premultiplied source-over, the way wl_shm buffers (ARGB8888) and the GPU
 /// path carry alpha: `dst = src + dst * (1 - src.a)`. Exact for the normal
 /// case of an opaque backdrop, which is also what XRGB8888 scanout assumes.
+/// Scale a premultiplied pixel: every channel, alpha included, or the result
+/// stops being premultiplied and the blend below brightens instead of fading.
+[[nodiscard]] Pixel fade(Pixel src, unsigned alpha8) noexcept {
+    if (alpha8 >= 255u) {
+        return src;
+    }
+    return Pixel{static_cast<std::uint8_t>(src.r * alpha8 / 255u),
+                 static_cast<std::uint8_t>(src.g * alpha8 / 255u),
+                 static_cast<std::uint8_t>(src.b * alpha8 / 255u),
+                 static_cast<std::uint8_t>(src.a * alpha8 / 255u)};
+}
+
+/// 0..1 as a byte, clamped — a caller's float is not to be trusted into an
+/// unsigned multiply.
+[[nodiscard]] unsigned alpha_byte(float alpha) noexcept {
+    return static_cast<unsigned>(std::clamp(alpha, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
 void blend(Pixel& dst, Pixel src) noexcept {
     const unsigned inv = 255u - src.a;
     if (inv == 0u) {
@@ -198,7 +221,8 @@ void CpuCompositor::draw_image(const CpuImage& image) {
         const auto row = static_cast<std::size_t>(y - image.box.y) * image.box.width;
         for (int x = box.x; x < box.x + box.width; ++x) {
             blend(pixels_[static_cast<std::size_t>(y) * width_ + x],
-                  image.pixels[row + static_cast<std::size_t>(x - image.box.x)]);
+                  fade(image.pixels[row + static_cast<std::size_t>(x - image.box.x)],
+                       alpha_byte(image.alpha)));
         }
     }
 }
@@ -218,11 +242,12 @@ void CpuCompositor::draw_view(const CpuView& view) {
     tree_.clear();
     surface->surface_tree(tree_);
     for (const SurfaceAt& at : tree_) {
-        draw_surface(*at.surface, view.x + at.x, view.y + at.y, clip);
+        draw_surface(*at.surface, view.x + at.x, view.y + at.y, clip, view.alpha);
     }
 }
 
-void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip) {
+void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip,
+                                 float alpha) {
     int buffer_w = 0;
     int buffer_h = 0;
     if (!surface.current_buffer_rgba(rgba_, buffer_w, buffer_h)) {
@@ -248,6 +273,7 @@ void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip
     // folded into the UVs by buffer_source_uv, exactly as for the GPU path.
     const double du = (u1 - u0) / surface_w;
     const double dv = (v1 - v0) / surface_h;
+    const unsigned opacity = alpha_byte(alpha);
     for (int py = box.y; py < box.y + box.height; ++py) {
         const double v = v0 + (py - y + 0.5) * dv;
         for (int px = box.x; px < box.x + box.width; ++px) {
@@ -258,7 +284,7 @@ void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip
             const int by = std::clamp(static_cast<int>(w * buffer_h), 0, buffer_h - 1);
             const std::size_t at = (static_cast<std::size_t>(by) * buffer_w + bx) * 4;
             blend(pixels_[static_cast<std::size_t>(py) * width_ + px],
-                  Pixel{rgba_[at], rgba_[at + 1], rgba_[at + 2], rgba_[at + 3]});
+                  fade(Pixel{rgba_[at], rgba_[at + 1], rgba_[at + 2], rgba_[at + 3]}, opacity));
         }
     }
 }
