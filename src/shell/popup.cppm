@@ -103,8 +103,12 @@ void PopupTree::append_to(std::vector<SceneItem>& scene) const {
         const int x = parent->x + entry.popup->x();
         const int y = parent->y + entry.popup->y();
         const SurfaceId surface = entry.popup->surface().id();
+        const int w = entry.popup->width() > 0 ? entry.popup->width()
+                                               : entry.popup->surface().surface_width();
+        const int h = entry.popup->height() > 0 ? entry.popup->height()
+                                                : entry.popup->surface().surface_height();
         scene.push_back({.kind = SceneItem::Kind::surface,
-                         .box = {x, y, entry.popup->width(), entry.popup->height()},
+                         .box = {x, y, w, h},
                          .surface = surface,
                          .x = x,
                          .y = y,

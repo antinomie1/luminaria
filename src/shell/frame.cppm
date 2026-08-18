@@ -1166,8 +1166,12 @@ void Frame::place(Surface& surface, const PlacementTransform& transform) {
         transform.u1_ <= transform.u0_ || transform.v1_ <= transform.v0_) {
         return;
     }
-    const float root_width = static_cast<float>(surface.surface_width());
-    const float root_height = static_cast<float>(surface.surface_height());
+    const float root_width = surface.surface_width() > 0
+                                 ? static_cast<float>(surface.surface_width())
+                                 : transform.width_;
+    const float root_height = surface.surface_height() > 0
+                                  ? static_cast<float>(surface.surface_height())
+                                  : transform.height_;
     if (root_width <= 0.0f || root_height <= 0.0f) {
         return;
     }

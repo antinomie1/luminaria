@@ -234,7 +234,9 @@ void border_rects(const Box& box, int thickness, Emit&& emit) {
 }
 
 void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
-    const Box surface{item.x, item.y, root.surface_width(), root.surface_height()};
+    const int root_w = root.surface_width() > 0 ? root.surface_width() : item.box.width;
+    const int root_h = root.surface_height() > 0 ? root.surface_height() : item.box.height;
+    const Box surface{item.x, item.y, root_w, root_h};
     const Box visible = surface.intersection(item.box);
     if (surface.empty() || visible.empty()) {
         return;
@@ -242,9 +244,9 @@ void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
     // The crop clips the whole tree to the item's box, so a window that has not
     // yet answered a resize never paints over its neighbour.
     const auto transform =
-        PlacementTransform::at(static_cast<float>(surface.x), static_cast<float>(surface.y),
-                               static_cast<float>(surface.width),
-                               static_cast<float>(surface.height))
+        PlacementTransform::at(static_cast<float>(visible.x), static_cast<float>(visible.y),
+                               static_cast<float>(visible.width),
+                               static_cast<float>(visible.height))
             .crop(static_cast<float>(visible.x - surface.x) / surface.width,
                   static_cast<float>(visible.y - surface.y) / surface.height,
                   static_cast<float>(visible.width) / surface.width,

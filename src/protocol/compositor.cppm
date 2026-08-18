@@ -234,6 +234,9 @@ public:
     /// has actually been presented — pacing clients to the display is the whole
     /// point of the callback. `time_ms` is a CLOCK_MONOTONIC millisecond stamp.
     void send_frame_done(std::uint32_t time_ms);
+    [[nodiscard]] bool has_queued_frame_callbacks() const noexcept {
+        return !queued_frame_callbacks_.empty();
+    }
 
     /// True if a client asked us to present this surface without waiting for
     /// vblank (wp_tearing_control_v1). Only meaningful for a fullscreen surface
