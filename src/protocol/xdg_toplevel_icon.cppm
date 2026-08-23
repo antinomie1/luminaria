@@ -16,6 +16,8 @@ import :protocol_helper;
 import :signal;
 import :xdg_shell;
 
+namespace luminaria { struct IconManagerImpl; }
+
 export namespace luminaria {
 
 struct IconPixels {
@@ -45,11 +47,10 @@ public:
 
     [[nodiscard]] const ToplevelIcon* icon_for(const Toplevel& toplevel) const noexcept;
     [[nodiscard]] Signal<ToplevelIconChange>& changed() noexcept;
-    struct Impl;
 
 private:
-    std::unique_ptr<Impl> impl_;
-    explicit XdgToplevelIconManager(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<IconManagerImpl> impl_;
+    explicit XdgToplevelIconManager(std::unique_ptr<IconManagerImpl> impl) noexcept;
 };
 
 } // namespace luminaria
@@ -57,7 +58,7 @@ private:
 // --------------------------------------------------------------- implementation
 namespace luminaria {
 
-struct XdgToplevelIconManager::Impl {
+struct IconManagerImpl {
     WlGlobal global;
     std::map<const Toplevel*, ToplevelIcon> icons;
     std::map<const Toplevel*, ToplevelIcon> pending;
@@ -67,7 +68,7 @@ struct XdgToplevelIconManager::Impl {
 };
 
 namespace {
-using Manager = XdgToplevelIconManager::Impl;
+using Manager = IconManagerImpl;
 struct PendingImage { BufferContents contents; int scale = 1; };
 struct Icon {
     Manager* manager = nullptr;
@@ -181,14 +182,14 @@ void bind_manager(wl_client* client, void* data, uint32_t version, uint32_t id) 
 }
 } // namespace
 
-XdgToplevelIconManager::XdgToplevelIconManager(std::unique_ptr<Impl> impl) noexcept
+XdgToplevelIconManager::XdgToplevelIconManager(std::unique_ptr<IconManagerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 XdgToplevelIconManager::~XdgToplevelIconManager() = default;
 XdgToplevelIconManager::XdgToplevelIconManager(XdgToplevelIconManager&&) noexcept = default;
 XdgToplevelIconManager& XdgToplevelIconManager::operator=(XdgToplevelIconManager&&) noexcept = default;
 
 Result<XdgToplevelIconManager> XdgToplevelIconManager::create(Display& display) {
-    auto impl = std::make_unique<Impl>();
+    auto impl = std::make_unique<IconManagerImpl>();
     auto global = create_wl_global<&xdg_toplevel_icon_manager_v1_interface, bind_manager>(
         display, 1, impl.get());
     if (!global) return fail(std::move(global.error().message));
