@@ -343,6 +343,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`FractionalScaleManager`** (`luminaria:fractional_scale`): `wp_fractional_scale_v1`（以 120 为基数的分数缩放通告）。
 - **`ContentTypeManager`** (`luminaria:content_type`): 视频、游戏、图片等画质与显示模式提示。
 - **`XdgDecorationManager`** (`luminaria:xdg_decoration`): 服务端/客户端装饰协商（默认答 Client-side）。
+- **`XdgToplevelIconManager`** (`luminaria:xdg_toplevel_icon`): 发布 `xdg_toplevel_icon_manager_v1`；`icon_for(toplevel)` 返回客户端图标名和已复制的 RGBA 尺寸集，`changed()` 在图标替换时发信号。
 
 ### 7.6 PointerConstraints & RelativePointer & CursorShape
 - **`PointerConstraints`** (`luminaria:pointer_constraints`): 指针锁定（Locked Pointer）与约束（Confined Pointer）。
