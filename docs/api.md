@@ -272,7 +272,8 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 ### 6.2 Scene & SceneRenderer (统一场景抽象)
 跨 GPU 与 CPU 路径的统一高层场景表示：
 - **`SceneItem`** (`luminaria:scene`):
-  - 图元类型：`Kind::surface_tree`、`Kind::solid_rect`、`Kind::border`、`Kind::image`、`Kind::shadow`、`Kind::blur`。
+  - 图元类型：`Kind::surface`、`Kind::rect`、`Kind::border`、`Kind::image`；透明度、圆角、模糊与投影是图元属性。
+  - `shadow_box` 可让投影包围大于图元本身的外框（例如客户端表面外的服务端装饰）；空矩形表示使用 `box`。
   - `std::uint64_t tag`: 混成器自定义标识符（库不解析，命中测试原样返回）。
 - **`SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y)`**: 全图元命中测试。
 - **`SceneRenderer`** (`luminaria.gpu:scene_renderer`):

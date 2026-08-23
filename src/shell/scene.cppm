@@ -164,8 +164,11 @@ struct SceneItem {
     /// Blur what is behind this item, inside `box`, following `corner_radius`.
     SceneBlur blur{};
 
-    /// A drop shadow cast by `box`, drawn under this item.
+    /// A drop shadow drawn under this item. `shadow_box` may name a frame larger
+    /// than `box` — for example server-side decorations around a client surface;
+    /// empty means the item's own box.
     SceneShadow shadow{};
+    Box shadow_box{};
 };
 
 /// What is under a point.

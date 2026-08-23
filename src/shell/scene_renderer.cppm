@@ -511,7 +511,8 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         std::size_t blur = 0; // non-x-ray blurred items so far
         for (const SceneItem& item : scene) {
             if (item.shadow.color.a > 0.0f && item.shadow.feather > 0.0f) {
-                frame.place_shadow(item.box, item.shadow.color, item.corner_radius,
+                const Box caster = item.shadow_box.empty() ? item.box : item.shadow_box;
+                frame.place_shadow(caster, item.shadow.color, item.corner_radius,
                                    item.shadow.feather);
             }
             if (wants_blur(item)) {
