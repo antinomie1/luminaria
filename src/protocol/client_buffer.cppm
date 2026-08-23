@@ -51,6 +51,7 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept { return state_ != nullptr; }
     [[nodiscard]] int width() const noexcept;
     [[nodiscard]] int height() const noexcept;
+    [[nodiscard]] bool is_shm() const noexcept;
     [[nodiscard]] bool rgba(std::vector<std::uint8_t>&, int&, int&) const;
     [[nodiscard]] bool dmabuf(DmabufPlane&) const noexcept;
     [[nodiscard]] const void* identity() const noexcept { return state_.get(); }
@@ -135,6 +136,10 @@ int BufferContents::height() const noexcept {
     }
     return state_->shm != nullptr ? wl_shm_buffer_get_height(state_->shm)
                                   : state_->custom->height();
+}
+
+bool BufferContents::is_shm() const noexcept {
+    return state_ != nullptr && state_->shm != nullptr;
 }
 
 bool BufferContents::rgba(std::vector<std::uint8_t>& out, int& width, int& height) const {

@@ -99,7 +99,8 @@ void icon_add_buffer(wl_client*, wl_resource* resource, wl_resource* buffer, int
         return;
     }
     BufferContents contents = retain_client_buffer(buffer);
-    if (!contents || contents.width() <= 0 || contents.width() != contents.height() || scale <= 0) {
+    if (!contents.is_shm() || contents.width() <= 0 ||
+        contents.width() != contents.height() || scale <= 0) {
         wl_resource_post_error(resource, XDG_TOPLEVEL_ICON_V1_ERROR_INVALID_BUFFER,
                                "icon buffers must be square wl_shm buffers");
         return;
