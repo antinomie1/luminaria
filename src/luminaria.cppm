@@ -73,3 +73,4 @@ export import :wayland;
 export import :xdg_activation;
 export import :xdg_decoration;
 export import :xdg_shell;
+export import :xdg_toplevel_icon;

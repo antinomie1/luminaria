@@ -120,7 +120,8 @@ target("luminaria")
               "src/protocol/subcompositor.cppm", "src/protocol/tearing_control.cppm",
               "src/protocol/text_input.cppm", "src/protocol/viewporter.cppm",
               "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
-              "src/protocol/xdg_shell.cppm", {public = true})
+              "src/protocol/xdg_shell.cppm", "src/protocol/xdg_toplevel_icon.cppm",
+              {public = true})
     add_files("src/render/cursor_theme.cppm", "src/shell/cpu_compositor.cppm",
               "src/shell/cursor_manager.cppm", "src/shell/layer.cppm",
               "src/shell/pointer.cppm", "src/shell/popup.cppm",
@@ -166,6 +167,7 @@ target("luminaria")
             {"ext-workspace-v1",              "staging/ext-workspace/ext-workspace-v1.xml",                 "scl"},
             {"linux-drm-syncobj-v1",          "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml",         "scl"},
             {"xdg-activation-v1",             "staging/xdg-activation/xdg-activation-v1.xml",               "scl"},
+            {"xdg-toplevel-icon-v1",          "staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml",         "scl"},
             {"relative-pointer-unstable-v1",  "unstable/relative-pointer/relative-pointer-unstable-v1.xml", "scl"},
             {"pointer-constraints-unstable-v1", "unstable/pointer-constraints/pointer-constraints-unstable-v1.xml", "scl"},
             {"text-input-unstable-v3",        "unstable/text-input/text-input-unstable-v3.xml",             "scl"},
