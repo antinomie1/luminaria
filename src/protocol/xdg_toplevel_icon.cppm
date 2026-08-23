@@ -9,6 +9,7 @@ export module luminaria:xdg_toplevel_icon;
 import std;
 
 import :client_buffer;
+import :compositor;
 import :display;
 import :expected;
 import :protocol_helper;
@@ -59,6 +60,8 @@ namespace luminaria {
 struct XdgToplevelIconManager::Impl {
     WlGlobal global;
     std::map<const Toplevel*, ToplevelIcon> icons;
+    std::map<const Toplevel*, ToplevelIcon> pending;
+    std::map<const Toplevel*, Signal<SurfaceCommit>::Connection> commit_connections;
     std::map<const Toplevel*, Signal<ToplevelDestroy>::Connection> destroy_connections;
     Signal<ToplevelIconChange> changed;
 };
@@ -140,16 +143,25 @@ void manager_set_icon(wl_client*, wl_resource* resource, wl_resource* toplevel_r
             }
         }
     }
-    manager->icons[toplevel] = std::move(applied);
-    if (!manager->destroy_connections.contains(toplevel)) {
+    manager->pending[toplevel] = std::move(applied);
+    if (!manager->commit_connections.contains(toplevel)) {
+        manager->commit_connections.emplace(
+            toplevel, toplevel->surface().commit.connect([manager, toplevel](SurfaceCommit&) {
+                auto pending = manager->pending.find(toplevel);
+                if (pending == manager->pending.end()) return;
+                manager->icons[toplevel] = std::move(pending->second);
+                manager->pending.erase(pending);
+                ToplevelIconChange event{*toplevel};
+                manager->changed.emit(event);
+            }));
         manager->destroy_connections.emplace(
             toplevel, toplevel->destroy.connect([manager](ToplevelDestroy& event) {
                 manager->icons.erase(&event.toplevel);
+                manager->pending.erase(&event.toplevel);
+                manager->commit_connections.erase(&event.toplevel);
                 manager->destroy_connections.erase(&event.toplevel);
             }));
     }
-    ToplevelIconChange event{*toplevel};
-    manager->changed.emit(event);
 }
 
 constexpr struct xdg_toplevel_icon_manager_v1_interface manager_impl = {
