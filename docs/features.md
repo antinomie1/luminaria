@@ -109,7 +109,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | layout | `OutputLayout` —— 输出在全局坐标系里的位置：`add_auto()` 横向排列、`box_of()` / `bounds()` / `at(x,y)` 命中、`intersecting(box)` 求窗口跨屏时各屏该画哪一块。用的是**逻辑尺寸**，所以旋转/HiDPI 输出占的格子跟它的 mode 不一样 | output-layout |
 | layout | `Transform` + `Output::scale()` —— 每输出旋转/翻转（值与 `WL_OUTPUT_TRANSFORM_*` 一致）与整数缩放。`transform_box()` 是逻辑坐标 → 帧缓冲像素的唯一映射，`transform_invert()` 供输入反向映射 | output-layout, output-scale |
 
-## 外壳层 / Xwayland / 示例
+## 外壳层 / 示例
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
@@ -120,7 +120,6 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | shell | **批量帧回调** —— `Frame::send_frame_done(time)`（本帧摆位里的全部表面，同一时间戳）与自由函数 `send_frame_done(ids, time)`（任意表面列表），把每个 compositor 都要手写的遍历收进库；`Presented::unchanged` 分支同样用它补发（没 `present` 的那帧，客户端不能饿死） | cpu_compositor |
 | shell | **场景表 `SceneItem` / `SceneRenderer`** —— 一张有序列表同时被画和被命中：四种图元（客户端表面树、纯色矩形、窗口边框、混成器自有像素块），`SceneRenderer` 按现有硬件喂给 `Frame` 或 `CpuCompositor`，`scene_hit_test()` 读同一张表回答"这点上是什么"。上层因此每种图元只写一遍，不必维护 `Placement` / `CpuItem` 两套实现；三种降级（无 Vulkan 设备、输出配不出渲染目标、`submit()` 答 `fallback`）全在运行时落到同一个 CPU 分支。`tag` 是调用方身份，库不解释、命中时原样交还 | scene, scene_renderer |
 | shell | **纯色矩形图元 `Frame::place_rect(x, y, w, h, color)`** —— 混成器-owned 的立即模式原语（边框、背景面板、遮罩、光标底）：不参与命中测试、不报自己的 damage，移动 / 换色由摆位 diff 恢复，代价恰好两个矩形；与表面同 z 序，GPU 侧走无纹理的 solid pipeline，CPU 侧就是 `RectFill` 图元 | frame |
-| xwayland | 启动 Xwayland + 最小 XWM（xcb 连接、重定向 root、map/configure） | xwayland |
 | example | `tinyluminaria`（嵌套/headless 参考 compositor）、`luminaria-drm-demo`、`luminaria-tty`（裸机 compositor） | tinyluminaria-smoke |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |
 

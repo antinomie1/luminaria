@@ -155,7 +155,6 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 
 | 位置 | 内容 |
 |------|------|
-| `xwayland.cppm:5` | 最小 XWM —— map/configure 已处理，完整 ICCCM/EWMH 未做 |
 | `region.cppm:14` | `Region` 的操作 O(n)、合并 O(n²)。矩形数量成为问题时换 `pixman_region32` |
 | `tearing_control.cppm:96` | 重复的 tearing_control 对象不发协议错误 |
 | `tty_compositor.cpp:13` | 示例里窗口固定偏移层叠，无移动/缩放/堆叠 UI |

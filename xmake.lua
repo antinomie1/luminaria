@@ -1,7 +1,7 @@
 -- Luminaria — a minimal Wayland compositor library.
 --
--- Built as four C++23 named modules: the dependency-light `luminaria` core and
--- opt-in `luminaria.gpu`, `luminaria.desktop`, `luminaria.xwayland` extensions.
+-- Built as three C++23 named modules: the dependency-light `luminaria` core and
+-- opt-in `luminaria.gpu` and `luminaria.desktop` extensions.
 -- Every partition lives in src/**/*.cppm — one file per concept, holding both
 -- interface and implementation. There is no public include/ tree.
 --
@@ -82,7 +82,7 @@ if standalone then
 end
 
 -- We build ON libwayland-server; the wire protocol is never reimplemented.
-local pkgs = {"wayland-server", "wayland-client", "vulkan", "xkbcommon", "xcb",
+local pkgs = {"wayland-server", "wayland-client", "vulkan", "xkbcommon",
               "libdrm", "libinput", "libudev", "gbm", "libseat"}
 for _, name in ipairs(pkgs) do
     add_requires("pkgconfig::" .. name, {alias = (name:gsub("-", "_"))})
@@ -297,13 +297,6 @@ target("luminaria-desktop")
               {public = true})
 
 
-target("luminaria-xwayland")
-    set_kind("static")
-    luminaria_defaults()
-    add_deps("luminaria")
-    add_files("src/xwayland/xwayland.cppm", {public = true})
-    add_packages("xcb", {public = true})
-
 target("luminaria-text")
     set_kind("static")
     luminaria_defaults()
@@ -379,8 +372,6 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
             add_deps("luminaria-gpu")
         elseif desktop_tests[name] then
             add_deps("luminaria-desktop")
-        elseif name == "test_xwayland" then
-            add_deps("luminaria-xwayland")
         else
             add_deps("luminaria")
         end

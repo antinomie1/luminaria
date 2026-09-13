@@ -4,7 +4,7 @@
 
 ## 定位与设计目标
 
-**有主见的库**：抽象程度落在“基于 wlroots 写”和“手写一个 X11 窗口管理器”之间。
+**有主见的纯 Wayland 机制库**：抽象层负责公共的 Wayland 运行机制，策略仍留在混成器。
 凡是每个混成器都得写一遍、写错就是 bug 的公共账本（帧调度、damage 记账、遮挡剔除、
 fence 编排、光标合成），库替你写好；凡是构成“这个混成器是什么样子”的决定
 （窗口摆在哪、怎么平铺、快捷键、工作区），一律不进来。你仍然自己写每一帧的循环。
@@ -15,7 +15,7 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 - **内存安全靠构造，不靠小心** — 每个 C 句柄 RAII 包装，每个信号监听析构自动摘链，
   没有一处手写 `wl_list_remove`。目标是让悬空指针那一族错误**写不出来**，而不是靠代码评审
   逮住。
-- **API 简洁明了** — 30 个协议对象（wlroots 是 73 个），四个按能力付费的 module，
+- **API 简洁明了** — 30 个协议对象（wlroots 是 73 个），三个按能力付费的 module，
   一层 `Result<T>`，异常不跨 C 边界。
 - **完整到能日常用** — 而不是停在“能跑个 demo”。
 
@@ -139,12 +139,11 @@ src/backend/             backend output input_event session drm headless libinpu
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
 src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
 src/protocol/            30 个 Wayland global，一个一文件
-src/xwayland/            `luminaria.xwayland`，X11 桥
 src/detail/wayland_fwd.h 唯一剩下的头文件
 ```
 
-四个公开 module 的边界见 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)：
-只用 `import luminaria;` 不会编译或链接 Vulkan、libdrm、libinput、libseat、GBM 或 xcb；
+三个公开 module 的边界见 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)：
+只用 `import luminaria;` 不会编译或链接 Vulkan、libdrm、libinput、libseat 或 GBM；
 桌面专用的三个高权限协议也不会进入基础接口。扩展 module 会 `export import luminaria`，
 所以需要 GPU 的下游只写 `import luminaria.gpu;` 即可。
 

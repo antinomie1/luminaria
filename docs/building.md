@@ -16,13 +16,6 @@ sudo dnf install -y \
   libinput-devel libseat-devel systemd-devel
 ```
 
-Xwayland（可选）：
-
-```sh
-sudo dnf install -y \
-  xorg-x11-server-Xwayland libxcb-devel xcb-util-wm-devel
-```
-
 编译需 **clang ≥ 22**（`xmake f --toolchain=clang`）或 **gcc ≥ 16** —— 更早的版本编不动
 模块分区。目前实际验证过的是 clang 22：库、示例与全部测试构建通过，`xmake test` 全绿。
 另需 Vulkan、xkbcommon、
@@ -98,4 +91,3 @@ buffer；`wf-recorder` 逐帧拉流。示例 compositor 已注册截图 manager 
 输出的 capture 回调。
 
 ---
-

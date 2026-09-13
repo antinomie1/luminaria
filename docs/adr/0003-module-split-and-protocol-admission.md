@@ -1,11 +1,10 @@
-# 切成四个 module，并给核心 module 定一条协议准入标准
+# 切成三个 module，并给核心 module 定一条协议准入标准
 
-`import luminaria;` 不再意味着链上 Vulkan + libdrm + libinput + libseat + xcb 全家桶。
+`import luminaria;` 不再意味着链上 Vulkan + libdrm + libinput + libseat 全家桶。
 交付面切成：
 
 - **`luminaria`** — 协议对象 + 核心 + headless 后端。
 - **`luminaria.gpu`** — Vulkan 渲染器、DRM/KMS 后端、dmabuf、explicit sync、直出。
-- **`luminaria.xwayland`** — X11 桥。
 - **`luminaria.desktop`** — 桌面外壳组件专用协议（见下）。
 
 ## 准入标准
@@ -23,8 +22,8 @@
 ## 为什么切三刀而不是更细
 
 更细就变成第二个 wlroots 的 meson option 地狱：几十个开关、组合爆炸、大部分组合没人测过。
-三刀对应三个真实存在的部署形态（嵌套/无头的下游、裸机 GPU 混成器、要 X11 兼容的桌面），
-第四个 module 对应"我是桌面外壳"这一个身份。
+三刀对应三个真实存在的部署形态（嵌套/无头的下游、裸机 GPU 混成器、桌面外壳）。X11
+兼容不是 luminaria 的部署形态，而是由需要它的上层 compositor 通过外部适配器处理。
 
 C++ module 无法条件化 `export import`，所以这是**分模块**而不是编译期开关——下游 `import`
 什么就付什么依赖，这也是低资源目标的一部分：不装载的东西不占内存。

@@ -48,22 +48,22 @@
    - [9.4 SessionLock (锁屏)](#94-sessionlock-锁屏)
    - [9.5 InputMethod (输入法引擎)](#95-inputmethod-输入法引擎)
    - [9.6 DesktopGlobals 便捷装配](#96-desktopglobals-便捷装配)
-10. [X11 桥接 (`luminaria.xwayland`)](#10-x11-桥接-luminariaxwayland)
-11. [架构约束、生命周期与安全规矩](#11-架构约束生命周期与安全规矩)
+10. [架构约束、生命周期与安全规矩](#10-架构约束生命周期与安全规矩)
 
 ---
 
 ## 1. 架构概述与核心设计哲学
 
-Luminaria 定位为**有主见的 Wayland 混成器 C++23 库**。抽象层次介于裸写 wlroots 与纯自研 X11 窗口管理器之间。
+Luminaria 定位为**有主见的纯 Wayland 机制 C++23 库**：公共机制由库提供，窗口布局与
+策略由上层混成器决定。
 
 ```
 +-------------------------------------------------------------------------+
 |                        Compositor Application                           |
 |  (Window Placement, Tiling, Workspace Policy, Keybindings, Workflows)   |
 +------------------------------------+------------------------------------+
-|       luminaria.desktop            |         luminaria.xwayland         |
-| (Workspace, ForeignToplevel, Lock) |    (Xwayland fork/exec, XWM)       |
+|       luminaria.desktop            |                                    |
+| (Workspace, ForeignToplevel, Lock) |                                    |
 +------------------------------------+------------------------------------+
 |                         luminaria.gpu                                   |
 |   (VulkanRenderer, Frame Ledger, DirectScanout, DRM, Libinput, Session) |
@@ -93,10 +93,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 | 模块名称 | 职责边界与依赖要求 | 典型应用场景 |
 |---|---|---|
-| `import luminaria;` | 核心主接口。无 Vulkan/DRM/Libinput/Libseat/XCB 依赖。包含 Display/EventLoop、核心协议、CPU 合成、Scene 表、Nested/Headless 后端。 | 基础混成器、无头测试、软件渲染、CI 测试环境 |
+| `import luminaria;` | 核心主接口。无 Vulkan/DRM/Libinput/Libseat 依赖。包含 Display/EventLoop、核心协议、CPU 合成、Scene 表、Nested/Headless 后端。 | 基础混成器、无头测试、软件渲染、CI 测试环境 |
 | `import luminaria.gpu;` | GPU 与裸机扩展。依赖 Vulkan-Hpp、libdrm、libinput、libseat。包含 `Frame` 帧账本、`VulkanRenderer`、`DirectScanout`、DRM/Libinput 后端与显式同步。 | 生产级裸机混成器、GPU 加速嵌套混成器 |
 | `import luminaria.desktop;` | 桌面特权协议扩展。包含工作区、任务栏控制、剪贴板管理、锁屏与输入法引擎协议。 | 完整桌面环境（Panel、Dock、Lockscreen） |
-| `import luminaria.xwayland;` | X11 兼容桥接。管理 Xwayland 进程并桥接基础 XWM。 | 运行传统 X11 客户端 |
 
 ---
 
@@ -404,16 +403,10 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ---
 
-## 10. X11 桥接 (`luminaria.xwayland`)
-
-- **`Xwayland`** (`luminaria.xwayland`):
-  - `static Result<Xwayland> create(Display& display, Compositor& compositor)`: 启动 Xwayland 进程并建立双向 Socket。
-  - `Signal<XwaylandReady>& ready()`: X Server 启动并设置 `$DISPLAY` 完成信号。
-  - 内置极简 XWM，自动响应 MapRequest 与 ConfigureRequest。
+## 10. 架构约束、生命周期与安全规矩
 
 ---
 
-## 11. 架构约束、生命周期与安全规矩
 
 为确保系统稳健性，使用 Luminaria 时必须严格遵守以下法则：
 

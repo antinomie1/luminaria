@@ -8,9 +8,9 @@ Luminaria: a minimal Wayland compositor **library** in modern C++23, built on to
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
 built with xmake. Roughly wlroots-shaped but far smaller (30 protocol types vs wlroots' 73).
 
-It ships as four **C++23 named modules** with no public headers: `luminaria` is the
+It ships as three **C++23 named modules** with no public headers: `luminaria` is the
 dependency-light protocol/core interface, with opt-in `luminaria.gpu`, `luminaria.desktop`
-and `luminaria.xwayland` extensions.
+extension.
 All prose docs are in Chinese. `README.md` is the introduction only — no technical detail.
 `CONTEXT.md` is the glossary (what "混成器"/"合成"/"布局" mean here, and what they don't);
 `docs/architecture.md` is the layering, module structure and the rules that bite;
@@ -18,7 +18,7 @@ All prose docs are in Chinese. `README.md` is the introduction only — no techn
 decisions and why; `TODO.md` is the open work in execution order.
 
 **Four ADRs set the current direction:** no retained scene graph, generational identities for
-retained surfaces, a four-way module split with an admission rule for the core module, and no
+retained surfaces, a three-way module split with an admission rule for the core module, and no
 API stability before 1.0. The first three are implemented. Read `docs/adr/` before designing
 anything structural.
 
@@ -67,7 +67,6 @@ src/backend/             backend output input_event session drm headless libinpu
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
 src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
-src/xwayland/            `luminaria.xwayland`, the X11 bridge
 src/detail/wayland_fwd.h the one remaining header
 ```
 
@@ -254,8 +253,6 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   in the global coordinate space, in *logical* units (`transform.cppm` holds the
   logical↔device mapping and nothing else does). `region.cppm` is the disjoint-box set both
   damage and wl_region are built on.
-- **`xwayland`** — spawns Xwayland plus a minimal XWM over xcb.
-
 Per-frame flow in a compositor built on this (see `examples/tinyluminaria.cpp`,
 `examples/tty_compositor.cpp`): `Output::frame` fires → `Frame::begin(view)` → one
 `Frame::place(surface, x, y)` per mapped toplevel (which expands its subsurface tree),
@@ -310,7 +307,7 @@ example compositors show the shape.
   `Status` (`fail("msg")`, `ok()`). Vulkan-Hpp throws internally; every `VulkanRenderer`
   method catches at its boundary and converts to `Result`.
 - **The exported interface is C-header-free.** `wl_display`, `wl_resource`, etc. are forward-declared
-  only; all libwayland/Vulkan/xcb includes live in the global module fragment. Protocol globals
+  only; all libwayland/Vulkan includes live in the global module fragment. Protocol globals
   use a pimpl (`struct Impl` declared public, defined below the implementation divider) so their address is stable for the
   `wl_global` user-data pointer, while the wrapper stays move-only.
 - **Lifetime via RAII, never manual list surgery.** `Signal<E>::Connection` disconnects on
@@ -372,7 +369,7 @@ example compositors show the shape.
    GPU/desktop extensions use their module name, `import luminaria;`, and sibling partition
    imports as needed. Keep the graph acyclic.
 4. Add the file to the corresponding xmake target and `export import :<name>;` to that
-   target's primary interface (`src/luminaria*.cppm`). Xwayland is a standalone primary unit.
+   target's primary interface (`src/luminaria*.cppm`).
 5. Drop a test in `tests/` — `xmake.lua` turns every `tests/test_*.cpp` into its own binary
    automatically. Exit 77 to skip when the machine cannot run it.
 

@@ -69,7 +69,8 @@ public:
     /// must outlive this manager.
     void track(XdgShell& shell);
 
-    /// Publish one window that `track()` cannot see (an Xwayland window, say).
+    /// Publish one window that `track()` cannot see (for example, one owned by
+    /// an external integration).
     /// Same lifecycle rules: it appears on map and vanishes on unmap/destroy.
     void add(Toplevel& toplevel);
 

@@ -3,11 +3,10 @@
 //     import luminaria;          // core protocols + nested/headless backends
 //     import luminaria.gpu;      // Vulkan, DRM/input/session and GPU protocols
 //     import luminaria.desktop;  // privileged desktop-shell protocols
-//     import luminaria.xwayland; // X11 bridge
 //
 // This is the dependency-light primary interface. Everything below is one of
 // its partitions, one per concept, and each partition file holds both its
-// interface and implementation. Consumers name one of the four public modules,
+// interface and implementation. Consumers name one of the three public modules,
 // never a partition.
 //
 // C libraries stay in each unit's global module fragment, so importing a module

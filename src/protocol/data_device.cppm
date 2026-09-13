@@ -41,7 +41,7 @@ class Seat;
 /// Whoever currently owns a selection. Ordinarily that is a client's
 /// wl_data_source and this type never appears; it exists so that code OUTSIDE
 /// the protocol can put something on the clipboard — a data-control client
-/// (see :data_control), a clipboard manager, an X11 bridge — and have pasting
+/// (see :data_control), a clipboard manager, or another Wayland integration — and have pasting
 /// clients see it as an ordinary offer.
 ///
 /// The manager holds it non-owningly and never reads the bytes: `send` gets the
