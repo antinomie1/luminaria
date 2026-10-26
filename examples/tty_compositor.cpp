@@ -98,13 +98,10 @@ int main(int argc, char** argv) {
     const char* env = std::getenv("LUMINARIA_DRM_DEVICE");
     const char* device = argc > 1 ? argv[1] : env;
 
-    // Before the Display: surfaces cache GPU textures owned by this renderer,
-    // and locals are destroyed in reverse order.
-    auto renderer = luminaria::VulkanRenderer::create();
-    if (!renderer) {
-        std::fprintf(stderr, "luminaria-tty: vulkan: %s\n", renderer.error().message.c_str());
-        return 1;
-    }
+    // Declared before the Display: surfaces cache GPU textures owned by this
+    // renderer, and locals are destroyed in reverse order. Created only once
+    // the card is open, so it can be the GPU that card belongs to.
+    std::optional<luminaria::VulkanRenderer> renderer;
 
     auto display = luminaria::Display::create();
     if (!display) {
@@ -143,6 +140,15 @@ int main(int argc, char** argv) {
                    : luminaria::DrmBackend::create(display->event_loop(), seat_session);
     if (!drm) {
         std::fprintf(stderr, "luminaria-tty: drm: %s\n", drm.error().message.c_str());
+        return 1;
+    }
+    if (auto r = luminaria::VulkanRenderer::create({luminaria::drm_device_id(drm->fd())})) {
+        renderer.emplace(std::move(*r));
+        std::printf("luminaria-tty: renderer = %.*s\n",
+                    static_cast<int>(renderer->device_name().size()),
+                    renderer->device_name().data());
+    } else {
+        std::fprintf(stderr, "luminaria-tty: vulkan: %s\n", r.error().message.c_str());
         return 1;
     }
     auto input = luminaria::LibinputBackend::create(display->event_loop(), seat_session);

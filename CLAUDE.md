@@ -174,7 +174,15 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   (wlr-data-control, bridged into `data_device` through `SelectionSource`),
   `session_lock` (ext-session-lock, which fails CLOSED: a lock client that dies leaves
   the session locked), `input_method` (input-method-v2, bridged to `text_input`).
-- **`vulkan`** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
+- **`vulkan`** — Vulkan 1.3 is the floor (ADR 0007): the instance asks for 1.3, features are
+  queried and enabled through one `StructureChain<Features2, Vulkan11, Vulkan12, Vulkan13>`
+  (synchronization2, dynamicRendering, timelineSemaphore), and a device without them is
+  turned down with its reason in the error. The physical device is chosen, not
+  `devices.front()`: `VulkanOptions::drm_device` (`drm_device_id(fd|path)`, `DrmBackend::fd()`)
+  makes the GPU behind the display's DRM node win via `VK_EXT_physical_device_drm`, otherwise
+  dmabuf support then discrete > integrated > virtual > CPU. `LUMINARIA_VK_VALIDATION=1` loads
+  `VK_LAYER_KHRONOS_validation` with a debug-utils messenger on stderr; the suite must stay
+  silent under it (plus `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`). Two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs
   are in the output's *logical* coordinates; the `OutputMapping` (scale + transform) turns
@@ -185,17 +193,22 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   Both rest on `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`.
   `render_to` scissors each *disjoint* damage box separately (a `Region`, not a bounding
   box), skips anything hidden behind a `GpuTextureFill::opaque` rect, and — given a
-  `RenderSync` — waits on client acquire fences as `VkSemaphore`s and hands back a
-  sync_file instead of stalling. Unfinished submits live in `Impl::in_flight` until their
-  fence clears. Each texture's descriptor set is written once and cached on the
+  `RenderSync` — waits on client acquire fences as `VkSemaphore`s (at the fragment stage;
+  the display's out-fence at colour output) and hands back a sync_file instead of stalling.
+  Rendering is dynamic rendering (`beginRendering`, load-vs-clear is the `loadOp`, pipelines
+  carry a `PipelineRenderingCreateInfo`); barriers are synchronization2 and go out as one
+  `pipelineBarrier2` per pass; submits are `submit2`. Every submit signals the next value of
+  one timeline semaphore, and unfinished submits live in `Impl::in_flight` until its counter
+  passes theirs. Each texture's descriptor set is written once and cached on the
   `GpuTexture` (the view it binds never changes); dead textures' sets go back on a free
   list, but only once every submit that could still be sampling through them has
-  retired — `Impl::reap()` gates that on the oldest surviving `in_flight` index.
+  retired — `Impl::reap()` gates that on the timeline counter.
   **A steady-state `render_to` allocates nothing** (`tests/test_render_alloc.cpp` counts it,
-  the same way `test_frame` does for the shell): the regions are `Impl` scratch, the
-  framebuffers are built once per render pass on the `ScanoutTarget`, and command buffers,
-  fences and the semaphore list come off free lists that `reap()` refills when a submit's
-  fence clears. `Region::subtract`/`intersect` ping-pong two buffers for the same reason —
+  the same way `test_frame` does for the shell): the regions and the barrier list are `Impl`
+  scratch, dynamic rendering needs no framebuffer at all, and command buffers and the
+  semaphore list come off free lists that `reap()` refills as the timeline advances
+  (`test_render_alloc` unsets `LUMINARIA_VK_VALIDATION`: the layer allocates through the
+  replaced `operator new`). `Region::subtract`/`intersect` ping-pong two buffers for the same reason —
   they used to move-assign a fresh vector, which is an allocation per call per surface.
 - **shell** — the opinionated half, and deliberately immediate-mode: there is no retained
   tree (ADR 0001). `Frame` (`shell/frame.cppm`) is the per-output ledger a compositor

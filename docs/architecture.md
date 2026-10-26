@@ -33,10 +33,12 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   没人要，就没有 vblank 订阅、没有内核回调、没有进程唤醒——静止的屏幕在这一层是零开销。
   DRM 的帧来自翻页完成，嵌套的来自父混成器的 frame callback，headless 的定时器不再自己续。
 - **protocol** — 每个 Wayland global 一个分区，见 [features.md](./features.md)。
-- **render** — Vulkan。GPU 路径：客户端 dmabuf 零拷贝导入成纹理 → 合成进一块导出为 dmabuf 的
+- **render** — Vulkan 1.3（[ADR 0007](./adr/0007-vulkan-1.3-minimum.md)）：动态渲染、
+  synchronization2、一条 timeline semaphore 回收提交；物理设备优先选与显示同一块 DRM 设备的
+  那块（`VulkanOptions::drm_device`）。GPU 路径：客户端 dmabuf 零拷贝导入成纹理 → 合成进一块导出为 dmabuf 的
   `ScanoutTarget` → KMS 直接扫描输出，全程无 CPU 读回。CPU 路径（`composite()`）保留给无
   dmabuf 的后端与截图。整窗特效的中间结果落在 `OffscreenTarget`：它既是 render target 也是
-  `GpuTexture`，写完停在 shader-read layout，下一趟可直接采样；两个路径共用 render pass、
+  `GpuTexture`，写完停在 shader-read layout，下一趟可直接采样；两个路径共用同一趟渲染、
   damage、遮挡剔除与显式同步，区别只在 scanout target 需要交还 display queue（ADR 0005）。
   compositor-owned texture 还能换成自定义 SPIR-V fragment stage；`ShaderDamage` 是强制契约，
   `full` 让 `Frame` 整帧失效，`continuous` 再预约下一帧，任何这类摆位都不能 direct scanout（ADR 0006）。
@@ -207,7 +209,7 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
   ICE（改成成员形式），`std::function` / `std::make_shared` 要求每个实例化点都能看见
   `<typeinfo>`，不像头文件那样继承得到。
 - **异步同步链路需要 GPU 支持 `VK_KHR_external_semaphore_fd`**。没有它时
-  `render_to()` 退回 fence 阻塞，功能不变、延迟变差；同理驱动缺 `IN_FENCE_FD` /
+  `render_to()` 退回 CPU 等 timeline semaphore，功能不变、延迟变差；同理驱动缺 `IN_FENCE_FD` /
   `OUT_FENCE_PTR` 属性时那两段自动跳过。
 - **`Region` 不合并相邻矩形**（O(n) 矩形向量）。真实负载让矩形数量成为问题时换
   `pixman_region32`；已在源码里标了 `ponytail:`。

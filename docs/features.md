@@ -69,7 +69,9 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| render | Vulkan-Hpp RAII：纯色背景、矩形填充、客户端纹理合成（真 GPU 读回验证） | vulkan, composite, texture |
+| render | Vulkan-Hpp RAII，**Vulkan 1.3 起步**：特性走 `StructureChain` 查询后只开 `synchronization2` / `dynamicRendering` / `timelineSemaphore`；纯色背景、矩形填充、客户端纹理合成（真 GPU 读回验证） | vulkan, composite, texture |
+| render | **物理设备选择**：`VulkanOptions::drm_device`（`drm_device_id(fd\|path)`、`DrmBackend::fd()`）优先选 `VK_EXT_physical_device_drm` 与显示同一块 DRM 设备的 GPU，否则 dmabuf 能力优先、独显 > 集显 > 虚拟 > CPU；不满足 1.3 的设备逐个说明原因；`on_drm_device()` 报告是否匹配 | vulkan_device |
+| render | **可选校验**：`LUMINARIA_VK_VALIDATION=1` 加载 `VK_LAYER_KHRONOS_validation` + `VK_EXT_debug_utils` messenger 打到 stderr；层不存在时照常运行。整套测试（含同步校验）零告警 | 全部 GPU 测试 |
 | render | 纹理裁剪 — 部分越界的 surface 只渲染可见部分（之前跨输出边缘直接丢弃） | texture |
 | render | **GPU 合成链**：`GpuTexture`（客户端 dmabuf 零拷贝导入 / shm 上传一次）→ `render_to()` 直接合成进 `ScanoutTarget` —— 一块用 `VK_EXT_image_drm_format_modifier` 分配、再导出成 dmabuf 的 Vulkan 渲染目标。整条链没有一次 CPU 读回 | gpu-scanout |
 | present | `Output::import_scanout(dmabuf)` / `commit_scanout(id, in_fence)` —— 渲染目标即 KMS framebuffer（`drmModeAddFB2WithModifiers`），双缓冲 atomic 翻页；渲染 out-fence 作为 `IN_FENCE_FD` 交给显示硬件，`OUT_FENCE_PTR` 经 `take_present_fence()` 反向喂回下一帧 | gpu-scanout |
@@ -82,13 +84,13 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | render | **连续几何**：`GpuTextureFill` 与 compositor-owned `Placement` 用 float x/y/width/height；vertex shader 保留小数，damage 与 scissor 对覆盖范围向外取整，所以半像素动画既平滑也不会留下旧像素 | gpu-scanout, offscreen |
 | render | **可组合摆位变换**：`PlacementTransform::at(...).crop(...).rescale(...).relocate(...).opacity(...)` 把 normalized crop、缩放、位移与整张纹理透明度收成不可变值对象；客户端表面树、普通 compositor texture 与 `compose_group()` 的离屏整窗结果共用一条路径，缩放树的命中测试会反变换回客户端坐标 | frame, offscreen |
 | render | **遮挡剔除**：`GpuTextureFill::opaque` 声明的不透明区从前往后累积，被完全盖住的表面一次都不采样 —— 最大化窗口下的壁纸不进 GPU | gpu-scanout |
-| render | **异步提交**：`RenderSync` 让 `render_to` 等一组 sync_file（客户端 acquire point）并吐出 out-fence，自己不阻塞；未完成的提交挂在 in-flight 列表上按 fence 回收 | gpu-scanout |
+| render | **异步提交**：`RenderSync` 让 `render_to` 等一组 sync_file（客户端 acquire point）并吐出 out-fence，自己不阻塞；未完成的提交挂在 in-flight 列表上，按一条 timeline semaphore 的计数回收；synchronization2 屏障 + `submit2`，客户端 fence 只挡 fragment 阶段、显示 out-fence 只挡颜色输出 | gpu-scanout |
 | render | **纹理缓存**：`Frame` 的 GPU bridge 按 `SurfaceId` + `wl_buffer` 缓存。dmabuf 导入是客户端内存的实时视图，跨帧保留；shm 上传是快照，客户端重绘时才重传；表面销毁后旧 id 立即失效，旧 placement 再 submit 也不会碰悬空纹理 | frame, texture-cache |
 | render | **光标主题**：自带 XCursor 解析器（`cursor_theme.cpp`），读 `/usr/share/icons/<主题>/cursors`，支持主题继承与动画帧。不依赖 libXcursor / X11 | cursor-theme |
 | render | **纹理四边形管线**（取代原先的 blit）：每个 surface 一次 draw，位置/UV 全走 push constant。由此一并拿到 **整数 scale**、**8 种 transform 全部（含 90/270 转置）**、以及**真正的 alpha 混合**（预乘 `ONE`/`ONE_MINUS_SRC_ALPHA`）。SPIR-V 由 `glslangValidator --vn` 编进二进制 | gpu-scanout |
 | present | `Output::commit_frame(pixels)` 呈现渲染帧（headless 存帧，DRM 写 dumb buffer）—— 保留给无 dmabuf 的降级路径 | render-output |
 | render | **描述符集按纹理缓存**：一个纹理绑定的 image view 终生不变，所以描述符集只在它第一次被画时写一次，之后每帧只是 `bindDescriptorSets`。此前是每帧新建一个描述符池、每个 fill 分配并重写一次描述符 —— 一屏没动过的窗口每秒重写六十遍。纹理销毁后描述符集进空闲表复用，但要等到所有可能仍在采样它的提交都完成（按提交序号比对 in-flight 队列），否则会改掉正在飞行中的那一帧 | texture-cache |
-| render | **每帧零堆分配**：`render_to()` 的 region 是渲染器自己的 scratch，framebuffer 按 render pass 挂在 `ScanoutTarget` 上建一次，command buffer 与 fence 走按提交 fence 回收的空闲表，连导入信号量的那个 vector 都跟着提交槽复用。`Region` 的 subtract/intersect 也改成两块缓冲乒乓——原先每次都是一次分配加一次释放，而遮挡剔除每个表面要做好几次 | render-alloc |
+| render | **每帧零堆分配**：`render_to()` 的 region 与屏障表是渲染器自己的 scratch，动态渲染根本不需要 framebuffer，command buffer 走按 timeline 回收的空闲表，连导入信号量的那个 vector 都跟着提交槽复用。`Region` 的 subtract/intersect 也改成两块缓冲乒乓——原先每次都是一次分配加一次释放，而遮挡剔除每个表面要做好几次 | render-alloc |
 | render | `read_scanout()` —— 需要 CPU 像素时（嵌套 wl_shm 呈现、screencopy）从渲染目标**自己的 VkImage** 拷出，暂存 buffer 建一次并常驻映射，优先要 HOST_CACHED 内存。之前每帧重新 import 一遍自己的 dmabuf 再从非缓存内存逐像素读，800×600 要 90ms —— 指针拖动卡顿就是它 | gpu-scanout |
 
 ## 后端

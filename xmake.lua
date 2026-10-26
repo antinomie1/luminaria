@@ -354,6 +354,7 @@ local gpu_tests = {
     test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,
     test_screencopy_bounds = true, test_session = true, test_syncobj = true,
     test_texture = true, test_texture_cache = true, test_vulkan = true,
+    test_vulkan_device = true,
     test_wayland_nested = true,
 }
 local desktop_tests = {

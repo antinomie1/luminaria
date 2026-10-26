@@ -23,6 +23,20 @@ libdrm、libinput、libudev、**libseat**、wayland-protocols，外加
 **`glslangValidator`（glslang 包）**—— 渲染器的纹理四边形管线用它把 GLSL 编成 SPIR-V 并
 直接嵌进二进制（运行时不读 shader 文件）。
 
+运行 GPU 路径需要 **Vulkan 1.3** 驱动（loader 与设备都要 1.3，见
+[ADR 0007](./adr/0007-vulkan-1.3-minimum.md)），并支持 `VK_KHR_external_memory_fd`、
+`VK_EXT_external_memory_dma_buf`、`VK_EXT_image_drm_format_modifier`。Mesa 的 RADV / ANV /
+NVK / Turnip 与 NVIDIA 专有驱动都满足；没有的机器上 `VulkanRenderer::create()` 报错说明原因，
+`SceneRenderer` 退到 CPU 合成。
+
+调试渲染器时设 `LUMINARIA_VK_VALIDATION=1` 打开 `VK_LAYER_KHRONOS_validation`（需另装
+`vulkan-validation-layers`），告警打到 stderr；再加 `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`
+连同步一起校验。测试套件在两者下都应零告警：
+
+```sh
+LUMINARIA_VK_VALIDATION=1 VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true xmake test
+```
+
 光标主题不需要 libXcursor：XCursor 文件格式的解析器就在
 `cursor_theme.cppm` 里（含主题继承与动画帧），免去把 X11 拖进 Wayland
 compositor。

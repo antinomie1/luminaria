@@ -63,6 +63,9 @@ private:
 class SceneRenderer {
 public:
     SceneRenderer();
+    /// As above, with the options the Vulkan renderer is created with — the
+    /// DRM device to prefer, on a bare-metal compositor.
+    explicit SceneRenderer(const VulkanOptions& options);
     ~SceneRenderer();
     SceneRenderer(SceneRenderer&&) noexcept;
     SceneRenderer& operator=(SceneRenderer&&) noexcept;
@@ -351,8 +354,10 @@ SceneOutput& SceneOutput::operator=(SceneOutput&&) noexcept = default;
 
 bool SceneOutput::gpu_output() const noexcept { return impl_->frame.has_value(); }
 
-SceneRenderer::SceneRenderer() : impl_(std::make_unique<Impl>()) {
-    Result<VulkanRenderer> gpu = VulkanRenderer::create();
+SceneRenderer::SceneRenderer() : SceneRenderer(VulkanOptions{}) {}
+
+SceneRenderer::SceneRenderer(const VulkanOptions& options) : impl_(std::make_unique<Impl>()) {
+    Result<VulkanRenderer> gpu = VulkanRenderer::create(options);
     if (gpu) {
         impl_->gpu = std::make_unique<VulkanRenderer>(std::move(*gpu));
     } else {

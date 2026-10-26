@@ -131,7 +131,14 @@ int main() {
         gbm_device* g = gbm_create_device(render_fd);
         assert(g != nullptr);
         const int W = 4, H = 4;
-        gbm_bo* bo = gbm_bo_create(g, W, H, GBM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING);
+        // With an explicit modifier from the renderer's own list: a plain
+        // gbm_bo_create may answer DRM_FORMAT_MOD_INVALID (implicit), which
+        // Vulkan cannot import as an explicit-modifier image at all.
+        const std::vector<std::uint64_t> mods = renderer->dmabuf_modifiers(GBM_FORMAT_ARGB8888);
+        assert(!mods.empty());
+        gbm_bo* bo = gbm_bo_create_with_modifiers2(g, W, H, GBM_FORMAT_ARGB8888, mods.data(),
+                                                   static_cast<unsigned>(mods.size()),
+                                                   GBM_BO_USE_RENDERING);
         assert(bo != nullptr);
         const uint64_t mod = gbm_bo_get_modifier(bo);
         int bfd = gbm_bo_get_fd(bo);

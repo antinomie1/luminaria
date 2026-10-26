@@ -4,8 +4,8 @@
 // allocates nothing. The renderer used to be the other half of the story: every
 // `render_to()` built a `Region` or three, a `vk::raii::Framebuffer`, a command
 // buffer and a fence, freed them all, and did it again 1/60s later. Now the
-// regions are the renderer's scratch, the framebuffers live on the target, and
-// command buffers and fences come off free lists gated on their submit's fence.
+// regions are the renderer's scratch, dynamic rendering needs no framebuffer at
+// all, and command buffers come off a free list gated on the timeline semaphore.
 //
 // So: warm everything up, then count C++ heap allocations across a run of
 // identical frames. The count must be zero. (This cannot see what the Vulkan
@@ -71,6 +71,11 @@ void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 int main() {
+    // The validation layer runs in this process and is C++: it allocates
+    // through the operator new replaced above, and every one of its
+    // allocations would be counted against the renderer. Validate the renderer
+    // in any other test; this one measures it.
+    unsetenv("LUMINARIA_VK_VALIDATION");
     auto renderer = luminaria::VulkanRenderer::create();
     if (!renderer) {
         std::fprintf(stderr, "skip: %s\n", renderer.error().message.c_str());
@@ -134,7 +139,7 @@ int main() {
     assert(spent == 0);
 
     // The other path: an out-fence, so the render is not waited for and its
-    // command buffer, fence and semaphores live in the in-flight list until
+    // command buffer and semaphores live in the in-flight list until
     // the GPU retires them. That is how a real display runs — the free lists
     // have to come back round there too.
     int out_fence = -1;

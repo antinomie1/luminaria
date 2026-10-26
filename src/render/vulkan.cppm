@@ -8,8 +8,12 @@
 module;
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
-#include <unistd.h> // dup
+#include <sys/stat.h>      // fstat/stat: which DRM device an fd or path is
+#include <sys/sysmacros.h> // gnu_dev_major/minor: vulkan.hpp #undefs the macros
+#include <unistd.h>        // dup
 #include <drm_fourcc.h>
 #include <vulkan/vulkan_raii.hpp>
 #include "quad_frag_spv.h"
@@ -342,10 +346,49 @@ struct RenderSync {
     int* out_fence_fd = nullptr;
 };
 
+/// A DRM device node's identity — `st_rdev` of /dev/dri/cardN or renderDN.
+/// It is how the renderer and the display find out they are the same GPU.
+struct DrmDeviceId {
+    std::uint32_t major = 0;
+    std::uint32_t minor = 0;
+};
+
+/// The DRM device an open fd (card or render node) or a device path refers to.
+/// Empty if it is not a character device.
+[[nodiscard]] std::optional<DrmDeviceId> drm_device_id(int fd) noexcept;
+[[nodiscard]] std::optional<DrmDeviceId> drm_device_id(const std::string& path) noexcept;
+
+struct VulkanOptions {
+    /// The DRM device the compositor scans out through. The physical device
+    /// whose primary or render node this is (VK_EXT_physical_device_drm) wins
+    /// over every other, because only it can import the display's buffers and
+    /// render into ones the display can scan out without a copy. If no device
+    /// matches — a display-only KMS device next to a separate GPU — the usual
+    /// ranking decides instead of failing.
+    std::optional<DrmDeviceId> drm_device;
+};
+
 class VulkanRenderer {
 public:
-    /// Bring up an instance + device. Fails if no Vulkan device is available.
+    /// Bring up a Vulkan 1.3 instance + device. Fails if no physical device
+    /// offers Vulkan 1.3 with synchronization2, dynamic rendering and timeline
+    /// semaphores; the error lists why each one was turned down.
+    ///
+    /// Without a DRM device to match, a device with the dmabuf extensions
+    /// beats one without, then discrete > integrated > virtual > CPU.
+    ///
+    /// `LUMINARIA_VK_VALIDATION=1` turns on VK_LAYER_KHRONOS_validation and
+    /// logs its messages to stderr; nothing requires the layer to exist.
     [[nodiscard]] static Result<VulkanRenderer> create();
+    [[nodiscard]] static Result<VulkanRenderer> create(const VulkanOptions& options);
+
+    /// The chosen physical device, as the driver names it.
+    [[nodiscard]] std::string_view device_name() const noexcept;
+
+    /// True when `VulkanOptions::drm_device` was given and the chosen device
+    /// is that DRM device. False means the ranking chose instead, and buffers
+    /// crossing between the display and this GPU may not import.
+    [[nodiscard]] bool on_drm_device() const noexcept;
 
     ~VulkanRenderer();
     VulkanRenderer(VulkanRenderer&&) noexcept;
@@ -581,12 +624,12 @@ namespace luminaria {
 
 /// The textured-quad pipeline: one draw per surface, positioned by push
 /// constants. Built once per target format and kept — compiling a pipeline every
-/// frame would cost more than the frame.
+/// frame would cost more than the frame. Dynamic rendering means a pipeline
+/// names its attachment format and nothing else, so load-versus-clear is a
+/// per-pass `loadOp` rather than a render pass object per mode.
 struct QuadPipeline {
     vk::Format format;
     vk::raii::PipelineLayout layout;
-    vk::raii::RenderPass load_pass;  // partial repaint: keep what is there
-    vk::raii::RenderPass clear_pass; // full repaint: contents are undefined
     vk::raii::Pipeline pipeline;
     vk::raii::Pipeline solid;   // solid-colour quads: no descriptor binding
     vk::raii::Pipeline rounded; // ... with the corners cut out
@@ -601,21 +644,19 @@ struct EffectPipeline {
     vk::raii::Pipeline pipeline;
 };
 
-/// One submitted-but-not-waited-for render. Without the fence stall the command
+/// One submitted-but-not-waited-for render. Without the CPU wait the command
 /// buffer, its descriptors and its semaphores are still in use after render_to
-/// returns, so they live here until the fence says otherwise.
+/// returns, so they live here until the timeline semaphore passes `index`.
 ///
-/// The command buffer and the fence then go back on free lists rather than
-/// being destroyed: allocating a command buffer and creating a fence are two
-/// heap allocations per frame, sixty times a second, for objects that are
-/// identical every time. The semaphores really are per-frame — they are
-/// imported from whatever fds this frame's clients handed over — but the vector
-/// holding them is recycled with the slot.
+/// The command buffer then goes back on a free list rather than being
+/// destroyed: allocating one is a heap allocation per frame, sixty times a
+/// second, for an object that is identical every time. The semaphores really
+/// are per-frame — they are imported from whatever fds this frame's clients
+/// handed over — but the vector holding them is recycled with the slot.
 struct InFlight {
-    vk::raii::Fence fence;
     vk::raii::CommandBuffer cmd;
     std::vector<vk::raii::Semaphore> semaphores;
-    std::uint64_t index = 0; ///< submission order, for retiring descriptor sets
+    std::uint64_t index = 0; ///< the timeline value this submit signals
 };
 
 /// A descriptor set whose texture is gone. It cannot go back on the free list
@@ -629,11 +670,18 @@ struct RetiredSet {
 struct VulkanRenderer::Impl {
     vk::raii::Context context;
     vk::raii::Instance instance;
+    // After the instance, so it is destroyed first.
+    std::optional<vk::raii::DebugUtilsMessengerEXT> messenger;
     vk::raii::PhysicalDevice physical;
+    std::string device_name;
+    bool on_drm_device = false;
     std::uint32_t queue_family;
     vk::raii::Device device;
     vk::raii::Queue queue;
     vk::raii::CommandPool command_pool;
+    /// Every submit signals the next value. It replaces a fence per submit:
+    /// retiring work is one counter read, and blocking on it is one wait.
+    vk::raii::Semaphore timeline;
     bool dmabuf_ok = false;      // external-memory-dmabuf + DRM-modifier available
     bool queue_foreign = false;  // VK_EXT_queue_family_foreign available
     bool sync_fd_ok = false;     // VK_KHR_external_semaphore_fd: fences in and out
@@ -641,7 +689,7 @@ struct VulkanRenderer::Impl {
     std::vector<QuadPipeline> pipelines;
     std::vector<EffectPipeline> effect_pipelines;
     std::vector<InFlight> in_flight;
-    std::uint64_t submits = 0;
+    std::uint64_t submits = 0; ///< the last timeline value submitted
     std::uint64_t next_shader = 0;
 
     // --- per-frame objects, recycled ---
@@ -651,7 +699,6 @@ struct VulkanRenderer::Impl {
     // is that a steady-state frame allocates nothing at all, on the CPU heap or
     // in the driver.
     std::vector<vk::raii::CommandBuffer> free_cmds;
-    std::vector<vk::raii::Fence> free_fences;
     std::vector<std::vector<vk::raii::Semaphore>> free_sem_lists;
     // Scratch for render_to: cleared per frame, never released.
     Region repaint;
@@ -659,8 +706,8 @@ struct VulkanRenderer::Impl {
     Region backdrop;
     std::vector<Region> visible; ///< one per texture; only ever grows
     std::vector<vk::ClearRect> clear_rects;
-    std::vector<vk::Semaphore> wait_handles;
-    std::vector<vk::PipelineStageFlags> wait_stages;
+    std::vector<vk::ImageMemoryBarrier2> barriers;
+    std::vector<vk::SemaphoreSubmitInfo> waits;
 
     vk::raii::CommandBuffer acquire_cmd() {
         if (!free_cmds.empty()) {
@@ -675,16 +722,6 @@ struct VulkanRenderer::Impl {
         return std::move(fresh.front());
     }
 
-    vk::raii::Fence acquire_fence_object() {
-        if (!free_fences.empty()) {
-            vk::raii::Fence fence = std::move(free_fences.back());
-            free_fences.pop_back();
-            device.resetFences(*fence);
-            return fence;
-        }
-        return vk::raii::Fence{device, vk::FenceCreateInfo{}};
-    }
-
     std::vector<vk::raii::Semaphore> acquire_sem_list() {
         if (free_sem_lists.empty()) {
             return {};
@@ -692,6 +729,41 @@ struct VulkanRenderer::Impl {
         std::vector<vk::raii::Semaphore> list = std::move(free_sem_lists.back());
         free_sem_lists.pop_back();
         return list;
+    }
+
+    /// Block until the timeline reaches `value`. Throws if the device is lost.
+    void wait_for(std::uint64_t value) const {
+        const vk::Semaphore handle = *timeline;
+        const vk::SemaphoreWaitInfo info{{}, handle, value};
+        if (device.waitSemaphores(info, std::numeric_limits<std::uint64_t>::max()) !=
+            vk::Result::eSuccess) {
+            throw std::runtime_error("timeline semaphore wait failed");
+        }
+    }
+
+    /// Submit one recorded command buffer, signalling the next timeline value
+    /// (plus `extra_signal`, a binary semaphore, if given), with `wait` as the
+    /// semaphores to wait on. Returns the value it signals.
+    std::uint64_t submit(const vk::raii::CommandBuffer& cmd,
+                         std::span<const vk::SemaphoreSubmitInfo> wait = {},
+                         vk::Semaphore extra_signal = {}) {
+        const std::uint64_t value = submits + 1;
+        const vk::CommandBufferSubmitInfo cmd_info{*cmd};
+        const std::array<vk::SemaphoreSubmitInfo, 2> signal{
+            vk::SemaphoreSubmitInfo{*timeline, value, vk::PipelineStageFlagBits2::eAllCommands},
+            vk::SemaphoreSubmitInfo{extra_signal, 0, vk::PipelineStageFlagBits2::eAllCommands}};
+        const std::span<const vk::SemaphoreSubmitInfo> signals{signal.data(),
+                                                               extra_signal ? 2u : 1u};
+        const vk::SubmitInfo2 info{{}, wait, cmd_info, signals};
+        queue.submit2(info);
+        submits = value; // only once it is really queued
+        return value;
+    }
+
+    /// The one-off path: submit, wait, and put the command buffer back.
+    void submit_and_wait(vk::raii::CommandBuffer cmd) {
+        wait_for(submit(cmd));
+        free_cmds.push_back(std::move(cmd));
     }
 
     // --- descriptor sets, cached per texture ---
@@ -717,7 +789,8 @@ struct VulkanRenderer::Impl {
     vk::DescriptorSetLayout quad_set_layout();
     vk::DescriptorSet acquire_set();
 
-    /// A texture is gone; its set can be reused once nothing is reading it.
+    /// A texture is gone; its set can be reused once nothing is reading it —
+    /// that is, once the timeline passes the last submit made so far.
     void retire_set(vk::DescriptorSet set) {
         if (set) {
             retiring.push_back(RetiredSet{set, submits});
@@ -727,8 +800,9 @@ struct VulkanRenderer::Impl {
     /// Drop everything the GPU has finished with. Cheap and called once per
     /// render; the list is bounded by how many frames the display is behind.
     void reap() {
-        std::erase_if(in_flight, [this](InFlight& f) {
-            if (f.fence.getStatus() != vk::Result::eSuccess) {
+        const std::uint64_t done = timeline.getCounterValue();
+        std::erase_if(in_flight, [&](InFlight& f) {
+            if (f.index > done) {
                 return false;
             }
             // The GPU is done with this submit: the imported semaphores have
@@ -736,16 +810,12 @@ struct VulkanRenderer::Impl {
             f.semaphores.clear();
             free_sem_lists.push_back(std::move(f.semaphores));
             free_cmds.push_back(std::move(f.cmd));
-            free_fences.push_back(std::move(f.fence));
             return true;
         });
         // A retired set is safe to rewrite once every submit that could still
-        // reference it has completed. in_flight is in submission order, so the
-        // oldest survivor is the whole test.
-        const std::uint64_t oldest =
-            in_flight.empty() ? submits + 1 : in_flight.front().index;
+        // reference it has completed, and the timeline says exactly that.
         std::erase_if(retiring, [&](const RetiredSet& r) {
-            if (r.after >= oldest) {
+            if (r.after > done) {
                 return false;
             }
             free_sets.push_back(r.set);
@@ -755,17 +825,6 @@ struct VulkanRenderer::Impl {
 };
 
 namespace {
-
-// First queue family that can clear an image (graphics implies transfer+clear).
-std::uint32_t pick_graphics_family(const vk::raii::PhysicalDevice& phys) {
-    const auto families = phys.getQueueFamilyProperties();
-    for (std::uint32_t i = 0; i < families.size(); ++i) {
-        if (families[i].queueFlags & vk::QueueFlagBits::eGraphics) {
-            return i;
-        }
-    }
-    throw std::runtime_error("no graphics queue family");
-}
 
 std::uint32_t find_memory_type(const vk::raii::PhysicalDevice& phys, std::uint32_t type_bits,
                                vk::MemoryPropertyFlags want) {
@@ -778,7 +837,90 @@ std::uint32_t find_memory_type(const vk::raii::PhysicalDevice& phys, std::uint32
     throw std::runtime_error("no suitable memory type");
 }
 
+constexpr vk::ImageSubresourceRange kWholeImage{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+
+/// One synchronization2 image barrier over the whole colour image. The stage
+/// and access pairs sit next to each other here, which is most of what
+/// synchronization2 buys over the old barrier: every barrier says on its own
+/// what it waits for and what it lets through.
+vk::ImageMemoryBarrier2 image_barrier(vk::Image image, vk::PipelineStageFlags2 src_stage,
+                                      vk::AccessFlags2 src_access,
+                                      vk::PipelineStageFlags2 dst_stage,
+                                      vk::AccessFlags2 dst_access, vk::ImageLayout from,
+                                      vk::ImageLayout to,
+                                      std::uint32_t src_family = VK_QUEUE_FAMILY_IGNORED,
+                                      std::uint32_t dst_family = VK_QUEUE_FAMILY_IGNORED) {
+    return vk::ImageMemoryBarrier2{src_stage, src_access, dst_stage, dst_access, from, to,
+                                   src_family, dst_family, image, kWholeImage};
+}
+
+void barrier(const vk::raii::CommandBuffer& cmd, const vk::ImageMemoryBarrier2& b) {
+    cmd.pipelineBarrier2(vk::DependencyInfo{{}, {}, {}, b});
+}
+
+/// Copies done, now let the host read what they wrote.
+void host_read_barrier(const vk::raii::CommandBuffer& cmd) {
+    const vk::MemoryBarrier2 b{vk::PipelineStageFlagBits2::eTransfer,
+                               vk::AccessFlagBits2::eTransferWrite,
+                               vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead};
+    cmd.pipelineBarrier2(vk::DependencyInfo{{}, b, {}, {}});
+}
+
+/// LUMINARIA_VK_VALIDATION set to anything but "" or "0".
+bool validation_requested() {
+    const char* v = std::getenv("LUMINARIA_VK_VALIDATION");
+    return v != nullptr && *v != '\0' && std::string_view{v} != "0";
+}
+
+VKAPI_ATTR vk::Bool32 VKAPI_CALL log_validation(vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                vk::DebugUtilsMessageTypeFlagsEXT,
+                                                const vk::DebugUtilsMessengerCallbackDataEXT* data,
+                                                void*) {
+    const char* level =
+        severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "error" : "warning";
+    std::fprintf(stderr, "luminaria: vulkan %s: %s\n", level,
+                 data != nullptr && data->pMessage != nullptr ? data->pMessage : "(no message)");
+    return VK_FALSE; // never abort the call that triggered it
+}
+
+std::string version_string(std::uint32_t v) {
+    return std::to_string(VK_API_VERSION_MAJOR(v)) + "." + std::to_string(VK_API_VERSION_MINOR(v));
+}
+
+/// Device extensions the dmabuf path needs. VK_KHR_image_format_list, which
+/// the modifier extension depends on, is core since 1.2 and not listed.
+constexpr std::array<const char*, 3> kDmabufExtensions{
+    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME};
+
+/// What the selection loop learned about one physical device.
+struct DeviceChoice {
+    std::size_t index = 0;
+    std::uint32_t queue_family = 0;
+    int score = -1;
+    bool drm_match = false;
+    bool dmabuf = false;
+    bool queue_foreign = false;
+    bool sync_fd = false;
+};
+
 } // namespace
+
+std::optional<DrmDeviceId> drm_device_id(int fd) noexcept {
+    struct stat st{};
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
+        return std::nullopt;
+    }
+    return DrmDeviceId{gnu_dev_major(st.st_rdev), gnu_dev_minor(st.st_rdev)};
+}
+
+std::optional<DrmDeviceId> drm_device_id(const std::string& path) noexcept {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0 || !S_ISCHR(st.st_mode)) {
+        return std::nullopt;
+    }
+    return DrmDeviceId{gnu_dev_major(st.st_rdev), gnu_dev_minor(st.st_rdev)};
+}
 
 VulkanRenderer::VulkanRenderer(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 VulkanRenderer::~VulkanRenderer() {
@@ -793,6 +935,8 @@ VulkanRenderer::VulkanRenderer(VulkanRenderer&&) noexcept = default;
 VulkanRenderer& VulkanRenderer::operator=(VulkanRenderer&&) noexcept = default;
 
 std::uint64_t VulkanRenderer::submission_count() const noexcept { return impl_->submits; }
+std::string_view VulkanRenderer::device_name() const noexcept { return impl_->device_name; }
+bool VulkanRenderer::on_drm_device() const noexcept { return impl_->on_drm_device; }
 
 struct FragmentShader::Impl {
     VulkanRenderer::Impl* owner = nullptr;
@@ -810,66 +954,175 @@ ShaderDamage FragmentShader::damage() const noexcept {
 }
 std::uint64_t FragmentShader::id() const noexcept { return impl_ != nullptr ? impl_->id : 0; }
 
-Result<VulkanRenderer> VulkanRenderer::create() {
+Result<VulkanRenderer> VulkanRenderer::create() { return create(VulkanOptions{}); }
+
+Result<VulkanRenderer> VulkanRenderer::create(const VulkanOptions& options) {
     try {
         vk::raii::Context context;
-
-        vk::ApplicationInfo app{"luminaria", 1, "luminaria", 1, VK_API_VERSION_1_1};
-        vk::InstanceCreateInfo instance_info{{}, &app};
-        vk::raii::Instance instance{context, instance_info};
-
-        vk::raii::PhysicalDevices devices{instance};
-        if (devices.empty()) {
-            return fail("no Vulkan physical device");
+        if (const std::uint32_t loader = context.enumerateInstanceVersion();
+            loader < VK_API_VERSION_1_3) {
+            return fail("vulkan init: the Vulkan loader is " + version_string(loader) +
+                        ", luminaria needs 1.3");
         }
-        vk::raii::PhysicalDevice physical = std::move(devices.front());
 
-        const std::uint32_t queue_family = pick_graphics_family(physical);
-        const float priority = 1.0f;
-        vk::DeviceQueueCreateInfo queue_info{{}, queue_family, 1, &priority};
-
-        // Enable dmabuf import/export extensions when the device has them. If any
-        // required one is missing, the renderer still works (shm path); only
-        // import/export report unsupported.
-        const auto avail = physical.enumerateDeviceExtensionProperties();
-        auto has = [&](const char* name) {
-            return std::any_of(avail.begin(), avail.end(), [&](const auto& e) {
-                return std::string_view(e.extensionName) == name;
+        // --- instance, with validation only when asked for ---
+        std::vector<const char*> layers;
+        std::vector<const char*> instance_exts;
+        bool debug_utils = false;
+        if (validation_requested()) {
+            const auto avail_layers = context.enumerateInstanceLayerProperties();
+            const bool have_layer = std::ranges::any_of(avail_layers, [](const auto& l) {
+                return std::string_view(l.layerName) == "VK_LAYER_KHRONOS_validation";
             });
-        };
-        std::vector<const char*> exts;
-        const std::array<const char*, 4> required{VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                                                  VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-                                                  VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-                                                  VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME};
-        bool dmabuf_ok = true;
-        for (const char* e : required) {
-            if (has(e)) {
-                exts.push_back(e);
+            if (have_layer) {
+                layers.push_back("VK_LAYER_KHRONOS_validation");
             } else {
-                dmabuf_ok = false;
+                std::fprintf(stderr, "luminaria: LUMINARIA_VK_VALIDATION is set but "
+                                     "VK_LAYER_KHRONOS_validation is not installed\n");
+            }
+            const auto avail_exts = context.enumerateInstanceExtensionProperties();
+            debug_utils = std::ranges::any_of(avail_exts, [](const auto& e) {
+                return std::string_view(e.extensionName) == VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+            });
+            if (debug_utils) {
+                instance_exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             }
         }
-        bool queue_foreign = has(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
-        if (dmabuf_ok && queue_foreign) {
-            exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+        const vk::DebugUtilsMessengerCreateInfoEXT messenger_info{
+            {},
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                vk::DebugUtilsMessageSeverityFlagBitsEXT::eError,
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+                vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance,
+            &log_validation};
+
+        const vk::ApplicationInfo app{"luminaria", 1, "luminaria", 1, VK_API_VERSION_1_3};
+        vk::InstanceCreateInfo instance_info{{}, &app, layers, instance_exts};
+        if (debug_utils) {
+            instance_info.pNext = &messenger_info; // covers create/destroy too
         }
-        if (!dmabuf_ok) {
-            exts.clear(); // don't half-enable; nothing else needs these
-            queue_foreign = false;
+        vk::raii::Instance instance{context, instance_info};
+        std::optional<vk::raii::DebugUtilsMessengerEXT> messenger;
+        if (debug_utils) {
+            messenger.emplace(instance, messenger_info);
+        }
+
+        // --- pick the physical device ---
+        //
+        // Not devices.front(): on a laptop with two GPUs that is whichever the
+        // loader enumerated first, and the wrong one cannot import the display's
+        // buffers. Every device that cannot run this renderer at all is turned
+        // down with a reason, so a failure says what was wrong with each.
+        vk::raii::PhysicalDevices devices{instance};
+        std::string rejected;
+        auto reject = [&](const vk::PhysicalDeviceProperties& props, std::string_view why) {
+            rejected += rejected.empty() ? "" : "; ";
+            rejected += std::string{props.deviceName.data()} + ": " + std::string{why};
+        };
+        std::optional<DeviceChoice> best;
+        for (std::size_t i = 0; i < devices.size(); ++i) {
+            const vk::raii::PhysicalDevice& phys = devices[i];
+            const vk::PhysicalDeviceProperties props = phys.getProperties();
+            if (props.apiVersion < VK_API_VERSION_1_3) {
+                reject(props, "Vulkan " + version_string(props.apiVersion) + " < 1.3");
+                continue;
+            }
+            const auto features =
+                phys.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+                                  vk::PhysicalDeviceVulkan12Features,
+                                  vk::PhysicalDeviceVulkan13Features>();
+            const auto& f12 = features.get<vk::PhysicalDeviceVulkan12Features>();
+            const auto& f13 = features.get<vk::PhysicalDeviceVulkan13Features>();
+            if (!f13.synchronization2 || !f13.dynamicRendering || !f12.timelineSemaphore) {
+                reject(props, "missing synchronization2, dynamicRendering or timelineSemaphore");
+                continue;
+            }
+            // First queue family that can draw (graphics implies transfer).
+            const auto families = phys.getQueueFamilyProperties();
+            const auto family = std::ranges::find_if(families, [](const auto& q) {
+                return static_cast<bool>(q.queueFlags & vk::QueueFlagBits::eGraphics);
+            });
+            if (family == families.end()) {
+                reject(props, "no graphics queue");
+                continue;
+            }
+
+            const auto avail = phys.enumerateDeviceExtensionProperties();
+            auto has = [&](const char* name) {
+                return std::ranges::any_of(avail, [&](const auto& e) {
+                    return std::string_view(e.extensionName) == name;
+                });
+            };
+            DeviceChoice c;
+            c.index = i;
+            c.queue_family = static_cast<std::uint32_t>(family - families.begin());
+            c.dmabuf = std::ranges::all_of(kDmabufExtensions, has);
+            c.queue_foreign = c.dmabuf && has(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+            c.sync_fd = has(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+
+            bool& drm_match = c.drm_match;
+            if (options.drm_device.has_value() && has(VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) {
+                const auto chain = phys.getProperties2<vk::PhysicalDeviceProperties2,
+                                                       vk::PhysicalDeviceDrmPropertiesEXT>();
+                const auto& drm = chain.get<vk::PhysicalDeviceDrmPropertiesEXT>();
+                const auto [want_major, want_minor] = *options.drm_device;
+                auto is = [&](std::int64_t maj, std::int64_t min) {
+                    return maj == want_major && min == want_minor;
+                };
+                drm_match = (drm.hasPrimary && is(drm.primaryMajor, drm.primaryMinor)) ||
+                            (drm.hasRender && is(drm.renderMajor, drm.renderMinor));
+            }
+            // The DRM match dominates, then dmabuf support (without it there
+            // is no zero-copy path at all), then the kind of device.
+            int kind = 0;
+            switch (props.deviceType) {
+            case vk::PhysicalDeviceType::eDiscreteGpu: kind = 4; break;
+            case vk::PhysicalDeviceType::eIntegratedGpu: kind = 3; break;
+            case vk::PhysicalDeviceType::eVirtualGpu: kind = 2; break;
+            case vk::PhysicalDeviceType::eCpu: kind = 1; break;
+            default: kind = 0; break;
+            }
+            c.score = (drm_match ? 100 : 0) + (c.dmabuf ? 10 : 0) + kind;
+            if (!best.has_value() || c.score > best->score) {
+                best = c;
+            }
+        }
+        if (!best.has_value()) {
+            return fail(devices.empty() ? std::string{"vulkan init: no Vulkan physical device"}
+                                        : "vulkan init: no usable Vulkan 1.3 device (" +
+                                              rejected + ")");
+        }
+        vk::raii::PhysicalDevice physical = std::move(devices[best->index]);
+        std::string device_name{physical.getProperties().deviceName.data()};
+
+        // --- device: exactly the features this renderer uses ---
+        std::vector<const char*> exts;
+        if (best->dmabuf) {
+            exts.assign(kDmabufExtensions.begin(), kDmabufExtensions.end());
+        }
+        if (best->queue_foreign) {
+            exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
         }
         // Semaphores that cross the device boundary as sync_file fds: a client's
         // acquire point comes in, the finished render goes out to KMS. Optional —
-        // without it render_to falls back to a CPU fence wait.
-        const bool sync_fd_ok = has(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
-        if (sync_fd_ok) {
+        // without it render_to falls back to a CPU wait.
+        if (best->sync_fd) {
             exts.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
         }
+        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+                           vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features>
+            enabled{};
+        enabled.get<vk::PhysicalDeviceVulkan12Features>().timelineSemaphore = VK_TRUE;
+        enabled.get<vk::PhysicalDeviceVulkan13Features>().synchronization2 = VK_TRUE;
+        enabled.get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering = VK_TRUE;
 
-        vk::DeviceCreateInfo device_info{{}, queue_info};
-        device_info.setPEnabledExtensionNames(exts);
+        const float priority = 1.0f;
+        const vk::DeviceQueueCreateInfo queue_info{{}, best->queue_family, 1, &priority};
+        vk::DeviceCreateInfo device_info{{}, queue_info, {}, exts};
+        device_info.pNext = &enabled.get<vk::PhysicalDeviceFeatures2>();
         vk::raii::Device device{physical, device_info};
-        vk::raii::Queue queue{device, queue_family, 0};
+        vk::raii::Queue queue{device, best->queue_family, 0};
         // eResetCommandBuffer: render_to recycles its command buffer rather
         // than allocating one per frame, and a buffer can only be re-recorded
         // if it can be reset on its own.
@@ -877,13 +1130,28 @@ Result<VulkanRenderer> VulkanRenderer::create() {
             device,
             vk::CommandPoolCreateInfo{vk::CommandPoolCreateFlagBits::eTransient |
                                           vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-                                      queue_family}};
+                                      best->queue_family}};
+        vk::SemaphoreTypeCreateInfo timeline_type{vk::SemaphoreType::eTimeline, 0};
+        vk::SemaphoreCreateInfo timeline_info{};
+        timeline_info.pNext = &timeline_type;
+        vk::raii::Semaphore timeline{device, timeline_info};
 
-        auto impl = std::make_unique<Impl>(Impl{std::move(context), std::move(instance),
-                                                std::move(physical), queue_family, std::move(device),
-                                                std::move(queue), std::move(command_pool),
-                                                dmabuf_ok, queue_foreign, sync_fd_ok, std::nullopt,
-                                                {}, {}});
+        auto impl = std::make_unique<Impl>(Impl{
+            .context = std::move(context),
+            .instance = std::move(instance),
+            .messenger = std::move(messenger),
+            .physical = std::move(physical),
+            .device_name = std::move(device_name),
+            .on_drm_device = best->drm_match,
+            .queue_family = best->queue_family,
+            .device = std::move(device),
+            .queue = std::move(queue),
+            .command_pool = std::move(command_pool),
+            .timeline = std::move(timeline),
+            .dmabuf_ok = best->dmabuf,
+            .queue_foreign = best->queue_foreign,
+            .sync_fd_ok = best->sync_fd,
+        });
         // How many submits can be outstanding before the display catches up.
         // Reserved rather than grown: without this the in-flight list and the
         // free lists reallocate the first time the queue runs a frame or two
@@ -893,7 +1161,6 @@ Result<VulkanRenderer> VulkanRenderer::create() {
         constexpr std::size_t kPipelineDepth = 8;
         impl->in_flight.reserve(kPipelineDepth);
         impl->free_cmds.reserve(kPipelineDepth);
-        impl->free_fences.reserve(kPipelineDepth);
         impl->free_sem_lists.reserve(kPipelineDepth);
 
         // Linear filtering with clamped edges: a scaled or rotated surface must
@@ -921,7 +1188,6 @@ Result<Pixel> VulkanRenderer::render_clear_readback(int width, int height, Color
         auto& device = impl_->device;
 
         // Host-visible LINEAR image: clear it on the GPU, then map and read directly.
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
         vk::ImageCreateInfo image_info{
             {},
             vk::ImageType::e2D,
@@ -944,48 +1210,23 @@ Result<Pixel> VulkanRenderer::render_clear_readback(int width, int height, Color
         vk::raii::DeviceMemory memory{device, vk::MemoryAllocateInfo{req.size, mem_type}};
         image.bindMemory(*memory, 0);
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
-
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-        vk::ImageMemoryBarrier to_general{
-            {},
-            vk::AccessFlagBits::eTransferWrite,
-            vk::ImageLayout::eUndefined,
-            vk::ImageLayout::eGeneral,
-            VK_QUEUE_FAMILY_IGNORED,
-            VK_QUEUE_FAMILY_IGNORED,
-            *image,
-            whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_general);
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::PipelineStageFlagBits2::eClear,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral));
 
         vk::ClearColorValue clear{std::array<float, 4>{color.r, color.g, color.b, color.a}};
-        cmd.clearColorImage(*image, vk::ImageLayout::eGeneral, clear, whole);
+        cmd.clearColorImage(*image, vk::ImageLayout::eGeneral, clear, kWholeImage);
 
-        vk::ImageMemoryBarrier to_host{
-            vk::AccessFlagBits::eTransferWrite,
-            vk::AccessFlagBits::eHostRead,
-            vk::ImageLayout::eGeneral,
-            vk::ImageLayout::eGeneral,
-            VK_QUEUE_FAMILY_IGNORED,
-            VK_QUEUE_FAMILY_IGNORED,
-            *image,
-            whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-                            {}, {}, {}, to_host);
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eClear,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::PipelineStageFlagBits2::eHost,
+                                   vk::AccessFlagBits2::eHostRead, vk::ImageLayout::eGeneral,
+                                   vk::ImageLayout::eGeneral));
         cmd.end();
-
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
+        impl_->submit_and_wait(std::move(cmd));
 
         const auto layout = image.getSubresourceLayout(
             vk::ImageSubresource{vk::ImageAspectFlagBits::eColor, 0, 0});
@@ -1048,24 +1289,6 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
                                             {},
                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}};
 
-        vk::AttachmentDescription attachment{{},
-                                             format,
-                                             vk::SampleCountFlagBits::e1,
-                                             vk::AttachmentLoadOp::eClear,
-                                             vk::AttachmentStoreOp::eStore,
-                                             vk::AttachmentLoadOp::eDontCare,
-                                             vk::AttachmentStoreOp::eDontCare,
-                                             vk::ImageLayout::eUndefined,
-                                             vk::ImageLayout::eTransferDstOptimal};
-        vk::AttachmentReference color_ref{0, vk::ImageLayout::eColorAttachmentOptimal};
-        vk::SubpassDescription subpass{{}, vk::PipelineBindPoint::eGraphics, {}, color_ref};
-        vk::raii::RenderPass render_pass{device,
-                                         vk::RenderPassCreateInfo{{}, attachment, subpass}};
-
-        vk::ImageView fb_attachment = *view;
-        vk::raii::Framebuffer framebuffer{
-            device, vk::FramebufferCreateInfo{{}, *render_pass, fb_attachment, uw, uh, 1}};
-
         // Host-visible buffer to read the frame back.
         const vk::DeviceSize buffer_size = static_cast<vk::DeviceSize>(uw) * uh * 4;
         vk::raii::Buffer readback{device, vk::BufferCreateInfo{{}, buffer_size,
@@ -1080,17 +1303,28 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
                                              vk::MemoryPropertyFlagBits::eHostCoherent)}};
         readback.bindMemory(*readback_memory, 0);
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-        vk::ClearValue clear{vk::ClearColorValue{
-            std::array<float, 4>{background.r, background.g, background.b, background.a}}};
-        cmd.beginRenderPass(vk::RenderPassBeginInfo{*render_pass, *framebuffer,
-                                                    vk::Rect2D{{0, 0}, {uw, uh}}, clear},
-                            vk::SubpassContents::eInline);
+        // Dynamic rendering does no layout transitions of its own: the image
+        // goes into the attachment layout here and out of it below.
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                   vk::AccessFlagBits2::eColorAttachmentWrite,
+                                   vk::ImageLayout::eUndefined,
+                                   vk::ImageLayout::eColorAttachmentOptimal));
+        const vk::RenderingAttachmentInfo color_attachment{
+            *view,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ResolveModeFlagBits::eNone,
+            {},
+            vk::ImageLayout::eUndefined,
+            vk::AttachmentLoadOp::eClear,
+            vk::AttachmentStoreOp::eStore,
+            vk::ClearValue{vk::ClearColorValue{
+                std::array<float, 4>{background.r, background.g, background.b, background.a}}}};
+        cmd.beginRendering(
+            vk::RenderingInfo{{}, vk::Rect2D{{0, 0}, {uw, uh}}, 1, 0, color_attachment});
         for (const RectFill& rf : rects) {
             const int x0 = std::max(0, rf.box.x);
             const int y0 = std::max(0, rf.box.y);
@@ -1108,9 +1342,15 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
                 0, 1};
             cmd.clearAttachments(clear_att, clear_rect);
         }
-        cmd.endRenderPass();
-        // The render pass leaves the image in TransferDstOptimal, ready for the
-        // texture copies below. Staging buffers must outlive the submit.
+        cmd.endRendering();
+        // Into TransferDstOptimal for the texture copies below. Staging buffers
+        // must outlive the submit.
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                   vk::AccessFlagBits2::eColorAttachmentWrite,
+                                   vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::ImageLayout::eColorAttachmentOptimal,
+                                   vk::ImageLayout::eTransferDstOptimal));
         std::vector<vk::raii::Buffer> staging;
         std::vector<vk::raii::DeviceMemory> staging_memory;
         for (const TextureFill& t : textures) {
@@ -1164,16 +1404,12 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
         }
 
         // Transition the image to TransferSrc for the read-back copy.
-        vk::ImageMemoryBarrier to_src{vk::AccessFlagBits::eTransferWrite,
-                                      vk::AccessFlagBits::eTransferRead,
-                                      vk::ImageLayout::eTransferDstOptimal,
-                                      vk::ImageLayout::eTransferSrcOptimal,
-                                      VK_QUEUE_FAMILY_IGNORED,
-                                      VK_QUEUE_FAMILY_IGNORED,
-                                      *image,
-                                      {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_src);
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferRead,
+                                   vk::ImageLayout::eTransferDstOptimal,
+                                   vk::ImageLayout::eTransferSrcOptimal));
 
         vk::BufferImageCopy region{0,
                                    0,
@@ -1182,20 +1418,9 @@ Result<std::vector<Pixel>> VulkanRenderer::composite(int width, int height, Colo
                                    {0, 0, 0},
                                    {uw, uh, 1}};
         cmd.copyImageToBuffer(*image, vk::ImageLayout::eTransferSrcOptimal, *readback, region);
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-                            {}, vk::MemoryBarrier{vk::AccessFlagBits::eTransferWrite,
-                                                  vk::AccessFlagBits::eHostRead},
-                            {}, {});
+        host_read_barrier(cmd);
         cmd.end();
-
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
+        impl_->submit_and_wait(std::move(cmd));
 
         std::vector<Pixel> out(static_cast<size_t>(uw) * uh);
         auto* base = static_cast<std::uint8_t*>(readback_memory.mapMemory(0, VK_WHOLE_SIZE));
@@ -1228,11 +1453,50 @@ struct DmabufImage {
     vk::raii::DeviceMemory memory;
 };
 
+// Whether the driver takes a dmabuf of this format and modifier, imported, for
+// `usage`, at this size. Asked before vkCreateImage because the modifier is the
+// client's word: an implicit one (DRM_FORMAT_MOD_INVALID) or one this GPU never
+// advertised is invalid usage there, not an error the driver has to report.
+void check_dmabuf_importable(const vk::raii::PhysicalDevice& physical, int w, int h,
+                             vk::Format fmt, std::uint64_t modifier, vk::ImageUsageFlags usage) {
+    if (modifier == DRM_FORMAT_MOD_INVALID) {
+        throw std::runtime_error("implicit modifier (DRM_FORMAT_MOD_INVALID) is not importable");
+    }
+    vk::PhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info{modifier,
+                                                                  vk::SharingMode::eExclusive};
+    vk::PhysicalDeviceExternalImageFormatInfo external_info{
+        vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT};
+    external_info.pNext = &modifier_info;
+    vk::PhysicalDeviceImageFormatInfo2 info{fmt, vk::ImageType::e2D,
+                                            vk::ImageTiling::eDrmFormatModifierEXT, usage};
+    info.pNext = &external_info;
+    vk::ExternalImageFormatProperties external_props{};
+    vk::ImageFormatProperties2 props{};
+    props.pNext = &external_props;
+    // The C entry point: "not supported" is an answer here, not an exception.
+    const auto result = static_cast<vk::Result>(vkGetPhysicalDeviceImageFormatProperties2(
+        static_cast<VkPhysicalDevice>(*physical),
+        reinterpret_cast<const VkPhysicalDeviceImageFormatInfo2*>(&info),
+        reinterpret_cast<VkImageFormatProperties2*>(&props)));
+    const vk::Extent3D max = props.imageFormatProperties.maxExtent;
+    if (result != vk::Result::eSuccess ||
+        !(external_props.externalMemoryProperties.externalMemoryFeatures &
+          vk::ExternalMemoryFeatureFlagBits::eImportable) ||
+        static_cast<std::uint32_t>(w) > max.width || static_cast<std::uint32_t>(h) > max.height) {
+        char hex[19];
+        std::snprintf(hex, sizeof hex, "0x%llx", static_cast<unsigned long long>(modifier));
+        throw std::runtime_error(std::string{"dmabuf modifier "} + hex +
+                                 " is not importable for this format and usage");
+    }
+}
+
 // Create a VkImage backed by an imported single-plane dmabuf. `fd` is borrowed;
 // a dup is handed to Vulkan (which owns it on success). Throws on failure.
-DmabufImage make_dmabuf_image(const vk::raii::Device& device, int fd, int w, int h, vk::Format fmt,
+DmabufImage make_dmabuf_image(const vk::raii::PhysicalDevice& physical,
+                              const vk::raii::Device& device, int fd, int w, int h, vk::Format fmt,
                               std::uint32_t offset, std::uint32_t stride, std::uint64_t modifier,
                               vk::ImageUsageFlags usage) {
+    check_dmabuf_importable(physical, w, h, fmt, modifier, usage);
     const vk::SubresourceLayout plane{offset, 0, stride, 0, 0};
     vk::ImageDrmFormatModifierExplicitCreateInfoEXT mod_info{modifier, 1, &plane};
     vk::ExternalMemoryImageCreateInfo ext_img{vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT};
@@ -1344,7 +1608,8 @@ Result<std::vector<std::uint8_t>> VulkanRenderer::import_dmabuf(int fd, int widt
         auto& device = impl_->device;
         const auto uw = static_cast<std::uint32_t>(width);
         const auto uh = static_cast<std::uint32_t>(height);
-        DmabufImage src = make_dmabuf_image(device, fd, width, height, fmt, offset, stride, modifier,
+        DmabufImage src = make_dmabuf_image(impl_->physical, device, fd, width, height, fmt,
+                                            offset, stride, modifier,
                                             vk::ImageUsageFlagBits::eTransferSrc);
 
         const vk::DeviceSize buffer_size = static_cast<vk::DeviceSize>(uw) * uh * 4;
@@ -1360,10 +1625,7 @@ Result<std::vector<std::uint8_t>> VulkanRenderer::import_dmabuf(int fd, int widt
                                              vk::MemoryPropertyFlagBits::eHostCoherent)}};
         readback.bindMemory(*readback_memory, 0);
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
         // Acquire the imported image from the foreign (external) owner. For DRM
@@ -1372,35 +1634,18 @@ Result<std::vector<std::uint8_t>> VulkanRenderer::import_dmabuf(int fd, int widt
         const std::uint32_t foreign =
             impl_->queue_foreign ? uint32_t{VK_QUEUE_FAMILY_FOREIGN_EXT} : VK_QUEUE_FAMILY_IGNORED;
         const std::uint32_t self = impl_->queue_foreign ? impl_->queue_family : VK_QUEUE_FAMILY_IGNORED;
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        vk::ImageMemoryBarrier acquire{{},
-                                       vk::AccessFlagBits::eTransferRead,
-                                       vk::ImageLayout::eUndefined,
-                                       vk::ImageLayout::eTransferSrcOptimal,
-                                       foreign,
-                                       self,
-                                       *src.image,
-                                       whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, acquire);
+        barrier(cmd, image_barrier(*src.image, vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferRead,
+                                   vk::ImageLayout::eUndefined,
+                                   vk::ImageLayout::eTransferSrcOptimal, foreign, self));
 
         vk::BufferImageCopy region{0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                                    {0, 0, 0}, {uw, uh, 1}};
         cmd.copyImageToBuffer(*src.image, vk::ImageLayout::eTransferSrcOptimal, *readback, region);
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-                            {}, vk::MemoryBarrier{vk::AccessFlagBits::eTransferWrite,
-                                                  vk::AccessFlagBits::eHostRead},
-                            {}, {});
+        host_read_barrier(cmd);
         cmd.end();
-
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
+        impl_->submit_and_wait(std::move(cmd));
 
         const bool opaque = drm_format == DRM_FORMAT_XRGB8888;
         std::vector<std::uint8_t> out(static_cast<size_t>(uw) * uh * 4);
@@ -1438,7 +1683,8 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height, std::uint32_
         auto& device = impl_->device;
         const auto uw = static_cast<std::uint32_t>(width);
         const auto uh = static_cast<std::uint32_t>(height);
-        DmabufImage dst = make_dmabuf_image(device, fd, width, height, fmt, offset, stride, modifier,
+        DmabufImage dst = make_dmabuf_image(impl_->physical, device, fd, width, height, fmt,
+                                            offset, stride, modifier,
                                             vk::ImageUsageFlagBits::eTransferDst);
 
         // Staging buffer holds BGRA (from RGBA input).
@@ -1463,53 +1709,30 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height, std::uint32_
         }
         staging_memory.unmapMemory();
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
         const std::uint32_t foreign =
             impl_->queue_foreign ? uint32_t{VK_QUEUE_FAMILY_FOREIGN_EXT} : VK_QUEUE_FAMILY_IGNORED;
         const std::uint32_t self = impl_->queue_foreign ? impl_->queue_family : VK_QUEUE_FAMILY_IGNORED;
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        vk::ImageMemoryBarrier acquire{{},
-                                       vk::AccessFlagBits::eTransferWrite,
-                                       vk::ImageLayout::eUndefined,
-                                       vk::ImageLayout::eTransferDstOptimal,
-                                       foreign,
-                                       self,
-                                       *dst.image,
-                                       whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, acquire);
+        barrier(cmd, image_barrier(*dst.image, vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::ImageLayout::eUndefined,
+                                   vk::ImageLayout::eTransferDstOptimal, foreign, self));
 
         vk::BufferImageCopy region{0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                                    {0, 0, 0}, {uw, uh, 1}};
         cmd.copyBufferToImage(*staging, *dst.image, vk::ImageLayout::eTransferDstOptimal, region);
 
         // Release back to the foreign owner so the client sees the pixels.
-        vk::ImageMemoryBarrier release{vk::AccessFlagBits::eTransferWrite,
-                                       {},
-                                       vk::ImageLayout::eTransferDstOptimal,
-                                       vk::ImageLayout::eGeneral,
-                                       self,
-                                       foreign,
-                                       *dst.image,
-                                       whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                            vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, release);
+        barrier(cmd, image_barrier(*dst.image, vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::ImageLayout::eTransferDstOptimal,
+                                   vk::ImageLayout::eGeneral, self, foreign));
         cmd.end();
-
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
-        impl_->free_fences.push_back(std::move(fence));
+        impl_->submit_and_wait(std::move(cmd));
         return ok();
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan dmabuf export: "} + e.what());
@@ -1551,8 +1774,6 @@ struct VulkanRenderTarget {
     int width;  // device pixels
     int height; // device pixels
     bool* has_content;
-    std::optional<vk::raii::Framebuffer>* fb_load;
-    std::optional<vk::raii::Framebuffer>* fb_clear;
     UniqueFd* acquire_fence;
     /// True: the image is handed to and taken back from the display engine, so
     /// it crosses the foreign queue and rests in eGeneral between passes. False:
@@ -1569,13 +1790,6 @@ struct ScanoutTarget::Impl {
     DmabufPlane plane;        // plane.fd is owned here
     bool has_content = false; // false until the first full render
     UniqueFd acquire_fence;   // sync_file from the flip still scanning us out
-
-    // The two framebuffers over `view` — one per render pass, since a partial
-    // repaint loads and a full one clears. Nothing about either changes after
-    // the first frame (the view and the size are fixed for the life of the
-    // target), so they are built once here instead of per frame.
-    std::optional<vk::raii::Framebuffer> fb_load;
-    std::optional<vk::raii::Framebuffer> fb_clear;
 
     // Staging buffer for read_scanout(), created on first use and kept. It is
     // mapped once and stays mapped: re-creating and re-mapping it per frame was
@@ -1599,8 +1813,6 @@ struct OffscreenTarget::Impl {
     GpuTexture texture;
     vk::Format format;
     bool has_content = false;
-    std::optional<vk::raii::Framebuffer> fb_load;
-    std::optional<vk::raii::Framebuffer> fb_clear;
     // Never set: nothing outside this renderer ever holds an offscreen image, so
     // there is no foreign fence to wait for. It exists because the shared pass
     // takes one, and an empty UniqueFd is the honest way to say "none".
@@ -1711,48 +1923,33 @@ Status VulkanRenderer::read_scanout(ScanoutTarget& target, std::vector<std::uint
                 static_cast<std::uint8_t*>(t.readback_memory->mapMemory(0, VK_WHOLE_SIZE));
         }
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        // render_to leaves the image in eGeneral, released to the foreign owner.
-        vk::ImageMemoryBarrier to_src{{},
-                                      vk::AccessFlagBits::eTransferRead,
-                                      vk::ImageLayout::eGeneral,
-                                      vk::ImageLayout::eTransferSrcOptimal,
-                                      VK_QUEUE_FAMILY_IGNORED,
-                                      VK_QUEUE_FAMILY_IGNORED,
-                                      *t.image,
-                                      whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_src);
+        // render_to leaves the image in eGeneral, released to the foreign owner,
+        // so it is taken back the same way render_to takes it back — after the
+        // colour writes of the render that is still ahead of us on this queue.
+        const std::uint32_t foreign =
+            impl_->queue_foreign ? uint32_t{VK_QUEUE_FAMILY_FOREIGN_EXT} : VK_QUEUE_FAMILY_IGNORED;
+        const std::uint32_t self =
+            impl_->queue_foreign ? impl_->queue_family : VK_QUEUE_FAMILY_IGNORED;
+        barrier(cmd, image_barrier(*t.image, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                   vk::AccessFlagBits2::eColorAttachmentWrite,
+                                   vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferRead, vk::ImageLayout::eGeneral,
+                                   vk::ImageLayout::eTransferSrcOptimal, foreign, self));
         vk::BufferImageCopy region{0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
                                    {0, 0, 0}, {uw, uh, 1}};
         cmd.copyImageToBuffer(*t.image, vk::ImageLayout::eTransferSrcOptimal, **t.readback, region);
         // Put it back where render_to and the display engine expect to find it.
-        vk::ImageMemoryBarrier back{vk::AccessFlagBits::eTransferRead,
-                                    {},
-                                    vk::ImageLayout::eTransferSrcOptimal,
-                                    vk::ImageLayout::eGeneral,
-                                    VK_QUEUE_FAMILY_IGNORED,
-                                    VK_QUEUE_FAMILY_IGNORED,
-                                    *t.image,
-                                    whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                            vk::PipelineStageFlagBits::eBottomOfPipe, {}, {}, {}, back);
+        barrier(cmd, image_barrier(*t.image, vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferRead,
+                                   vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral,
+                                   self, foreign));
+        host_read_barrier(cmd);
         cmd.end();
-
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
+        impl_->submit_and_wait(std::move(cmd));
         if (!t.readback_coherent) {
             device.invalidateMappedMemoryRanges(
                 vk::MappedMemoryRange{**t.readback_memory, 0, VK_WHOLE_SIZE});
@@ -1873,20 +2070,50 @@ struct FloatBox {
     }
 }
 
-vk::raii::RenderPass make_pass(const vk::raii::Device& device, vk::Format format, bool load) {
-    vk::AttachmentDescription attachment{
-        {},
-        format,
-        vk::SampleCountFlagBits::e1,
-        load ? vk::AttachmentLoadOp::eLoad : vk::AttachmentLoadOp::eClear,
-        vk::AttachmentStoreOp::eStore,
-        vk::AttachmentLoadOp::eDontCare,
-        vk::AttachmentStoreOp::eDontCare,
-        load ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eUndefined,
-        vk::ImageLayout::eColorAttachmentOptimal};
-    vk::AttachmentReference color_ref{0, vk::ImageLayout::eColorAttachmentOptimal};
-    vk::SubpassDescription subpass{{}, vk::PipelineBindPoint::eGraphics, {}, color_ref};
-    return vk::raii::RenderPass{device, vk::RenderPassCreateInfo{{}, attachment, subpass}};
+/// Every quad pipeline: the shared vertex stage, `frag` as the fragment stage,
+/// pre-multiplied source-over into one colour attachment of `format`. With
+/// dynamic rendering the attachment format is all a pipeline knows about where
+/// it draws, so the textured, solid, shaped and custom-shader quads differ in
+/// the fragment module and nothing else.
+vk::raii::Pipeline make_quad_pipeline(const vk::raii::Device& device,
+                                      const vk::raii::PipelineLayout& layout,
+                                      const vk::raii::ShaderModule& vert,
+                                      std::span<const std::uint32_t> frag_spv,
+                                      vk::Format format) {
+    vk::raii::ShaderModule frag{
+        device, vk::ShaderModuleCreateInfo{{}, frag_spv.size_bytes(), frag_spv.data()}};
+    const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
+        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
+        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag, "main"}};
+    vk::PipelineVertexInputStateCreateInfo vertex_input{}; // positions come from push constants
+    vk::PipelineInputAssemblyStateCreateInfo assembly{{}, vk::PrimitiveTopology::eTriangleStrip};
+    vk::PipelineViewportStateCreateInfo viewport{{}, 1, nullptr, 1, nullptr}; // dynamic
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.lineWidth = 1.0f;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    // Wayland buffers are pre-multiplied, so ONE / ONE_MINUS_SRC_ALPHA is the
+    // correct over-operator — translucent surfaces blend instead of stamping.
+    vk::PipelineColorBlendAttachmentState blend{
+        VK_TRUE,
+        vk::BlendFactor::eOne,
+        vk::BlendFactor::eOneMinusSrcAlpha,
+        vk::BlendOp::eAdd,
+        vk::BlendFactor::eOne,
+        vk::BlendFactor::eOneMinusSrcAlpha,
+        vk::BlendOp::eAdd,
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    vk::PipelineColorBlendStateCreateInfo blending{{}, VK_FALSE, vk::LogicOp::eCopy, blend};
+    const std::array<vk::DynamicState, 2> dynamic_states{vk::DynamicState::eViewport,
+                                                         vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamic{{}, dynamic_states};
+    const vk::PipelineRenderingCreateInfo rendering{0, format};
+    vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr,
+                                        &viewport, &raster, &multisample, nullptr, &blending,
+                                        &dynamic, *layout};
+    info.pNext = &rendering;
+    return vk::raii::Pipeline{device, nullptr, info};
 }
 
 } // namespace
@@ -1946,58 +2173,19 @@ QuadPipeline& VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
 
     vk::raii::ShaderModule vert{
         device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadVertSpv), kQuadVertSpv}};
-
-    vk::PipelineVertexInputStateCreateInfo vertex_input{}; // positions come from push constants
-    vk::PipelineInputAssemblyStateCreateInfo assembly{{}, vk::PrimitiveTopology::eTriangleStrip};
-    vk::PipelineViewportStateCreateInfo viewport{{}, 1, nullptr, 1, nullptr}; // dynamic
-    vk::PipelineRasterizationStateCreateInfo raster{};
-    raster.lineWidth = 1.0f;
-    raster.cullMode = vk::CullModeFlagBits::eNone;
-    vk::PipelineMultisampleStateCreateInfo multisample{};
-    // Wayland buffers are pre-multiplied, so ONE / ONE_MINUS_SRC_ALPHA is the
-    // correct over-operator — translucent surfaces now blend instead of stamping.
-    vk::PipelineColorBlendAttachmentState blend{
-        VK_TRUE,
-        vk::BlendFactor::eOne,
-        vk::BlendFactor::eOneMinusSrcAlpha,
-        vk::BlendOp::eAdd,
-        vk::BlendFactor::eOne,
-        vk::BlendFactor::eOneMinusSrcAlpha,
-        vk::BlendOp::eAdd,
-        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
-    vk::PipelineColorBlendStateCreateInfo blending{{}, VK_FALSE, vk::LogicOp::eCopy, blend};
-    const std::array<vk::DynamicState, 2> dynamic_states{vk::DynamicState::eViewport,
-                                                         vk::DynamicState::eScissor};
-    vk::PipelineDynamicStateCreateInfo dynamic{{}, dynamic_states};
-
-    vk::raii::RenderPass load_pass = make_pass(device, format, true);
-    vk::raii::RenderPass clear_pass = make_pass(device, format, false);
-
-    // One factory for both fragment stages: the textured quad and the
-    // solid-colour quad share every fixed-function state and the push block,
-    // differing only in the shader. The solid one's shader has no sampler, so
-    // it never binds a descriptor set.
-    auto make = [&](const std::uint32_t* spv, std::size_t size) {
-        vk::raii::ShaderModule frag{device, vk::ShaderModuleCreateInfo{{}, size, spv}};
-        const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
-            vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
-            vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag,
-                                              "main"}};
-        vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr,
-                                            &viewport, &raster, &multisample, nullptr, &blending,
-                                            &dynamic, *layout, *clear_pass, 0};
-        return vk::raii::Pipeline{device, nullptr, info};
+    // The textured quad and the solid-colour quad share every fixed-function
+    // state and the push block, differing only in the shader. The solid one's
+    // shader has no sampler, so it never binds a descriptor set.
+    auto make = [&](std::span<const std::uint32_t> spv) {
+        return make_quad_pipeline(device, layout, vert, spv, format);
     };
-    vk::raii::Pipeline pipeline = make(kQuadFragSpv, sizeof(kQuadFragSpv));
-    vk::raii::Pipeline solid = make(kSolidFragSpv, sizeof(kSolidFragSpv));
-    vk::raii::Pipeline rounded = make(kRoundedFragSpv, sizeof(kRoundedFragSpv));
-    vk::raii::Pipeline shadow = make(kShadowFragSpv, sizeof(kShadowFragSpv));
+    vk::raii::Pipeline pipeline = make(kQuadFragSpv);
+    vk::raii::Pipeline solid = make(kSolidFragSpv);
+    vk::raii::Pipeline rounded = make(kRoundedFragSpv);
+    vk::raii::Pipeline shadow = make(kShadowFragSpv);
 
-    pipelines.push_back(QuadPipeline{format, std::move(layout), std::move(load_pass),
-                                     std::move(clear_pass), std::move(pipeline),
-                                     std::move(solid), std::move(rounded),
-                                     std::move(shadow)});
+    pipelines.push_back(QuadPipeline{format, std::move(layout), std::move(pipeline),
+                                     std::move(solid), std::move(rounded), std::move(shadow)});
     return pipelines.back();
 }
 
@@ -2014,35 +2202,9 @@ vk::raii::Pipeline& VulkanRenderer::Impl::effect_pipeline(const FragmentShader& 
 
     vk::raii::ShaderModule vert{
         device, vk::ShaderModuleCreateInfo{{}, sizeof(kQuadVertSpv), kQuadVertSpv}};
-    vk::raii::ShaderModule frag{device,
-                                vk::ShaderModuleCreateInfo{{},
-                                                         shader.impl_->spirv.size() *
-                                                             sizeof(std::uint32_t),
-                                                         shader.impl_->spirv.data()}};
-    const std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
-        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eVertex, *vert, "main"},
-        vk::PipelineShaderStageCreateInfo{{}, vk::ShaderStageFlagBits::eFragment, *frag, "main"}};
-    vk::PipelineVertexInputStateCreateInfo vertex_input{};
-    vk::PipelineInputAssemblyStateCreateInfo assembly{{}, vk::PrimitiveTopology::eTriangleStrip};
-    vk::PipelineViewportStateCreateInfo viewport{{}, 1, nullptr, 1, nullptr};
-    vk::PipelineRasterizationStateCreateInfo raster{};
-    raster.lineWidth = 1.0f;
-    raster.cullMode = vk::CullModeFlagBits::eNone;
-    vk::PipelineMultisampleStateCreateInfo multisample{};
-    vk::PipelineColorBlendAttachmentState blend{
-        VK_TRUE, vk::BlendFactor::eOne, vk::BlendFactor::eOneMinusSrcAlpha,
-        vk::BlendOp::eAdd, vk::BlendFactor::eOne, vk::BlendFactor::eOneMinusSrcAlpha,
-        vk::BlendOp::eAdd, vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                             vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
-    vk::PipelineColorBlendStateCreateInfo blending{{}, VK_FALSE, vk::LogicOp::eCopy, blend};
-    const std::array<vk::DynamicState, 2> dynamic_states{vk::DynamicState::eViewport,
-                                                          vk::DynamicState::eScissor};
-    vk::PipelineDynamicStateCreateInfo dynamic{{}, dynamic_states};
-    vk::GraphicsPipelineCreateInfo info{{}, stages, &vertex_input, &assembly, nullptr, &viewport,
-                                        &raster, &multisample, nullptr, &blending, &dynamic,
-                                        *quad.layout, *quad.clear_pass, 0};
-    effect_pipelines.push_back(
-        EffectPipeline{shader.id(), quad.format, vk::raii::Pipeline{device, nullptr, info}});
+    effect_pipelines.push_back(EffectPipeline{
+        shader.id(), quad.format,
+        make_quad_pipeline(device, quad.layout, vert, shader.impl_->spirv, quad.format)});
     return effect_pipelines.back().pipeline;
 }
 
@@ -2058,8 +2220,9 @@ Result<GpuTexture> VulkanRenderer::import_texture(const DmabufPlane& p) {
         return fail("unsupported dmabuf format");
     }
     try {
-        DmabufImage img = make_dmabuf_image(impl_->device, p.fd, p.width, p.height, fmt, p.offset,
-                                            p.stride, p.modifier, vk::ImageUsageFlagBits::eSampled);
+        DmabufImage img =
+            make_dmabuf_image(impl_->physical, impl_->device, p.fd, p.width, p.height, fmt,
+                              p.offset, p.stride, p.modifier, vk::ImageUsageFlagBits::eSampled);
         // XRGB has no meaningful alpha byte; force it to opaque in the view.
         vk::raii::ImageView view = make_sampler_view(impl_->device, img.image, fmt,
                                                      p.format == DRM_FORMAT_XRGB8888);
@@ -2121,48 +2284,26 @@ Result<GpuTexture> VulkanRenderer::upload_texture(int width, int height,
         std::memcpy(sp, rgba.data(), static_cast<size_t>(size));
         staging_memory.unmapMemory();
 
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        vk::ImageMemoryBarrier to_dst{{},
-                                      vk::AccessFlagBits::eTransferWrite,
-                                      vk::ImageLayout::eUndefined,
-                                      vk::ImageLayout::eTransferDstOptimal,
-                                      VK_QUEUE_FAMILY_IGNORED,
-                                      VK_QUEUE_FAMILY_IGNORED,
-                                      *image,
-                                      whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_dst);
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::ImageLayout::eUndefined,
+                                   vk::ImageLayout::eTransferDstOptimal));
         vk::BufferImageCopy region{
             0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {0, 0, 0}, {uw, uh, 1}};
         cmd.copyBufferToImage(*staging, *image, vk::ImageLayout::eTransferDstOptimal, region);
         // Park it in ShaderReadOnlyOptimal: that is where render_to() expects it,
         // so repeated frames re-use the texture with no further transition.
-        vk::ImageMemoryBarrier to_read{vk::AccessFlagBits::eTransferWrite,
-                                       vk::AccessFlagBits::eShaderRead,
-                                       vk::ImageLayout::eTransferDstOptimal,
-                                       vk::ImageLayout::eShaderReadOnlyOptimal,
-                                       VK_QUEUE_FAMILY_IGNORED,
-                                       VK_QUEUE_FAMILY_IGNORED,
-                                       *image,
-                                       whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                            vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_read);
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eTransfer,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::PipelineStageFlagBits2::eFragmentShader,
+                                   vk::AccessFlagBits2::eShaderSampledRead,
+                                   vk::ImageLayout::eTransferDstOptimal,
+                                   vk::ImageLayout::eShaderReadOnlyOptimal));
         cmd.end();
-
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
+        impl_->submit_and_wait(std::move(cmd));
         // current_buffer_rgba() already forces alpha to 255 for opaque formats,
         // so this view needs no swizzle.
         vk::raii::ImageView view =
@@ -2230,31 +2371,15 @@ Result<OffscreenTarget> VulkanRenderer::create_offscreen(int width, int height) 
         // the one every source texture is assumed to be in — otherwise an
         // offscreen that is drawn before it is rendered into would be sampled
         // through a barrier that lies about where it came from.
-        vk::raii::CommandBuffers command_buffers{
-            device, vk::CommandBufferAllocateInfo{*impl_->command_pool,
-                                                  vk::CommandBufferLevel::ePrimary, 1}};
-        vk::raii::CommandBuffer& cmd = command_buffers.front();
+        vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        vk::ImageMemoryBarrier to_read{{},
-                                       vk::AccessFlagBits::eShaderRead,
-                                       vk::ImageLayout::eUndefined,
-                                       vk::ImageLayout::eShaderReadOnlyOptimal,
-                                       VK_QUEUE_FAMILY_IGNORED,
-                                       VK_QUEUE_FAMILY_IGNORED,
-                                       *image,
-                                       whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_read);
+        barrier(cmd, image_barrier(*image, vk::PipelineStageFlagBits2::eNone, {},
+                                   vk::PipelineStageFlagBits2::eFragmentShader,
+                                   vk::AccessFlagBits2::eShaderSampledRead,
+                                   vk::ImageLayout::eUndefined,
+                                   vk::ImageLayout::eShaderReadOnlyOptimal));
         cmd.end();
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        impl_->queue.submit(submit, *fence);
-        if (device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()) !=
-            vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
+        impl_->submit_and_wait(std::move(cmd));
 
         vk::raii::ImageView view = make_sampler_view(device, image, format, false);
         GpuTexture texture{std::make_unique<GpuTexture::Impl>(GpuTexture::Impl{
@@ -2363,7 +2488,7 @@ Result<ScanoutTarget> VulkanRenderer::create_scanout(int width, int height,
         return ScanoutTarget{std::unique_ptr<ScanoutTarget::Impl>(
             new ScanoutTarget::Impl{std::move(image), std::move(memory), std::move(view), fmt,
                                     plane, false, UniqueFd{}, std::nullopt, std::nullopt,
-                                    std::nullopt, std::nullopt, nullptr, true})};
+                                    nullptr, true})};
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan scanout alloc: "} + e.what());
     }
@@ -2375,9 +2500,9 @@ Status VulkanRenderer::render_to(ScanoutTarget& target, Color background,
                                  std::span<const Box> damage, const OutputMapping& mapping,
                                  const RenderSync& sync) {
     ScanoutTarget::Impl& s = *target.impl_;
-    VulkanRenderTarget t{*s.image,     *s.view,   s.format,        s.plane.width, s.plane.height,
-                         &s.has_content, &s.fb_load, &s.fb_clear, &s.acquire_fence,
-                         /*scanout=*/true};
+    VulkanRenderTarget t{*s.image,       *s.view,           s.format,
+                         s.plane.width,  s.plane.height,    &s.has_content,
+                         &s.acquire_fence, /*scanout=*/true};
     return render_pass_to(t, background, rects, textures, {}, damage, mapping, sync);
 }
 
@@ -2390,9 +2515,9 @@ Status VulkanRenderer::render_offscreen(OffscreenTarget& target, Color backgroun
     const GpuTexture::Impl& tex = *o.texture.impl_;
     // No OutputMapping: this image is its own pixel space, and the output's
     // scale and rotation are applied to the finished window when it is drawn.
-    VulkanRenderTarget t{*tex.image,     *tex.view,  o.format,    tex.width, tex.height,
-                         &o.has_content, &o.fb_load, &o.fb_clear, &o.acquire_fence,
-                         /*scanout=*/false};
+    VulkanRenderTarget t{*tex.image,     *tex.view,         o.format,
+                         tex.width,      tex.height,        &o.has_content,
+                         &o.acquire_fence, /*scanout=*/false};
     return render_pass_to(t, background, rects, textures, {}, damage,
                           OutputMapping{Transform::normal, scale}, sync);
 }
@@ -2405,9 +2530,9 @@ Status VulkanRenderer::render_to_with_shaders(
         return fail("fragment shader list does not match texture fills");
     }
     ScanoutTarget::Impl& s = *target.impl_;
-    VulkanRenderTarget t{*s.image,     *s.view,   s.format,        s.plane.width, s.plane.height,
-                         &s.has_content, &s.fb_load, &s.fb_clear, &s.acquire_fence,
-                         /*scanout=*/true};
+    VulkanRenderTarget t{*s.image,       *s.view,           s.format,
+                         s.plane.width,  s.plane.height,    &s.has_content,
+                         &s.acquire_fence, /*scanout=*/true};
     return render_pass_to(t, background, rects, textures, shaders, damage, mapping, sync);
 }
 
@@ -2501,9 +2626,9 @@ Status VulkanRenderer::blur_pass(OffscreenTarget& target, const GpuTexture& sour
 
     OffscreenTarget::Impl& o = *target.impl_;
     const GpuTexture::Impl& tex = *o.texture.impl_;
-    VulkanRenderTarget t{*tex.image,     *tex.view,  o.format,    tex.width, tex.height,
-                         &o.has_content, &o.fb_load, &o.fb_clear, &o.acquire_fence,
-                         /*scanout=*/false};
+    VulkanRenderTarget t{*tex.image,     *tex.view,         o.format,
+                         tex.width,      tex.height,        &o.has_content,
+                         &o.acquire_fence, /*scanout=*/false};
     // Opaque background: every pixel of the target is written by the quad, so
     // the clear is only there to satisfy the load op.
     return render_pass_to(t, Color{0, 0, 0, 0}, {}, std::span{&fill, 1}, shaders, {},
@@ -2629,19 +2754,6 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
         const Box device_area = to_device(repaint.extents());
 
         QuadPipeline& quad = impl_->quad_pipeline(t.format);
-        // Built on the first frame that needs this pass and kept on the target.
-        std::optional<vk::raii::Framebuffer>& cached = partial ? *t.fb_load : *t.fb_clear;
-        if (!cached.has_value()) {
-            vk::ImageView fb_attachment = t.view;
-            cached.emplace(device,
-                           vk::FramebufferCreateInfo{{},
-                                                     partial ? *quad.load_pass : *quad.clear_pass,
-                                                     fb_attachment,
-                                                     static_cast<std::uint32_t>(device_w),
-                                                     static_cast<std::uint32_t>(device_h),
-                                                     1});
-        }
-        const vk::raii::Framebuffer& framebuffer = *cached;
 
         vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
         cmd.begin(vk::CommandBufferBeginInfo{vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
@@ -2650,7 +2762,10 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             impl_->queue_foreign ? uint32_t{VK_QUEUE_FAMILY_FOREIGN_EXT} : VK_QUEUE_FAMILY_IGNORED;
         const std::uint32_t self =
             impl_->queue_foreign ? impl_->queue_family : VK_QUEUE_FAMILY_IGNORED;
-        const vk::ImageSubresourceRange whole{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+
+        // Every transition this pass needs goes into one pipelineBarrier2.
+        std::vector<vk::ImageMemoryBarrier2>& barriers = impl_->barriers;
+        barriers.clear();
 
         // Take the target back from whoever had it. On a partial repaint the
         // untouched pixels must survive, so we come in from the layout they were
@@ -2658,48 +2773,60 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
         // taking it back off the display engine's queue, and for an offscreen
         // one means taking it back from the pass that sampled it. A full repaint
         // keeps nothing either way, so it comes in from Undefined.
+        //
+        // The source scope is the colour-output stage — which is where the
+        // display's out-fence is waited on, and where the last render into this
+        // target wrote — plus the fragment stage, for an offscreen target that a
+        // previous pass sampled.
         const bool reclaim_from_display = partial && t.scanout;
-        vk::ImageMemoryBarrier reacquire{{},
-                                         vk::AccessFlagBits::eColorAttachmentWrite,
-                                         !partial ? vk::ImageLayout::eUndefined
-                                         : t.scanout ? vk::ImageLayout::eGeneral
-                                                     : vk::ImageLayout::eShaderReadOnlyOptimal,
-                                         vk::ImageLayout::eColorAttachmentOptimal,
-                                         reclaim_from_display ? foreign : VK_QUEUE_FAMILY_IGNORED,
-                                         reclaim_from_display ? self : VK_QUEUE_FAMILY_IGNORED,
-                                         t.image,
-                                         whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                            vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, {}, {},
-                            reacquire);
+        barriers.push_back(image_barrier(
+            t.image,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                vk::PipelineStageFlagBits2::eFragmentShader,
+            {}, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eColorAttachmentWrite |
+                (partial ? vk::AccessFlagBits2::eColorAttachmentRead : vk::AccessFlags2{}),
+            !partial    ? vk::ImageLayout::eUndefined
+            : t.scanout ? vk::ImageLayout::eGeneral
+                        : vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            reclaim_from_display ? foreign : VK_QUEUE_FAMILY_IGNORED,
+            reclaim_from_display ? self : VK_QUEUE_FAMILY_IGNORED));
 
-        // Take every source texture for sampling. Imported client buffers come
-        // from the foreign (external) queue; ours already sit in the read layout.
+        // Take every imported client buffer for sampling, from the foreign
+        // (external) queue, once each however many quads draw it. Ours already
+        // sit in the read layout, made visible to the fragment stage by the
+        // barrier that put them there, so they need nothing at all.
         for (const GpuTextureFill& tf : textures) {
-            if (tf.texture == nullptr) {
+            if (tf.texture == nullptr || !tf.texture->impl_->external) {
                 continue;
             }
-            const GpuTexture::Impl& tex = *tf.texture->impl_;
-            vk::ImageMemoryBarrier acquire{
-                {},
-                vk::AccessFlagBits::eShaderRead,
-                tex.external ? vk::ImageLayout::eUndefined
-                             : vk::ImageLayout::eShaderReadOnlyOptimal,
-                vk::ImageLayout::eShaderReadOnlyOptimal,
-                tex.external ? foreign : VK_QUEUE_FAMILY_IGNORED,
-                tex.external ? self : VK_QUEUE_FAMILY_IGNORED,
-                *tex.image,
-                whole};
-            cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                                vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, acquire);
+            const vk::Image image = *tf.texture->impl_->image;
+            if (std::ranges::any_of(barriers, [&](const auto& b) { return b.image == image; })) {
+                continue;
+            }
+            barriers.push_back(image_barrier(
+                image, vk::PipelineStageFlagBits2::eFragmentShader, {},
+                vk::PipelineStageFlagBits2::eFragmentShader,
+                vk::AccessFlagBits2::eShaderSampledRead, vk::ImageLayout::eUndefined,
+                vk::ImageLayout::eShaderReadOnlyOptimal, foreign, self));
         }
+        cmd.pipelineBarrier2(vk::DependencyInfo{{}, {}, {}, barriers});
 
-        vk::ClearValue clear{vk::ClearColorValue{
-            std::array<float, 4>{background.r, background.g, background.b, background.a}}};
-        const vk::Rect2D render_area = to_rect2d(device_area);
-        cmd.beginRenderPass(vk::RenderPassBeginInfo{partial ? *quad.load_pass : *quad.clear_pass,
-                                                    *framebuffer, render_area, clear},
-                            vk::SubpassContents::eInline);
+        // Dynamic rendering: load versus clear is the attachment's loadOp, so
+        // there is no render pass per mode and no framebuffer to cache.
+        const vk::RenderingAttachmentInfo color_attachment{
+            t.view,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ResolveModeFlagBits::eNone,
+            {},
+            vk::ImageLayout::eUndefined,
+            partial ? vk::AttachmentLoadOp::eLoad : vk::AttachmentLoadOp::eClear,
+            vk::AttachmentStoreOp::eStore,
+            vk::ClearValue{vk::ClearColorValue{
+                std::array<float, 4>{background.r, background.g, background.b, background.a}}}};
+        cmd.beginRendering(
+            vk::RenderingInfo{{}, to_rect2d(device_area), 1, 0, color_attachment});
 
         // On a partial repaint loadOp is eLoad, so the background has to be
         // painted explicitly — over each damage box, not over the box spanning
@@ -2830,39 +2957,39 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                 cmd.draw(4, 1, 0, 0);
             }
         }
-        cmd.endRenderPass();
+        cmd.endRendering();
 
         // Hand the target on. A scanout target goes back to the foreign owner —
-        // the display engine reads it next, not us. An offscreen one stays ours
-        // and is sampled by the pass that draws it onto the output, so it is
-        // parked in exactly the layout the loop above expects of a source
-        // texture: that next pass then needs no transition at all.
-        vk::ImageMemoryBarrier release{
-            vk::AccessFlagBits::eColorAttachmentWrite,
-            t.scanout ? vk::AccessFlags{} : vk::AccessFlags{vk::AccessFlagBits::eShaderRead},
-            vk::ImageLayout::eColorAttachmentOptimal,
-            t.scanout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
-            t.scanout ? self : VK_QUEUE_FAMILY_IGNORED,
-            t.scanout ? foreign : VK_QUEUE_FAMILY_IGNORED,
-            t.image,
-            whole};
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                            t.scanout ? vk::PipelineStageFlagBits::eBottomOfPipe
-                                      : vk::PipelineStageFlagBits::eFragmentShader,
-                            {}, {}, {}, release);
+        // the display engine reads it next, not us; the submit's semaphore
+        // signals cover the transition. An offscreen one stays ours and is
+        // sampled by the pass that draws it onto the output, so it is parked in
+        // exactly the layout the source textures are assumed to be in: that
+        // next pass then needs no transition at all.
+        barrier(cmd, image_barrier(
+                         t.image, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                         vk::AccessFlagBits2::eColorAttachmentWrite,
+                         t.scanout ? vk::PipelineStageFlagBits2::eNone
+                                   : vk::PipelineStageFlagBits2::eFragmentShader,
+                         t.scanout ? vk::AccessFlags2{}
+                                   : vk::AccessFlags2{vk::AccessFlagBits2::eShaderSampledRead},
+                         vk::ImageLayout::eColorAttachmentOptimal,
+                         t.scanout ? vk::ImageLayout::eGeneral
+                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
+                         t.scanout ? self : VK_QUEUE_FAMILY_IGNORED,
+                         t.scanout ? foreign : VK_QUEUE_FAMILY_IGNORED));
         cmd.end();
 
         // --- explicit sync: wait on the GPU, not on the CPU ---
         //
         // Every fence a client gave us for its buffer, plus whatever the display
         // engine still owes on this target, becomes a semaphore the queue waits
-        // on. The finished render becomes a sync_file the caller hands to KMS.
+        // on — at the stage that actually needs it: client buffers before they
+        // are sampled, the target before it is written. The finished render
+        // becomes a sync_file the caller hands to KMS.
         std::vector<vk::raii::Semaphore> semaphores = impl_->acquire_sem_list();
-        std::vector<vk::Semaphore>& wait_handles = impl_->wait_handles;
-        std::vector<vk::PipelineStageFlags>& wait_stages = impl_->wait_stages;
-        wait_handles.clear();
-        wait_stages.clear();
-        auto add_wait = [&](int fd) {
+        std::vector<vk::SemaphoreSubmitInfo>& waits = impl_->waits;
+        waits.clear();
+        auto add_wait = [&](int fd, vk::PipelineStageFlags2 stage) {
             if (fd < 0 || !impl_->sync_fd_ok) {
                 return;
             }
@@ -2874,14 +3001,13 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             device.importSemaphoreFdKHR(vk::ImportSemaphoreFdInfoKHR{
                 *sem, vk::SemaphoreImportFlagBits::eTemporary,
                 vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd, dupfd});
-            wait_handles.push_back(*sem);
-            wait_stages.push_back(vk::PipelineStageFlagBits::eAllCommands);
+            waits.push_back(vk::SemaphoreSubmitInfo{*sem, 0, stage});
             semaphores.push_back(std::move(sem));
         };
         for (int fd : sync.wait_fds) {
-            add_wait(fd);
+            add_wait(fd, vk::PipelineStageFlagBits2::eFragmentShader);
         }
-        add_wait(t.acquire_fence->get());
+        add_wait(t.acquire_fence->get(), vk::PipelineStageFlagBits2::eColorAttachmentOutput);
 
         const bool want_out_fence = sync.out_fence_fd != nullptr && impl_->sync_fd_ok;
         std::optional<vk::raii::Semaphore> out_sem;
@@ -2893,19 +3019,8 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
             out_sem.emplace(device, ci);
         }
 
-        vk::raii::Fence fence = impl_->acquire_fence_object();
-        vk::SubmitInfo submit;
-        submit.setCommandBuffers(*cmd);
-        if (!wait_handles.empty()) {
-            submit.setWaitSemaphores(wait_handles);
-            submit.setWaitDstStageMask(wait_stages);
-        }
-        vk::Semaphore out_handle;
-        if (out_sem.has_value()) {
-            out_handle = **out_sem;
-            submit.setSignalSemaphores(out_handle);
-        }
-        impl_->queue.submit(submit, *fence);
+        const std::uint64_t value =
+            impl_->submit(cmd, waits, out_sem.has_value() ? **out_sem : vk::Semaphore{});
 
         // The waits consumed the target's fence; a stale one must not be waited
         // on twice.
@@ -2917,26 +3032,21 @@ Status VulkanRenderer::render_pass_to(VulkanRenderTarget& t, Color background,
                 **out_sem, vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd});
             semaphores.push_back(std::move(*out_sem));
             // Nothing is waited on here: the command buffer, its descriptors and
-            // these semaphores stay alive in the in-flight list until the fence
-            // says the GPU is done with them.
-            impl_->in_flight.push_back(InFlight{std::move(fence), std::move(cmd),
-                                                std::move(semaphores), ++impl_->submits});
+            // these semaphores stay alive in the in-flight list until the
+            // timeline says the GPU is done with them.
+            impl_->in_flight.push_back(
+                InFlight{std::move(cmd), std::move(semaphores), value});
             return ok();
         }
         if (sync.out_fence_fd != nullptr) {
             *sync.out_fence_fd = -1; // asked for a fence the device cannot give
         }
-        const vk::Result waited =
-            device.waitForFences(*fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+        impl_->wait_for(value);
         // Waited for, so nothing is reading either of them any more: straight
         // back on the free lists rather than out through the destructor.
         semaphores.clear();
         impl_->free_sem_lists.push_back(std::move(semaphores));
         impl_->free_cmds.push_back(std::move(cmd));
-        impl_->free_fences.push_back(std::move(fence));
-        if (waited != vk::Result::eSuccess) {
-            return fail("fence wait failed");
-        }
         return ok();
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan render pass: "} + e.what());
