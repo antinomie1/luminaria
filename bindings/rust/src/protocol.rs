@@ -88,6 +88,39 @@ impl SurfaceId {
     pub fn accepts_input(&self, sx: f64, sy: f64) -> bool {
         ffi::surface_accepts_input(self.0, sx, sy)
     }
+
+    /// The surface tree rooted here, back to front, subsurfaces included. Each
+    /// entry's x/y is its offset from this surface, so input that belongs to a
+    /// grabbed surface can be sent in that surface's own coordinates even when
+    /// it is a subsurface: add the offset, subtract it again on the way back.
+    pub fn surface_tree(&self) -> Vec<SurfaceAt> {
+        ffi::surface_tree(self.0)
+            .into_iter()
+            .filter_map(|at| {
+                let surface = Self::from_raw(at.surface_id)?;
+                Some(SurfaceAt { surface, x: at.x, y: at.y })
+            })
+            .collect()
+    }
+
+    /// Render at `scale` device pixels per logical pixel. Ignored for clients
+    /// that negotiated an older `wl_surface` version.
+    pub fn set_preferred_buffer_scale(&self, scale: i32) {
+        ffi::surface_set_preferred_buffer_scale(self.0, scale);
+    }
+
+    /// A hint for clients that rotate their buffers themselves.
+    pub fn set_preferred_buffer_transform(&self, transform: Transform) {
+        ffi::surface_set_preferred_buffer_transform(self.0, transform.as_u32());
+    }
+}
+
+/// One surface of a [`SurfaceId::surface_tree`], at its offset from the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceAt {
+    pub surface: SurfaceId,
+    pub x: i32,
+    pub y: i32,
 }
 
 /// A compositor event regarding surface lifecycle.
@@ -333,7 +366,6 @@ macro_rules! define_manager {
 }
 
 define_manager!(Viewporter, ViewporterShim, viewporter_new);
-define_manager!(FractionalScaleManager, FractionalScaleManagerShim, fractional_scale_manager_new);
 define_manager!(SinglePixelBufferManager, SinglePixelBufferManagerShim, single_pixel_buffer_manager_new);
 define_manager!(TearingControlManager, TearingControlManagerShim, tearing_control_manager_new);
 define_manager!(ContentTypeManager, ContentTypeManagerShim, content_type_manager_new);
@@ -341,6 +373,40 @@ define_manager!(FifoManager, FifoManagerShim, fifo_manager_new);
 define_manager!(CommitTimingManager, CommitTimingManagerShim, commit_timing_manager_new);
 define_manager!(Presentation, PresentationShim, presentation_new);
 define_manager!(BackgroundEffectManager, BackgroundEffectManagerShim, background_effect_manager_new);
+
+/// The `wp_fractional_scale_manager_v1` global.
+///
+/// Scale is per surface and per output: [tell](Self::set_scale) it when a
+/// window lands on an output, and again when that output's scale changes.
+pub struct FractionalScaleManager<'d> {
+    #[allow(dead_code)]
+    pub(crate) raw: cxx::UniquePtr<ffi::FractionalScaleManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> FractionalScaleManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::fractional_scale_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self { raw, _display: Holds::new() })
+        }
+    }
+
+    /// `scale_120ths` is the scale in 120ths (180 = 1.5x), which is what the
+    /// protocol carries. Surfaces that never created a `wp_fractional_scale_v1`
+    /// object are skipped by the library.
+    pub fn set_scale(&self, surface: SurfaceId, scale_120ths: i32) {
+        self.raw.set_scale(surface.0, scale_120ths);
+    }
+
+    /// The same from a floating-point scale, e.g. 1.5.
+    pub fn set_scale_f64(&self, surface: SurfaceId, scale: f64) {
+        self.set_scale(surface, (scale * 120.0 + 0.5) as i32);
+    }
+}
 
 /// Window decoration modes (`zxdg_toplevel_decoration_v1.mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

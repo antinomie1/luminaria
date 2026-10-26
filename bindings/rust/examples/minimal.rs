@@ -18,9 +18,10 @@
 //! answering the display — frame callbacks, the frame that turned out
 //! unchanged — is `SceneRenderer`'s.
 //!
-//! Where it still differs from its twin, because the binding does not expose
-//! it yet: no preferred buffer scale or fractional scale sent on map, and a
-//! pointer grab held by a subsurface is routed as if it sat at its window's origin.
+//! It sends the output's scale to a window on map, both the integer hint and
+//! the exact value for clients that speak fractional-scale, and a held button
+//! keeps the pointer on the surface that took it even when that is a
+//! subsurface (`SurfaceId::surface_tree` gives the offset).
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -217,14 +218,23 @@ fn raise(stack: &mut Vec<SurfaceId>, surface: SurfaceId) {
 }
 
 /// Gives the pointer to whatever is under it. A held button keeps it on the
-/// surface it went down on, in that surface's coordinates.
+/// surface it went down on, in that surface's coordinates — which is the
+/// window's origin when the grab is the window itself, and that plus the
+/// subsurface's own offset when it is not.
 fn pointer_focus(seat: &Seat, items: &[SceneItem], usable: Rect, (x, y): (f64, f64)) {
     if let Some(grab) = seat.pointer_grab() {
-        let (ox, oy) = items
+        let origin = items
             .iter()
             .find(|item| item.surface == grab)
-            .map_or((usable.x, usable.y), |item| item.surface_origin);
-        seat.pointer_motion(x - ox as f64, y - oy as f64);
+            .map(|item| item.surface_origin)
+            .or_else(|| {
+                items.iter().find_map(|item| {
+                    let at = item.surface.surface_tree().into_iter().find(|at| at.surface == grab)?;
+                    Some((item.surface_origin.0 + at.x, item.surface_origin.1 + at.y))
+                })
+            })
+            .unwrap_or((usable.x, usable.y));
+        seat.pointer_motion(x - origin.0 as f64, y - origin.1 as f64);
         return;
     }
     let hit = scene_hit_test(items, x, y);
@@ -343,7 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _single_pixel = SinglePixelBufferManager::new(&display)?;
     let presentation = Presentation::new(&display)?;
     let _viewporter = Viewporter::new(&display)?;
-    let _fractional = FractionalScaleManager::new(&display)?;
+    let fractional = FractionalScaleManager::new(&display)?;
     // We draw no title bars, so clients draw their own.
     let _decoration = XdgDecorationManager::new(&display)?;
     let cursor_shape = CursorShapeManager::new(&display)?;
@@ -550,6 +560,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             t.configure(usable.width, usable.height);
                         }
                         ToplevelEvent::Map => {
+                            // Render at the output's density: the integer hint
+                            // and the exact scale for fractional-scale clients.
+                            let scale = screens.first().map_or(1, |s| s.output.scale());
+                            surface.set_preferred_buffer_scale(scale);
+                            fractional.set_scale(surface, scale * 120);
                             println!("minimal: window mapped — \"{}\"", t.title());
                             raise(&mut stack, surface);
                             restacked = true;
@@ -577,7 +592,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         PopupEvent::Map => popups.set_mapped(popup, true),
                         PopupEvent::Unmap => popups.set_mapped(popup, false),
-                        _ => {}
+                        // Its geometry moved; the redraw below shows it where
+                        // it now is. A destroyed popup has already left the
+                        // tree by itself.
+                        PopupEvent::Reposition | PopupEvent::Destroy | PopupEvent::Grab { .. } => {}
                     }
                     redraw = true;
                 }

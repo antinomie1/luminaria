@@ -369,6 +369,10 @@ fn popups_through_the_tree_into_the_scene() {
     assert!(tree.dismiss_grabs_outside(Some(parent)));
     assert_eq!(drain(|| shell.next_event()), [XdgEvent::Popup(p, PopupEvent::Unmap)]);
     assert!(!popup.is_mapped());
+    // Dropping one by hand is the compositor's call; it leaves the scene with
+    // it. (A destroy does the same on its own.)
+    tree.remove(p);
+    assert!(!tree.contains(p));
     peer.go();
 
     peer.wait(&display, "popup destroyed");

@@ -18,6 +18,7 @@ struct Mode;
 struct Rect;
 struct SceneItemRaw;
 struct SceneHitRaw;
+struct SurfaceAtRaw;
 struct BackendInputEventRaw;
 struct EventRaw;
 struct ToplevelInfoRaw;
@@ -230,6 +231,11 @@ rust::Vec<Rect> surface_damage(std::uint64_t surface_id);
 void surface_send_frame_done(std::uint64_t surface_id, std::uint32_t time_ms);
 void surface_notify_rendered(std::uint64_t surface_id, int fence_fd);
 bool surface_accepts_input(std::uint64_t surface_id, double sx, double sy);
+// Back to front, subsurfaces included; each entry's x/y is its offset from the
+// root surface, so a grab on a subsurface can be placed where it is drawn.
+rust::Vec<SurfaceAtRaw> surface_tree(std::uint64_t surface_id);
+void surface_set_preferred_buffer_scale(std::uint64_t surface_id, std::int32_t scale);
+void surface_set_preferred_buffer_transform(std::uint64_t surface_id, std::uint32_t transform);
 
 class SubcompositorShim {
 public:
@@ -415,7 +421,6 @@ private: \
 std::unique_ptr<Name##Shim> FuncName(const DisplayShim& display, rust::String& error);
 
 DECLARE_GLOBAL_SHIM(Viewporter, viewporter_new)
-DECLARE_GLOBAL_SHIM(FractionalScaleManager, fractional_scale_manager_new)
 DECLARE_GLOBAL_SHIM(SinglePixelBufferManager, single_pixel_buffer_manager_new)
 DECLARE_GLOBAL_SHIM(TearingControlManager, tearing_control_manager_new)
 DECLARE_GLOBAL_SHIM(ContentTypeManager, content_type_manager_new)
@@ -445,6 +450,17 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 std::unique_ptr<XdgDecorationManagerShim> xdg_decoration_manager_new(const DisplayShim& display, rust::String& error);
+
+class FractionalScaleManagerShim {
+public:
+    LUM_SHIM_BOILERPLATE(FractionalScaleManagerShim)
+    // Tells `surface` to render for a scale of `scale_120ths / 120`. Surfaces
+    // with no wp_fractional_scale_v1 object are skipped by the library.
+    void set_scale(std::uint64_t surface_id, std::int32_t scale_120ths) const;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<FractionalScaleManagerShim> fractional_scale_manager_new(const DisplayShim& display, rust::String& error);
 
 class CursorShapeManagerShim {
 public:

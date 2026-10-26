@@ -120,9 +120,10 @@ src/detail/wayland_fwd.h the one remaining header
   global module precisely so that works.
 
 Running the example compositor — one, `examples/minimal.cpp`, the C++ twin of
-`bindings/rust/examples/minimal.rs` (same window policy, same bindings, same backend choice; keep
-the two in step — the Rust one still lacks `LinuxDmabuf`, cursor shapes and preferred scales, see
-`bindings/rust/docs/api.md` §9.5):
+`bindings/rust/examples/minimal.rs`. The two are kept in step: same window policy, same bindings,
+same backend choice, same popups, dmabuf, cursor shapes, preferred and fractional scale, and the
+same subsurface-aware pointer grab. Adding a visible behaviour to one means adding it to the
+other; `bindings/rust/docs/api.md` §9.5 records what the Rust one does with it:
 
 ```sh
 xmake run minimal                                # nested; prints its own socket name

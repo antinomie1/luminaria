@@ -264,6 +264,10 @@ while let Some(event) = seat.next_event() { /* SeatEvent */ }
   - `surface_id.damage() -> Vec<Rect>`：当前帧损伤区域。
   - `surface_id.send_frame_done(time_ms)`：释放帧回调节拍。
   - `surface_id.accepts_input(sx, sy) -> bool`：基于输入区域的命中测试。
+  - `surface_id.surface_tree() -> Vec<SurfaceAt>`：这棵树（子表面在内，后到前），每项的 `x`/`y`
+    是相对根表面的偏移；`SurfaceAt { surface, x, y }`。
+  - `surface_id.set_preferred_buffer_scale(scale)` / `set_preferred_buffer_transform(t)`：
+    告诉客户端按哪个缩放、哪个朝向准备 buffer（`wl_surface` v6 起）。
 
 ### `Seat`
 发布 `wl_seat`，控制键盘焦点、鼠标光标、按键与触摸：
@@ -678,7 +682,7 @@ ADR 0003 约束的是**核心模块**收什么协议；Vulkan 本来就在 `lumi
   wgpu 这类需要更多特性的库不一定能在这个设备上建起来；luminaria 不会为外部调用者多开特性。
 - **测试兜底失效。** "稳态 `render_to` 不分配"和"校验层零报错"这两条测试保证，覆盖不到外部代码提交的工作。
 
-### 9.5 `examples/minimal.rs` 与 C++ 版的差别，以及绑定还缺什么
+### 9.5 `examples/minimal.rs` 与 C++ 版的对齐情况
 
 有了 9.2 和 9.3，`minimal.rs` 加上了与 `minimal.cpp` 相同的后端选择：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
 auto 依次尝试嵌套、能拿到 libseat 会话时的 DRM、无头；显卡取第一个参数或 `LUMINARIA_DRM_DEVICE`；
@@ -688,10 +692,20 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 告诉客户端位置、模式、缩放与朝向。C++ 版没有 layer shell 与锁屏，所以 Rust 版也没有（两者保持同步）；
 它们的用法见 `tests/test_layer_shell.rs`、`tests/test_session_lock.rs`。
 
-与 C++ 版仍有的差别，都是绑定还没导出的东西：
+与 C++ 版曾有的差别现已全部补齐，两个示例在行为上已经一致：
 
-- 映射时不发首选缓冲缩放与分数缩放：`Surface::set_preferred_buffer_scale` 与 `FractionalScaleManager::set_scale` 没有导出。
-- 子表面树（`Surface::surface_tree`）没有导出：按住按钮时，抓取落在子表面上的指针按其窗口原点换算坐标。
+- **首选缓冲缩放与分数缩放**：窗口 map 时把输出的整数缩放与分数缩放发给客户端——`SurfaceId::set_preferred_buffer_scale(scale)`、
+  `SurfaceId::set_preferred_buffer_transform(transform)` 对应 `wl_surface.preferred_buffer_scale` /
+  `preferred_buffer_transform`（`wl_surface` v6 起），`FractionalScaleManager::set_scale(surface, scale_120ths)`
+  对应 `wp_fractional_scale_v1.preferred_scale`（120 分之一；另有 `set_scale_f64(1.5)`）。输出缩放变化后要重新发。
+- **子表面树**：`SurfaceId::surface_tree() -> Vec<SurfaceAt>` 按后到前的顺序给出这棵树（含子表面），
+  每一项的 `x`/`y` 是它相对根表面的偏移。按住按钮、抓取落在子表面上时，用它算出该子表面在屏幕上的原点
+  （场景项的位置 + 偏移），指针坐标才不会按整个窗口的原点算。
+
+另有两条与「对象活得比输出久」相关的约定，热插拔时靠它们兜底：`Frame`（借用 `VulkanRenderer` 的那个）
+在输出销毁时被 shim 直接丢弃，之后 `reset` / `submit` 返回错误、其余方法是空操作；`DirectScanout`
+在 C++ 侧自己把 `Output*` 置空，所以输出拔掉之后 `available()` 为 false、`id_for()` 为 `None`。这两条由
+`tests/test_escape_hatches.rs` 用一个被丢掉的 headless 后端守着。
 
 现已补全的跨 crate 互操作与功能支持：
 

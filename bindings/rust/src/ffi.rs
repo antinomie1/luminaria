@@ -64,6 +64,15 @@ pub(crate) mod ffi {
         sy: f64,
     }
 
+    /// One entry of [`SurfaceId::surface_tree`](crate::protocol::SurfaceId::surface_tree):
+    /// a surface of the tree and where it sits relative to the root.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SurfaceAtRaw {
+        surface_id: u64,
+        x: i32,
+        y: i32,
+    }
+
     /// What an [`EventRaw`] reports. Shared, so both halves name the same values.
     #[derive(Debug)]
     #[repr(u32)]
@@ -366,6 +375,9 @@ pub(crate) mod ffi {
         fn surface_send_frame_done(surface_id: u64, time_ms: u32);
         fn surface_notify_rendered(surface_id: u64, fence_fd: i32);
         fn surface_accepts_input(surface_id: u64, sx: f64, sy: f64) -> bool;
+        fn surface_tree(surface_id: u64) -> Vec<SurfaceAtRaw>;
+        fn surface_set_preferred_buffer_scale(surface_id: u64, scale: i32);
+        fn surface_set_preferred_buffer_transform(surface_id: u64, transform: u32);
 
         // Core Protocols
         type CompositorShim;
@@ -456,6 +468,7 @@ pub(crate) mod ffi {
 
         type FractionalScaleManagerShim;
         fn fractional_scale_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<FractionalScaleManagerShim>;
+        fn set_scale(self: &FractionalScaleManagerShim, surface_id: u64, scale_120ths: i32);
 
         type XdgActivationShim;
         fn xdg_activation_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgActivationShim>;

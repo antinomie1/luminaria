@@ -1,14 +1,17 @@
 //! The escape hatches of docs/api.md §9 that run without a free VT: the DRM
 //! device identity, the libinput queue's surface, the output identity and the
-//! layout dropping a dead output, and (with `raw-vulkan`) the raw handles.
-//! `test_raw_display.rs` covers `Display::as_ptr()`.
+//! layout dropping a dead output, the objects that outlive their output, and
+//! (with `raw-vulkan`) the raw handles. `test_raw_display.rs` covers
+//! `Display::as_ptr()`.
 
 use std::fs::File;
 
 use luminaria::backend::{HeadlessBackend, InputCapabilities, LibinputBackend};
 use luminaria::core::Display;
-use luminaria::gpu::DrmDeviceId;
+use luminaria::gpu::{DirectScanout, DrmDeviceId, Frame, SceneRenderer, VulkanOptions, VulkanRenderer};
+use luminaria::protocol::SurfaceId;
 use luminaria::shell::OutputLayout;
+use luminaria::util::{Color, Rect};
 
 fn runtime_dir() {
     let dir = std::env::temp_dir().join("luminaria_test_escape_hatches_runtime");
@@ -83,6 +86,67 @@ fn output_identity_and_liveness() {
     assert!(!a.is_alive() && !b.is_alive());
     assert!(layout.bounds().width <= 0, "dead outputs still laid out: {:?}", layout.bounds());
     layout.remove(&mut a); // and a late removal is harmless
+}
+
+/// A hotplug is not a Rust scope: the `Output` is the backend's, and the
+/// objects built around it have to go inert when it is destroyed rather than
+/// keep a pointer to a monitor that is gone. `DirectScanout` guards itself in
+/// C++ (its `Output*` is nulled by `Output::destroy`); `Frame` does not, so its
+/// shim drops the frame instead. Both are exercised here by dropping the
+/// backend, which is what a monitor going away does.
+#[test]
+fn output_dependants_survive_their_output() {
+    runtime_dir();
+    let display = Display::new().expect("display");
+    let mut backend = HeadlessBackend::new(&display, 16).expect("headless");
+    let mut output = backend.add_output(640, 480).expect("output");
+
+    let mut direct = DirectScanout::new(&mut output).expect("direct scanout");
+    assert!(!direct.available(), "a headless output cannot scan out");
+    let surface = SurfaceId::INVALID;
+    assert_eq!(direct.id_for(surface), None);
+    direct.committed(surface);
+    direct.presented();
+    direct.clear();
+
+    // Declared before the frame: `Frame<'r>` borrows the renderer, so it has to
+    // drop first. No GPU means no Frame half of this test.
+    let renderer = match VulkanRenderer::new(&VulkanOptions::default()) {
+        Ok(renderer) => Some(renderer),
+        Err(e) => {
+            eprintln!("skip: no Vulkan renderer for the Frame half ({e})");
+            None
+        }
+    };
+    let mut frame = renderer.as_ref().map(|renderer| {
+        let mut frame = Frame::new(&mut output, renderer).expect("frame");
+        assert!(frame.reset(0x34325258).is_ok(), "headless has a render target");
+        assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_ok());
+        frame
+    });
+    let scene = SceneRenderer::new(&VulkanOptions::default()).expect("scene renderer");
+
+    // The monitor (here: the backend) goes away under everything.
+    drop(backend);
+    assert!(!output.is_alive());
+
+    // Nothing here may touch the freed Output.
+    assert!(!direct.available());
+    assert_eq!(direct.id_for(surface), None);
+    direct.committed(surface);
+    direct.presented();
+    direct.clear();
+    assert_eq!(direct.cached(), 0);
+
+    if let Some(frame) = frame.as_mut() {
+        assert!(frame.reset(0x34325258).is_err(), "reset after hotplug fails");
+        assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_err());
+        frame.begin(Rect::new(0, 0, 640, 480));
+        frame.place_rect(Rect::new(0, 0, 10, 10), Color::rgb(1.0, 0.0, 0.0));
+        frame.send_frame_done(0);
+    }
+    let mut state = luminaria::gpu::SceneOutput::new();
+    assert!(scene.reset(&mut state, &mut output, 0x34325258).is_err());
 }
 
 #[cfg(feature = "raw-vulkan")]

@@ -634,6 +634,25 @@ bool surface_accepts_input(std::uint64_t surface_id, double sx, double sy) {
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
     return s ? s->accepts_input(sx, sy) : false;
 }
+rust::Vec<SurfaceAtRaw> surface_tree(std::uint64_t surface_id) {
+    rust::Vec<SurfaceAtRaw> out;
+    lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
+    if (s == nullptr) return out;
+    std::vector<lm::SurfaceAt> tree;
+    s->surface_tree(tree);
+    for (const lm::SurfaceAt& at : tree) {
+        out.push_back(SurfaceAtRaw{u64_from_id(at.surface->id()), at.x, at.y});
+    }
+    return out;
+}
+void surface_set_preferred_buffer_scale(std::uint64_t surface_id, std::int32_t scale) {
+    lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
+    if (s) s->set_preferred_buffer_scale(scale);
+}
+void surface_set_preferred_buffer_transform(std::uint64_t surface_id, std::uint32_t transform) {
+    lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
+    if (s) s->set_preferred_buffer_transform(static_cast<lm::Transform>(transform));
+}
 
 struct CompositorShim::Impl {
     struct SurfaceEntry {
@@ -1310,7 +1329,6 @@ std::unique_ptr<Name##Shim> FuncName(const DisplayShim& display, rust::String& e
 }
 
 DEFINE_GLOBAL_SHIM_IMPL(Viewporter, Viewporter, viewporter_new)
-DEFINE_GLOBAL_SHIM_IMPL(FractionalScaleManager, FractionalScaleManager, fractional_scale_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(SinglePixelBufferManager, SinglePixelBufferManager, single_pixel_buffer_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(TearingControlManager, TearingControlManager, tearing_control_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(ContentTypeManager, ContentTypeManager, content_type_manager_new)
@@ -1319,6 +1337,33 @@ DEFINE_GLOBAL_SHIM_IMPL(CommitTimingManager, CommitTimingManager, commit_timing_
 DEFINE_GLOBAL_SHIM_IMPL(BackgroundEffectManager, BackgroundEffectManager, background_effect_manager_new)
 
 #undef DEFINE_GLOBAL_SHIM_IMPL
+
+// ---- fractional-scale ------------------------------------------------------
+//
+// The scale is per surface and per output: the compositor calls set_scale()
+// when a window lands on an output and again when that output's scale changes.
+
+struct FractionalScaleManagerShim::Impl {
+    std::optional<lm::FractionalScaleManager> mgr;
+};
+FractionalScaleManagerShim::~FractionalScaleManagerShim() = default;
+FractionalScaleManagerShim::FractionalScaleManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+FractionalScaleManagerShim::Impl& FractionalScaleManagerShim::impl() const { return *impl_; }
+std::unique_ptr<FractionalScaleManagerShim> fractional_scale_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::FractionalScaleManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<FractionalScaleManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        return std::make_unique<FractionalScaleManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+void FractionalScaleManagerShim::set_scale(std::uint64_t surface_id, std::int32_t scale_120ths) const {
+    if (!impl_->mgr) return;
+    lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
+    if (s) impl_->mgr->set_scale(*s, scale_120ths);
+}
 
 // ---- xdg-decoration --------------------------------------------------------
 
