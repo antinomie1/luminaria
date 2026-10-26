@@ -81,9 +81,23 @@ impl SurfaceId {
         ffi::surface_send_frame_done(self.0, time_ms);
     }
 
+    pub fn notify_rendered(&self, fence_fd: i32) {
+        ffi::surface_notify_rendered(self.0, fence_fd);
+    }
+
     pub fn accepts_input(&self, sx: f64, sy: f64) -> bool {
         ffi::surface_accepts_input(self.0, sx, sy)
     }
+}
+
+/// A compositor event regarding surface lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositorEvent {
+    NewSurface(SurfaceId),
+    Commit(SurfaceId),
+    Destroy(SurfaceId),
+    Rendered(SurfaceId),
+    Invalidated(SurfaceId),
 }
 
 /// The `wl_compositor` global.
@@ -101,6 +115,21 @@ impl<'d> Compositor<'d> {
             Err(Error(err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
+        }
+    }
+
+    pub fn next_event(&self) -> Option<CompositorEvent> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            let surface = SurfaceId(raw.id);
+            match raw.kind {
+                ffi::EventKind::NewSurface => return Some(CompositorEvent::NewSurface(surface)),
+                ffi::EventKind::SurfaceCommit => return Some(CompositorEvent::Commit(surface)),
+                ffi::EventKind::SurfaceDestroy => return Some(CompositorEvent::Destroy(surface)),
+                ffi::EventKind::SurfaceRendered => return Some(CompositorEvent::Rendered(surface)),
+                ffi::EventKind::SurfaceInvalidated => return Some(CompositorEvent::Invalidated(surface)),
+                _ => {}
+            }
         }
     }
 }
@@ -222,8 +251,6 @@ macro_rules! define_manager {
 
 define_manager!(Viewporter, ViewporterShim, viewporter_new);
 define_manager!(FractionalScaleManager, FractionalScaleManagerShim, fractional_scale_manager_new);
-define_manager!(XdgDecorationManager, XdgDecorationManagerShim, xdg_decoration_manager_new);
-define_manager!(CursorShapeManager, CursorShapeManagerShim, cursor_shape_manager_new);
 define_manager!(SinglePixelBufferManager, SinglePixelBufferManagerShim, single_pixel_buffer_manager_new);
 define_manager!(TearingControlManager, TearingControlManagerShim, tearing_control_manager_new);
 define_manager!(ContentTypeManager, ContentTypeManagerShim, content_type_manager_new);
@@ -231,7 +258,160 @@ define_manager!(FifoManager, FifoManagerShim, fifo_manager_new);
 define_manager!(CommitTimingManager, CommitTimingManagerShim, commit_timing_manager_new);
 define_manager!(Presentation, PresentationShim, presentation_new);
 define_manager!(BackgroundEffectManager, BackgroundEffectManagerShim, background_effect_manager_new);
-define_manager!(XdgToplevelIconManager, XdgToplevelIconManagerShim, xdg_toplevel_icon_manager_new);
+
+/// Window decoration modes (`zxdg_toplevel_decoration_v1.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DecorationMode {
+    ClientSide = 1,
+    ServerSide = 2,
+}
+
+impl DecorationMode {
+    pub(crate) fn from_u32(val: u32) -> Option<Self> {
+        match val {
+            1 => Some(Self::ClientSide),
+            2 => Some(Self::ServerSide),
+            _ => None,
+        }
+    }
+}
+
+/// A client asks who decorates its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecorationRequest {
+    pub surface: Option<SurfaceId>,
+    pub preferred: Option<DecorationMode>,
+    pub mode: DecorationMode,
+}
+
+/// The `zxdg_decoration_manager_v1` global.
+pub struct XdgDecorationManager<'d> {
+    pub(crate) raw: cxx::UniquePtr<ffi::XdgDecorationManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> XdgDecorationManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::xdg_decoration_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error(err))
+        } else {
+            Ok(Self { raw, _display: Holds::new() })
+        }
+    }
+
+    pub fn set_default_mode(&self, mode: DecorationMode) {
+        self.raw.set_default_mode(mode as u32);
+    }
+
+    pub fn default_mode(&self) -> DecorationMode {
+        DecorationMode::from_u32(self.raw.default_mode()).unwrap_or(DecorationMode::ClientSide)
+    }
+
+    pub fn next_event(&self) -> Option<DecorationRequest> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                ffi::EventKind::DecorationRequest => {
+                    return Some(DecorationRequest {
+                        surface: SurfaceId::from_raw(raw.id),
+                        preferred: DecorationMode::from_u32(raw.serial),
+                        mode: DecorationMode::from_u32(raw.value).unwrap_or(DecorationMode::ClientSide),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A request for a named cursor shape (`wp_cursor_shape_device_v1.set_shape`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorShapeRequest {
+    pub serial: u32,
+    pub shape: u32,
+    pub name: String,
+}
+
+/// The `wp_cursor_shape_manager_v1` global.
+pub struct CursorShapeManager<'d> {
+    pub(crate) raw: cxx::UniquePtr<ffi::CursorShapeManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> CursorShapeManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::cursor_shape_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error(err))
+        } else {
+            Ok(Self { raw, _display: Holds::new() })
+        }
+    }
+
+    pub fn next_event(&self) -> Option<CursorShapeRequest> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                ffi::EventKind::CursorShapeRequest => {
+                    return Some(CursorShapeRequest {
+                        serial: raw.serial,
+                        shape: raw.value,
+                        name: raw.text,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Notification that a toplevel's client-supplied icon changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToplevelIconChange {
+    pub surface: SurfaceId,
+    pub name: String,
+}
+
+/// The `xdg_toplevel_icon_manager_v1` global.
+pub struct XdgToplevelIconManager<'d> {
+    pub(crate) raw: cxx::UniquePtr<ffi::XdgToplevelIconManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> XdgToplevelIconManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::xdg_toplevel_icon_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error(err))
+        } else {
+            Ok(Self { raw, _display: Holds::new() })
+        }
+    }
+
+    pub fn icon_name(&self, surface: SurfaceId) -> String {
+        self.raw.icon_name(surface.0)
+    }
+
+    pub fn next_event(&self) -> Option<ToplevelIconChange> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                ffi::EventKind::ToplevelIconChange => {
+                    return Some(ToplevelIconChange {
+                        surface: SurfaceId(raw.id),
+                        name: raw.text,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
 
 /// The `zwp_relative_pointer_manager_v1` global. It routes through the [`Seat`] it was created for,
 /// which it keeps borrowed.

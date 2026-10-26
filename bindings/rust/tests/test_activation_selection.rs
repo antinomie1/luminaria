@@ -137,7 +137,15 @@ fn activation_requests() {
 
     let mut peer = Peer::spawn(&display, activation_client);
     peer.wait(&display, "activated");
-    let requests = drain(|| activation.next_event());
+    let events = drain(|| activation.next_event());
+    assert!(events.iter().any(|e| matches!(e, luminaria::protocol::ActivationEvent::TokenRequest(t) if t.app_id == "org.luminaria.test" && t.granted)));
+    let requests: Vec<_> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            luminaria::protocol::ActivationEvent::Request(r) => Some(r),
+            _ => None,
+        })
+        .collect();
     assert_eq!(requests.len(), 2, "{requests:?}");
     let (spent, forged) = (&requests[0], &requests[1]);
     assert!(spent.token_valid);

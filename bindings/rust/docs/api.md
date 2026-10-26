@@ -664,16 +664,22 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 与 C++ 版仍有的差别，都是绑定还没导出的东西：
 
 - 没有 `LinuxDmabuf`：它要一个 `VulkanRenderer`，而 `SceneRenderer` 不把自己那个交出来；GPU 客户端只能走 wl_shm。
-- `Cursor` 没接 cursor-shape 管理器，客户端请求的光标形状不生效。
 - 映射时不发首选缓冲缩放与分数缩放：`Surface::set_preferred_buffer_scale` 与 `FractionalScaleManager::set_scale` 没有导出。
 - 子表面树（`Surface::surface_tree`）没有导出：按住按钮时，抓取落在子表面上的指针按其窗口原点换算坐标。
 
-整个绑定里还没有转发的信号（87 个 `Signal<...>` 负载里剩下这些）：
+整个绑定现已完整转发全部信号（C++ 产生信号时将 `EventRaw` 入队，Rust 侧通过对应包装类型的 `next_event()` 取出）：
 
-- `Compositor` 的 `NewSurface`，以及每个 surface 的 `SurfaceCommit`、`SurfaceDestroy`、`SurfaceRendered` 和全局的 `SurfaceInvalidated`。
-- `Output` 的 `PresentEvent`（呈现反馈由 `SceneRenderer` 代发）。
-- 嵌套后端的 `KeymapChange`、`HostCloseRequest`、`ModifiersEvent`、`PointerAxisEvent`（只转发了按键、指针移动与按钮）。
-- 需要同步回答的：xdg-activation 的 `ActivationTokenRequest`（总是批准）、cursor-shape 的 `CursorShapeRequest`。
-- 桌面协议的请求：`DecorationRequest`、`ForeignToplevelRequest`、`WorkspaceRequest`、`OutputConfigRequest`、`ToplevelIconChange`。
+- **`Compositor`**：`CompositorEvent::NewSurface`，以及每个 surface 的 `Commit`、`Destroy`、`Rendered` 与全局的 `Invalidated`。
+- **`Output`**：`OutputEvent::Present(PresentEvent)`（亦可通过 `output.next_present()` 获取，包含硬件时钟与单调时间戳、刷新周期与垂直同步标志）。
+- **`WaylandBackend`**：`BackendInputEvent` 现完整转发 `Key`、`Motion`、`Button`、`Modifiers`、`Axis`（平滑滚动量、离散步进刻度与停止标记）、`KeymapChange`（携带新 keymap 字符串）以及 `HostCloseRequest`。
+- **需同步回答的信号**（遵照 C++ 绝不调用 Rust 的规矩，策略预先配在 shim 上）：
+  - xdg-activation 的 `ActivationTokenRequest`：默认批准（可通过 `set_grant_tokens(bool)` 预设策略），同时入队到 `next_event()`。
+  - cursor-shape 的 `CursorShapeRequest`：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接进 `Cursor`，在 C++ 信号发射期间直接由光标引擎同步呈现所请求的光标；`CursorShapeManager::next_event()` 亦可获取该请求。
+- **桌面协议请求**：
+  - `XdgDecorationManager`：`next_event() -> Option<DecorationRequest>`（携带表面、客户端偏好与最终决议），可由 `set_default_mode` 预先配置默认模式。
+  - `ForeignToplevelManager`：`next_event() -> Option<ForeignToplevelRequest>`（最大化、最小化、全屏、激活、关闭等请求）。
+  - `WorkspaceManager`：`next_event() -> Option<WorkspaceRequest>`（激活、反激活、创建、移除等工作区请求）。
+  - `OutputManager`：`next_event() -> Option<OutputConfigRequest>`（测试与应用请求，可通过 `set_auto_verdict` 设置默认裁决）。
+  - `XdgToplevelIconManager`：`next_event() -> Option<ToplevelIconChange>`，并提供 `icon_name(surface)` 查询客户端设定的图标名。
 
 DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 上的运行还没有验证过。

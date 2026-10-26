@@ -393,6 +393,27 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Load the cursor theme and start following `seat`'s pointer picture,
+    /// also wired to `shapes` (`wp_cursor_shape_manager_v1`) to automatically
+    /// show requested cursor shapes.
+    pub fn new_with_shapes(
+        renderer: &'a SceneRenderer,
+        layout: &'a OutputLayout,
+        seat: &'a Seat<'_>,
+        shapes: &'a crate::protocol::CursorShapeManager<'_>,
+    ) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::cursor_new_with_shapes(&renderer.raw, &layout.raw, &seat.raw, &shapes.raw, &mut err);
+        if raw.is_null() {
+            Err(Error(err))
+        } else {
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
+        }
+    }
+
     fn pin(&mut self) -> Pin<&mut ffi::CursorShim> {
         self.raw.pin_mut()
     }

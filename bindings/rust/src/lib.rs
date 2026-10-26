@@ -153,6 +153,28 @@ pub(crate) mod ffi {
         SeatKeyboardFocus,
         SeatPointerFocus,
         SeatCursorChange,
+        // wl_compositor:
+        NewSurface,
+        SurfaceCommit,
+        SurfaceDestroy,
+        SurfaceRendered,
+        SurfaceInvalidated,
+        // Output:
+        OutputPresent,
+        // xdg-decoration:
+        DecorationRequest,
+        // foreign-toplevel:
+        ForeignToplevelRequest,
+        // ext-workspace:
+        WorkspaceRequest,
+        // output-management:
+        OutputConfigRequest,
+        // xdg-toplevel-icon:
+        ToplevelIconChange,
+        // xdg-activation:
+        ActivationTokenRequest,
+        // cursor-shape:
+        CursorShapeRequest,
     }
 
     /// One luminaria signal, queued by the shim until Rust drains it. Which
@@ -167,6 +189,7 @@ pub(crate) mod ffi {
         y: i32,
         value: u32,
         flag: bool,
+        flag2: bool,
         text: String,
     }
 
@@ -261,13 +284,24 @@ pub(crate) mod ffi {
         serial: u32,
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct BackendInputEventRaw {
         kind: u32,
         code: u32,
         pressed: bool,
         x: f64,
         y: f64,
+        dx: f64,
+        dy: f64,
+        dx_steps: i32,
+        dy_steps: i32,
+        stop_horizontal: bool,
+        stop_vertical: bool,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+        text: String,
     }
 
     /// A DRM device node's identity: `st_rdev` of /dev/dri/cardN or renderDN.
@@ -375,6 +409,7 @@ pub(crate) mod ffi {
         fn hide_cursor(self: Pin<&mut OutputShim>, error: &mut String) -> bool;
         fn take_frame(self: Pin<&mut OutputShim>) -> bool;
         fn take_mode_changed(self: Pin<&mut OutputShim>) -> bool;
+        fn next_event(self: &OutputShim, out: &mut EventRaw) -> bool;
         fn alive(self: &OutputShim) -> bool;
         fn id(self: &OutputShim) -> u64;
 
@@ -427,11 +462,13 @@ pub(crate) mod ffi {
         fn surface_has_buffer(surface_id: u64) -> bool;
         fn surface_damage(surface_id: u64) -> Vec<Rect>;
         fn surface_send_frame_done(surface_id: u64, time_ms: u32);
+        fn surface_notify_rendered(surface_id: u64, fence_fd: i32);
         fn surface_accepts_input(surface_id: u64, sx: f64, sy: f64) -> bool;
 
         // Core Protocols
         type CompositorShim;
         fn compositor_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CompositorShim>;
+        fn next_event(self: &CompositorShim, out: &mut EventRaw) -> bool;
 
         type SubcompositorShim;
         fn subcompositor_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SubcompositorShim>;
@@ -511,12 +548,17 @@ pub(crate) mod ffi {
         type XdgActivationShim;
         fn xdg_activation_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgActivationShim>;
         fn next_event(self: &XdgActivationShim, out: &mut EventRaw) -> bool;
+        fn set_grant_tokens(self: &XdgActivationShim, grant: bool);
 
         type XdgDecorationManagerShim;
         fn xdg_decoration_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgDecorationManagerShim>;
+        fn set_default_mode(self: &XdgDecorationManagerShim, mode: u32);
+        fn default_mode(self: &XdgDecorationManagerShim) -> u32;
+        fn next_event(self: &XdgDecorationManagerShim, out: &mut EventRaw) -> bool;
 
         type CursorShapeManagerShim;
         fn cursor_shape_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CursorShapeManagerShim>;
+        fn next_event(self: &CursorShapeManagerShim, out: &mut EventRaw) -> bool;
 
         type IdleInhibitManagerShim;
         fn idle_inhibit_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<IdleInhibitManagerShim>;
@@ -571,6 +613,8 @@ pub(crate) mod ffi {
 
         type XdgToplevelIconManagerShim;
         fn xdg_toplevel_icon_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgToplevelIconManagerShim>;
+        fn icon_name(self: &XdgToplevelIconManagerShim, surface_id: u64) -> String;
+        fn next_event(self: &XdgToplevelIconManagerShim, out: &mut EventRaw) -> bool;
 
         type DrmSyncobjManagerShim;
         fn drm_syncobj_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<DrmSyncobjManagerShim>;
@@ -580,9 +624,15 @@ pub(crate) mod ffi {
 
         type ForeignToplevelManagerShim;
         fn foreign_toplevel_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ForeignToplevelManagerShim>;
+        fn next_event(self: &ForeignToplevelManagerShim, out: &mut EventRaw) -> bool;
 
         type WorkspaceManagerShim;
         fn workspace_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<WorkspaceManagerShim>;
+        fn create_group(self: &WorkspaceManagerShim) -> u32;
+        fn create_workspace(self: &WorkspaceManagerShim, group: u32, name: &str) -> u32;
+        fn remove_workspace(self: &WorkspaceManagerShim, workspace: u32);
+        fn activate_workspace(self: &WorkspaceManagerShim, workspace: u32);
+        fn next_event(self: &WorkspaceManagerShim, out: &mut EventRaw) -> bool;
 
         type SessionLockManagerShim;
         fn session_lock_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SessionLockManagerShim>;
@@ -663,6 +713,7 @@ pub(crate) mod ffi {
 
         type CursorShim;
         fn cursor_new(renderer: &SceneRendererShim, layout: &OutputLayoutShim, seat: &SeatShim, error: &mut String) -> UniquePtr<CursorShim>;
+        fn cursor_new_with_shapes(renderer: &SceneRendererShim, layout: &OutputLayoutShim, seat: &SeatShim, shapes: &CursorShapeManagerShim, error: &mut String) -> UniquePtr<CursorShim>;
         fn move_to(self: Pin<&mut CursorShim>, x: f64, y: f64, bounds: Rect) -> bool;
         fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64, bounds: Rect) -> bool;
         fn leave(self: Pin<&mut CursorShim>);
@@ -696,14 +747,11 @@ pub(crate) mod ffi {
         // Desktop Protocols
         fn foreign_toplevel_track(ftm: Pin<&mut ForeignToplevelManagerShim>, shell: &XdgShellShim);
 
-        fn workspace_manager_create_group(wm: Pin<&mut WorkspaceManagerShim>) -> u32;
-        fn workspace_manager_create_workspace(wm: Pin<&mut WorkspaceManagerShim>, group: u32, name: &str) -> u32;
-        fn workspace_manager_remove_workspace(wm: Pin<&mut WorkspaceManagerShim>, workspace: u32);
-        fn workspace_manager_activate_workspace(wm: Pin<&mut WorkspaceManagerShim>, workspace: u32);
-
         type OutputManagerShim;
         fn output_manager_new(display: &DisplayShim, layout: &OutputLayoutShim, error: &mut String) -> UniquePtr<OutputManagerShim>;
         fn update(self: Pin<&mut OutputManagerShim>);
+        fn set_auto_verdict(self: &OutputManagerShim, succeed: bool);
+        fn next_event(self: &OutputManagerShim, out: &mut EventRaw) -> bool;
 
         type DataControlManagerShim;
         fn data_control_manager_new(display: &DisplayShim, ddm: &DataDeviceManagerShim, error: &mut String) -> UniquePtr<DataControlManagerShim>;
@@ -757,6 +805,7 @@ impl ffi::EventRaw {
             y: 0,
             value: 0,
             flag: false,
+            flag2: false,
             text: String::new(),
         }
     }

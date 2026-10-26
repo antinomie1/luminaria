@@ -288,6 +288,47 @@ bool layout_fits_raw(std::int32_t width, std::int32_t height, std::uint32_t stri
 // Backend & Output
 // ============================================================================
 
+namespace {
+
+// 0 is Rust's "no surface". A live id never packs to 0 (generations start at
+// 1), but SurfaceId{0, 0} would still pass valid(), which checks the index.
+inline lm::SurfaceId id_from_u64(std::uint64_t raw) {
+    if (raw == 0) return lm::SurfaceId{};
+    return lm::SurfaceId{static_cast<std::uint32_t>(raw & 0xffffffff), static_cast<std::uint32_t>(raw >> 32)};
+}
+
+inline std::uint64_t u64_from_id(lm::SurfaceId id) {
+    return id.valid() ? ((static_cast<std::uint64_t>(id.generation) << 32) | id.index) : 0;
+}
+
+inline std::uint64_t surface_u64(lm::Surface* s) { return s != nullptr ? u64_from_id(s->id()) : 0; }
+
+// An event for Rust to drain; `kind` says which of the other fields mean
+// something. Every shim that forwards signals keeps one queue of these.
+EventRaw event(EventKind kind, std::uint64_t id = 0, std::uint64_t other = 0) {
+    EventRaw e{};
+    e.kind = kind;
+    e.id = id;
+    e.other = other;
+    e.flag = false;
+    e.flag2 = false;
+    return e;
+}
+
+struct Events {
+    std::deque<EventRaw> queue;
+
+    void push(EventRaw e) { queue.push_back(std::move(e)); }
+    bool pop(EventRaw& out) {
+        if (queue.empty()) return false;
+        out = std::move(queue.front());
+        queue.pop_front();
+        return true;
+    }
+};
+
+} // namespace
+
 struct OutputShim::Impl {
     lm::Output* output = nullptr;
     // Identity that outlives the output, so Rust can match a removal to the
@@ -295,9 +336,11 @@ struct OutputShim::Impl {
     std::uint64_t id = 0;
     bool frame_pending = false;
     bool mode_changed = false;
+    Events events;
     Conn<lm::OutputDestroy> on_destroy;
     Conn<lm::FrameEvent> on_frame;
     Conn<lm::OutputModeChange> on_mode;
+    Conn<lm::PresentEvent> on_present;
 };
 
 OutputShim::~OutputShim() = default;
@@ -408,6 +451,10 @@ bool OutputShim::take_mode_changed() {
     return std::exchange(impl_->mode_changed, false);
 }
 
+bool OutputShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
+}
+
 bool OutputShim::alive() const { return impl_->output != nullptr; }
 
 std::uint64_t OutputShim::id() const { return impl_->id; }
@@ -426,6 +473,14 @@ inline std::unique_ptr<OutputShim> make_output_shim(lm::Output* output) {
     });
     impl->on_frame = output->frame.connect([impl = impl.get()](lm::FrameEvent&) {
         impl->frame_pending = true;
+    });
+    impl->on_present = output->present.connect([impl = impl.get()](lm::PresentEvent& e) {
+        EventRaw ev = event(EventKind::OutputPresent, e.seq, e.tv_sec);
+        ev.serial = e.tv_nsec;
+        ev.value = e.refresh_ns;
+        ev.flag = e.vsync;
+        ev.flag2 = e.hw_clock;
+        impl->events.push(std::move(ev));
     });
     return std::make_unique<OutputShim>(std::move(impl));
 }
@@ -470,6 +525,10 @@ struct WaylandBackendShim::Impl {
     Conn<lm::KeyEvent> on_key;
     Conn<lm::PointerMotionAbsEvent> on_motion;
     Conn<lm::PointerButtonEvent> on_button;
+    Conn<lm::ModifiersEvent> on_modifiers;
+    Conn<lm::PointerAxisEvent> on_axis;
+    Conn<lm::KeymapChange> on_keymap;
+    Conn<lm::HostCloseRequest> on_close;
 };
 
 WaylandBackendShim::~WaylandBackendShim() = default;
@@ -485,13 +544,56 @@ std::unique_ptr<WaylandBackendShim> wayland_backend_new(const DisplayShim& displ
         impl->backend = std::make_unique<lm::WaylandBackend>(std::move(*r));
         auto* raw_impl = impl.get();
         raw_impl->on_key = raw_impl->backend->key.connect([raw_impl](lm::KeyEvent& e) {
-            raw_impl->input_events.push_back(BackendInputEventRaw{0 /* key */, e.keycode, e.pressed, 0.0, 0.0});
+            BackendInputEventRaw raw{};
+            raw.kind = 0;
+            raw.code = e.keycode;
+            raw.pressed = e.pressed;
+            raw_impl->input_events.push_back(std::move(raw));
         });
         raw_impl->on_motion = raw_impl->backend->pointer_motion.connect([raw_impl](lm::PointerMotionAbsEvent& e) {
-            raw_impl->input_events.push_back(BackendInputEventRaw{1 /* motion */, 0, false, e.x, e.y});
+            BackendInputEventRaw raw{};
+            raw.kind = 1;
+            raw.x = e.x;
+            raw.y = e.y;
+            raw_impl->input_events.push_back(std::move(raw));
         });
         raw_impl->on_button = raw_impl->backend->pointer_button.connect([raw_impl](lm::PointerButtonEvent& e) {
-            raw_impl->input_events.push_back(BackendInputEventRaw{2 /* button */, e.button, e.pressed, 0.0, 0.0});
+            BackendInputEventRaw raw{};
+            raw.kind = 2;
+            raw.code = e.button;
+            raw.pressed = e.pressed;
+            raw_impl->input_events.push_back(std::move(raw));
+        });
+        raw_impl->on_modifiers = raw_impl->backend->modifiers.connect([raw_impl](lm::ModifiersEvent& e) {
+            BackendInputEventRaw raw{};
+            raw.kind = 3;
+            raw.depressed = e.depressed;
+            raw.latched = e.latched;
+            raw.locked = e.locked;
+            raw.group = e.group;
+            raw_impl->input_events.push_back(std::move(raw));
+        });
+        raw_impl->on_axis = raw_impl->backend->pointer_axis.connect([raw_impl](lm::PointerAxisEvent& e) {
+            BackendInputEventRaw raw{};
+            raw.kind = 4;
+            raw.dx = e.dx;
+            raw.dy = e.dy;
+            raw.dx_steps = e.dx_steps;
+            raw.dy_steps = e.dy_steps;
+            raw.stop_horizontal = e.stop_horizontal;
+            raw.stop_vertical = e.stop_vertical;
+            raw_impl->input_events.push_back(std::move(raw));
+        });
+        raw_impl->on_keymap = raw_impl->backend->keymap_changed.connect([raw_impl](lm::KeymapChange& e) {
+            BackendInputEventRaw raw{};
+            raw.kind = 5;
+            raw.text = to_rust(e.text);
+            raw_impl->input_events.push_back(std::move(raw));
+        });
+        raw_impl->on_close = raw_impl->backend->close_requested.connect([raw_impl](lm::HostCloseRequest&) {
+            BackendInputEventRaw raw{};
+            raw.kind = 6;
+            raw_impl->input_events.push_back(std::move(raw));
         });
         return std::make_unique<WaylandBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
@@ -520,7 +622,7 @@ rust::String WaylandBackendShim::keymap() const {
 
 bool WaylandBackendShim::next_input_event(BackendInputEventRaw& out) {
     if (impl_->input_events.empty()) return false;
-    out = impl_->input_events.front();
+    out = std::move(impl_->input_events.front());
     impl_->input_events.pop_front();
     return true;
 }
@@ -854,17 +956,6 @@ std::uint32_t LibinputBackendShim::capabilities() const {
 // Protocols
 // ============================================================================
 
-// 0 is Rust's "no surface". A live id never packs to 0 (generations start at
-// 1), but SurfaceId{0, 0} would still pass valid(), which checks the index.
-inline lm::SurfaceId id_from_u64(std::uint64_t raw) {
-    if (raw == 0) return lm::SurfaceId{};
-    return lm::SurfaceId{static_cast<std::uint32_t>(raw & 0xffffffff), static_cast<std::uint32_t>(raw >> 32)};
-}
-
-inline std::uint64_t u64_from_id(lm::SurfaceId id) {
-    return id.valid() ? ((static_cast<std::uint64_t>(id.generation) << 32) | id.index) : 0;
-}
-
 std::int32_t surface_width(std::uint64_t surface_id) {
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
     return s ? s->surface_width() : 0;
@@ -907,13 +998,43 @@ void surface_send_frame_done(std::uint64_t surface_id, std::uint32_t time_ms) {
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
     if (s) s->send_frame_done(time_ms);
 }
+void surface_notify_rendered(std::uint64_t surface_id, int fence_fd) {
+    lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
+    if (s) s->notify_rendered(fence_fd);
+}
 bool surface_accepts_input(std::uint64_t surface_id, double sx, double sy) {
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
     return s ? s->accepts_input(sx, sy) : false;
 }
 
 struct CompositorShim::Impl {
+    struct SurfaceEntry {
+        Conn<lm::SurfaceCommit> on_commit;
+        Conn<lm::SurfaceDestroy> on_destroy;
+        Conn<lm::SurfaceRendered> on_rendered;
+    };
     std::optional<lm::Compositor> comp;
+    std::unordered_map<std::uint64_t, std::unique_ptr<SurfaceEntry>> surfaces;
+    Events events;
+    Conn<lm::NewSurface> on_new_surface;
+    Conn<lm::SurfaceInvalidated> on_invalidated;
+
+    void watch(lm::Surface& surface) {
+        const std::uint64_t id = u64_from_id(surface.id());
+        auto entry = std::make_unique<SurfaceEntry>();
+        entry->on_commit = surface.commit.connect([this, id](lm::SurfaceCommit&) {
+            events.push(event(EventKind::SurfaceCommit, id));
+        });
+        entry->on_rendered = surface.rendered.connect([this, id](lm::SurfaceRendered&) {
+            events.push(event(EventKind::SurfaceRendered, id));
+        });
+        entry->on_destroy = surface.destroy.connect([this, id](lm::SurfaceDestroy&) {
+            events.push(event(EventKind::SurfaceDestroy, id));
+            surfaces.erase(id);
+        });
+        events.push(event(EventKind::NewSurface, id));
+        surfaces[id] = std::move(entry);
+    }
 };
 CompositorShim::~CompositorShim() = default;
 CompositorShim::CompositorShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -926,11 +1047,22 @@ std::unique_ptr<CompositorShim> compositor_new(const DisplayShim& display, rust:
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<CompositorShim::Impl>();
         impl->comp.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new_surface = raw->comp->new_surface().connect([raw](lm::NewSurface& e) {
+            raw->watch(e.surface);
+        });
+        raw->on_invalidated = lm::surface_invalidated().connect([raw](lm::SurfaceInvalidated& e) {
+            raw->events.push(event(EventKind::SurfaceInvalidated, u64_from_id(e.surface)));
+        });
         return std::make_unique<CompositorShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
         return nullptr;
     }
+}
+
+bool CompositorShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
 }
 
 struct SubcompositorShim::Impl {
@@ -956,28 +1088,6 @@ std::unique_ptr<SubcompositorShim> subcompositor_new(const DisplayShim& display,
 
 namespace {
 
-// An event for Rust to drain; `kind` says which of the other fields mean
-// something. Every shim that forwards signals keeps one queue of these.
-EventRaw event(EventKind kind, std::uint64_t id, std::uint64_t other = 0) {
-    EventRaw e{};
-    e.kind = kind;
-    e.id = id;
-    e.other = other;
-    return e;
-}
-
-struct Events {
-    std::deque<EventRaw> queue;
-
-    void push(EventRaw e) { queue.push_back(std::move(e)); }
-    bool pop(EventRaw& out) {
-        if (queue.empty()) return false;
-        out = std::move(queue.front());
-        queue.pop_front();
-        return true;
-    }
-};
-
 // Identity for an object that has no surface of its own to be named by (a
 // lock, an idle notification, a text input). Never reused.
 std::uint64_t next_object_id() {
@@ -987,8 +1097,6 @@ std::uint64_t next_object_id() {
 
 lm::Box to_box(const Rect& r) { return lm::Box{r.x, r.y, r.width, r.height}; }
 Rect to_rect(const lm::Box& b) { return Rect{b.x, b.y, b.width, b.height}; }
-
-std::uint64_t surface_u64(lm::Surface* s) { return s != nullptr ? u64_from_id(s->id()) : 0; }
 
 rust::Vec<rust::String> to_rust(const std::vector<std::string>& v) {
     rust::Vec<rust::String> out;
@@ -1646,8 +1754,6 @@ std::unique_ptr<Name##Shim> FuncName(const DisplayShim& display, rust::String& e
 
 DEFINE_GLOBAL_SHIM_IMPL(Viewporter, Viewporter, viewporter_new)
 DEFINE_GLOBAL_SHIM_IMPL(FractionalScaleManager, FractionalScaleManager, fractional_scale_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(XdgDecorationManager, XdgDecorationManager, xdg_decoration_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(CursorShapeManager, CursorShapeManager, cursor_shape_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(SinglePixelBufferManager, SinglePixelBufferManager, single_pixel_buffer_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(TearingControlManager, TearingControlManager, tearing_control_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(ContentTypeManager, ContentTypeManager, content_type_manager_new)
@@ -1655,22 +1761,132 @@ DEFINE_GLOBAL_SHIM_IMPL(FifoManager, FifoManager, fifo_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(CommitTimingManager, CommitTimingManager, commit_timing_manager_new)
 // Presentation is defined by hand below SceneRendererShim, which links to it.
 DEFINE_GLOBAL_SHIM_IMPL(BackgroundEffectManager, BackgroundEffectManager, background_effect_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(XdgToplevelIconManager, XdgToplevelIconManager, xdg_toplevel_icon_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(DrmSyncobjManager, DrmSyncobjManager, drm_syncobj_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(ScreencopyManager, ScreencopyManager, screencopy_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(ForeignToplevelManager, ForeignToplevelManager, foreign_toplevel_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(WorkspaceManager, WorkspaceManager, workspace_manager_new)
 
 #undef DEFINE_GLOBAL_SHIM_IMPL
 
+// ---- xdg-decoration --------------------------------------------------------
+
+struct XdgDecorationManagerShim::Impl {
+    std::optional<lm::XdgDecorationManager> mgr;
+    Events events;
+    Conn<lm::DecorationRequest> on_request;
+};
+XdgDecorationManagerShim::~XdgDecorationManagerShim() = default;
+XdgDecorationManagerShim::XdgDecorationManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+XdgDecorationManagerShim::Impl& XdgDecorationManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<XdgDecorationManagerShim> xdg_decoration_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::XdgDecorationManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<XdgDecorationManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_request = raw->mgr->request().connect([raw](lm::DecorationRequest& e) {
+            EventRaw ev = event(EventKind::DecorationRequest,
+                                e.toplevel != nullptr ? surface_u64(&e.toplevel->surface()) : 0);
+            ev.value = static_cast<std::uint32_t>(e.mode);
+            ev.serial = e.preferred.has_value() ? static_cast<std::uint32_t>(*e.preferred) : 0;
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<XdgDecorationManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+
+void XdgDecorationManagerShim::set_default_mode(std::uint32_t mode) const {
+    if (impl_->mgr) impl_->mgr->set_default_mode(static_cast<lm::DecorationMode>(mode));
+}
+std::uint32_t XdgDecorationManagerShim::default_mode() const {
+    return impl_->mgr ? static_cast<std::uint32_t>(impl_->mgr->default_mode()) : 1;
+}
+bool XdgDecorationManagerShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
+}
+
+// ---- cursor-shape ----------------------------------------------------------
+
+struct CursorShapeManagerShim::Impl {
+    std::optional<lm::CursorShapeManager> mgr;
+    Events events;
+    Conn<lm::CursorShapeRequest> on_request;
+};
+CursorShapeManagerShim::~CursorShapeManagerShim() = default;
+CursorShapeManagerShim::CursorShapeManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+CursorShapeManagerShim::Impl& CursorShapeManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<CursorShapeManagerShim> cursor_shape_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::CursorShapeManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<CursorShapeManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_request = raw->mgr->request().connect([raw](lm::CursorShapeRequest& req) {
+            EventRaw ev = event(EventKind::CursorShapeRequest);
+            ev.serial = req.serial;
+            ev.value = req.shape;
+            ev.text = req.name ? to_rust(req.name) : rust::String("");
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<CursorShapeManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+bool CursorShapeManagerShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
+}
+
+// ---- xdg-toplevel-icon -----------------------------------------------------
+
+struct XdgToplevelIconManagerShim::Impl {
+    std::optional<lm::XdgToplevelIconManager> mgr;
+    Events events;
+    std::unordered_map<std::uint64_t, std::string> icon_names;
+    Conn<lm::ToplevelIconChange> on_changed;
+};
+XdgToplevelIconManagerShim::~XdgToplevelIconManagerShim() = default;
+XdgToplevelIconManagerShim::XdgToplevelIconManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+XdgToplevelIconManagerShim::Impl& XdgToplevelIconManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<XdgToplevelIconManagerShim> xdg_toplevel_icon_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::XdgToplevelIconManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<XdgToplevelIconManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_changed = raw->mgr->changed().connect([raw](lm::ToplevelIconChange& e) {
+            const std::uint64_t id = surface_u64(&e.toplevel.surface());
+            EventRaw ev = event(EventKind::ToplevelIconChange, id);
+            const auto* icon = raw->mgr->icon_for(e.toplevel);
+            std::string name = icon != nullptr ? icon->name : "";
+            raw->icon_names[id] = name;
+            ev.text = to_rust(name);
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<XdgToplevelIconManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+bool XdgToplevelIconManagerShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
+}
+rust::String XdgToplevelIconManagerShim::icon_name(std::uint64_t surface_id) const {
+    auto it = impl_->icon_names.find(surface_id);
+    return it != impl_->icon_names.end() ? to_rust(it->second) : "";
+}
+
 // ---- xdg-activation --------------------------------------------------------
 
-// Only request_activate is forwarded. A token request wants its answer inside
-// the signal, which Rust cannot give; luminaria's default (grant) stands.
 struct XdgActivationShim::Impl {
     std::optional<lm::XdgActivation> mgr;
     Events events;
     Conn<lm::ActivationRequest> on_activate;
+    Conn<lm::ActivationTokenRequest> on_token;
+    bool grant_tokens = true;
 };
 XdgActivationShim::~XdgActivationShim() = default;
 XdgActivationShim::XdgActivationShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1691,10 +1907,19 @@ std::unique_ptr<XdgActivationShim> xdg_activation_new(const DisplayShim& display
             ev.text = to_rust(e.app_id);
             raw->events.push(std::move(ev));
         });
+        raw->on_token = raw->mgr->new_token().connect([raw](lm::ActivationTokenRequest& e) {
+            e.granted = raw->grant_tokens;
+            EventRaw ev = event(EventKind::ActivationTokenRequest, surface_u64(e.surface));
+            ev.serial = e.serial;
+            ev.flag = e.granted;
+            ev.text = to_rust(e.app_id);
+            raw->events.push(std::move(ev));
+        });
         return std::make_unique<XdgActivationShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
 bool XdgActivationShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+void XdgActivationShim::set_grant_tokens(bool grant) const { impl_->grant_tokens = grant; }
 
 // ---- idle-inhibit ----------------------------------------------------------
 
@@ -2523,6 +2748,24 @@ std::unique_ptr<CursorShim> cursor_new(const SceneRendererShim& renderer, const 
     }
 }
 
+std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                  const SeatShim& seat, const CursorShapeManagerShim& shapes,
+                                                  rust::String& error) {
+    try {
+        if (!renderer.impl().renderer || !seat.impl().seat) { error = "null renderer or seat"; return nullptr; }
+        auto impl = std::make_unique<CursorShim::Impl>();
+        lm::CursorShapeManager* shapes_mgr = shapes.impl().mgr ? &*shapes.impl().mgr : nullptr;
+        impl->cursor = std::make_unique<lm::Cursor>(
+            *renderer.impl().renderer, layout.impl().layout, *seat.impl().seat,
+            shapes_mgr, nullptr
+        );
+        return std::make_unique<CursorShim>(std::move(impl));
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nullptr;
+    }
+}
+
 bool CursorShim::move_to(double x, double y, Rect bounds) {
     return impl_->cursor ? impl_->cursor->move_to(x, y, lm::Box{bounds.x, bounds.y, bounds.width, bounds.height}) : false;
 }
@@ -2671,27 +2914,106 @@ SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, 
 // Desktop Protocols
 // ============================================================================
 
-void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, const XdgShellShim& shell) {
-    if (ftm.impl().mgr && shell.impl().shell) {
-        ftm.impl().mgr->track(*shell.impl().shell);
+struct ForeignToplevelManagerShim::Impl {
+    std::optional<lm::ForeignToplevelManager> mgr;
+    Events events;
+    Conn<lm::ForeignToplevelRequest> on_request;
+};
+ForeignToplevelManagerShim::~ForeignToplevelManagerShim() = default;
+ForeignToplevelManagerShim::ForeignToplevelManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+ForeignToplevelManagerShim::Impl& ForeignToplevelManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<ForeignToplevelManagerShim> foreign_toplevel_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::ForeignToplevelManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<ForeignToplevelManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_request = raw->mgr->request().connect([raw](lm::ForeignToplevelRequest& e) {
+            EventRaw ev = event(EventKind::ForeignToplevelRequest, surface_u64(&e.toplevel.surface()));
+            ev.value = static_cast<std::uint32_t>(e.kind);
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<ForeignToplevelManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+
+void ForeignToplevelManagerShim::track(const XdgShellShim& shell) {
+    if (impl_->mgr && shell.impl().shell) {
+        impl_->mgr->track(*shell.impl().shell);
     }
+}
+bool ForeignToplevelManagerShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
+}
+
+void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, const XdgShellShim& shell) {
+    ftm.track(shell);
+}
+
+struct WorkspaceManagerShim::Impl {
+    std::optional<lm::WorkspaceManager> mgr;
+    Events events;
+    Conn<lm::WorkspaceRequest> on_request;
+};
+WorkspaceManagerShim::~WorkspaceManagerShim() = default;
+WorkspaceManagerShim::WorkspaceManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+WorkspaceManagerShim::Impl& WorkspaceManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<WorkspaceManagerShim> workspace_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::WorkspaceManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<WorkspaceManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_request = raw->mgr->request().connect([raw](lm::WorkspaceRequest& e) {
+            EventRaw ev = event(EventKind::WorkspaceRequest, e.workspace, e.group);
+            ev.value = static_cast<std::uint32_t>(e.kind);
+            ev.text = to_rust(e.name);
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<WorkspaceManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+
+std::uint32_t WorkspaceManagerShim::create_group() const {
+    return impl_->mgr ? impl_->mgr->add_group() : 0;
+}
+std::uint32_t WorkspaceManagerShim::create_workspace(std::uint32_t group, rust::Str name) const {
+    return impl_->mgr ? impl_->mgr->add_workspace(group, std::string(name), std::string(name)) : 0;
+}
+void WorkspaceManagerShim::remove_workspace(std::uint32_t workspace) const {
+    if (impl_->mgr) impl_->mgr->remove_workspace(workspace);
+}
+void WorkspaceManagerShim::activate_workspace(std::uint32_t workspace) const {
+    if (impl_->mgr) impl_->mgr->activate(workspace);
+}
+bool WorkspaceManagerShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
 }
 
 std::uint32_t workspace_manager_create_group(WorkspaceManagerShim& wm) {
-    return wm.impl().mgr ? wm.impl().mgr->add_group() : 0;
+    return wm.create_group();
 }
 std::uint32_t workspace_manager_create_workspace(WorkspaceManagerShim& wm, std::uint32_t group, rust::Str name) {
-    return wm.impl().mgr ? wm.impl().mgr->add_workspace(group, std::string(name), std::string(name)) : 0;
+    return wm.create_workspace(group, name);
 }
 void workspace_manager_remove_workspace(WorkspaceManagerShim& wm, std::uint32_t workspace) {
-    if (wm.impl().mgr) wm.impl().mgr->remove_workspace(workspace);
+    wm.remove_workspace(workspace);
 }
 void workspace_manager_activate_workspace(WorkspaceManagerShim& wm, std::uint32_t workspace) {
-    if (wm.impl().mgr) wm.impl().mgr->activate(workspace);
+    wm.activate_workspace(workspace);
 }
 
 struct OutputManagerShim::Impl {
     std::optional<lm::OutputManager> mgr;
+    Events events;
+    Conn<lm::OutputConfigRequest> on_request;
+    lm::OutputConfigVerdict auto_verdict = lm::OutputConfigVerdict::succeeded;
 };
 OutputManagerShim::~OutputManagerShim() = default;
 OutputManagerShim::OutputManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -2704,6 +3026,13 @@ std::unique_ptr<OutputManagerShim> output_manager_new(const DisplayShim& display
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<OutputManagerShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_request = raw->mgr->request().connect([raw](lm::OutputConfigRequest& r) {
+            r.verdict = raw->auto_verdict;
+            EventRaw ev = event(EventKind::OutputConfigRequest, 0);
+            ev.flag = r.test;
+            raw->events.push(std::move(ev));
+        });
         return std::make_unique<OutputManagerShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -2712,6 +3041,12 @@ std::unique_ptr<OutputManagerShim> output_manager_new(const DisplayShim& display
 }
 void OutputManagerShim::update() {
     if (impl_->mgr) impl_->mgr->update();
+}
+bool OutputManagerShim::next_event(EventRaw& out) const {
+    return impl_->events.pop(out);
+}
+void OutputManagerShim::set_auto_verdict(bool succeed) const {
+    impl_->auto_verdict = succeed ? lm::OutputConfigVerdict::succeeded : lm::OutputConfigVerdict::failed;
 }
 
 struct DataControlManagerShim::Impl {

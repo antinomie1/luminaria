@@ -11,12 +11,15 @@ mod common;
 
 use common::{drain, shm_buffer, ClientSide, Peer};
 use luminaria::core::Display;
-use luminaria::desktop::{InputMethodManager, SessionLockManager};
-use luminaria::protocol::{
-    Compositor, DataDeviceManager, IdleInhibitManager, IdleNotifier, LayerShell, LayerSurfaceEvent, OutputGlobal,
-    PointerConstraints, PopupEvent, Seat, TextInputEvent, TextInputManager, XdgActivation, XdgEvent, XdgShell,
+use luminaria::desktop::{
+    ForeignToplevelManager, InputMethodManager, OutputManager, SessionLockManager, WorkspaceManager,
 };
-use luminaria::shell::{LayerManager, PopupTree};
+use luminaria::protocol::{
+    Compositor, CursorShapeManager, DataDeviceManager, IdleInhibitManager, IdleNotifier, LayerShell,
+    LayerSurfaceEvent, OutputGlobal, PointerConstraints, PopupEvent, Seat, TextInputEvent,
+    TextInputManager, XdgActivation, XdgDecorationManager, XdgEvent, XdgShell, XdgToplevelIconManager,
+};
+use luminaria::shell::{LayerManager, OutputLayout, PopupTree};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_keyboard,
@@ -27,15 +30,33 @@ use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, 
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
+use wayland_protocols::ext::workspace::v1::client::{
+    ext_workspace_group_handle_v1, ext_workspace_handle_v1, ext_workspace_manager_v1,
+};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 use wayland_protocols::wp::idle_inhibit::zv1::client::{zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{zwp_locked_pointer_v1, zwp_pointer_constraints_v1};
 use wayland_protocols::wp::text_input::zv3::client::{zwp_text_input_manager_v3, zwp_text_input_v3};
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_wm_base};
+use wayland_protocols::xdg::toplevel_icon::v1::client::{
+    xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1,
+};
 use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2, zwp_input_popup_surface_v2,
 };
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1, zwlr_foreign_toplevel_manager_v1,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_configuration_v1, zwlr_output_head_v1, zwlr_output_manager_v1, zwlr_output_mode_v1,
+};
 
 struct State;
 
@@ -75,7 +96,51 @@ ignore_events!(State:
     zwp_input_method_v2::ZwpInputMethodV2,
     zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
     zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+    xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1,
+    xdg_toplevel_icon_v1::XdgToplevelIconV1,
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+    wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+    ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1,
+    ext_workspace_handle_v1::ExtWorkspaceHandleV1,
+    zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
+    zwlr_output_configuration_v1::ZwlrOutputConfigurationV1,
+    zwlr_output_mode_v1::ZwlrOutputModeV1,
 );
+
+impl Dispatch<ext_workspace_manager_v1::ExtWorkspaceManagerV1, ()> for State {
+    fn event(_: &mut Self, _: &ext_workspace_manager_v1::ExtWorkspaceManagerV1, _: ext_workspace_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+
+    event_created_child!(State, ext_workspace_manager_v1::ExtWorkspaceManagerV1, [
+        ext_workspace_manager_v1::EVT_WORKSPACE_GROUP_OPCODE => (ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1, ()),
+        ext_workspace_manager_v1::EVT_WORKSPACE_OPCODE => (ext_workspace_handle_v1::ExtWorkspaceHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, ()> for State {
+    fn event(_: &mut Self, _: &zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, _: zwlr_foreign_toplevel_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+
+    event_created_child!(State, zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, [
+        zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for State {
+    fn event(_: &mut Self, _: &zwlr_output_manager_v1::ZwlrOutputManagerV1, _: zwlr_output_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+
+    event_created_child!(State, zwlr_output_manager_v1::ZwlrOutputManagerV1, [
+        zwlr_output_manager_v1::EVT_HEAD_OPCODE => (zwlr_output_head_v1::ZwlrOutputHeadV1, ()),
+    ]);
+}
+
+impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for State {
+    fn event(_: &mut Self, _: &zwlr_output_head_v1::ZwlrOutputHeadV1, _: zwlr_output_head_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+
+    event_created_child!(State, zwlr_output_head_v1::ZwlrOutputHeadV1, [
+        zwlr_output_head_v1::EVT_MODE_OPCODE => (zwlr_output_mode_v1::ZwlrOutputModeV1, ()),
+    ]);
+}
 
 impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
     fn event(_: &mut Self, _: &wl_data_device::WlDataDevice, _: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
@@ -155,6 +220,24 @@ fn client(conn: Connection, step: ClientSide) {
     let _grab = im.grab_keyboard(&qh, ());
     let candidates = compositor.create_surface(&qh, ());
     let _candidates = im.get_input_popup_surface(&candidates, &qh, ());
+
+    // Decoration, icon, cursor shape, workspace, foreign toplevel, output management.
+    let deco_mgr: zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let _deco = deco_mgr.get_toplevel_decoration(&_toplevel, &qh, ());
+
+    let icon_mgr: xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let icon = icon_mgr.create_icon(&qh, ());
+    icon_mgr.set_icon(&_toplevel, Some(&icon));
+
+    let shape_mgr: wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 = globals.bind(&qh, 1..=2, ()).unwrap();
+    let _shape_device = shape_mgr.get_pointer(&pointer, &qh, ());
+
+    let _ws_mgr: ext_workspace_manager_v1::ExtWorkspaceManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let _ft_mgr: zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1 = globals.bind(&qh, 1..=3, ()).unwrap();
+
+    let out_mgr: zwlr_output_manager_v1::ZwlrOutputManagerV1 = globals.bind(&qh, 1..=4, ()).unwrap();
+    let _config = out_mgr.create_configuration(0, &qh, ());
+
     queue.roundtrip(&mut state).unwrap();
 
     step.step("holding");
@@ -183,6 +266,16 @@ fn globals_and_display_drop_under_a_connected_client() {
     let constraints = PointerConstraints::new(&display, &seat).expect("pointer-constraints");
     let text_inputs = TextInputManager::new(&display, &seat).expect("text-input");
     let input_methods = InputMethodManager::new(&display, &seat, &text_inputs).expect("input-method");
+    let layout = OutputLayout::new().expect("layout");
+    let out_mgr = OutputManager::new(&display, &layout).expect("output-management");
+    let deco_mgr = XdgDecorationManager::new(&display).expect("decoration");
+    let icon_mgr = XdgToplevelIconManager::new(&display).expect("icon");
+    let shape_mgr = CursorShapeManager::new(&display).expect("cursor-shape");
+    let mut ws_mgr = WorkspaceManager::new(&display).expect("workspace");
+    let group = ws_mgr.create_group();
+    ws_mgr.create_workspace(group, "ws-1");
+    let mut ft_mgr = ForeignToplevelManager::new(&display).expect("foreign");
+    ft_mgr.track(&shell);
 
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "holding");
@@ -215,6 +308,12 @@ fn globals_and_display_drop_under_a_connected_client() {
     assert_eq!(clipboard.selection_mime_types(), ["text/plain"]);
 
     // Every global first, in reverse order of creation, then the Display.
+    drop(ft_mgr);
+    drop(ws_mgr);
+    drop(shape_mgr);
+    drop(icon_mgr);
+    drop(deco_mgr);
+    drop(out_mgr);
     drop(input_methods);
     drop(text_inputs);
     drop(constraints);

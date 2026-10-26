@@ -142,6 +142,33 @@ impl Output {
         self.pin().take_mode_changed()
     }
 
+    /// Pull the next output event (e.g. presentation feedback).
+    pub fn next_event(&self) -> Option<OutputEvent> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                ffi::EventKind::OutputPresent => {
+                    return Some(OutputEvent::Present(PresentEvent {
+                        tv_sec: raw.other,
+                        tv_nsec: raw.serial,
+                        refresh_ns: raw.value,
+                        seq: raw.id,
+                        vsync: raw.flag,
+                        hw_clock: raw.flag2,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Pull the next presentation feedback event, if any.
+    pub fn next_present(&self) -> Option<PresentEvent> {
+        match self.next_event()? {
+            OutputEvent::Present(p) => Some(p),
+        }
+    }
+
     /// False once the monitor behind this output is gone (unplugged). Every
     /// call is then a harmless no-op; drop it.
     pub fn is_alive(&self) -> bool {
@@ -153,6 +180,29 @@ impl Output {
     pub fn id(&self) -> OutputId {
         OutputId(self.raw.id())
     }
+}
+
+/// Frame presentation feedback timestamp and hardware timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentEvent {
+    pub tv_sec: u64,
+    pub tv_nsec: u32,
+    pub refresh_ns: u32,
+    pub seq: u64,
+    pub vsync: bool,
+    pub hw_clock: bool,
+}
+
+impl PresentEvent {
+    pub fn time_ms(&self) -> u32 {
+        (self.tv_sec * 1000 + self.tv_nsec as u64 / 1_000_000) as u32
+    }
+}
+
+/// An event on an [`Output`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputEvent {
+    Present(PresentEvent),
 }
 
 /// Identifies an [`Output`], including after it was destroyed.
@@ -246,6 +296,17 @@ impl<'d> WaylandBackend<'d> {
             pressed: false,
             x: 0.0,
             y: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dx_steps: 0,
+            dy_steps: 0,
+            stop_horizontal: false,
+            stop_vertical: false,
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+            text: String::new(),
         };
         if self.raw.pin_mut().next_input_event(&mut raw) {
             Some(match raw.kind {
@@ -258,11 +319,32 @@ impl<'d> WaylandBackend<'d> {
                     button: raw.code,
                     pressed: raw.pressed,
                 },
+                3 => BackendInputEvent::Modifiers(Modifiers {
+                    depressed: raw.depressed,
+                    latched: raw.latched,
+                    locked: raw.locked,
+                    group: raw.group,
+                }),
+                4 => BackendInputEvent::Axis {
+                    dx: raw.dx,
+                    dy: raw.dy,
+                    dx_steps: raw.dx_steps,
+                    dy_steps: raw.dy_steps,
+                    stop_horizontal: raw.stop_horizontal,
+                    stop_vertical: raw.stop_vertical,
+                },
+                5 => BackendInputEvent::KeymapChange(raw.text),
+                6 => BackendInputEvent::HostCloseRequest,
                 _ => return None,
             })
         } else {
             None
         }
+    }
+
+    /// An alias for [`next_input_event`](Self::next_input_event).
+    pub fn next_event(&mut self) -> Option<BackendInputEvent> {
+        self.next_input_event()
     }
 }
 
@@ -609,11 +691,22 @@ pub enum LibinputEvent {
 }
 
 /// An input event from a nested backend.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BackendInputEvent {
     Key { key: u32, pressed: bool },
     Motion { x: f64, y: f64 },
     Button { button: u32, pressed: bool },
+    Modifiers(Modifiers),
+    Axis {
+        dx: f64,
+        dy: f64,
+        dx_steps: i32,
+        dy_steps: i32,
+        stop_horizontal: bool,
+        stop_vertical: bool,
+    },
+    KeymapChange(String),
+    HostCloseRequest,
 }
 
 /// Raw input event types.

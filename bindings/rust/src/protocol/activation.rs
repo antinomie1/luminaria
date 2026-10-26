@@ -5,6 +5,22 @@ use crate::ffi::{self, EventKind};
 
 use super::SurfaceId;
 
+/// An event from [`XdgActivation`]: a token request or an activation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationEvent {
+    Request(ActivationRequest),
+    TokenRequest(ActivationTokenRequest),
+}
+
+/// A client asked for an activation token (`xdg_activation_token_v1.commit`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationTokenRequest {
+    pub surface: Option<SurfaceId>,
+    pub serial: u32,
+    pub app_id: String,
+    pub granted: bool,
+}
+
 /// A client wants `surface` focused. Whether it gets it is the compositor's
 /// call: a valid token came from a recent input event, an invalid one did not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +35,7 @@ pub struct ActivationRequest {
     pub serial: u32,
 }
 
-/// The `xdg_activation_v1` global. Every token request is granted; the
-/// decision is made inside the request, which Rust cannot answer.
+/// The `xdg_activation_v1` global.
 pub struct XdgActivation<'d> {
     pub(crate) raw: cxx::UniquePtr<ffi::XdgActivationShim>,
     _display: Holds<'d>,
@@ -36,22 +51,47 @@ impl<'d> XdgActivation<'d> {
             Ok(Self { raw, _display: Holds::new() })
         }
     }
+
+    /// Whether to grant future token requests. Default is true.
+    pub fn set_grant_tokens(&self, grant: bool) {
+        self.raw.set_grant_tokens(grant);
+    }
 }
 
 impl XdgActivation<'_> {
-    pub fn next_event(&self) -> Option<ActivationRequest> {
+    pub fn next_event(&self) -> Option<ActivationEvent> {
         loop {
             let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            if raw.kind != EventKind::ActivationRequest {
-                continue;
+            match raw.kind {
+                EventKind::ActivationRequest => {
+                    return Some(ActivationEvent::Request(ActivationRequest {
+                        surface: SurfaceId(raw.id),
+                        token_valid: raw.flag,
+                        app_id: raw.text,
+                        requesting_surface: SurfaceId::from_raw(raw.other),
+                        serial: raw.serial,
+                    }));
+                }
+                EventKind::ActivationTokenRequest => {
+                    return Some(ActivationEvent::TokenRequest(ActivationTokenRequest {
+                        surface: SurfaceId::from_raw(raw.id),
+                        serial: raw.serial,
+                        app_id: raw.text,
+                        granted: raw.flag,
+                    }));
+                }
+                _ => {}
             }
-            return Some(ActivationRequest {
-                surface: SurfaceId(raw.id),
-                token_valid: raw.flag,
-                app_id: raw.text,
-                requesting_surface: SurfaceId::from_raw(raw.other),
-                serial: raw.serial,
-            });
+        }
+    }
+
+    /// Pull the next activation request, skipping any token requests.
+    pub fn next_request(&self) -> Option<ActivationRequest> {
+        loop {
+            match self.next_event()? {
+                ActivationEvent::Request(req) => return Some(req),
+                _ => {}
+            }
         }
     }
 }

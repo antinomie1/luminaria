@@ -153,6 +153,7 @@ public:
     bool hide_cursor(rust::String& error);
     bool take_frame();
     bool take_mode_changed();
+    bool next_event(EventRaw& out) const;
     bool alive() const;
     std::uint64_t id() const;
 
@@ -280,6 +281,8 @@ public:
     CompositorShim(const CompositorShim&) = delete;
     CompositorShim& operator=(const CompositorShim&) = delete;
 
+    bool next_event(EventRaw& out) const;
+
     struct Impl;
     Impl& impl() const;
     explicit CompositorShim(std::unique_ptr<Impl> impl) noexcept;
@@ -298,6 +301,7 @@ std::uint32_t buffer_transform(std::uint64_t surface_id);
 bool surface_has_buffer(std::uint64_t surface_id);
 rust::Vec<Rect> surface_damage(std::uint64_t surface_id);
 void surface_send_frame_done(std::uint64_t surface_id, std::uint32_t time_ms);
+void surface_notify_rendered(std::uint64_t surface_id, int fence_fd);
 bool surface_accepts_input(std::uint64_t surface_id, double sx, double sy);
 
 class SubcompositorShim {
@@ -474,8 +478,6 @@ std::unique_ptr<Name##Shim> FuncName(const DisplayShim& display, rust::String& e
 
 DECLARE_GLOBAL_SHIM(Viewporter, viewporter_new)
 DECLARE_GLOBAL_SHIM(FractionalScaleManager, fractional_scale_manager_new)
-DECLARE_GLOBAL_SHIM(XdgDecorationManager, xdg_decoration_manager_new)
-DECLARE_GLOBAL_SHIM(CursorShapeManager, cursor_shape_manager_new)
 DECLARE_GLOBAL_SHIM(SinglePixelBufferManager, single_pixel_buffer_manager_new)
 DECLARE_GLOBAL_SHIM(TearingControlManager, tearing_control_manager_new)
 DECLARE_GLOBAL_SHIM(ContentTypeManager, content_type_manager_new)
@@ -483,11 +485,8 @@ DECLARE_GLOBAL_SHIM(FifoManager, fifo_manager_new)
 DECLARE_GLOBAL_SHIM(CommitTimingManager, commit_timing_manager_new)
 DECLARE_GLOBAL_SHIM(Presentation, presentation_new)
 DECLARE_GLOBAL_SHIM(BackgroundEffectManager, background_effect_manager_new)
-DECLARE_GLOBAL_SHIM(XdgToplevelIconManager, xdg_toplevel_icon_manager_new)
 DECLARE_GLOBAL_SHIM(DrmSyncobjManager, drm_syncobj_manager_new)
 DECLARE_GLOBAL_SHIM(ScreencopyManager, screencopy_manager_new)
-DECLARE_GLOBAL_SHIM(ForeignToplevelManager, foreign_toplevel_manager_new)
-DECLARE_GLOBAL_SHIM(WorkspaceManager, workspace_manager_new)
 
 #undef DECLARE_GLOBAL_SHIM
 
@@ -500,10 +499,64 @@ DECLARE_GLOBAL_SHIM(WorkspaceManager, workspace_manager_new)
     Impl& impl() const; \
     explicit Name(std::unique_ptr<Impl> impl) noexcept;
 
+class XdgDecorationManagerShim {
+public:
+    LUM_SHIM_BOILERPLATE(XdgDecorationManagerShim)
+    void set_default_mode(std::uint32_t mode) const;
+    std::uint32_t default_mode() const;
+    bool next_event(EventRaw& out) const;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<XdgDecorationManagerShim> xdg_decoration_manager_new(const DisplayShim& display, rust::String& error);
+
+class CursorShapeManagerShim {
+public:
+    LUM_SHIM_BOILERPLATE(CursorShapeManagerShim)
+    bool next_event(EventRaw& out) const;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<CursorShapeManagerShim> cursor_shape_manager_new(const DisplayShim& display, rust::String& error);
+
+class XdgToplevelIconManagerShim {
+public:
+    LUM_SHIM_BOILERPLATE(XdgToplevelIconManagerShim)
+    bool next_event(EventRaw& out) const;
+    rust::String icon_name(std::uint64_t surface_id) const;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<XdgToplevelIconManagerShim> xdg_toplevel_icon_manager_new(const DisplayShim& display, rust::String& error);
+
+class ForeignToplevelManagerShim {
+public:
+    LUM_SHIM_BOILERPLATE(ForeignToplevelManagerShim)
+    void track(const XdgShellShim& shell);
+    bool next_event(EventRaw& out) const;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<ForeignToplevelManagerShim> foreign_toplevel_manager_new(const DisplayShim& display, rust::String& error);
+
+class WorkspaceManagerShim {
+public:
+    LUM_SHIM_BOILERPLATE(WorkspaceManagerShim)
+    std::uint32_t create_group() const;
+    std::uint32_t create_workspace(std::uint32_t group, rust::Str name) const;
+    void remove_workspace(std::uint32_t workspace) const;
+    void activate_workspace(std::uint32_t workspace) const;
+    bool next_event(EventRaw& out) const;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<WorkspaceManagerShim> workspace_manager_new(const DisplayShim& display, rust::String& error);
+
 class XdgActivationShim {
 public:
     LUM_SHIM_BOILERPLATE(XdgActivationShim)
     bool next_event(EventRaw& out) const;
+    void set_grant_tokens(bool grant) const;
 private:
     std::unique_ptr<Impl> impl_;
 };
@@ -771,6 +824,9 @@ private:
 
 std::unique_ptr<CursorShim> cursor_new(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
                                       const SeatShim& seat, rust::String& error);
+std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                  const SeatShim& seat, const CursorShapeManagerShim& shapes,
+                                                  rust::String& error);
 
 class FrameShim {
 public:
@@ -856,6 +912,8 @@ public:
     OutputManagerShim& operator=(const OutputManagerShim&) = delete;
 
     void update();
+    bool next_event(EventRaw& out) const;
+    void set_auto_verdict(bool succeed) const;
 
     struct Impl;
     Impl& impl() const;

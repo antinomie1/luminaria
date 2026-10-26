@@ -34,7 +34,7 @@ use luminaria::backend::{
 use luminaria::core::{Display, Error, KeyRouter};
 use luminaria::gpu::{Cursor, DrmDeviceId, SceneOutcome, SceneOutput, SceneRenderer, VulkanOptions};
 use luminaria::protocol::{
-    Compositor, DataDeviceManager, FractionalScaleManager, OutputGlobal, PopupArea, PopupEvent,
+    Compositor, CursorShapeManager, DataDeviceManager, FractionalScaleManager, OutputGlobal, PopupArea, PopupEvent,
     Presentation, Seat, SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent,
     Viewporter, XdgDecorationManager, XdgEvent, XdgShell,
 };
@@ -346,6 +346,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _fractional = FractionalScaleManager::new(&display)?;
     // We draw no title bars, so clients draw their own.
     let _decoration = XdgDecorationManager::new(&display)?;
+    let cursor_shape = CursorShapeManager::new(&display)?;
     let layout = OutputLayout::new()?;
     let mut popups = PopupTree::new()?;
 
@@ -418,7 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("minimal: renderer = CPU ({})", renderer.gpu_error());
     }
     renderer.set_presentation(Some(&presentation));
-    let mut cursor = Cursor::new(&renderer, &layout, &seat)?;
+    let mut cursor = Cursor::new_with_shapes(&renderer, &layout, &seat, &cursor_shape)?;
 
     let mut screens: Vec<Screen> = Vec::new();
     for output in outputs {
@@ -612,6 +613,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 (k.keysym(code), depressed | latched)
                             });
                             commands.extend(key(&seat, &mut keys, &mut held, code, pressed, state, false));
+                        }
+                        BackendInputEvent::Modifiers(mods) => {
+                            seat.notify_modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
+                        }
+                        BackendInputEvent::Axis {
+                            dx,
+                            dy,
+                            dx_steps,
+                            dy_steps,
+                            stop_horizontal,
+                            stop_vertical,
+                        } => {
+                            if dx != 0.0 || dy != 0.0 {
+                                seat.pointer_axis(dx, dy);
+                            }
+                            if dx_steps != 0 || dy_steps != 0 {
+                                seat.pointer_axis_discrete(dx_steps, dy_steps);
+                            }
+                            if stop_horizontal || stop_vertical {
+                                seat.pointer_axis_stop(stop_horizontal, stop_vertical);
+                            }
+                        }
+                        BackendInputEvent::KeymapChange(text) => {
+                            seat.set_keymap(&text);
+                            keymap = KeymapState::from_text(&text).ok();
+                        }
+                        BackendInputEvent::HostCloseRequest => {
+                            break 'run;
                         }
                     }
                 }

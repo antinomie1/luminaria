@@ -1,13 +1,47 @@
 //! Desktop shell protocols: taskbars, workspaces, screen locking, output configuration, and input methods.
 
-use std::pin::Pin;
-
 use crate::core::{Display, Error, Holds};
 use crate::ffi::{self, EventKind};
 use crate::gpu::VulkanRenderer;
 use crate::protocol::{DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell};
 use crate::util::Rect;
 use crate::shell::OutputLayout;
+
+/// Taskbar and window switcher request kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignToplevelRequestKind {
+    Maximize,
+    Unmaximize,
+    Minimize,
+    Unminimize,
+    Fullscreen,
+    Unfullscreen,
+    Activate,
+    Close,
+}
+
+impl ForeignToplevelRequestKind {
+    pub(crate) fn from_u32(val: u32) -> Option<Self> {
+        match val {
+            0 => Some(Self::Maximize),
+            1 => Some(Self::Unmaximize),
+            2 => Some(Self::Minimize),
+            3 => Some(Self::Unminimize),
+            4 => Some(Self::Fullscreen),
+            5 => Some(Self::Unfullscreen),
+            6 => Some(Self::Activate),
+            7 => Some(Self::Close),
+            _ => None,
+        }
+    }
+}
+
+/// A request from a window switcher or taskbar (`zwlr_foreign_toplevel_handle_v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignToplevelRequest {
+    pub surface: SurfaceId,
+    pub kind: ForeignToplevelRequestKind,
+}
 
 /// Taskbar and window switcher protocol manager (`zwlr_foreign_toplevel_management_v1`).
 pub struct ForeignToplevelManager<'d> {
@@ -33,6 +67,53 @@ impl<'d> ForeignToplevelManager<'d> {
     pub fn track(&mut self, shell: &'d XdgShell<'_>) {
         ffi::foreign_toplevel_track(self.raw.pin_mut(), &shell.raw);
     }
+
+    pub fn next_event(&self) -> Option<ForeignToplevelRequest> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                EventKind::ForeignToplevelRequest => {
+                    let surface = SurfaceId(raw.id);
+                    if let Some(kind) = ForeignToplevelRequestKind::from_u32(raw.value) {
+                        return Some(ForeignToplevelRequest { surface, kind });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A workspace request kind from a pager or panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRequestKind {
+    Activate,
+    Deactivate,
+    Remove,
+    Assign,
+    Create,
+}
+
+impl WorkspaceRequestKind {
+    pub(crate) fn from_u32(val: u32) -> Option<Self> {
+        match val {
+            0 => Some(Self::Activate),
+            1 => Some(Self::Deactivate),
+            2 => Some(Self::Remove),
+            3 => Some(Self::Assign),
+            4 => Some(Self::Create),
+            _ => None,
+        }
+    }
+}
+
+/// A workspace request (`ext_workspace_manager_v1` or `ext_workspace_handle_v1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRequest {
+    pub kind: WorkspaceRequestKind,
+    pub workspace: u32,
+    pub group: u32,
+    pub name: String,
 }
 
 /// Workspace protocol manager (`ext_workspace_manager_v1`).
@@ -52,24 +133,39 @@ impl<'d> WorkspaceManager<'d> {
         }
     }
 
-    fn pin(&mut self) -> Pin<&mut ffi::WorkspaceManagerShim> {
-        self.raw.pin_mut()
-    }
-
     pub fn create_group(&mut self) -> u32 {
-        ffi::workspace_manager_create_group(self.pin())
+        self.raw.create_group()
     }
 
     pub fn create_workspace(&mut self, group: u32, name: &str) -> u32 {
-        ffi::workspace_manager_create_workspace(self.pin(), group, name)
+        self.raw.create_workspace(group, name)
     }
 
     pub fn remove_workspace(&mut self, workspace: u32) {
-        ffi::workspace_manager_remove_workspace(self.pin(), workspace);
+        self.raw.remove_workspace(workspace);
     }
 
     pub fn activate_workspace(&mut self, workspace: u32) {
-        ffi::workspace_manager_activate_workspace(self.pin(), workspace);
+        self.raw.activate_workspace(workspace);
+    }
+
+    pub fn next_event(&self) -> Option<WorkspaceRequest> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                EventKind::WorkspaceRequest => {
+                    if let Some(kind) = WorkspaceRequestKind::from_u32(raw.value) {
+                        return Some(WorkspaceRequest {
+                            kind,
+                            workspace: raw.id as u32,
+                            group: raw.other as u32,
+                            name: raw.text,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -238,6 +334,12 @@ impl LockSurface<'_> {
     }
 }
 
+/// A client applied or tested a screen arrangement (`zwlr_output_configuration_v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputConfigRequest {
+    pub test: bool,
+}
+
 /// Output layout configuration manager (`zwlr_output_manager_v1` for
 /// kanshi/wlr-randr). Describes heads from the [`OutputLayout`] it borrows.
 pub struct OutputManager<'a> {
@@ -258,6 +360,22 @@ impl<'a> OutputManager<'a> {
 
     pub fn update(&mut self) {
         self.raw.pin_mut().update();
+    }
+
+    pub fn set_auto_verdict(&self, succeed: bool) {
+        self.raw.set_auto_verdict(succeed);
+    }
+
+    pub fn next_event(&self) -> Option<OutputConfigRequest> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            match raw.kind {
+                EventKind::OutputConfigRequest => {
+                    return Some(OutputConfigRequest { test: raw.flag });
+                }
+                _ => {}
+            }
+        }
     }
 }
 
