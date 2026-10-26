@@ -38,6 +38,7 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 | `Cursor<'a>` | `SceneRenderer`、`OutputLayout`、`Seat` |
 | `SceneOutput<'r>` | 第一次 `reset()` / `present()` 它的 `SceneRenderer`（它缓存该渲染器的纹理与渲染目标） |
 | `Frame<'r>` | `VulkanRenderer` |
+| `Toplevel<'s>`、`Popup<'s>`、`LayerSurface<'s>`、`LockSurface<'m>`、`SessionLock<'m>`、`PointerConstraint<'m>`、`TextInput<'m>`、`InputMethod<'m>` | 发出它的那个 global（只是查询句柄，见 §4"事件"） |
 
 几点说明：
 
@@ -202,6 +203,30 @@ let (depressed, latched, locked, group) = keymap.modifiers();
 
 负责向客户端通告和处理 Wayland 协议规范。
 
+### 事件：`next_event()`
+
+混成器是被 C++ 的 `Signal` 驱动的。绑定不让 C++ 回调 Rust，而是每个 shim 把信号排进自己的队列，
+Rust 在 `Display::dispatch` 返回后用 `next_event()` 一个个取走：
+
+```rust
+display.dispatch(Some(Duration::from_millis(16)))?;
+while let Some(event) = shell.next_event() { /* XdgEvent */ }
+while let Some((surface, event)) = layers.next_event() { /* LayerSurfaceEvent */ }
+while let Some(event) = seat.next_event() { /* SeatEvent */ }
+```
+
+- **事件晚于信号到达。** 信号在 `dispatch` 里发出，Rust 看到时对象可能已经又变了、甚至没了。所以客户端创建的对象
+  不以引用交给 Rust，而是以名字：有自己 surface 的（toplevel、popup、layer surface、锁屏 surface、指针约束、
+  输入法弹窗）用那个 surface 的 `SurfaceId`，其余（锁、idle 通知与抑制器、text input、输入法）用绑定分配、
+  永不复用的 id。`shell.toplevel(id)` 之类返回的句柄每次调用都重新查找；对象销毁后 getter 返回默认值、setter 不做事。
+- **替 Rust 立刻做的事，由 shim 自己做。** 对象销毁时必须马上放开它的地方——`PopupTree`、`LayerManager`、
+  `OutputLayout`——shim 监听销毁信号，不等 Rust 取到 `Destroy` 事件。
+- **要同步回答的信号无法转发。** `XdgShell` 的 popup 约束查询改成事先告知（`set_popup_constraint_areas`）；
+  xdg-activation 的发 token 请求总是批准。
+- **绑定总在监听。** luminaria 对 `request_maximize` / `request_fullscreen` / `request_minimize` 有一个
+  "没人监听就自己批准"的兜底；绑定每个都监听，所以这个兜底不会发生，回答是 Rust 的事（`examples/minimal.rs` 照兜底的样子回答）。
+- **队列不取就一直长。** 用了某个 global，就在每次 `dispatch` 之后把它的队列取空。
+
 ### `Compositor` 与 `SurfaceId`
 - `Compositor::new(&display)?`：发布 `wl_compositor`。
 - **`SurfaceId`**：表面的代际标识符。严禁在事件调度之间持有裸 `Surface*` 指针。调用方法前即时解析，若表面已销毁则方法安全静默无害：
@@ -237,18 +262,71 @@ seat.touch_up(0);
 seat.touch_frame();
 ```
 
+`seat.next_event()` 报告路由的变化，无论谁引起：`SeatEvent::KeyboardFocus(Option<SurfaceId>)`、
+`PointerFocus(Option<SurfaceId>)`、`CursorChange { surface, hotspot, hidden }`（指针焦点所在的客户端设置了光标；
+指针离开时光标回到混成器自己的，报为 `surface: None, hidden: false`）。
+
 ### `XdgShell`
-发布 `xdg_wm_base`（支持 toplevels 和 popups）：
+发布 `xdg_wm_base`（toplevel 与 popup）。`next_event()` 返回 `XdgEvent::Toplevel(SurfaceId, ToplevelEvent)` 或
+`XdgEvent::Popup(SurfaceId, PopupEvent)`：
+
+- `ToplevelEvent`：`Created`、`Map`、`Unmap`、`Destroy`；客户端的请求 `RequestMaximize(bool)`、`RequestFullscreen(bool)`、
+  `RequestMinimize`、`RequestMove { serial }`、`RequestResize { serial, edges }`（`util::edge` 位掩码）、
+  `RequestWindowMenu { serial, x, y }`；`IdentityChange`（标题 / app id）、`StateChange`（混成器的 setter 真的改了状态）、
+  `ParentChange(Option<SurfaceId>)`。
+- `PopupEvent`：`Created { parent }`（layer surface 的 popup 为 `None`）、`Map`、`Unmap`、`Destroy`、`Reposition`、`Grab { serial }`。
+
 ```rust
-let xdg_shell = XdgShell::new(&display)?;
-xdg_shell.set_bounds(1920, 1080);
+let shell = XdgShell::new(&display)?;
+shell.set_bounds(1920, 1080);
+while let Some(event) = shell.next_event() {
+    match event {
+        XdgEvent::Toplevel(s, ToplevelEvent::Created) => {
+            let t = shell.toplevel(s).unwrap();
+            t.set_maximized(true);
+            t.configure(1920, 1080);
+        }
+        XdgEvent::Toplevel(s, ToplevelEvent::RequestFullscreen(on)) => {
+            if let Some(t) = shell.toplevel(s) { t.set_fullscreen(on) }
+        }
+        XdgEvent::Popup(p, PopupEvent::Created { .. }) => { popups.add(&shell, p); }
+        _ => {}
+    }
+}
 ```
+
+- `Toplevel`：`title()`、`app_id()`、`parent()`、`is_mapped()`、`min_size()`、`max_size()`、`geometry()`（窗口几何，
+  不含客户端阴影）、`pending_size()`、`states()`；`configure(w, h) -> serial`、`set_maximized` / `set_fullscreen` /
+  `set_activated` / `set_resizing` / `set_tiled` / `set_minimized`、`close()`。`shell.toplevels()` 列出全部。
+- `Popup`：`parent()`、`is_mapped()`、`has_grab()`、`geometry()`（相对父窗口几何）、`dismiss()`。
+- `set_popup_constraint_areas(&[PopupArea { parent, parent_box, usable }])`：每个可能当 popup 父亲的 surface 画在哪、
+  在哪块屏上。shell 摆 popup 时在 `dispatch` 里同步查询，只能用事先告诉它的；场景一变就更新。不在表里的父亲不受约束。
+
+### `LayerShell`
+发布 `zwlr_layer_shell_v1`（面板、壁纸、通知、锁屏界面）。`next_event()` 返回 `(SurfaceId, LayerSurfaceEvent)`：
+`Created`、`Map`、`Unmap`、`Destroy`、`StateChange`（提交了新的层 / 锚点 / 尺寸 / 边距 / 独占区，重新排版）、
+`NewPopup(SurfaceId)`（客户端把这个没有 xdg 父亲的 popup 挂到本 layer surface 上，这是唯一知道它归属的地方）。
+
+`layers.layer_surface(id)` 的句柄：`scope()`、`layer()`、`anchor()`（`util::edge` 位掩码）、`desired_size()`、
+`exclusive_zone()`、`exclusive_edge()`、`margins()`、`keyboard_interactivity()`、`is_mapped()`、`pending_size()`、
+`has_output()` / `is_on(&output_global)`（客户端点名的输出）、`configure(w, h)`、`close()`、
+`arrange(full, &mut usable) -> Rect`。整块输出一起排版用 `shell::LayerManager`（§7）。
+
+### 其余协议的事件
+
+| global | `next_event()` 返回 | 查询与回答 |
+|---|---|---|
+| `IdleInhibitManager` | `IdleInhibitEvent::{NewInhibitor { inhibitor, surface }, InhibitorDestroy, Changed(bool)}` | `is_inhibited()`、`inhibitor_count()`、`set_visible(id, bool)`（只有可见的抑制器生效） |
+| `IdleNotifier` | `IdleNotifierEvent::{NewNotification, NotificationDestroy, StateChange { notification, idled }}` | `notify_activity()`、`set_inhibited()`、`notification(id)` |
+| `XdgActivation` | `ActivationRequest { surface, token_valid, app_id, requesting_surface, serial }` | 给不给焦点由混成器决定 |
+| `PointerConstraints` | `PointerConstraintEvent::{New, Destroy, RegionChange}(SurfaceId)` | `constraint(surface)`：`kind()`、`region()`、`cursor_hint()`、`activate()`（只在指针焦点在该 surface 时生效）、`deactivate()`；`active_constraint()` |
+| `TextInputManager` | `TextInputEvent::{New, Enable, Disable, Commit, Destroy}(TextInputId)` | `focused()`、`text_input(id)`：`state()`、`surrounding_text()`、`send_preedit_string` / `send_commit_string` / `send_delete_surrounding_text` / `send_done` |
+| `DataDeviceManager`、`PrimarySelectionManager` | `next_selection_change() -> Option<Vec<String>>`（新所有者提供的 MIME 类型，空表示清空） | `selection_mime_types()`、`selection_receive(mime, OwnedFd)`（写进管道写端，dispatch 后读另一端） |
 
 ### 协议扩展管理器
 所有管理器均采用统一构建规范，内部 RAII 管理协议生命周期：
 ```rust
 let _subcompositor   = Subcompositor::new(&display)?;
-let _layer_shell     = LayerShell::new(&display)?;
 let _viewporter      = Viewporter::new(&display)?;
 let _fractional      = FractionalScaleManager::new(&display)?;
 let _activation      = XdgActivation::new(&display)?;
@@ -339,10 +417,17 @@ match outcome {
   let ws = wm.create_workspace(group, "Workspace 1");
   wm.activate_workspace(ws);
   ```
-- **`SessionLockManager`**：`ext-session-lock` 锁屏协议。锁定期间仅允许绘制锁屏界面（`is_locked()`）。
+- **`SessionLockManager`**：`ext-session-lock` 锁屏协议。`next_event()` 返回 `SessionLockEvent`：`NewLock(LockId)`、
+  `NewSurface { lock, surface }`、`SurfaceMap`、`SurfaceDestroy`、`LockDestroy { lock, unlocked }`。盖住所有输出后
+  `locks.lock(id).send_locked()`，拒绝用 `send_finished()`；`lock_surface(surface)` 的句柄 `is_on(&output_global)`、
+  `configure(w, h)`。它**失败即锁定**：锁屏客户端没解锁就死了，`unlocked` 为 false，`is_locked()` 仍为 true，
+  绘制与输入应跟随 `is_locked()` 而不是锁屏客户端是否还在。
 - **`OutputManager`**：为 `kanshi`、`wlr-randr` 等外部多屏配置工具提供查询与动态布局修改接口。
 - **`DataControlManager`**：为 `wl-clipboard` 等无窗口剪贴板工具提供特权读取与写入接口。
-- **`InputMethodManager`**：为 Fcitx / IBus 等输入法引擎提供候选词窗口绑定与键盘抢占支持。
+- **`InputMethodManager`**：为 Fcitx / IBus 等输入法引擎提供候选词窗口绑定与键盘抢占支持；与 `TextInputManager`
+  之间的桥接它自己完成。`next_event()` 返回 `InputMethodEvent`：`New`、`GrabChange { input_method, grabbed }`、`Destroy`、
+  `NewPopupSurface { input_method, surface }`、`PopupSurfaceDestroy`。抢占键盘期间按键经 `input_method(id).grab_send_key(...)`
+  送给输入法，候选窗口放在 `popup_text_input_rectangle(surface)` 旁边。
 
 ---
 
@@ -387,6 +472,18 @@ if hit.hit {
     println!("命中表面: {:?}, 自定义标记: {}", hit.surface, hit.tag);
 }
 ```
+
+### `PopupTree`
+已映射的 popup 及其位置：`popups.add(&shell, popup)`（layer surface 的 popup 用 `add_with_parent(&shell, popup, layer_surface)`）、
+`set_mapped`、`append_to(&mut scene)`（每个 popup 接在父 surface 之上、按偏移摆放、带父窗口的 tag，子菜单嵌套）、
+`contains`、`active_grab`、`dismiss_grabs_outside(seat.pointer_focus())`（点在所有 popup 外面就关掉抢占的那些，返回 true
+时这次点击不该交给客户端）。popup 销毁时它自己放手，不借用 `XdgShell`。
+
+### `LayerManager`
+按输出管理 layer surface：`add(&layers, surface, output_id)`（`output_id` 由混成器自定）、`set_mapped`、
+`arrange(output_id, full, usable) -> Rect`（配置每个 surface，返回扣掉独占区后剩下的区域，交给 `XdgShell::set_bounds`
+并在其中摆窗口）、`append_to(&mut scene, output_id, Layer::Top)`、`keyboard_target(surface)`、`close_output(output_id)`。
+同样自己放开销毁的 surface。
 
 ### `CpuCompositor`
 纯软件 CPU 光栅化混合器，无需 GPU 支持即可将 `Rect` 与图像合成至线性内存 RGBA 缓冲区，适用于无头环境或截屏输出。
@@ -554,18 +651,29 @@ ADR 0003 约束的是**核心模块**收什么协议；Vulkan 本来就在 `lumi
   wgpu 这类需要更多特性的库不一定能在这个设备上建起来；luminaria 不会为外部调用者多开特性。
 - **测试兜底失效。** "稳态 `render_to` 不分配"和"校验层零报错"这两条测试保证，覆盖不到外部代码提交的工作。
 
-### 9.5 `examples/minimal.rs` 的 DRM 路径
+### 9.5 `examples/minimal.rs` 与 C++ 版的差别，以及绑定还缺什么
 
 有了 9.2 和 9.3，`minimal.rs` 加上了与 `minimal.cpp` 相同的后端选择：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
 auto 依次尝试嵌套、能拿到 libseat 会话时的 DRM、无头；显卡取第一个参数或 `LUMINARIA_DRM_DEVICE`；
 Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满第一块；显示器热插拔、模式变化、VT 切走时放开
-按键、DRM 上每秒一行帧统计，都与 C++ 版一致。
+按键、DRM 上每秒一行帧统计，都与 C++ 版一致。有了 §4 的事件，弹出菜单也一致了：`PopupTree` 把 popup 放进场景，
+点在菜单外面关掉它，`set_popup_constraint_areas` 让贴边的菜单翻转；窗口按窗口几何摆放；`OutputGlobal`
+告诉客户端位置、模式、缩放与朝向。C++ 版没有 layer shell 与锁屏，所以 Rust 版也没有（两者保持同步）；
+它们的用法见 `tests/test_layer_shell.rs`、`tests/test_session_lock.rs`。
 
-与 C++ 版仍有的差别，都是绑定还没导出的东西，不是 DRM 路径本身的缺口：
+与 C++ 版仍有的差别，都是绑定还没导出的东西：
 
-- 没有弹出菜单：`PopupTree` 在 Rust 里没有加入 popup 的入口，`XdgShell` 也不报告 popup 事件。
 - 没有 `LinuxDmabuf`：它要一个 `VulkanRenderer`，而 `SceneRenderer` 不把自己那个交出来；GPU 客户端只能走 wl_shm。
 - `Cursor` 没接 cursor-shape 管理器，客户端请求的光标形状不生效。
-- `OutputGlobal` 只有尺寸：位置、刷新率、缩放、朝向都没告诉客户端。
+- 映射时不发首选缓冲缩放与分数缩放：`Surface::set_preferred_buffer_scale` 与 `FractionalScaleManager::set_scale` 没有导出。
+- 子表面树（`Surface::surface_tree`）没有导出：按住按钮时，抓取落在子表面上的指针按其窗口原点换算坐标。
+
+整个绑定里还没有转发的信号（87 个 `Signal<...>` 负载里剩下这些）：
+
+- `Compositor` 的 `NewSurface`，以及每个 surface 的 `SurfaceCommit`、`SurfaceDestroy`、`SurfaceRendered` 和全局的 `SurfaceInvalidated`。
+- `Output` 的 `PresentEvent`（呈现反馈由 `SceneRenderer` 代发）。
+- 嵌套后端的 `KeymapChange`、`HostCloseRequest`、`ModifiersEvent`、`PointerAxisEvent`（只转发了按键、指针移动与按钮）。
+- 需要同步回答的：xdg-activation 的 `ActivationTokenRequest`（总是批准）、cursor-shape 的 `CursorShapeRequest`。
+- 桌面协议的请求：`DecorationRequest`、`ForeignToplevelRequest`、`WorkspaceRequest`、`OutputConfigRequest`、`ToplevelIconChange`。
 
 DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 上的运行还没有验证过。

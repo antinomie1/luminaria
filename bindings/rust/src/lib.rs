@@ -13,7 +13,12 @@
 //! - [`protocol`]: Compositor, Subcompositor, XdgShell, Seat, LayerShell, and core protocol managers.
 //! - [`gpu`]: VulkanRenderer, SceneRenderer, Frame, Cursor, DirectScanout, LinuxDmabuf, Screencopy.
 //! - [`desktop`]: ForeignToplevelManager, WorkspaceManager, SessionLockManager, OutputManager, DataControlManager, InputMethodManager.
-//! - [`shell`]: OutputLayout, SceneItem, SceneHit, scene_hit_test, CpuCompositor, PopupTree.
+//! - [`shell`]: OutputLayout, SceneItem, SceneHit, scene_hit_test, CpuCompositor, PopupTree, LayerManager.
+//!
+//! The library is driven by its signals, and C++ never calls Rust: each global
+//! queues what it emitted, and its `next_event()` hands it over after
+//! [`Display::dispatch`](core::Display::dispatch) returns. The [`protocol`]
+//! module documentation says how the objects those events are about are named.
 //!
 //! `examples/minimal.rs` is a complete compositor built this way.
 

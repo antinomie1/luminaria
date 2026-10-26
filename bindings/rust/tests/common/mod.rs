@@ -127,6 +127,13 @@ impl Peer {
         }
     }
 
+    /// Let the client go on and wait for it, without dispatching: for a test
+    /// that has already dropped the display under it.
+    pub fn join(mut self) {
+        self.go();
+        self.join_thread();
+    }
+
     fn join_thread(&mut self) {
         if let Some(t) = self.thread.take() {
             if let Err(panic) = t.join() {

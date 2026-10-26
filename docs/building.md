@@ -75,7 +75,7 @@ Rust 绑定的 `build.rs` 把 cargo 的并行度原样交给 xmake，所以那�
 同样的窗口策略（每个窗口最大化到输出上、新的在最上面、点击置顶），同样的快捷键：
 Logo+Return 开 `$TERMINAL`（默认 foot）、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出。
 光标与帧回调全由库处理（`Cursor`、`SceneRenderer`），示例里只剩混成器自己的决定。
-Rust 那份的后端选择与 C++ 相同（嵌套 / DRM / headless），还缺弹出菜单、`LinuxDmabuf` 与光标形状，
+Rust 那份的后端选择与 C++ 相同（嵌套 / DRM / headless），还缺 `LinuxDmabuf`、光标形状与首选缩放，
 见 `bindings/rust/docs/api.md` §9.5。
 
 **嵌套**（在现有桌面里开一个窗口，暴露自己的 `WAYLAND_DISPLAY` 供客户端连接）：

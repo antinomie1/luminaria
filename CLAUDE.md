@@ -120,7 +120,7 @@ src/detail/wayland_fwd.h the one remaining header
 
 Running the example compositor — one, `examples/minimal.cpp`, the C++ twin of
 `bindings/rust/examples/minimal.rs` (same window policy, same bindings, same backend choice; keep
-the two in step — the Rust one still lacks popups, `LinuxDmabuf` and cursor shapes, see
+the two in step — the Rust one still lacks `LinuxDmabuf`, cursor shapes and preferred scales, see
 `bindings/rust/docs/api.md` §9.5):
 
 ```sh

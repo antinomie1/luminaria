@@ -19,10 +19,10 @@
 //! unchanged — is `SceneRenderer`'s.
 //!
 //! Where it still differs from its twin, because the binding does not expose
-//! it yet: no popups (`PopupTree` has no way in), no `LinuxDmabuf` on the
-//! renderer's GPU (`SceneRenderer` does not hand out its `VulkanRenderer`), no
-//! cursor-shape manager for `Cursor`, and the `OutputGlobal`s are not told an
-//! output's position, refresh, scale or transform.
+//! it yet: no `LinuxDmabuf` on the renderer's GPU (`SceneRenderer` does not
+//! hand out its `VulkanRenderer`), no cursor-shape manager for `Cursor`, no
+//! preferred buffer scale or fractional scale sent on map, and a pointer grab
+//! held by a subsurface is routed as if it sat at its window's origin.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -34,11 +34,11 @@ use luminaria::backend::{
 use luminaria::core::{Display, Error, KeyRouter};
 use luminaria::gpu::{Cursor, DrmDeviceId, SceneOutcome, SceneOutput, SceneRenderer, VulkanOptions};
 use luminaria::protocol::{
-    Compositor, DataDeviceManager, FractionalScaleManager, OutputGlobal, Presentation, Seat,
-    SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent, Viewporter, XdgEvent,
-    XdgDecorationManager, XdgShell,
+    Compositor, DataDeviceManager, FractionalScaleManager, OutputGlobal, PopupArea, PopupEvent,
+    Presentation, Seat, SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent,
+    Viewporter, XdgDecorationManager, XdgEvent, XdgShell,
 };
-use luminaria::shell::{scene_hit_test, OutputLayout, SceneItem};
+use luminaria::shell::{scene_hit_test, OutputLayout, PopupTree, SceneItem};
 use luminaria::util::{Color, KeymapState, Rect};
 
 const WIDTH: i32 = 1280;
@@ -97,7 +97,7 @@ impl Backend<'_> {
 struct Screen<'a> {
     output: Output,
     state: SceneOutput<'a>,
-    _global: Option<OutputGlobal<'a>>,
+    global: Option<OutputGlobal<'a>>,
 }
 
 /// What the frames did, once a second on DRM and only when it changed: the
@@ -125,9 +125,15 @@ fn add_screen<'a>(
     if let Err(e) = renderer.reset(&mut state, &mut output, DRM_FORMAT_XRGB8888) {
         eprintln!("minimal: render target: {e}; compositing on the CPU");
     }
+    let b = layout.output_box(&output);
     let name = format!("minimal-{}", screens.len() + 1);
     let global = OutputGlobal::new(display, output.width(), output.height(), &name).ok();
-    let b = layout.output_box(&output);
+    if let Some(g) = &global {
+        g.set_logical_position(b.x, b.y);
+        g.set_mode(output.width(), output.height(), output.current_mode().refresh_mhz);
+        g.set_scale(output.scale());
+        g.set_transform(output.transform());
+    }
     println!(
         "minimal: output {}x{}@{:.3}Hz at ({},{}), scale {}, cursor plane {}",
         output.width(),
@@ -138,19 +144,45 @@ fn add_screen<'a>(
         output.scale(),
         if output.has_cursor_plane() { "yes" } else { "no" }
     );
-    screens.push(Screen {
-        output,
-        state,
-        _global: global,
-    });
+    screens.push(Screen { output, state, global });
 }
 
-/// Every window covers the whole usable area. Tagged with its own surface, so
-/// a hit on one of its subsurfaces still names the window.
-fn scene(stack: &[SurfaceId], usable: Rect) -> Vec<SceneItem> {
-    stack
+/// Every window sits at the usable area's origin, newest on top, with its
+/// popups above it. Tagged with its own surface, so a hit on one of its
+/// subsurfaces or popups still names the window.
+fn scene(shell: &XdgShell, popups: &PopupTree, stack: &[SurfaceId], usable: Rect) -> Vec<SceneItem> {
+    let mut items: Vec<SceneItem> = stack
         .iter()
-        .map(|&s| SceneItem::surface(s, usable, usable.x, usable.y).with_tag(s.0))
+        .filter_map(|&s| {
+            // The client's shadow sits outside its window geometry, so the
+            // geometry, not the buffer, is what lands on the usable area.
+            let g = shell.toplevel(s)?.geometry();
+            let framed = g.width > 0 && g.height > 0;
+            let (w, h) = if framed { (g.width, g.height) } else { (s.surface_width(), s.surface_height()) };
+            let (ox, oy) = if framed { (g.x, g.y) } else { (0, 0) };
+            Some(SceneItem::surface(s, Rect::new(usable.x, usable.y, w, h), usable.x - ox, usable.y - oy).with_tag(s.0))
+        })
+        .collect();
+    popups.append_to(&mut items);
+    items
+}
+
+/// Where each surface in `items` is and what screen it is on, so a menu near
+/// the bottom edge flips up instead of hanging off it. The shell asks while
+/// it places a popup, inside dispatch, so it is told ahead of time.
+fn popup_areas(items: &[SceneItem], layout: &OutputLayout, screens: &[Screen]) -> Vec<PopupArea> {
+    items
+        .iter()
+        .filter(|item| item.surface.is_valid())
+        .map(|item| {
+            let (x, y) = (item.rect.x as f64, item.rect.y as f64);
+            let usable = screens
+                .iter()
+                .map(|s| layout.output_box(&s.output))
+                .find(|b| b.contains(x, y))
+                .unwrap_or_else(|| layout.bounds());
+            PopupArea { parent: item.surface, parent_box: item.rect, usable }
+        })
         .collect()
 }
 
@@ -185,13 +217,17 @@ fn raise(stack: &mut Vec<SurfaceId>, surface: SurfaceId) {
 }
 
 /// Gives the pointer to whatever is under it. A held button keeps it on the
-/// surface it went down on; every window sits at the usable area's origin.
-fn pointer_focus(seat: &Seat, stack: &[SurfaceId], usable: Rect, (x, y): (f64, f64)) {
-    if seat.pointer_grab().is_some() {
-        seat.pointer_motion(x - usable.x as f64, y - usable.y as f64);
+/// surface it went down on, in that surface's coordinates.
+fn pointer_focus(seat: &Seat, items: &[SceneItem], usable: Rect, (x, y): (f64, f64)) {
+    if let Some(grab) = seat.pointer_grab() {
+        let (ox, oy) = items
+            .iter()
+            .find(|item| item.surface == grab)
+            .map_or((usable.x, usable.y), |item| item.surface_origin);
+        seat.pointer_motion(x - ox as f64, y - oy as f64);
         return;
     }
-    let hit = scene_hit_test(&scene(stack, usable), x, y);
+    let hit = scene_hit_test(items, x, y);
     match hit.surface {
         Some(surface) => seat.pointer_enter(surface, hit.sx, hit.sy),
         None if seat.pointer_focus().is_some() => seat.pointer_clear_focus(),
@@ -199,21 +235,25 @@ fn pointer_focus(seat: &Seat, stack: &[SurfaceId], usable: Rect, (x, y): (f64, f
     }
 }
 
-/// A button: a press raises the window under the pointer. Returns whether the
-/// stack changed.
-fn button(
-    seat: &Seat,
-    stack: &mut Vec<SurfaceId>,
+/// The windows and popups a button lands among.
+struct Desk<'s, 'd> {
+    shell: &'s XdgShell<'d>,
+    popups: &'s mut PopupTree,
+    stack: &'s mut Vec<SurfaceId>,
     usable: Rect,
-    at: Option<(f64, f64)>,
-    code: u32,
-    pressed: bool,
-) -> bool {
+}
+
+/// A button: a press outside an open menu closes it, and raises the window
+/// under the pointer. Returns whether the stack changed.
+fn button(seat: &Seat, desk: Desk, at: Option<(f64, f64)>, code: u32, pressed: bool) -> bool {
     let mut restacked = false;
+    if pressed {
+        desk.popups.dismiss_grabs_outside(seat.pointer_focus()); // menu semantics
+    }
     if let (true, Some((x, y))) = (pressed, at) {
-        let hit = scene_hit_test(&scene(stack, usable), x, y);
-        if hit.tag != 0 && stack.last() != Some(&SurfaceId(hit.tag)) {
-            raise(stack, SurfaceId(hit.tag));
+        let hit = scene_hit_test(&scene(desk.shell, desk.popups, desk.stack, desk.usable), x, y);
+        if hit.tag != 0 && desk.stack.last() != Some(&SurfaceId(hit.tag)) {
+            raise(desk.stack, SurfaceId(hit.tag));
             restacked = true;
         }
     }
@@ -221,7 +261,8 @@ fn button(
         seat.pointer_button(code, pressed);
     }
     if let (false, Some(at)) = (pressed, at) {
-        pointer_focus(seat, stack, usable, at); // an implicit grab may have ended
+        // An implicit grab may have ended.
+        pointer_focus(seat, &scene(desk.shell, desk.popups, desk.stack, desk.usable), desk.usable, at);
     }
     restacked
 }
@@ -306,6 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // We draw no title bars, so clients draw their own.
     let _decoration = XdgDecorationManager::new(&display)?;
     let layout = OutputLayout::new()?;
+    let mut popups = PopupTree::new()?;
 
     // Backends after the globals: an output's last `present` must still find
     // the presentation global there.
@@ -455,6 +497,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for s in &mut screens {
             if s.output.take_mode_changed() {
                 let _ = renderer.reset(&mut s.state, &mut s.output, DRM_FORMAT_XRGB8888);
+                let old = layout.output_box(&s.output);
+                layout.add(&mut s.output, old.x, old.y);
+                if let Some(g) = &s.global {
+                    g.set_mode(s.output.width(), s.output.height(), s.output.current_mode().refresh_mhz);
+                }
                 relayout = true;
             }
         }
@@ -480,24 +527,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- windows ---------------------------------------------------------
 
         let mut restacked = false;
+        let mut redraw = false;
         while let Some(event) = shell.next_event() {
             match event {
-                XdgEvent::Toplevel(surface, ToplevelEvent::Created) => {
-                    // Sized before its first frame, so it never shows at its own size.
-                    if let Some(t) = shell.toplevel(surface) {
-                        t.set_maximized(true);
-                        t.configure(usable.width, usable.height);
+                XdgEvent::Toplevel(surface, event) => {
+                    let Some(t) = shell.toplevel(surface) else {
+                        // Destroyed since: only its leaving matters.
+                        stack.retain(|&s| s != surface);
+                        restacked = true;
+                        continue;
+                    };
+                    match event {
+                        ToplevelEvent::Created => {
+                            // Sized before its first frame, so it never shows at its own size.
+                            t.set_maximized(true);
+                            t.configure(usable.width, usable.height);
+                        }
+                        ToplevelEvent::Map => {
+                            println!("minimal: window mapped — \"{}\"", t.title());
+                            raise(&mut stack, surface);
+                            restacked = true;
+                        }
+                        ToplevelEvent::Unmap | ToplevelEvent::Destroy => {
+                            stack.retain(|&s| s != surface);
+                            restacked = true;
+                        }
+                        // The twin listens to none of these, and luminaria then
+                        // grants them itself. The binding always listens, so
+                        // the same answer is given here.
+                        ToplevelEvent::RequestMaximize(on) => t.set_maximized(on),
+                        ToplevelEvent::RequestFullscreen(on) => t.set_fullscreen(on),
+                        ToplevelEvent::RequestMinimize => t.set_minimized(true),
+                        _ => {}
                     }
                 }
-                XdgEvent::Toplevel(surface, ToplevelEvent::Map) => {
-                    raise(&mut stack, surface);
-                    restacked = true;
+                // Menus, tooltips and combo boxes: drawn above their parents,
+                // dismissed by a click outside them. A destroyed one has
+                // already left the tree.
+                XdgEvent::Popup(popup, event) => {
+                    match event {
+                        PopupEvent::Created { .. } => {
+                            popups.add(&shell, popup);
+                        }
+                        PopupEvent::Map => popups.set_mapped(popup, true),
+                        PopupEvent::Unmap => popups.set_mapped(popup, false),
+                        _ => {}
+                    }
+                    redraw = true;
                 }
-                XdgEvent::Toplevel(surface, ToplevelEvent::Unmap | ToplevelEvent::Destroy) => {
-                    stack.retain(|&s| s != surface);
-                    restacked = true;
-                }
-                _ => {}
             }
         }
 
@@ -516,12 +593,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         BackendInputEvent::Motion { x, y } => {
                             cursor.move_to(usable.x as f64 + x, usable.y as f64 + y, layout.bounds());
                             if let Some(at) = cursor.position() {
-                                pointer_focus(&seat, &stack, usable, at);
+                                pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
                             }
                         }
                         BackendInputEvent::Button { button: code, pressed } => {
                             let at = cursor.position();
-                            restacked |= button(&seat, &mut stack, usable, at, code, pressed);
+                            let desk = Desk { shell: &shell, popups: &mut popups, stack: &mut stack, usable };
+                            restacked |= button(&seat, desk, at, code, pressed);
                         }
                         BackendInputEvent::Key { key: code, pressed } => {
                             // The host sends no modifier events through the
@@ -544,13 +622,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         LibinputEvent::Motion { dx, dy } => {
                             if cursor.move_by(dx, dy, layout.bounds()) {
                                 if let Some(at) = cursor.position() {
-                                    pointer_focus(&seat, &stack, usable, at);
+                                    pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
                                 }
                             }
                         }
                         LibinputEvent::Button { button: code, pressed } => {
                             let at = cursor.position();
-                            restacked |= button(&seat, &mut stack, usable, at, code, pressed);
+                            let desk = Desk { shell: &shell, popups: &mut popups, stack: &mut stack, usable };
+                            restacked |= button(&seat, desk, at, code, pressed);
                         }
                         LibinputEvent::Axis {
                             dx,
@@ -646,8 +725,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if restacked {
             focus_top(&stack, &shell, &seat);
             if let Some(at) = cursor.position() {
-                pointer_focus(&seat, &stack, usable, at);
+                pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
             }
+        }
+        if restacked || redraw {
             for s in &mut screens {
                 s.output.schedule_frame();
             }
@@ -655,7 +736,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // --- frames ----------------------------------------------------------
 
-        let items = scene(&stack, usable);
+        let items = scene(&shell, &popups, &stack, usable);
+        shell.set_popup_constraint_areas(&popup_areas(&items, &layout, &screens));
         for s in &mut screens {
             if !s.output.take_frame() {
                 continue;
