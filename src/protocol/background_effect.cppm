@@ -56,6 +56,9 @@ namespace luminaria {
 struct BackgroundEffectManager::Impl {
     WlGlobal global;
     std::vector<SurfaceId> active;
+    std::vector<wl_resource*> effects; // every live effect object; each points back here
+
+    ~Impl();
 };
 
 namespace {
@@ -85,6 +88,7 @@ void effect_resource_destroy(wl_resource* resource) {
     }
     if (effect->owner != nullptr) {
         std::erase(effect->owner->active, effect->id);
+        std::erase(effect->owner->effects, resource);
     }
     delete effect;
 }
@@ -121,6 +125,7 @@ void manager_get_background_effect(wl_client* client, wl_resource* manager, std:
         });
     }
     wl_resource_set_implementation(resource, &effect_impl, effect, effect_resource_destroy);
+    owner->effects.push_back(resource);
 }
 
 constexpr struct ext_background_effect_manager_v1_interface manager_impl = {
@@ -141,6 +146,14 @@ void manager_bind(wl_client* client, void* data, std::uint32_t version, std::uin
 }
 
 } // namespace
+
+// The effect objects are the client's and outlive us at exit (the Display,
+// declared first, is what destroys a still-connected client).
+BackgroundEffectManager::Impl::~Impl() {
+    for (wl_resource* r : effects) {
+        static_cast<BackgroundEffectObject*>(wl_resource_get_user_data(r))->owner = nullptr;
+    }
+}
 
 BackgroundEffectManager::BackgroundEffectManager(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}

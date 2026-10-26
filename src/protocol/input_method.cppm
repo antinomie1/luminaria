@@ -198,6 +198,8 @@ struct InputMethodManager::Impl {
     /// Copy the focused text input's state to the input method and send `done`.
     void push_state(bool activating);
     void deactivate();
+
+    ~Impl();
 };
 
 using ImMgr = InputMethodManager::Impl;
@@ -208,12 +210,18 @@ public:
         : mgr_(mgr), im_(im), resource_(resource) {}
 
     void send_key(std::uint32_t time, std::uint32_t key, bool pressed) override {
+        if (mgr_ == nullptr) {
+            return;
+        }
         zwp_input_method_keyboard_grab_v2_send_key(
             resource_, wl_display_next_serial(mgr_->display), time, key,
             pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
     }
     void send_modifiers(std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked,
                         std::uint32_t group) override {
+        if (mgr_ == nullptr) {
+            return;
+        }
         zwp_input_method_keyboard_grab_v2_send_modifiers(
             resource_, wl_display_next_serial(mgr_->display), depressed, latched, locked, group);
     }
@@ -284,7 +292,7 @@ namespace {
 /// The text input an input method's requests apply to: the focused, enabled
 /// one, or null when there is none.
 TextInput* target(ImMgr* mgr) {
-    return mgr->text_inputs != nullptr ? mgr->text_inputs->focused() : nullptr;
+    return mgr != nullptr && mgr->text_inputs != nullptr ? mgr->text_inputs->focused() : nullptr;
 }
 
 // --- zwp_input_method_keyboard_grab_v2 ---
@@ -304,7 +312,7 @@ void grab_resource_destroy(wl_resource* resource) {
 /// Hand the client the seat's keymap through a memfd, the way wl_keyboard does.
 /// An input method without a keymap cannot tell which key was pressed.
 void send_keymap(ImMgr* mgr, wl_resource* grab) {
-    if (mgr->seat == nullptr) {
+    if (mgr == nullptr || mgr->seat == nullptr) {
         return;
     }
     const std::string& text = mgr->seat->keymap();
@@ -448,7 +456,7 @@ void im_resource_destroy(wl_resource* resource) {
     if (im->grab_ != nullptr) {
         im->grab_->im_ = nullptr;
     }
-    if (im->mgr_->current == im) {
+    if (im->mgr_ != nullptr && im->mgr_->current == im) {
         im->mgr_->current = nullptr;
     }
     delete im;
@@ -490,6 +498,18 @@ constexpr struct zwp_input_method_manager_v2_interface manager_impl = {
 };
 
 } // namespace
+
+// Only the current input method and its grab point back here (a refused one
+// is inert from birth). Both are the client's and outlive us at exit — the
+// Display, declared first, is what destroys a still-connected client.
+InputMethodManager::Impl::~Impl() {
+    if (current != nullptr) {
+        current->mgr_ = nullptr;
+        if (current->grab_ != nullptr) {
+            current->grab_->mgr_ = nullptr;
+        }
+    }
+}
 
 void InputMethodManager::Impl::push_state(bool activating) {
     InputMethodImpl* im = current;

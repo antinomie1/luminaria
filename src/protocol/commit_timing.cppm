@@ -80,6 +80,8 @@ struct CommitTimingManager::Impl {
 
     /// Apply what is due and re-arm for the earliest deadline still ahead.
     void tick();
+
+    ~Impl();
 };
 
 using CtMgr = CommitTimingManager::Impl;
@@ -139,7 +141,9 @@ void timer_set_timestamp(wl_client*, wl_resource* resource, uint32_t tv_sec_hi,
         (static_cast<std::uint64_t>(tv_sec_hi) << 32) | static_cast<std::uint64_t>(tv_sec_lo);
     timer->deadline = seconds * 1'000'000'000ULL + tv_nsec;
     surface->set_pending_commit_time(timer->deadline);
-    timer->mgr->tick();
+    if (timer->mgr != nullptr) {
+        timer->mgr->tick();
+    }
 }
 
 constexpr struct wp_commit_timer_v1_interface timer_impl = {
@@ -182,6 +186,15 @@ constexpr struct wp_commit_timing_manager_v1_interface manager_impl = {
 };
 
 } // namespace
+
+// The timers are the client's and outlive us at exit (the Display, declared
+// first, is what destroys a still-connected client). They must not unregister
+// from a manager that is gone.
+CommitTimingManager::Impl::~Impl() {
+    for (CommitTimer* timer : timers) {
+        timer->mgr = nullptr;
+    }
+}
 
 void CommitTimingManager::Impl::tick() {
     const std::uint64_t now = monotonic_ns();

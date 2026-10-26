@@ -180,6 +180,8 @@ struct ScreencopyManager::Impl {
         }
         return nullptr;
     }
+
+    ~Impl();
 };
 
 // =============================================================================
@@ -536,6 +538,14 @@ struct ExtCursorSession {
     int x = 0, y = 0;
 };
 
+// A cursor session is the client's and outlives us at exit (the Display,
+// declared first, is what destroys a still-connected client).
+ScreencopyManager::Impl::~Impl() {
+    for (ExtCursorSession* cs : cursor_sessions) {
+        cs->mgr = nullptr;
+    }
+}
+
 // =============================================================================
 // ext-image-copy-capture-v1 implementation
 // =============================================================================
@@ -889,7 +899,9 @@ constexpr struct ext_image_copy_capture_cursor_session_v1_interface ext_cursor_s
 
 void ext_cursor_session_resource_destroy(wl_resource* resource) {
     auto* cs = static_cast<ExtCursorSession*>(wl_resource_get_user_data(resource));
-    std::erase(cs->mgr->cursor_sessions, cs);
+    if (cs->mgr != nullptr) {
+        std::erase(cs->mgr->cursor_sessions, cs);
+    }
     delete cs;
 }
 

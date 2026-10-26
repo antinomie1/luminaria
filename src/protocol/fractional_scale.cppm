@@ -72,6 +72,8 @@ struct ScaleObject;
 struct FractionalScaleManager::Impl {
     WlGlobal global;
     std::vector<ScaleObject*> objects; // not owned; each lives on its resource
+
+    ~Impl();
 };
 
 using FsMgr = FractionalScaleManager::Impl;
@@ -90,6 +92,14 @@ struct ScaleObject : SurfaceTracker {
         }
     }
 };
+
+// The objects are the client's and outlive us at exit (the Display, declared
+// first, is what destroys a still-connected client).
+FractionalScaleManager::Impl::~Impl() {
+    for (ScaleObject* object : objects) {
+        object->mgr = nullptr;
+    }
+}
 
 namespace {
 

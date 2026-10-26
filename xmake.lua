@@ -358,7 +358,7 @@ local gpu_tests = {
 }
 local desktop_tests = {
     test_data_control = true, test_foreign_toplevel = true, test_input_method = true,
-    test_session_lock = true, test_workspace = true,
+    test_session_lock = true, test_teardown_order = true, test_workspace = true,
 }
 
 for _, file in ipairs(os.files("tests/test_*.cpp")) do

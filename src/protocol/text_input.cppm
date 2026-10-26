@@ -248,6 +248,8 @@ struct TextInputManager::Impl {
     /// The focused surface is going away. Same bookkeeping, no `leave` event.
     void drop_focus_silently();
     void leave_all(Surface& surface, bool send_event);
+
+    ~Impl();
 };
 
 using TiMgr = TextInputManager::Impl;
@@ -466,7 +468,9 @@ void text_input_resource_destroy(wl_resource* resource) {
     TextInputImpl* ti = text_input_of(resource);
     TextInputDestroy event{*ti};
     ti->destroy.emit(event);
-    std::erase(ti->mgr_->text_inputs, ti);
+    if (ti->mgr_ != nullptr) {
+        std::erase(ti->mgr_->text_inputs, ti);
+    }
     delete ti;
 }
 
@@ -502,6 +506,17 @@ constexpr struct zwp_text_input_manager_v3_interface manager_impl = {
 };
 
 } // namespace
+
+// The text inputs are the client's and outlive us at exit (the Display,
+// declared first, is what destroys a still-connected client). Their focus is a
+// raw Surface* only we were watching, so it goes too: unfocused, they ignore
+// every request.
+TextInputManager::Impl::~Impl() {
+    for (TextInputImpl* ti : text_inputs) {
+        ti->mgr_ = nullptr;
+        ti->focus_ = nullptr;
+    }
+}
 
 void TextInputManager::Impl::leave_all(Surface& surface, bool send_event) {
     // Copy first: leave() fires a signal whose handler may destroy a text input.

@@ -162,6 +162,10 @@ struct DataDeviceManager::Impl {
     Seat* seat = nullptr;
 
     std::vector<wl_resource*> devices; // every bound wl_data_device
+    // Every client source and offer that points back here, so the destructor
+    // can sever them: they are the client's and outlive us (see ~Impl).
+    std::vector<Source*> sources;
+    std::vector<wl_resource*> offers;
     Signal<SeatKeyboardFocus>::Connection focus_conn;
 
     Source* selection = nullptr;
@@ -178,6 +182,8 @@ struct DataDeviceManager::Impl {
     SurfaceId drag_focus;              // surface under the cursor
     wl_resource* drag_offer = nullptr; // offer handed to drag_focus's client
     Signal<SurfaceInvalidated>::Connection surface_invalidated_conn;
+
+    ~Impl();
 };
 
 using DdMgr = DataDeviceManager::Impl;
@@ -291,8 +297,11 @@ void offer_resource_destroy(wl_resource* resource) {
     if (offer->source != nullptr) {
         std::erase(offer->source->offers, resource);
     }
-    if (offer->mgr != nullptr && offer->mgr->drag_offer == resource) {
-        offer->mgr->drag_offer = nullptr;
+    if (offer->mgr != nullptr) {
+        std::erase(offer->mgr->offers, resource);
+        if (offer->mgr->drag_offer == resource) {
+            offer->mgr->drag_offer = nullptr;
+        }
     }
     delete offer;
 }
@@ -307,6 +316,7 @@ wl_resource* make_offer(DdMgr* mgr, wl_resource* device, Source* source, bool is
     auto* offer = new Offer{source, mgr, is_drag};
     wl_resource_set_implementation(offer_resource, &offer_impl, offer, offer_resource_destroy);
     source->offers.push_back(offer_resource);
+    mgr->offers.push_back(offer_resource);
 
     wl_data_device_send_data_offer(device, offer_resource);
     for (const std::string& mime : source->mimes) {
@@ -389,6 +399,9 @@ void source_resource_destroy(wl_resource* resource) {
     // Offers can outlive the source; make them inert rather than dangling.
     for (wl_resource* offer : source->offers) {
         offer_of(offer)->source = nullptr;
+    }
+    if (mgr != nullptr) {
+        std::erase(mgr->sources, source);
     }
     if (mgr != nullptr && mgr->selection == source) {
         mgr->selection = nullptr;
@@ -511,6 +524,9 @@ void drag_drop(DdMgr* mgr) {
 void device_start_drag(wl_client*, wl_resource* resource, wl_resource* source_resource,
                        wl_resource* /*origin*/, wl_resource* icon, uint32_t /*serial*/) {
     auto* mgr = static_cast<DdMgr*>(wl_resource_get_user_data(resource));
+    if (mgr == nullptr) {
+        return; // the manager is gone; the device is inert
+    }
     if (mgr->drag_source != nullptr) {
         return; // a drag is already running
     }
@@ -540,6 +556,9 @@ void device_start_drag(wl_client*, wl_resource* resource, wl_resource* source_re
 void device_set_selection(wl_client*, wl_resource* resource, wl_resource* source_resource,
                           uint32_t /*serial*/) {
     auto* mgr = static_cast<DdMgr*>(wl_resource_get_user_data(resource));
+    if (mgr == nullptr) {
+        return;
+    }
     apply_selection(mgr, source_resource != nullptr ? source_of(source_resource) : nullptr);
 }
 
@@ -550,8 +569,9 @@ constexpr struct wl_data_device_interface device_impl = {
 };
 
 void device_resource_destroy(wl_resource* resource) {
-    auto* mgr = static_cast<DdMgr*>(wl_resource_get_user_data(resource));
-    std::erase(mgr->devices, resource);
+    if (auto* mgr = static_cast<DdMgr*>(wl_resource_get_user_data(resource))) {
+        std::erase(mgr->devices, resource);
+    }
 }
 
 // ---- wl_data_device_manager ----
@@ -567,6 +587,7 @@ void manager_create_data_source(wl_client* client, wl_resource* resource, uint32
     source->resource = source_resource;
     source->mgr = mgr;
     wl_resource_set_implementation(source_resource, &source_impl, source, source_resource_destroy);
+    mgr->sources.push_back(source);
 }
 
 void manager_get_data_device(wl_client* client, wl_resource* resource, uint32_t id,
@@ -593,6 +614,33 @@ constexpr struct wl_data_device_manager_interface manager_impl = {
 };
 
 } // namespace
+
+// The global goes before its clients do: the compositor declares the Display
+// first, and libwayland destroys a still-connected client's resources only when
+// the Display goes. Everything of the client's that points back here is
+// severed, so destroying it later is a no-op as far as we are concerned.
+DataDeviceManager::Impl::~Impl() {
+    if (drag_source != nullptr) {
+        seat->end_drag(); // the seat's drag hooks capture `this`
+    }
+    for (wl_resource* r : devices) {
+        detach_resource(r);
+    }
+    for (Source* source : sources) {
+        source->mgr = nullptr;
+    }
+    for (wl_resource* r : offers) {
+        offer_of(r)->mgr = nullptr;
+    }
+    // The wrapper around an external selection is ours, unlike the
+    // SelectionSource behind it.
+    if (external_selection != nullptr) {
+        for (wl_resource* offer : external_selection->offers) {
+            offer_of(offer)->source = nullptr;
+        }
+        delete external_selection;
+    }
+}
 
 DataDeviceManager::DataDeviceManager(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -692,12 +740,15 @@ struct PrimarySelectionManager::Impl {
     WlGlobal global;
     Seat* seat = nullptr;
     std::vector<wl_resource*> devices;
+    std::vector<PrimarySource*> sources; // client sources pointing back here
     Signal<SeatKeyboardFocus>::Connection focus_conn;
 
     PrimarySource* selection = nullptr;
     PrimarySource* external_selection = nullptr;
     Signal<SelectionChange> selection_changed;
     const std::vector<std::string> no_mimes;
+
+    ~Impl();
 };
 
 using PrimaryMgr = PrimarySelectionManager::Impl;
@@ -807,6 +858,9 @@ void primary_source_resource_destroy(wl_resource* resource) {
     for (wl_resource* offer : source->offers) {
         primary_offer_of(offer)->source = nullptr;
     }
+    if (source->mgr != nullptr) {
+        std::erase(source->mgr->sources, source);
+    }
     if (source->mgr != nullptr && source->mgr->selection == source) {
         source->mgr->selection = nullptr;
         primary_broadcast(source->mgr);
@@ -840,6 +894,9 @@ void primary_set_selection(PrimaryMgr* mgr, PrimarySource* source) {
 void primary_device_set_selection(wl_client*, wl_resource* resource, wl_resource* source_resource,
                                   uint32_t /*serial*/) {
     auto* mgr = static_cast<PrimaryMgr*>(wl_resource_get_user_data(resource));
+    if (mgr == nullptr) {
+        return; // the manager is gone; the device is inert
+    }
     primary_set_selection(mgr,
                           source_resource != nullptr ? primary_source_of(source_resource) : nullptr);
 }
@@ -848,8 +905,9 @@ constexpr struct zwp_primary_selection_device_v1_interface primary_device_impl =
     .destroy = resource_destroy_request,
 };
 void primary_device_resource_destroy(wl_resource* resource) {
-    auto* mgr = static_cast<PrimaryMgr*>(wl_resource_get_user_data(resource));
-    std::erase(mgr->devices, resource);
+    if (auto* mgr = static_cast<PrimaryMgr*>(wl_resource_get_user_data(resource))) {
+        std::erase(mgr->devices, resource);
+    }
 }
 
 void primary_manager_create_source(wl_client* client, wl_resource* resource, uint32_t id) {
@@ -866,6 +924,7 @@ void primary_manager_create_source(wl_client* client, wl_resource* resource, uin
     source->mgr = mgr;
     wl_resource_set_implementation(source_resource, &primary_source_impl, source,
                                    primary_source_resource_destroy);
+    mgr->sources.push_back(source);
 }
 
 void primary_manager_get_device(wl_client* client, wl_resource* resource, uint32_t id,
@@ -893,6 +952,22 @@ constexpr struct zwp_primary_selection_device_manager_v1_interface primary_manag
 };
 
 } // namespace
+
+// Same as DataDeviceManager::Impl::~Impl: sever what the clients still hold.
+PrimarySelectionManager::Impl::~Impl() {
+    for (wl_resource* r : devices) {
+        detach_resource(r);
+    }
+    for (PrimarySource* source : sources) {
+        source->mgr = nullptr;
+    }
+    if (external_selection != nullptr) {
+        for (wl_resource* offer : external_selection->offers) {
+            primary_offer_of(offer)->source = nullptr;
+        }
+        delete external_selection;
+    }
+}
 
 PrimarySelectionManager::PrimarySelectionManager(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}

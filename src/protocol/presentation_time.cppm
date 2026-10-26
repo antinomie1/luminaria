@@ -114,6 +114,21 @@ struct Presentation::Impl {
             std::erase(p.feedbacks, feedback);
         }
     }
+
+    // A feedback still waiting is the client's and would otherwise outlive us
+    // at exit (the Display, declared first, is what destroys a still-connected
+    // client). Nothing will present it now, which is exactly what `discarded`
+    // says — and it is a destructor, so the object goes with it.
+    ~Impl() {
+        std::map<Surface*, Pending> orphans = std::move(pending);
+        pending.clear();
+        for (auto& [surface, p] : orphans) {
+            for (wl_resource* r : p.feedbacks) {
+                wp_presentation_feedback_send_discarded(r);
+                wl_resource_destroy(r);
+            }
+        }
+    }
 };
 
 namespace {
