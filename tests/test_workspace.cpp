@@ -1,5 +1,11 @@
 // ext-workspace-v1: a pager lists the compositor's workspaces, sees which one
 // is active, and asks to switch. The switch is the compositor's to make.
+//
+// Also: an output that left its group (group_remove_output) and was then
+// destroyed is not read by the next client to bind — the group used to keep
+// the pointer, and a monitor unplugged before a pager started was a
+// use-after-free. Run it under ASan to see the read; here it shows up as an
+// output_enter that should not exist.
 #include <cstdint>
 #include <cassert>
 #include <cstddef>
@@ -31,6 +37,7 @@ struct ClientState {
     std::vector<ext_workspace_handle_v1*> handles;
     int groups = 0;
     int dones = 0;
+    int output_enters = 0;
 };
 
 ClientState* g_client = nullptr;
@@ -53,7 +60,9 @@ const ext_workspace_handle_v1_listener kWorkspace{ws_id,           ws_name,    w
                                                   ws_state,        ws_capabilities, ws_removed};
 
 void grp_capabilities(void*, ext_workspace_group_handle_v1*, uint32_t) {}
-void grp_output_enter(void*, ext_workspace_group_handle_v1*, wl_output*) {}
+void grp_output_enter(void* data, ext_workspace_group_handle_v1*, wl_output*) {
+    ++static_cast<ClientState*>(data)->output_enters;
+}
 void grp_output_leave(void*, ext_workspace_group_handle_v1*, wl_output*) {}
 void grp_workspace_enter(void*, ext_workspace_group_handle_v1*, ext_workspace_handle_v1*) {}
 void grp_workspace_leave(void*, ext_workspace_group_handle_v1*, ext_workspace_handle_v1*) {}
@@ -107,6 +116,7 @@ void run_client(int fd) {
     wl_display_roundtrip(display); // …plus the events it triggered
 
     assert(st.groups == 1);
+    assert(st.output_enters == 0); // the removed output is gone from the group
     assert(st.workspaces.size() == 2);
     assert(st.workspaces[0].id == "ws-1");
     assert(st.workspaces[1].name == "two");
@@ -152,6 +162,15 @@ int main() {
     (void)workspaces->add_workspace(group, "ws-2", "two", {1});
     workspaces->activate(first);
     workspaces->done();
+
+    // A monitor that came and went before any pager bound.
+    {
+        auto gone = luminaria::OutputGlobal::create(*display, 640, 480, "gone-1");
+        assert(gone.has_value());
+        workspaces->group_add_output(group, *gone);
+        workspaces->group_remove_output(group, *gone);
+        workspaces->done();
+    } // destroyed here; the group must not still point at it
 
     auto conn = workspaces->request().connect([&](luminaria::WorkspaceRequest& r) {
         ++g_requests;

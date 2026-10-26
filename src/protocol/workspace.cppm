@@ -59,6 +59,10 @@ public:
     [[nodiscard]] std::uint32_t add_group();
     /// Tell clients this group drives `output` (ext_workspace_group.output_enter).
     void group_add_output(std::uint32_t group, OutputGlobal& output);
+    /// The reverse (ext_workspace_group.output_leave), and required before
+    /// `output` is destroyed: the group keeps a pointer to it, which the next
+    /// client to bind would otherwise read.
+    void group_remove_output(std::uint32_t group, OutputGlobal& output);
 
     /// A new workspace in `group`. `id` is the stable string clients match on
     /// across compositor restarts; `coordinates` places it on a grid (e.g. {2}
@@ -395,6 +399,23 @@ void WorkspaceManager::group_add_output(std::uint32_t group, OutputGlobal& outpu
     g->outputs.push_back(&output);
     for (auto& b : impl_->bindings) {
         impl_->send_group_outputs(*b, *g);
+    }
+}
+
+void WorkspaceManager::group_remove_output(std::uint32_t group, OutputGlobal& output) {
+    GroupInfo* g = impl_->group(group);
+    if (g == nullptr || std::erase(g->outputs, &output) == 0) {
+        return;
+    }
+    for (auto& b : impl_->bindings) {
+        auto it = b->group_handles.find(g->id);
+        if (it == b->group_handles.end()) {
+            continue;
+        }
+        if (wl_resource* out = output.resource_for(wl_resource_get_client(b->resource));
+            out != nullptr) {
+            ext_workspace_group_handle_v1_send_output_leave(it->second, out);
+        }
     }
 }
 
