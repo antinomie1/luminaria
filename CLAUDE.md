@@ -119,7 +119,8 @@ src/detail/wayland_fwd.h the one remaining header
   global module precisely so that works.
 
 Running the example compositor — one, `examples/minimal.cpp`, the C++ twin of
-`bindings/rust/examples/minimal.rs` (same window policy, same bindings; keep the two in step):
+`bindings/rust/examples/minimal.rs` (same window policy, same bindings; keep the two in step —
+the Rust one has no DRM path, since the binding does not report a `DrmBackend`'s outputs):
 
 ```sh
 xmake run minimal                                # nested; prints its own socket name
@@ -328,7 +329,7 @@ region decides, not the buffer rectangle.
 
 **The renderer must outlive the Display.** Each `Frame` caches `GpuTexture`s owned by the
 `VulkanRenderer`, so the renderer has to be declared *before* the `Display`
-(locals are destroyed in reverse order). `examples/minimal.cpp` and the Rust shim do this
+(locals are destroyed in reverse order). `examples/minimal.cpp` and its Rust twin do this
 with a comment; getting it wrong aborts inside `vk::raii` at shutdown.
 
 **Frame callbacks belong to whoever presents.** `wl_surface.frame` is NOT answered on commit

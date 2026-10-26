@@ -125,7 +125,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | shell | **纯色矩形图元 `Frame::place_rect(x, y, w, h, color)`** —— 混成器-owned 的立即模式原语（边框、背景面板、遮罩、光标底）：不参与命中测试、不报自己的 damage，移动 / 换色由摆位 diff 恢复，代价恰好两个矩形；与表面同 z 序，GPU 侧走无纹理的 solid pipeline，CPU 侧就是 `RectFill` 图元 | frame |
 | shell | **`SceneRenderer` 替混成器应答显示器** —— `reset()` 把 `SceneOutput` 绑到输出上，此后该输出的 `present` 自己释放本帧画过的全部表面的帧回调并发 presentation 反馈（`set_presentation()`），`unchanged` 的那帧当场补发，CPU 路径像 GPU 路径的 `Frame` 一样盯着画过的表面的 commit，并且同样会空闲 —— 图元列表、图像 serial、背景色与上一次提交的 CPU 帧相同且其间没有被画表面 commit 时，不合成、不提交、不再要帧，当场补发帧回调并答 `unchanged`；输出销毁或 `SceneOutput` 销毁时自动解绑。`present()` 回答 `composited` / `scanout` / `unchanged` / `cpu` | scene_present |
 | shell | **`Cursor`：指针与它的图像，一条龙** —— 加载主题、跟随 cursor-shape 请求与客户端光标表面（动画光标每次 commit 重传）、指针焦点换客户端时回到默认箭头；作为 `SceneRenderer` 的光标源，每次移动在有 KMS 光标平面的输出上只挪平面、其余输出要一帧；按输出裁掉不在该屏上的精灵；`capture()` 供 ext-image-copy-capture 光标会话。指针往哪走仍由混成器决定（`move_to` / `move_by` 收边界） | scene_present |
-| example | `minimal`（嵌套 / DRM / headless 同一份，与 Rust 的 `minimal` 一对：最大化窗口栈、点击置顶、Logo+Return/Tab/q/Escape） | scene_present |
+| example | `minimal`（嵌套 / DRM / headless 同一份，与 Rust 的 `minimal` 一对（Rust 那份无 DRM）：最大化窗口栈、点击置顶、Logo+Return/Tab/q/Escape） | scene_present |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |
 
 ---

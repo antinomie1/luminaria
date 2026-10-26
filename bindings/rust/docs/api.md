@@ -1,8 +1,8 @@
-# Luminaria 底层模块化 API 文档
+# Luminaria Rust API 文档
 
 Luminaria 不仅仅是一个现成的混成器，更是一个灵活的现代化 C++23 Wayland 混成器**库**。
 
-通过新增的底层模块化 Rust API，使用者无需依赖固定的 [`Server`] 策略封装，可以像在 C++ 中一样，按需挑选与组合各个模块（`core`、`util`、`backend`、`protocol`、`gpu`、`desktop`、`shell`），构建无头测试环境、嵌套调试工具、专用嵌入式显示服务或自定义渲染管线的混成器。
+Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与组合各个模块（`core`、`util`、`backend`、`protocol`、`gpu`、`desktop`、`shell`），构建无头测试环境、嵌套调试工具、专用嵌入式显示服务或自定义渲染管线的混成器。
 
 ---
 
@@ -82,7 +82,7 @@ display.flush_clients();
 - `rect.intersects(&other) -> bool`
 - `rect.intersection(&other) -> Option<Rect>`：两矩形相交重叠区域。
 - `rect.united(&other) -> Rect`：最小包围外框。
-- `rect.resized(edges, dx, dy, min)`：按边缘掩码进行交互式缩放计算。
+- `rect.resized(edges, dx, dy, min)`：按边缘掩码（`util::edge::{TOP, BOTTOM, LEFT, RIGHT}`，即 xdg_toplevel 的 resize edge 位）进行交互式缩放计算。
 
 ### `Color`
 不预乘的 RGBA 浮点颜色（0.0 ~ 1.0）：
@@ -347,9 +347,9 @@ if hit.hit {
 
 ---
 
-## 8. 实战：从零组合构建纯底层混成器
+## 8. 实战：从零组合一个混成器
 
-以下代码完全不使用 `Server`，从零组装一个具备完整 Wayland 核心功能与 CPU 软件合成能力的独立混成器（配套可直接运行的示例位于 `examples/minimal_low_level.rs`）：
+以下代码从零组装一个具备 Wayland 核心协议与 CPU 软件合成能力的混成器，并合成一帧。完整可用的混成器（窗口栈、点击置顶、快捷键）见 `examples/minimal.rs`：
 
 ```rust
 use std::time::Duration;
@@ -363,7 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 初始化核心显示与事件循环
     let display = Display::new()?;
     let socket = display.add_socket_auto()?;
-    println!("Server running on WAYLAND_DISPLAY={socket}");
+    println!("WAYLAND_DISPLAY={socket}");
     display.init_shm()?;
 
     // 2. 创建无头输出后端并启动

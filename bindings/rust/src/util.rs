@@ -5,7 +5,13 @@ use std::pin::Pin;
 use crate::ffi;
 
 /// An RGBA colour, each channel in `0.0..=1.0`, not premultiplied.
-pub use ffi::Color;
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Color {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
 
 impl Color {
     pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
@@ -44,6 +50,14 @@ impl Color {
 
 /// A rectangle in global logical coordinates.
 pub use ffi::Rect;
+
+/// The bits of an xdg_toplevel resize edge, as [`Rect::resized`] takes them.
+pub mod edge {
+    pub const TOP: u32 = 1;
+    pub const BOTTOM: u32 = 2;
+    pub const LEFT: u32 = 4;
+    pub const RIGHT: u32 = 8;
+}
 
 impl Rect {
     pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
@@ -107,18 +121,18 @@ impl Rect {
     pub fn resized(&self, edges: u32, dx: i32, dy: i32, min: (i32, i32)) -> Rect {
         let (min_w, min_h) = (min.0.max(1), min.1.max(1));
         let mut r = *self;
-        if edges & crate::edge::LEFT != 0 {
+        if edges & edge::LEFT != 0 {
             let w = (self.width - dx).max(min_w);
             r.x = self.x + self.width - w;
             r.width = w;
-        } else if edges & crate::edge::RIGHT != 0 {
+        } else if edges & edge::RIGHT != 0 {
             r.width = (self.width + dx).max(min_w);
         }
-        if edges & crate::edge::TOP != 0 {
+        if edges & edge::TOP != 0 {
             let h = (self.height - dy).max(min_h);
             r.y = self.y + self.height - h;
             r.height = h;
-        } else if edges & crate::edge::BOTTOM != 0 {
+        } else if edges & edge::BOTTOM != 0 {
             r.height = (self.height + dy).max(min_h);
         }
         r

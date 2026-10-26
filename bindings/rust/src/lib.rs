@@ -1,13 +1,13 @@
 //! Rust bindings for luminaria, a Wayland compositor library.
 //!
-//! Luminaria provides three C++23 modules:
+//! Luminaria provides three C++23 modules, and this crate mirrors them type for type:
 //! - `luminaria`: Core protocols, utilities, event loop, display, and nested/headless backends.
 //! - `luminaria.gpu`: Vulkan renderer, DRM/KMS, libinput, session, screencopy, direct scanout, and GPU frame ledgers.
 //! - `luminaria.desktop`: Privileged desktop-shell protocols (foreign-toplevel, workspaces, session-lock, output-management, data-control, input-method).
 //!
-//! You can use the high-level [`Server`] facade for a ready-made compositor policy,
-//! or assemble low-level library components directly from the submodules:
-//! - [`util`]: Box, Rect, Color, Transform, Region, KeymapState, Pixel.
+//! A compositor is assembled from the submodules; the policy (where windows go,
+//! who has the keyboard, what a key does) stays in the caller:
+//! - [`util`]: Rect, Color, Transform, Region, KeymapState, Pixel, resize edges.
 //! - [`core`]: Display, EventLoop, Error, KeyRouter.
 //! - [`backend`]: Output, HeadlessBackend, WaylandBackend, DrmBackend, LibinputBackend, Session.
 //! - [`protocol`]: Compositor, Subcompositor, XdgShell, Seat, LayerShell, and core protocol managers.
@@ -15,145 +15,18 @@
 //! - [`desktop`]: ForeignToplevelManager, WorkspaceManager, SessionLockManager, OutputManager, DataControlManager, InputMethodManager.
 //! - [`shell`]: OutputLayout, SceneItem, SceneHit, scene_hit_test, CpuCompositor, PopupTree.
 //!
-//! # High-level Example
-//!
-//! ```no_run
-//! use luminaria::{Config, Event, Item, Server};
-//!
-//! let mut server = Server::new(Config::default()).unwrap();
-//! println!("WAYLAND_DISPLAY={}", server.socket_name());
-//! let mut windows = Vec::new();
-//! server.run(|server, event| {
-//!     match event {
-//!         Event::WindowMap(w) => {
-//!             windows.push(w);
-//!             server.focus(Some(w));
-//!         }
-//!         Event::WindowDestroy(w) => windows.retain(|&x| x != w),
-//!         Event::CloseRequested => return std::ops::ControlFlow::Break(()),
-//!         _ => return std::ops::ControlFlow::Continue(()),
-//!     }
-//!     let scene: Vec<Item> = windows
-//!         .iter()
-//!         .enumerate()
-//!         .map(|(i, &id)| Item::Window { id, x: 40 + 30 * i as i32, y: 40 + 30 * i as i32 })
-//!         .collect();
-//!     server.set_scene(&scene);
-//!     std::ops::ControlFlow::Continue(())
-//! })
-//! .unwrap();
-//! ```
+//! `examples/minimal.rs` is a complete compositor built this way.
 
 pub mod backend;
 pub mod core;
 pub mod desktop;
 pub mod gpu;
 pub mod protocol;
-pub mod server;
 pub mod shell;
 pub mod util;
 
-// Re-exports for 100% backward compatibility with existing users and examples
-pub use core::Error;
-pub use server::{
-    edge, keysym, Backend, BindingId, Config, Event, Item, Mods, OutputId, Server, WindowId,
-    WorkspaceId,
-};
-pub use util::{Color, Mode, Rect, Transform};
-
 #[cxx::bridge(namespace = "lum")]
 pub(crate) mod ffi {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum BackendKind {
-        Auto,
-        Nested,
-        Headless,
-        Drm,
-    }
-
-    #[derive(Debug, Clone)]
-    struct Config {
-        backend: BackendKind,
-        width: i32,
-        height: i32,
-        server_side_decorations: bool,
-        drm_device: String,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum EventKind {
-        WindowNew,
-        WindowMap,
-        WindowUnmap,
-        WindowDestroy,
-        WindowTitle,
-        RequestMaximize,
-        RequestFullscreen,
-        RequestMinimize,
-        RequestMove,
-        RequestResize,
-        PointerMotion,
-        PointerButton,
-        Binding,
-        OutputNew,
-        OutputDestroy,
-        CloseRequested,
-        SessionActive,
-        RequestActivate,
-        OutputChange,
-        SessionLock,
-        WorkspaceActivate,
-        TouchDown,
-        TouchMotion,
-        TouchUp,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct Event {
-        kind: EventKind,
-        window: u64,
-        output: u64,
-        on: bool,
-        code: u32,
-        x: f64,
-        y: f64,
-        width: i32,
-        height: i32,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum ItemKind {
-        Window,
-        Rect,
-        Border,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct Color {
-        r: f32,
-        g: f32,
-        b: f32,
-        a: f32,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct Item {
-        kind: ItemKind,
-        window: u64,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        thickness: i32,
-        color: Color,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct Size {
-        width: i32,
-        height: i32,
-    }
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     struct Rect {
         x: i32,
@@ -226,60 +99,7 @@ pub(crate) mod ffi {
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
 
-        type Server;
-
-        fn server_new(config: &Config, error: &mut String) -> UniquePtr<Server>;
-        fn keysym_from_name(name: &str) -> u32;
-
-        fn socket_name(self: &Server) -> String;
-        fn fd(self: &Server) -> i32;
-        fn dispatch(self: Pin<&mut Server>, timeout_ms: i32) -> bool;
-        fn next_event(self: Pin<&mut Server>, out: &mut Event) -> bool;
-
-        fn set_scene(self: Pin<&mut Server>, items: &[Item]);
-        fn set_background(self: Pin<&mut Server>, r: f32, g: f32, b: f32, a: f32);
-
-        fn focus(self: Pin<&mut Server>, window: u64);
-        fn configure(self: Pin<&mut Server>, window: u64, width: i32, height: i32);
-        fn set_maximized(self: Pin<&mut Server>, window: u64, on: bool);
-        fn set_fullscreen(self: Pin<&mut Server>, window: u64, on: bool);
-        fn set_minimized(self: Pin<&mut Server>, window: u64, on: bool);
-        fn set_tiled(self: Pin<&mut Server>, window: u64, on: bool);
-        fn set_resizing(self: Pin<&mut Server>, window: u64, on: bool);
-        fn close(self: Pin<&mut Server>, window: u64);
-        fn window_title(self: &Server, window: u64) -> String;
-        fn window_app_id(self: &Server, window: u64) -> String;
-        fn window_icon_name(self: &Server, window: u64) -> String;
-        fn window_size(self: &Server, window: u64) -> Size;
-        fn window_min_size(self: &Server, window: u64) -> Size;
-        fn window_parent(self: &Server, window: u64) -> u64;
-
-        fn grab_pointer(self: Pin<&mut Server>, on: bool);
-        fn bind_key(self: Pin<&mut Server>, mods: u32, keysym: u32) -> u32;
-        fn set_keyboard_layout(self: Pin<&mut Server>, layout: &str) -> bool;
-
-        fn output_box(self: &Server, output: u64) -> Rect;
-        fn output_usable(self: &Server, output: u64) -> Rect;
-        fn output_modes(self: &Server, output: u64) -> Vec<Mode>;
-        fn set_output_mode(
-            self: Pin<&mut Server>,
-            output: u64,
-            width: i32,
-            height: i32,
-            refresh_mhz: i32,
-            error: &mut String,
-        ) -> bool;
-        fn set_output_scale(self: Pin<&mut Server>, output: u64, scale: i32);
-        fn set_output_transform(self: Pin<&mut Server>, output: u64, transform: u32);
-        fn set_output_position(self: Pin<&mut Server>, output: u64, x: i32, y: i32);
-
-        fn add_workspace(self: Pin<&mut Server>, name: &str) -> u32;
-        fn remove_workspace(self: Pin<&mut Server>, workspace: u32);
-        fn activate_workspace(self: Pin<&mut Server>, workspace: u32);
-
-        fn is_locked(self: &Server) -> bool;
-
-        // Core & Util Shims
+        // Core & Util
         type DisplayShim;
         fn display_new(error: &mut String) -> UniquePtr<DisplayShim>;
         fn fd(self: &DisplayShim) -> i32;

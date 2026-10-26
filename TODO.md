@@ -73,8 +73,9 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
   `test_input_method` 用一个同时扮演应用与输入法的客户端跑完整个来回。XML 上游不发，
   vendored 到 `protocol/`。
 
-三个核心协议已注册进 Rust 绑定（C++ 的 `minimal` 只开最小可用的那一组 global）；两个 desktop 协议按 ADR 0003 只在 `luminaria.desktop`
-里，需要 compositor 自己创建。剩下的收尾在下面「已知的天花板」里。
+五个协议在 Rust 绑定里都有对应类型（`protocol::{FifoManager, CommitTimingManager, ContentTypeManager}`、
+`desktop::{SessionLockManager, InputMethodManager}`），和 C++ 一样由 compositor 自己创建；两个 desktop 协议按
+ADR 0003 只在 `luminaria.desktop` 里，C++ 的 `minimal` 只开最小可用的那一组 global。剩下的收尾在下面「已知的天花板」里。
 
 ### 4. 视觉特效地基 —— 给「带模糊与轻动画的混成器」用
 
@@ -183,8 +184,9 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 - **`LibinputBackend` 只发相对指针运动** —— 绝对定位设备（触摸屏、数位板，以及虚拟机给客户机
   的那块 tablet）的 `LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE` 不处理，于是虚拟机里指针根本
   不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
-- **C++ 的 `minimal` 不接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
-  触摸面板），Rust 绑定也接好了（映射到第一块输出、`scene_hit_test`、按 slot 路由）；C++ 示例
-  为了保持最小没有照做，所以它的 `set_capabilities()` 传 touch=false。
+- **没有混成器接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
+  触摸面板），但映射到哪块输出、`scene_hit_test`、按 slot 路由这一层没有任何示例在做：C++ 的
+  `minimal` 为了保持最小没接，`set_capabilities()` 传 touch=false；Rust 绑定连 `LibinputBackend`
+  的输入事件都还没导出。
 - **headless 在每一帧之前都报一次 `present`，不管提交过没有** —— 于是 headless 上看不出
   `unchanged` 帧漏发帧回调；`test_scene_present` 因此自带一个只在提交后才 present 的测试输出。

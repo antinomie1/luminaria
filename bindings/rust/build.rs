@@ -14,7 +14,7 @@
 //! `LUMINARIA_SANITIZE=address` (or `undefined`) instruments both halves and
 //! links the runtime. The link must then be done by the same compiler family:
 //!
-//!   LUMINARIA_SANITIZE=address RUSTFLAGS="-C linker=clang" cargo run --example floating
+//!   LUMINARIA_SANITIZE=address RUSTFLAGS="-C linker=clang" cargo run --example minimal
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -113,7 +113,6 @@ fn main() {
     for path in [
         "luminaria_rs.h",
         "luminaria_rs.cpp",
-        "luminaria_rs_shims.inc",
         "xmake.lua",
         "../../src",
         "../../xmake.lua",

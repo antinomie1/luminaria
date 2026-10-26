@@ -14,82 +14,15 @@
 namespace lum {
 
 // Shared structs from lib.rs.h
-struct Config;
-struct Event;
-struct Item;
 struct Mode;
 struct Rect;
-struct Size;
 struct SceneItemRaw;
 struct SceneHitRaw;
 struct ToplevelEventRaw;
 struct BackendInputEventRaw;
 
 // ============================================================================
-// 1. Existing high-level Server facade
-// ============================================================================
-
-class Server {
-public:
-    ~Server();
-    Server(const Server&) = delete;
-    Server& operator=(const Server&) = delete;
-
-    rust::String socket_name() const;
-    int fd() const;
-
-    bool dispatch(int timeout_ms);
-    bool next_event(Event& out);
-
-    void set_scene(rust::Slice<const Item> items);
-    void set_background(float r, float g, float b, float a);
-
-    void focus(std::uint64_t window);
-    void configure(std::uint64_t window, std::int32_t width, std::int32_t height);
-    void set_maximized(std::uint64_t window, bool on);
-    void set_fullscreen(std::uint64_t window, bool on);
-    void set_minimized(std::uint64_t window, bool on);
-    void set_tiled(std::uint64_t window, bool on);
-    void set_resizing(std::uint64_t window, bool on);
-    void close(std::uint64_t window);
-    rust::String window_title(std::uint64_t window) const;
-    rust::String window_app_id(std::uint64_t window) const;
-    rust::String window_icon_name(std::uint64_t window) const;
-    Size window_size(std::uint64_t window) const;
-    Size window_min_size(std::uint64_t window) const;
-    std::uint64_t window_parent(std::uint64_t window) const;
-
-    void grab_pointer(bool on);
-    std::uint32_t bind_key(std::uint32_t mods, std::uint32_t keysym);
-    bool set_keyboard_layout(rust::Str layout);
-
-    Rect output_box(std::uint64_t output) const;
-    Rect output_usable(std::uint64_t output) const;
-    rust::Vec<Mode> output_modes(std::uint64_t output) const;
-    bool set_output_mode(std::uint64_t output, std::int32_t width, std::int32_t height,
-                         std::int32_t refresh_mhz, rust::String& error);
-    void set_output_scale(std::uint64_t output, std::int32_t scale);
-    void set_output_transform(std::uint64_t output, std::uint32_t transform);
-    void set_output_position(std::uint64_t output, std::int32_t x, std::int32_t y);
-
-    std::uint32_t add_workspace(rust::Str name);
-    void remove_workspace(std::uint32_t workspace);
-    void activate_workspace(std::uint32_t workspace);
-
-    bool is_locked() const;
-
-    struct Impl;
-    explicit Server(std::unique_ptr<Impl> impl) noexcept;
-
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<Server> server_new(const Config& config, rust::String& error);
-std::uint32_t keysym_from_name(rust::Str name);
-
-// ============================================================================
-// 2. Core & Util Shims
+// Core & Util
 // ============================================================================
 
 class DisplayShim {
@@ -171,7 +104,7 @@ bool layout_fits_raw(std::int32_t width, std::int32_t height, std::uint32_t stri
                      std::uint32_t offset, std::size_t total_size);
 
 // ============================================================================
-// 3. Backend & Output Shims
+// Backend & Output
 // ============================================================================
 
 class OutputShim {
@@ -307,7 +240,7 @@ std::unique_ptr<LibinputBackendShim> libinput_backend_new(const DisplayShim& dis
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_standalone(const DisplayShim& display, rust::String& error);
 
 // ============================================================================
-// 4. Protocol Shims
+// Protocols
 // ============================================================================
 
 class CompositorShim {
@@ -570,7 +503,7 @@ private:
 std::unique_ptr<TextInputManagerShim> text_input_manager_new(const DisplayShim& display, const SeatShim& seat, rust::String& error);
 
 // ============================================================================
-// 5. GPU & Render Shims
+// GPU & Render
 // ============================================================================
 
 class VulkanRendererShim {
@@ -755,7 +688,7 @@ std::unique_ptr<DirectScanoutShim> direct_scanout_new(OutputShim& output);
 SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, double y);
 
 // ============================================================================
-// 6. Desktop Protocols
+// Desktop Protocols
 // ============================================================================
 
 void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, XdgShellShim& shell);

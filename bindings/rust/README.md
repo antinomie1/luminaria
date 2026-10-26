@@ -2,59 +2,27 @@
 
 用 [cxx](https://cxx.rs) 从 Rust 调用 luminaria。
 
-既提供高层开箱即用的 [`Server`] API（处理全局对象、渲染、帧节拍、popup、layer-shell、光标等，仅留窗口管理策略给 Rust），也完整公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop` 三个 C++23 模块的基础底层类型和协议能力，供使用者按需自由组合定制混成器架构。
+Crate 逐类型公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop` 三个 C++23 模块的类型与协议能力，由使用者自行组合成混成器；窗口放哪、谁拿键盘、按键做什么，这些策略始终留在 Rust 一侧。
 
-- 详细高层 API 说明：参见 [高层 API 文档 (`Server`)](docs/high_level_api.md)
-- 详细底层模块化 API 说明：参见 [底层模块化 API 文档](docs/low_level_api.md)
+- 详细 API 说明：参见 [API 文档](docs/api.md)
 
 ## 模块结构
 
 Crate 按库的职责分层组织为以下模块：
 
 - **`core`**：`Display`（拥有 `wl_display` 和事件循环）、`EventLoop`、`KeyRouter`、`Error`。
-- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`、`DmabufPlane`、`layout_fits`。
+- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`、`edge`（xdg_toplevel 缩放边缘位）、`DmabufPlane`、`layout_fits`。
 - **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）、`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）。
 - **`protocol`**：Wayland 核心协议全局对象：`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
 - **`gpu`**（对应 `luminaria.gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退）、`SceneOutput`、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
 - **`desktop`**（对应 `luminaria.desktop`）：桌面特权协议管理器：`ForeignToplevelManager`（任务栏窗口列表）、`WorkspaceManager`（ext-workspace 工作区）、`SessionLockManager`（ext-session-lock 锁屏）、`OutputManager`（wlr-output-management 显示器配置）、`DataControlManager`（剪贴板访问）、`InputMethodManager`（输入法协议）、`DesktopGlobals`（标准桌面全局对象套件）。
 - **`shell`**：即时模式场景与排版：`OutputLayout`（全局逻辑多屏布局）、`SceneItem`（场景绘制项）、`SceneHit` 与 `scene_hit_test`（命中测试）、`CpuCompositor`（纯 CPU 软件合成器）、`PopupTree`（popup 层次树与 grab 关闭）、`Pointer`。
-- **根导出**：现有高层 API（[`Server`]、[`Config`]、[`Event`]、[`Item`]、[`WindowId`]、[`OutputId`]、[`WorkspaceId`]、[`BindingId`]、[`Mods`]、[`Backend`] 等）直接在根路径导出，100% 保持向后兼容。
 
 ---
 
 ## 快速上手
 
-### 1. 使用高层 `Server` API（开箱即用）
-
-```rust
-use luminaria::{Config, Event, Item, Server};
-
-let mut server = Server::new(Config::default())?;
-println!("WAYLAND_DISPLAY={}", server.socket_name());
-let mut windows = Vec::new();
-server.run(|server, event| {
-    if let Event::WindowMap(w) = event {
-        windows.push(w);
-        server.focus(Some(w));
-        let scene: Vec<Item> = windows.iter().map(|&id| Item::Window { id, x: 40, y: 40 }).collect();
-        server.set_scene(&scene);
-    }
-    std::ops::ControlFlow::Continue(())
-})?;
-```
-
-配套示例：
-- `examples/minimal.rs`：最小可用平铺窗口管理器（与根目录 `examples/minimal.cpp` 对齐）。
-- `examples/floating.rs`：层叠漂浮窗口管理器（拖拽移动、边缘缩放、工作区切换）。
-
-```sh
-cargo run --example minimal
-cargo run --example floating
-```
-
-### 2. 使用底层 API 直接组合定制混成器
-
-不依赖 `Server` 封装，自由组合 Display、后端、协议与渲染流程：
+组合 Display、后端、协议与渲染流程：
 
 ```rust
 use std::time::Duration;
@@ -97,7 +65,14 @@ display.dispatch(Some(Duration::ZERO))?;
 display.flush_clients();
 ```
 
-更多底层组装细节可参考 `examples/minimal_low_level.rs` 与 `tests/test_custom_compositor.rs`。
+完整可用的混成器见 `examples/minimal.rs`：它与根目录的 `examples/minimal.cpp` 是一对，窗口策略与快捷键相同（每个窗口最大化、新的在最上面、点击置顶；Logo+Return 开终端、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出），只是没有 DRM 路径。
+
+```sh
+cargo run --example minimal                                        # 嵌套在当前桌面
+LUMINARIA_BACKEND=headless LUMINARIA_EXIT_MS=500 cargo run --example minimal  # 冒烟测试
+```
+
+更多组装细节可参考 `tests/test_custom_compositor.rs`。
 
 ---
 
