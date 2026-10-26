@@ -186,7 +186,7 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
   不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
 - **没有混成器接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
   触摸面板），但映射到哪块输出、`scene_hit_test`、按 slot 路由这一层没有任何示例在做：C++ 的
-  `minimal` 为了保持最小没接，`set_capabilities()` 传 touch=false；Rust 绑定连 `LibinputBackend`
-  的输入事件都还没导出。
+  `minimal` 为了保持最小没接，`set_capabilities()` 传 touch=false；Rust 绑定的
+  `LibinputBackend::next_input_event()` 已经带出 `Touch*` 事件，Rust 的 `minimal` 同样没接。
 - **headless 在每一帧之前都报一次 `present`，不管提交过没有** —— 于是 headless 上看不出
   `unchanged` 帧漏发帧回调；`test_scene_present` 因此自带一个只在提交后才 present 的测试输出。

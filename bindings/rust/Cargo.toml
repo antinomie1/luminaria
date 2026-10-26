@@ -7,6 +7,11 @@ license-file = "../../LICENSE"
 links = "luminaria"
 build = "build.rs"
 
+[features]
+# Raw VkInstance/VkPhysicalDevice/VkDevice/VkQueue for ash users; see
+# docs/api.md §9.4 for what borrowing them obliges the caller to.
+raw-vulkan = []
+
 [dependencies]
 cxx = "1.0"
 

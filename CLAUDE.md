@@ -119,8 +119,9 @@ src/detail/wayland_fwd.h the one remaining header
   global module precisely so that works.
 
 Running the example compositor — one, `examples/minimal.cpp`, the C++ twin of
-`bindings/rust/examples/minimal.rs` (same window policy, same bindings; keep the two in step —
-the Rust one has no DRM path, since the binding does not report a `DrmBackend`'s outputs):
+`bindings/rust/examples/minimal.rs` (same window policy, same bindings, same backend choice; keep
+the two in step — the Rust one still lacks popups, `LinuxDmabuf` and cursor shapes, see
+`bindings/rust/docs/api.md` §9.5):
 
 ```sh
 xmake run minimal                                # nested; prints its own socket name
@@ -188,7 +189,9 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   makes the GPU behind the display's DRM node win via `VK_EXT_physical_device_drm`, otherwise
   dmabuf support then discrete > integrated > virtual > CPU. `LUMINARIA_VK_VALIDATION=1` loads
   `VK_LAYER_KHRONOS_validation` with a debug-utils messenger on stderr; the suite must stay
-  silent under it (plus `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`). Two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
+  silent under it (plus `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`). `handles()` lends the
+  instance/physical device/device/queue out as `void*` (so the interface stays Vulkan-header-free)
+  for code that submits on the same device — the Rust binding's `raw-vulkan` feature. Two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs
   are in the output's *logical* coordinates; the `OutputMapping` (scale + transform) turns

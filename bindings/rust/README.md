@@ -65,7 +65,9 @@ display.dispatch(Some(Duration::ZERO))?;
 display.flush_clients();
 ```
 
-完整可用的混成器见 `examples/minimal.rs`：它与根目录的 `examples/minimal.cpp` 是一对，窗口策略与快捷键相同（每个窗口最大化、新的在最上面、点击置顶；Logo+Return 开终端、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出），只是没有 DRM 路径。
+完整可用的混成器见 `examples/minimal.rs`：它与根目录的 `examples/minimal.cpp` 是一对，窗口策略与快捷键相同（每个窗口最大化、新的在最上面、点击置顶；Logo+Return 开终端、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出），后端选择也相同（嵌套 / DRM / headless）。
+
+要和别的 Rust crate 共用底层对象——在 luminaria 的 `wl_display` 上注册自定义 global、把 DRM fd 交给 `drm`/`gbm`、用 ash 在同一块 GPU 上提交工作——见 [`docs/api.md`](docs/api.md) 第 9 节"逃生口"。
 
 ```sh
 cargo run --example minimal                                        # 嵌套在当前桌面

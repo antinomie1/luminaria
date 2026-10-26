@@ -1,5 +1,7 @@
 //! GPU rendering, Vulkan integration, direct scanout, and hardware frame ledgers.
 
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 
 use crate::backend::Output;
@@ -9,10 +11,78 @@ use crate::protocol::{Presentation, Seat, SurfaceId};
 use crate::shell::{OutputLayout, SceneItem};
 use crate::util::{Color, Rect};
 
+pub use crate::ffi::DrmDeviceId;
+
+impl DrmDeviceId {
+    /// The device an open card or render node refers to; `None` if it is not
+    /// a character device. `DrmDeviceId::from_fd(&drm_backend)` is how the
+    /// renderer is made to be the GPU the display belongs to.
+    pub fn from_fd(fd: impl AsFd) -> Option<Self> {
+        let mut id = DrmDeviceId { major: 0, minor: 0 };
+        ffi::drm_device_id_from_fd(fd.as_fd().as_raw_fd(), &mut id).then_some(id)
+    }
+
+    /// The device a path such as `/dev/dri/card0` names.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let mut id = DrmDeviceId { major: 0, minor: 0 };
+        ffi::drm_device_id_from_path(path, &mut id).then_some(id)
+    }
+}
+
 /// Options for initializing Vulkan and physical device selection.
 #[derive(Debug, Clone, Default)]
 pub struct VulkanOptions {
-    pub drm_device: Option<String>,
+    /// The DRM device the compositor scans out through. The physical device
+    /// behind it wins over every other; `None` lets the ranking decide.
+    pub drm_device: Option<DrmDeviceId>,
+}
+
+impl VulkanOptions {
+    fn drm_device_raw(&self) -> (bool, DrmDeviceId) {
+        match self.drm_device {
+            Some(id) => (true, id),
+            None => (false, DrmDeviceId { major: 0, minor: 0 }),
+        }
+    }
+}
+
+/// The renderer's Vulkan objects as raw handles (`raw-vulkan` feature).
+///
+/// Every handle is a `u64`, which is what ash's `Handle::from_raw` takes:
+/// `ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(h.instance))`.
+///
+/// Borrowed: valid until the renderer drops, never to be destroyed. The queue
+/// needs external synchronisation, so submit to it only from the thread that
+/// drives luminaria, between its calls, and wait for your own work before the
+/// renderer goes; luminaria's timeline does not know about it. The device has
+/// exactly `device_extensions` plus Vulkan 1.3's synchronization2,
+/// dynamicRendering and timelineSemaphore. See `docs/api.md` §9.4.
+#[cfg(feature = "raw-vulkan")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawVulkanHandles {
+    pub instance: u64,
+    pub physical_device: u64,
+    pub device: u64,
+    pub queue: u64,
+    pub queue_family_index: u32,
+    /// What the instance was created for (`VK_API_VERSION_1_3`).
+    pub api_version: u32,
+    pub device_extensions: Vec<String>,
+}
+
+#[cfg(feature = "raw-vulkan")]
+impl From<ffi::VulkanHandlesRaw> for RawVulkanHandles {
+    fn from(h: ffi::VulkanHandlesRaw) -> Self {
+        Self {
+            instance: h.instance,
+            physical_device: h.physical_device,
+            device: h.device,
+            queue: h.queue,
+            queue_family_index: h.queue_family,
+            api_version: h.api_version,
+            device_extensions: h.device_extensions,
+        }
+    }
 }
 
 /// Vulkan 1.3 renderer with external memory dmabuf and dynamic rendering.
@@ -23,10 +93,8 @@ pub struct VulkanRenderer {
 impl VulkanRenderer {
     pub fn new(options: &VulkanOptions) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::vulkan_renderer_new(
-            options.drm_device.as_deref().unwrap_or(""),
-            &mut err,
-        );
+        let (has_drm, drm) = options.drm_device_raw();
+        let raw = ffi::vulkan_renderer_new(has_drm, &drm, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
@@ -36,6 +104,12 @@ impl VulkanRenderer {
 
     pub fn scanout_modifiers(&self, drm_format: u32) -> Vec<u64> {
         self.raw.scanout_modifiers(drm_format)
+    }
+
+    /// The instance, device and queue this renderer runs on, for ash.
+    #[cfg(feature = "raw-vulkan")]
+    pub fn raw_handles(&self) -> RawVulkanHandles {
+        self.raw.handles().into()
     }
 }
 
@@ -148,10 +222,8 @@ pub struct SceneRenderer {
 impl SceneRenderer {
     pub fn new(options: &VulkanOptions) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::scene_renderer_new(
-            options.drm_device.as_deref().unwrap_or(""),
-            &mut err,
-        );
+        let (has_drm, drm) = options.drm_device_raw();
+        let raw = ffi::scene_renderer_new(has_drm, &drm, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
@@ -230,6 +302,14 @@ impl SceneRenderer {
         self.pin().update_cursor();
     }
 
+    /// The GPU's raw Vulkan handles; `None` when this renderer fell back to the
+    /// CPU. Same contract as [`VulkanRenderer::raw_handles`].
+    #[cfg(feature = "raw-vulkan")]
+    pub fn raw_vulkan_handles(&self) -> Option<RawVulkanHandles> {
+        let mut h = ffi::VulkanHandlesRaw::default();
+        self.raw.vulkan_handles(&mut h).then(|| h.into())
+    }
+
     pub fn read_back(&mut self, state: &mut SceneOutput) -> Result<Vec<u8>, Error> {
         let mut err = String::new();
         let mut s_pin = state.raw.pin_mut();
@@ -278,6 +358,13 @@ impl Cursor {
 
     pub fn leave(&mut self) {
         self.pin().leave();
+    }
+
+    /// Where the pointer is, in layout coordinates, after the clamping
+    /// `move_to`/`move_by` did; `None` before the first move or after `leave()`.
+    pub fn position(&self) -> Option<(f64, f64)> {
+        let (mut x, mut y) = (0.0, 0.0);
+        self.raw.position(&mut x, &mut y).then_some((x, y))
     }
 
     pub fn refresh(&mut self) {

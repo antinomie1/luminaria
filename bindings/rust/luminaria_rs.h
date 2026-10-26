@@ -20,6 +20,9 @@ struct SceneItemRaw;
 struct SceneHitRaw;
 struct ToplevelEventRaw;
 struct BackendInputEventRaw;
+struct LibinputEventRaw;
+struct DrmDeviceId;
+struct VulkanHandlesRaw;
 
 // ============================================================================
 // Core & Util
@@ -39,6 +42,8 @@ public:
     void terminate() const;
     int dispatch(int timeout_ms) const;
     void flush_clients() const;
+    // The wl_display, borrowed: see Display::as_ptr in src/core.rs.
+    std::size_t raw_display() const;
 
     struct Impl;
     Impl& impl() const;
@@ -137,6 +142,9 @@ public:
     bool move_cursor(std::int32_t x, std::int32_t y, rust::String& error);
     bool hide_cursor(rust::String& error);
     bool take_frame();
+    bool take_mode_changed();
+    bool alive() const;
+    std::uint64_t id() const;
 
     struct Impl;
     Impl& impl() const;
@@ -192,6 +200,8 @@ public:
     bool switch_to(int vt, rust::String& error);
     bool active() const;
     rust::String seat_name() const;
+    // 0 = nothing queued, 1 = became inactive, 2 = became active.
+    std::uint32_t next_activity();
 
     struct Impl;
     Impl& impl() const;
@@ -209,6 +219,10 @@ public:
     DrmBackendShim& operator=(const DrmBackendShim&) = delete;
 
     bool start(rust::String& error);
+    int fd() const;
+    void scan_connectors();
+    // kind: 0 = nothing queued, 1 = output added (returned), 2 = removed (`removed` set).
+    std::unique_ptr<OutputShim> next_event(std::uint32_t& kind, std::uint64_t& removed);
 
     struct Impl;
     Impl& impl() const;
@@ -228,6 +242,11 @@ public:
 
     bool start(rust::String& error);
     bool add_device(rust::Str path, rust::String& error);
+    bool next_input_event(LibinputEventRaw& out);
+    rust::String keymap() const;
+    bool set_keymap(rust::Str xkb_text);
+    // keyboard, pointer, touch as bits 0, 1, 2.
+    std::uint32_t capabilities() const;
 
     struct Impl;
     Impl& impl() const;
@@ -238,6 +257,8 @@ private:
 
 std::unique_ptr<LibinputBackendShim> libinput_backend_new(const DisplayShim& display, const SessionShim& session, rust::String& error);
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_standalone(const DisplayShim& display, rust::String& error);
+std::unique_ptr<LibinputBackendShim> libinput_backend_new_path(const DisplayShim& display, const SessionShim& session, rust::String& error);
+std::unique_ptr<LibinputBackendShim> libinput_backend_new_path_standalone(const DisplayShim& display, rust::String& error);
 
 // ============================================================================
 // Protocols
@@ -513,6 +534,7 @@ public:
     VulkanRendererShim& operator=(const VulkanRendererShim&) = delete;
 
     rust::Vec<std::uint64_t> scanout_modifiers(std::uint32_t drm_format) const;
+    VulkanHandlesRaw handles() const;
 
     struct Impl;
     Impl& impl() const;
@@ -521,7 +543,11 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<VulkanRendererShim> vulkan_renderer_new(rust::Str drm_device, rust::String& error);
+bool drm_device_id_from_fd(int fd, DrmDeviceId& out);
+bool drm_device_id_from_path(rust::Str path, DrmDeviceId& out);
+
+// `has_drm_device` false: no DRM device to match, the ranking decides.
+std::unique_ptr<VulkanRendererShim> vulkan_renderer_new(bool has_drm_device, const DrmDeviceId& drm_device, rust::String& error);
 
 class LinuxDmabufShim {
 public:
@@ -571,6 +597,7 @@ public:
     void clear_presentation();
     void update_cursor();
     rust::Vec<std::uint8_t> read_back(SceneOutputShim& state, rust::String& error);
+    bool vulkan_handles(VulkanHandlesRaw& out) const;
 
     struct Impl;
     Impl& impl() const;
@@ -579,7 +606,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<SceneRendererShim> scene_renderer_new(rust::Str drm_device, rust::String& error);
+std::unique_ptr<SceneRendererShim> scene_renderer_new(bool has_drm_device, const DrmDeviceId& drm_device, rust::String& error);
 
 class OutputLayoutShim {
 public:
@@ -588,7 +615,9 @@ public:
     OutputLayoutShim& operator=(const OutputLayoutShim&) = delete;
 
     void add(OutputShim& output, std::int32_t x, std::int32_t y);
+    void add_auto(OutputShim& output);
     void remove(OutputShim& output);
+    Rect bounds() const;
     Rect output_box(const OutputShim& output) const;
 
     struct Impl;
@@ -610,6 +639,7 @@ public:
     bool move_by(double dx, double dy, Rect bounds);
     void leave();
     void refresh();
+    bool position(double& x, double& y) const;
 
     struct Impl;
     Impl& impl() const;

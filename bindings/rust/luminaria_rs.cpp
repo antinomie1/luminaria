@@ -15,6 +15,8 @@
 // returned, while no luminaria signal is on the stack.
 #include <wayland-server-core.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -126,6 +128,10 @@ int DisplayShim::dispatch(int timeout_ms) const {
 
 void DisplayShim::flush_clients() const {
     if (impl_->display) wl_display_flush_clients(impl_->display->c_ptr());
+}
+
+std::size_t DisplayShim::raw_display() const {
+    return impl_->display ? reinterpret_cast<std::size_t>(impl_->display->c_ptr()) : 0;
 }
 
 struct KeymapStateShim::Impl {
@@ -281,9 +287,14 @@ bool layout_fits_raw(std::int32_t width, std::int32_t height, std::uint32_t stri
 
 struct OutputShim::Impl {
     lm::Output* output = nullptr;
+    // Identity that outlives the output, so Rust can match a removal to the
+    // Output it holds. Never reused.
+    std::uint64_t id = 0;
     bool frame_pending = false;
+    bool mode_changed = false;
     Conn<lm::OutputDestroy> on_destroy;
     Conn<lm::FrameEvent> on_frame;
+    Conn<lm::OutputModeChange> on_mode;
 };
 
 OutputShim::~OutputShim() = default;
@@ -390,10 +401,23 @@ bool OutputShim::take_frame() {
     return std::exchange(impl_->frame_pending, false);
 }
 
+bool OutputShim::take_mode_changed() {
+    return std::exchange(impl_->mode_changed, false);
+}
+
+bool OutputShim::alive() const { return impl_->output != nullptr; }
+
+std::uint64_t OutputShim::id() const { return impl_->id; }
+
 inline std::unique_ptr<OutputShim> make_output_shim(lm::Output* output) {
+    static std::atomic<std::uint64_t> next_id{1};
     if (!output) return nullptr;
     auto impl = std::make_unique<OutputShim::Impl>();
     impl->output = output;
+    impl->id = next_id.fetch_add(1, std::memory_order_relaxed);
+    impl->on_mode = output->mode_changed.connect([impl = impl.get()](lm::OutputModeChange&) {
+        impl->mode_changed = true;
+    });
     impl->on_destroy = output->destroy.connect([impl = impl.get()](lm::OutputDestroy&) {
         impl->output = nullptr;
     });
@@ -500,6 +524,8 @@ bool WaylandBackendShim::next_input_event(BackendInputEventRaw& out) {
 
 struct SessionShim::Impl {
     std::unique_ptr<lm::Session> session;
+    std::deque<bool> activity;
+    Conn<lm::SessionActive> on_activity;
 };
 
 SessionShim::~SessionShim() = default;
@@ -513,6 +539,8 @@ std::unique_ptr<SessionShim> session_new(const DisplayShim& display, rust::Strin
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<SessionShim::Impl>();
         impl->session = std::make_unique<lm::Session>(std::move(*r));
+        impl->on_activity = impl->session->activity().connect(
+            [raw = impl.get()](lm::SessionActive& e) { raw->activity.push_back(e.active); });
         return std::make_unique<SessionShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -535,8 +563,46 @@ rust::String SessionShim::seat_name() const {
     return "seat0";
 }
 
+std::uint32_t SessionShim::next_activity() {
+    if (impl_->activity.empty()) return 0;
+    const bool active = impl_->activity.front();
+    impl_->activity.pop_front();
+    return active ? 2 : 1;
+}
+
 struct DrmBackendShim::Impl {
+    struct Event {
+        std::unique_ptr<OutputShim> added; // null: a removal
+        std::uint64_t removed = 0;
+    };
+    // Hotplug watch on each output the backend reported, keyed by the shim's id.
+    struct Watch {
+        std::uint64_t id;
+        Conn<lm::OutputDestroy> on_destroy;
+    };
+
     std::unique_ptr<lm::DrmBackend> backend;
+    std::deque<Event> events;
+    std::deque<Watch> watches;
+    Conn<lm::NewOutput> on_new_output;
+
+    // Every output, the ones start() finds included, reaches Rust as an event:
+    // C++ never calls Rust, so a signal can only leave something to be drained.
+    void watch() {
+        on_new_output = backend->new_output.connect([this](lm::NewOutput& e) {
+            auto shim = make_output_shim(&e.output);
+            const std::uint64_t id = shim->id();
+            Watch& w = watches.emplace_back();
+            w.id = id;
+            w.on_destroy = e.output.destroy.connect([this, id](lm::OutputDestroy&) {
+                events.push_back(Event{nullptr, id});
+                // Erasing the watch inside its own slot is safe: a Signal never
+                // frees the slot that is running.
+                std::erase_if(watches, [id](const Watch& x) { return x.id == id; });
+            });
+            events.push_back(Event{std::move(shim), 0});
+        });
+    }
 };
 
 DrmBackendShim::~DrmBackendShim() = default;
@@ -554,6 +620,7 @@ std::unique_ptr<DrmBackendShim> drm_backend_new(const DisplayShim& display, rust
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<DrmBackendShim::Impl>();
         impl->backend = std::make_unique<lm::DrmBackend>(std::move(*r));
+        impl->watch();
         return std::make_unique<DrmBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -571,6 +638,7 @@ std::unique_ptr<DrmBackendShim> drm_backend_new_standalone(const DisplayShim& di
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<DrmBackendShim::Impl>();
         impl->backend = std::make_unique<lm::DrmBackend>(std::move(*r));
+        impl->watch();
         return std::make_unique<DrmBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -585,23 +653,140 @@ bool DrmBackendShim::start(rust::String& error) {
     return true;
 }
 
+int DrmBackendShim::fd() const {
+    return impl_->backend ? impl_->backend->fd() : -1;
+}
+
+void DrmBackendShim::scan_connectors() {
+    if (impl_->backend) impl_->backend->scan_connectors();
+}
+
+std::unique_ptr<OutputShim> DrmBackendShim::next_event(std::uint32_t& kind, std::uint64_t& removed) {
+    kind = 0;
+    if (impl_->events.empty()) return nullptr;
+    Impl::Event e = std::move(impl_->events.front());
+    impl_->events.pop_front();
+    if (e.added) {
+        kind = 1;
+        return std::move(e.added);
+    }
+    kind = 2;
+    removed = e.removed;
+    return nullptr;
+}
+
+// Event kinds, matched by src/backend.rs.
+enum : std::uint32_t {
+    kLiKey, kLiModifiers, kLiMotion, kLiButton, kLiAxis,
+    kLiTouchDown, kLiTouchMotion, kLiTouchUp, kLiTouchFrame, kLiTouchCancel,
+    kLiCapabilities,
+};
+
 struct LibinputBackendShim::Impl {
     std::unique_ptr<lm::LibinputBackend> backend;
+    std::deque<LibinputEventRaw> events;
+    Conn<lm::KeyEvent> on_key;
+    Conn<lm::ModifiersEvent> on_modifiers;
+    Conn<lm::PointerMotionEvent> on_motion;
+    Conn<lm::PointerButtonEvent> on_button;
+    Conn<lm::PointerAxisEvent> on_axis;
+    Conn<lm::TouchDownEvent> on_touch_down;
+    Conn<lm::TouchMotionEvent> on_touch_motion;
+    Conn<lm::TouchUpEvent> on_touch_up;
+    Conn<lm::TouchFrameEvent> on_touch_frame;
+    Conn<lm::TouchCancelEvent> on_touch_cancel;
+    Conn<lm::InputCapabilities> on_caps;
+
+    void push(std::uint32_t kind, auto&& fill) {
+        LibinputEventRaw ev{};
+        ev.kind = kind;
+        fill(ev);
+        events.push_back(ev);
+    }
+
+    void watch() {
+        lm::LibinputBackend& b = *backend;
+        // The key signal fires before the backend's xkb state takes the key in,
+        // and Rust reads the queue only after dispatch() returns, by which time
+        // later keys of the same batch have moved the state on. So the keysym
+        // and masks a binding is matched against are taken here, as C++ would
+        // read them in its handler.
+        on_key = b.key().connect([this](lm::KeyEvent& e) {
+            push(kLiKey, [&](LibinputEventRaw& ev) {
+                const lm::KeymapState& ks = backend->keymap_state();
+                const lm::ModifiersEvent m = ks.modifiers();
+                ev.code = e.keycode;
+                ev.pressed = e.pressed;
+                ev.keysym = ks.keysym(e.keycode);
+                ev.depressed = m.depressed;
+                ev.latched = m.latched;
+                ev.locked = m.locked;
+                ev.group = m.group;
+            });
+        });
+        on_modifiers = b.modifiers().connect([this](lm::ModifiersEvent& e) {
+            push(kLiModifiers, [&](LibinputEventRaw& ev) {
+                ev.depressed = e.depressed;
+                ev.latched = e.latched;
+                ev.locked = e.locked;
+                ev.group = e.group;
+            });
+        });
+        on_motion = b.pointer_motion().connect([this](lm::PointerMotionEvent& e) {
+            push(kLiMotion, [&](LibinputEventRaw& ev) { ev.x = e.dx; ev.y = e.dy; });
+        });
+        on_button = b.pointer_button().connect([this](lm::PointerButtonEvent& e) {
+            push(kLiButton, [&](LibinputEventRaw& ev) { ev.code = e.button; ev.pressed = e.pressed; });
+        });
+        on_axis = b.pointer_axis().connect([this](lm::PointerAxisEvent& e) {
+            push(kLiAxis, [&](LibinputEventRaw& ev) {
+                ev.x = e.dx;
+                ev.y = e.dy;
+                ev.steps_x = e.dx_steps;
+                ev.steps_y = e.dy_steps;
+                ev.flags = (e.stop_horizontal ? 1u : 0u) | (e.stop_vertical ? 2u : 0u);
+            });
+        });
+        on_touch_down = b.touch_down().connect([this](lm::TouchDownEvent& e) {
+            push(kLiTouchDown, [&](LibinputEventRaw& ev) { ev.id = e.id; ev.x = e.x; ev.y = e.y; });
+        });
+        on_touch_motion = b.touch_motion().connect([this](lm::TouchMotionEvent& e) {
+            push(kLiTouchMotion, [&](LibinputEventRaw& ev) { ev.id = e.id; ev.x = e.x; ev.y = e.y; });
+        });
+        on_touch_up = b.touch_up().connect([this](lm::TouchUpEvent& e) {
+            push(kLiTouchUp, [&](LibinputEventRaw& ev) { ev.id = e.id; });
+        });
+        on_touch_frame = b.touch_frame().connect([this](lm::TouchFrameEvent&) {
+            push(kLiTouchFrame, [](LibinputEventRaw&) {});
+        });
+        on_touch_cancel = b.touch_cancel().connect([this](lm::TouchCancelEvent& e) {
+            push(kLiTouchCancel, [&](LibinputEventRaw& ev) { ev.id = e.id; });
+        });
+        on_caps = b.capabilities_changed().connect([this](lm::InputCapabilities& c) {
+            push(kLiCapabilities, [&](LibinputEventRaw& ev) {
+                ev.flags = (c.keyboard ? 1u : 0u) | (c.pointer ? 2u : 0u) | (c.touch ? 4u : 0u);
+            });
+        });
+    }
 };
 
 LibinputBackendShim::~LibinputBackendShim() = default;
 LibinputBackendShim::LibinputBackendShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 LibinputBackendShim::Impl& LibinputBackendShim::impl() const { return *impl_; }
 
-std::unique_ptr<LibinputBackendShim> libinput_backend_new(const DisplayShim& display, const SessionShim& session, rust::String& error) {
+namespace {
+
+std::unique_ptr<LibinputBackendShim> make_libinput(const DisplayShim& display, lm::Session* session,
+                                                   bool path, rust::String& error) {
     try {
         if (!display.impl().display) { error = "display not initialized"; return nullptr; }
         auto loop = display.impl().display->event_loop();
-        lm::Session* sess = session.impl().session.get();
-        auto r = lm::LibinputBackend::create(loop, sess);
+        auto r = path ? lm::LibinputBackend::create_path(loop, session)
+                      : lm::LibinputBackend::create(loop, session);
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<LibinputBackendShim::Impl>();
         impl->backend = std::make_unique<lm::LibinputBackend>(std::move(*r));
+        impl->watch();
         return std::make_unique<LibinputBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -609,19 +794,22 @@ std::unique_ptr<LibinputBackendShim> libinput_backend_new(const DisplayShim& dis
     }
 }
 
+} // namespace
+
+std::unique_ptr<LibinputBackendShim> libinput_backend_new(const DisplayShim& display, const SessionShim& session, rust::String& error) {
+    return make_libinput(display, session.impl().session.get(), false, error);
+}
+
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_standalone(const DisplayShim& display, rust::String& error) {
-    try {
-        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
-        auto loop = display.impl().display->event_loop();
-        auto r = lm::LibinputBackend::create(loop, nullptr);
-        if (!r) { error = to_rust(r.error().message); return nullptr; }
-        auto impl = std::make_unique<LibinputBackendShim::Impl>();
-        impl->backend = std::make_unique<lm::LibinputBackend>(std::move(*r));
-        return std::make_unique<LibinputBackendShim>(std::move(impl));
-    } catch (const std::exception& e) {
-        error = e.what();
-        return nullptr;
-    }
+    return make_libinput(display, nullptr, false, error);
+}
+
+std::unique_ptr<LibinputBackendShim> libinput_backend_new_path(const DisplayShim& display, const SessionShim& session, rust::String& error) {
+    return make_libinput(display, session.impl().session.get(), true, error);
+}
+
+std::unique_ptr<LibinputBackendShim> libinput_backend_new_path_standalone(const DisplayShim& display, rust::String& error) {
+    return make_libinput(display, nullptr, true, error);
 }
 
 bool LibinputBackendShim::start(rust::String& error) {
@@ -636,6 +824,27 @@ bool LibinputBackendShim::add_device(rust::Str path, rust::String& error) {
     auto st = impl_->backend->add_device(std::string(path));
     if (!st) { error = to_rust(st.error().message); return false; }
     return true;
+}
+
+bool LibinputBackendShim::next_input_event(LibinputEventRaw& out) {
+    if (impl_->events.empty()) return false;
+    out = impl_->events.front();
+    impl_->events.pop_front();
+    return true;
+}
+
+rust::String LibinputBackendShim::keymap() const {
+    return impl_->backend ? to_rust(impl_->backend->keymap()) : rust::String{};
+}
+
+bool LibinputBackendShim::set_keymap(rust::Str xkb_text) {
+    return impl_->backend && impl_->backend->set_keymap(std::string(xkb_text));
+}
+
+std::uint32_t LibinputBackendShim::capabilities() const {
+    if (!impl_->backend) return 0;
+    const lm::InputCapabilities c = impl_->backend->capabilities();
+    return (c.keyboard ? 1u : 0u) | (c.pointer ? 2u : 0u) | (c.touch ? 4u : 0u);
 }
 
 // ============================================================================
@@ -1162,10 +1371,46 @@ VulkanRendererShim::~VulkanRendererShim() = default;
 VulkanRendererShim::VulkanRendererShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 VulkanRendererShim::Impl& VulkanRendererShim::impl() const { return *impl_; }
 
-std::unique_ptr<VulkanRendererShim> vulkan_renderer_new(rust::Str drm_device, rust::String& error) {
+bool drm_device_id_from_fd(int fd, DrmDeviceId& out) {
+    const auto id = lm::drm_device_id(fd);
+    if (!id) return false;
+    out = DrmDeviceId{id->major, id->minor};
+    return true;
+}
+
+bool drm_device_id_from_path(rust::Str path, DrmDeviceId& out) {
+    const auto id = lm::drm_device_id(std::string(path));
+    if (!id) return false;
+    out = DrmDeviceId{id->major, id->minor};
+    return true;
+}
+
+namespace {
+
+lm::VulkanOptions vulkan_options(bool has_drm_device, const DrmDeviceId& drm_device) {
+    lm::VulkanOptions opts{};
+    if (has_drm_device) opts.drm_device = lm::DrmDeviceId{drm_device.major, drm_device.minor};
+    return opts;
+}
+
+VulkanHandlesRaw handles_raw(const lm::VulkanRenderer& renderer) {
+    const lm::VulkanHandles h = renderer.handles();
+    VulkanHandlesRaw out{};
+    out.instance = reinterpret_cast<std::uint64_t>(h.instance);
+    out.physical_device = reinterpret_cast<std::uint64_t>(h.physical_device);
+    out.device = reinterpret_cast<std::uint64_t>(h.device);
+    out.queue = reinterpret_cast<std::uint64_t>(h.queue);
+    out.queue_family = h.queue_family;
+    out.api_version = h.api_version;
+    for (const char* ext : h.device_extensions) out.device_extensions.push_back(rust::String(ext));
+    return out;
+}
+
+} // namespace
+
+std::unique_ptr<VulkanRendererShim> vulkan_renderer_new(bool has_drm_device, const DrmDeviceId& drm_device, rust::String& error) {
     try {
-        lm::VulkanOptions opts{};
-        if (!drm_device.empty()) opts.drm_device = lm::drm_device_id(std::string(drm_device));
+        const lm::VulkanOptions opts = vulkan_options(has_drm_device, drm_device);
         auto r = lm::VulkanRenderer::create(opts);
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<VulkanRendererShim::Impl>();
@@ -1185,6 +1430,10 @@ rust::Vec<std::uint64_t> VulkanRendererShim::scanout_modifiers(std::uint32_t drm
         }
     }
     return out;
+}
+
+VulkanHandlesRaw VulkanRendererShim::handles() const {
+    return impl_->renderer ? handles_raw(*impl_->renderer) : VulkanHandlesRaw{};
 }
 
 struct LinuxDmabufShim::Impl {
@@ -1243,10 +1492,9 @@ SceneRendererShim::~SceneRendererShim() = default;
 SceneRendererShim::SceneRendererShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 SceneRendererShim::Impl& SceneRendererShim::impl() const { return *impl_; }
 
-std::unique_ptr<SceneRendererShim> scene_renderer_new(rust::Str drm_device, rust::String& error) {
+std::unique_ptr<SceneRendererShim> scene_renderer_new(bool has_drm_device, const DrmDeviceId& drm_device, rust::String& error) {
     try {
-        lm::VulkanOptions opts{};
-        if (!drm_device.empty()) opts.drm_device = lm::drm_device_id(std::string(drm_device));
+        const lm::VulkanOptions opts = vulkan_options(has_drm_device, drm_device);
         auto impl = std::make_unique<SceneRendererShim::Impl>();
         impl->renderer = std::make_unique<lm::SceneRenderer>(opts);
         return std::make_unique<SceneRendererShim>(std::move(impl));
@@ -1323,8 +1571,39 @@ rust::Vec<std::uint8_t> SceneRendererShim::read_back(SceneOutputShim& state, rus
     return out;
 }
 
+bool SceneRendererShim::vulkan_handles(VulkanHandlesRaw& out) const {
+    if (!impl_->renderer || impl_->renderer->gpu() == nullptr) return false;
+    out = handles_raw(*impl_->renderer->gpu());
+    return true;
+}
+
 struct OutputLayoutShim::Impl {
+    // An output that dies leaves the layout at once. That is not policy: C++
+    // compositors remove it in their Output::destroy handler, while Rust only
+    // hears of it after dispatch() returns, and the Cursor may read the layout
+    // before then.
+    struct Watch {
+        lm::Output* output;
+        Conn<lm::OutputDestroy> on_destroy;
+    };
+
     lm::OutputLayout layout;
+    std::deque<Watch> watches;
+
+    void watch(lm::Output* out) {
+        if (std::ranges::any_of(watches, [out](const Watch& w) { return w.output == out; })) {
+            return;
+        }
+        // Erasing the watch inside its own slot is safe: a Signal never frees
+        // the slot that is running.
+        watches.push_back(Watch{out, out->destroy.connect([this, out](lm::OutputDestroy&) {
+                                    layout.remove(*out);
+                                    unwatch(out);
+                                })});
+    }
+    void unwatch(const lm::Output* output) {
+        std::erase_if(watches, [output](const Watch& w) { return w.output == output; });
+    }
 };
 OutputLayoutShim::~OutputLayoutShim() = default;
 OutputLayoutShim::OutputLayoutShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1334,10 +1613,26 @@ std::unique_ptr<OutputLayoutShim> output_layout_new() {
     return std::make_unique<OutputLayoutShim>(std::make_unique<OutputLayoutShim::Impl>());
 }
 void OutputLayoutShim::add(OutputShim& output, std::int32_t x, std::int32_t y) {
-    if (output.impl().output) impl_->layout.add(*output.impl().output, x, y);
+    lm::Output* out = output.impl().output;
+    if (!out) return;
+    impl_->layout.add(*out, x, y);
+    impl_->watch(out);
+}
+void OutputLayoutShim::add_auto(OutputShim& output) {
+    lm::Output* out = output.impl().output;
+    if (!out) return;
+    impl_->layout.add_auto(*out);
+    impl_->watch(out);
+}
+Rect OutputLayoutShim::bounds() const {
+    const auto b = impl_->layout.bounds();
+    return Rect{b.x, b.y, b.width, b.height};
 }
 void OutputLayoutShim::remove(OutputShim& output) {
-    if (output.impl().output) impl_->layout.remove(*output.impl().output);
+    lm::Output* out = output.impl().output;
+    if (!out) return;
+    impl_->layout.remove(*out);
+    impl_->unwatch(out);
 }
 Rect OutputLayoutShim::output_box(const OutputShim& output) const {
     if (!output.impl().output) return Rect{0, 0, 0, 0};
@@ -1379,6 +1674,12 @@ void CursorShim::leave() {
 }
 void CursorShim::refresh() {
     if (impl_->cursor) impl_->cursor->refresh();
+}
+bool CursorShim::position(double& x, double& y) const {
+    if (!impl_->cursor || !impl_->cursor->pointer().present()) return false;
+    x = impl_->cursor->pointer().x();
+    y = impl_->cursor->pointer().y();
+    return true;
 }
 
 struct FrameShim::Impl {

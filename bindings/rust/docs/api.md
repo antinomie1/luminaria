@@ -1,6 +1,6 @@
 # Luminaria Rust API 文档
 
-Luminaria 不仅仅是一个现成的混成器，更是一个灵活的现代化 C++23 Wayland 混成器**库**。
+Luminaria 是写 Wayland 混成器的**库**，不是现成的混成器：它提供协议、后端与渲染，窗口放哪、谁拿键盘、按键做什么由使用者决定。
 
 Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与组合各个模块（`core`、`util`、`backend`、`protocol`、`gpu`、`desktop`、`shell`），构建无头测试环境、嵌套调试工具、专用嵌入式显示服务或自定义渲染管线的混成器。
 
@@ -153,7 +153,7 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   let mut output = backend.add_output(1280, 800)?;
   backend.start()?;
   ```
-- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。
+- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器经 `DrmBackend::next_event()` 到来与离开，输入经 `LibinputBackend::next_input_event()` 取出，VT 切换经 `Session::next_activity()`；见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
 
 ---
 
@@ -203,7 +203,7 @@ let mut xdg_shell = XdgShell::new(&display)?;
 xdg_shell.set_bounds(1920, 1080);
 ```
 
-### 全套协议扩展管理器（开箱即用）
+### 协议扩展管理器
 所有管理器均采用统一构建规范，内部 RAII 管理协议生命周期：
 ```rust
 let _subcompositor   = Subcompositor::new(&display)?;
@@ -239,7 +239,7 @@ let _text_input      = TextInputManager::new(&display, &seat)?;
 对应 `luminaria.gpu` 扩展，包含基于 Vulkan 1.3 的高性能图形管线与裸机加速支持。
 
 ### `VulkanRenderer`
-- `VulkanRenderer::new(&VulkanOptions::default())`：初始化 Vulkan 1.3 上下文（要求 Dynamic Rendering、Timeline Semaphore 与 dmabuf 扩展支持）。
+- `VulkanRenderer::new(&VulkanOptions::default())`：初始化 Vulkan 1.3 上下文（要求 Dynamic Rendering、Timeline Semaphore 与 dmabuf 扩展支持）。裸机上传 `VulkanOptions { drm_device: DrmDeviceId::from_fd(&drm) }`，让渲染器就是显示所在的那块 GPU。
 - `vulkan.scanout_modifiers(drm_format)`：读取显卡支持的内存布局 modifier。
 
 ### `SceneRenderer` 与 `SceneOutput`
@@ -407,3 +407,119 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+---
+
+## 9. 逃生口：和别的 Rust crate 共用底层对象
+
+绑定之外总有 luminaria 没覆盖的东西：自定义协议、自己读 DRM 属性、用 ash 往同一块 GPU 上提交工作。
+为此绑定把几样底层对象**借**出去。四条共同的规矩：
+
+- **只借不转让。** 借出的指针、fd、句柄与借出它的 luminaria 对象同寿，不得关闭、销毁或另存到它死之后。
+- **不反向接管。** luminaria 不接收外来的 `wl_display`、DRM fd 或 `VkDevice`；对象始终由 luminaria 创建和销毁。
+- **C++ 从不调用 Rust** 这条规矩只约束绑定自己。通过逃生口注册的 libwayland 回调会在 `display.dispatch()`
+  里被直接调用：回调里不要 panic（2024 edition 的 `extern "C"` 遇到 unwind 直接 abort），也不要回头调用
+  luminaria 的包装类型——照 shim 的做法，入队，等 `dispatch()` 返回再处理。
+- **没有稳定性承诺**（ADR 0004），这一节的签名随 C++ 接口一起变。
+
+### 9.1 `Display::as_ptr()`：原始 `wl_display*`
+
+`Display::as_ptr() -> *mut c_void` 返回 luminaria 自己的 `wl_display`。拿到指针是安全的，用它是 `unsafe` 的；
+指针在 `Display` drop 之前有效。
+
+**能做的**：用 libwayland-server 的 C API（`wayland-sys` 的 `server` feature，或自己写 `extern "C"`）
+`wl_global_create` 注册额外的 global、`wl_resource_create` 建资源、`wl_display_add_client_created_listener` 之类。
+接口描述（`wl_interface`）可以手写，也可以取 `wayland-scanner` 生成代码里的 C 接口指针。
+`tests/test_raw_display.rs` 在 luminaria 的 display 上用这种方式注册了一个 global，一个 libwayland 客户端在
+registry 里同时看到它和 luminaria 的 global，并且绑定成功。
+
+**不能做的**：把 `wayland-server` 的 `Display<D>`（即 `wayland-backend` 的 server `Backend`）挂到这个指针上。
+`wayland-backend` 0.3.17 的服务端只会自己 `wl_display_create`，没有 `from_foreign_display`（只有客户端那半边有）。
+所以高层的 `wayland-server` 类型系统用不上，只能走 C API；这要等上游加接口，绑定这边绕不过去。
+
+**销毁顺序**，和 CLAUDE.md 里 C++ 一侧的规矩是同一条：
+
+1. **global 先于 `Display` 死。** 把 `wl_global_destroy` 放进某个 Rust 对象的 `Drop`，并且**把这个对象声明在
+   `Display` 之后**（局部变量按声明的逆序析构）。漏掉 `wl_global_destroy` 也不会出错（`wl_display_destroy`
+   会一并释放），但那样 global 的 user data 必须活到 `Display` 之后。
+2. **客户端的资源比 global 活得久。** 仍连着的客户端的资源，要等 `Display` drop 时
+   （`wl_display_destroy_clients`）才销毁，那时 Rust 侧的 global 和它的状态都可能已经没了。资源的 destroy
+   回调只能碰资源自己持有的东西（例如自己那份 `Arc`），或者由 global 的 `Drop` 把回指针清空。
+   `test_raw_display.rs` 让客户端在 `Display` drop 时仍然连着，专门覆盖这一点。
+3. **`wl_display_set_global_filter` 只有一个槽。** `DataControlManager` 的过滤器（C++ `set_filter`）用的就是它；
+   Rust 侧另设一个会和它互相覆盖，所以不要设。
+
+### 9.2 `DrmBackend: AsFd`，以及 `DrmDeviceId`
+
+`DrmBackend` 实现 `AsFd` / `AsRawFd`，借出 card 的 fd（C++ `DrmBackend::fd()`）。DRM master 与 KMS 状态归
+luminaria：借去的 fd 可以给 `drm` crate 做查询（connector、property、驱动名），`gbm` 需要自己拥有 fd 时用
+`BorrowedFd::try_clone_to_owned()` 复制一份；但**不要**拿它做 modeset 或 atomic commit，那会和 luminaria
+自己提交的 atomic 状态打架。
+
+`gpu::DrmDeviceId` 对应 C++ 的 `DrmDeviceId`（设备节点的 major/minor），`DrmDeviceId::from_fd(&drm)` /
+`DrmDeviceId::from_path("/dev/dri/card0")` 分别对应两个 `drm_device_id()` 重载。`VulkanOptions::drm_device`
+随之从 `Option<String>` 改成 `Option<DrmDeviceId>`，这样渲染器选中的是这块屏幕所在的 GPU：
+
+```rust
+let drm = DrmBackend::new(&display, None, session.as_ref())?;
+let options = VulkanOptions { drm_device: DrmDeviceId::from_fd(&drm) };
+let renderer = SceneRenderer::new(&options)?;
+```
+
+### 9.3 裸机输入、显示器热插拔、VT 切换
+
+绑定原先拿不到 `LibinputBackend` 的输入，也拿不到 `DrmBackend` 找到的显示器，所以 Rust 写不了裸机混成器。
+补法与 `WaylandBackend::next_input_event` 一样：shim 把信号排进队列，Rust 在 `dispatch()` 返回后取。
+
+- **`LibinputBackend::next_input_event() -> Option<LibinputEvent>`**：按键、修饰键、相对移动、按钮、滚轮
+  （平滑量 + 刻度 + 停止标记）、触摸（down/motion/up/frame/cancel，坐标归一化到触摸屏）、设备能力变化。
+  **按键事件带着当时的 keysym 和修饰键快照。** 队列要到 `dispatch()` 返回后才被读，那时 xkb 状态可能已被同一批里
+  后面的按键改掉；快照在信号里拍，才和 C++ 里在回调中读 `keymap_state()` 的结果一致。
+  另有 `keymap()` / `set_keymap()` / `capabilities()`，以及对应 `create_path()` 的 `LibinputBackend::new_path()`。
+- **`DrmBackend::next_event() -> Option<DrmEvent>`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`。
+  `start()` 时已有的显示器也以 `OutputAdded` 到来。显示器被拔掉后，手里的 `Output` 仍可安全调用，只是一切都成了
+  空操作（`Output::is_alive()` 为 false），收到 `OutputRemoved` 时丢掉即可。`Output::id()` 是比较身份用的。
+- **`OutputLayout::add_auto()` / `bounds()`**：从左到右排；所有输出的外框，相对指针就夹在里面。
+  **`Cursor::position()`** 读回 `move_by()` 夹过之后指针在哪，不必在 Rust 里再算一遍。
+- **`OutputLayout` 在显示器销毁时自动把它移除。** 这不是策略：C++ 的混成器在 `Output::destroy` 回调里同步移除，
+  Rust 只能等到 `dispatch()` 返回才知道，而在那之前 `Cursor` 可能已经在用这个 layout。shim 自己挂 destroy
+  信号，避免留下悬垂指针。`SceneOutput` 本来就会自行解绑。
+- **`Output::take_mode_changed()`**：`set_mode()` 生效后为真一次，此时要 `reset()` 渲染状态、重新排版。
+- **`Session::next_activity() -> Option<bool>`**：VT 切走 / 切回。切走时该把发给客户端的按下状态全部放开。
+
+### 9.4 Vulkan 原始句柄（cargo feature `raw-vulkan`）
+
+ADR 0003 约束的是**核心模块**收什么协议；Vulkan 本来就在 `luminaria.gpu` 里。C++ 侧给 `VulkanRenderer`
+加了 `handles()`，返回的 `VulkanHandles` 全是 `void*` 和整数，导出接口仍然不带任何 Vulkan 头，没有越过
+任何模块边界，所以可以做。
+
+打开 `raw-vulkan` 后有 `VulkanRenderer::raw_handles()` 与 `SceneRenderer::raw_vulkan_handles()`（CPU 降级时为
+`None`），得到 `RawVulkanHandles`：instance、physical device、device、queue（都是 `u64`，正好是 ash
+`Handle::from_raw` 要的类型）、queue family、API 版本、已启用的设备扩展。用 ash 时：
+`ash::Instance::load(entry.static_fn(), vk::Instance::from_raw(h.instance))`。
+
+为什么要用 feature 打开：句柄一旦被外部使用，下面几件事就不再由本库保证，得由调用者负责：
+
+- **同步。** `VkQueue` 要求调用方自己做外部同步。luminaria 在调用它的那个线程上提交，外部工作也只能在这个线程上、
+  在两次 luminaria 调用之间提交。luminaria 的 timeline semaphore 和 in-flight 记账不知道外部提交的存在。
+- **寿命。** renderer drop 之前，外部代码必须先等自己的工作完成（`vkQueueWaitIdle` 或自己的 fence），并销毁自己
+  创建的对象。
+- **特性。** 设备只启用了列出的扩展，外加 Vulkan 1.3 的 synchronization2 / dynamicRendering / timelineSemaphore。
+  wgpu 这类需要更多特性的库不一定能在这个设备上建起来；luminaria 不会为外部调用者多开特性。
+- **测试兜底失效。** "稳态 `render_to` 不分配"和"校验层零报错"这两条测试保证，覆盖不到外部代码提交的工作。
+
+### 9.5 `examples/minimal.rs` 的 DRM 路径
+
+有了 9.2 和 9.3，`minimal.rs` 加上了与 `minimal.cpp` 相同的后端选择：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
+auto 依次尝试嵌套、能拿到 libseat 会话时的 DRM、无头；显卡取第一个参数或 `LUMINARIA_DRM_DEVICE`；
+Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满第一块；显示器热插拔、模式变化、VT 切走时放开
+按键、DRM 上每秒一行帧统计，都与 C++ 版一致。
+
+与 C++ 版仍有的差别，都是绑定还没导出的东西，不是 DRM 路径本身的缺口：
+
+- 没有弹出菜单：`PopupTree` 在 Rust 里没有加入 popup 的入口，`XdgShell` 也不报告 popup 事件。
+- 没有 `LinuxDmabuf`：它要一个 `VulkanRenderer`，而 `SceneRenderer` 不把自己那个交出来；GPU 客户端只能走 wl_shm。
+- `Cursor` 没接 cursor-shape 管理器，客户端请求的光标形状不生效。
+- `OutputGlobal` 只有尺寸：位置、刷新率、缩放、朝向都没告诉客户端。
+
+DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 上的运行还没有验证过。

@@ -364,6 +364,27 @@ struct DrmDeviceId {
 /// a line on stderr that nothing fails on.
 [[nodiscard]] std::uint64_t vulkan_validation_errors() noexcept;
 
+/// The renderer's own Vulkan objects as raw handles, for code that records
+/// work on the same device (ash, a second Vulkan-Hpp user). Plain pointers so
+/// importing this module still pulls in no Vulkan header: each is the
+/// dispatchable handle of the type named beside it.
+///
+/// Borrowed, and only that: valid until the renderer is destroyed, never to be
+/// destroyed by the caller. The queue needs external synchronisation, so submit
+/// to it only from the thread that drives the renderer, between its calls; the
+/// renderer's timeline does not know about such work, so wait for it yourself
+/// before the renderer goes. The device has exactly `device_extensions` plus
+/// Vulkan 1.3's synchronization2, dynamicRendering and timelineSemaphore.
+struct VulkanHandles {
+    void* instance = nullptr;        ///< VkInstance
+    void* physical_device = nullptr; ///< VkPhysicalDevice
+    void* device = nullptr;          ///< VkDevice
+    void* queue = nullptr;           ///< VkQueue
+    std::uint32_t queue_family = 0;
+    std::uint32_t api_version = 0; ///< what the instance was created for
+    std::span<const char* const> device_extensions;
+};
+
 struct VulkanOptions {
     /// The DRM device the compositor scans out through. The physical device
     /// whose primary or render node this is (VK_EXT_physical_device_drm) wins
@@ -395,6 +416,10 @@ public:
     /// is that DRM device. False means the ranking chose instead, and buffers
     /// crossing between the display and this GPU may not import.
     [[nodiscard]] bool on_drm_device() const noexcept;
+
+    /// The instance, device and queue this renderer runs on. See `VulkanHandles`
+    /// for what borrowing them obliges the caller to.
+    [[nodiscard]] VulkanHandles handles() const noexcept;
 
     ~VulkanRenderer();
     VulkanRenderer(VulkanRenderer&&) noexcept;
@@ -705,6 +730,7 @@ struct VulkanRenderer::Impl {
     bool dmabuf_ok = false;      // external-memory-dmabuf + DRM-modifier available
     bool queue_foreign = false;  // VK_EXT_queue_family_foreign available
     bool sync_fd_ok = false;     // VK_KHR_external_semaphore_fd: fences in and out
+    std::vector<const char*> device_extensions; // what the device was created with
     std::optional<vk::raii::Sampler> sampler;
     std::vector<QuadPipeline> pipelines;
     std::vector<EffectPipeline> effect_pipelines;
@@ -972,6 +998,20 @@ std::uint64_t VulkanRenderer::submission_count() const noexcept { return impl_->
 std::string_view VulkanRenderer::device_name() const noexcept { return impl_->device_name; }
 bool VulkanRenderer::on_drm_device() const noexcept { return impl_->on_drm_device; }
 
+VulkanHandles VulkanRenderer::handles() const noexcept {
+    // Dispatchable handles are pointers on every platform, so the casts are exact.
+    return VulkanHandles{
+        .instance = reinterpret_cast<void*>(static_cast<VkInstance>(*impl_->instance)),
+        .physical_device =
+            reinterpret_cast<void*>(static_cast<VkPhysicalDevice>(*impl_->physical)),
+        .device = reinterpret_cast<void*>(static_cast<VkDevice>(*impl_->device)),
+        .queue = reinterpret_cast<void*>(static_cast<VkQueue>(*impl_->queue)),
+        .queue_family = impl_->queue_family,
+        .api_version = VK_API_VERSION_1_3,
+        .device_extensions = impl_->device_extensions,
+    };
+}
+
 struct FragmentShader::Impl {
     VulkanRenderer::Impl* owner = nullptr;
     std::uint64_t id = 0;
@@ -1185,6 +1225,7 @@ Result<VulkanRenderer> VulkanRenderer::create(const VulkanOptions& options) {
             .dmabuf_ok = best->dmabuf,
             .queue_foreign = best->queue_foreign,
             .sync_fd_ok = best->sync_fd,
+            .device_extensions = std::move(exts),
         });
         // How many submits can be outstanding before the display catches up.
         // Reserved rather than grown: without this the in-flight list and the

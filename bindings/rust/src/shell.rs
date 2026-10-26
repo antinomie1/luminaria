@@ -27,6 +27,15 @@ impl OutputLayout {
         lay.as_mut().add(out.as_mut(), x, y);
     }
 
+    /// Place `output` to the right of everything already placed.
+    pub fn add_auto(&mut self, output: &mut Output) {
+        let mut lay = self.raw.pin_mut();
+        let mut out = output.raw.pin_mut();
+        lay.as_mut().add_auto(out.as_mut());
+    }
+
+    /// An output that is destroyed (a monitor unplugged) leaves the layout by
+    /// itself, before Rust hears of it; removing it by hand is for policy.
     pub fn remove(&mut self, output: &mut Output) {
         let mut lay = self.raw.pin_mut();
         let mut out = output.raw.pin_mut();
@@ -35,6 +44,12 @@ impl OutputLayout {
 
     pub fn output_box(&self, output: &Output) -> Rect {
         self.raw.output_box(&output.raw)
+    }
+
+    /// The box around every output, empty when there are none: the bounds a
+    /// relative pointer is kept in.
+    pub fn bounds(&self) -> Rect {
+        self.raw.bounds()
     }
 }
 

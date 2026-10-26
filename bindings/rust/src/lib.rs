@@ -96,6 +96,45 @@ pub(crate) mod ffi {
         y: f64,
     }
 
+    /// A DRM device node's identity: `st_rdev` of /dev/dri/cardN or renderDN.
+    /// How the renderer and the display find out they are the same GPU.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct DrmDeviceId {
+        major: u32,
+        minor: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct LibinputEventRaw {
+        kind: u32,
+        code: u32,
+        keysym: u32,
+        pressed: bool,
+        x: f64,
+        y: f64,
+        steps_x: i32,
+        steps_y: i32,
+        id: i32,
+        flags: u32,
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    }
+
+    // Only `raw-vulkan` reads these.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Default)]
+    struct VulkanHandlesRaw {
+        instance: u64,
+        physical_device: u64,
+        device: u64,
+        queue: u64,
+        queue_family: u32,
+        api_version: u32,
+        device_extensions: Vec<String>,
+    }
+
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
 
@@ -110,6 +149,7 @@ pub(crate) mod ffi {
         fn terminate(self: &DisplayShim);
         fn dispatch(self: &DisplayShim, timeout_ms: i32) -> i32;
         fn flush_clients(self: &DisplayShim);
+        fn raw_display(self: &DisplayShim) -> usize;
 
         type KeymapStateShim;
         fn keymap_state_from_layout(layout: &str, error: &mut String) -> UniquePtr<KeymapStateShim>;
@@ -160,6 +200,9 @@ pub(crate) mod ffi {
         fn move_cursor(self: Pin<&mut OutputShim>, x: i32, y: i32, error: &mut String) -> bool;
         fn hide_cursor(self: Pin<&mut OutputShim>, error: &mut String) -> bool;
         fn take_frame(self: Pin<&mut OutputShim>) -> bool;
+        fn take_mode_changed(self: Pin<&mut OutputShim>) -> bool;
+        fn alive(self: &OutputShim) -> bool;
+        fn id(self: &OutputShim) -> u64;
 
         type HeadlessBackendShim;
         fn headless_backend_new(display: &DisplayShim, interval_ms: u32, error: &mut String) -> UniquePtr<HeadlessBackendShim>;
@@ -178,17 +221,27 @@ pub(crate) mod ffi {
         fn switch_to(self: Pin<&mut SessionShim>, vt: i32, error: &mut String) -> bool;
         fn active(self: &SessionShim) -> bool;
         fn seat_name(self: &SessionShim) -> String;
+        fn next_activity(self: Pin<&mut SessionShim>) -> u32;
 
         type DrmBackendShim;
         fn drm_backend_new(display: &DisplayShim, device: &str, session: &SessionShim, error: &mut String) -> UniquePtr<DrmBackendShim>;
         fn drm_backend_new_standalone(display: &DisplayShim, device: &str, error: &mut String) -> UniquePtr<DrmBackendShim>;
         fn start(self: Pin<&mut DrmBackendShim>, error: &mut String) -> bool;
+        fn fd(self: &DrmBackendShim) -> i32;
+        fn scan_connectors(self: Pin<&mut DrmBackendShim>);
+        fn next_event(self: Pin<&mut DrmBackendShim>, kind: &mut u32, removed: &mut u64) -> UniquePtr<OutputShim>;
 
         type LibinputBackendShim;
         fn libinput_backend_new(display: &DisplayShim, session: &SessionShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
         fn libinput_backend_new_standalone(display: &DisplayShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
+        fn libinput_backend_new_path(display: &DisplayShim, session: &SessionShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
+        fn libinput_backend_new_path_standalone(display: &DisplayShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
         fn start(self: Pin<&mut LibinputBackendShim>, error: &mut String) -> bool;
         fn add_device(self: Pin<&mut LibinputBackendShim>, path: &str, error: &mut String) -> bool;
+        fn next_input_event(self: Pin<&mut LibinputBackendShim>, out: &mut LibinputEventRaw) -> bool;
+        fn keymap(self: &LibinputBackendShim) -> String;
+        fn set_keymap(self: Pin<&mut LibinputBackendShim>, xkb_text: &str) -> bool;
+        fn capabilities(self: &LibinputBackendShim) -> u32;
 
         // Surface inspection
         fn surface_width(surface_id: u64) -> i32;
@@ -333,8 +386,13 @@ pub(crate) mod ffi {
 
         // GPU Rendering & Shell
         type VulkanRendererShim;
-        fn vulkan_renderer_new(drm_device: &str, error: &mut String) -> UniquePtr<VulkanRendererShim>;
+        fn drm_device_id_from_fd(fd: i32, out: &mut DrmDeviceId) -> bool;
+        fn drm_device_id_from_path(path: &str, out: &mut DrmDeviceId) -> bool;
+        fn vulkan_renderer_new(has_drm_device: bool, drm_device: &DrmDeviceId, error: &mut String) -> UniquePtr<VulkanRendererShim>;
         fn scanout_modifiers(self: &VulkanRendererShim, drm_format: u32) -> Vec<u64>;
+        // Only `raw-vulkan` reads these.
+        #[allow(dead_code)]
+        fn handles(self: &VulkanRendererShim) -> VulkanHandlesRaw;
 
         type LinuxDmabufShim;
         fn linux_dmabuf_new(display: &DisplayShim, renderer: &VulkanRendererShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
@@ -345,7 +403,7 @@ pub(crate) mod ffi {
         fn gpu_output(self: &SceneOutputShim) -> bool;
 
         type SceneRendererShim;
-        fn scene_renderer_new(drm_device: &str, error: &mut String) -> UniquePtr<SceneRendererShim>;
+        fn scene_renderer_new(has_drm_device: bool, drm_device: &DrmDeviceId, error: &mut String) -> UniquePtr<SceneRendererShim>;
         fn gpu_enabled(self: &SceneRendererShim) -> bool;
         fn gpu_error(self: &SceneRendererShim) -> String;
         fn reset(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
@@ -354,10 +412,15 @@ pub(crate) mod ffi {
         fn clear_presentation(self: Pin<&mut SceneRendererShim>);
         fn update_cursor(self: Pin<&mut SceneRendererShim>);
         fn read_back(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, error: &mut String) -> Vec<u8>;
+        // Only `raw-vulkan` reads these.
+        #[allow(dead_code)]
+        fn vulkan_handles(self: &SceneRendererShim, out: &mut VulkanHandlesRaw) -> bool;
 
         type OutputLayoutShim;
         fn output_layout_new() -> UniquePtr<OutputLayoutShim>;
         fn add(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>, x: i32, y: i32);
+        fn add_auto(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>);
+        fn bounds(self: &OutputLayoutShim) -> Rect;
         fn remove(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>);
         fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
 
@@ -367,6 +430,7 @@ pub(crate) mod ffi {
         fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64, bounds: Rect) -> bool;
         fn leave(self: Pin<&mut CursorShim>);
         fn refresh(self: Pin<&mut CursorShim>);
+        fn position(self: &CursorShim, x: &mut f64, y: &mut f64) -> bool;
 
         type FrameShim;
         fn frame_new(output: Pin<&mut OutputShim>, renderer: Pin<&mut VulkanRendererShim>, error: &mut String) -> UniquePtr<FrameShim>;

@@ -1,6 +1,7 @@
 //! Core library primitives: Display, EventLoop, errors, and input routers.
 
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
@@ -89,6 +90,32 @@ impl Display {
     /// Flush pending requests/events to all connected clients.
     pub fn flush_clients(&self) {
         self.raw.flush_clients();
+    }
+
+    /// The `wl_display` itself, for registering globals luminaria does not
+    /// provide through libwayland-server's C API (`wl_global_create`,
+    /// `wl_resource_create`, ...): `wayland-sys` with its `server` feature, or
+    /// your own `extern "C"` block.
+    ///
+    /// Getting the pointer is safe; everything done with it is `unsafe`, and
+    /// the contract is libwayland's plus luminaria's teardown order:
+    ///
+    /// - It is valid until this `Display` drops. Never `wl_display_destroy` it.
+    /// - A global you create must die before the `Display`: destroy it from the
+    ///   `Drop` of something declared *after* the `Display`.
+    /// - Your client resources outlive your global, because still-connected
+    ///   clients are destroyed inside the `Display`'s drop. Their destroy
+    ///   handlers may touch only what the resource itself owns.
+    /// - Your callbacks run inside [`Display::dispatch`]: do not panic out of
+    ///   them, and do not call back into luminaria's wrappers from there.
+    /// - Leave `wl_display_set_global_filter` alone: luminaria's data-control
+    ///   filter owns the display's one slot.
+    ///
+    /// `wayland-server`'s own `Display<D>` cannot adopt this pointer: its
+    /// backend only creates displays, it never wraps a foreign one.
+    /// See `docs/api.md` §9.1 and `tests/test_raw_display.rs`.
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.raw.raw_display() as *mut c_void
     }
 
     /// Get a non-owning view of the event loop.
