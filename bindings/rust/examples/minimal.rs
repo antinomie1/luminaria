@@ -35,7 +35,7 @@ use luminaria::core::{Display, Error, KeyRouter};
 use luminaria::gpu::{Cursor, DrmDeviceId, SceneOutcome, SceneOutput, SceneRenderer, VulkanOptions};
 use luminaria::protocol::{
     Compositor, DataDeviceManager, FractionalScaleManager, OutputGlobal, Presentation, Seat,
-    SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent, Viewporter,
+    SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent, Viewporter, XdgEvent,
     XdgDecorationManager, XdgShell,
 };
 use luminaria::shell::{scene_hit_test, OutputLayout, SceneItem};
@@ -172,7 +172,9 @@ fn local(items: &[SceneItem], view: Rect) -> Vec<SceneItem> {
 /// The top window has the keyboard; every other one is told it lost it.
 fn focus_top(stack: &[SurfaceId], shell: &XdgShell, seat: &Seat) {
     for (i, &s) in stack.iter().enumerate() {
-        shell.set_activated(s, i + 1 == stack.len());
+        if let Some(t) = shell.toplevel(s) {
+            t.set_activated(i + 1 == stack.len());
+        }
     }
     seat.set_keyboard_focus(stack.last().copied());
 }
@@ -464,7 +466,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 usable = layout.output_box(&first.output);
                 shell.set_bounds(usable.width, usable.height);
                 for &s in &stack {
-                    shell.configure(s, usable.width, usable.height);
+                    if let Some(t) = shell.toplevel(s) {
+                        t.configure(usable.width, usable.height);
+                    }
                 }
                 cursor.refresh();
                 for s in &mut screens {
@@ -478,19 +482,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut restacked = false;
         while let Some(event) = shell.next_event() {
             match event {
-                ToplevelEvent::Created(surface) => {
+                XdgEvent::Toplevel(surface, ToplevelEvent::Created) => {
                     // Sized before its first frame, so it never shows at its own size.
-                    shell.set_maximized(surface, true);
-                    shell.configure(surface, usable.width, usable.height);
+                    if let Some(t) = shell.toplevel(surface) {
+                        t.set_maximized(true);
+                        t.configure(usable.width, usable.height);
+                    }
                 }
-                ToplevelEvent::Map(surface) => {
+                XdgEvent::Toplevel(surface, ToplevelEvent::Map) => {
                     raise(&mut stack, surface);
                     restacked = true;
                 }
-                ToplevelEvent::Unmap(surface) | ToplevelEvent::Destroy(surface) => {
+                XdgEvent::Toplevel(surface, ToplevelEvent::Unmap | ToplevelEvent::Destroy) => {
                     stack.retain(|&s| s != surface);
                     restacked = true;
                 }
+                _ => {}
             }
         }
 
@@ -612,8 +619,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 KeyCommand::Run(Action::Close) => {
-                    if let Some(&top) = stack.last() {
-                        shell.close(top);
+                    if let Some(t) = stack.last().and_then(|&top| shell.toplevel(top)) {
+                        t.close();
                     }
                 }
                 KeyCommand::Run(Action::Quit) => break 'run,

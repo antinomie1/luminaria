@@ -56,5 +56,5 @@ fn test_cpu_compositor() {
 fn test_popup_tree() {
     let mut tree = PopupTree::new().expect("PopupTree failed");
     assert!(!tree.contains(SurfaceId(123)));
-    assert!(!tree.dismiss_grabs_outside(SurfaceId(123)));
+    assert!(!tree.dismiss_grabs_outside(Some(SurfaceId(123))));
 }

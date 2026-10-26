@@ -1,8 +1,33 @@
 //! Wayland protocol globals and managers: Compositor, XdgShell, Seat, LayerShell, etc.
+//!
+//! A global whose C++ type emits signals queues them, and its `next_event()`
+//! hands them over one at a time: call it until it returns `None` after every
+//! [`Display::dispatch`]. A queue nobody drains keeps growing. Objects clients
+//! create (a toplevel, a layer surface, a text input) are named by their
+//! surface's [`SurfaceId`] or by an id the binding assigns, never by a
+//! reference; each lookup happens on the call, and a stale name finds nothing.
 
 use crate::core::{Display, Error, Holds};
 use crate::ffi;
 use crate::util::{Rect, Transform};
+
+mod activation;
+mod idle;
+mod layer_shell;
+mod pointer_constraints;
+mod seat;
+mod selection;
+mod text_input;
+mod xdg_shell;
+
+pub use activation::*;
+pub use idle::*;
+pub use layer_shell::*;
+pub use pointer_constraints::*;
+pub use seat::*;
+pub use selection::*;
+pub use text_input::*;
+pub use xdg_shell::*;
 
 /// Generational identity of a Wayland surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -10,6 +35,11 @@ pub struct SurfaceId(pub u64);
 
 impl SurfaceId {
     pub const INVALID: Self = Self(0);
+
+    /// `None` for the 0 the C++ side uses for "no surface".
+    pub(crate) fn from_raw(raw: u64) -> Option<Self> {
+        (raw != 0).then_some(Self(raw))
+    }
 
     pub fn is_valid(&self) -> bool {
         self.0 != 0
@@ -94,236 +124,8 @@ impl<'d> Subcompositor<'d> {
     }
 }
 
-/// An event reported by an XDG toplevel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToplevelEvent {
-    Created(SurfaceId),
-    Map(SurfaceId),
-    Unmap(SurfaceId),
-    Destroy(SurfaceId),
-}
-
-/// The `xdg_wm_base` (xdg-shell) global. Its methods take `&self` because
-/// [`ForeignToplevelManager::track`](crate::desktop::ForeignToplevelManager::track)
-/// keeps it borrowed.
-pub struct XdgShell<'d> {
-    pub(crate) raw: cxx::UniquePtr<ffi::XdgShellShim>,
-    _display: Holds<'d>,
-}
-
-impl<'d> XdgShell<'d> {
-    pub fn new(display: &'d Display) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::xdg_shell_new(&display.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _display: Holds::new() })
-        }
-    }
-
-    pub fn set_bounds(&self, width: i32, height: i32) {
-        self.raw.set_bounds(width, height);
-    }
-
-    /// Pull the next toplevel lifecycle event.
-    pub fn next_event(&self) -> Option<ToplevelEvent> {
-        let mut raw = ffi::ToplevelEventRaw {
-            kind: 0,
-            surface_id: 0,
-        };
-        if self.raw.next_toplevel_event(&mut raw) {
-            let surface = SurfaceId(raw.surface_id);
-            Some(match raw.kind {
-                0 => ToplevelEvent::Created(surface),
-                1 => ToplevelEvent::Map(surface),
-                2 => ToplevelEvent::Unmap(surface),
-                3 => ToplevelEvent::Destroy(surface),
-                _ => return None,
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn configure(&self, surface: SurfaceId, width: i32, height: i32) {
-        self.raw
-            .toplevel_configure(surface.0, width, height);
-    }
-
-    pub fn set_maximized(&self, surface: SurfaceId, on: bool) {
-        self.raw.toplevel_set_maximized(surface.0, on);
-    }
-
-    pub fn set_activated(&self, surface: SurfaceId, on: bool) {
-        self.raw.toplevel_set_activated(surface.0, on);
-    }
-
-    pub fn close(&self, surface: SurfaceId) {
-        self.raw.toplevel_close(surface.0);
-    }
-}
-
-/// The `wl_seat` global.
-///
-/// [`Cursor`](crate::gpu::Cursor) and the seat-bound managers
-/// ([`DataDeviceManager`], [`TextInputManager`], ...) keep it borrowed while
-/// they live — the C++ objects hold a `Seat&` — so its methods take `&self`.
-pub struct Seat<'d> {
-    pub(crate) raw: cxx::UniquePtr<ffi::SeatShim>,
-    _display: Holds<'d>,
-}
-
-impl<'d> Seat<'d> {
-    pub fn new(display: &'d Display, name: &str) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::seat_new(&display.raw, name, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _display: Holds::new() })
-        }
-    }
-
-    pub fn set_capabilities(&self, keyboard: bool, pointer: bool, touch: bool) {
-        self.raw.set_capabilities(keyboard, pointer, touch);
-    }
-
-    pub fn set_keymap(&self, xkb_text: &str) -> bool {
-        self.raw.set_keymap(xkb_text)
-    }
-
-    pub fn keymap(&self) -> String {
-        self.raw.keymap()
-    }
-
-    pub fn set_keyboard_focus(&self, surface: Option<SurfaceId>) {
-        self.raw.set_keyboard_focus(surface.map_or(0, |s| s.0));
-    }
-
-    pub fn keyboard_focus(&self) -> Option<SurfaceId> {
-        match self.raw.keyboard_focus() {
-            0 => None,
-            id => Some(SurfaceId(id)),
-        }
-    }
-
-    pub fn notify_key(&self, key: u32, pressed: bool) {
-        self.raw.notify_key(key, pressed);
-    }
-
-    pub fn notify_modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        self.raw
-            .notify_modifiers(depressed, latched, locked, group);
-    }
-
-    pub fn pointer_enter(&self, surface: SurfaceId, sx: f64, sy: f64) {
-        self.raw.pointer_enter(surface.0, sx, sy);
-    }
-
-    pub fn pointer_clear_focus(&self) {
-        self.raw.pointer_clear_focus();
-    }
-
-    pub fn pointer_focus(&self) -> Option<SurfaceId> {
-        match self.raw.pointer_focus() {
-            0 => None,
-            id => Some(SurfaceId(id)),
-        }
-    }
-
-    pub fn pointer_grab(&self) -> Option<SurfaceId> {
-        match self.raw.pointer_grab() {
-            0 => None,
-            id => Some(SurfaceId(id)),
-        }
-    }
-
-    pub fn pointer_motion(&self, sx: f64, sy: f64) {
-        self.raw.pointer_motion(sx, sy);
-    }
-
-    pub fn pointer_button(&self, button: u32, pressed: bool) {
-        self.raw.pointer_button(button, pressed);
-    }
-
-    pub fn pointer_axis(&self, dx: f64, dy: f64) {
-        self.raw.pointer_axis(dx, dy);
-    }
-
-    pub fn pointer_axis_discrete(&self, dx_steps: i32, dy_steps: i32) {
-        self.raw.pointer_axis_discrete(dx_steps, dy_steps);
-    }
-
-    pub fn pointer_axis_stop(&self, horizontal: bool, vertical: bool) {
-        self.raw.pointer_axis_stop(horizontal, vertical);
-    }
-
-    pub fn cursor_surface(&self) -> Option<SurfaceId> {
-        match self.raw.cursor_surface() {
-            0 => None,
-            id => Some(SurfaceId(id)),
-        }
-    }
-
-    pub fn cursor_hidden(&self) -> bool {
-        self.raw.cursor_hidden()
-    }
-
-    pub fn cursor_hotspot(&self) -> (i32, i32) {
-        (self.raw.cursor_hotspot_x(), self.raw.cursor_hotspot_y())
-    }
-
-    pub fn touch_down(&self, surface: SurfaceId, id: i32, x: f64, y: f64) {
-        self.raw.touch_down(surface.0, id, x, y);
-    }
-
-    pub fn touch_motion(&self, id: i32, x: f64, y: f64) {
-        self.raw.touch_motion(id, x, y);
-    }
-
-    pub fn touch_up(&self, id: i32) {
-        self.raw.touch_up(id);
-    }
-
-    pub fn touch_frame(&self) {
-        self.raw.touch_frame();
-    }
-
-    pub fn touch_cancel(&self) {
-        self.raw.touch_cancel();
-    }
-
-    pub fn touch_focus(&self, id: i32) -> Option<SurfaceId> {
-        match self.raw.touch_focus(id) {
-            0 => None,
-            surface => Some(SurfaceId(surface)),
-        }
-    }
-}
-
-/// The `zwlr_layer_shell_v1` global.
-pub struct LayerShell<'d> {
-    #[allow(dead_code)]
-    pub(crate) raw: cxx::UniquePtr<ffi::LayerShellShim>,
-    _display: Holds<'d>,
-}
-
-impl<'d> LayerShell<'d> {
-    pub fn new(display: &'d Display) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::layer_shell_new(&display.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _display: Holds::new() })
-        }
-    }
-}
-
 /// The `wl_output` global publisher.
 pub struct OutputGlobal<'d> {
-    #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::OutputGlobalShim>,
     _display: Holds<'d>,
 }
@@ -348,6 +150,26 @@ impl<'d> OutputGlobal<'d> {
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
+    }
+}
+
+impl OutputGlobal<'_> {
+    /// Where this output sits in the layout, as xdg-output reports it.
+    pub fn set_logical_position(&self, x: i32, y: i32) {
+        self.raw.set_logical_position(x, y);
+    }
+
+    /// The mode now driving the display; re-sent to every bound client.
+    pub fn set_mode(&self, width: i32, height: i32, refresh_mhz: i32) {
+        self.raw.set_mode(width, height, refresh_mhz);
+    }
+
+    pub fn set_scale(&self, scale: i32) {
+        self.raw.set_scale(scale);
+    }
+
+    pub fn set_transform(&self, transform: Transform) {
+        self.raw.set_transform(transform as u32);
     }
 }
 
@@ -400,10 +222,8 @@ macro_rules! define_manager {
 
 define_manager!(Viewporter, ViewporterShim, viewporter_new);
 define_manager!(FractionalScaleManager, FractionalScaleManagerShim, fractional_scale_manager_new);
-define_manager!(XdgActivation, XdgActivationShim, xdg_activation_new);
 define_manager!(XdgDecorationManager, XdgDecorationManagerShim, xdg_decoration_manager_new);
 define_manager!(CursorShapeManager, CursorShapeManagerShim, cursor_shape_manager_new);
-define_manager!(IdleInhibitManager, IdleInhibitManagerShim, idle_inhibit_manager_new);
 define_manager!(SinglePixelBufferManager, SinglePixelBufferManagerShim, single_pixel_buffer_manager_new);
 define_manager!(TearingControlManager, TearingControlManagerShim, tearing_control_manager_new);
 define_manager!(ContentTypeManager, ContentTypeManagerShim, content_type_manager_new);
@@ -412,82 +232,6 @@ define_manager!(CommitTimingManager, CommitTimingManagerShim, commit_timing_mana
 define_manager!(Presentation, PresentationShim, presentation_new);
 define_manager!(BackgroundEffectManager, BackgroundEffectManagerShim, background_effect_manager_new);
 define_manager!(XdgToplevelIconManager, XdgToplevelIconManagerShim, xdg_toplevel_icon_manager_new);
-
-/// The `zwp_text_input_manager_v3` global. It routes through the [`Seat`] it was created for,
-/// which it keeps borrowed.
-pub struct TextInputManager<'a> {
-    pub(crate) raw: cxx::UniquePtr<ffi::TextInputManagerShim>,
-    _borrows: Holds<'a>,
-}
-
-impl<'a> TextInputManager<'a> {
-    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::text_input_manager_new(&display.raw, &seat.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-}
-
-pub struct IdleNotifier<'d> {
-    #[allow(dead_code)]
-    pub(crate) raw: cxx::UniquePtr<ffi::IdleNotifierShim>,
-    _display: Holds<'d>,
-}
-
-impl<'d> IdleNotifier<'d> {
-    pub fn new(display: &'d Display) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::idle_notifier_new(&display.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _display: Holds::new() })
-        }
-    }
-}
-
-/// The `wl_data_device_manager` (clipboard and drag-and-drop) global. It routes through the [`Seat`] it was created for,
-/// which it keeps borrowed.
-pub struct DataDeviceManager<'a> {
-    pub(crate) raw: cxx::UniquePtr<ffi::DataDeviceManagerShim>,
-    _borrows: Holds<'a>,
-}
-
-impl<'a> DataDeviceManager<'a> {
-    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::data_device_manager_new(&display.raw, &seat.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-}
-
-/// The `zwp_primary_selection_device_manager_v1` global. It routes through the [`Seat`] it was created for,
-/// which it keeps borrowed.
-pub struct PrimarySelectionManager<'a> {
-    #[allow(dead_code)]
-    pub(crate) raw: cxx::UniquePtr<ffi::PrimarySelectionManagerShim>,
-    _borrows: Holds<'a>,
-}
-
-impl<'a> PrimarySelectionManager<'a> {
-    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::primary_selection_manager_new(&display.raw, &seat.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-}
 
 /// The `zwp_relative_pointer_manager_v1` global. It routes through the [`Seat`] it was created for,
 /// which it keeps borrowed.
@@ -501,26 +245,6 @@ impl<'a> RelativePointerManager<'a> {
     pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::relative_pointer_manager_new(&display.raw, &seat.raw, &mut err);
-        if raw.is_null() {
-            Err(Error(err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-}
-
-/// The `zwp_pointer_constraints_v1` global. It routes through the [`Seat`] it was created for,
-/// which it keeps borrowed.
-pub struct PointerConstraints<'a> {
-    #[allow(dead_code)]
-    pub(crate) raw: cxx::UniquePtr<ffi::PointerConstraintsShim>,
-    _borrows: Holds<'a>,
-}
-
-impl<'a> PointerConstraints<'a> {
-    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::pointer_constraints_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {

@@ -3,7 +3,7 @@
 use crate::backend::Output;
 use crate::core::Error;
 use crate::ffi;
-use crate::protocol::SurfaceId;
+use crate::protocol::{Layer, LayerShell, SurfaceId, XdgShell};
 use crate::util::{Color, Rect};
 
 /// Manages arrangement of multiple outputs in global logical coordinates.
@@ -186,6 +186,26 @@ impl SceneItem {
         self
     }
 
+    pub(crate) fn from_raw(raw: &ffi::SceneItemRaw) -> Self {
+        Self {
+            kind: raw.kind,
+            rect: Rect::new(raw.x, raw.y, raw.width, raw.height),
+            surface: SurfaceId(raw.surface_id),
+            surface_origin: (raw.surface_x, raw.surface_y),
+            color: Color::rgba(raw.r, raw.g, raw.b, raw.a),
+            thickness: raw.thickness,
+            serial: raw.serial,
+            tag: raw.tag,
+            accepts_input: raw.accepts_input,
+            alpha: raw.alpha,
+            corner_radius: raw.corner_radius,
+            blur_enabled: raw.blur_enabled,
+            blur_xray: raw.blur_xray,
+            shadow_color: Color::rgba(raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a),
+            shadow_feather: raw.shadow_feather,
+        }
+    }
+
     pub(crate) fn to_raw(&self) -> ffi::SceneItemRaw {
         ffi::SceneItemRaw {
             kind: self.kind,
@@ -284,7 +304,13 @@ impl CpuCompositor {
     }
 }
 
-/// Popup hierarchy and grab tracker.
+/// The mapped popups and where they go: above their parents in the scene,
+/// dismissed by a click outside them.
+///
+/// It holds each popup it was given until the popup is destroyed, and lets go
+/// of it by itself then; [`remove`](Self::remove) is for policy. It needs no
+/// borrow of the [`XdgShell`]: the shell is only asked, in [`add`](Self::add),
+/// which popup an id names.
 pub struct PopupTree {
     raw: cxx::UniquePtr<ffi::PopupTreeShim>,
 }
@@ -299,12 +325,116 @@ impl PopupTree {
         }
     }
 
+    /// Track `popup`, drawn relative to its xdg parent. False if `shell` has
+    /// no such popup (any more).
+    pub fn add(&mut self, shell: &XdgShell<'_>, popup: SurfaceId) -> bool {
+        self.raw.pin_mut().add(&shell.raw, popup.0, 0)
+    }
+
+    /// Track `popup` (or re-parent it) as a child of `parent`: how a layer
+    /// surface's popup, which has no xdg parent, is placed.
+    pub fn add_with_parent(&mut self, shell: &XdgShell<'_>, popup: SurfaceId, parent: SurfaceId) -> bool {
+        self.raw.pin_mut().add(&shell.raw, popup.0, parent.0)
+    }
+
+    /// Only mapped popups are drawn and hit.
+    pub fn set_mapped(&mut self, popup: SurfaceId, mapped: bool) {
+        self.raw.pin_mut().set_mapped(popup.0, mapped);
+    }
+
+    pub fn remove(&mut self, popup: SurfaceId) {
+        self.raw.pin_mut().remove(popup.0);
+    }
+
+    /// Push the mapped popups onto `scene`, each above its parent's surface
+    /// item and at its offset from it, carrying the parent's tag. Popups whose
+    /// parent is not in `scene` are left out. Submenus nest.
+    pub fn append_to(&self, scene: &mut Vec<SceneItem>) {
+        let raw: Vec<ffi::SceneItemRaw> = scene.iter().map(SceneItem::to_raw).collect();
+        scene.extend(self.raw.append_to(&raw).iter().map(SceneItem::from_raw));
+    }
+
+    /// Whether `surface` is (part of) a mapped popup in the tree.
     pub fn contains(&self, surface: SurfaceId) -> bool {
         self.raw.contains(surface.0)
     }
 
-    pub fn dismiss_grabs_outside(&mut self, surface: SurfaceId) -> bool {
-        self.raw.pin_mut().dismiss_grabs_outside(surface.0)
+    /// The topmost mapped popup holding a grab.
+    pub fn active_grab(&self) -> Option<SurfaceId> {
+        match self.raw.active_grab() {
+            0 => None,
+            id => Some(SurfaceId(id)),
+        }
+    }
+
+    /// A click landed on `surface` (or on nothing): if that is outside every
+    /// popup, dismiss the grabbing ones. True when one was dismissed, which
+    /// is when the click should not reach a client.
+    pub fn dismiss_grabs_outside(&mut self, surface: Option<SurfaceId>) -> bool {
+        self.raw.pin_mut().dismiss_grabs_outside(surface.map_or(0, |s| s.0))
+    }
+}
+
+/// Layer surfaces per output: their layout, exclusive zones and the usable
+/// area they leave, and their place in the scene. Outputs are named by an id
+/// the compositor picks.
+///
+/// Like [`PopupTree`] it drops a destroyed layer surface by itself and needs
+/// no borrow of the [`LayerShell`].
+pub struct LayerManager {
+    raw: cxx::UniquePtr<ffi::LayerManagerShim>,
+}
+
+impl LayerManager {
+    pub fn new() -> Result<Self, Error> {
+        let raw = ffi::layer_manager_new();
+        if raw.is_null() {
+            Err(Error("failed to create layer manager".into()))
+        } else {
+            Ok(Self { raw })
+        }
+    }
+
+    /// Put `surface` on output `output`. False if `shell` has no such layer
+    /// surface (any more).
+    pub fn add(&mut self, shell: &LayerShell<'_>, surface: SurfaceId, output: u32) -> bool {
+        self.raw.pin_mut().add(&shell.raw, surface.0, output)
+    }
+
+    pub fn remove(&mut self, surface: SurfaceId) {
+        self.raw.pin_mut().remove(surface.0);
+    }
+
+    /// Only mapped surfaces take space and are drawn.
+    pub fn set_mapped(&mut self, surface: SurfaceId, mapped: bool) {
+        self.raw.pin_mut().set_mapped(surface.0, mapped);
+    }
+
+    /// Configure every surface on `output`, whose whole box is `full`, and
+    /// return what is left of `usable` after their exclusive zones: hand it
+    /// to [`XdgShell::set_bounds`] and lay windows out in it.
+    pub fn arrange(&mut self, output: u32, full: Rect, usable: Rect) -> Rect {
+        self.raw.pin_mut().arrange(output, full, usable)
+    }
+
+    /// Push `output`'s mapped surfaces of `layer` onto `scene`, where the last
+    /// [`arrange`](Self::arrange) put them.
+    pub fn append_to(&self, scene: &mut Vec<SceneItem>, output: u32, layer: Layer) {
+        scene.extend(self.raw.append_to(output, layer as u32).iter().map(SceneItem::from_raw));
+    }
+
+    /// The mapped layer surface `surface` belongs to, if it may take keyboard
+    /// focus.
+    pub fn keyboard_target(&self, surface: SurfaceId) -> Option<SurfaceId> {
+        match self.raw.keyboard_target(surface.0) {
+            0 => None,
+            id => Some(SurfaceId(id)),
+        }
+    }
+
+    /// Close every surface on `output`: its monitor went away.
+    pub fn close_output(&mut self, output: u32) {
+        self.raw.pin_mut().close_output(output);
     }
 }
 

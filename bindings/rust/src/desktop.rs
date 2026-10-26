@@ -3,9 +3,10 @@
 use std::pin::Pin;
 
 use crate::core::{Display, Error, Holds};
-use crate::ffi;
+use crate::ffi::{self, EventKind};
 use crate::gpu::VulkanRenderer;
-use crate::protocol::{DataDeviceManager, Seat, TextInputManager, XdgShell};
+use crate::protocol::{DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell};
+use crate::util::Rect;
 use crate::shell::OutputLayout;
 
 /// Taskbar and window switcher protocol manager (`zwlr_foreign_toplevel_management_v1`).
@@ -72,7 +73,30 @@ impl<'d> WorkspaceManager<'d> {
     }
 }
 
-/// Screen locking protocol manager (`ext_session_lock_manager_v1`).
+/// A lock client's claim on the session, named by the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LockId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLockEvent {
+    /// A client wants the session locked. Cover every output, then
+    /// [`SessionLock::send_locked`]; or refuse with [`SessionLock::send_finished`].
+    NewLock(LockId),
+    /// The lock client made `surface` its lock surface for one output.
+    /// Configure it to that output's size.
+    NewSurface { lock: LockId, surface: SurfaceId },
+    SurfaceMap(SurfaceId),
+    SurfaceDestroy(SurfaceId),
+    /// The lock object is gone. `unlocked`: the client unlocked in order.
+    /// Otherwise it died holding the lock, and the session STAYS locked
+    /// ([`SessionLockManager::is_locked`] says so) until a new lock client
+    /// unlocks it.
+    LockDestroy { lock: LockId, unlocked: bool },
+}
+
+/// Screen locking protocol manager (`ext_session_lock_manager_v1`). It fails
+/// closed: drawing and input should follow [`is_locked`](Self::is_locked), not
+/// whether a lock client is alive.
 pub struct SessionLockManager<'d> {
     pub(crate) raw: cxx::UniquePtr<ffi::SessionLockManagerShim>,
     _display: Holds<'d>,
@@ -88,9 +112,129 @@ impl<'d> SessionLockManager<'d> {
             Ok(Self { raw, _display: Holds::new() })
         }
     }
+}
 
-    pub fn is_locked(&mut self) -> bool {
-        ffi::session_lock_manager_locked(self.raw.pin_mut())
+impl SessionLockManager<'_> {
+    pub fn next_event(&self) -> Option<SessionLockEvent> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            return Some(match raw.kind {
+                EventKind::NewSessionLock => SessionLockEvent::NewLock(LockId(raw.id)),
+                EventKind::NewLockSurface => SessionLockEvent::NewSurface {
+                    lock: LockId(raw.id),
+                    surface: SurfaceId(raw.other),
+                },
+                EventKind::LockSurfaceMap => SessionLockEvent::SurfaceMap(SurfaceId(raw.id)),
+                EventKind::LockSurfaceDestroy => SessionLockEvent::SurfaceDestroy(SurfaceId(raw.id)),
+                EventKind::SessionLockDestroy => SessionLockEvent::LockDestroy {
+                    lock: LockId(raw.id),
+                    unlocked: raw.flag,
+                },
+                _ => continue,
+            });
+        }
+    }
+
+    /// True from the first `send_locked` until a client's orderly unlock.
+    pub fn is_locked(&self) -> bool {
+        self.raw.locked()
+    }
+
+    /// The lock currently held, if its client is alive. `None` does not mean
+    /// unlocked: see [`is_locked`](Self::is_locked).
+    pub fn current(&self) -> Option<SessionLock<'_>> {
+        match self.raw.current() {
+            0 => None,
+            id => Some(self.lock(LockId(id))),
+        }
+    }
+
+    /// A lock by id. Once its client is gone every call on it is a no-op.
+    pub fn lock(&self, lock: LockId) -> SessionLock<'_> {
+        SessionLock { mgr: &*self.raw, lock }
+    }
+
+    /// The lock surface whose surface is `surface`, if there is one now.
+    pub fn lock_surface(&self, surface: SurfaceId) -> Option<LockSurface<'_>> {
+        let mut info = ffi::LockSurfaceInfoRaw::default();
+        self.raw
+            .lock_surface_info(surface.0, &mut info)
+            .then_some(LockSurface { mgr: self.raw.as_ref()?, surface })
+    }
+}
+
+/// A lock, looked up on every call.
+#[derive(Clone, Copy)]
+pub struct SessionLock<'m> {
+    mgr: &'m ffi::SessionLockManagerShim,
+    lock: LockId,
+}
+
+impl SessionLock<'_> {
+    pub fn id(&self) -> LockId {
+        self.lock
+    }
+
+    /// "The screen is covered." Send it only once nothing else is visible.
+    pub fn send_locked(&self) {
+        self.mgr.send_locked(self.lock.0);
+    }
+
+    /// Refuse the lock, or give up one that can no longer be honoured.
+    pub fn send_finished(&self) {
+        self.mgr.send_finished(self.lock.0);
+    }
+
+    /// Whether `send_locked` has been sent.
+    pub fn is_locked(&self) -> bool {
+        self.mgr.lock_locked(self.lock.0)
+    }
+
+    pub fn surfaces(&self) -> Vec<SurfaceId> {
+        self.mgr.lock_surfaces(self.lock.0).into_iter().map(SurfaceId).collect()
+    }
+}
+
+/// One output's lock surface, looked up by its surface on every call.
+#[derive(Clone, Copy)]
+pub struct LockSurface<'m> {
+    mgr: &'m ffi::SessionLockManagerShim,
+    surface: SurfaceId,
+}
+
+impl LockSurface<'_> {
+    fn info(&self) -> ffi::LockSurfaceInfoRaw {
+        let mut info = ffi::LockSurfaceInfoRaw::default();
+        self.mgr.lock_surface_info(self.surface.0, &mut info);
+        info
+    }
+
+    pub fn surface(&self) -> SurfaceId {
+        self.surface
+    }
+
+    pub fn lock(&self) -> LockId {
+        LockId(self.info().lock)
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.info().mapped
+    }
+
+    /// The size last configured.
+    pub fn size(&self) -> (u32, u32) {
+        let i = self.info();
+        (i.width, i.height)
+    }
+
+    /// Whether this is the lock surface for `output`.
+    pub fn is_on(&self, output: &OutputGlobal<'_>) -> bool {
+        self.mgr.lock_surface_on_output(self.surface.0, &output.raw)
+    }
+
+    /// Size it to its output. Returns the configure serial.
+    pub fn configure(&self, width: u32, height: u32) -> u32 {
+        self.mgr.lock_surface_configure(self.surface.0, width, height)
     }
 }
 
@@ -137,10 +281,25 @@ impl<'a> DataControlManager<'a> {
     }
 }
 
+/// An input method client (one per seat), named by the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InputMethodId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMethodEvent {
+    New(InputMethodId),
+    /// It took (or released) the keyboard: while grabbed, keys go to it
+    /// through [`InputMethod::grab_send_key`] instead of the focused client.
+    GrabChange { input_method: InputMethodId, grabbed: bool },
+    Destroy(InputMethodId),
+    /// A candidate window. Draw it next to [`InputMethodManager::popup_text_input_rectangle`].
+    NewPopupSurface { input_method: InputMethodId, surface: SurfaceId },
+    PopupSurfaceDestroy(SurfaceId),
+}
+
 /// Input method manager (`zwp_input_method_manager_v2` for IBus/Fcitx).
 /// Borrows the [`Seat`] and the [`TextInputManager`] it is bridged to.
 pub struct InputMethodManager<'a> {
-    #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::InputMethodManagerShim>,
     _borrows: Holds<'a>,
 }
@@ -158,6 +317,86 @@ impl<'a> InputMethodManager<'a> {
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
+    }
+}
+
+impl InputMethodManager<'_> {
+    pub fn next_event(&self) -> Option<InputMethodEvent> {
+        loop {
+            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
+            let input_method = InputMethodId(raw.id);
+            return Some(match raw.kind {
+                EventKind::NewInputMethod => InputMethodEvent::New(input_method),
+                EventKind::InputMethodGrabChange => InputMethodEvent::GrabChange {
+                    input_method,
+                    grabbed: raw.flag,
+                },
+                EventKind::InputMethodDestroy => InputMethodEvent::Destroy(input_method),
+                EventKind::NewInputPopupSurface => InputMethodEvent::NewPopupSurface {
+                    input_method,
+                    surface: SurfaceId(raw.other),
+                },
+                EventKind::InputPopupSurfaceDestroy => InputMethodEvent::PopupSurfaceDestroy(SurfaceId(raw.id)),
+                _ => continue,
+            });
+        }
+    }
+
+    /// The input method bound to the seat.
+    pub fn current(&self) -> Option<InputMethod<'_>> {
+        match self.raw.current() {
+            0 => None,
+            id => Some(InputMethod { mgr: self.raw.as_ref()?, id: InputMethodId(id) }),
+        }
+    }
+
+    pub fn input_method(&self, id: InputMethodId) -> InputMethod<'_> {
+        InputMethod { mgr: &*self.raw, id }
+    }
+
+    /// The text cursor a candidate window belongs next to, in the coordinates
+    /// of the text field's surface.
+    pub fn popup_text_input_rectangle(&self, popup: SurfaceId) -> Rect {
+        self.raw.popup_text_input_rectangle(popup.0)
+    }
+}
+
+/// An input method, looked up on every call; once it is gone, every call is a
+/// no-op.
+#[derive(Clone, Copy)]
+pub struct InputMethod<'m> {
+    mgr: &'m ffi::InputMethodManagerShim,
+    id: InputMethodId,
+}
+
+impl InputMethod<'_> {
+    pub fn id(&self) -> InputMethodId {
+        self.id
+    }
+
+    /// Whether a text input is enabled and focused for it to serve.
+    pub fn is_active(&self) -> bool {
+        self.mgr.active(self.id.0)
+    }
+
+    pub fn has_keyboard_grab(&self) -> bool {
+        self.mgr.has_keyboard_grab(self.id.0)
+    }
+
+    pub fn grab_send_key(&self, time: u32, key: u32, pressed: bool) {
+        self.mgr.grab_send_key(self.id.0, time, key, pressed);
+    }
+
+    pub fn grab_send_modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        self.mgr.grab_send_modifiers(self.id.0, depressed, latched, locked, group);
+    }
+
+    pub fn grab_send_repeat_info(&self, rate: i32, delay: i32) {
+        self.mgr.grab_send_repeat_info(self.id.0, rate, delay);
+    }
+
+    pub fn popup_surfaces(&self) -> Vec<SurfaceId> {
+        self.mgr.popup_surfaces(self.id.0).into_iter().map(SurfaceId).collect()
     }
 }
 

@@ -34,7 +34,7 @@ fn test_desktop_protocols() {
     wm.remove_workspace(ws2);
 
     // Session lock manager
-    let mut slm = SessionLockManager::new(&display).expect("SessionLockManager failed");
+    let slm = SessionLockManager::new(&display).expect("SessionLockManager failed");
     assert!(!slm.is_locked());
 
     // Output manager

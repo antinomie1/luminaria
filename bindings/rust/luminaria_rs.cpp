@@ -13,6 +13,7 @@
 // The rule that keeps it sound: C++ never calls Rust. libwayland's callbacks
 // only append to a shim's queue, and Rust drains it after `dispatch()` has
 // returned, while no luminaria signal is on the stack.
+#include <unistd.h>
 #include <wayland-server-core.h>
 
 #include <algorithm>
@@ -23,8 +24,10 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -851,7 +854,10 @@ std::uint32_t LibinputBackendShim::capabilities() const {
 // Protocols
 // ============================================================================
 
+// 0 is Rust's "no surface". A live id never packs to 0 (generations start at
+// 1), but SurfaceId{0, 0} would still pass valid(), which checks the index.
 inline lm::SurfaceId id_from_u64(std::uint64_t raw) {
+    if (raw == 0) return lm::SurfaceId{};
     return lm::SurfaceId{static_cast<std::uint32_t>(raw & 0xffffffff), static_cast<std::uint32_t>(raw >> 32)};
 }
 
@@ -948,18 +954,234 @@ std::unique_ptr<SubcompositorShim> subcompositor_new(const DisplayShim& display,
     }
 }
 
+namespace {
+
+// An event for Rust to drain; `kind` says which of the other fields mean
+// something. Every shim that forwards signals keeps one queue of these.
+EventRaw event(EventKind kind, std::uint64_t id, std::uint64_t other = 0) {
+    EventRaw e{};
+    e.kind = kind;
+    e.id = id;
+    e.other = other;
+    return e;
+}
+
+struct Events {
+    std::deque<EventRaw> queue;
+
+    void push(EventRaw e) { queue.push_back(std::move(e)); }
+    bool pop(EventRaw& out) {
+        if (queue.empty()) return false;
+        out = std::move(queue.front());
+        queue.pop_front();
+        return true;
+    }
+};
+
+// Identity for an object that has no surface of its own to be named by (a
+// lock, an idle notification, a text input). Never reused.
+std::uint64_t next_object_id() {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+lm::Box to_box(const Rect& r) { return lm::Box{r.x, r.y, r.width, r.height}; }
+Rect to_rect(const lm::Box& b) { return Rect{b.x, b.y, b.width, b.height}; }
+
+std::uint64_t surface_u64(lm::Surface* s) { return s != nullptr ? u64_from_id(s->id()) : 0; }
+
+rust::Vec<rust::String> to_rust(const std::vector<std::string>& v) {
+    rust::Vec<rust::String> out;
+    for (const auto& s : v) out.push_back(to_rust(s));
+    return out;
+}
+
+lm::SceneItem scene_item(const SceneItemRaw& raw) {
+    lm::SceneItem it{};
+    it.kind = static_cast<lm::SceneItem::Kind>(raw.kind);
+    it.box = lm::Box{raw.x, raw.y, raw.width, raw.height};
+    it.surface = id_from_u64(raw.surface_id);
+    it.x = raw.surface_x;
+    it.y = raw.surface_y;
+    it.color = lm::Color{raw.r, raw.g, raw.b, raw.a};
+    it.thickness = raw.thickness;
+    it.serial = raw.serial;
+    it.tag = raw.tag;
+    it.accepts_input = raw.accepts_input;
+    it.alpha = raw.alpha;
+    it.corner_radius = raw.corner_radius;
+    it.blur.enabled = raw.blur_enabled;
+    it.blur.xray = raw.blur_xray;
+    it.shadow.color = lm::Color{raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a};
+    it.shadow.feather = raw.shadow_feather;
+    return it;
+}
+
+std::vector<lm::SceneItem> scene_items(rust::Slice<const SceneItemRaw> items) {
+    std::vector<lm::SceneItem> scene;
+    scene.reserve(items.size());
+    for (const auto& raw : items) scene.push_back(scene_item(raw));
+    return scene;
+}
+
+SceneItemRaw scene_item_raw(const lm::SceneItem& it) {
+    SceneItemRaw raw{};
+    raw.kind = static_cast<std::uint32_t>(it.kind);
+    raw.x = it.box.x;
+    raw.y = it.box.y;
+    raw.width = it.box.width;
+    raw.height = it.box.height;
+    raw.surface_id = u64_from_id(it.surface);
+    raw.surface_x = it.x;
+    raw.surface_y = it.y;
+    raw.r = it.color.r;
+    raw.g = it.color.g;
+    raw.b = it.color.b;
+    raw.a = it.color.a;
+    raw.thickness = it.thickness;
+    raw.serial = it.serial;
+    raw.tag = it.tag;
+    raw.accepts_input = it.accepts_input;
+    raw.alpha = it.alpha;
+    raw.corner_radius = it.corner_radius;
+    raw.blur_enabled = it.blur.enabled;
+    raw.blur_xray = it.blur.xray;
+    raw.shadow_r = it.shadow.color.r;
+    raw.shadow_g = it.shadow.color.g;
+    raw.shadow_b = it.shadow.color.b;
+    raw.shadow_a = it.shadow.color.a;
+    raw.shadow_feather = it.shadow.feather;
+    return raw;
+}
+
+} // namespace
+
+// Every toplevel and popup is watched from the moment the shell announces it
+// until its destroy signal, which drops the watch; Rust names them by surface.
 struct XdgShellShim::Impl {
-    std::optional<lm::XdgShell> shell;
     struct ToplevelEntry {
         lm::Toplevel* toplevel = nullptr;
-        std::uint64_t surface_id = 0;
         Conn<lm::ToplevelMap> on_map;
         Conn<lm::ToplevelUnmap> on_unmap;
         Conn<lm::ToplevelDestroy> on_destroy;
+        Conn<lm::ToplevelRequestMaximize> on_maximize;
+        Conn<lm::ToplevelRequestFullscreen> on_fullscreen;
+        Conn<lm::ToplevelRequestMinimize> on_minimize;
+        Conn<lm::ToplevelRequestMove> on_move;
+        Conn<lm::ToplevelRequestResize> on_resize;
+        Conn<lm::ToplevelRequestWindowMenu> on_window_menu;
+        Conn<lm::ToplevelIdentityChange> on_identity;
+        Conn<lm::ToplevelStateChange> on_state;
+        Conn<lm::ToplevelParentChange> on_parent;
     };
-    std::vector<std::unique_ptr<ToplevelEntry>> toplevels;
-    std::deque<ToplevelEventRaw> events;
+    struct PopupEntry {
+        lm::Popup* popup = nullptr;
+        Conn<lm::PopupMap> on_map;
+        Conn<lm::PopupUnmap> on_unmap;
+        Conn<lm::PopupDestroy> on_destroy;
+        Conn<lm::PopupReposition> on_reposition;
+        Conn<lm::PopupGrab> on_grab;
+    };
+    // What set_popup_constraint_areas() was last told, for the query below:
+    // the shell asks synchronously, and C++ never calls Rust.
+    struct Area {
+        std::uint64_t surface;
+        lm::Box parent, usable;
+    };
+
+    std::optional<lm::XdgShell> shell;
+    std::unordered_map<std::uint64_t, std::unique_ptr<ToplevelEntry>> toplevels;
+    std::unordered_map<std::uint64_t, std::unique_ptr<PopupEntry>> popups;
+    std::vector<Area> areas;
+    Events events;
     Conn<lm::NewToplevel> on_new_toplevel;
+    Conn<lm::NewPopup> on_new_popup;
+
+    lm::Toplevel* toplevel(std::uint64_t id) const {
+        const auto it = toplevels.find(id);
+        return it == toplevels.end() ? nullptr : it->second->toplevel;
+    }
+    lm::Popup* popup(std::uint64_t id) const {
+        const auto it = popups.find(id);
+        return it == popups.end() ? nullptr : it->second->popup;
+    }
+
+    void watch(lm::Toplevel& t) {
+        const std::uint64_t id = u64_from_id(t.surface().id());
+        auto entry = std::make_unique<ToplevelEntry>();
+        entry->toplevel = &t;
+        auto plain = [this, id](EventKind kind) {
+            return [this, id, kind](auto&) { events.push(event(kind, id)); };
+        };
+        entry->on_map = t.map.connect(plain(EventKind::ToplevelMap));
+        entry->on_unmap = t.unmap.connect(plain(EventKind::ToplevelUnmap));
+        entry->on_minimize = t.request_minimize.connect(plain(EventKind::ToplevelRequestMinimize));
+        entry->on_identity = t.identity_change.connect(plain(EventKind::ToplevelIdentityChange));
+        entry->on_state = t.state_change.connect(plain(EventKind::ToplevelStateChange));
+        entry->on_maximize = t.request_maximize.connect([this, id](lm::ToplevelRequestMaximize& e) {
+            EventRaw ev = event(EventKind::ToplevelRequestMaximize, id);
+            ev.flag = e.maximized;
+            events.push(std::move(ev));
+        });
+        entry->on_fullscreen = t.request_fullscreen.connect([this, id](lm::ToplevelRequestFullscreen& e) {
+            EventRaw ev = event(EventKind::ToplevelRequestFullscreen, id);
+            ev.flag = e.fullscreen;
+            events.push(std::move(ev));
+        });
+        entry->on_move = t.request_move.connect([this, id](lm::ToplevelRequestMove& e) {
+            EventRaw ev = event(EventKind::ToplevelRequestMove, id);
+            ev.serial = e.serial;
+            events.push(std::move(ev));
+        });
+        entry->on_resize = t.request_resize.connect([this, id](lm::ToplevelRequestResize& e) {
+            EventRaw ev = event(EventKind::ToplevelRequestResize, id);
+            ev.serial = e.serial;
+            ev.value = e.edges;
+            events.push(std::move(ev));
+        });
+        entry->on_window_menu = t.request_window_menu.connect([this, id](lm::ToplevelRequestWindowMenu& e) {
+            EventRaw ev = event(EventKind::ToplevelRequestWindowMenu, id);
+            ev.serial = e.serial;
+            ev.x = e.x;
+            ev.y = e.y;
+            events.push(std::move(ev));
+        });
+        entry->on_parent = t.parent_change.connect([this, id](lm::ToplevelParentChange& e) {
+            events.push(event(EventKind::ToplevelParentChange, id,
+                              e.parent != nullptr ? surface_u64(&e.parent->surface()) : 0));
+        });
+        // Erasing the entry inside its own slot is safe: a Signal never frees
+        // the slot that is running.
+        entry->on_destroy = t.destroy.connect([this, id](lm::ToplevelDestroy&) {
+            events.push(event(EventKind::ToplevelDestroy, id));
+            toplevels.erase(id);
+        });
+        events.push(event(EventKind::NewToplevel, id));
+        toplevels[id] = std::move(entry);
+    }
+
+    void watch(lm::Popup& p) {
+        const std::uint64_t id = u64_from_id(p.surface().id());
+        auto entry = std::make_unique<PopupEntry>();
+        entry->popup = &p;
+        auto plain = [this, id](EventKind kind) {
+            return [this, id, kind](auto&) { events.push(event(kind, id)); };
+        };
+        entry->on_map = p.map.connect(plain(EventKind::PopupMap));
+        entry->on_unmap = p.unmap.connect(plain(EventKind::PopupUnmap));
+        entry->on_reposition = p.reposition.connect(plain(EventKind::PopupReposition));
+        entry->on_grab = p.grab.connect([this, id](lm::PopupGrab& e) {
+            EventRaw ev = event(EventKind::PopupGrab, id);
+            ev.serial = e.serial;
+            events.push(std::move(ev));
+        });
+        entry->on_destroy = p.destroy.connect([this, id](lm::PopupDestroy&) {
+            events.push(event(EventKind::PopupDestroy, id));
+            popups.erase(id);
+        });
+        events.push(event(EventKind::NewPopup, id, surface_u64(p.parent_surface())));
+        popups[id] = std::move(entry);
+    }
 };
 XdgShellShim::~XdgShellShim() = default;
 XdgShellShim::XdgShellShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -972,31 +1194,23 @@ std::unique_ptr<XdgShellShim> xdg_shell_new(const DisplayShim& display, rust::St
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<XdgShellShim::Impl>();
         impl->shell.emplace(std::move(*r));
-        auto* raw_impl = impl.get();
-        raw_impl->on_new_toplevel = raw_impl->shell->new_toplevel().connect([raw_impl](lm::NewToplevel& e) {
-            auto entry = std::make_unique<XdgShellShim::Impl::ToplevelEntry>();
-            entry->toplevel = &e.toplevel;
-            entry->surface_id = u64_from_id(e.toplevel.surface().id());
-            raw_impl->events.push_back(ToplevelEventRaw{0 /* Created */, entry->surface_id});
-
-            auto* p_entry = entry.get();
-            entry->on_map = e.toplevel.map.connect([raw_impl, p_entry](lm::ToplevelMap&) {
-                raw_impl->events.push_back(ToplevelEventRaw{1 /* Map */, p_entry->surface_id});
-            });
-            entry->on_unmap = e.toplevel.unmap.connect([raw_impl, p_entry](lm::ToplevelUnmap&) {
-                raw_impl->events.push_back(ToplevelEventRaw{2 /* Unmap */, p_entry->surface_id});
-            });
-            entry->on_destroy = e.toplevel.destroy.connect([raw_impl, p_entry](lm::ToplevelDestroy&) {
-                raw_impl->events.push_back(ToplevelEventRaw{3 /* Destroy */, p_entry->surface_id});
-                for (auto it = raw_impl->toplevels.begin(); it != raw_impl->toplevels.end(); ++it) {
-                    if (it->get() == p_entry) {
-                        raw_impl->toplevels.erase(it);
-                        break;
+        auto* raw = impl.get();
+        raw->on_new_toplevel = raw->shell->new_toplevel().connect(
+            [raw](lm::NewToplevel& e) { raw->watch(e.toplevel); });
+        raw->on_new_popup = raw->shell->new_popup().connect(
+            [raw](lm::NewPopup& e) { raw->watch(e.popup); });
+        raw->shell->set_popup_constraint_query(
+            [raw](lm::Surface& parent, lm::Box& parent_box, lm::Box& usable) {
+                const std::uint64_t id = u64_from_id(parent.id());
+                for (const auto& a : raw->areas) {
+                    if (a.surface == id) {
+                        parent_box = a.parent;
+                        usable = a.usable;
+                        return !usable.empty();
                     }
                 }
+                return false;
             });
-            raw_impl->toplevels.push_back(std::move(entry));
-        });
         return std::make_unique<XdgShellShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -1008,51 +1222,101 @@ void XdgShellShim::set_bounds(std::int32_t width, std::int32_t height) const {
     if (impl_->shell) impl_->shell->set_bounds(width, height);
 }
 
-bool XdgShellShim::next_toplevel_event(ToplevelEventRaw& out) const {
-    if (impl_->events.empty()) return false;
-    out = impl_->events.front();
-    impl_->events.pop_front();
+bool XdgShellShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+
+rust::Vec<std::uint64_t> XdgShellShim::toplevels() const {
+    rust::Vec<std::uint64_t> out;
+    for (const auto& [id, entry] : impl_->toplevels) out.push_back(id);
+    return out;
+}
+
+// Bits of ToplevelStates, as src/protocol/xdg_shell.rs spells them.
+enum : std::uint32_t {
+    kMaximized = 1, kFullscreen = 2, kActivated = 4, kResizing = 8, kTiled = 16, kMinimized = 32,
+};
+
+bool XdgShellShim::toplevel_info(std::uint64_t surface_id, ToplevelInfoRaw& out) const {
+    const lm::Toplevel* t = impl_->toplevel(surface_id);
+    if (t == nullptr) return false;
+    out.parent = t->parent() != nullptr ? surface_u64(&t->parent()->surface()) : 0;
+    out.mapped = t->mapped();
+    out.min_width = t->min_width();
+    out.min_height = t->min_height();
+    out.max_width = t->max_width();
+    out.max_height = t->max_height();
+    const lm::XdgGeometry g = t->geometry();
+    out.geometry = Rect{g.x, g.y, g.width, g.height};
+    out.states = (t->is_maximized() ? kMaximized : 0u) | (t->is_fullscreen() ? kFullscreen : 0u) |
+                 (t->is_activated() ? kActivated : 0u) | (t->is_resizing() ? kResizing : 0u) |
+                 (t->is_tiled() ? kTiled : 0u) | (t->is_minimized() ? kMinimized : 0u);
+    out.pending_width = t->pending_width();
+    out.pending_height = t->pending_height();
     return true;
 }
 
-void XdgShellShim::toplevel_configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height) const {
-    for (const auto& entry : impl_->toplevels) {
-        if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
-            (void)entry->toplevel->configure(width, height);
-            return;
-        }
-    }
+rust::String XdgShellShim::toplevel_title(std::uint64_t surface_id) const {
+    const lm::Toplevel* t = impl_->toplevel(surface_id);
+    return t != nullptr ? to_rust(t->title()) : rust::String{};
 }
 
-void XdgShellShim::toplevel_set_maximized(std::uint64_t surface_id, bool on) const {
-    for (const auto& entry : impl_->toplevels) {
-        if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
-            entry->toplevel->set_maximized(on);
-            return;
-        }
-    }
+rust::String XdgShellShim::toplevel_app_id(std::uint64_t surface_id) const {
+    const lm::Toplevel* t = impl_->toplevel(surface_id);
+    return t != nullptr ? to_rust(t->app_id()) : rust::String{};
 }
 
-void XdgShellShim::toplevel_set_activated(std::uint64_t surface_id, bool on) const {
-    for (const auto& entry : impl_->toplevels) {
-        if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
-            entry->toplevel->set_activated(on);
-            return;
-        }
+std::uint32_t XdgShellShim::toplevel_configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height) const {
+    lm::Toplevel* t = impl_->toplevel(surface_id);
+    return t != nullptr ? t->configure(width, height) : 0;
+}
+
+void XdgShellShim::toplevel_set_state(std::uint64_t surface_id, std::uint32_t state, bool on) const {
+    lm::Toplevel* t = impl_->toplevel(surface_id);
+    if (t == nullptr) return;
+    switch (state) {
+    case kMaximized: t->set_maximized(on); break;
+    case kFullscreen: t->set_fullscreen(on); break;
+    case kActivated: t->set_activated(on); break;
+    case kResizing: t->set_resizing(on); break;
+    case kTiled: t->set_tiled(on); break;
+    case kMinimized: t->set_minimized(on); break;
+    default: break;
     }
 }
 
 void XdgShellShim::toplevel_close(std::uint64_t surface_id) const {
-    for (const auto& entry : impl_->toplevels) {
-        if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
-            entry->toplevel->close();
-            return;
-        }
+    if (lm::Toplevel* t = impl_->toplevel(surface_id); t != nullptr) t->close();
+}
+
+bool XdgShellShim::popup_info(std::uint64_t surface_id, PopupInfoRaw& out) const {
+    const lm::Popup* p = impl_->popup(surface_id);
+    if (p == nullptr) return false;
+    out.parent = surface_u64(p->parent_surface());
+    out.mapped = p->mapped();
+    out.has_grab = p->has_grab();
+    out.x = p->x();
+    out.y = p->y();
+    out.width = p->width();
+    out.height = p->height();
+    return true;
+}
+
+void XdgShellShim::popup_dismiss(std::uint64_t surface_id) const {
+    if (lm::Popup* p = impl_->popup(surface_id); p != nullptr) p->dismiss();
+}
+
+void XdgShellShim::set_popup_constraint_areas(rust::Slice<const PopupAreaRaw> areas) const {
+    impl_->areas.clear();
+    for (const auto& a : areas) {
+        impl_->areas.push_back(Impl::Area{a.surface_id, to_box(a.parent), to_box(a.usable)});
     }
 }
 
 struct SeatShim::Impl {
     std::optional<lm::Seat> seat;
+    Events events;
+    Conn<lm::SeatKeyboardFocus> on_keyboard_focus;
+    Conn<lm::SeatPointerFocus> on_pointer_focus;
+    Conn<lm::SeatCursorChange> on_cursor;
 };
 SeatShim::~SeatShim() = default;
 SeatShim::SeatShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1065,6 +1329,20 @@ std::unique_ptr<SeatShim> seat_new(const DisplayShim& display, rust::Str name, r
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<SeatShim::Impl>();
         impl->seat.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_keyboard_focus = raw->seat->keyboard_focus_changed().connect([raw](lm::SeatKeyboardFocus& e) {
+            raw->events.push(event(EventKind::SeatKeyboardFocus, u64_from_id(e.surface)));
+        });
+        raw->on_pointer_focus = raw->seat->pointer_focus_changed().connect([raw](lm::SeatPointerFocus& e) {
+            raw->events.push(event(EventKind::SeatPointerFocus, u64_from_id(e.surface)));
+        });
+        raw->on_cursor = raw->seat->cursor_changed().connect([raw](lm::SeatCursorChange& e) {
+            EventRaw ev = event(EventKind::SeatCursorChange, u64_from_id(e.surface));
+            ev.x = e.hotspot_x;
+            ev.y = e.hotspot_y;
+            ev.flag = e.hidden;
+            raw->events.push(std::move(ev));
+        });
         return std::make_unique<SeatShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -1164,9 +1442,48 @@ std::uint64_t SeatShim::touch_focus(std::int32_t id) const {
     if (!impl_->seat) return 0;
     return u64_from_id(impl_->seat->touch_focus(id));
 }
+bool SeatShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 
 struct LayerShellShim::Impl {
+    struct Entry {
+        lm::LayerSurface* surface = nullptr;
+        Conn<lm::LayerSurfaceMap> on_map;
+        Conn<lm::LayerSurfaceUnmap> on_unmap;
+        Conn<lm::LayerSurfaceDestroy> on_destroy;
+        Conn<lm::LayerSurfaceStateChange> on_state;
+        Conn<lm::LayerSurfacePopup> on_popup;
+    };
+
     std::optional<lm::LayerShell> layer_shell;
+    std::unordered_map<std::uint64_t, std::unique_ptr<Entry>> surfaces;
+    Events events;
+    Conn<lm::NewLayerSurface> on_new;
+
+    lm::LayerSurface* find(std::uint64_t id) const {
+        const auto it = surfaces.find(id);
+        return it == surfaces.end() ? nullptr : it->second->surface;
+    }
+
+    void watch(lm::LayerSurface& ls) {
+        const std::uint64_t id = u64_from_id(ls.surface().id());
+        auto entry = std::make_unique<Entry>();
+        entry->surface = &ls;
+        auto plain = [this, id](EventKind kind) {
+            return [this, id, kind](auto&) { events.push(event(kind, id)); };
+        };
+        entry->on_map = ls.map.connect(plain(EventKind::LayerSurfaceMap));
+        entry->on_unmap = ls.unmap.connect(plain(EventKind::LayerSurfaceUnmap));
+        entry->on_state = ls.state_change.connect(plain(EventKind::LayerSurfaceStateChange));
+        entry->on_popup = ls.new_popup.connect([this, id](lm::LayerSurfacePopup& e) {
+            events.push(event(EventKind::LayerSurfacePopup, id, u64_from_id(e.popup.surface().id())));
+        });
+        entry->on_destroy = ls.destroy.connect([this, id](lm::LayerSurfaceDestroy&) {
+            events.push(event(EventKind::LayerSurfaceDestroy, id));
+            surfaces.erase(id);
+        });
+        events.push(event(EventKind::NewLayerSurface, id));
+        surfaces[id] = std::move(entry);
+    }
 };
 LayerShellShim::~LayerShellShim() = default;
 LayerShellShim::LayerShellShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1179,11 +1496,66 @@ std::unique_ptr<LayerShellShim> layer_shell_new(const DisplayShim& display, rust
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<LayerShellShim::Impl>();
         impl->layer_shell.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new = raw->layer_shell->new_layer_surface().connect(
+            [raw](lm::NewLayerSurface& e) { raw->watch(e.layer_surface); });
         return std::make_unique<LayerShellShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
         return nullptr;
     }
+}
+
+bool LayerShellShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+
+rust::Vec<std::uint64_t> LayerShellShim::layer_surfaces() const {
+    rust::Vec<std::uint64_t> out;
+    for (const auto& [id, entry] : impl_->surfaces) out.push_back(id);
+    return out;
+}
+
+bool LayerShellShim::info(std::uint64_t surface_id, LayerSurfaceInfoRaw& out) const {
+    const lm::LayerSurface* ls = impl_->find(surface_id);
+    if (ls == nullptr) return false;
+    out.layer = static_cast<std::uint32_t>(ls->layer());
+    out.anchor = ls->anchor();
+    out.desired_width = ls->desired_width();
+    out.desired_height = ls->desired_height();
+    out.exclusive_zone = ls->exclusive_zone();
+    out.exclusive_edge = ls->exclusive_edge();
+    out.margin_top = ls->margin_top();
+    out.margin_right = ls->margin_right();
+    out.margin_bottom = ls->margin_bottom();
+    out.margin_left = ls->margin_left();
+    out.keyboard_interactivity = static_cast<std::uint32_t>(ls->keyboard_interactivity());
+    out.mapped = ls->mapped();
+    out.pending_width = ls->pending_width();
+    out.pending_height = ls->pending_height();
+    out.has_output = ls->output_resource() != nullptr;
+    return true;
+}
+
+rust::String LayerShellShim::scope(std::uint64_t surface_id) const {
+    const lm::LayerSurface* ls = impl_->find(surface_id);
+    return ls != nullptr ? to_rust(ls->scope()) : rust::String{};
+}
+
+std::uint32_t LayerShellShim::configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height) const {
+    lm::LayerSurface* ls = impl_->find(surface_id);
+    return ls != nullptr ? ls->configure(width, height) : 0;
+}
+
+void LayerShellShim::close(std::uint64_t surface_id) const {
+    if (lm::LayerSurface* ls = impl_->find(surface_id); ls != nullptr) ls->close();
+}
+
+Rect LayerShellShim::arrange(std::uint64_t surface_id, Rect full, Rect& usable) const {
+    lm::LayerSurface* ls = impl_->find(surface_id);
+    if (ls == nullptr) return Rect{0, 0, 0, 0};
+    lm::Box u = to_box(usable);
+    const lm::Box placed = lm::arrange_layer_surface(*ls, to_box(full), u);
+    usable = to_rect(u);
+    return to_rect(placed);
 }
 
 struct OutputGlobalShim::Impl {
@@ -1206,6 +1578,34 @@ std::unique_ptr<OutputGlobalShim> output_global_new(const DisplayShim& display, 
         error = e.what();
         return nullptr;
     }
+}
+
+void OutputGlobalShim::set_logical_position(std::int32_t x, std::int32_t y) const {
+    if (impl_->global) impl_->global->set_logical_position(x, y);
+}
+void OutputGlobalShim::set_mode(std::int32_t width, std::int32_t height, std::int32_t refresh_mhz) const {
+    if (impl_->global) impl_->global->set_mode(width, height, refresh_mhz);
+}
+void OutputGlobalShim::set_scale(std::int32_t scale) const {
+    if (impl_->global) impl_->global->set_scale(scale);
+}
+void OutputGlobalShim::set_transform(std::uint32_t transform) const {
+    if (impl_->global) impl_->global->set_transform(static_cast<lm::Transform>(transform));
+}
+
+namespace {
+
+// Whether `resource` (a client's wl_output) is `global`'s.
+bool is_output(wl_resource* resource, const OutputGlobalShim& global) {
+    const auto& g = global.impl().global;
+    return resource != nullptr && g && g->resource_for(wl_resource_get_client(resource)) == resource;
+}
+
+} // namespace
+
+bool LayerShellShim::on_output(std::uint64_t surface_id, const OutputGlobalShim& output) const {
+    const lm::LayerSurface* ls = impl_->find(surface_id);
+    return ls != nullptr && is_output(ls->output_resource(), output);
 }
 
 struct CursorThemeShim::Impl {
@@ -1246,10 +1646,8 @@ std::unique_ptr<Name##Shim> FuncName(const DisplayShim& display, rust::String& e
 
 DEFINE_GLOBAL_SHIM_IMPL(Viewporter, Viewporter, viewporter_new)
 DEFINE_GLOBAL_SHIM_IMPL(FractionalScaleManager, FractionalScaleManager, fractional_scale_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(XdgActivation, XdgActivation, xdg_activation_new)
 DEFINE_GLOBAL_SHIM_IMPL(XdgDecorationManager, XdgDecorationManager, xdg_decoration_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(CursorShapeManager, CursorShapeManager, cursor_shape_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(IdleInhibitManager, IdleInhibitManager, idle_inhibit_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(SinglePixelBufferManager, SinglePixelBufferManager, single_pixel_buffer_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(TearingControlManager, TearingControlManager, tearing_control_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(ContentTypeManager, ContentTypeManager, content_type_manager_new)
@@ -1262,11 +1660,124 @@ DEFINE_GLOBAL_SHIM_IMPL(DrmSyncobjManager, DrmSyncobjManager, drm_syncobj_manage
 DEFINE_GLOBAL_SHIM_IMPL(ScreencopyManager, ScreencopyManager, screencopy_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(ForeignToplevelManager, ForeignToplevelManager, foreign_toplevel_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(WorkspaceManager, WorkspaceManager, workspace_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(SessionLockManager, SessionLockManager, session_lock_manager_new)
 
 #undef DEFINE_GLOBAL_SHIM_IMPL
 
-struct IdleNotifierShim::Impl { std::optional<lm::IdleNotifier> mgr; };
+// ---- xdg-activation --------------------------------------------------------
+
+// Only request_activate is forwarded. A token request wants its answer inside
+// the signal, which Rust cannot give; luminaria's default (grant) stands.
+struct XdgActivationShim::Impl {
+    std::optional<lm::XdgActivation> mgr;
+    Events events;
+    Conn<lm::ActivationRequest> on_activate;
+};
+XdgActivationShim::~XdgActivationShim() = default;
+XdgActivationShim::XdgActivationShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+XdgActivationShim::Impl& XdgActivationShim::impl() const { return *impl_; }
+std::unique_ptr<XdgActivationShim> xdg_activation_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::XdgActivation::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<XdgActivationShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_activate = raw->mgr->request_activate().connect([raw](lm::ActivationRequest& e) {
+            EventRaw ev = event(EventKind::ActivationRequest, u64_from_id(e.surface.id()),
+                                surface_u64(e.requesting_surface));
+            ev.flag = e.token_valid;
+            ev.serial = e.serial;
+            ev.text = to_rust(e.app_id);
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<XdgActivationShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+bool XdgActivationShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+
+// ---- idle-inhibit ----------------------------------------------------------
+
+struct IdleInhibitManagerShim::Impl {
+    struct Entry {
+        lm::IdleInhibitor* inhibitor = nullptr;
+        Conn<lm::IdleInhibitorDestroy> on_destroy;
+    };
+    std::optional<lm::IdleInhibitManager> mgr;
+    std::unordered_map<std::uint64_t, Entry> inhibitors;
+    Events events;
+    Conn<lm::NewIdleInhibitor> on_new;
+    Conn<lm::IdleInhibitChange> on_change;
+
+    lm::IdleInhibitor* find(std::uint64_t id) const {
+        const auto it = inhibitors.find(id);
+        return it == inhibitors.end() ? nullptr : it->second.inhibitor;
+    }
+};
+IdleInhibitManagerShim::~IdleInhibitManagerShim() = default;
+IdleInhibitManagerShim::IdleInhibitManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+IdleInhibitManagerShim::Impl& IdleInhibitManagerShim::impl() const { return *impl_; }
+std::unique_ptr<IdleInhibitManagerShim> idle_inhibit_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::IdleInhibitManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<IdleInhibitManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new = raw->mgr->new_inhibitor().connect([raw](lm::NewIdleInhibitor& e) {
+            const std::uint64_t id = next_object_id();
+            auto& entry = raw->inhibitors[id];
+            entry.inhibitor = &e.inhibitor;
+            entry.on_destroy = e.inhibitor.destroy.connect([raw, id](lm::IdleInhibitorDestroy&) {
+                raw->events.push(event(EventKind::IdleInhibitorDestroy, id));
+                raw->inhibitors.erase(id);
+            });
+            raw->events.push(event(EventKind::NewIdleInhibitor, id, u64_from_id(e.inhibitor.surface().id())));
+        });
+        raw->on_change = raw->mgr->changed().connect([raw](lm::IdleInhibitChange& e) {
+            EventRaw ev = event(EventKind::IdleInhibitChange, 0);
+            ev.flag = e.inhibited;
+            raw->events.push(std::move(ev));
+        });
+        return std::make_unique<IdleInhibitManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+bool IdleInhibitManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+bool IdleInhibitManagerShim::inhibited() const { return impl_->mgr && impl_->mgr->inhibited(); }
+std::size_t IdleInhibitManagerShim::inhibitor_count() const { return impl_->mgr ? impl_->mgr->inhibitor_count() : 0; }
+std::uint64_t IdleInhibitManagerShim::inhibitor_surface(std::uint64_t inhibitor) const {
+    lm::IdleInhibitor* i = impl_->find(inhibitor);
+    return i != nullptr ? u64_from_id(i->surface().id()) : 0;
+}
+bool IdleInhibitManagerShim::inhibitor_visible(std::uint64_t inhibitor) const {
+    const lm::IdleInhibitor* i = impl_->find(inhibitor);
+    return i != nullptr && i->visible();
+}
+void IdleInhibitManagerShim::set_inhibitor_visible(std::uint64_t inhibitor, bool visible) const {
+    if (lm::IdleInhibitor* i = impl_->find(inhibitor); i != nullptr) i->set_visible(visible);
+}
+
+// ---- ext-idle-notify -------------------------------------------------------
+
+struct IdleNotifierShim::Impl {
+    struct Entry {
+        lm::IdleNotification* notification = nullptr;
+        Conn<lm::IdleNotificationDestroy> on_destroy;
+    };
+    std::optional<lm::IdleNotifier> mgr;
+    std::unordered_map<std::uint64_t, Entry> notifications;
+    Events events;
+    Conn<lm::NewIdleNotification> on_new;
+    Conn<lm::IdleStateChange> on_state;
+
+    std::uint64_t id_of(const lm::IdleNotification* n) const {
+        for (const auto& [id, entry] : notifications) {
+            if (entry.notification == n) return id;
+        }
+        return 0;
+    }
+};
 IdleNotifierShim::~IdleNotifierShim() = default;
 IdleNotifierShim::IdleNotifierShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 IdleNotifierShim::Impl& IdleNotifierShim::impl() const { return *impl_; }
@@ -1277,11 +1788,200 @@ std::unique_ptr<IdleNotifierShim> idle_notifier_new(const DisplayShim& display, 
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<IdleNotifierShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new = raw->mgr->new_notification().connect([raw](lm::NewIdleNotification& e) {
+            const std::uint64_t id = next_object_id();
+            auto& entry = raw->notifications[id];
+            entry.notification = &e.notification;
+            entry.on_destroy = e.notification.destroy.connect([raw, id](lm::IdleNotificationDestroy&) {
+                raw->events.push(event(EventKind::IdleNotificationDestroy, id));
+                raw->notifications.erase(id);
+            });
+            raw->events.push(event(EventKind::NewIdleNotification, id));
+        });
+        raw->on_state = raw->mgr->state_change().connect([raw](lm::IdleStateChange& e) {
+            EventRaw ev = event(EventKind::IdleStateChange, raw->id_of(&e.notification));
+            ev.flag = e.idled;
+            raw->events.push(std::move(ev));
+        });
         return std::make_unique<IdleNotifierShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
+bool IdleNotifierShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+void IdleNotifierShim::notify_activity() const { if (impl_->mgr) impl_->mgr->notify_activity(); }
+void IdleNotifierShim::set_inhibited(bool inhibited) const { if (impl_->mgr) impl_->mgr->set_inhibited(inhibited); }
+bool IdleNotifierShim::inhibited() const { return impl_->mgr && impl_->mgr->inhibited(); }
+std::size_t IdleNotifierShim::notification_count() const { return impl_->mgr ? impl_->mgr->notification_count() : 0; }
+std::size_t IdleNotifierShim::idled_count() const { return impl_->mgr ? impl_->mgr->idled_count() : 0; }
+bool IdleNotifierShim::notification_info(std::uint64_t notification, IdleNotificationInfoRaw& out) const {
+    const auto it = impl_->notifications.find(notification);
+    if (it == impl_->notifications.end()) return false;
+    const lm::IdleNotification& n = *it->second.notification;
+    out.timeout_ms = n.timeout_ms();
+    out.idled = n.idled();
+    out.input_only = n.input_only();
+    return true;
+}
 
-struct DataDeviceManagerShim::Impl { std::optional<lm::DataDeviceManager> mgr; };
+// ---- ext-session-lock ------------------------------------------------------
+
+struct SessionLockManagerShim::Impl {
+    struct LockEntry {
+        lm::SessionLock* lock = nullptr;
+        Conn<lm::NewSessionLockSurface> on_surface;
+        Conn<lm::SessionLockDestroy> on_destroy;
+    };
+    struct SurfaceEntry {
+        lm::SessionLockSurface* surface = nullptr;
+        std::uint64_t lock = 0;
+        Conn<lm::SessionLockSurfaceMap> on_map;
+        Conn<lm::SessionLockSurfaceDestroy> on_destroy;
+    };
+
+    std::optional<lm::SessionLockManager> mgr;
+    std::unordered_map<std::uint64_t, std::unique_ptr<LockEntry>> locks;
+    std::unordered_map<std::uint64_t, std::unique_ptr<SurfaceEntry>> surfaces;
+    Events events;
+    Conn<lm::NewSessionLock> on_new_lock;
+
+    lm::SessionLock* lock(std::uint64_t id) const {
+        const auto it = locks.find(id);
+        return it == locks.end() ? nullptr : it->second->lock;
+    }
+    const SurfaceEntry* surface(std::uint64_t id) const {
+        const auto it = surfaces.find(id);
+        return it == surfaces.end() ? nullptr : it->second.get();
+    }
+
+    void watch(lm::SessionLockSurface& ls, std::uint64_t lock_id) {
+        const std::uint64_t id = u64_from_id(ls.surface().id());
+        auto entry = std::make_unique<SurfaceEntry>();
+        entry->surface = &ls;
+        entry->lock = lock_id;
+        entry->on_map = ls.map.connect([this, id](lm::SessionLockSurfaceMap&) {
+            events.push(event(EventKind::LockSurfaceMap, id));
+        });
+        entry->on_destroy = ls.destroy.connect([this, id](lm::SessionLockSurfaceDestroy&) {
+            events.push(event(EventKind::LockSurfaceDestroy, id));
+            surfaces.erase(id);
+        });
+        events.push(event(EventKind::NewLockSurface, lock_id, id));
+        surfaces[id] = std::move(entry);
+    }
+
+    void watch(lm::SessionLock& lock) {
+        const std::uint64_t id = next_object_id();
+        auto entry = std::make_unique<LockEntry>();
+        entry->lock = &lock;
+        entry->on_surface = lock.new_surface.connect(
+            [this, id](lm::NewSessionLockSurface& e) { watch(e.lock_surface, id); });
+        entry->on_destroy = lock.destroy.connect([this, id](lm::SessionLockDestroy& e) {
+            EventRaw ev = event(EventKind::SessionLockDestroy, id);
+            ev.flag = e.unlocked;
+            events.push(std::move(ev));
+            locks.erase(id);
+        });
+        events.push(event(EventKind::NewSessionLock, id));
+        locks[id] = std::move(entry);
+    }
+};
+SessionLockManagerShim::~SessionLockManagerShim() = default;
+SessionLockManagerShim::SessionLockManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+SessionLockManagerShim::Impl& SessionLockManagerShim::impl() const { return *impl_; }
+std::unique_ptr<SessionLockManagerShim> session_lock_manager_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::SessionLockManager::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<SessionLockManagerShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new_lock = raw->mgr->new_lock().connect([raw](lm::NewSessionLock& e) { raw->watch(e.lock); });
+        return std::make_unique<SessionLockManagerShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+bool SessionLockManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+bool SessionLockManagerShim::locked() const { return impl_->mgr && impl_->mgr->session_locked(); }
+std::uint64_t SessionLockManagerShim::current() const {
+    if (!impl_->mgr) return 0;
+    const lm::SessionLock* current = impl_->mgr->current();
+    for (const auto& [id, entry] : impl_->locks) {
+        if (current != nullptr && entry->lock == current) return id;
+    }
+    return 0;
+}
+bool SessionLockManagerShim::lock_locked(std::uint64_t lock) const {
+    const lm::SessionLock* l = impl_->lock(lock);
+    return l != nullptr && l->locked();
+}
+void SessionLockManagerShim::send_locked(std::uint64_t lock) const {
+    if (lm::SessionLock* l = impl_->lock(lock); l != nullptr) l->send_locked();
+}
+void SessionLockManagerShim::send_finished(std::uint64_t lock) const {
+    if (lm::SessionLock* l = impl_->lock(lock); l != nullptr) l->send_finished();
+}
+rust::Vec<std::uint64_t> SessionLockManagerShim::lock_surfaces(std::uint64_t lock) const {
+    rust::Vec<std::uint64_t> out;
+    if (const lm::SessionLock* l = impl_->lock(lock); l != nullptr) {
+        for (lm::SessionLockSurface* s : l->surfaces()) out.push_back(u64_from_id(s->surface().id()));
+    }
+    return out;
+}
+bool SessionLockManagerShim::lock_surface_info(std::uint64_t surface_id, LockSurfaceInfoRaw& out) const {
+    const Impl::SurfaceEntry* e = impl_->surface(surface_id);
+    if (e == nullptr) return false;
+    out.lock = e->lock;
+    out.mapped = e->surface->mapped();
+    out.width = e->surface->width();
+    out.height = e->surface->height();
+    out.has_output = e->surface->output_resource() != nullptr;
+    return true;
+}
+std::uint32_t SessionLockManagerShim::lock_surface_configure(std::uint64_t surface_id, std::uint32_t width, std::uint32_t height) const {
+    const Impl::SurfaceEntry* e = impl_->surface(surface_id);
+    return e != nullptr ? e->surface->configure(width, height) : 0;
+}
+bool SessionLockManagerShim::lock_surface_on_output(std::uint64_t surface_id, const OutputGlobalShim& output) const {
+    const Impl::SurfaceEntry* e = impl_->surface(surface_id);
+    return e != nullptr && is_output(e->surface->output_resource(), output);
+}
+
+// ---- selections ------------------------------------------------------------
+
+namespace {
+
+// DataDeviceManager and PrimarySelectionManager have the same three hooks.
+template <class Manager>
+struct SelectionShimImpl {
+    std::optional<Manager> mgr;
+    std::deque<std::vector<std::string>> changes;
+    Conn<lm::SelectionChange> on_change;
+
+    void watch() {
+        on_change = mgr->selection_changed().connect(
+            [this](lm::SelectionChange& e) { changes.push_back(e.mime_types); });
+    }
+    bool next(rust::Vec<rust::String>& out) {
+        if (changes.empty()) return false;
+        out = to_rust(changes.front());
+        changes.pop_front();
+        return true;
+    }
+    rust::Vec<rust::String> mime_types() const {
+        return mgr ? to_rust(mgr->selection_mime_types()) : rust::Vec<rust::String>{};
+    }
+    bool receive(rust::Str mime, int fd) {
+        if (!mgr) {
+            if (fd >= 0) ::close(fd);
+            return false;
+        }
+        return mgr->selection_receive(std::string(mime), fd);
+    }
+};
+
+} // namespace
+
+struct DataDeviceManagerShim::Impl : SelectionShimImpl<lm::DataDeviceManager> {};
 DataDeviceManagerShim::~DataDeviceManagerShim() = default;
 DataDeviceManagerShim::DataDeviceManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 DataDeviceManagerShim::Impl& DataDeviceManagerShim::impl() const { return *impl_; }
@@ -1292,11 +1992,15 @@ std::unique_ptr<DataDeviceManagerShim> data_device_manager_new(const DisplayShim
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<DataDeviceManagerShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        impl->watch();
         return std::make_unique<DataDeviceManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
+bool DataDeviceManagerShim::next_selection_change(rust::Vec<rust::String>& mime_types) const { return impl_->next(mime_types); }
+rust::Vec<rust::String> DataDeviceManagerShim::selection_mime_types() const { return impl_->mime_types(); }
+bool DataDeviceManagerShim::selection_receive(rust::Str mime, int fd) const { return impl_->receive(mime, fd); }
 
-struct PrimarySelectionManagerShim::Impl { std::optional<lm::PrimarySelectionManager> mgr; };
+struct PrimarySelectionManagerShim::Impl : SelectionShimImpl<lm::PrimarySelectionManager> {};
 PrimarySelectionManagerShim::~PrimarySelectionManagerShim() = default;
 PrimarySelectionManagerShim::PrimarySelectionManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 PrimarySelectionManagerShim::Impl& PrimarySelectionManagerShim::impl() const { return *impl_; }
@@ -1307,9 +2011,13 @@ std::unique_ptr<PrimarySelectionManagerShim> primary_selection_manager_new(const
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<PrimarySelectionManagerShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        impl->watch();
         return std::make_unique<PrimarySelectionManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
+bool PrimarySelectionManagerShim::next_selection_change(rust::Vec<rust::String>& mime_types) const { return impl_->next(mime_types); }
+rust::Vec<rust::String> PrimarySelectionManagerShim::selection_mime_types() const { return impl_->mime_types(); }
+bool PrimarySelectionManagerShim::selection_receive(rust::Str mime, int fd) const { return impl_->receive(mime, fd); }
 
 struct RelativePointerManagerShim::Impl { std::optional<lm::RelativePointerManager> mgr; };
 RelativePointerManagerShim::~RelativePointerManagerShim() = default;
@@ -1326,8 +2034,23 @@ std::unique_ptr<RelativePointerManagerShim> relative_pointer_manager_new(const D
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
 
+// ---- pointer-constraints ---------------------------------------------------
+
 struct PointerConstraintsShim::Impl {
+    struct Entry {
+        lm::PointerConstraint* constraint = nullptr;
+        Conn<lm::PointerConstraintDestroy> on_destroy;
+        Conn<lm::PointerConstraintRegionChange> on_region;
+    };
     std::optional<lm::PointerConstraints> mgr;
+    std::unordered_map<std::uint64_t, std::unique_ptr<Entry>> constraints;
+    Events events;
+    Conn<lm::NewPointerConstraint> on_new;
+
+    lm::PointerConstraint* find(std::uint64_t id) const {
+        const auto it = constraints.find(id);
+        return it == constraints.end() ? nullptr : it->second->constraint;
+    }
 };
 PointerConstraintsShim::~PointerConstraintsShim() = default;
 PointerConstraintsShim::PointerConstraintsShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1339,12 +2062,75 @@ std::unique_ptr<PointerConstraintsShim> pointer_constraints_new(const DisplayShi
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<PointerConstraintsShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new = raw->mgr->new_constraint().connect([raw](lm::NewPointerConstraint& e) {
+            const std::uint64_t id = u64_from_id(e.constraint.surface().id());
+            auto entry = std::make_unique<PointerConstraintsShim::Impl::Entry>();
+            entry->constraint = &e.constraint;
+            entry->on_region = e.constraint.region_change.connect([raw, id](lm::PointerConstraintRegionChange&) {
+                raw->events.push(event(EventKind::PointerConstraintRegionChange, id));
+            });
+            entry->on_destroy = e.constraint.destroy.connect([raw, id](lm::PointerConstraintDestroy&) {
+                raw->events.push(event(EventKind::PointerConstraintDestroy, id));
+                raw->constraints.erase(id);
+            });
+            raw->events.push(event(EventKind::NewPointerConstraint, id));
+            raw->constraints[id] = std::move(entry);
+        });
         return std::make_unique<PointerConstraintsShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
+bool PointerConstraintsShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+bool PointerConstraintsShim::constraint_info(std::uint64_t surface_id, PointerConstraintInfoRaw& out) const {
+    const lm::PointerConstraint* c = impl_->find(surface_id);
+    if (c == nullptr) return false;
+    out.locked = c->type() == lm::PointerConstraintType::locked;
+    out.persistent = c->lifetime() == lm::PointerConstraintLifetime::persistent;
+    out.has_region = c->has_region();
+    out.has_hint = c->has_cursor_position_hint();
+    out.hint_x = c->cursor_hint_x();
+    out.hint_y = c->cursor_hint_y();
+    out.active = c->active();
+    return true;
+}
+rust::Vec<Rect> PointerConstraintsShim::constraint_region(std::uint64_t surface_id) const {
+    rust::Vec<Rect> out;
+    if (const lm::PointerConstraint* c = impl_->find(surface_id); c != nullptr) {
+        for (const auto& b : c->region().rects()) out.push_back(to_rect(b));
+    }
+    return out;
+}
+void PointerConstraintsShim::activate(std::uint64_t surface_id) const {
+    if (lm::PointerConstraint* c = impl_->find(surface_id); c != nullptr) c->activate();
+}
+void PointerConstraintsShim::deactivate(std::uint64_t surface_id) const {
+    if (lm::PointerConstraint* c = impl_->find(surface_id); c != nullptr) c->deactivate();
+}
+std::uint64_t PointerConstraintsShim::active_constraint() const {
+    if (!impl_->mgr) return 0;
+    const lm::PointerConstraint* c = std::as_const(*impl_->mgr).active_constraint();
+    return c != nullptr ? u64_from_id(c->surface().id()) : 0;
+}
+
+// ---- text-input-v3 ---------------------------------------------------------
 
 struct TextInputManagerShim::Impl {
+    struct Entry {
+        lm::TextInput* text_input = nullptr;
+        Conn<lm::TextInputEnable> on_enable;
+        Conn<lm::TextInputDisable> on_disable;
+        Conn<lm::TextInputCommit> on_commit;
+        Conn<lm::TextInputDestroy> on_destroy;
+    };
     std::optional<lm::TextInputManager> mgr;
+    std::unordered_map<std::uint64_t, std::unique_ptr<Entry>> text_inputs;
+    Events events;
+    Conn<lm::NewTextInput> on_new;
+
+    lm::TextInput* find(std::uint64_t id) const {
+        const auto it = text_inputs.find(id);
+        return it == text_inputs.end() ? nullptr : it->second->text_input;
+    }
 };
 TextInputManagerShim::~TextInputManagerShim() = default;
 TextInputManagerShim::TextInputManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1356,8 +2142,65 @@ std::unique_ptr<TextInputManagerShim> text_input_manager_new(const DisplayShim& 
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<TextInputManagerShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new = raw->mgr->new_text_input().connect([raw](lm::NewTextInput& e) {
+            const std::uint64_t id = next_object_id();
+            auto entry = std::make_unique<TextInputManagerShim::Impl::Entry>();
+            entry->text_input = &e.text_input;
+            auto plain = [raw, id](EventKind kind) {
+                return [raw, id, kind](auto&) { raw->events.push(event(kind, id)); };
+            };
+            entry->on_enable = e.text_input.enable.connect(plain(EventKind::TextInputEnable));
+            entry->on_disable = e.text_input.disable.connect(plain(EventKind::TextInputDisable));
+            entry->on_commit = e.text_input.commit.connect(plain(EventKind::TextInputCommit));
+            entry->on_destroy = e.text_input.destroy.connect([raw, id](lm::TextInputDestroy&) {
+                raw->events.push(event(EventKind::TextInputDestroy, id));
+                raw->text_inputs.erase(id);
+            });
+            raw->events.push(event(EventKind::NewTextInput, id));
+            raw->text_inputs[id] = std::move(entry);
+        });
         return std::make_unique<TextInputManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+bool TextInputManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+std::uint64_t TextInputManagerShim::focused() const {
+    if (!impl_->mgr) return 0;
+    const lm::TextInput* focused = impl_->mgr->focused();
+    for (const auto& [id, entry] : impl_->text_inputs) {
+        if (focused != nullptr && entry->text_input == focused) return id;
+    }
+    return 0;
+}
+bool TextInputManagerShim::text_input_info(std::uint64_t text_input, TextInputInfoRaw& out) const {
+    const lm::TextInput* t = impl_->find(text_input);
+    if (t == nullptr) return false;
+    out.focused_surface = surface_u64(t->focused_surface());
+    out.enabled = t->enabled();
+    out.cursor = t->surrounding_cursor();
+    out.anchor = t->surrounding_anchor();
+    out.change_cause = static_cast<std::uint32_t>(t->text_change_cause());
+    out.content_hint = t->content_hint();
+    out.content_purpose = static_cast<std::uint32_t>(t->content_purpose());
+    out.cursor_rectangle = to_rect(t->cursor_rectangle());
+    out.serial = t->serial();
+    return true;
+}
+rust::String TextInputManagerShim::surrounding_text(std::uint64_t text_input) const {
+    const lm::TextInput* t = impl_->find(text_input);
+    return t != nullptr ? to_rust(t->surrounding_text()) : rust::String{};
+}
+void TextInputManagerShim::send_preedit_string(std::uint64_t text_input, rust::Str text, std::int32_t cursor_begin, std::int32_t cursor_end) const {
+    if (lm::TextInput* t = impl_->find(text_input); t != nullptr) t->send_preedit_string(std::string(text), cursor_begin, cursor_end);
+}
+void TextInputManagerShim::send_commit_string(std::uint64_t text_input, rust::Str text) const {
+    if (lm::TextInput* t = impl_->find(text_input); t != nullptr) t->send_commit_string(std::string(text));
+}
+void TextInputManagerShim::send_delete_surrounding_text(std::uint64_t text_input, std::uint32_t before, std::uint32_t after) const {
+    if (lm::TextInput* t = impl_->find(text_input); t != nullptr) t->send_delete_surrounding_text(before, after);
+}
+void TextInputManagerShim::send_done(std::uint64_t text_input) const {
+    if (lm::TextInput* t = impl_->find(text_input); t != nullptr) t->send_done();
 }
 
 // ============================================================================
@@ -1561,28 +2404,7 @@ bool SceneRendererShim::reset(SceneOutputShim& state, OutputShim& output, std::u
 int SceneRendererShim::present(SceneOutputShim& state, OutputShim& output, rust::Slice<const SceneItemRaw> items,
                              float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const {
     if (!impl_->renderer || !output.impl().output) { error = "null object"; return -1; }
-    std::vector<lm::SceneItem> scene;
-    scene.reserve(items.size());
-    for (const auto& raw : items) {
-        lm::SceneItem it{};
-        it.kind = static_cast<lm::SceneItem::Kind>(raw.kind);
-        it.box = lm::Box{raw.x, raw.y, raw.width, raw.height};
-        it.surface = id_from_u64(raw.surface_id);
-        it.x = raw.surface_x;
-        it.y = raw.surface_y;
-        it.color = lm::Color{raw.r, raw.g, raw.b, raw.a};
-        it.thickness = raw.thickness;
-        it.serial = raw.serial;
-        it.tag = raw.tag;
-        it.accepts_input = raw.accepts_input;
-        it.alpha = raw.alpha;
-        it.corner_radius = raw.corner_radius;
-        it.blur.enabled = raw.blur_enabled;
-        it.blur.xray = raw.blur_xray;
-        it.shadow.color = lm::Color{raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a};
-        it.shadow.feather = raw.shadow_feather;
-        scene.push_back(it);
-    }
+    const std::vector<lm::SceneItem> scene = scene_items(items);
     auto r = impl_->renderer->present(state.impl().state, *output.impl().output, scene, lm::Color{bg_r, bg_g, bg_b, bg_a});
     if (!r) { error = to_rust(r.error().message); return -1; }
     return static_cast<int>(*r);
@@ -1834,24 +2656,7 @@ std::size_t DirectScanoutShim::cached() const {
 }
 
 SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, double y) {
-    std::vector<lm::SceneItem> scene;
-    scene.reserve(items.size());
-    for (const auto& raw : items) {
-        lm::SceneItem it{};
-        it.kind = static_cast<lm::SceneItem::Kind>(raw.kind);
-        it.box = lm::Box{raw.x, raw.y, raw.width, raw.height};
-        it.surface = id_from_u64(raw.surface_id);
-        it.x = raw.surface_x;
-        it.y = raw.surface_y;
-        it.color = lm::Color{raw.r, raw.g, raw.b, raw.a};
-        it.thickness = raw.thickness;
-        it.serial = raw.serial;
-        it.tag = raw.tag;
-        it.accepts_input = raw.accepts_input;
-        it.alpha = raw.alpha;
-        it.corner_radius = raw.corner_radius;
-        scene.push_back(it);
-    }
+    const std::vector<lm::SceneItem> scene = scene_items(items);
     auto hit = lm::scene_hit_test(scene, x, y);
     SceneHitRaw out{};
     out.hit = hit.hit;
@@ -1883,10 +2688,6 @@ void workspace_manager_remove_workspace(WorkspaceManagerShim& wm, std::uint32_t 
 }
 void workspace_manager_activate_workspace(WorkspaceManagerShim& wm, std::uint32_t workspace) {
     if (wm.impl().mgr) wm.impl().mgr->activate(workspace);
-}
-
-bool session_lock_manager_locked(SessionLockManagerShim& slm) {
-    return slm.impl().mgr ? slm.impl().mgr->session_locked() : false;
 }
 
 struct OutputManagerShim::Impl {
@@ -1935,7 +2736,58 @@ std::unique_ptr<DataControlManagerShim> data_control_manager_new(const DisplaySh
 }
 
 struct InputMethodManagerShim::Impl {
+    struct Entry {
+        lm::InputMethod* input_method = nullptr;
+        Conn<lm::NewInputPopupSurface> on_popup;
+        Conn<lm::InputMethodGrabChange> on_grab;
+        Conn<lm::InputMethodDestroy> on_destroy;
+    };
+    struct PopupEntry {
+        lm::InputPopupSurface* popup = nullptr;
+        Conn<lm::InputPopupSurfaceDestroy> on_destroy;
+    };
+
     std::optional<lm::InputMethodManager> mgr;
+    std::unordered_map<std::uint64_t, std::unique_ptr<Entry>> input_methods;
+    std::unordered_map<std::uint64_t, std::unique_ptr<PopupEntry>> popups;
+    Events events;
+    Conn<lm::NewInputMethod> on_new;
+
+    lm::InputMethod* find(std::uint64_t id) const {
+        const auto it = input_methods.find(id);
+        return it == input_methods.end() ? nullptr : it->second->input_method;
+    }
+
+    void watch(lm::InputPopupSurface& popup, std::uint64_t im) {
+        const std::uint64_t id = u64_from_id(popup.surface().id());
+        auto entry = std::make_unique<PopupEntry>();
+        entry->popup = &popup;
+        entry->on_destroy = popup.destroy.connect([this, id](lm::InputPopupSurfaceDestroy&) {
+            events.push(event(EventKind::InputPopupSurfaceDestroy, id));
+            popups.erase(id);
+        });
+        events.push(event(EventKind::NewInputPopupSurface, im, id));
+        popups[id] = std::move(entry);
+    }
+
+    void watch(lm::InputMethod& im) {
+        const std::uint64_t id = next_object_id();
+        auto entry = std::make_unique<Entry>();
+        entry->input_method = &im;
+        entry->on_popup = im.new_popup_surface.connect(
+            [this, id](lm::NewInputPopupSurface& e) { watch(e.popup, id); });
+        entry->on_grab = im.grab_changed.connect([this, id](lm::InputMethodGrabChange& e) {
+            EventRaw ev = event(EventKind::InputMethodGrabChange, id);
+            ev.flag = e.grabbed;
+            events.push(std::move(ev));
+        });
+        entry->on_destroy = im.destroy.connect([this, id](lm::InputMethodDestroy&) {
+            events.push(event(EventKind::InputMethodDestroy, id));
+            input_methods.erase(id);
+        });
+        events.push(event(EventKind::NewInputMethod, id));
+        input_methods[id] = std::move(entry);
+    }
 };
 InputMethodManagerShim::~InputMethodManagerShim() = default;
 InputMethodManagerShim::InputMethodManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1951,11 +2803,58 @@ std::unique_ptr<InputMethodManagerShim> input_method_manager_new(const DisplaySh
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<InputMethodManagerShim::Impl>();
         impl->mgr.emplace(std::move(*r));
+        auto* raw = impl.get();
+        raw->on_new = raw->mgr->new_input_method().connect(
+            [raw](lm::NewInputMethod& e) { raw->watch(e.input_method); });
         return std::make_unique<InputMethodManagerShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
         return nullptr;
     }
+}
+bool InputMethodManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+std::uint64_t InputMethodManagerShim::current() const {
+    if (!impl_->mgr) return 0;
+    const lm::InputMethod* current = impl_->mgr->current();
+    for (const auto& [id, entry] : impl_->input_methods) {
+        if (current != nullptr && entry->input_method == current) return id;
+    }
+    return 0;
+}
+bool InputMethodManagerShim::active(std::uint64_t input_method) const {
+    const lm::InputMethod* im = impl_->find(input_method);
+    return im != nullptr && im->active();
+}
+bool InputMethodManagerShim::has_keyboard_grab(std::uint64_t input_method) const {
+    lm::InputMethod* im = impl_->find(input_method);
+    return im != nullptr && im->keyboard_grab() != nullptr;
+}
+void InputMethodManagerShim::grab_send_key(std::uint64_t input_method, std::uint32_t time, std::uint32_t key, bool pressed) const {
+    if (lm::InputMethod* im = impl_->find(input_method); im != nullptr && im->keyboard_grab() != nullptr) {
+        im->keyboard_grab()->send_key(time, key, pressed);
+    }
+}
+void InputMethodManagerShim::grab_send_modifiers(std::uint64_t input_method, std::uint32_t depressed, std::uint32_t latched,
+                                                 std::uint32_t locked, std::uint32_t group) const {
+    if (lm::InputMethod* im = impl_->find(input_method); im != nullptr && im->keyboard_grab() != nullptr) {
+        im->keyboard_grab()->send_modifiers(depressed, latched, locked, group);
+    }
+}
+void InputMethodManagerShim::grab_send_repeat_info(std::uint64_t input_method, std::int32_t rate, std::int32_t delay) const {
+    if (lm::InputMethod* im = impl_->find(input_method); im != nullptr && im->keyboard_grab() != nullptr) {
+        im->keyboard_grab()->send_repeat_info(rate, delay);
+    }
+}
+rust::Vec<std::uint64_t> InputMethodManagerShim::popup_surfaces(std::uint64_t input_method) const {
+    rust::Vec<std::uint64_t> out;
+    if (const lm::InputMethod* im = impl_->find(input_method); im != nullptr) {
+        for (lm::InputPopupSurface* p : im->popup_surfaces()) out.push_back(u64_from_id(p->surface().id()));
+    }
+    return out;
+}
+Rect InputMethodManagerShim::popup_text_input_rectangle(std::uint64_t surface_id) const {
+    const auto it = impl_->popups.find(surface_id);
+    return it == impl_->popups.end() ? Rect{0, 0, 0, 0} : to_rect(it->second->popup->text_input_rectangle());
 }
 
 struct DesktopGlobalsShim::Impl {
@@ -1993,8 +2892,28 @@ std::unique_ptr<DesktopGlobalsShim> desktop_globals_new_headless(const DisplaySh
     }
 }
 
+// lm::PopupTree holds each popup by reference, and the compositor drops it in
+// the popup's destroy handler. Rust only hears of the destroy after dispatch()
+// returns, so the shim watches each popup it was given and drops it itself.
 struct PopupTreeShim::Impl {
+    struct Watch {
+        std::uint64_t id;
+        lm::Popup* popup;
+        Conn<lm::PopupDestroy> on_destroy;
+    };
     lm::PopupTree tree;
+    std::vector<Watch> watches;
+
+    lm::Popup* find(std::uint64_t id) const {
+        const auto it = std::ranges::find(watches, id, &Watch::id);
+        return it == watches.end() ? nullptr : it->popup;
+    }
+    void forget(std::uint64_t id) {
+        if (lm::Popup* p = find(id); p != nullptr) tree.remove(*p);
+        // Erasing the watch inside its own slot is safe: a Signal never frees
+        // the slot that is running.
+        std::erase_if(watches, [id](const Watch& w) { return w.id == id; });
+    }
 };
 PopupTreeShim::~PopupTreeShim() = default;
 PopupTreeShim::PopupTreeShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -2003,11 +2922,98 @@ PopupTreeShim::Impl& PopupTreeShim::impl() const { return *impl_; }
 std::unique_ptr<PopupTreeShim> popup_tree_new() {
     return std::make_unique<PopupTreeShim>(std::make_unique<PopupTreeShim::Impl>());
 }
+bool PopupTreeShim::add(const XdgShellShim& shell, std::uint64_t popup, std::uint64_t parent) {
+    lm::Popup* p = shell.impl().popup(popup);
+    if (p == nullptr) return false;
+    impl_->tree.add(*p, id_from_u64(parent));
+    if (impl_->find(popup) == nullptr) {
+        Impl* raw = impl_.get();
+        impl_->watches.push_back(Impl::Watch{popup, p, p->destroy.connect([raw, popup](lm::PopupDestroy&) {
+                                                 raw->forget(popup);
+                                             })});
+    }
+    return true;
+}
+void PopupTreeShim::set_mapped(std::uint64_t popup, bool mapped) {
+    if (lm::Popup* p = impl_->find(popup); p != nullptr) impl_->tree.set_mapped(*p, mapped);
+}
+void PopupTreeShim::remove(std::uint64_t popup) { impl_->forget(popup); }
+rust::Vec<SceneItemRaw> PopupTreeShim::append_to(rust::Slice<const SceneItemRaw> scene) const {
+    std::vector<lm::SceneItem> items = scene_items(scene);
+    const std::size_t before = items.size();
+    impl_->tree.append_to(items);
+    rust::Vec<SceneItemRaw> out;
+    for (std::size_t i = before; i < items.size(); ++i) out.push_back(scene_item_raw(items[i]));
+    return out;
+}
 bool PopupTreeShim::contains(std::uint64_t surface_id) const {
     return impl_->tree.contains(id_from_u64(surface_id));
+}
+std::uint64_t PopupTreeShim::active_grab() const {
+    const lm::Popup* p = impl_->tree.active_grab();
+    return p != nullptr ? u64_from_id(const_cast<lm::Popup*>(p)->surface().id()) : 0;
 }
 bool PopupTreeShim::dismiss_grabs_outside(std::uint64_t surface_id) {
     return impl_->tree.dismiss_grabs_outside(id_from_u64(surface_id));
 }
+
+// Same reason as PopupTreeShim: every layer surface handed in is watched, and
+// leaves the manager by itself when it is destroyed.
+struct LayerManagerShim::Impl {
+    struct Watch {
+        std::uint64_t id;
+        lm::LayerSurface* surface;
+        Conn<lm::LayerSurfaceDestroy> on_destroy;
+    };
+    lm::LayerManager mgr;
+    std::vector<Watch> watches;
+
+    lm::LayerSurface* find(std::uint64_t id) const {
+        const auto it = std::ranges::find(watches, id, &Watch::id);
+        return it == watches.end() ? nullptr : it->surface;
+    }
+    void forget(std::uint64_t id) {
+        if (lm::LayerSurface* ls = find(id); ls != nullptr) mgr.remove(*ls);
+        std::erase_if(watches, [id](const Watch& w) { return w.id == id; });
+    }
+};
+LayerManagerShim::~LayerManagerShim() = default;
+LayerManagerShim::LayerManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+LayerManagerShim::Impl& LayerManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<LayerManagerShim> layer_manager_new() {
+    return std::make_unique<LayerManagerShim>(std::make_unique<LayerManagerShim::Impl>());
+}
+bool LayerManagerShim::add(const LayerShellShim& shell, std::uint64_t surface_id, std::uint32_t output_id) {
+    lm::LayerSurface* ls = shell.impl().find(surface_id);
+    if (ls == nullptr) return false;
+    impl_->mgr.add(*ls, output_id);
+    if (impl_->find(surface_id) == nullptr) {
+        Impl* raw = impl_.get();
+        impl_->watches.push_back(Impl::Watch{surface_id, ls, ls->destroy.connect([raw, surface_id](lm::LayerSurfaceDestroy&) {
+                                                 raw->forget(surface_id);
+                                             })});
+    }
+    return true;
+}
+void LayerManagerShim::remove(std::uint64_t surface_id) { impl_->forget(surface_id); }
+void LayerManagerShim::set_mapped(std::uint64_t surface_id, bool mapped) {
+    if (lm::LayerSurface* ls = impl_->find(surface_id); ls != nullptr) impl_->mgr.set_mapped(*ls, mapped);
+}
+Rect LayerManagerShim::arrange(std::uint32_t output_id, Rect full, Rect usable) {
+    return to_rect(impl_->mgr.arrange(output_id, to_box(full), to_box(usable)));
+}
+rust::Vec<SceneItemRaw> LayerManagerShim::append_to(std::uint32_t output_id, std::uint32_t layer) const {
+    std::vector<lm::SceneItem> items;
+    impl_->mgr.append_to(items, output_id, static_cast<lm::Layer>(layer));
+    rust::Vec<SceneItemRaw> out;
+    for (const lm::SceneItem& it : items) out.push_back(scene_item_raw(it));
+    return out;
+}
+std::uint64_t LayerManagerShim::keyboard_target(std::uint64_t surface_id) const {
+    lm::LayerSurface* ls = impl_->mgr.keyboard_target(id_from_u64(surface_id));
+    return ls != nullptr ? u64_from_id(ls->surface().id()) : 0;
+}
+void LayerManagerShim::close_output(std::uint32_t output_id) { impl_->mgr.close_output(output_id); }
 
 } // namespace lum

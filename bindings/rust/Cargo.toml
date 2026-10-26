@@ -18,3 +18,11 @@ cxx = "1.0"
 [build-dependencies]
 cxx-build = "1.0"
 pkg-config = "0.3"
+
+[dev-dependencies]
+# The client half of the protocol tests: real requests over a socketpair.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
