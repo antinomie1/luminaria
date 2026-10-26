@@ -1,8 +1,8 @@
 # luminaria（Rust 绑定）
 
 用 [cxx](https://cxx.rs) 从 Rust 调用 luminaria。C++ 侧做所有混成器都一样做的事
-（全局对象、渲染、帧节拍、帧回调、presentation 反馈、popup、光标、指针焦点），
-Rust 侧只剩窗口管理：窗口放哪、叠放顺序、尺寸、焦点、快捷键。
+（全局对象、渲染、帧节拍、帧回调、presentation 反馈、popup、layer-shell、光标、指针焦点、
+截屏、锁屏、输入法），Rust 侧只剩窗口管理：窗口放哪、叠放顺序、尺寸、焦点、快捷键、工作区。
 
 ```rust
 use luminaria::{Config, Event, Item, Server};
@@ -21,7 +21,8 @@ server.run(|server, event| {
 })?;
 ```
 
-完整示例见 `examples/floating.rs`（层叠放置、点击聚焦、拖标题栏移动、最大化）：
+完整示例见 `examples/floating.rs`（层叠放置、点击聚焦、拖标题栏移动、拖边缘缩放、
+避开 panel 的最大化、最小化、两个工作区）：
 
 ```sh
 cargo run --example floating                                    # 嵌套在当前会话里
@@ -50,6 +51,29 @@ LUMINARIA_BACKEND=drm cargo run --example floating              # 裸机，在�
 但 VT 切换会被禁用——这时请绑一个退出键（示例里是 Logo+Escape），第一次试的时候再加上
 `LUMINARIA_EXIT_MS=10000` 兜底。
 
+## 协议：哪些自动处理，哪些交给 Rust
+
+| 协议 | shim 自动做的 | 留给 Rust 的 |
+|---|---|---|
+| xdg-shell | popup 摆位与约束、grab 外点击关闭菜单 | 窗口位置、尺寸、焦点：`set_scene`、`configure`、`focus`；`Request*` 事件 |
+| wlr-layer-shell | 按输出排版与独占区；background/bottom 画在窗口下，top/overlay 在上；panel 的 popup；`exclusive` 抢键盘、`on_demand` 点击获得键盘 | `output_usable()` 与 `Event::OutputChange`：窗口该放进的区域 |
+| ext-session-lock | 锁定即只画锁屏、只给锁屏输入、快捷键全部失效；所有输出都画出锁屏后才回 `locked`；锁屏程序崩溃时保持锁定（fails closed） | `Event::SessionLock`、`is_locked()`，仅供知情 |
+| wlr-screencopy / ext-image-copy-capture | 从已上屏的画面读回（含 dmabuf 目标），光标作为单独的捕获源 | — |
+| foreign-toplevel、xdg-activation | 任务栏列表自动同步；关闭请求直接执行；只有有效 token 才能转移焦点 | 转成 `RequestActivate` / `RequestMaximize` / `RequestMinimize` 等同一套事件 |
+| ext-workspace | 一个 group，覆盖所有输出 | `add_workspace` / `activate_workspace` / `remove_workspace`；`Event::WorkspaceActivate` |
+| text-input-v3 + input-method-v2 | 输入法抢键盘时按键转给它；候选框贴在文本光标下 | — |
+| pointer-constraints、relative-pointer | 指针锁定/限制随指针焦点生效；裸机上发相对位移 | — |
+| idle-notify、idle-inhibit | 任何输入都算活动；有 inhibitor 时不进入 idle | — |
+| data-device、primary-selection、wlr-data-control | 剪贴板、拖放、中键粘贴、剪贴板管理器 | — |
+| 其余（viewporter、fractional-scale、presentation-time、fifo、commit-timing、tearing-control、content-type、cursor-shape、single-pixel-buffer、linux-dmabuf、drm-syncobj、xdg-decoration、background-effect、xdg-toplevel-icon） | 全部自动；客户端声明的模糊区域在 GPU 上照做 | `icon_name()`；`Config::server_side_decorations` |
+
+交互式移动/缩放：收到 `RequestMove` / `RequestResize` 后 `grab_pointer(true)`（客户端看不到指针移动），
+缩放时配合 `set_resizing` 和 `Rect::resized(edges, dx, dy, min_size)`，松开按键后 `grab_pointer(false)`。
+
+输出（裸机上才有意义）：`output_modes`、`set_output_mode`、`set_output_scale`、
+`set_output_transform`、`set_output_position`，之后都会收到 `Event::OutputChange`。键盘布局用
+`set_keyboard_layout("de")`；嵌套时按键来自宿主，跟随宿主的布局。
+
 ## 构建
 
 需要 xmake、clang ≥ 22（或 gcc ≥ 16）、glslangValidator，以及 luminaria 本身的系统依赖。
@@ -57,19 +81,26 @@ LUMINARIA_BACKEND=drm cargo run --example floating              # 裸机，在�
 
 1. `cxx-build` 展开 `src/lib.rs` 里的 `#[cxx::bridge]`，生成 `lib.rs.h` / `lib.rs.cc`，
    用 `cc` 编译胶水。`cc` 不认识 C++ 模块——胶水只 include `luminaria_rs.h`，用不着。
-2. xmake 编译 luminaria 和 `luminaria_rs.cpp`（唯一 `import luminaria.gpu;` 的文件），
+2. xmake 编译 luminaria 和 `luminaria_rs.cpp`（唯一 import 模块的文件），
    include 路径里带上第一步生成的头文件。xmake 的状态和产物都放在 `OUT_DIR` 下，不污染源码树。
-3. 链接三个静态库，系统库由 pkg-config 给出。
+3. 链接四个静态库，系统库由 pkg-config 给出。
 
 两边必须用同一套 C++ 标准库，否则跨桥的 `std::unique_ptr` 布局对不上。默认两边都用
 clang（Linux 上即都是 libstdc++）；`LUMINARIA_TOOLCHAIN=gcc` 会把两边一起换成 gcc。
 `LUMINARIA_XMAKE_MODE=debug|release` 可以单独指定 C++ 侧的构建模式（默认跟随 cargo profile）。
 
+`LUMINARIA_SANITIZE=address`（或 `undefined`）把两边都插桩。链接也必须交给同一家编译器，
+建议用单独的 target 目录，免得整个重编：
+
+```sh
+CARGO_TARGET_DIR=target-asan LUMINARIA_SANITIZE=address RUSTFLAGS="-C linker=clang" cargo build --example floating
+```
+
 ## 文件
 
 ```
 luminaria_rs.h     普通头文件，不含模块，也不出现任何 luminaria 类型；给 cxx 读
-luminaria_rs.cpp   import luminaria.gpu; 所有封装都在这里，由 xmake 编译
+luminaria_rs.cpp   import luminaria.gpu / luminaria.desktop; 所有封装都在这里，由 xmake 编译
 src/lib.rs         #[cxx::bridge]（私有）加一层安全封装（公开 API）
 build.rs           上面三步
 xmake.lua          shim 的 xmake 子工程，includes("../..") 引入 luminaria
@@ -88,13 +119,19 @@ xmake.lua          shim 的 xmake 子工程，includes("../..") 引入 luminaria
 - **只把 id 交给 Rust。** `WindowId` / `OutputId` 是单调递增、永不复用的 u64；对象没了，
   拿旧 id 调用就是空操作。`Surface*`、`Toplevel*` 永远不过桥。
 - **生命周期靠成员声明顺序。** `Server::Impl` 里 `SceneRenderer` 最先声明（最后析构），
-  满足"renderer 必须比 Display 活得久"；每窗口、每输出的状态最后声明（最先析构），
-  它们的信号连接先断开。销毁回调里只做标记，真正释放推迟到下一次 `dispatch()`。
+  满足"renderer 必须比 Display 活得久"；持有 `Seat&` 的全局对象排在 seat 后面；每窗口、
+  每输出的状态最后声明（最先析构），它们的信号连接先断开。销毁回调里只做标记，真正释放
+  推迟到下一次 `dispatch()`。析构时**先断开所有客户端**，再拆全局对象：客户端资源在死去时
+  会回调它的全局对象（退出时还连着的 wl-copy 曾让 data-control 读到已释放的
+  `DataDeviceManager`）。
 - **场景是每次整体替换的列表**（ADR 0001 的即时模式）：布局变了就 `set_scene(&items)`，
   画什么和点中什么来自同一张列表，重绘范围由库里的列表 diff 算出。`Item::Window` 的坐标
   是窗口几何（不含客户端阴影）的左上角，popup 跟着父窗口自动摆放。
 
 ## 还没有的
 
-layer-shell、截屏、桌面特权协议、触摸、交互式缩放的辅助、裸机上的输出模式/缩放/旋转设置
-（目前每块屏保持连接器的首选模式，scale 1）。
+- **触摸。** Seat 支持 `touch_*`，但 `LibinputBackend` 只报告设备有没有触摸能力、不发触摸事件，
+  嵌套后端也不转发；要先在库里补上这一层。
+- **wlr-output-management**（让 `wlr-randr`/kanshi 改输出）：库里没有这个协议；目前只能由
+  Rust 调 `set_output_*`。
+- 截屏注册的输出尺寸是客户端绑定 wl_output 时的尺寸；改模式后新绑定的客户端才拿到新尺寸。

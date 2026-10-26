@@ -5,11 +5,12 @@
 // unit, so it has no `module;` line: includes first, then the import, exactly
 // like examples/tinyluminaria.cpp.
 //
-// What it is: tinyluminaria's wiring with the policy taken out. Everything
-// every compositor writes the same way — globals, renderer, frame pump, frame
-// callbacks, presentation feedback, popups, the cursor, pointer focus — is
+// What it is: tinyluminaria's and luminaria-tty's wiring with the policy taken
+// out. Everything every compositor writes the same way — globals, renderer,
+// frame pump, frame callbacks, presentation feedback, popups, layer shell, the
+// cursor, pointer focus, screen capture, the lock screen, input methods — is
 // done here. What a window manager decides — where windows go, their stacking,
-// sizes, focus, bindings — is Rust's, and arrives as plain calls.
+// sizes, focus, bindings, workspaces — is Rust's, and arrives as plain calls.
 //
 // The rule that keeps it sound: C++ never calls Rust. libwayland's callbacks
 // only append to `events`; Rust drains that queue after `dispatch()` returns,
@@ -24,6 +25,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <memory>
@@ -35,6 +37,7 @@
 #include "luminaria/src/lib.rs.h"
 
 import luminaria.gpu;
+import luminaria.desktop;
 
 namespace lum {
 
@@ -64,6 +67,11 @@ rust::String to_rust(const std::string& s) { return rust::String::lossy(s); }
 // (Caps, Num) are deliberately not here — a binding must not stop working
 // because Caps Lock is on.
 constexpr std::uint32_t kBindableMods = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 6);
+
+// Screen capture copies whole rows of these straight into the client's RGBA.
+static_assert(sizeof(lm::Pixel) == 4);
+
+Rect to_rect(const lm::Box& b) { return Rect{b.x, b.y, b.width, b.height}; }
 
 } // namespace
 
@@ -96,16 +104,38 @@ struct PopupEntry {
     Conn<lm::PopupDestroy> on_destroy;
 };
 
+struct LayerEntry {
+    lm::LayerSurface* layer = nullptr; // null once destroyed
+    std::uint64_t output = 0;
+    bool added = false; // in LayerManager: only from the client's initial commit on
+    bool dead = false;
+    Conn<lm::LayerSurfaceMap> on_map;
+    Conn<lm::LayerSurfaceUnmap> on_unmap;
+    Conn<lm::LayerSurfaceDestroy> on_destroy;
+    Conn<lm::LayerSurfaceStateChange> on_state;
+    Conn<lm::LayerSurfacePopup> on_popup;
+};
+
+struct LockSurfaceEntry {
+    lm::SessionLockSurface* surface = nullptr;
+    bool dead = false;
+    Conn<lm::SessionLockSurfaceMap> on_map;
+    Conn<lm::SessionLockSurfaceDestroy> on_destroy;
+};
+
 struct OutputEntry {
     std::uint64_t id = 0;
     lm::Output* output = nullptr; // null once unplugged
     bool dead = false;
     lm::SceneOutput state;
     std::optional<lm::OutputGlobal> global;
+    lm::Box usable;           // what layer-shell exclusive zones leave, global coordinates
+    bool drew_locked = false; // the last frame on screen showed only the lock
     std::vector<lm::SurfaceId> drawn; // roots of the last frame, for presentation feedback
     Conn<lm::FrameEvent> on_frame;
     Conn<lm::PresentEvent> on_present;
     Conn<lm::OutputDestroy> on_destroy;
+    Conn<lm::OutputModeChange> on_mode;
 };
 
 struct SurfaceWatch {
@@ -124,13 +154,14 @@ struct Binding {
 using namespace detail;
 
 struct Server::Impl {
-    // Declaration order is destruction order, reversed, and three of these
-    // depend on it:
+    // Declaration order is destruction order, reversed, and it matters:
     //  * `renderer` first, so it dies last: every SceneOutput below caches GPU
     //    textures it owns ("the renderer must outlive the Display").
-    //  * `display` before the globals and the backend, which hold its loop.
-    //  * the per-window/per-output state last, so it dies first: its signal
-    //    connections are gone before any object they point into.
+    //  * `display` before the globals and the backends, which hold its loop.
+    //  * anything holding a Seat& (data devices, constraints, text input, the
+    //    input method) after `seat`, and data-control after the data devices.
+    //  * the per-object state last, so it dies first: its signal connections
+    //    are gone before any object they point into.
     lm::SceneRenderer renderer;
     std::optional<lm::Display> display;
     // Before both bare-metal backends, which hold a pointer to it.
@@ -139,20 +170,36 @@ struct Server::Impl {
     std::optional<lm::Compositor> compositor;
     std::optional<lm::Subcompositor> subcompositor;
     std::optional<lm::XdgShell> shell;
-    std::optional<lm::Seat> seat;
+    std::optional<lm::LayerShell> layer_shell;
     std::optional<lm::SinglePixelBufferManager> single_pixel;
     std::optional<lm::Presentation> presentation;
     std::optional<lm::Viewporter> viewporter;
     std::optional<lm::FractionalScaleManager> fractional;
     std::optional<lm::XdgDecorationManager> decoration;
     std::optional<lm::CursorShapeManager> cursor_shape;
-    std::optional<lm::DataDeviceManager> data_device;
-    std::optional<lm::PrimarySelectionManager> primary_selection;
     std::optional<lm::FifoManager> fifo;
     std::optional<lm::CommitTimingManager> commit_timing;
     std::optional<lm::TearingControlManager> tearing;
+    std::optional<lm::ContentTypeManager> content_type;
+    std::optional<lm::BackgroundEffectManager> background_effect;
+    std::optional<lm::XdgActivation> activation;
+    std::optional<lm::XdgToplevelIconManager> icons;
+    std::optional<lm::IdleInhibitManager> idle_inhibit;
+    std::optional<lm::IdleNotifier> idle_notify;
     std::optional<lm::LinuxDmabuf> dmabuf;
     std::optional<lm::DrmSyncobjManager> syncobj;
+    std::optional<lm::ScreencopyManager> screencopy;
+    std::optional<lm::ForeignToplevelManager> foreign;
+    std::optional<lm::WorkspaceManager> workspaces;
+    std::optional<lm::SessionLockManager> locks;
+    std::optional<lm::Seat> seat;
+    std::optional<lm::DataDeviceManager> data_device;
+    std::optional<lm::PrimarySelectionManager> primary_selection;
+    std::optional<lm::DataControlManager> data_control;
+    std::optional<lm::PointerConstraints> constraints;
+    std::optional<lm::RelativePointerManager> relative;
+    std::optional<lm::TextInputManager> text_input;
+    std::optional<lm::InputMethodManager> input_method;
 
     std::unique_ptr<lm::Backend> backend;
     lm::WaylandBackend* nested = nullptr; // == backend.get() when nested; input comes from it
@@ -163,12 +210,13 @@ struct Server::Impl {
     lm::Pointer pointer;
     lm::CursorManager cursors;
     lm::PopupTree popup_tree;
-    std::optional<lm::KeymapState> keymap;
+    lm::LayerManager layers;
+    std::optional<lm::KeymapState> keymap; // nested: built from the host's keymap
     lm::KeyRouter keys;
     lm::Color background{0.1f, 0.1f, 0.12f, 1.0f};
 
     std::vector<Item> items;            // Rust's list, global logical coordinates
-    std::vector<lm::SceneItem> scene;   // `items` resolved, plus popups (global)
+    std::vector<lm::SceneItem> scene;   // `items` resolved, plus layers and popups (global)
     std::vector<lm::SceneItem> local;   // `scene` in one output's coordinates
     std::vector<lm::SurfaceAt> tree;    // scratch for surface_tree()
     std::deque<Event> events;
@@ -176,36 +224,56 @@ struct Server::Impl {
 
     std::uint64_t next_window = 1;
     std::uint64_t next_output = 1;
-    std::uint64_t focused = 0;
-    lm::SurfaceId ptr_focus;
-    std::uint64_t ptr_window = 0;
-    int buttons_down = 0;
+    std::uint64_t focused = 0;    // the window Rust focused
+    lm::SurfaceId layer_focus;    // an on-demand layer surface the user clicked into
+    std::uint64_t ptr_window = 0; // the window under the pointer
+    bool wm_grab = false;         // Rust is dragging something: clients see no motion
     std::vector<std::uint32_t> held; // keys a client was told are down
+    std::uint32_t workspace_group = 0;
+
+    // The lock screen. `lock_pending`: a lock was asked for and the screens
+    // are already blanked, but not every output has shown that yet, so the
+    // client has not been told it is locked. `lock_failed`: a lock client died
+    // without unlocking, and the session stays locked — fails closed — until
+    // another lock client unlocks it.
+    bool lock_pending = false;
+    bool lock_failed = false;
+    bool reported_locked = false;
 
     Conn<lm::NewOutput> on_new_output;
     Conn<lm::NewToplevel> on_new_toplevel;
     Conn<lm::NewPopup> on_new_popup;
+    Conn<lm::NewLayerSurface> on_new_layer;
     Conn<lm::NewSurface> on_new_surface;
     Conn<lm::CursorShapeRequest> on_cursor_shape;
     Conn<lm::SeatCursorChange> on_cursor_change;
+    Conn<lm::SeatPointerFocus> on_pointer_focus;
     Conn<lm::PointerMotionAbsEvent> on_motion;
+    Conn<lm::PointerMotionEvent> on_rel_motion;
     Conn<lm::PointerButtonEvent> on_button;
     Conn<lm::PointerAxisEvent> on_axis;
     Conn<lm::KeyEvent> on_key;
     Conn<lm::ModifiersEvent> on_mods;
     Conn<lm::KeymapChange> on_keymap;
     Conn<lm::HostCloseRequest> on_close;
-    Conn<lm::PointerMotionEvent> on_rel_motion;
     Conn<lm::InputCapabilities> on_caps;
     Conn<lm::SessionActive> on_session;
-    Conn<lm::SeatPointerFocus> on_pointer_focus;
+    Conn<lm::ForeignToplevelRequest> on_foreign;
+    Conn<lm::ActivationRequest> on_activate;
+    Conn<lm::WorkspaceRequest> on_workspace;
+    Conn<lm::IdleInhibitChange> on_inhibit;
+    Conn<lm::NewSessionLock> on_new_lock;
+    Conn<lm::NewSessionLockSurface> on_lock_surface;
+    Conn<lm::SessionLockDestroy> on_lock_destroy;
 
     std::vector<SurfaceWatch> surfaces;
+    std::vector<std::unique_ptr<LockSurfaceEntry>> lock_surfaces;
     std::vector<std::unique_ptr<OutputEntry>> outputs;
+    std::vector<std::unique_ptr<LayerEntry>> layer_entries;
     std::vector<std::unique_ptr<PopupEntry>> popups;
     std::vector<std::unique_ptr<Window>> windows;
 
-    // ------------------------------------------------------------- helpers
+    // ------------------------------------------------------------- lookups
 
     void push(EventKind kind, std::uint64_t window = 0) {
         Event e{};
@@ -223,6 +291,71 @@ struct Server::Impl {
         return nullptr;
     }
 
+    Window* window_of(const lm::Toplevel& toplevel) const {
+        for (const auto& w : windows) {
+            if (w->toplevel == &toplevel) {
+                return w.get();
+            }
+        }
+        return nullptr;
+    }
+
+    Window* window_of(const lm::Surface& surface) const {
+        for (const auto& w : windows) {
+            if (w->toplevel != nullptr && &w->toplevel->surface() == &surface) {
+                return w.get();
+            }
+        }
+        return nullptr;
+    }
+
+    OutputEntry* output(std::uint64_t id) const {
+        for (const auto& o : outputs) {
+            if (o->id == id && o->output != nullptr) {
+                return o.get();
+            }
+        }
+        return nullptr;
+    }
+
+    /// The output a client means by one of its wl_output resources.
+    OutputEntry* output_of(wl_resource* resource) const {
+        if (resource == nullptr) {
+            return nullptr;
+        }
+        wl_client* client = wl_resource_get_client(resource);
+        for (const auto& o : outputs) {
+            if (o->output != nullptr && o->global.has_value() &&
+                o->global->resource_for(client) == resource) {
+                return o.get();
+            }
+        }
+        return nullptr;
+    }
+
+    /// "Compositor's choice": the output under the pointer, else the first.
+    OutputEntry* default_output() const {
+        if (pointer.present()) {
+            if (lm::Output* on = layout.at(static_cast<int>(pointer.x()),
+                                           static_cast<int>(pointer.y()));
+                on != nullptr) {
+                for (const auto& o : outputs) {
+                    if (o->output == on) {
+                        return o.get();
+                    }
+                }
+            }
+        }
+        for (const auto& o : outputs) {
+            if (o->output != nullptr) {
+                return o.get();
+            }
+        }
+        return nullptr;
+    }
+
+    bool locked() const { return lock_pending || lock_failed || locks->session_locked(); }
+
     /// Nothing reports damage for a layout change, a popup or the cursor; ask
     /// every output for a frame and let the scene diff work out what moved.
     void schedule_all() {
@@ -233,34 +366,100 @@ struct Server::Impl {
         }
     }
 
-    /// `items` → `scene`. A window item names where its *window geometry* goes
-    /// (what xdg-shell calls the window, without CSD shadows), and is clipped
-    /// to it. That is also the box popups are positioned against, so a menu
-    /// lands where the client asked even on a shadowed GTK window.
+    // ------------------------------------------------------------- scene
+
+    void append_window(const Item& it) {
+        const Window* w = window(it.window);
+        if (w == nullptr || !w->mapped) {
+            return;
+        }
+        lm::Surface& root = w->toplevel->surface();
+        const lm::XdgGeometry g = w->toplevel->geometry();
+        const bool has_geometry = g.width > 0 && g.height > 0;
+        const int ox = it.x - (has_geometry ? g.x : 0);
+        const int oy = it.y - (has_geometry ? g.y : 0);
+        const lm::Box box{it.x, it.y, has_geometry ? g.width : root.surface_width(),
+                          has_geometry ? g.height : root.surface_height()};
+        scene.push_back({.kind = lm::SceneItem::Kind::surface,
+                         .box = box,
+                         .surface = root.id(),
+                         .x = ox,
+                         .y = oy,
+                         .tag = it.window,
+                         // Blur only what the client asked to have blurred
+                         // (ext-background-effect). A window that declared
+                         // nothing costs nothing; the CPU path ignores it.
+                         .blur = {.enabled = true, .surface_regions = true}});
+    }
+
+    void append_layers(lm::Layer layer) {
+        for (const auto& o : outputs) {
+            if (o->output != nullptr) {
+                layers.append_to(scene, static_cast<std::uint32_t>(o->id), layer);
+            }
+        }
+    }
+
+    /// The input method's candidate window, under the text cursor of whatever
+    /// text field is focused.
+    void append_input_popups() {
+        lm::InputMethod* im = input_method->current();
+        lm::TextInput* ti = text_input->focused();
+        lm::Surface* field = ti != nullptr ? ti->focused_surface() : nullptr;
+        double fx = 0, fy = 0;
+        if (im == nullptr || field == nullptr || !surface_origin(field->id(), fx, fy)) {
+            return;
+        }
+        for (lm::InputPopupSurface* popup : im->popup_surfaces()) {
+            lm::Surface& s = popup->surface();
+            const lm::Box& r = popup->text_input_rectangle();
+            const int x = static_cast<int>(fx) + r.x;
+            const int y = static_cast<int>(fy) + r.y + r.height;
+            scene.push_back({.kind = lm::SceneItem::Kind::surface,
+                             .box = {x, y, s.surface_width(), s.surface_height()},
+                             .surface = s.id(),
+                             .x = x,
+                             .y = y});
+        }
+    }
+
+    /// The lock screen replaces everything: each output shows its own lock
+    /// surface, or nothing at all — never a window.
+    void build_lock_scene() {
+        lm::SessionLock* lock = locks->current();
+        if (lock == nullptr) {
+            return; // the lock client died: black, and still locked
+        }
+        for (lm::SessionLockSurface* s : lock->surfaces()) {
+            OutputEntry* o = output_of(s->output_resource());
+            if (o == nullptr || !s->mapped()) {
+                continue;
+            }
+            const lm::Box box = layout.box_of(*o->output);
+            scene.push_back({.kind = lm::SceneItem::Kind::surface,
+                             .box = box,
+                             .surface = s->surface().id(),
+                             .x = box.x,
+                             .y = box.y});
+        }
+    }
+
+    /// Everything, back to front, in global coordinates: background and
+    /// bottom layers, Rust's list, top and overlay layers, then popups (window
+    /// popups, panel menus) and the input method's popup above it all.
     void build_scene() {
         scene.clear();
+        if (locked()) {
+            build_lock_scene();
+            return;
+        }
+        append_layers(lm::Layer::background);
+        append_layers(lm::Layer::bottom);
         for (const Item& it : items) {
             switch (it.kind) {
-            case ItemKind::Window: {
-                const Window* w = window(it.window);
-                if (w == nullptr || !w->mapped) {
-                    break;
-                }
-                lm::Surface& root = w->toplevel->surface();
-                const lm::XdgGeometry g = w->toplevel->geometry();
-                const bool has_geometry = g.width > 0 && g.height > 0;
-                const int ox = it.x - (has_geometry ? g.x : 0);
-                const int oy = it.y - (has_geometry ? g.y : 0);
-                const lm::Box box{it.x, it.y, has_geometry ? g.width : root.surface_width(),
-                                  has_geometry ? g.height : root.surface_height()};
-                scene.push_back({.kind = lm::SceneItem::Kind::surface,
-                                 .box = box,
-                                 .surface = root.id(),
-                                 .x = ox,
-                                 .y = oy,
-                                 .tag = it.window});
+            case ItemKind::Window:
+                append_window(it);
                 break;
-            }
             case ItemKind::Rect:
                 scene.push_back({.kind = lm::SceneItem::Kind::rect,
                                  .box = {it.x, it.y, it.width, it.height},
@@ -278,7 +477,10 @@ struct Server::Impl {
                 break;
             }
         }
+        append_layers(lm::Layer::top);
+        append_layers(lm::Layer::overlay);
         popup_tree.append_to(scene);
+        append_input_popups();
     }
 
     /// Global origin of `id` if it is drawn in `scene`, subsurfaces included.
@@ -303,37 +505,104 @@ struct Server::Impl {
         return false;
     }
 
-    /// Send pointer enter/motion for the current position. While a button is
-    /// held the surface that took the press keeps the pointer (the implicit
-    /// grab every toolkit's drag and text selection relies on).
+    // ------------------------------------------------------------- focus
+
+    /// Who gets the keyboard, highest claim first: the lock screen; a top or
+    /// overlay layer surface that demands it exclusively (a launcher, a
+    /// password prompt); an on-demand layer surface the user clicked into;
+    /// the window Rust focused.
+    void apply_keyboard_focus() {
+        lm::Surface* target = nullptr;
+        if (locked()) {
+            if (lm::SessionLock* lock = locks->current(); lock != nullptr) {
+                OutputEntry* here = default_output();
+                for (lm::SessionLockSurface* s : lock->surfaces()) {
+                    if (!s->mapped()) {
+                        continue;
+                    }
+                    if (target == nullptr || output_of(s->output_resource()) == here) {
+                        target = &s->surface();
+                    }
+                }
+            }
+        } else if (lm::LayerSurface* ex = exclusive_layer(); ex != nullptr) {
+            target = &ex->surface();
+        } else if (lm::Surface* clicked = lm::surface_from_id(layer_focus); clicked != nullptr) {
+            target = clicked;
+        } else if (Window* w = window(focused); w != nullptr && w->mapped) {
+            target = &w->toplevel->surface();
+        }
+        const lm::SurfaceId want = target != nullptr ? target->id() : lm::SurfaceId{};
+        if (want != seat->keyboard_focus()) {
+            seat->set_keyboard_focus(target);
+        }
+    }
+
+    lm::LayerSurface* exclusive_layer() const {
+        lm::LayerSurface* best = nullptr;
+        for (const auto& e : layer_entries) {
+            lm::LayerSurface* ls = e->layer;
+            if (ls == nullptr || !ls->mapped() ||
+                ls->keyboard_interactivity() != lm::LayerKeyboardInteractivity::exclusive ||
+                ls->layer() < lm::Layer::top) {
+                continue;
+            }
+            if (best == nullptr || ls->layer() >= best->layer()) {
+                best = ls;
+            }
+        }
+        return best;
+    }
+
+    /// Hand the pointer's constraint (a game's pointer lock, a confined
+    /// drawing app) to the surface under it, and take it away on leave.
+    void apply_pointer_constraint() {
+        lm::Surface* focus = lm::surface_from_id(seat->pointer_focus());
+        lm::PointerConstraint* want = focus != nullptr ? constraints->constraint_for(*focus) : nullptr;
+        lm::PointerConstraint* current = constraints->active_constraint();
+        if (current != nullptr && current != want) {
+            current->deactivate();
+        }
+        if (want != nullptr && !want->active()) {
+            want->activate();
+        }
+    }
+
+    /// Send pointer enter/motion for the current position.
+    ///
+    /// Three cases. A drag-and-drop is in progress: hit-test as usual, and
+    /// the seat routes it to the drag. A button is held (the seat's implicit
+    /// grab): every event belongs to the surface that took the press, in its
+    /// own coordinates, wherever the pointer is. Otherwise: whatever is under
+    /// the pointer.
     void update_pointer_focus() {
         if (!pointer.present()) {
             return;
         }
         build_scene();
-        if (buttons_down > 0 && ptr_focus.valid()) {
-            double ox = 0, oy = 0;
-            if (lm::surface_from_id(ptr_focus) != nullptr && surface_origin(ptr_focus, ox, oy)) {
-                seat->pointer_motion(pointer.x() - ox, pointer.y() - oy);
-                return;
-            }
-        }
         const lm::SceneHit hit = lm::scene_hit_test(scene, pointer.x(), pointer.y());
         ptr_window = hit.hit ? hit.tag : 0;
-        if (hit.surface == nullptr) {
-            if (ptr_focus.valid()) {
-                ptr_focus = {};
-                seat->pointer_clear_focus();
+        if (wm_grab) {
+            return; // the window manager is moving or resizing something
+        }
+        if (const lm::SurfaceId grab = seat->pointer_grab(); grab.valid() && !seat->dragging()) {
+            double ox = 0, oy = 0;
+            if (lm::surface_from_id(grab) != nullptr && surface_origin(grab, ox, oy)) {
+                seat->pointer_motion(pointer.x() - ox, pointer.y() - oy);
             }
             return;
         }
-        if (hit.surface->id() != ptr_focus) {
-            ptr_focus = hit.surface->id();
-            seat->pointer_enter(*hit.surface, hit.sx, hit.sy);
+        if (hit.surface == nullptr) {
+            if (seat->pointer_focus().valid()) {
+                seat->pointer_clear_focus();
+            }
         } else {
-            seat->pointer_motion(hit.sx, hit.sy);
+            seat->pointer_enter(*hit.surface, hit.sx, hit.sy);
         }
+        apply_pointer_constraint();
     }
+
+    // ------------------------------------------------------------- frames
 
     void draw(OutputEntry& o) {
         if (o.output == nullptr) {
@@ -357,13 +626,19 @@ struct Server::Impl {
         cursor.x -= view.x;
         cursor.y -= view.y;
 
-        auto outcome = renderer.present(o.state, *o.output, local, background, cursor);
+        const bool showing_lock = locked();
+        const lm::Color bg = showing_lock ? lm::Color{0.0f, 0.0f, 0.0f, 1.0f} : background;
+        auto outcome = renderer.present(o.state, *o.output, local, bg, cursor);
         if (!outcome) {
             warn("present", outcome.error());
-        } else if (*outcome == lm::SceneOutcome::unchanged) {
+            return;
+        }
+        o.drew_locked = showing_lock;
+        if (*outcome == lm::SceneOutcome::unchanged) {
             // Nothing was committed, so no `present` follows: release the
             // callbacks here or a client that committed without damage freezes.
             renderer.send_frame_done(o.state, now_ms());
+            confirm_lock();
         }
     }
 
@@ -381,6 +656,24 @@ struct Server::Impl {
                 presentation->notify_presented(*at.surface, pe);
             }
         }
+        confirm_lock();
+    }
+
+    /// ext-session-lock: `locked` may only be sent once no output shows
+    /// anything but the lock — so only after each has presented such a frame.
+    void confirm_lock() {
+        if (!lock_pending) {
+            return;
+        }
+        for (const auto& o : outputs) {
+            if (o->output != nullptr && !o->drew_locked) {
+                return;
+            }
+        }
+        lock_pending = false;
+        if (lm::SessionLock* lock = locks->current(); lock != nullptr) {
+            lock->send_locked();
+        }
     }
 
     /// Free everything whose object died during the last dispatch. Here and
@@ -388,12 +681,14 @@ struct Server::Impl {
     void reap() {
         std::erase_if(windows, [](const auto& w) { return w->dead; });
         std::erase_if(popups, [](const auto& p) { return p->dead; });
+        std::erase_if(layer_entries, [](const auto& l) { return l->dead; });
+        std::erase_if(lock_surfaces, [](const auto& l) { return l->dead; });
         std::erase_if(outputs, [](const auto& o) { return o->dead; });
         std::erase_if(surfaces,
                       [](const SurfaceWatch& s) { return lm::surface_from_id(s.surface) == nullptr; });
     }
 
-    // ------------------------------------------------------------- wiring
+    // ------------------------------------------------------------- windows
 
     void watch_toplevel(lm::Toplevel& toplevel) {
         auto owned = std::make_unique<Window>();
@@ -404,12 +699,11 @@ struct Server::Impl {
             w->mapped = true;
             // Render at the output's density, both the integer hint and the
             // exact scale for clients that speak fractional-scale.
-            if (!outputs.empty() && outputs.front()->global.has_value()) {
-                lm::OutputGlobal& g = *outputs.front()->global;
+            if (OutputEntry* o = default_output(); o != nullptr) {
                 lm::Surface& surface = w->toplevel->surface();
-                surface.set_preferred_buffer_scale(g.scale());
-                surface.set_preferred_buffer_transform(g.transform());
-                fractional->set_scale(surface, g.scale() * 120);
+                surface.set_preferred_buffer_scale(o->output->scale());
+                surface.set_preferred_buffer_transform(o->output->transform());
+                fractional->set_scale(surface, o->output->scale() * 120);
             }
             push(EventKind::WindowMap, w->id);
             schedule_all();
@@ -418,19 +712,19 @@ struct Server::Impl {
             w->mapped = false;
             if (focused == w->id) {
                 focused = 0;
-                seat->set_keyboard_focus(nullptr);
+                apply_keyboard_focus();
             }
             push(EventKind::WindowUnmap, w->id);
             schedule_all();
         });
         w->on_destroy = toplevel.destroy.connect([this, w](lm::ToplevelDestroy&) {
-            if (focused == w->id) {
-                focused = 0;
-                seat->set_keyboard_focus(nullptr);
-            }
             w->mapped = false;
             w->toplevel = nullptr;
             w->dead = true;
+            if (focused == w->id) {
+                focused = 0;
+                apply_keyboard_focus();
+            }
             push(EventKind::WindowDestroy, w->id);
             schedule_all();
         });
@@ -444,8 +738,11 @@ struct Server::Impl {
                 push(EventKind::RequestFullscreen, w->id);
                 events.back().on = e.fullscreen;
             });
-        w->on_minimize = toplevel.request_minimize.connect(
-            [this, w](lm::ToplevelRequestMinimize&) { push(EventKind::RequestMinimize, w->id); });
+        w->on_minimize =
+            toplevel.request_minimize.connect([this, w](lm::ToplevelRequestMinimize&) {
+                push(EventKind::RequestMinimize, w->id);
+                events.back().on = true;
+            });
         w->on_move = toplevel.request_move.connect(
             [this, w](lm::ToplevelRequestMove&) { push(EventKind::RequestMove, w->id); });
         w->on_resize = toplevel.request_resize.connect([this, w](lm::ToplevelRequestResize& e) {
@@ -480,6 +777,116 @@ struct Server::Impl {
         popups.push_back(std::move(owned));
     }
 
+    /// Requests from a taskbar (foreign-toplevel) or an activation token are
+    /// the same requests the window itself can make, so they reach Rust as
+    /// the same events. Closing needs no decision and is done here.
+    void foreign_request(lm::ForeignToplevelRequest& r) {
+        Window* w = window_of(r.toplevel);
+        if (w == nullptr) {
+            return;
+        }
+        using K = lm::ForeignToplevelRequest::Kind;
+        switch (r.kind) {
+        case K::maximize:
+        case K::unmaximize:
+            push(EventKind::RequestMaximize, w->id);
+            events.back().on = r.kind == K::maximize;
+            break;
+        case K::fullscreen:
+        case K::unfullscreen:
+            push(EventKind::RequestFullscreen, w->id);
+            events.back().on = r.kind == K::fullscreen;
+            break;
+        case K::minimize:
+        case K::unminimize:
+            push(EventKind::RequestMinimize, w->id);
+            events.back().on = r.kind == K::minimize;
+            break;
+        case K::activate:
+            push(EventKind::RequestActivate, w->id);
+            break;
+        case K::close:
+            r.toplevel.close();
+            break;
+        }
+    }
+
+    // ------------------------------------------------------------- layer shell
+
+    void watch_layer(lm::LayerSurface& ls) {
+        OutputEntry* o = output_of(ls.output_resource());
+        if (o == nullptr) {
+            o = default_output();
+        }
+        if (o == nullptr) {
+            ls.close(); // nowhere to put it
+            return;
+        }
+        auto owned = std::make_unique<LayerEntry>();
+        LayerEntry* e = owned.get();
+        e->layer = &ls;
+        e->output = o->id;
+        const auto changed = [this, e] {
+            if (OutputEntry* out = output(e->output); out != nullptr) {
+                arrange(*out);
+            }
+            apply_keyboard_focus();
+            schedule_all();
+        };
+        e->on_map = ls.map.connect([this, e, changed](lm::LayerSurfaceMap&) {
+            layers.set_mapped(*e->layer, true);
+            changed();
+        });
+        e->on_unmap = ls.unmap.connect([this, e, changed](lm::LayerSurfaceUnmap&) {
+            layers.set_mapped(*e->layer, false);
+            if (layer_focus == e->layer->surface().id()) {
+                layer_focus = {};
+            }
+            changed();
+        });
+        // The first of these is the client's initial commit, and only from
+        // then on may it be configured: an earlier arrange() would configure
+        // it before it said what it wants.
+        e->on_state = ls.state_change.connect([this, e, changed](lm::LayerSurfaceStateChange&) {
+            if (!e->added) {
+                layers.add(*e->layer, static_cast<std::uint32_t>(e->output));
+                e->added = true;
+            }
+            changed();
+        });
+        e->on_destroy = ls.destroy.connect([this, e, changed](lm::LayerSurfaceDestroy&) {
+            layers.remove(*e->layer);
+            if (layer_focus == e->layer->surface().id()) {
+                layer_focus = {};
+            }
+            e->layer = nullptr;
+            e->dead = true;
+            changed();
+        });
+        // A panel's own menu: positioned against the panel, not a window.
+        e->on_popup = ls.new_popup.connect([this](lm::LayerSurfacePopup& p) {
+            popup_tree.set_parent(p.popup, p.layer_surface.surface().id());
+        });
+        layer_entries.push_back(std::move(owned));
+    }
+
+    /// Lay out one output's layer surfaces, configure them, and tell Rust if
+    /// the area left for windows changed.
+    void arrange(OutputEntry& o) {
+        const lm::Box full = layout.box_of(*o.output);
+        const lm::Box usable = layers.arrange(static_cast<std::uint32_t>(o.id), full, full);
+        if (usable.x != o.usable.x || usable.y != o.usable.y || usable.width != o.usable.width ||
+            usable.height != o.usable.height) {
+            o.usable = usable;
+            push(EventKind::OutputChange);
+            events.back().output = o.id;
+            // How big a window may get, for maximize and configure_bounds.
+            shell->set_bounds(usable.width, usable.height);
+        }
+    }
+
+    // ------------------------------------------------------------- outputs
+
     void watch_output(lm::Output& output) {
         auto owned = std::make_unique<OutputEntry>();
         OutputEntry* o = owned.get();
@@ -487,6 +894,7 @@ struct Server::Impl {
         o->output = &output;
         layout.add_auto(output);
         const lm::Box box = layout.box_of(output);
+        o->usable = box;
 
         if (auto s = renderer.reset(o->state, output, DRM_FORMAT_XRGB8888); !s) {
             warn("render target (falling back to CPU)", s.error());
@@ -494,13 +902,23 @@ struct Server::Impl {
         auto global = lm::OutputGlobal::create(*display, output.width(), output.height(),
                                                "luminaria-" + std::to_string(o->id));
         if (global) {
-            global->set_logical_position(box.x, box.y);
-            if (const auto modes = output.modes(); !modes.empty()) {
-                global->set_modes(modes); // a real monitor: tell clients what it can do
-                global->set_mode(output.width(), output.height(),
-                                 output.current_mode().refresh_mhz);
-            }
             o->global.emplace(std::move(*global));
+            sync_global(*o);
+            // Capture registers per binding: the client names the output by
+            // its own wl_output resource. The callback looks the output up by
+            // id when it runs, because it outlives this entry.
+            const std::uint64_t id = o->id;
+            o->global->on_bind([this, id](wl_resource* resource) {
+                if (OutputEntry* out = this->output(id); out != nullptr) {
+                    screencopy->add_output(resource, out->output->width(), out->output->height(),
+                                           [this, id](int x, int y, int w, int h,
+                                                      std::vector<std::uint8_t>& rgba) {
+                                               return capture(id, x, y, w, h, rgba);
+                                           });
+                }
+            });
+            workspaces->group_add_output(workspace_group, *o->global);
+            workspaces->done();
         } else {
             warn("wl_output", global.error());
         }
@@ -509,16 +927,25 @@ struct Server::Impl {
         o->on_frame = output.frame.connect([this, o](lm::FrameEvent&) { draw(*o); });
         o->on_present =
             output.present.connect([this, o](lm::PresentEvent& pe) { presented(*o, pe); });
+        o->on_mode = output.mode_changed.connect([this, o](lm::OutputModeChange&) {
+            // Everything sized for the old mode has to be rebuilt.
+            if (auto s = renderer.reset(o->state, *o->output, DRM_FORMAT_XRGB8888); !s) {
+                warn("render target (falling back to CPU)", s.error());
+            }
+            relayout(*o);
+        });
         o->on_destroy = output.destroy.connect([this, o](lm::OutputDestroy&) {
+            layers.close_output(static_cast<std::uint32_t>(o->id));
             layout.remove(*o->output);
             // The render state goes now, while the Output it was built for
             // still exists; the entry itself waits for reap().
             o->state = lm::SceneOutput{};
-            o->global.reset();
+            drop_global(*o);
             o->output = nullptr;
             o->dead = true;
             push(EventKind::OutputDestroy);
             events.back().output = o->id;
+            confirm_lock(); // one fewer screen that has to show the lock
         });
         outputs.push_back(std::move(owned));
 
@@ -536,7 +963,168 @@ struct Server::Impl {
         if (input.has_value() && !pointer.present()) {
             pointer.move_to(box.x + box.width / 2.0, box.y + box.height / 2.0, layout.bounds());
         }
+        if (locked()) {
+            reconfigure_lock_surfaces();
+        }
         output.schedule_frame();
+    }
+
+    /// Mirror the output's current state into its wl_output.
+    void sync_global(OutputEntry& o) {
+        if (!o.global.has_value()) {
+            return;
+        }
+        lm::Output& out = *o.output;
+        const lm::Box box = layout.box_of(out);
+        o.global->set_logical_position(box.x, box.y);
+        if (const auto modes = out.modes(); !modes.empty()) {
+            o.global->set_modes(modes); // a real monitor: tell clients what it can do
+        }
+        o.global->set_mode(out.width(), out.height(), out.current_mode().refresh_mhz);
+        o.global->set_scale(out.scale());
+        o.global->set_transform(out.transform());
+    }
+
+    void drop_global(OutputEntry& o) {
+        if (o.global.has_value()) {
+            workspaces->group_remove_output(workspace_group, *o.global);
+            workspaces->done();
+            o.global.reset();
+        }
+    }
+
+    /// The output changed size, scale, transform or position.
+    void relayout(OutputEntry& o) {
+        const lm::Box old = layout.box_of(*o.output);
+        layout.add(*o.output, old.x, old.y); // re-adding re-reads its logical size
+        sync_global(o);
+        o.usable = {};                       // force the OutputChange below
+        arrange(o);
+        if (pointer.present()) {
+            pointer.move_to(pointer.x(), pointer.y(), layout.bounds());
+        }
+        if (locked()) {
+            reconfigure_lock_surfaces();
+        }
+        o.output->schedule_frame();
+    }
+
+    bool capture(std::uint64_t id, int x, int y, int w, int h, std::vector<std::uint8_t>& rgba) {
+        OutputEntry* o = output(id);
+        if (o == nullptr) {
+            return false;
+        }
+        auto shown = renderer.read_back(o->state);
+        const int ow = o->output->width();
+        const int oh = o->output->height();
+        // The rectangle is the client's; the frame is ours. Check both before
+        // a single byte is copied.
+        if (!shown || x < 0 || y < 0 || w <= 0 || h <= 0 || x > ow - w || y > oh - h ||
+            shown->size() < static_cast<std::size_t>(ow) * static_cast<std::size_t>(oh)) {
+            return false;
+        }
+        rgba.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4);
+        for (int row = 0; row < h; ++row) {
+            const lm::Pixel* src = shown->data() + static_cast<std::size_t>(y + row) * ow + x;
+            std::memcpy(rgba.data() + static_cast<std::size_t>(row) * w * 4, src,
+                        static_cast<std::size_t>(w) * 4);
+        }
+        return true;
+    }
+
+    /// For ext-image-copy-capture cursor sessions: the pointer as it looks on
+    /// `resource`'s output, if it is there.
+    bool capture_cursor(wl_resource* resource, lm::CursorCapture& out) {
+        OutputEntry* o = output_of(resource);
+        if (o == nullptr || !pointer.present() || locked()) {
+            return false;
+        }
+        const lm::Box view = layout.box_of(*o->output);
+        if (!view.contains(static_cast<int>(pointer.x()), static_cast<int>(pointer.y()))) {
+            return false;
+        }
+        const lm::SceneCursor sprite = cursors.sprite(pointer, *seat);
+        if (lm::Surface* client = lm::surface_from_id(sprite.surface); client != nullptr) {
+            if (!client->current_buffer_rgba(out.rgba, out.width, out.height)) {
+                return false;
+            }
+            out.hotspot_x = seat->cursor_hotspot_x();
+            out.hotspot_y = seat->cursor_hotspot_y();
+        } else if (sprite.image != nullptr) {
+            out.rgba = sprite.image->rgba;
+            out.width = sprite.image->width;
+            out.height = sprite.image->height;
+            out.hotspot_x = sprite.image->hotspot_x;
+            out.hotspot_y = sprite.image->hotspot_y;
+        } else {
+            return false;
+        }
+        const int scale = o->output->scale();
+        out.x = static_cast<int>(pointer.x() - view.x) * scale;
+        out.y = static_cast<int>(pointer.y() - view.y) * scale;
+        return true;
+    }
+
+    // ------------------------------------------------------------- lock screen
+
+    void watch_lock(lm::SessionLock& lock) {
+        lock_pending = true; // blank every screen now; confirm once they show it
+        on_lock_surface = lock.new_surface.connect([this](lm::NewSessionLockSurface& e) {
+            auto owned = std::make_unique<LockSurfaceEntry>();
+            LockSurfaceEntry* entry = owned.get();
+            entry->surface = &e.lock_surface;
+            entry->on_map = e.lock_surface.map.connect([this](lm::SessionLockSurfaceMap&) {
+                apply_keyboard_focus();
+                schedule_all();
+            });
+            entry->on_destroy = e.lock_surface.destroy.connect(
+                [this, entry](lm::SessionLockSurfaceDestroy&) {
+                    entry->surface = nullptr;
+                    entry->dead = true;
+                    apply_keyboard_focus();
+                    schedule_all();
+                });
+            lock_surfaces.push_back(std::move(owned));
+            configure_lock_surface(e.lock_surface);
+        });
+        on_lock_destroy = lock.destroy.connect([this](lm::SessionLockDestroy& e) {
+            lock_pending = false;
+            lock_failed = !e.unlocked; // a crash is not an unlock
+            report_lock();
+            apply_keyboard_focus();
+            schedule_all();
+        });
+        report_lock();
+        // Nothing of the session may stay under the pointer or the keyboard.
+        seat->pointer_clear_focus();
+        apply_keyboard_focus();
+        schedule_all();
+        confirm_lock(); // no outputs at all: nothing to wait for
+    }
+
+    void configure_lock_surface(lm::SessionLockSurface& s) {
+        if (OutputEntry* o = output_of(s.output_resource()); o != nullptr) {
+            const lm::Box box = layout.box_of(*o->output);
+            (void)s.configure(static_cast<std::uint32_t>(box.width),
+                              static_cast<std::uint32_t>(box.height));
+        }
+    }
+
+    void reconfigure_lock_surfaces() {
+        for (const auto& e : lock_surfaces) {
+            if (e->surface != nullptr) {
+                configure_lock_surface(*e->surface);
+            }
+        }
+    }
+
+    void report_lock() {
+        const bool now = locked();
+        if (now != reported_locked) {
+            reported_locked = now;
+            push(EventKind::SessionLock);
+            events.back().on = now;
+        }
     }
 
     // ------------------------------------------------------------- input
@@ -555,17 +1143,19 @@ struct Server::Impl {
                 continue;
             }
             const lm::Box view = layout.box_of(*o->output);
-            lm::SceneCursor local = sprite;
-            local.x -= view.x;
-            local.y -= view.y;
-            if (!renderer.set_cursor_plane(o->state, *o->output, local)) {
+            lm::SceneCursor local_sprite = sprite;
+            local_sprite.x -= view.x;
+            local_sprite.y -= view.y;
+            if (!renderer.set_cursor_plane(o->state, *o->output, local_sprite)) {
                 o->output->schedule_frame();
             }
         }
+        screencopy->notify_cursor_changed();
     }
 
     /// The pointer is somewhere new: draw it there and tell the client under it.
     void pointer_moved() {
+        idle_notify->notify_activity();
         refresh_cursor();
         update_pointer_focus();
         Event ev{};
@@ -578,34 +1168,46 @@ struct Server::Impl {
 
     void pointer_left() {
         pointer.leave();
-        ptr_focus = {};
         ptr_window = 0;
         seat->pointer_clear_focus();
         schedule_all(); // take the composited cursor off the screen
+        screencopy->notify_cursor_changed();
     }
 
     void button(std::uint32_t code, bool pressed) {
-        if (pressed) {
-            (void)popup_tree.dismiss_grabs_outside(ptr_focus); // menu semantics
+        idle_notify->notify_activity();
+        if (pressed && !locked()) {
+            (void)popup_tree.dismiss_grabs_outside(seat->pointer_focus()); // menu semantics
+            // Clicking into an on-demand layer surface (a panel's search box)
+            // gives it the keyboard; clicking anywhere else takes it back.
+            lm::LayerSurface* ls = layers.keyboard_target(seat->pointer_focus());
+            const lm::SurfaceId next = ls != nullptr ? ls->surface().id() : lm::SurfaceId{};
+            if (next != layer_focus) {
+                layer_focus = next;
+                apply_keyboard_focus();
+            }
         }
-        buttons_down = std::max(0, buttons_down + (pressed ? 1 : -1));
         Event ev{};
         ev.kind = EventKind::PointerButton;
-        ev.window = ptr_window;
+        ev.window = locked() ? 0 : ptr_window;
         ev.code = code;
         ev.on = pressed;
         ev.x = pointer.x();
         ev.y = pointer.y();
         events.push_back(ev);
-        if (ptr_focus.valid()) {
+        if (seat->pointer_focus().valid()) {
             seat->pointer_button(code, pressed);
         }
-        if (!pressed && buttons_down == 0) {
-            update_pointer_focus(); // the grab ended; re-pick what is under it
+        if (!pressed) {
+            update_pointer_focus(); // an implicit grab may have ended; re-pick
         }
     }
 
     void axis(const lm::PointerAxisEvent& e) {
+        idle_notify->notify_activity();
+        if (wm_grab) {
+            return;
+        }
         // Notches win over the smooth deltas that accompany them.
         if (e.dx_steps != 0 || e.dy_steps != 0) {
             seat->pointer_axis_discrete(e.dx_steps, e.dy_steps);
@@ -617,15 +1219,32 @@ struct Server::Impl {
         }
     }
 
+    void relative_motion(double dx, double dy) {
+        // Games under a pointer lock read these; the pointer itself may not move.
+        lm::CursorManager::send_relative_motion(&*relative, dx, dy);
+        const lm::PointerConstraint* active = constraints->active_constraint();
+        if (active != nullptr && active->type() == lm::PointerConstraintType::locked) {
+            idle_notify->notify_activity();
+            return;
+        }
+        build_scene();
+        const lm::Box bounds =
+            lm::CursorManager::pointer_bounds(&*constraints, scene, layout.bounds());
+        if (pointer.move_by(dx, dy, bounds)) {
+            pointer_moved();
+        }
+    }
+
     void watch_input(lm::WaylandBackend& host) {
         on_motion = host.pointer_motion.connect([this](lm::PointerMotionAbsEvent& e) {
             if (e.x < 0) { // left the host window
                 pointer_left();
                 return;
             }
-            const lm::Box origin = outputs.empty() || outputs.front()->output == nullptr
+            OutputEntry* first = outputs.empty() ? nullptr : outputs.front().get();
+            const lm::Box origin = first == nullptr || first->output == nullptr
                                        ? lm::Box{}
-                                       : layout.box_of(*outputs.front()->output);
+                                       : layout.box_of(*first->output);
             pointer.move_to(origin.x + e.x, origin.y + e.y, layout.bounds());
             pointer_moved();
         });
@@ -635,10 +1254,9 @@ struct Server::Impl {
         on_key = host.key.connect([this](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
         on_mods = host.modifiers.connect([this](lm::ModifiersEvent& e) {
             if (keymap.has_value()) {
-                lm::KeyRouter::sync_modifiers(*keymap, *seat, e);
-            } else {
-                seat->notify_modifiers(e.depressed, e.latched, e.locked, e.group);
+                keymap->update_modifiers(e);
             }
+            modifiers(e);
         });
         // Adopt the host's layout: the modifier masks above are computed
         // against it, and clients should see the layout the user types on.
@@ -648,19 +1266,14 @@ struct Server::Impl {
     }
 
     void watch_input(lm::LibinputBackend& devices) {
-        on_rel_motion = devices.pointer_motion().connect([this](lm::PointerMotionEvent& e) {
-            if (pointer.move_by(e.dx, e.dy, layout.bounds()) || !pointer.present()) {
-                pointer_moved();
-            }
-        });
+        on_rel_motion = devices.pointer_motion().connect(
+            [this](lm::PointerMotionEvent& e) { relative_motion(e.dx, e.dy); });
         on_button = devices.pointer_button().connect(
             [this](lm::PointerButtonEvent& e) { button(e.button, e.pressed); });
         on_axis = devices.pointer_axis().connect([this](lm::PointerAxisEvent& e) { axis(e); });
         on_key = devices.key().connect([this](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
         // libinput's own xkb state already took this; the seat only relays it.
-        on_mods = devices.modifiers().connect([this](lm::ModifiersEvent& e) {
-            seat->notify_modifiers(e.depressed, e.latched, e.locked, e.group);
-        });
+        on_mods = devices.modifiers().connect([this](lm::ModifiersEvent& e) { modifiers(e); });
         // Advertise what is plugged in: a client that binds a wl_pointer no
         // device can drive waits forever. Touch is never routed, so never
         // claimed.
@@ -689,6 +1302,21 @@ struct Server::Impl {
         return keymap.has_value() ? &*keymap : nullptr;
     }
 
+    /// The input method holding the keyboard, if one is: it gets every key
+    /// a binding does not, and sends text back through text-input.
+    lm::InputMethodKeyboardGrab* im_grab() {
+        lm::InputMethod* im = input_method->current();
+        return im != nullptr && !locked() ? im->keyboard_grab() : nullptr;
+    }
+
+    void modifiers(const lm::ModifiersEvent& e) {
+        if (lm::InputMethodKeyboardGrab* grab = im_grab(); grab != nullptr) {
+            grab->send_modifiers(e.depressed, e.latched, e.locked, e.group);
+        } else {
+            seat->notify_modifiers(e.depressed, e.latched, e.locked, e.group);
+        }
+    }
+
     /// Every key a client was told is down, as up — before the input it came
     /// from goes away (a VT switch), so nothing stays logically held.
     void release_held_keys() {
@@ -700,8 +1328,14 @@ struct Server::Impl {
     }
 
     void key(std::uint32_t keycode, bool pressed) {
+        idle_notify->notify_activity();
         if (!pressed) {
             if (keys.unconsume(keycode)) { // the release of a key we kept stays ours
+                return;
+            }
+            if (lm::InputMethodKeyboardGrab* grab = im_grab();
+                grab != nullptr && std::ranges::find(held, keycode) == held.end()) {
+                grab->send_key(now_ms(), keycode, false);
                 return;
             }
             std::erase(held, keycode);
@@ -717,7 +1351,7 @@ struct Server::Impl {
             const std::uint32_t raw = ks->keysym(keycode);
             // Ctrl+Alt+Fn, which the keymap itself turns into XF86Switch_VT_n.
             // Mechanism, not policy: on bare metal it is the way out, and it
-            // must work whatever the window manager binds.
+            // must work whatever the window manager binds — or the lock screen.
             if (session.has_value() && raw >= XKB_KEY_XF86Switch_VT_1 &&
                 raw <= XKB_KEY_XF86Switch_VT_12) {
                 keys.consume(keycode);
@@ -728,21 +1362,30 @@ struct Server::Impl {
                 }
                 return;
             }
-            const lm::ModifiersEvent m = ks->modifiers();
-            const std::uint32_t mods = (m.depressed | m.latched) & kBindableMods;
-            const std::uint32_t sym = xkb_keysym_to_lower(raw);
-            for (const Binding& b : bindings) {
-                if (b.mods == mods && b.keysym == sym) {
-                    keys.consume(keycode);
-                    push(EventKind::Binding);
-                    events.back().code = b.id;
-                    return;
+            // No window-manager shortcut may act behind the lock screen.
+            if (!locked()) {
+                const lm::ModifiersEvent m = ks->modifiers();
+                const std::uint32_t mods = (m.depressed | m.latched) & kBindableMods;
+                const std::uint32_t sym = xkb_keysym_to_lower(raw);
+                for (const Binding& b : bindings) {
+                    if (b.mods == mods && b.keysym == sym) {
+                        keys.consume(keycode);
+                        push(EventKind::Binding);
+                        events.back().code = b.id;
+                        return;
+                    }
                 }
             }
+        }
+        if (lm::InputMethodKeyboardGrab* grab = im_grab(); grab != nullptr) {
+            grab->send_key(now_ms(), keycode, true);
+            return;
         }
         held.push_back(keycode);
         seat->notify_key(keycode, true);
     }
+
+    // ------------------------------------------------------------- setup
 
     /// The bare-metal pair. On failure everything is left as it was, so the
     /// caller can still fall back to headless.
@@ -795,8 +1438,8 @@ struct Server::Impl {
             return "wl_shm: " + s.error().message;
         }
 
-        // Every global a desktop client expects before it will map a window.
-        // A failure in any of them is a broken install, not a runtime choice.
+        // Every global a desktop expects. A failure in any of them is a
+        // broken install, not a runtime choice.
 #define LUM_CREATE(member, expr, what)                                                            \
     do {                                                                                          \
         auto r = (expr);                                                                          \
@@ -808,7 +1451,7 @@ struct Server::Impl {
         LUM_CREATE(compositor, lm::Compositor::create(*display), "wl_compositor");
         LUM_CREATE(subcompositor, lm::Subcompositor::create(*display), "wl_subcompositor");
         LUM_CREATE(shell, lm::XdgShell::create(*display), "xdg-shell");
-        LUM_CREATE(seat, lm::Seat::create(*display), "wl_seat");
+        LUM_CREATE(layer_shell, lm::LayerShell::create(*display), "layer-shell");
         LUM_CREATE(single_pixel, lm::SinglePixelBufferManager::create(*display),
                    "single-pixel-buffer");
         LUM_CREATE(presentation, lm::Presentation::create(*display), "presentation-time");
@@ -816,12 +1459,35 @@ struct Server::Impl {
         LUM_CREATE(fractional, lm::FractionalScaleManager::create(*display), "fractional-scale");
         LUM_CREATE(decoration, lm::XdgDecorationManager::create(*display), "xdg-decoration");
         LUM_CREATE(cursor_shape, lm::CursorShapeManager::create(*display), "cursor-shape");
-        LUM_CREATE(data_device, lm::DataDeviceManager::create(*display, *seat), "data-device");
-        LUM_CREATE(primary_selection, lm::PrimarySelectionManager::create(*display, *seat),
-                   "primary-selection");
         LUM_CREATE(fifo, lm::FifoManager::create(*display), "wp-fifo");
         LUM_CREATE(commit_timing, lm::CommitTimingManager::create(*display), "wp-commit-timing");
         LUM_CREATE(tearing, lm::TearingControlManager::create(*display), "tearing-control");
+        LUM_CREATE(content_type, lm::ContentTypeManager::create(*display), "content-type");
+        LUM_CREATE(background_effect, lm::BackgroundEffectManager::create(*display),
+                   "background-effect");
+        LUM_CREATE(activation, lm::XdgActivation::create(*display), "xdg-activation");
+        LUM_CREATE(icons, lm::XdgToplevelIconManager::create(*display), "xdg-toplevel-icon");
+        LUM_CREATE(idle_inhibit, lm::IdleInhibitManager::create(*display), "idle-inhibit");
+        LUM_CREATE(idle_notify, lm::IdleNotifier::create(*display, display->event_loop()),
+                   "idle-notify");
+        LUM_CREATE(screencopy, lm::ScreencopyManager::create(*display), "screencopy");
+        LUM_CREATE(foreign, lm::ForeignToplevelManager::create(*display), "foreign-toplevel");
+        LUM_CREATE(workspaces, lm::WorkspaceManager::create(*display), "ext-workspace");
+        LUM_CREATE(locks, lm::SessionLockManager::create(*display), "session-lock");
+        LUM_CREATE(seat, lm::Seat::create(*display), "wl_seat");
+        LUM_CREATE(data_device, lm::DataDeviceManager::create(*display, *seat), "data-device");
+        LUM_CREATE(primary_selection, lm::PrimarySelectionManager::create(*display, *seat),
+                   "primary-selection");
+        LUM_CREATE(data_control,
+                   lm::DataControlManager::create(*display, *data_device, &*primary_selection),
+                   "data-control");
+        LUM_CREATE(constraints, lm::PointerConstraints::create(*display, *seat),
+                   "pointer-constraints");
+        LUM_CREATE(relative, lm::RelativePointerManager::create(*display, *seat),
+                   "relative-pointer");
+        LUM_CREATE(text_input, lm::TextInputManager::create(*display, *seat), "text-input");
+        LUM_CREATE(input_method, lm::InputMethodManager::create(*display, *seat, *text_input),
+                   "input-method");
 #undef LUM_CREATE
 
         // Optional: only with a GPU, and the compositor works without either.
@@ -831,6 +1497,7 @@ struct Server::Impl {
             } else {
                 warn("linux-dmabuf (off)", r.error());
             }
+            screencopy->set_renderer(renderer.gpu()); // dmabuf capture targets too
         }
         if (auto r = lm::DrmSyncobjManager::create(*display); r) {
             syncobj.emplace(std::move(*r));
@@ -842,11 +1509,16 @@ struct Server::Impl {
         if (auto c = lm::CursorManager::create(); c) {
             cursors = std::move(*c);
         } // no theme installed: the cursor is whatever clients set, or none
+        workspace_group = workspaces->add_group();
+        workspaces->done();
+        foreign->track(*shell); // taskbars see every toplevel without our help
 
         on_new_toplevel = shell->new_toplevel().connect(
             [this](lm::NewToplevel& e) { watch_toplevel(e.toplevel); });
         on_new_popup =
             shell->new_popup().connect([this](lm::NewPopup& e) { watch_popup(e.popup); });
+        on_new_layer = layer_shell->new_layer_surface().connect(
+            [this](lm::NewLayerSurface& e) { watch_layer(e.layer_surface); });
         // Without a GPU no Frame is watching surfaces, so a commit would never
         // reach the screen. Asking twice on the GPU path costs nothing.
         on_new_surface = compositor->new_surface().connect([this](lm::NewSurface& e) {
@@ -871,6 +1543,27 @@ struct Server::Impl {
             cursors.set_shape("default");
             refresh_cursor();
         });
+        on_foreign = foreign->request().connect(
+            [this](lm::ForeignToplevelRequest& r) { foreign_request(r); });
+        on_activate = activation->request_activate().connect([this](lm::ActivationRequest& r) {
+            // Only a valid token (one the focused client handed over) may move
+            // focus; anything else would let any client steal the keyboard.
+            if (Window* w = window_of(r.surface); w != nullptr && r.token_valid) {
+                push(EventKind::RequestActivate, w->id);
+            }
+        });
+        on_workspace = workspaces->request().connect([this](lm::WorkspaceRequest& r) {
+            if (r.kind == lm::WorkspaceRequest::Kind::activate) {
+                push(EventKind::WorkspaceActivate);
+                events.back().code = r.workspace;
+            }
+        });
+        on_inhibit = idle_inhibit->changed().connect(
+            [this](lm::IdleInhibitChange& e) { idle_notify->set_inhibited(e.inhibited); });
+        on_new_lock =
+            locks->new_lock().connect([this](lm::NewSessionLock& e) { watch_lock(e.lock); });
+        screencopy->set_cursor_source(
+            [this](wl_resource* out, lm::CursorCapture& c) { return capture_cursor(out, c); });
         // xdg_positioner's constraint solving needs to know where the parent
         // is and what screen it is on, or menus hang off the edge.
         shell->set_popup_constraint_query([this](lm::Surface& parent, lm::Box& parent_box,
@@ -957,11 +1650,25 @@ struct Server::Impl {
     }
 
     ~Impl() {
-        // Explicit, rather than trusting the member order alone: per-object
-        // state first, so no slot can fire into a half-destroyed Impl while
-        // the Display tears its clients down.
+        // Clients first, while every global still exists. Display's own
+        // destructor would do this too, but only after the members above it
+        // are gone, and client resources call back into their globals as they
+        // die: a clipboard manager still connected at exit (wl-copy serving
+        // its selection) has data-control ask the already-freed
+        // DataDeviceManager what the selection is.
+        if (display.has_value()) {
+            wl_display_destroy_clients(display->c_ptr());
+        }
+        // Then per-object state, explicitly rather than by member order, so no
+        // slot can fire into a half-destroyed Impl. Outputs leave the
+        // workspace group before their wl_output goes, since it points at it.
         windows.clear();
         popups.clear();
+        layer_entries.clear();
+        lock_surfaces.clear();
+        for (const auto& o : outputs) {
+            drop_global(*o);
+        }
         outputs.clear();
         surfaces.clear();
     }
@@ -1014,19 +1721,17 @@ void Server::focus(std::uint64_t id) {
     Impl& self = *impl_;
     Window* next = self.window(id);
     const std::uint64_t next_id = next != nullptr ? id : 0;
-    if (self.focused == next_id) {
-        return;
+    self.layer_focus = {}; // choosing a window takes the keyboard back from a panel
+    if (self.focused != next_id) {
+        if (Window* old = self.window(self.focused); old != nullptr) {
+            old->toplevel->set_activated(false);
+        }
+        self.focused = next_id;
+        if (next != nullptr) {
+            next->toplevel->set_activated(true);
+        }
     }
-    if (Window* old = self.window(self.focused); old != nullptr) {
-        old->toplevel->set_activated(false);
-    }
-    self.focused = next_id;
-    if (next != nullptr) {
-        next->toplevel->set_activated(true);
-        self.seat->set_keyboard_focus(&next->toplevel->surface());
-    } else {
-        self.seat->set_keyboard_focus(nullptr);
-    }
+    self.apply_keyboard_focus();
 }
 
 void Server::configure(std::uint64_t id, std::int32_t width, std::int32_t height) {
@@ -1047,6 +1752,24 @@ void Server::set_fullscreen(std::uint64_t id, bool on) {
     }
 }
 
+void Server::set_minimized(std::uint64_t id, bool on) {
+    if (Window* w = impl_->window(id); w != nullptr) {
+        w->toplevel->set_minimized(on);
+    }
+}
+
+void Server::set_tiled(std::uint64_t id, bool on) {
+    if (Window* w = impl_->window(id); w != nullptr) {
+        w->toplevel->set_tiled(on);
+    }
+}
+
+void Server::set_resizing(std::uint64_t id, bool on) {
+    if (Window* w = impl_->window(id); w != nullptr) {
+        w->toplevel->set_resizing(on);
+    }
+}
+
 void Server::close(std::uint64_t id) {
     if (Window* w = impl_->window(id); w != nullptr) {
         w->toplevel->close();
@@ -1063,6 +1786,12 @@ rust::String Server::window_app_id(std::uint64_t id) const {
     return w != nullptr ? to_rust(w->toplevel->app_id()) : rust::String();
 }
 
+rust::String Server::window_icon_name(std::uint64_t id) const {
+    const Window* w = impl_->window(id);
+    const lm::ToplevelIcon* icon = w != nullptr ? impl_->icons->icon_for(*w->toplevel) : nullptr;
+    return icon != nullptr ? to_rust(icon->name) : rust::String();
+}
+
 Size Server::window_size(std::uint64_t id) const {
     Size size{};
     if (const Window* w = impl_->window(id); w != nullptr) {
@@ -1075,11 +1804,130 @@ Size Server::window_size(std::uint64_t id) const {
     return size;
 }
 
+Size Server::window_min_size(std::uint64_t id) const {
+    Size size{};
+    if (const Window* w = impl_->window(id); w != nullptr) {
+        size.width = w->toplevel->min_width();
+        size.height = w->toplevel->min_height();
+    }
+    return size;
+}
+
+std::uint64_t Server::window_parent(std::uint64_t id) const {
+    const Window* w = impl_->window(id);
+    const lm::Toplevel* parent = w != nullptr ? w->toplevel->parent() : nullptr;
+    const Window* pw = parent != nullptr ? impl_->window_of(*parent) : nullptr;
+    return pw != nullptr ? pw->id : 0;
+}
+
+void Server::grab_pointer(bool on) {
+    impl_->wm_grab = on;
+    if (!on) {
+        impl_->update_pointer_focus(); // hand the pointer back to whatever is under it
+    }
+}
+
 std::uint32_t Server::bind_key(std::uint32_t mods, std::uint32_t keysym) {
     const auto id = static_cast<std::uint32_t>(impl_->bindings.size() + 1);
     impl_->bindings.push_back({id, mods & kBindableMods, xkb_keysym_to_lower(keysym)});
     return id;
 }
+
+bool Server::set_keyboard_layout(rust::Str layout) {
+    Impl& self = *impl_;
+    if (!self.input.has_value()) {
+        return false; // nested: the host's layout is what the keys arrive in
+    }
+    auto k = lm::KeymapState::from_layout(std::string(layout));
+    if (!k || !self.input->set_keymap(k->text())) {
+        return false;
+    }
+    return self.seat->set_keymap(self.input->keymap());
+}
+
+Rect Server::output_box(std::uint64_t id) const {
+    const OutputEntry* o = impl_->output(id);
+    return o != nullptr ? to_rect(impl_->layout.box_of(*o->output)) : Rect{};
+}
+
+Rect Server::output_usable(std::uint64_t id) const {
+    const OutputEntry* o = impl_->output(id);
+    return o != nullptr ? to_rect(o->usable) : Rect{};
+}
+
+rust::Vec<Mode> Server::output_modes(std::uint64_t id) const {
+    rust::Vec<Mode> out;
+    if (const OutputEntry* o = impl_->output(id); o != nullptr) {
+        for (const lm::OutputMode& m : o->output->modes()) {
+            out.push_back(Mode{m.width, m.height, m.refresh_mhz, m.preferred});
+        }
+    }
+    return out;
+}
+
+bool Server::set_output_mode(std::uint64_t id, std::int32_t width, std::int32_t height,
+                             std::int32_t refresh_mhz, rust::String& error) {
+    OutputEntry* o = impl_->output(id);
+    if (o == nullptr) {
+        error = "no such output";
+        return false;
+    }
+    // Success lands in Output::mode_changed, which rebuilds everything.
+    if (auto s = o->output->set_mode(width, height, refresh_mhz); !s) {
+        error = to_rust(s.error().message);
+        return false;
+    }
+    return true;
+}
+
+void Server::set_output_scale(std::uint64_t id, std::int32_t scale) {
+    if (OutputEntry* o = impl_->output(id); o != nullptr) {
+        o->output->set_scale(scale);
+        if (auto s = impl_->renderer.reset(o->state, *o->output, DRM_FORMAT_XRGB8888); !s) {
+            warn("render target (falling back to CPU)", s.error());
+        }
+        impl_->relayout(*o);
+    }
+}
+
+void Server::set_output_transform(std::uint64_t id, std::uint32_t transform) {
+    OutputEntry* o = impl_->output(id);
+    if (o == nullptr || transform > 7) {
+        return;
+    }
+    o->output->set_transform(static_cast<lm::Transform>(transform));
+    if (auto s = impl_->renderer.reset(o->state, *o->output, DRM_FORMAT_XRGB8888); !s) {
+        warn("render target (falling back to CPU)", s.error());
+    }
+    impl_->relayout(*o);
+}
+
+void Server::set_output_position(std::uint64_t id, std::int32_t x, std::int32_t y) {
+    if (OutputEntry* o = impl_->output(id); o != nullptr) {
+        impl_->layout.add(*o->output, x, y);
+        impl_->relayout(*o);
+    }
+}
+
+std::uint32_t Server::add_workspace(rust::Str name) {
+    Impl& self = *impl_;
+    const std::string n(name);
+    const std::uint32_t id = self.workspaces->add_workspace(self.workspace_group, n, n);
+    self.workspaces->done();
+    return id;
+}
+
+void Server::remove_workspace(std::uint32_t id) {
+    impl_->workspaces->remove_workspace(id);
+    impl_->workspaces->done();
+}
+
+void Server::activate_workspace(std::uint32_t id) {
+    impl_->workspaces->activate(id);
+    impl_->workspaces->done();
+}
+
+bool Server::is_locked() const { return impl_->locked(); }
 
 std::unique_ptr<Server> server_new(const Config& config, rust::String& error) {
     auto impl = std::make_unique<Server::Impl>();

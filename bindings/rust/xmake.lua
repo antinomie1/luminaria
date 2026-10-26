@@ -15,6 +15,19 @@ option("cxxbridge")
     set_description("cxx-build's $OUT_DIR/cxxbridge (holds rust/cxx.h and lib.rs.h)")
 option_end()
 
+-- LUMINARIA_SANITIZE=address|undefined, passed down by build.rs. Root scope on
+-- purpose, before includes(): it has to reach luminaria's own targets too.
+option("sanitize")
+    set_default("none")
+    set_values("none", "address", "undefined")
+    set_showmenu(true)
+option_end()
+if get_config("sanitize") == "address" then
+    set_policy("build.sanitizer.address", true)
+elseif get_config("sanitize") == "undefined" then
+    set_policy("build.sanitizer.undefined", true)
+end
+
 includes("../..")
 
 target("luminaria-rs")
@@ -24,7 +37,7 @@ target("luminaria-rs")
     -- The same warning set luminaria builds with, minus the vtable idiom.
     set_warnings("all", "extra", "pedantic", "error")
     add_cxxflags("-Wno-missing-field-initializers")
-    add_deps("luminaria-gpu")
+    add_deps("luminaria-gpu", "luminaria-desktop")
     add_options("cxxbridge")
     add_files("luminaria_rs.cpp")
     local bridge = get_config("cxxbridge")

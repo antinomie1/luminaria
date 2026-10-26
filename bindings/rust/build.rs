@@ -10,6 +10,11 @@
 //! Both halves must use the same C++ standard library, or a `std::unique_ptr`
 //! crossing the bridge has two layouts. Default: clang for both, which on
 //! Linux means libstdc++ for both. `LUMINARIA_TOOLCHAIN=gcc` switches both.
+//!
+//! `LUMINARIA_SANITIZE=address` (or `undefined`) instruments both halves and
+//! links the runtime. The link must then be done by the same compiler family:
+//!
+//!   LUMINARIA_SANITIZE=address RUSTFLAGS="-C linker=clang" cargo run --example floating
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -25,12 +30,20 @@ fn main() {
         Err(_) if env::var("PROFILE").as_deref() == Ok("release") => "release".into(),
         Err(_) => "debug".into(),
     };
+    let sanitize = env::var("LUMINARIA_SANITIZE").unwrap_or_else(|_| "none".into());
+    assert!(
+        ["none", "address", "undefined"].contains(&sanitize.as_str()),
+        "LUMINARIA_SANITIZE must be none, address or undefined"
+    );
 
     // ---------------------------------------------------------------- 1. glue
-    cxx_build::bridge("src/lib.rs")
-        .compiler(cxx)
-        .std("c++20")
-        .compile("luminaria-cxxbridge");
+    let mut glue = cxx_build::bridge("src/lib.rs");
+    glue.compiler(cxx).std("c++20");
+    if sanitize != "none" {
+        glue.flag(format!("-fsanitize={sanitize}"));
+        println!("cargo:rustc-link-arg=-fsanitize={sanitize}");
+    }
+    glue.compile("luminaria-cxxbridge");
 
     // --------------------------------------------------------------- 2. xmake
     let bridge = out.join("cxxbridge");
@@ -56,6 +69,7 @@ fn main() {
         "-o",
         build_dir.to_str().expect("OUT_DIR is not UTF-8"),
         &format!("--cxxbridge={}", bridge.display()),
+        &format!("--sanitize={sanitize}"),
     ]);
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "0".into());
     let mut build = vec!["build", "-y", "-P", "."];
@@ -70,9 +84,14 @@ fn main() {
     let libdir = find_archive_dir(&build_dir, "libluminaria-rs.a")
         .expect("xmake built luminaria-rs but its archive is nowhere under the build dir");
     println!("cargo:rustc-link-search=native={}", libdir.display());
-    // Dependents before dependencies: the shim needs luminaria.gpu, which
-    // needs luminaria.
-    for lib in ["luminaria-rs", "luminaria-gpu", "luminaria"] {
+    // Dependents before dependencies: the shim needs luminaria.desktop and
+    // luminaria.gpu, which both need luminaria.
+    for lib in [
+        "luminaria-rs",
+        "luminaria-desktop",
+        "luminaria-gpu",
+        "luminaria",
+    ] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
     for pkg in [
@@ -100,7 +119,11 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    for var in ["LUMINARIA_TOOLCHAIN", "LUMINARIA_XMAKE_MODE"] {
+    for var in [
+        "LUMINARIA_TOOLCHAIN",
+        "LUMINARIA_XMAKE_MODE",
+        "LUMINARIA_SANITIZE",
+    ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
 }

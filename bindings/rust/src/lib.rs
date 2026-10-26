@@ -84,6 +84,10 @@ mod ffi {
         OutputDestroy,
         CloseRequested,
         SessionActive,
+        RequestActivate,
+        OutputChange,
+        SessionLock,
+        WorkspaceActivate,
     }
 
     /// Flat on purpose: cxx cannot carry a Rust enum with payloads, so every
@@ -134,6 +138,22 @@ mod ffi {
         height: i32,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    struct Rect {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct Mode {
+        width: i32,
+        height: i32,
+        refresh_mhz: i32,
+        preferred: bool,
+    }
+
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
 
@@ -154,12 +174,41 @@ mod ffi {
         fn configure(self: Pin<&mut Server>, window: u64, width: i32, height: i32);
         fn set_maximized(self: Pin<&mut Server>, window: u64, on: bool);
         fn set_fullscreen(self: Pin<&mut Server>, window: u64, on: bool);
+        fn set_minimized(self: Pin<&mut Server>, window: u64, on: bool);
+        fn set_tiled(self: Pin<&mut Server>, window: u64, on: bool);
+        fn set_resizing(self: Pin<&mut Server>, window: u64, on: bool);
         fn close(self: Pin<&mut Server>, window: u64);
         fn window_title(self: &Server, window: u64) -> String;
         fn window_app_id(self: &Server, window: u64) -> String;
+        fn window_icon_name(self: &Server, window: u64) -> String;
         fn window_size(self: &Server, window: u64) -> Size;
+        fn window_min_size(self: &Server, window: u64) -> Size;
+        fn window_parent(self: &Server, window: u64) -> u64;
 
+        fn grab_pointer(self: Pin<&mut Server>, on: bool);
         fn bind_key(self: Pin<&mut Server>, mods: u32, keysym: u32) -> u32;
+        fn set_keyboard_layout(self: Pin<&mut Server>, layout: &str) -> bool;
+
+        fn output_box(self: &Server, output: u64) -> Rect;
+        fn output_usable(self: &Server, output: u64) -> Rect;
+        fn output_modes(self: &Server, output: u64) -> Vec<Mode>;
+        fn set_output_mode(
+            self: Pin<&mut Server>,
+            output: u64,
+            width: i32,
+            height: i32,
+            refresh_mhz: i32,
+            error: &mut String,
+        ) -> bool;
+        fn set_output_scale(self: Pin<&mut Server>, output: u64, scale: i32);
+        fn set_output_transform(self: Pin<&mut Server>, output: u64, transform: u32);
+        fn set_output_position(self: Pin<&mut Server>, output: u64, x: i32, y: i32);
+
+        fn add_workspace(self: Pin<&mut Server>, name: &str) -> u32;
+        fn remove_workspace(self: Pin<&mut Server>, workspace: u32);
+        fn activate_workspace(self: Pin<&mut Server>, workspace: u32);
+
+        fn is_locked(self: &Server) -> bool;
     }
 }
 
@@ -174,6 +223,80 @@ impl Color {
         Self { r, g, b, a }
     }
 }
+
+/// A rectangle in global logical coordinates.
+pub use ffi::Rect;
+
+impl Rect {
+    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x as f64
+            && y >= self.y as f64
+            && x < (self.x + self.width) as f64
+            && y < (self.y + self.height) as f64
+    }
+
+    /// The rectangle an interactive resize from `self` reaches after the
+    /// pointer moved by (`dx`, `dy`): the edges in `edges` (an
+    /// [`Event::RequestResize`] bitmask, see [`edge`]) follow the pointer, the
+    /// opposite ones stay put, and neither axis shrinks below `min`.
+    pub fn resized(&self, edges: u32, dx: i32, dy: i32, min: (i32, i32)) -> Rect {
+        let (min_w, min_h) = (min.0.max(1), min.1.max(1));
+        let mut r = *self;
+        if edges & edge::LEFT != 0 {
+            let w = (self.width - dx).max(min_w);
+            r.x = self.x + self.width - w;
+            r.width = w;
+        } else if edges & edge::RIGHT != 0 {
+            r.width = (self.width + dx).max(min_w);
+        }
+        if edges & edge::TOP != 0 {
+            let h = (self.height - dy).max(min_h);
+            r.y = self.y + self.height - h;
+            r.height = h;
+        } else if edges & edge::BOTTOM != 0 {
+            r.height = (self.height + dy).max(min_h);
+        }
+        r
+    }
+}
+
+/// The bits of xdg_toplevel's resize edge, as [`Event::RequestResize`] carries it.
+pub mod edge {
+    pub const TOP: u32 = 1;
+    pub const BOTTOM: u32 = 2;
+    pub const LEFT: u32 = 4;
+    pub const RIGHT: u32 = 8;
+}
+
+/// One display mode a monitor supports.
+pub use ffi::Mode;
+
+/// How an output is rotated / flipped (wl_output.transform).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Transform {
+    #[default]
+    Normal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    Flipped,
+    Flipped90,
+    Flipped180,
+    Flipped270,
+}
+
+/// A workspace, as pagers (ext-workspace) see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkspaceId(u32);
 
 /// A toplevel window. Never reused, so a stale id simply stops resolving:
 /// every call taking one is a no-op once the window is gone.
@@ -287,7 +410,15 @@ pub enum Event {
         window: WindowId,
         on: bool,
     },
-    RequestMinimize(WindowId),
+    /// Minimize (`on`) or restore: from the window itself, or a taskbar.
+    /// Hide it yourself, then confirm with [`Server::set_minimized`].
+    RequestMinimize {
+        window: WindowId,
+        on: bool,
+    },
+    /// Raise and focus this window: a taskbar click, or an app handing focus
+    /// to another through a valid xdg-activation token.
+    RequestActivate(WindowId),
     /// The client wants an interactive move (it was dragged by its title bar).
     RequestMove(WindowId),
     /// The client wants an interactive resize; `edges` is xdg_toplevel's
@@ -321,6 +452,10 @@ pub enum Event {
         height: i32,
     },
     OutputDestroy(OutputId),
+    /// The output's box or usable area changed: a mode, scale, transform or
+    /// position change, or a panel claiming or releasing an exclusive zone.
+    /// Re-read [`Server::output_box`] / [`Server::output_usable`].
+    OutputChange(OutputId),
     /// The user closed the nested window. Nothing is torn down; stopping is up to you.
     CloseRequested,
     /// [`Backend::Drm`]: our VT was switched away from (`false`) or back to
@@ -329,6 +464,16 @@ pub enum Event {
     SessionActive {
         active: bool,
     },
+    /// The screen locker (ext-session-lock) locked or unlocked the session.
+    /// While locked only the lock screen is drawn and gets input, and no
+    /// binding fires; there is nothing to do here but, say, pause things.
+    /// A locker that crashes leaves the session locked until another unlocks it.
+    SessionLock {
+        locked: bool,
+    },
+    /// A pager asked to switch to this workspace. Do it, then
+    /// [`Server::activate_workspace`].
+    WorkspaceActivate(WorkspaceId),
 }
 
 impl Event {
@@ -344,7 +489,8 @@ impl Event {
             K::WindowTitle => Event::WindowTitle(window),
             K::RequestMaximize => Event::RequestMaximize { window, on: e.on },
             K::RequestFullscreen => Event::RequestFullscreen { window, on: e.on },
-            K::RequestMinimize => Event::RequestMinimize(window),
+            K::RequestMinimize => Event::RequestMinimize { window, on: e.on },
+            K::RequestActivate => Event::RequestActivate(window),
             K::RequestMove => Event::RequestMove(window),
             K::RequestResize => Event::RequestResize {
                 window,
@@ -371,8 +517,11 @@ impl Event {
                 height: e.height,
             },
             K::OutputDestroy => Event::OutputDestroy(OutputId(e.output)),
+            K::OutputChange => Event::OutputChange(OutputId(e.output)),
             K::CloseRequested => Event::CloseRequested,
             K::SessionActive => Event::SessionActive { active: e.on },
+            K::SessionLock => Event::SessionLock { locked: e.on },
+            K::WorkspaceActivate => Event::WorkspaceActivate(WorkspaceId(e.code)),
             _ => return None,
         })
     }
@@ -592,6 +741,121 @@ impl Server {
     pub fn size(&self, window: WindowId) -> (i32, i32) {
         let s = self.raw.window_size(window.0);
         (s.width, s.height)
+    }
+
+    /// The smallest size the client says it can be drawn at, `(0, 0)` for none.
+    pub fn min_size(&self, window: WindowId) -> (i32, i32) {
+        let s = self.raw.window_min_size(window.0);
+        (s.width, s.height)
+    }
+
+    /// The window this one is a dialog of, if any.
+    pub fn parent(&self, window: WindowId) -> Option<WindowId> {
+        match self.raw.window_parent(window.0) {
+            0 => None,
+            id => Some(WindowId(id)),
+        }
+    }
+
+    /// The icon name the client set (xdg-toplevel-icon), empty when none.
+    pub fn icon_name(&self, window: WindowId) -> String {
+        self.raw.window_icon_name(window.0)
+    }
+
+    /// Tell the window (and taskbars) that you have hidden it, or shown it again.
+    pub fn set_minimized(&mut self, window: WindowId, on: bool) {
+        self.pin().set_minimized(window.0, on);
+    }
+
+    /// Tiled windows drop their shadows and rounded corners.
+    pub fn set_tiled(&mut self, window: WindowId, on: bool) {
+        self.pin().set_tiled(window.0, on);
+    }
+
+    /// Bracket an interactive resize: clients redraw cheaper while it is on.
+    pub fn set_resizing(&mut self, window: WindowId, on: bool) {
+        self.pin().set_resizing(window.0, on);
+    }
+
+    /// While on, the pointer is yours: clients see no motion or scrolling
+    /// (buttons still reach them, so the press that started a drag ends
+    /// cleanly). Turn it on for an interactive move or resize, off at the end.
+    pub fn grab_pointer(&mut self, on: bool) {
+        self.pin().grab_pointer(on);
+    }
+
+    /// Switch the keyboard layout, e.g. `"de"` or `"us,ru"`. Bare metal only:
+    /// nested, keys arrive in the host's layout. False if xkb rejects it.
+    pub fn set_keyboard_layout(&mut self, layout: &str) -> bool {
+        self.pin().set_keyboard_layout(layout)
+    }
+
+    /// Where the output sits in the global layout, in logical pixels.
+    pub fn output_box(&self, output: OutputId) -> Rect {
+        self.raw.output_box(output.0)
+    }
+
+    /// [`Server::output_box`] minus what panels reserved (layer-shell
+    /// exclusive zones): where windows should go.
+    pub fn output_usable(&self, output: OutputId) -> Rect {
+        self.raw.output_usable(output.0)
+    }
+
+    /// The modes the monitor supports; empty for nested and headless outputs.
+    pub fn output_modes(&self, output: OutputId) -> Vec<Mode> {
+        self.raw.output_modes(output.0)
+    }
+
+    /// Change the monitor's mode. `refresh_mhz` 0 picks the best rate for the
+    /// size. Followed by [`Event::OutputChange`].
+    pub fn set_output_mode(&mut self, output: OutputId, mode: Mode) -> Result<(), Error> {
+        let mut error = String::new();
+        let raw = self.pin();
+        if raw.set_output_mode(
+            output.0,
+            mode.width,
+            mode.height,
+            mode.refresh_mhz,
+            &mut error,
+        ) {
+            Ok(())
+        } else {
+            Err(Error(error))
+        }
+    }
+
+    /// Integer scale (HiDPI). Followed by [`Event::OutputChange`].
+    pub fn set_output_scale(&mut self, output: OutputId, scale: i32) {
+        self.pin().set_output_scale(output.0, scale.max(1));
+    }
+
+    /// Rotate or flip the output. Followed by [`Event::OutputChange`].
+    pub fn set_output_transform(&mut self, output: OutputId, transform: Transform) {
+        self.pin().set_output_transform(output.0, transform as u32);
+    }
+
+    /// Move the output in the global layout. Followed by [`Event::OutputChange`].
+    pub fn set_output_position(&mut self, output: OutputId, x: i32, y: i32) {
+        self.pin().set_output_position(output.0, x, y);
+    }
+
+    /// Publish a workspace to pagers. What a workspace *is* stays yours.
+    pub fn add_workspace(&mut self, name: &str) -> WorkspaceId {
+        WorkspaceId(self.pin().add_workspace(name))
+    }
+
+    pub fn remove_workspace(&mut self, workspace: WorkspaceId) {
+        self.pin().remove_workspace(workspace.0);
+    }
+
+    /// Mark it the active one (and every other inactive).
+    pub fn activate_workspace(&mut self, workspace: WorkspaceId) {
+        self.pin().activate_workspace(workspace.0);
+    }
+
+    /// Whether the lock screen is up. See [`Event::SessionLock`].
+    pub fn is_locked(&self) -> bool {
+        self.raw.is_locked()
     }
 
     /// Swallow `keysym` pressed with exactly `mods` and report it as

@@ -20,6 +20,8 @@ namespace lum {
 struct Config;
 struct Event;
 struct Item;
+struct Mode;
+struct Rect;
 struct Size;
 
 /// A whole compositor: display, socket, backend, the standard globals and the
@@ -44,12 +46,35 @@ public:
     void configure(std::uint64_t window, std::int32_t width, std::int32_t height);
     void set_maximized(std::uint64_t window, bool on);
     void set_fullscreen(std::uint64_t window, bool on);
+    void set_minimized(std::uint64_t window, bool on);
+    void set_tiled(std::uint64_t window, bool on);
+    void set_resizing(std::uint64_t window, bool on);
     void close(std::uint64_t window);
     rust::String window_title(std::uint64_t window) const;
     rust::String window_app_id(std::uint64_t window) const;
+    rust::String window_icon_name(std::uint64_t window) const;
     Size window_size(std::uint64_t window) const;
+    Size window_min_size(std::uint64_t window) const;
+    std::uint64_t window_parent(std::uint64_t window) const;
 
+    void grab_pointer(bool on);
     std::uint32_t bind_key(std::uint32_t mods, std::uint32_t keysym);
+    bool set_keyboard_layout(rust::Str layout);
+
+    Rect output_box(std::uint64_t output) const;
+    Rect output_usable(std::uint64_t output) const;
+    rust::Vec<Mode> output_modes(std::uint64_t output) const;
+    bool set_output_mode(std::uint64_t output, std::int32_t width, std::int32_t height,
+                         std::int32_t refresh_mhz, rust::String& error);
+    void set_output_scale(std::uint64_t output, std::int32_t scale);
+    void set_output_transform(std::uint64_t output, std::uint32_t transform);
+    void set_output_position(std::uint64_t output, std::int32_t x, std::int32_t y);
+
+    std::uint32_t add_workspace(rust::Str name);
+    void remove_workspace(std::uint32_t workspace);
+    void activate_workspace(std::uint32_t workspace);
+
+    bool is_locked() const;
 
     struct Impl;
     explicit Server(std::unique_ptr<Impl> impl) noexcept;
