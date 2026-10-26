@@ -1,5 +1,5 @@
 // luminaria/backend/libinput.cppm — bare-metal input via libinput. Emits keyboard,
-// pointer and scroll events the compositor routes into a Seat.
+// pointer, scroll and touchscreen events the compositor routes into a Seat.
 //
 // Devices are opened through a luminaria::Session (libseat) when one is given,
 // and directly otherwise — in which case it relies on the logind ACLs a
@@ -101,6 +101,14 @@ public:
     /// One scroll frame per libinput event: wheel notches in `d*_steps`, smooth
     /// touchpad deltas in `dx/dy`, end-of-gesture in `stop_*`.
     [[nodiscard]] Signal<PointerAxisEvent>& pointer_axis() noexcept;
+    /// Touchscreen points, normalised to the panel — see `TouchDownEvent`.
+    /// Mapping them onto an output and hit-testing them is the compositor's;
+    /// close each burst with `Seat::touch_frame()` on `touch_frame`.
+    [[nodiscard]] Signal<TouchDownEvent>& touch_down() noexcept;
+    [[nodiscard]] Signal<TouchMotionEvent>& touch_motion() noexcept;
+    [[nodiscard]] Signal<TouchUpEvent>& touch_up() noexcept;
+    [[nodiscard]] Signal<TouchFrameEvent>& touch_frame() noexcept;
+    [[nodiscard]] Signal<TouchCancelEvent>& touch_cancel() noexcept;
     /// A device was added or removed and the aggregate capabilities changed.
     /// Re-advertise them on the seat here.
     [[nodiscard]] Signal<InputCapabilities>& capabilities_changed() noexcept;
@@ -150,6 +158,11 @@ struct LibinputBackend::Impl {
     Signal<PointerMotionEvent> pointer_motion;
     Signal<PointerButtonEvent> pointer_button;
     Signal<PointerAxisEvent> pointer_axis;
+    Signal<TouchDownEvent> touch_down;
+    Signal<TouchMotionEvent> touch_motion;
+    Signal<TouchUpEvent> touch_up;
+    Signal<TouchFrameEvent> touch_frame;
+    Signal<TouchCancelEvent> touch_cancel;
     Signal<InputCapabilities> capabilities_changed;
 
     ~Impl() {
@@ -255,6 +268,47 @@ struct LibinputBackend::Impl {
         }
     }
 
+    /// The seat slot, not the device slot: two touchscreens can both have a
+    /// slot 0 down at once, and wl_touch ids are per seat. `_transformed` with
+    /// a size of 1 is how libinput hands out a position normalised to the
+    /// panel with its calibration matrix applied; any other size would claim
+    /// to know which output the panel covers, which this backend does not.
+    void handle_touch(libinput_event* event, libinput_event_type type) {
+        auto* t = libinput_event_get_touch_event(event);
+        const auto id = static_cast<int32_t>(libinput_event_touch_get_seat_slot(t));
+        switch (type) {
+        case LIBINPUT_EVENT_TOUCH_DOWN: {
+            TouchDownEvent e{id, libinput_event_touch_get_x_transformed(t, 1),
+                             libinput_event_touch_get_y_transformed(t, 1)};
+            touch_down.emit(e);
+            break;
+        }
+        case LIBINPUT_EVENT_TOUCH_MOTION: {
+            TouchMotionEvent e{id, libinput_event_touch_get_x_transformed(t, 1),
+                               libinput_event_touch_get_y_transformed(t, 1)};
+            touch_motion.emit(e);
+            break;
+        }
+        case LIBINPUT_EVENT_TOUCH_UP: {
+            TouchUpEvent e{id};
+            touch_up.emit(e);
+            break;
+        }
+        case LIBINPUT_EVENT_TOUCH_CANCEL: {
+            TouchCancelEvent e{id};
+            touch_cancel.emit(e);
+            break;
+        }
+        case LIBINPUT_EVENT_TOUCH_FRAME: {
+            TouchFrameEvent e{};
+            touch_frame.emit(e);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
     void dispatch() {
         libinput_dispatch(li);
         libinput_event* event = nullptr;
@@ -289,6 +343,13 @@ struct LibinputBackend::Impl {
             case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
             case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
                 handle_scroll(event, type);
+                break;
+            case LIBINPUT_EVENT_TOUCH_DOWN:
+            case LIBINPUT_EVENT_TOUCH_MOTION:
+            case LIBINPUT_EVENT_TOUCH_UP:
+            case LIBINPUT_EVENT_TOUCH_CANCEL:
+            case LIBINPUT_EVENT_TOUCH_FRAME:
+                handle_touch(event, type);
                 break;
             default:
                 break;
@@ -444,6 +505,11 @@ Signal<PointerButtonEvent>& LibinputBackend::pointer_button() noexcept {
     return impl_->pointer_button;
 }
 Signal<PointerAxisEvent>& LibinputBackend::pointer_axis() noexcept { return impl_->pointer_axis; }
+Signal<TouchDownEvent>& LibinputBackend::touch_down() noexcept { return impl_->touch_down; }
+Signal<TouchMotionEvent>& LibinputBackend::touch_motion() noexcept { return impl_->touch_motion; }
+Signal<TouchUpEvent>& LibinputBackend::touch_up() noexcept { return impl_->touch_up; }
+Signal<TouchFrameEvent>& LibinputBackend::touch_frame() noexcept { return impl_->touch_frame; }
+Signal<TouchCancelEvent>& LibinputBackend::touch_cancel() noexcept { return impl_->touch_cancel; }
 Signal<InputCapabilities>& LibinputBackend::capabilities_changed() noexcept {
     return impl_->capabilities_changed;
 }

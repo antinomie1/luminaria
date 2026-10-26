@@ -184,6 +184,6 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 - **`LibinputBackend` 只发相对指针运动** —— 绝对定位设备（触摸屏、数位板，以及虚拟机给客户机
   的那块 tablet）的 `LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE` 不处理，于是虚拟机里指针根本
   不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
-- **`LibinputBackend` 报告 touch 能力但不发 touch 事件** —— `capabilities()` 如实说有触摸屏，
-  触摸事件本身还没接（`Seat` 那一侧 `touch_down/motion/up/frame` 是齐的）。所以示例里
-  `set_capabilities()` 的 touch 一律传 false。
+- **`luminaria-tty` 示例还没接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
+  触摸面板），Rust 绑定也接好了（映射到第一块输出、`scene_hit_test`、按 slot 路由）；C++ 示例
+  `tty_compositor.cpp` 还没照做，所以它的 `set_capabilities()` 仍传 touch=false。

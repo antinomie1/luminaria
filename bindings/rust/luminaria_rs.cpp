@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -121,6 +122,15 @@ struct LockSurfaceEntry {
     bool dead = false;
     Conn<lm::SessionLockSurfaceMap> on_map;
     Conn<lm::SessionLockSurfaceDestroy> on_destroy;
+};
+
+/// A touchscreen point, from its down to its up: the surface and window it
+/// went down on keep it wherever the finger goes, as the pointer's implicit
+/// grab does. `surface` is invalid when it went down on no client.
+struct TouchSlot {
+    std::int32_t id = 0;
+    lm::SurfaceId surface;
+    std::uint64_t window = 0;
 };
 
 struct OutputEntry {
@@ -229,6 +239,7 @@ struct Server::Impl {
     std::uint64_t ptr_window = 0; // the window under the pointer
     bool wm_grab = false;         // Rust is dragging something: clients see no motion
     std::vector<std::uint32_t> held; // keys a client was told are down
+    std::vector<TouchSlot> touch_slots; // touch points that are down
     std::uint32_t workspace_group = 0;
 
     // The lock screen. `lock_pending`: a lock was asked for and the screens
@@ -257,6 +268,11 @@ struct Server::Impl {
     Conn<lm::KeymapChange> on_keymap;
     Conn<lm::HostCloseRequest> on_close;
     Conn<lm::InputCapabilities> on_caps;
+    Conn<lm::TouchDownEvent> on_touch_down;
+    Conn<lm::TouchMotionEvent> on_touch_motion;
+    Conn<lm::TouchUpEvent> on_touch_up;
+    Conn<lm::TouchFrameEvent> on_touch_frame;
+    Conn<lm::TouchCancelEvent> on_touch_cancel;
     Conn<lm::SessionActive> on_session;
     Conn<lm::ForeignToplevelRequest> on_foreign;
     Conn<lm::ActivationRequest> on_activate;
@@ -1174,18 +1190,27 @@ struct Server::Impl {
         screencopy->notify_cursor_changed();
     }
 
+    /// A click or a touch went down on `target`: what that means for menus
+    /// and the keyboard, whichever device it came from.
+    void pressed_on(lm::SurfaceId target) {
+        if (locked()) {
+            return;
+        }
+        (void)popup_tree.dismiss_grabs_outside(target); // menu semantics
+        // Clicking into an on-demand layer surface (a panel's search box)
+        // gives it the keyboard; clicking anywhere else takes it back.
+        lm::LayerSurface* ls = layers.keyboard_target(target);
+        const lm::SurfaceId next = ls != nullptr ? ls->surface().id() : lm::SurfaceId{};
+        if (next != layer_focus) {
+            layer_focus = next;
+            apply_keyboard_focus();
+        }
+    }
+
     void button(std::uint32_t code, bool pressed) {
         idle_notify->notify_activity();
-        if (pressed && !locked()) {
-            (void)popup_tree.dismiss_grabs_outside(seat->pointer_focus()); // menu semantics
-            // Clicking into an on-demand layer surface (a panel's search box)
-            // gives it the keyboard; clicking anywhere else takes it back.
-            lm::LayerSurface* ls = layers.keyboard_target(seat->pointer_focus());
-            const lm::SurfaceId next = ls != nullptr ? ls->surface().id() : lm::SurfaceId{};
-            if (next != layer_focus) {
-                layer_focus = next;
-                apply_keyboard_focus();
-            }
+        if (pressed) {
+            pressed_on(seat->pointer_focus());
         }
         Event ev{};
         ev.kind = EventKind::PointerButton;
@@ -1235,6 +1260,118 @@ struct Server::Impl {
         }
     }
 
+    // ------------------------------------------------------------- touch
+
+    /// Where a touchscreen point lands, in global logical coordinates. The
+    /// panel is taken to cover the first output — the built-in screen on a
+    /// laptop or tablet — and to share its native orientation, so a rotated
+    /// output rotates touch with it. libinput gives the point in units of the
+    /// panel; false when there is no output to put it on.
+    bool touch_to_global(double u, double v, double& x, double& y) const {
+        const OutputEntry* o = nullptr;
+        for (const auto& entry : outputs) {
+            if (entry->output != nullptr) {
+                o = entry.get();
+                break;
+            }
+        }
+        if (o == nullptr) {
+            return false;
+        }
+        // A badly calibrated panel can report a little past its edges; [0, 1)
+        // keeps the point on this output rather than on its neighbour.
+        const double below_one = std::nextafter(1.0, 0.0);
+        const lm::UnitPoint p = lm::transform_unit_point(
+            o->output->transform(), {std::clamp(u, 0.0, below_one), std::clamp(v, 0.0, below_one)});
+        const lm::Box box = layout.box_of(*o->output);
+        x = box.x + p.x * box.width;
+        y = box.y + p.y * box.height;
+        return true;
+    }
+
+    TouchSlot* touch_slot(std::int32_t id) {
+        for (TouchSlot& t : touch_slots) {
+            if (t.id == id) {
+                return &t;
+            }
+        }
+        return nullptr;
+    }
+
+    void push_touch(EventKind kind, const TouchSlot& t, double x, double y) {
+        Event ev{};
+        ev.kind = kind;
+        ev.window = t.window;
+        ev.code = static_cast<std::uint32_t>(t.id);
+        ev.x = x;
+        ev.y = y;
+        events.push_back(ev);
+    }
+
+    /// Hit-tested with the same scene the pointer uses, so a finger and a
+    /// click on the same pixel reach the same surface.
+    void touch_down(const lm::TouchDownEvent& e) {
+        idle_notify->notify_activity();
+        double x = 0, y = 0;
+        if (!touch_to_global(e.x, e.y, x, y)) {
+            return;
+        }
+        build_scene();
+        const lm::SceneHit hit = lm::scene_hit_test(scene, x, y);
+        pressed_on(hit.surface != nullptr ? hit.surface->id() : lm::SurfaceId{});
+        std::erase_if(touch_slots, [&](const TouchSlot& t) { return t.id == e.id; });
+        TouchSlot slot{e.id, {}, locked() || !hit.hit ? 0 : hit.tag};
+        if (hit.surface != nullptr) {
+            slot.surface = hit.surface->id();
+            seat->touch_down(*hit.surface, e.id, hit.sx, hit.sy);
+        }
+        touch_slots.push_back(slot);
+        push_touch(EventKind::TouchDown, slot, x, y);
+    }
+
+    void touch_motion(const lm::TouchMotionEvent& e) {
+        idle_notify->notify_activity();
+        const TouchSlot* slot = touch_slot(e.id);
+        double x = 0, y = 0;
+        if (slot == nullptr || !touch_to_global(e.x, e.y, x, y)) {
+            return;
+        }
+        // The surface's origin now, not at the down: a window the WM moved
+        // under a held finger still gets coordinates local to itself.
+        build_scene();
+        double ox = 0, oy = 0;
+        if (lm::surface_from_id(slot->surface) != nullptr &&
+            surface_origin(slot->surface, ox, oy)) {
+            seat->touch_motion(e.id, x - ox, y - oy);
+        }
+        push_touch(EventKind::TouchMotion, *slot, x, y);
+    }
+
+    void touch_up(const lm::TouchUpEvent& e) {
+        idle_notify->notify_activity();
+        const TouchSlot* slot = touch_slot(e.id);
+        if (slot == nullptr) {
+            return;
+        }
+        seat->touch_up(e.id);
+        push_touch(EventKind::TouchUp, *slot, 0, 0);
+        std::erase_if(touch_slots, [&](const TouchSlot& t) { return t.id == e.id; });
+    }
+
+    /// Every point is gone and none will get an up: a device went away, or
+    /// the VT did. Clients are told to forget the whole sequence, and Rust
+    /// sees each point lift so a gesture of its own cannot stay half-done.
+    void cancel_touches() {
+        if (touch_slots.empty()) {
+            return;
+        }
+        seat->touch_cancel();
+        for (const TouchSlot& t : touch_slots) {
+            push_touch(EventKind::TouchUp, t, 0, 0);
+        }
+        touch_slots.clear();
+    }
+
     void watch_input(lm::WaylandBackend& host) {
         on_motion = host.pointer_motion.connect([this](lm::PointerMotionAbsEvent& e) {
             if (e.x < 0) { // left the host window
@@ -1274,11 +1411,21 @@ struct Server::Impl {
         on_key = devices.key().connect([this](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
         // libinput's own xkb state already took this; the seat only relays it.
         on_mods = devices.modifiers().connect([this](lm::ModifiersEvent& e) { modifiers(e); });
+        on_touch_down = devices.touch_down().connect(
+            [this](lm::TouchDownEvent& e) { touch_down(e); });
+        on_touch_motion = devices.touch_motion().connect(
+            [this](lm::TouchMotionEvent& e) { touch_motion(e); });
+        on_touch_up = devices.touch_up().connect([this](lm::TouchUpEvent& e) { touch_up(e); });
+        on_touch_frame =
+            devices.touch_frame().connect([this](lm::TouchFrameEvent&) { seat->touch_frame(); });
+        // libinput cancels per point; wl_touch cancels the whole sequence, so
+        // the first cancel takes every point and the rest find none left.
+        on_touch_cancel =
+            devices.touch_cancel().connect([this](lm::TouchCancelEvent&) { cancel_touches(); });
         // Advertise what is plugged in: a client that binds a wl_pointer no
-        // device can drive waits forever. Touch is never routed, so never
-        // claimed.
+        // device can drive waits forever.
         on_caps = devices.capabilities_changed().connect([this](lm::InputCapabilities& caps) {
-            seat->set_capabilities(caps.keyboard, caps.pointer, false);
+            seat->set_capabilities(caps.keyboard, caps.pointer, caps.touch);
         });
     }
 
@@ -1418,6 +1565,7 @@ struct Server::Impl {
             on_session = session->activity().connect([this](lm::SessionActive& e) {
                 if (!e.active) {
                     release_held_keys();
+                    cancel_touches();
                 } else {
                     schedule_all(); // back on our VT: repaint what the other one drew over
                 }
@@ -1634,7 +1782,7 @@ struct Server::Impl {
                 return "libinput: " + s.error().message;
             }
             const lm::InputCapabilities caps = input->capabilities();
-            seat->set_capabilities(caps.keyboard, caps.pointer, false);
+            seat->set_capabilities(caps.keyboard, caps.pointer, caps.touch);
         }
         if (auto s = backend->start(); !s) {
             return "backend: " + s.error().message;

@@ -47,6 +47,15 @@ LUMINARIA_BACKEND=drm cargo run --example floating              # 裸机，在�
 客户端那边按住的键全部松开，窗口管理器绑不到也拦不住它。切走/切回会收到
 `Event::SessionActive { active }`。
 
+**触摸屏**也在这里接好：libinput 给的是归一化到触摸面板的坐标，shim 把它映射到**第一块输出**
+的布局框（假定面板和这块屏的原生朝向一致，所以输出旋转时触摸跟着转），用和指针同一份场景
+做命中测试，按表面局部坐标发给客户端。每个触点按 slot 记住按下时落在哪个表面上，之后的
+移动和抬起都发给它，手指滑出窗口也一样（和按住鼠标键时的隐式 grab 相同）。seat 的触摸能力
+按插着的设备如实通告。Rust 另外收到一份 `Event::TouchDown` / `TouchMotion` / `TouchUp`
+（全局坐标、触点 id、按下时的窗口），用来做窗口管理器自己的手势，比如示例里的点按聚焦。
+设备取消触点或 VT 被切走时，客户端收到 `wl_touch.cancel`，Rust 对每个还按着的触点收到一个
+`TouchUp`。多块触摸屏、触摸屏不在第一块输出上的情况暂不处理。
+
 没有 libseat session（既没有 logind seat 也没有 seatd）时 `Drm` 仍能从已登录的 VT 启动，
 但 VT 切换会被禁用——这时请绑一个退出键（示例里是 Logo+Escape），第一次试的时候再加上
 `LUMINARIA_EXIT_MS=10000` 兜底。
@@ -130,8 +139,7 @@ xmake.lua          shim 的 xmake 子工程，includes("../..") 引入 luminaria
 
 ## 还没有的
 
-- **触摸。** Seat 支持 `touch_*`，但 `LibinputBackend` 只报告设备有没有触摸能力、不发触摸事件，
-  嵌套后端也不转发；要先在库里补上这一层。
+- **嵌套后端的触摸。** `WaylandBackend` 不转发宿主的 `wl_touch`，所以触摸只在 `Drm` 后端有。
 - **wlr-output-management**（让 `wlr-randr`/kanshi 改输出）：库里没有这个协议；目前只能由
   Rust 调 `set_output_*`。
 - 截屏注册的输出尺寸是客户端绑定 wl_output 时的尺寸；改模式后新绑定的客户端才拿到新尺寸。

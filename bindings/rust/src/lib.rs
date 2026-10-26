@@ -88,6 +88,9 @@ mod ffi {
         OutputChange,
         SessionLock,
         WorkspaceActivate,
+        TouchDown,
+        TouchMotion,
+        TouchUp,
     }
 
     /// Flat on purpose: cxx cannot carry a Rust enum with payloads, so every
@@ -442,6 +445,31 @@ pub enum Event {
         x: f64,
         y: f64,
     },
+    /// A finger touched the screen ([`Backend::Drm`] only: libinput
+    /// touchscreens). Global logical coordinates, and the window under the
+    /// finger. Already forwarded to the client there; this copy is for your
+    /// own gestures. `id` is the touch point: unique among the points down at
+    /// once, reused after it lifts.
+    TouchDown {
+        id: i32,
+        window: Option<WindowId>,
+        x: f64,
+        y: f64,
+    },
+    /// Point `id` moved. `window` is still the one it went down on, wherever
+    /// the finger is now — the client keeps getting it, as with a held button.
+    TouchMotion {
+        id: i32,
+        window: Option<WindowId>,
+        x: f64,
+        y: f64,
+    },
+    /// Point `id` lifted, or was cancelled (a VT switch, the device went
+    /// away); either way it is gone.
+    TouchUp {
+        id: i32,
+        window: Option<WindowId>,
+    },
     /// A key binding fired. The key was not forwarded to any client.
     Binding(BindingId),
     OutputNew {
@@ -507,6 +535,22 @@ impl Event {
                 pressed: e.on,
                 x: e.x,
                 y: e.y,
+            },
+            K::TouchDown => Event::TouchDown {
+                id: e.code as i32,
+                window: under,
+                x: e.x,
+                y: e.y,
+            },
+            K::TouchMotion => Event::TouchMotion {
+                id: e.code as i32,
+                window: under,
+                x: e.x,
+                y: e.y,
+            },
+            K::TouchUp => Event::TouchUp {
+                id: e.code as i32,
+                window: under,
             },
             K::Binding => Event::Binding(BindingId(e.code)),
             K::OutputNew => Event::OutputNew {

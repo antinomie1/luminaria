@@ -40,6 +40,20 @@ int main() {
     assert((transform_box(Transform::rotate_90, 2, Box{0, 0, 25, 50}, 100, 50) ==
             Box{0, 0, 100, 50}));
 
+    // A touch point comes back from the panel the way transform_box sent the
+    // logical point out, for all eight transforms: a zero-sized box is a point.
+    for (std::uint8_t v = 0; v < 8; ++v) {
+        const auto t = static_cast<Transform>(v);
+        constexpr int dw = 200, dh = 100;
+        const int lw = transform_swaps_axes(t) ? dh : dw;
+        const int lh = transform_swaps_axes(t) ? dw : dh;
+        const Box out = transform_box(t, 1, Box{30, 10, 0, 0}, dw, dh);
+        const luminaria::UnitPoint back = luminaria::transform_unit_point(
+            t, {static_cast<double>(out.x) / dw, static_cast<double>(out.y) / dh});
+        assert(std::abs(back.x - 30.0 / lw) < 1e-9);
+        assert(std::abs(back.y - 10.0 / lh) < 1e-9);
+    }
+
     luminaria::OutputLayout layout;
     assert(layout.empty());
     layout.add_auto(left);
