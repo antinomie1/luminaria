@@ -9,8 +9,8 @@
 ## 快速开始
 
 ```sh
-xmake f -y --toolchain=clang && xmake
-WAYLAND_DISPLAY=wayland-0 ./build/examples/tinyluminaria
+xmake f -y --toolchain=clang && xmake -j4
+xmake run minimal
 ```
 
 依赖、测试、裸机运行方式见 **[docs/building.md](docs/building.md)**。

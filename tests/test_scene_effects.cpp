@@ -51,7 +51,7 @@ int main() {
 
     const luminaria::Color black{0, 0, 0, 1};
     const auto show = [&](std::span<const luminaria::SceneItem> scene) {
-        return scene_renderer.present(state, output, scene, black, {});
+        return scene_renderer.present(state, output, scene, black);
     };
 
     // --- opacity -------------------------------------------------------------

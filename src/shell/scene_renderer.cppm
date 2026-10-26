@@ -11,6 +11,14 @@
 // trees and the cursor were all previously two implementations that had to be
 // kept in step by hand, in every compositor built on this library.
 //
+// It also answers the display for the compositor. Once `reset()` has bound an
+// output, that output's `present` event releases the frame callbacks of
+// everything the frame drew and sends its presentation feedback, a frame that
+// turns out `unchanged` releases them on the spot (no `present` follows it),
+// and on the CPU path a commit to anything drawn asks for the next frame, as
+// `Frame` does on the GPU. Those three were a contract every compositor had to
+// remember, and forgetting any one froze its clients.
+//
 // A compositor that wants the GPU path only can still drive `Frame` directly;
 // this is for the ones that must also come up on a machine with no GPU — which
 // includes every test suite that runs in CI.
@@ -25,15 +33,32 @@ import :vulkan;
 
 export namespace luminaria {
 
-/// What `SceneRenderer::present()` did. `unchanged` means nothing was committed
+/// What `SceneRenderer::present()` did, for a compositor that keeps count.
+/// `unchanged`: nothing was committed, so no `present` event follows it; the
+/// frame callbacks it owed have already been released.
+enum class SceneOutcome {
+    /// Composited and flipped on the GPU.
+    composited,
+    /// A client's own buffer went straight to the display.
+    scanout,
+    /// The frame was identical to the one on screen.
+    unchanged,
+    /// Composited on the CPU and handed over as pixels.
+    cpu,
+};
 
-/// and no `present` event will follow, so whatever the compositor does there —
-/// `send_frame_done()` above all — it must do on this answer too.
-enum class SceneOutcome { committed, unchanged };
+/// The pointer as `output` should show it, in that output's logical
+/// coordinates; an empty `SceneCursor` for none. `Cursor` installs one.
+using SceneCursorSource = std::function<SceneCursor(const Output& output)>;
 
 /// Per-output renderer state: the GPU frame ledger when there is one, the CPU
 /// compositor when there is not, and the scratch both reuse so that a
 /// steady-state frame allocates nothing.
+///
+/// `SceneRenderer::reset()` binds it to an output, and from then on it answers
+/// that output's `present` events by itself. It unbinds when the output is
+/// destroyed or when it is itself destroyed, whichever comes first, so dropping
+/// it in an `Output::destroy` handler is as safe as never dropping it.
 ///
 /// Move-only, and it must not outlive the `SceneRenderer` that filled it.
 class SceneOutput {
@@ -79,16 +104,23 @@ public:
     /// Why there is none. Empty when there is.
     [[nodiscard]] std::string_view gpu_error() const noexcept;
 
-    /// Allocate everything sized for `output`'s CURRENT mode. Call it once per
-    /// output and again from `Output::mode_changed`.
+    /// Where presentation feedback goes. Null (the default) sends none; frame
+    /// callbacks are released either way. Borrowed: it must outlive every
+    /// `present` event of a bound output — declare the backends after it, which
+    /// the globals-before-backends order already does.
+    void set_presentation(Presentation* presentation) noexcept;
+
+    /// Allocate everything sized for `output`'s CURRENT mode, and bind `state`
+    /// to it. Call it once per output and again from `Output::mode_changed`.
     ///
     /// A failure is not fatal and is not an error the caller has to handle
     /// beyond reporting it: this output falls back to the CPU path, which needs
-    /// no setup. There is nothing to reset when there is no GPU at all, and
-    /// that answers `ok()`.
+    /// no setup. There is nothing to allocate when there is no GPU at all, and
+    /// that answers `ok()` — the binding happens either way.
     Status reset(SceneOutput& state, Output& output, std::uint32_t drm_format);
 
-    /// Draw `scene` and present it on `output`.
+    /// Draw `scene` and present it on `output`, with the pointer from the
+    /// cursor source composited on top unless the cursor plane carries it.
     ///
     /// The scene is in the output's *logical* coordinates. On the GPU path
     /// `Frame` applies the output's scale and transform; the CPU path draws
@@ -96,33 +128,20 @@ public:
     /// coordinates — byte-exact for scale=1 and a normal transform, which is
     /// what every software output currently is.
     [[nodiscard]] Result<SceneOutcome> present(SceneOutput& state, Output& output,
-                                               std::span<const SceneItem> scene, Color background,
-                                               const SceneCursor& cursor = {});
+                                               std::span<const SceneItem> scene, Color background);
 
-    /// Put `cursor` on the output's KMS cursor plane, if it has one and can
-    /// take this image. Returns true when hardware owns the pointer.
-    ///
-    /// This is the call that makes moving the mouse cheap. A cursor composited
-    /// into the scene costs a full recomposite and a page flip per motion
-    /// event; on the plane it costs one small atomic commit and no repaint at
-    /// all. So a compositor should call this from its pointer handler and only
-    /// mark the output dirty when it answers false.
-    ///
-    /// `present()` calls it too, and leaves the cursor out of the frame when it
-    /// succeeds — so the pointer is never drawn twice, and an output whose
-    /// plane rejects the image (too large, wrong format) silently goes back to
-    /// being composited.
-    [[nodiscard]] bool set_cursor_plane(SceneOutput& state, Output& output,
-                                        const SceneCursor& cursor);
+    /// What the pointer looks like on each output. Without one no cursor is
+    /// drawn. `Cursor` installs itself here; an empty function uninstalls.
+    void set_cursor_source(SceneCursorSource source);
 
-    /// From the output's `present` handler.
-    void presented(SceneOutput& state);
-
-    /// Release every frame callback the last `present()` owed, at one stamp.
-    /// Call it from `Output::present`, and again when `present()` answered
-    /// `unchanged` — that frame never reaches the display, so no `present`
-    /// follows it and a client that committed without damage would freeze.
-    void send_frame_done(SceneOutput& state, std::uint32_t time_ms);
+    /// The pointer moved or changed picture: every bound output re-reads the
+    /// cursor source. One with a KMS cursor plane that takes the image moves
+    /// the plane — one small atomic commit and no repaint, which is what makes
+    /// moving the mouse cheap — and every other output asks for a frame, since
+    /// a composited pointer is damage no client reports. An output whose plane
+    /// rejects the image (too large, wrong format) silently goes back to being
+    /// composited, and the pointer is never drawn twice.
+    void update_cursor();
 
     /// Read back the last presented frame on `state` as RGBA8 pixels.
     /// On the GPU path reads back `Frame::read_back()`; on the CPU path returns
@@ -169,12 +188,21 @@ struct SceneBlurCache {
 /// What is currently on this output's KMS cursor plane. `source` is the identity
 /// of the pixels up there — a `CursorImage*` for a themed cursor, a
 /// `current_buffer_identity()` for a client one — so a moving pointer with an
-/// unchanged image costs one `move_cursor` and no upload.
+/// unchanged image costs one `move_cursor` and no upload. `surface` is the
+/// client sprite whose frame callbacks the plane owes, since no frame draws it.
 struct SceneCursorPlane {
     const void* source = nullptr;
+    SurfaceId surface;
     int x = 0;
     int y = 0;
     bool shown = false;
+};
+
+/// A surface the CPU path drew, and the commit that has to wake its output.
+/// The GPU path's `Frame` keeps the same watch on everything it places.
+struct SceneCommitWatch {
+    SurfaceId surface;
+    Signal<SurfaceCommit>::Connection committed;
 };
 
 struct SceneOutput::Impl {
@@ -187,6 +215,10 @@ struct SceneOutput::Impl {
     std::vector<CpuItem> items;
     std::vector<SurfaceId> drawn;
     std::vector<SurfaceAt> tree;
+    std::vector<SceneCommitWatch> watched;
+    // Which path the frame on screen came from: a GPU output that fell back
+    // drew `drawn`, not its placement list.
+    bool drew_on_cpu = false;
     // Per output rather than per renderer, so two monitors do not evict each
     // other's bar every frame. Indexed by the image's position among the
     // frame's image items, which is stable for a scene built the same way twice.
@@ -200,6 +232,23 @@ struct SceneOutput::Impl {
     std::vector<SceneGroupCache> groups;
     // One per non-x-ray blurred item, indexed like the group caches.
     std::vector<SceneBlurCache> blurs;
+
+    // The binding reset() makes. `owner` lists this state among its outputs;
+    // both pointers are null while unbound.
+    SceneRenderer::Impl* owner = nullptr;
+    Output* output = nullptr;
+    Signal<PresentEvent>::Connection on_present;
+    Signal<OutputDestroy>::Connection on_destroy;
+
+    Impl() = default;
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    ~Impl() { unbind(); }
+
+    void bind(SceneRenderer::Impl& renderer, Output& out);
+    void unbind() noexcept;
+    void presented(const PresentEvent& event);
+    void send_frame_done(std::uint32_t time_ms);
 };
 
 struct SceneRenderer::Impl {
@@ -212,6 +261,25 @@ struct SceneRenderer::Impl {
     const CursorImage* cursor_texture_of = nullptr;
     std::vector<Pixel> cursor_pixels;
     const CursorImage* cursor_pixels_of = nullptr;
+    SceneCursorSource cursor;
+    Presentation* presentation = nullptr;
+    // Every bound output, so the pointer can be moved on all of them at once.
+    std::vector<SceneOutput::Impl*> outputs;
+
+    Impl() = default;
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    ~Impl() {
+        // States are meant to die first; one that did not must not unregister
+        // itself from a renderer that is already gone.
+        for (SceneOutput::Impl* state : outputs) {
+            state->owner = nullptr;
+        }
+    }
+
+    [[nodiscard]] SceneCursor cursor_on(const Output& output) const {
+        return cursor ? cursor(output) : SceneCursor{};
+    }
 };
 
 namespace {
@@ -345,58 +413,23 @@ void append_tree(SceneOutput::Impl& state, const Output& output, Surface& root, 
     state.items.emplace_back(CpuView{root.id(), origin.x, origin.y, clip, alpha});
 }
 
-} // namespace
-
-SceneOutput::SceneOutput() : impl_(std::make_unique<Impl>()) {}
-SceneOutput::~SceneOutput() = default;
-SceneOutput::SceneOutput(SceneOutput&&) noexcept = default;
-SceneOutput& SceneOutput::operator=(SceneOutput&&) noexcept = default;
-
-bool SceneOutput::gpu_output() const noexcept { return impl_->frame.has_value(); }
-
-SceneRenderer::SceneRenderer() : SceneRenderer(VulkanOptions{}) {}
-
-SceneRenderer::SceneRenderer(const VulkanOptions& options) : impl_(std::make_unique<Impl>()) {
-    Result<VulkanRenderer> gpu = VulkanRenderer::create(options);
-    if (gpu) {
-        impl_->gpu = std::make_unique<VulkanRenderer>(std::move(*gpu));
-    } else {
-        impl_->gpu_error = gpu.error().message;
-    }
+/// Milliseconds on the clock `PresentEvent` reports, for the frame callbacks
+/// released when nothing is presented.
+[[nodiscard]] std::uint32_t monotonic_ms() noexcept {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<std::uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
-SceneRenderer::~SceneRenderer() = default;
-SceneRenderer::SceneRenderer(SceneRenderer&&) noexcept = default;
-SceneRenderer& SceneRenderer::operator=(SceneRenderer&&) noexcept = default;
-
-bool SceneRenderer::gpu_enabled() const noexcept { return impl_->gpu != nullptr; }
-
-VulkanRenderer* SceneRenderer::gpu() noexcept { return impl_->gpu.get(); }
-
-std::string_view SceneRenderer::gpu_error() const noexcept { return impl_->gpu_error; }
-
-Status SceneRenderer::reset(SceneOutput& state, Output& output, std::uint32_t drm_format) {
-    // Dropped first: every texture it cached describes the old mode, and so do
-    // the scanout buffers it would otherwise keep alive while allocating more.
-    state.impl_->frame.reset();
-    state.impl_->images.clear();
-    if (impl_->gpu == nullptr) {
-        return ok();
-    }
-    state.impl_->frame.emplace(output, *impl_->gpu);
-    if (Status ready = state.impl_->frame->reset(drm_format); !ready) {
-        state.impl_->frame.reset();
-        return ready;
-    }
-    return ok();
-}
-
-bool SceneRenderer::set_cursor_plane(SceneOutput& state, Output& output,
-                                     const SceneCursor& cursor) {
+/// Put `cursor` on the output's KMS cursor plane, if it has one and can take
+/// this image. Returns true when hardware owns the pointer — including when
+/// there is no pointer to show and the plane was what had been showing it.
+[[nodiscard]] bool cursor_plane(SceneOutput::Impl& state, Output& output,
+                                const SceneCursor& cursor) {
     if (!output.has_cursor_plane()) {
         return false;
     }
-    SceneCursorPlane& plane = state.impl_->cursor_plane;
+    SceneCursorPlane& plane = state.cursor_plane;
 
     const auto take_down = [&] {
         if (plane.shown) {
@@ -450,7 +483,13 @@ bool SceneRenderer::set_cursor_plane(SceneOutput& state, Output& output,
             return false;
         }
         plane.source = source;
+        plane.surface = client != nullptr ? client->id() : SurfaceId{};
         plane.shown = false; // position not applied to this image yet
+        // The new image is on the display now; no frame drew it, so no
+        // `present` will release an animated sprite's next frame either.
+        if (client != nullptr) {
+            client->send_frame_done(monotonic_ms());
+        }
     }
 
     if (!plane.shown || plane.x != cursor.x || plane.y != cursor.y) {
@@ -465,27 +504,149 @@ bool SceneRenderer::set_cursor_plane(SceneOutput& state, Output& output,
     return true;
 }
 
-void SceneRenderer::presented(SceneOutput& state) {
-    if (state.impl_->frame.has_value()) {
-        state.impl_->frame->presented();
+} // namespace
+
+void SceneOutput::Impl::bind(SceneRenderer::Impl& renderer, Output& out) {
+    if (owner == &renderer && output == &out) {
+        return;
+    }
+    unbind();
+    owner = &renderer;
+    output = &out;
+    renderer.outputs.push_back(this);
+    on_present = out.present.connect([this](PresentEvent& event) { presented(event); });
+    // Everything here that holds the output goes while it still exists.
+    on_destroy = out.destroy.connect([this](OutputDestroy&) { unbind(); });
+}
+
+void SceneOutput::Impl::unbind() noexcept {
+    if (owner != nullptr) {
+        std::erase(owner->outputs, this);
+    }
+    frame.reset();
+    watched.clear();
+    cursor_plane = {};
+    owner = nullptr;
+    output = nullptr;
+    on_present.disconnect();
+    on_destroy.disconnect();
+}
+
+void SceneOutput::Impl::send_frame_done(std::uint32_t time_ms) {
+    if (frame.has_value() && !drew_on_cpu) {
+        frame->send_frame_done(time_ms);
+    } else {
+        luminaria::send_frame_done(drawn, time_ms);
+    }
+    if (Surface* sprite = surface_from_id(cursor_plane.surface); sprite != nullptr) {
+        sprite->send_frame_done(time_ms);
     }
 }
 
-void SceneRenderer::send_frame_done(SceneOutput& state, std::uint32_t time_ms) {
-    if (state.impl_->frame.has_value()) {
-        state.impl_->frame->send_frame_done(time_ms);
+void SceneOutput::Impl::presented(const PresentEvent& event) {
+    // First: it is what lets a directly scanned-out client have its buffer back.
+    if (frame.has_value()) {
+        frame->presented();
+    }
+    // One stamp for the whole frame: every client that drew it paces to the
+    // same presentation.
+    send_frame_done(event.time_ms());
+    Presentation* feedback = owner != nullptr ? owner->presentation : nullptr;
+    if (feedback == nullptr) {
+        return;
+    }
+    const auto notify = [&](SurfaceId id) {
+        if (Surface* surface = surface_from_id(id); surface != nullptr) {
+            feedback->notify_presented(*surface, event);
+        }
+    };
+    if (frame.has_value() && !drew_on_cpu) {
+        for (const Placement& placement : frame->placements()) {
+            notify(placement.surface);
+        }
     } else {
-        luminaria::send_frame_done(state.impl_->drawn, time_ms);
+        for (const SurfaceId id : drawn) {
+            notify(id);
+        }
+    }
+}
+
+SceneOutput::SceneOutput() : impl_(std::make_unique<Impl>()) {}
+SceneOutput::~SceneOutput() = default;
+SceneOutput::SceneOutput(SceneOutput&&) noexcept = default;
+SceneOutput& SceneOutput::operator=(SceneOutput&&) noexcept = default;
+
+bool SceneOutput::gpu_output() const noexcept { return impl_->frame.has_value(); }
+
+SceneRenderer::SceneRenderer() : SceneRenderer(VulkanOptions{}) {}
+
+SceneRenderer::SceneRenderer(const VulkanOptions& options) : impl_(std::make_unique<Impl>()) {
+    Result<VulkanRenderer> gpu = VulkanRenderer::create(options);
+    if (gpu) {
+        impl_->gpu = std::make_unique<VulkanRenderer>(std::move(*gpu));
+    } else {
+        impl_->gpu_error = gpu.error().message;
+    }
+}
+
+SceneRenderer::~SceneRenderer() = default;
+SceneRenderer::SceneRenderer(SceneRenderer&&) noexcept = default;
+SceneRenderer& SceneRenderer::operator=(SceneRenderer&&) noexcept = default;
+
+bool SceneRenderer::gpu_enabled() const noexcept { return impl_->gpu != nullptr; }
+
+VulkanRenderer* SceneRenderer::gpu() noexcept { return impl_->gpu.get(); }
+
+std::string_view SceneRenderer::gpu_error() const noexcept { return impl_->gpu_error; }
+
+void SceneRenderer::set_presentation(Presentation* presentation) noexcept {
+    impl_->presentation = presentation;
+}
+
+void SceneRenderer::set_cursor_source(SceneCursorSource source) {
+    impl_->cursor = std::move(source);
+}
+
+Status SceneRenderer::reset(SceneOutput& state, Output& output, std::uint32_t drm_format) {
+    SceneOutput::Impl& self = *state.impl_;
+    self.bind(*impl_, output);
+    // Dropped first: every texture it cached describes the old mode, and so do
+    // the scanout buffers it would otherwise keep alive while allocating more.
+    self.frame.reset();
+    self.images.clear();
+    if (impl_->gpu == nullptr) {
+        return ok();
+    }
+    self.frame.emplace(output, *impl_->gpu);
+    if (Status ready = self.frame->reset(drm_format); !ready) {
+        self.frame.reset();
+        return ready;
+    }
+    return ok();
+}
+
+void SceneRenderer::update_cursor() {
+    // By index: nothing below binds or unbinds, but nothing here should have to
+    // know that.
+    for (std::size_t i = 0; i < impl_->outputs.size(); ++i) {
+        SceneOutput::Impl& state = *impl_->outputs[i];
+        Output& output = *state.output;
+        if (!cursor_plane(state, output, impl_->cursor_on(output))) {
+            output.schedule_frame();
+        }
     }
 }
 
 Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
-                                            std::span<const SceneItem> scene, Color background,
-                                            const SceneCursor& cursor) {
+                                            std::span<const SceneItem> scene, Color background) {
     SceneOutput::Impl& self = *state.impl_;
+    // A compositor with no GPU has nothing to reset(), but its frames still
+    // have to be answered.
+    self.bind(*impl_, output);
+    const SceneCursor cursor = impl_->cursor_on(output);
     // Hardware first: if the plane takes the pointer, it is already on screen
     // and must not also be composited into the frame.
-    const bool cursor_on_plane = set_cursor_plane(state, output, cursor);
+    const bool cursor_on_plane = cursor_plane(self, output, cursor);
 
     if (self.frame.has_value()) {
         Frame& frame = *self.frame;
@@ -646,12 +807,18 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         Result<Presented> shown = frame.submit(background);
         if (shown && *shown != Presented::fallback) {
             if (*shown == Presented::unchanged) {
+                // Nothing was committed, so no `present` follows: release the
+                // callbacks now, or a client that committed without damaging
+                // anything waits for good. There is no feedback to give.
+                self.send_frame_done(monotonic_ms());
                 return SceneOutcome::unchanged;
             }
+            self.drew_on_cpu = false;
             // Nested and headless outputs have no page flip to report this
             // commit; one paced event delivers presentation and then stops.
             output.schedule_frame();
-            return SceneOutcome::committed;
+            return *shown == Presented::scanout ? SceneOutcome::scanout
+                                                : SceneOutcome::composited;
         }
         // `fallback`: the GPU could not composite at all. That is what the rest
         // of this function is for.
@@ -729,10 +896,28 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
     if (Status committed = output.commit_frame(self.cpu.pixels(), width, height); !committed) {
         return std::unexpected(committed.error());
     }
+    self.drew_on_cpu = true;
+    // No `Frame` is watching these surfaces, so their next commit would never
+    // reach the screen. One connection per surface for as long as it is drawn;
+    // a steady scene adds none.
+    std::erase_if(self.watched, [](const SceneCommitWatch& watch) {
+        return surface_from_id(watch.surface) == nullptr;
+    });
+    for (const SurfaceId id : self.drawn) {
+        Surface* surface = surface_from_id(id);
+        if (surface == nullptr ||
+            std::ranges::find(self.watched, id, &SceneCommitWatch::surface) !=
+                self.watched.end()) {
+            continue;
+        }
+        Output* out = &output;
+        self.watched.push_back(
+            {id, surface->commit.connect([out](SurfaceCommit&) { out->schedule_frame(); })});
+    }
     // Software outputs report presentation immediately before the next frame;
     // ask for that one event so frame callbacks are paced to what was shown.
     output.schedule_frame();
-    return SceneOutcome::committed;
+    return SceneOutcome::cpu;
 }
 
 Result<std::span<const Pixel>> SceneRenderer::read_back(SceneOutput& state) {

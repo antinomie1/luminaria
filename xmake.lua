@@ -237,8 +237,8 @@ target("luminaria-gpu")
               "src/backend/libinput.cppm", "src/backend/session.cppm",
               "src/protocol/drm_syncobj.cppm", "src/protocol/linux_dmabuf.cppm",
               "src/protocol/screencopy.cppm", "src/render/vulkan.cppm",
-              "src/shell/direct_scanout.cppm", "src/shell/frame.cppm",
-              "src/shell/scene_renderer.cppm", {public = true})
+              "src/shell/cursor.cppm", "src/shell/direct_scanout.cppm",
+              "src/shell/frame.cppm", "src/shell/scene_renderer.cppm", {public = true})
     add_includedirs("src", "build/generated", {public = true})
     add_packages(gpu_packages, {public = true})
     on_load(function (target)
@@ -319,22 +319,10 @@ target("luminaria-text")
 
 if standalone then
 
-target("tinyluminaria")
+target("minimal")
     set_kind("binary")
     luminaria_defaults()
-    add_files("examples/tinyluminaria.cpp")
-    add_deps("luminaria-gpu", "luminaria-desktop")
-
-target("luminaria-drm-demo")
-    set_kind("binary")
-    luminaria_defaults()
-    add_files("examples/drm_demo.cpp")
-    add_deps("luminaria-gpu")
-
-target("luminaria-tty")
-    set_kind("binary")
-    luminaria_defaults()
-    add_files("examples/tty_compositor.cpp")
+    add_files("examples/minimal.cpp")
     add_deps("luminaria-gpu")
 
 -- One test binary per file, same as before. Several skip themselves with exit 77
@@ -354,7 +342,7 @@ local gpu_tests = {
     test_frame_damage = true, test_offscreen = true,
     test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,
     test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,
-    test_screencopy_bounds = true, test_session = true, test_syncobj = true,
+    test_scene_present = true, test_screencopy_bounds = true, test_session = true, test_syncobj = true,
     test_texture = true, test_texture_cache = true, test_vulkan = true,
     test_vulkan_device = true, test_render_inflight = true,
     test_wayland_nested = true,
