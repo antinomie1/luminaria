@@ -15,6 +15,10 @@
 //   3. a new buffer again: on the CPU path nothing but the library's own
 //      commit watch can wake the output for it.
 //
+// And idling: with nothing committing, a software output must stop asking for
+// frames as the GPU one does, without going deaf — a new buffer, or a commit
+// that changes nothing but wants its callback, must still be answered.
+//
 // Run twice, on the machine's GPU when there is one and then with Vulkan made
 // unavailable, so the CPU path is covered on every machine.
 //
@@ -52,6 +56,8 @@ constexpr bool content_round(int round) { return round == 0 || round == kRounds 
 
 std::atomic<int> g_rounds{0};
 std::atomic<int> g_presented{0};
+std::atomic<int> g_frames{0}; // `frame` events the idle session's output emitted
+constexpr int kIdleMs = 100;
 
 struct ClientState {
     wl_compositor* compositor = nullptr;
@@ -144,6 +150,63 @@ void run_client(int fd) {
         g_rounds.fetch_add(1);
     }
     wl_display_roundtrip(display); // the last feedback, if it is still in flight
+    wl_display_disconnect(display);
+}
+
+/// Commit `argb` (or nothing, when 0) and wait for the frame callback.
+bool commit_and_wait(wl_display* display, ClientState& st, wl_surface* surface,
+                     std::uint32_t argb) {
+    bool done = false;
+    wl_callback* cb = wl_surface_frame(surface);
+    wl_callback_add_listener(cb, &kFrameListener, &done);
+    if (argb != 0) {
+        wl_surface_attach(surface, make_buffer(st, argb), 0, 0);
+        wl_surface_damage(surface, 0, 0, kWinW, kWinH);
+    }
+    wl_surface_commit(surface);
+    wl_display_flush(display);
+    while (!done) {
+        if (wl_display_dispatch(display) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::atomic<int> g_idle_frames{-1};   // frames emitted while the client sat still
+std::atomic<int> g_idle_answered{0};  // commits that got their callback
+
+void run_idle_client(int fd) {
+    wl_display* display = wl_display_connect_to_fd(fd);
+    assert(display != nullptr);
+    ClientState st;
+    wl_registry* registry = wl_display_get_registry(display);
+    wl_registry_add_listener(registry, &kRegistryListener, &st);
+    wl_display_roundtrip(display);
+    wl_surface* surface = wl_compositor_create_surface(st.compositor);
+
+    do {
+        if (!commit_and_wait(display, st, surface, 0xFFFF0000u)) { // red
+            break;
+        }
+        g_idle_answered.fetch_add(1);
+        // Let the frame that follows the first present drain, then sit still.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const int before = g_frames.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(kIdleMs));
+        g_idle_frames = g_frames.load() - before;
+        // A commit that changes nothing on screen still wants its callback.
+        if (!commit_and_wait(display, st, surface, 0)) {
+            break;
+        }
+        g_idle_answered.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kIdleMs));
+        // And a new buffer must still be drawn.
+        if (!commit_and_wait(display, st, surface, 0xFF00FF00u)) { // green
+            break;
+        }
+        g_idle_answered.fetch_add(1);
+    } while (false);
     wl_display_disconnect(display);
 }
 
@@ -258,6 +321,71 @@ bool run_session(luminaria::SceneRenderer& renderer) {
     return gpu;
 }
 
+/// The idle half: the same server as `run_session`, a client that stops
+/// committing for `kIdleMs`, and a count of the frames the output asked for
+/// meanwhile. A free-running software output emits ~100 of them.
+void run_idle_session(luminaria::SceneRenderer& renderer) {
+    g_frames = 0;
+    g_idle_frames = -1;
+    g_idle_answered = 0;
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    auto display = luminaria::Display::create();
+    assert(display.has_value() && display->init_shm().has_value());
+    auto compositor = luminaria::Compositor::create(*display);
+    assert(compositor.has_value());
+
+    FlipOutput output(display->event_loop());
+    luminaria::SceneOutput state;
+    (void)renderer.reset(state, output, DRM_FORMAT_XRGB8888);
+    const bool gpu = state.gpu_output();
+
+    luminaria::SurfaceId window;
+    auto ns = compositor->new_surface().connect([&](luminaria::NewSurface& e) {
+        window = e.surface.id();
+        output.schedule_frame();
+    });
+    std::vector<luminaria::SceneItem> scene;
+    int repainted = 0, unchanged = 0;
+    auto on_frame = output.frame.connect([&](luminaria::FrameEvent&) {
+        g_frames.fetch_add(1);
+        scene.clear();
+        if (luminaria::surface_from_id(window) != nullptr) {
+            scene.push_back({.box = {0, 0, kWinW, kWinH}, .surface = window});
+        }
+        const auto shown = renderer.present(state, output, scene, luminaria::Color{0, 0, 1, 1});
+        assert(shown.has_value());
+        unchanged += *shown == luminaria::SceneOutcome::unchanged;
+        repainted += *shown != luminaria::SceneOutcome::unchanged;
+    });
+
+    wl_client* client = wl_client_create(display->c_ptr(), fds[0]);
+    assert(client != nullptr);
+    DestroyCtx destroy_ctx{{}, &*display};
+    destroy_ctx.listener.notify = on_client_destroy;
+    wl_client_add_destroy_listener(client, &destroy_ctx.listener);
+
+    std::thread client_thread(run_idle_client, fds[1]);
+    auto timeout = display->event_loop().add_timer([&] { wl_client_destroy(client); });
+    timeout.arm(5000);
+    display->run();
+    client_thread.join();
+
+    const auto pixels = renderer.read_back(state);
+    assert(pixels.has_value());
+    const luminaria::Pixel last = (*pixels)[0];
+
+    std::fprintf(stderr, "%s idle: %d frames in %d ms, %d repainted, %d unchanged, %d answered\n",
+                 gpu ? "gpu" : "cpu", g_idle_frames.load(), kIdleMs, repainted, unchanged,
+                 g_idle_answered.load());
+    assert(g_idle_answered.load() == 3); // none of the three commits was left waiting
+    assert(g_idle_frames.load() >= 0 && g_idle_frames.load() <= 4);
+    assert(unchanged > 0);
+    // The last commit was green, and it was drawn.
+    assert(last.g == 0xFF && last.r == 0 && last.b == 0);
+}
+
 void cursor_follows_the_pointer(luminaria::SceneRenderer& renderer) {
     auto display = luminaria::Display::create();
     assert(display.has_value());
@@ -320,6 +448,7 @@ int main() {
     {
         luminaria::SceneRenderer renderer;
         (void)run_session(renderer);
+        run_idle_session(renderer);
         cursor_follows_the_pointer(renderer);
     }
     // The same on the CPU path, wherever this runs: a loader with no driver
@@ -329,6 +458,7 @@ int main() {
     luminaria::SceneRenderer cpu;
     assert(!cpu.gpu_enabled());
     assert(!run_session(cpu));
+    run_idle_session(cpu);
     cursor_follows_the_pointer(cpu);
     return 0;
 }

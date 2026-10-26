@@ -274,7 +274,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   callbacks of everything the frame drew and sends presentation feedback (to the
   `Presentation` given by `set_presentation()`), an `unchanged` frame releases them on the
   spot, and the CPU path watches what it drew for commits the way `Frame` does on the GPU.
-  `tests/test_scene_present.cpp` guards all three, on a test output that — like DRM and
+  **The CPU path idles too:** it keeps the last committed frame's items (plus image serials,
+  surface list, background, size) in reused vectors and, when this frame's are identical and no
+  drawn surface has committed since (the watch sets a dirty flag — a new buffer changes none of
+  the keys), skips compositing and committing, releases the callbacks on the spot, asks for no
+  further frame and answers `unchanged`. A mode change or a GPU frame invalidates the keys.
+  `tests/test_scene_present.cpp` guards all three plus the idling, on a test output that — like DRM and
   unlike headless — presents only what was committed. **`Cursor`** (`shell/cursor.cppm`,
   `luminaria.gpu`) is the pointer and its picture end to end: it loads the theme, follows
   cursor-shape requests and the client sprite (re-uploading an animated one on each commit),
