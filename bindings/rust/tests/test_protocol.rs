@@ -13,10 +13,10 @@ fn test_core_protocols_instantiation() {
 
     let _compositor = Compositor::new(&display).expect("Compositor failed");
     let _subcompositor = Subcompositor::new(&display).expect("Subcompositor failed");
-    let mut xdg_shell = XdgShell::new(&display).expect("XdgShell failed");
+    let xdg_shell = XdgShell::new(&display).expect("XdgShell failed");
     xdg_shell.set_bounds(1920, 1080);
 
-    let mut seat = Seat::new(&display, "seat0").expect("Seat failed");
+    let seat = Seat::new(&display, "seat0").expect("Seat failed");
     seat.set_capabilities(true, true, true);
     assert!(!seat.keymap().is_empty());
 

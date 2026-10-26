@@ -1,7 +1,7 @@
 use luminaria::backend::HeadlessBackend;
 use luminaria::core::Display;
 use luminaria::gpu::*;
-use luminaria::protocol::Seat;
+use luminaria::protocol::{Presentation, Seat};
 use luminaria::shell::{OutputLayout, SceneItem};
 use luminaria::util::{Color, Rect};
 
@@ -16,7 +16,7 @@ fn test_scene_renderer_and_output() {
     let mut backend = HeadlessBackend::new(&display, 16).expect("HeadlessBackend failed");
     let mut output = backend.add_output(800, 600).expect("add_output failed");
 
-    let mut renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
+    let renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
     let mut state = SceneOutput::new();
 
     // Reset output target
@@ -37,8 +37,8 @@ fn test_scene_renderer_and_output() {
 
     // Test cursor integration
     let layout = OutputLayout::new().expect("OutputLayout failed");
-    let mut seat = Seat::new(&display, "seat0").expect("Seat failed");
-    let mut cursor = Cursor::new(&mut renderer, &layout, &mut seat).expect("Cursor failed");
+    let seat = Seat::new(&display, "seat0").expect("Seat failed");
+    let mut cursor = Cursor::new(&renderer, &layout, &seat).expect("Cursor failed");
     assert!(cursor.move_to(400.0, 300.0, Rect::new(0, 0, 800, 600)));
     cursor.leave();
 }
@@ -66,16 +66,71 @@ fn test_vulkan_and_frame_skipped_by_default() {
     let mut backend = HeadlessBackend::new(&display, 16).expect("HeadlessBackend failed");
     let mut output = backend.add_output(640, 480).expect("add_output failed");
 
-    if let Ok(mut vk) = VulkanRenderer::new(&VulkanOptions::default()) {
+    if let Ok(vk) = VulkanRenderer::new(&VulkanOptions::default()) {
         let _ = vk.scanout_modifiers(0x34325241);
         let _dmabuf = LinuxDmabuf::new(&display, Some(&vk));
         let _syncobj = DrmSyncobjManager::new(&display);
 
-        if let Ok(mut frame) = Frame::new(&mut output, &mut vk) {
+        if let Ok(mut frame) = Frame::new(&mut output, &vk) {
             let _ = frame.reset(0x34325241);
             frame.begin(Rect::new(0, 0, 640, 480));
             frame.place_rect(Rect::new(10, 10, 50, 50), Color::rgb(1.0, 0.0, 0.0));
             let _ = frame.submit(Color::rgb(0.0, 0.0, 0.0));
         }
     }
+}
+
+#[test]
+fn frame_outlives_its_output() {
+    // The renderer first, so it drops last: the Frame borrows it.
+    let vk = match VulkanRenderer::new(&VulkanOptions::default()) {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skip: no Vulkan 1.3 device ({e})");
+            return;
+        }
+    };
+    let display = Display::new().expect("Display failed");
+    let mut backend = HeadlessBackend::new(&display, 16).expect("HeadlessBackend failed");
+    let mut output = backend.add_output(64, 64).expect("add_output failed");
+    let mut frame = Frame::new(&mut output, &vk).expect("Frame failed");
+
+    // The monitor goes away (here: its backend does) under a live Frame, which
+    // no lifetime can prevent. The frame goes with it and is inert after.
+    drop(backend);
+    assert!(!output.is_alive());
+    assert!(frame.reset(0x34325258).is_err());
+    frame.begin(Rect::new(0, 0, 64, 64));
+    frame.place_rect(Rect::new(0, 0, 8, 8), Color::rgb(1.0, 0.0, 0.0));
+    assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_err());
+    frame.send_frame_done(0);
+}
+
+#[test]
+fn presentation_link_survives_either_drop_order() {
+    // SceneRenderer::set_presentation takes no borrow (the renderer outlives
+    // the Display, so it outlives every global); the link is severed from
+    // whichever end goes first. Meaningful under LUMINARIA_SANITIZE=address.
+    let renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
+    let display = Display::new().expect("Display failed");
+
+    // The global first, as declaration order makes it in a compositor.
+    {
+        let first = Presentation::new(&display).expect("Presentation failed");
+        let second = Presentation::new(&display).expect("Presentation failed");
+        renderer.set_presentation(Some(&first));
+        renderer.set_presentation(Some(&second)); // moves the link
+        drop(first);
+        renderer.set_presentation(None);
+        renderer.set_presentation(Some(&second));
+    }
+    renderer.set_presentation(None);
+
+    // The renderer first.
+    let presentation = Presentation::new(&display).expect("Presentation failed");
+    {
+        let early = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
+        early.set_presentation(Some(&presentation));
+    }
+    drop(presentation);
 }

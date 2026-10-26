@@ -548,7 +548,7 @@ std::unique_ptr<SessionShim> session_new(const DisplayShim& display, rust::Strin
     }
 }
 
-bool SessionShim::switch_to(int vt, rust::String& error) {
+bool SessionShim::switch_to(int vt, rust::String& error) const {
     if (!impl_->session) { error = "session not initialized"; return false; }
     auto st = impl_->session->switch_to(vt);
     if (!st) { error = to_rust(st.error().message); return false; }
@@ -563,7 +563,7 @@ rust::String SessionShim::seat_name() const {
     return "seat0";
 }
 
-std::uint32_t SessionShim::next_activity() {
+std::uint32_t SessionShim::next_activity() const {
     if (impl_->activity.empty()) return 0;
     const bool active = impl_->activity.front();
     impl_->activity.pop_front();
@@ -1004,18 +1004,18 @@ std::unique_ptr<XdgShellShim> xdg_shell_new(const DisplayShim& display, rust::St
     }
 }
 
-void XdgShellShim::set_bounds(std::int32_t width, std::int32_t height) {
+void XdgShellShim::set_bounds(std::int32_t width, std::int32_t height) const {
     if (impl_->shell) impl_->shell->set_bounds(width, height);
 }
 
-bool XdgShellShim::next_toplevel_event(ToplevelEventRaw& out) {
+bool XdgShellShim::next_toplevel_event(ToplevelEventRaw& out) const {
     if (impl_->events.empty()) return false;
     out = impl_->events.front();
     impl_->events.pop_front();
     return true;
 }
 
-void XdgShellShim::toplevel_configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height) {
+void XdgShellShim::toplevel_configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height) const {
     for (const auto& entry : impl_->toplevels) {
         if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
             (void)entry->toplevel->configure(width, height);
@@ -1024,7 +1024,7 @@ void XdgShellShim::toplevel_configure(std::uint64_t surface_id, std::int32_t wid
     }
 }
 
-void XdgShellShim::toplevel_set_maximized(std::uint64_t surface_id, bool on) {
+void XdgShellShim::toplevel_set_maximized(std::uint64_t surface_id, bool on) const {
     for (const auto& entry : impl_->toplevels) {
         if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
             entry->toplevel->set_maximized(on);
@@ -1033,7 +1033,7 @@ void XdgShellShim::toplevel_set_maximized(std::uint64_t surface_id, bool on) {
     }
 }
 
-void XdgShellShim::toplevel_set_activated(std::uint64_t surface_id, bool on) {
+void XdgShellShim::toplevel_set_activated(std::uint64_t surface_id, bool on) const {
     for (const auto& entry : impl_->toplevels) {
         if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
             entry->toplevel->set_activated(on);
@@ -1042,7 +1042,7 @@ void XdgShellShim::toplevel_set_activated(std::uint64_t surface_id, bool on) {
     }
 }
 
-void XdgShellShim::toplevel_close(std::uint64_t surface_id) {
+void XdgShellShim::toplevel_close(std::uint64_t surface_id) const {
     for (const auto& entry : impl_->toplevels) {
         if (entry->toplevel && u64_from_id(entry->toplevel->surface().id()) == surface_id) {
             entry->toplevel->close();
@@ -1072,10 +1072,10 @@ std::unique_ptr<SeatShim> seat_new(const DisplayShim& display, rust::Str name, r
     }
 }
 
-void SeatShim::set_capabilities(bool keyboard, bool pointer, bool touch) {
+void SeatShim::set_capabilities(bool keyboard, bool pointer, bool touch) const {
     if (impl_->seat) impl_->seat->set_capabilities(keyboard, pointer, touch);
 }
-bool SeatShim::set_keymap(rust::Str xkb_text) {
+bool SeatShim::set_keymap(rust::Str xkb_text) const {
     if (!impl_->seat) return false;
     return impl_->seat->set_keymap(std::string(xkb_text));
 }
@@ -1083,7 +1083,7 @@ rust::String SeatShim::keymap() const {
     if (!impl_->seat) return "";
     return to_rust(impl_->seat->keymap());
 }
-void SeatShim::set_keyboard_focus(std::uint64_t surface_id) {
+void SeatShim::set_keyboard_focus(std::uint64_t surface_id) const {
     if (!impl_->seat) return;
     lm::Surface* s = surface_id != 0 ? lm::surface_from_id(id_from_u64(surface_id)) : nullptr;
     impl_->seat->set_keyboard_focus(s);
@@ -1092,19 +1092,19 @@ std::uint64_t SeatShim::keyboard_focus() const {
     if (!impl_->seat) return 0;
     return u64_from_id(impl_->seat->keyboard_focus());
 }
-void SeatShim::notify_key(std::uint32_t key, bool pressed) {
+void SeatShim::notify_key(std::uint32_t key, bool pressed) const {
     if (impl_->seat) impl_->seat->notify_key(key, pressed);
 }
 void SeatShim::notify_modifiers(std::uint32_t depressed, std::uint32_t latched,
-                               std::uint32_t locked, std::uint32_t group) {
+                               std::uint32_t locked, std::uint32_t group) const {
     if (impl_->seat) impl_->seat->notify_modifiers(depressed, latched, locked, group);
 }
-void SeatShim::pointer_enter(std::uint64_t surface_id, double sx, double sy) {
+void SeatShim::pointer_enter(std::uint64_t surface_id, double sx, double sy) const {
     if (!impl_->seat) return;
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
     if (s) impl_->seat->pointer_enter(*s, sx, sy);
 }
-void SeatShim::pointer_clear_focus() {
+void SeatShim::pointer_clear_focus() const {
     if (impl_->seat) impl_->seat->pointer_clear_focus();
 }
 std::uint64_t SeatShim::pointer_focus() const {
@@ -1115,19 +1115,19 @@ std::uint64_t SeatShim::pointer_grab() const {
     if (!impl_->seat) return 0;
     return u64_from_id(impl_->seat->pointer_grab());
 }
-void SeatShim::pointer_motion(double sx, double sy) {
+void SeatShim::pointer_motion(double sx, double sy) const {
     if (impl_->seat) impl_->seat->pointer_motion(sx, sy);
 }
-void SeatShim::pointer_button(std::uint32_t button, bool pressed) {
+void SeatShim::pointer_button(std::uint32_t button, bool pressed) const {
     if (impl_->seat) impl_->seat->pointer_button(button, pressed);
 }
-void SeatShim::pointer_axis(double dx, double dy) {
+void SeatShim::pointer_axis(double dx, double dy) const {
     if (impl_->seat) impl_->seat->pointer_axis(dx, dy);
 }
-void SeatShim::pointer_axis_discrete(std::int32_t dx_steps, std::int32_t dy_steps) {
+void SeatShim::pointer_axis_discrete(std::int32_t dx_steps, std::int32_t dy_steps) const {
     if (impl_->seat) impl_->seat->pointer_axis_discrete(dx_steps, dy_steps);
 }
-void SeatShim::pointer_axis_stop(bool horizontal, bool vertical) {
+void SeatShim::pointer_axis_stop(bool horizontal, bool vertical) const {
     if (impl_->seat) impl_->seat->pointer_axis_stop(horizontal, vertical);
 }
 std::uint64_t SeatShim::cursor_surface() const {
@@ -1143,21 +1143,21 @@ std::int32_t SeatShim::cursor_hotspot_x() const {
 std::int32_t SeatShim::cursor_hotspot_y() const {
     return impl_->seat ? impl_->seat->cursor_hotspot_y() : 0;
 }
-void SeatShim::touch_down(std::uint64_t surface_id, std::int32_t id, double x, double y) {
+void SeatShim::touch_down(std::uint64_t surface_id, std::int32_t id, double x, double y) const {
     if (!impl_->seat) return;
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
     if (s) impl_->seat->touch_down(*s, id, x, y);
 }
-void SeatShim::touch_motion(std::int32_t id, double x, double y) {
+void SeatShim::touch_motion(std::int32_t id, double x, double y) const {
     if (impl_->seat) impl_->seat->touch_motion(id, x, y);
 }
-void SeatShim::touch_up(std::int32_t id) {
+void SeatShim::touch_up(std::int32_t id) const {
     if (impl_->seat) impl_->seat->touch_up(id);
 }
-void SeatShim::touch_frame() {
+void SeatShim::touch_frame() const {
     if (impl_->seat) impl_->seat->touch_frame();
 }
-void SeatShim::touch_cancel() {
+void SeatShim::touch_cancel() const {
     if (impl_->seat) impl_->seat->touch_cancel();
 }
 std::uint64_t SeatShim::touch_focus(std::int32_t id) const {
@@ -1255,7 +1255,7 @@ DEFINE_GLOBAL_SHIM_IMPL(TearingControlManager, TearingControlManager, tearing_co
 DEFINE_GLOBAL_SHIM_IMPL(ContentTypeManager, ContentTypeManager, content_type_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(FifoManager, FifoManager, fifo_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(CommitTimingManager, CommitTimingManager, commit_timing_manager_new)
-DEFINE_GLOBAL_SHIM_IMPL(Presentation, Presentation, presentation_new)
+// Presentation is defined by hand below SceneRendererShim, which links to it.
 DEFINE_GLOBAL_SHIM_IMPL(BackgroundEffectManager, BackgroundEffectManager, background_effect_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(XdgToplevelIconManager, XdgToplevelIconManager, xdg_toplevel_icon_manager_new)
 DEFINE_GLOBAL_SHIM_IMPL(DrmSyncobjManager, DrmSyncobjManager, drm_syncobj_manager_new)
@@ -1485,9 +1485,51 @@ bool SceneOutputShim::gpu_output() const {
     return impl_->state.gpu_output();
 }
 
+// The renderer keeps a plain `Presentation*`, and Rust cannot put a lifetime
+// on that: the renderer is declared before the Display so that it dies last,
+// which makes every global — the Presentation included — die before it. So
+// the link is kept here from both ends, and whichever side goes first severs it.
 struct SceneRendererShim::Impl {
     std::unique_ptr<lm::SceneRenderer> renderer;
+    PresentationShim::Impl* presentation = nullptr;
+
+    void link(PresentationShim::Impl* to);
+    ~Impl() { link(nullptr); }
 };
+
+struct PresentationShim::Impl {
+    std::optional<lm::Presentation> mgr;
+    std::vector<SceneRendererShim::Impl*> renderers;
+
+    // Before `mgr` goes: no renderer may still be pointing at it.
+    ~Impl() {
+        for (SceneRendererShim::Impl* r : renderers) {
+            r->presentation = nullptr;
+            if (r->renderer) r->renderer->set_presentation(nullptr);
+        }
+    }
+};
+PresentationShim::~PresentationShim() = default;
+PresentationShim::PresentationShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+PresentationShim::Impl& PresentationShim::impl() const { return *impl_; }
+std::unique_ptr<PresentationShim> presentation_new(const DisplayShim& display, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        auto r = lm::Presentation::create(*display.impl().display);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<PresentationShim::Impl>();
+        impl->mgr.emplace(std::move(*r));
+        return std::make_unique<PresentationShim>(std::move(impl));
+    } catch (const std::exception& e) { error = e.what(); return nullptr; }
+}
+
+void SceneRendererShim::Impl::link(PresentationShim::Impl* to) {
+    if (presentation != nullptr) std::erase(presentation->renderers, this);
+    presentation = to;
+    if (to != nullptr) to->renderers.push_back(this);
+    if (renderer) renderer->set_presentation(to != nullptr && to->mgr ? &*to->mgr : nullptr);
+}
+
 SceneRendererShim::~SceneRendererShim() = default;
 SceneRendererShim::SceneRendererShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 SceneRendererShim::Impl& SceneRendererShim::impl() const { return *impl_; }
@@ -1510,14 +1552,14 @@ bool SceneRendererShim::gpu_enabled() const {
 rust::String SceneRendererShim::gpu_error() const {
     return impl_->renderer ? to_rust(std::string(impl_->renderer->gpu_error())) : "not initialized";
 }
-bool SceneRendererShim::reset(SceneOutputShim& state, OutputShim& output, std::uint32_t drm_format, rust::String& error) {
+bool SceneRendererShim::reset(SceneOutputShim& state, OutputShim& output, std::uint32_t drm_format, rust::String& error) const {
     if (!impl_->renderer || !output.impl().output) { error = "null object"; return false; }
     auto st = impl_->renderer->reset(state.impl().state, *output.impl().output, drm_format);
     if (!st) { error = to_rust(st.error().message); return false; }
     return true;
 }
 int SceneRendererShim::present(SceneOutputShim& state, OutputShim& output, rust::Slice<const SceneItemRaw> items,
-                             float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) {
+                             float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const {
     if (!impl_->renderer || !output.impl().output) { error = "null object"; return -1; }
     std::vector<lm::SceneItem> scene;
     scene.reserve(items.size());
@@ -1545,20 +1587,16 @@ int SceneRendererShim::present(SceneOutputShim& state, OutputShim& output, rust:
     if (!r) { error = to_rust(r.error().message); return -1; }
     return static_cast<int>(*r);
 }
-void SceneRendererShim::set_presentation(const PresentationShim& presentation) {
-    if (impl_->renderer && presentation.impl().mgr) {
-        impl_->renderer->set_presentation(&*presentation.impl().mgr);
-    }
+void SceneRendererShim::set_presentation(const PresentationShim& presentation) const {
+    impl_->link(&presentation.impl());
 }
-void SceneRendererShim::clear_presentation() {
-    if (impl_->renderer) {
-        impl_->renderer->set_presentation(nullptr);
-    }
+void SceneRendererShim::clear_presentation() const {
+    impl_->link(nullptr);
 }
-void SceneRendererShim::update_cursor() {
+void SceneRendererShim::update_cursor() const {
     if (impl_->renderer) impl_->renderer->update_cursor();
 }
-rust::Vec<std::uint8_t> SceneRendererShim::read_back(SceneOutputShim& state, rust::String& error) {
+rust::Vec<std::uint8_t> SceneRendererShim::read_back(SceneOutputShim& state, rust::String& error) const {
     rust::Vec<std::uint8_t> out;
     if (!impl_->renderer) { error = "not initialized"; return out; }
     auto r = impl_->renderer->read_back(state.impl().state);
@@ -1612,13 +1650,13 @@ OutputLayoutShim::Impl& OutputLayoutShim::impl() const { return *impl_; }
 std::unique_ptr<OutputLayoutShim> output_layout_new() {
     return std::make_unique<OutputLayoutShim>(std::make_unique<OutputLayoutShim::Impl>());
 }
-void OutputLayoutShim::add(OutputShim& output, std::int32_t x, std::int32_t y) {
+void OutputLayoutShim::add(OutputShim& output, std::int32_t x, std::int32_t y) const {
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.add(*out, x, y);
     impl_->watch(out);
 }
-void OutputLayoutShim::add_auto(OutputShim& output) {
+void OutputLayoutShim::add_auto(OutputShim& output) const {
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.add_auto(*out);
@@ -1628,7 +1666,7 @@ Rect OutputLayoutShim::bounds() const {
     const auto b = impl_->layout.bounds();
     return Rect{b.x, b.y, b.width, b.height};
 }
-void OutputLayoutShim::remove(OutputShim& output) {
+void OutputLayoutShim::remove(OutputShim& output) const {
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.remove(*out);
@@ -1647,8 +1685,8 @@ CursorShim::~CursorShim() = default;
 CursorShim::CursorShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 CursorShim::Impl& CursorShim::impl() const { return *impl_; }
 
-std::unique_ptr<CursorShim> cursor_new(SceneRendererShim& renderer, const OutputLayoutShim& layout,
-                                      SeatShim& seat, rust::String& error) {
+std::unique_ptr<CursorShim> cursor_new(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                      const SeatShim& seat, rust::String& error) {
     try {
         if (!renderer.impl().renderer || !seat.impl().seat) { error = "null renderer or seat"; return nullptr; }
         auto impl = std::make_unique<CursorShim::Impl>();
@@ -1684,18 +1722,26 @@ bool CursorShim::position(double& x, double& y) const {
 
 struct FrameShim::Impl {
     std::unique_ptr<lm::Frame> frame;
+    // lm::Frame keeps an Output&, and the output is its backend's: a monitor
+    // unplugged, or the backend dropped, with this frame still in Rust's hands
+    // would leave it dangling. No Rust lifetime can say "until hotplug", so the
+    // frame goes with the output, as SceneOutput's does, and the shim is inert.
+    Conn<lm::OutputDestroy> output_gone;
 };
 FrameShim::~FrameShim() = default;
 FrameShim::FrameShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 FrameShim::Impl& FrameShim::impl() const { return *impl_; }
 
-std::unique_ptr<FrameShim> frame_new(OutputShim& output, VulkanRendererShim& renderer, rust::String& error) {
+std::unique_ptr<FrameShim> frame_new(OutputShim& output, const VulkanRendererShim& renderer, rust::String& error) {
     if (!output.impl().output || !renderer.impl().renderer) {
         error = "null output or renderer";
         return nullptr;
     }
     auto impl = std::make_unique<FrameShim::Impl>();
     impl->frame = std::make_unique<lm::Frame>(*output.impl().output, *renderer.impl().renderer);
+    impl->output_gone = output.impl().output->destroy.connect([raw = impl.get()](lm::OutputDestroy&) {
+        raw->frame.reset();
+    });
     return std::make_unique<FrameShim>(std::move(impl));
 }
 bool FrameShim::reset(std::uint32_t drm_format, rust::String& error) {
@@ -1820,7 +1866,7 @@ SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, 
 // Desktop Protocols
 // ============================================================================
 
-void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, XdgShellShim& shell) {
+void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, const XdgShellShim& shell) {
     if (ftm.impl().mgr && shell.impl().shell) {
         ftm.impl().mgr->track(*shell.impl().shell);
     }

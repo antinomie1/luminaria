@@ -11,7 +11,7 @@ Crate 逐类型公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop` 三个
 Crate 按库的职责分层组织为以下模块：
 
 - **`core`**：`Display`（拥有 `wl_display` 和事件循环）、`EventLoop`、`KeyRouter`、`Error`。
-- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`、`edge`（xdg_toplevel 缩放边缘位）、`DmabufPlane`、`layout_fits`。
+- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`。
 - **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）、`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）。
 - **`protocol`**：Wayland 核心协议全局对象：`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
 - **`gpu`**（对应 `luminaria.gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退）、`SceneOutput`、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
@@ -44,13 +44,13 @@ backend.start()?;
 
 // 3. 注册协议全局对象
 let _compositor = Compositor::new(&display)?;
-let mut xdg_shell = XdgShell::new(&display)?;
+let xdg_shell = XdgShell::new(&display)?;
 xdg_shell.set_bounds(1280, 720);
-let mut seat = Seat::new(&display, "seat0")?;
+let seat = Seat::new(&display, "seat0")?;
 seat.set_capabilities(true, true, false);
 
 // 4. 配置屏幕布局
-let mut layout = OutputLayout::new()?;
+let layout = OutputLayout::new()?;
 layout.add(&mut output, 0, 0);
 let _out_global = OutputGlobal::new(&display, 1280, 720, "HEADLESS-1")?;
 
@@ -82,15 +82,18 @@ LUMINARIA_BACKEND=headless LUMINARIA_EXIT_MS=500 cargo run --example minimal  # 
 
 1. **单线程约束（Single-Threaded）**：
    底层 `libwayland-server` 是单线程事件循环架构，所有涉及 Wayland 对象、后端输出与渲染器的操作必须在同一个线程中运行。所有 FFI 包装类型均未实现 `Send` 与 `Sync`。
-2. **析构与生命周期顺序**：
-   - 依赖项的生命周期必须符合底层库规则：**Renderer 必须比 Display 存活更久**；**Display 必须比协议 Global 存活更久**（Global 析构注销其全局接口，Display 析构时断开所有客户端连接）。
-   - 在函数局部变量中声明时，利用 Rust 局部变量的逆序析构（先声明的后析构）：
+2. **析构顺序由借用检查器保证**：
+   - C++ 对象之间的引用都写进了 Rust 类型的生命周期参数：协议 global、后端和 `Session` 借用 `Display`（`Seat<'d>`、`HeadlessBackend<'d>`……），`Cursor<'a>` 借用 renderer、layout 和 seat，`SceneOutput<'r>` 借用渲染它的 `SceneRenderer`，等等。被借的一方先 drop 就**编译不过**，不再是运行时的 use-after-free。完整清单见 [API 文档](docs/api.md) 的"借用关系"一节。
+   - 会被别的对象借住的类型（`Seat`、`XdgShell`、`OutputLayout`、`SceneRenderer`、`Session`）的方法都取 `&self`，所以借出之后照样能用。
+   - 局部变量按声明的逆序析构，被借的先声明即可。**Renderer 比 Display 活得久**这条仍然写得出来：`SceneRenderer` 不借任何东西，放在最前面声明：
      ```rust
-     let renderer = SceneRenderer::new(&opts)?; // 先声明，最后析构
-     let display = Display::new()?;              // 其次声明
-     let compositor = Compositor::new(&display)?;// 最后声明，最先析构
+     let renderer = SceneRenderer::new(&opts)?;     // 先声明，最后析构
+     let display = Display::new()?;
+     let seat = Seat::new(&display, "seat0")?;       // 借 display
+     let layout = OutputLayout::new()?;
+     let cursor = Cursor::new(&renderer, &layout, &seat)?; // 借三者，最先析构
      ```
-   - 在结构体中持有多个组件时，字段按声明顺序正序析构，因此应按依赖关系排列字段。
+   - 结构体不能同时持有被借者和借用者（那是自引用）。把被借的对象放在外层（`main` 的局部变量，或一个只装它们的结构体），再让持有 `Cursor<'a>` 之类的结构体借用它们。
 3. **世代标识符（Generational SurfaceId）**：
    跨事件调度或存储时不直接持有裸指针，而是使用 `SurfaceId`。`SurfaceId` 包含槽位索引与单调自增的世代号；当表面销毁时，该 ID 自动失效，不会发生悬垂指针或复用误判。
 4. **异常与错误安全**：

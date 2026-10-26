@@ -218,10 +218,10 @@ pub(crate) mod ffi {
 
         type SessionShim;
         fn session_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SessionShim>;
-        fn switch_to(self: Pin<&mut SessionShim>, vt: i32, error: &mut String) -> bool;
+        fn switch_to(self: &SessionShim, vt: i32, error: &mut String) -> bool;
         fn active(self: &SessionShim) -> bool;
         fn seat_name(self: &SessionShim) -> String;
-        fn next_activity(self: Pin<&mut SessionShim>) -> u32;
+        fn next_activity(self: &SessionShim) -> u32;
 
         type DrmBackendShim;
         fn drm_backend_new(display: &DisplayShim, device: &str, session: &SessionShim, error: &mut String) -> UniquePtr<DrmBackendShim>;
@@ -264,40 +264,40 @@ pub(crate) mod ffi {
 
         type XdgShellShim;
         fn xdg_shell_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgShellShim>;
-        fn set_bounds(self: Pin<&mut XdgShellShim>, width: i32, height: i32);
-        fn next_toplevel_event(self: Pin<&mut XdgShellShim>, out: &mut ToplevelEventRaw) -> bool;
-        fn toplevel_configure(self: Pin<&mut XdgShellShim>, surface_id: u64, width: i32, height: i32);
-        fn toplevel_set_maximized(self: Pin<&mut XdgShellShim>, surface_id: u64, on: bool);
-        fn toplevel_set_activated(self: Pin<&mut XdgShellShim>, surface_id: u64, on: bool);
-        fn toplevel_close(self: Pin<&mut XdgShellShim>, surface_id: u64);
+        fn set_bounds(self: &XdgShellShim, width: i32, height: i32);
+        fn next_toplevel_event(self: &XdgShellShim, out: &mut ToplevelEventRaw) -> bool;
+        fn toplevel_configure(self: &XdgShellShim, surface_id: u64, width: i32, height: i32);
+        fn toplevel_set_maximized(self: &XdgShellShim, surface_id: u64, on: bool);
+        fn toplevel_set_activated(self: &XdgShellShim, surface_id: u64, on: bool);
+        fn toplevel_close(self: &XdgShellShim, surface_id: u64);
 
         type SeatShim;
         fn seat_new(display: &DisplayShim, name: &str, error: &mut String) -> UniquePtr<SeatShim>;
-        fn set_capabilities(self: Pin<&mut SeatShim>, keyboard: bool, pointer: bool, touch: bool);
-        fn set_keymap(self: Pin<&mut SeatShim>, xkb_text: &str) -> bool;
+        fn set_capabilities(self: &SeatShim, keyboard: bool, pointer: bool, touch: bool);
+        fn set_keymap(self: &SeatShim, xkb_text: &str) -> bool;
         fn keymap(self: &SeatShim) -> String;
-        fn set_keyboard_focus(self: Pin<&mut SeatShim>, surface_id: u64);
+        fn set_keyboard_focus(self: &SeatShim, surface_id: u64);
         fn keyboard_focus(self: &SeatShim) -> u64;
-        fn notify_key(self: Pin<&mut SeatShim>, key: u32, pressed: bool);
-        fn notify_modifiers(self: Pin<&mut SeatShim>, depressed: u32, latched: u32, locked: u32, group: u32);
-        fn pointer_enter(self: Pin<&mut SeatShim>, surface_id: u64, sx: f64, sy: f64);
-        fn pointer_clear_focus(self: Pin<&mut SeatShim>);
+        fn notify_key(self: &SeatShim, key: u32, pressed: bool);
+        fn notify_modifiers(self: &SeatShim, depressed: u32, latched: u32, locked: u32, group: u32);
+        fn pointer_enter(self: &SeatShim, surface_id: u64, sx: f64, sy: f64);
+        fn pointer_clear_focus(self: &SeatShim);
         fn pointer_focus(self: &SeatShim) -> u64;
         fn pointer_grab(self: &SeatShim) -> u64;
-        fn pointer_motion(self: Pin<&mut SeatShim>, sx: f64, sy: f64);
-        fn pointer_button(self: Pin<&mut SeatShim>, button: u32, pressed: bool);
-        fn pointer_axis(self: Pin<&mut SeatShim>, dx: f64, dy: f64);
-        fn pointer_axis_discrete(self: Pin<&mut SeatShim>, dx_steps: i32, dy_steps: i32);
-        fn pointer_axis_stop(self: Pin<&mut SeatShim>, horizontal: bool, vertical: bool);
+        fn pointer_motion(self: &SeatShim, sx: f64, sy: f64);
+        fn pointer_button(self: &SeatShim, button: u32, pressed: bool);
+        fn pointer_axis(self: &SeatShim, dx: f64, dy: f64);
+        fn pointer_axis_discrete(self: &SeatShim, dx_steps: i32, dy_steps: i32);
+        fn pointer_axis_stop(self: &SeatShim, horizontal: bool, vertical: bool);
         fn cursor_surface(self: &SeatShim) -> u64;
         fn cursor_hidden(self: &SeatShim) -> bool;
         fn cursor_hotspot_x(self: &SeatShim) -> i32;
         fn cursor_hotspot_y(self: &SeatShim) -> i32;
-        fn touch_down(self: Pin<&mut SeatShim>, surface_id: u64, id: i32, x: f64, y: f64);
-        fn touch_motion(self: Pin<&mut SeatShim>, id: i32, x: f64, y: f64);
-        fn touch_up(self: Pin<&mut SeatShim>, id: i32);
-        fn touch_frame(self: Pin<&mut SeatShim>);
-        fn touch_cancel(self: Pin<&mut SeatShim>);
+        fn touch_down(self: &SeatShim, surface_id: u64, id: i32, x: f64, y: f64);
+        fn touch_motion(self: &SeatShim, id: i32, x: f64, y: f64);
+        fn touch_up(self: &SeatShim, id: i32);
+        fn touch_frame(self: &SeatShim);
+        fn touch_cancel(self: &SeatShim);
         fn touch_focus(self: &SeatShim, id: i32) -> u64;
 
         type LayerShellShim;
@@ -406,26 +406,26 @@ pub(crate) mod ffi {
         fn scene_renderer_new(has_drm_device: bool, drm_device: &DrmDeviceId, error: &mut String) -> UniquePtr<SceneRendererShim>;
         fn gpu_enabled(self: &SceneRendererShim) -> bool;
         fn gpu_error(self: &SceneRendererShim) -> String;
-        fn reset(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
-        fn present(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, items: &[SceneItemRaw], bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
-        fn set_presentation(self: Pin<&mut SceneRendererShim>, presentation: &PresentationShim);
-        fn clear_presentation(self: Pin<&mut SceneRendererShim>);
-        fn update_cursor(self: Pin<&mut SceneRendererShim>);
-        fn read_back(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, error: &mut String) -> Vec<u8>;
+        fn reset(self: &SceneRendererShim, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
+        fn present(self: &SceneRendererShim, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, items: &[SceneItemRaw], bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
+        fn set_presentation(self: &SceneRendererShim, presentation: &PresentationShim);
+        fn clear_presentation(self: &SceneRendererShim);
+        fn update_cursor(self: &SceneRendererShim);
+        fn read_back(self: &SceneRendererShim, state: Pin<&mut SceneOutputShim>, error: &mut String) -> Vec<u8>;
         // Only `raw-vulkan` reads these.
         #[allow(dead_code)]
         fn vulkan_handles(self: &SceneRendererShim, out: &mut VulkanHandlesRaw) -> bool;
 
         type OutputLayoutShim;
         fn output_layout_new() -> UniquePtr<OutputLayoutShim>;
-        fn add(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>, x: i32, y: i32);
-        fn add_auto(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>);
+        fn add(self: &OutputLayoutShim, output: Pin<&mut OutputShim>, x: i32, y: i32);
+        fn add_auto(self: &OutputLayoutShim, output: Pin<&mut OutputShim>);
         fn bounds(self: &OutputLayoutShim) -> Rect;
-        fn remove(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>);
+        fn remove(self: &OutputLayoutShim, output: Pin<&mut OutputShim>);
         fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
 
         type CursorShim;
-        fn cursor_new(renderer: Pin<&mut SceneRendererShim>, layout: &OutputLayoutShim, seat: Pin<&mut SeatShim>, error: &mut String) -> UniquePtr<CursorShim>;
+        fn cursor_new(renderer: &SceneRendererShim, layout: &OutputLayoutShim, seat: &SeatShim, error: &mut String) -> UniquePtr<CursorShim>;
         fn move_to(self: Pin<&mut CursorShim>, x: f64, y: f64, bounds: Rect) -> bool;
         fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64, bounds: Rect) -> bool;
         fn leave(self: Pin<&mut CursorShim>);
@@ -433,7 +433,7 @@ pub(crate) mod ffi {
         fn position(self: &CursorShim, x: &mut f64, y: &mut f64) -> bool;
 
         type FrameShim;
-        fn frame_new(output: Pin<&mut OutputShim>, renderer: Pin<&mut VulkanRendererShim>, error: &mut String) -> UniquePtr<FrameShim>;
+        fn frame_new(output: Pin<&mut OutputShim>, renderer: &VulkanRendererShim, error: &mut String) -> UniquePtr<FrameShim>;
         fn reset(self: Pin<&mut FrameShim>, drm_format: u32, error: &mut String) -> bool;
         fn begin(self: Pin<&mut FrameShim>, vx: i32, vy: i32, vw: i32, vh: i32);
         fn place_rect(self: Pin<&mut FrameShim>, x: i32, y: i32, width: i32, height: i32, r: f32, g: f32, b: f32, a: f32);
@@ -457,7 +457,7 @@ pub(crate) mod ffi {
         fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
 
         // Desktop Protocols
-        fn foreign_toplevel_track(ftm: Pin<&mut ForeignToplevelManagerShim>, shell: Pin<&mut XdgShellShim>);
+        fn foreign_toplevel_track(ftm: Pin<&mut ForeignToplevelManagerShim>, shell: &XdgShellShim);
 
         fn workspace_manager_create_group(wm: Pin<&mut WorkspaceManagerShim>) -> u32;
         fn workspace_manager_create_workspace(wm: Pin<&mut WorkspaceManagerShim>, group: u32, name: &str) -> u32;

@@ -68,7 +68,7 @@ fn output_identity_and_liveness() {
     assert!(a.is_alive() && b.is_alive());
     assert!(!a.take_mode_changed());
 
-    let mut layout = OutputLayout::new().unwrap();
+    let layout = OutputLayout::new().unwrap();
     layout.add_auto(&mut a);
     layout.add_auto(&mut b);
     assert_eq!(layout.output_box(&b).x, 640);

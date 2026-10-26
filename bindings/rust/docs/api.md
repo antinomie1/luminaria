@@ -20,6 +20,43 @@ Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与�
 
 ---
 
+## 借用关系：析构顺序由编译器检查
+
+C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLayout&`、`Seat&`，每个 global 都挂在
+`wl_display` 上。绑定把这些关系写成 Rust 的生命周期参数，被引用的一方先 drop 就编译不过：
+
+| 类型 | 借用的对象 |
+|---|---|
+| 所有协议 global（`Compositor<'d>`、`Seat<'d>`、`XdgShell<'d>`、`Presentation<'d>`……）、`HeadlessBackend<'d>`、`WaylandBackend<'d>`、`Session<'d>`、`EventLoop<'d>` | `Display` |
+| `DrmBackend<'a>`、`LibinputBackend<'a>` | `Display`，以及传入的 `Session` |
+| `DataDeviceManager<'a>`、`PrimarySelectionManager<'a>`、`RelativePointerManager<'a>`、`PointerConstraints<'a>`、`TextInputManager<'a>` | `Display`、`Seat` |
+| `DataControlManager<'a>` | `Display`、`DataDeviceManager` |
+| `InputMethodManager<'a>` | `Display`、`Seat`、`TextInputManager` |
+| `OutputManager<'a>` | `Display`、`OutputLayout` |
+| `ForeignToplevelManager<'d>` | `Display`；`track(&shell)` 之后还有那个 `XdgShell` |
+| `LinuxDmabuf<'a>`、`DesktopGlobals<'a>` | `Display`，以及传入的 `VulkanRenderer` |
+| `Cursor<'a>` | `SceneRenderer`、`OutputLayout`、`Seat` |
+| `SceneOutput<'r>` | 第一次 `reset()` / `present()` 它的 `SceneRenderer`（它缓存该渲染器的纹理与渲染目标） |
+| `Frame<'r>` | `VulkanRenderer` |
+
+几点说明：
+
+- **借用是共享借用。** 被借的类型——`Seat`、`XdgShell`、`OutputLayout`、`SceneRenderer`、`Session`——方法都取
+  `&self`，借出之后照常使用。这是安全的：包装类型都不是 `Send`/`Sync`，C++ 从不回调 Rust，也不把内部引用交给 Rust。
+- **只写 lifetime 不够，还要 `Drop`。** 没有 `Drop` 的结构体，dropck 允许它在借用结束后才被隐式析构，
+  `drop(seat)` 放在 `Cursor` 之前照样能编译——而 `Cursor` 的析构恰好要碰那个 `Seat`。所以每个带 lifetime 的包装都
+  带一个有 `Drop` 的标记字段。`Cursor` 的文档里有一个 `compile_fail` doctest 守着这一点。
+- **`SceneRenderer` 不借任何东西**，所以"renderer 比 Display 活得久"仍然写得出来：最先声明它即可。
+  `set_presentation(Some(&p))` 因此没有借用：renderer 一般比 `Presentation` 活得久，这条链接由 shim 从两头维护，
+  哪边先死哪边负责断开，之后反馈只是不再发送。
+- **`Output` 不进生命周期。** 真正的 `lm::Output` 归后端所有，显示器随时可能被拔掉，这不是 Rust 的作用域能表达的。
+  所以和输出有关的都在运行时兜底：`Output` 自己变成空操作（`is_alive()` 为 false）；`OutputLayout` 与 `SceneOutput`
+  自动解除绑定；`DirectScanout` 不再调用它；`Frame` 随输出一起销毁，之后 `reset` / `submit` 返回错误、其余方法为空操作。
+- **结构体不能同时装被借者和借用者**（自引用）。把被借的放在外层——`main` 的局部变量，或一个只装它们的结构体——
+  再让装 `Cursor<'a>`、`SceneOutput<'a>` 的结构体借用它们，如 `examples/minimal.rs` 的 `Screen<'a>`、`Backend<'a>`。
+
+---
+
 ## 1. `core` 模块
 
 ### `Display`
@@ -39,7 +76,7 @@ let socket_name = display.add_socket_auto()?; // 例如 "wayland-0"
 // 3. 启用系统内置的 wl_shm 共享内存协议
 display.init_shm()?;
 
-// 4. 获取事件循环句柄（非拥有型）
+// 4. 获取事件循环句柄（非拥有型，借用 display：EventLoop<'_>）
 let event_loop = display.event_loop();
 
 // 5. 驱动事件分发（None 为阻塞等待，Some(0) 为立即非阻塞轮询）
@@ -123,6 +160,10 @@ let keysym = keymap.keysym(1); // evdev code 1 (KEY_ESC) -> XKB keysym
 let (depressed, latched, locked, group) = keymap.modifiers();
 ```
 
+### `Pixel`
+一个 RGBA8 像素，字节顺序与 C++ `luminaria::Pixel` 相同（`r, g, b, a`），也就是
+`SceneRenderer::read_back()` 返回、`Output::commit_frame()` 接收的缓冲区格式。
+
 ---
 
 ## 3. `backend` 模块
@@ -175,7 +216,7 @@ let (depressed, latched, locked, group) = keymap.modifiers();
 ### `Seat`
 发布 `wl_seat`，控制键盘焦点、鼠标光标、按键与触摸：
 ```rust
-let mut seat = Seat::new(&display, "seat0")?;
+let seat = Seat::new(&display, "seat0")?;
 seat.set_capabilities(true, true, true); // keyboard, pointer, touch
 
 // 键盘控制
@@ -199,7 +240,7 @@ seat.touch_frame();
 ### `XdgShell`
 发布 `xdg_wm_base`（支持 toplevels 和 popups）：
 ```rust
-let mut xdg_shell = XdgShell::new(&display)?;
+let xdg_shell = XdgShell::new(&display)?;
 xdg_shell.set_bounds(1920, 1080);
 ```
 
@@ -248,8 +289,8 @@ let _text_input      = TextInputManager::new(&display, &seat)?;
 use luminaria::gpu::{SceneRenderer, SceneOutput, VulkanOptions, SceneOutcome};
 use luminaria::util::Color;
 
-let mut renderer = SceneRenderer::new(&VulkanOptions::default())?;
-let mut state = SceneOutput::new();
+let renderer = SceneRenderer::new(&VulkanOptions::default())?;
+let mut state = SceneOutput::new(); // 第一次 reset/present 后借用 renderer
 
 // 在输出模式变更或初始化时重置缓冲区绑定
 renderer.reset(&mut state, &mut output, 0x34325241 /* DRM_FORMAT_ARGB8888 */)?;
@@ -264,9 +305,14 @@ match outcome {
 }
 ```
 
+### `Cursor`
+指针及其图像：主题、cursor-shape、客户端精灵、KMS 光标平面。`Cursor::new(&renderer, &layout, &seat)?`
+借用这三者直到它 drop（见上文"借用关系"）。`move_to` / `move_by` / `leave` / `position` / `refresh`。
+
 ### `Frame`
-逐输出的即时模式 GPU 帧账本。如果需要手动绕过 `SceneRenderer` 直接驱动 Vulkan 帧绘制，可使用 `Frame`：
-- `Frame::new(&mut output, &mut vulkan)?`
+逐输出的即时模式 GPU 帧账本。如果需要手动绕过 `SceneRenderer` 直接驱动 Vulkan 帧绘制，可使用 `Frame`。
+它借用 `VulkanRenderer`；输出被销毁时它随之失效（`reset` / `submit` 返回错误）：
+- `Frame::new(&mut output, &vulkan)?`
 - `frame.begin(viewport)`
 - `frame.place_rect(rect, color)`
 - `frame.submit(background)`
@@ -284,7 +330,7 @@ match outcome {
 - **`ForeignToplevelManager`**：为外部任务栏（waybar 等）提供窗口列表同步与激活事件响应：
   ```rust
   let mut ftm = ForeignToplevelManager::new(&display)?;
-  ftm.track(&mut xdg_shell); // 自动镜像跟踪 xdg_shell 内部所有窗口生命周期
+  ftm.track(&xdg_shell); // 自动镜像跟踪 xdg_shell 内部所有窗口生命周期；此后 xdg_shell 被 ftm 借住
   ```
 - **`WorkspaceManager`**：为分页器提供 `ext-workspace` 支持：
   ```rust
@@ -307,7 +353,7 @@ match outcome {
 ```rust
 use luminaria::shell::OutputLayout;
 
-let mut layout = OutputLayout::new()?;
+let layout = OutputLayout::new()?;
 layout.add(&mut output1, 0, 0);
 layout.add(&mut output2, 1920, 0); // 拼接在右侧
 
@@ -373,13 +419,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. 注册协议接口
     let _compositor = Compositor::new(&display)?;
-    let mut xdg_shell = XdgShell::new(&display)?;
+    let xdg_shell = XdgShell::new(&display)?;
     xdg_shell.set_bounds(1024, 768);
-    let mut seat = Seat::new(&display, "seat0")?;
+    let seat = Seat::new(&display, "seat0")?;
     seat.set_capabilities(true, true, false);
 
     // 4. 多屏坐标排版
-    let mut layout = OutputLayout::new()?;
+    let layout = OutputLayout::new()?;
     layout.add(&mut output, 0, 0);
 
     // 5. 向客户端发布输出全局描述符

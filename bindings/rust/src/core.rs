@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::fmt;
+use std::marker::PhantomData;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
 
@@ -18,6 +19,26 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// What a wrapper keeps borrowed for as long as it lives: the C++ object behind
+/// it holds a reference or pointer to whatever `'a` was taken from.
+///
+/// The `Drop` impl is the point. Without one, dropck lets a value outlive the
+/// borrow in its type as long as nothing *uses* it afterwards, and the implicit
+/// drop at the end of a scope does not count as a use — so `drop(seat)` before
+/// a `Cursor` that holds the C++ `Seat&` would compile. With it, the borrow has
+/// to last until the wrapper is dropped.
+pub(crate) struct Holds<'a>(PhantomData<&'a ()>);
+
+impl Holds<'_> {
+    pub(crate) fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl Drop for Holds<'_> {
+    fn drop(&mut self) {}
+}
 
 /// The Wayland display server context. Owns `wl_display` and the main event loop.
 pub struct Display {
@@ -118,10 +139,11 @@ impl Display {
         self.raw.raw_display() as *mut c_void
     }
 
-    /// Get a non-owning view of the event loop.
-    pub fn event_loop(&self) -> EventLoop {
+    /// Get a non-owning view of the event loop, valid while this `Display` is.
+    pub fn event_loop(&self) -> EventLoop<'_> {
         EventLoop {
             fd: self.raw.fd(),
+            _display: PhantomData,
         }
     }
 }
@@ -138,26 +160,30 @@ impl AsFd for Display {
     }
 }
 
-/// A non-owning handle to the event loop.
+/// A non-owning handle to the event loop. It borrows the [`Display`] that owns
+/// the loop, so its fd cannot be used after the loop is gone.
 #[derive(Clone, Copy)]
-pub struct EventLoop {
+pub struct EventLoop<'d> {
     fd: RawFd,
+    _display: PhantomData<&'d Display>,
 }
 
-impl EventLoop {
+impl EventLoop<'_> {
     pub fn fd(&self) -> RawFd {
         self.fd
     }
 }
 
-impl AsRawFd for EventLoop {
+impl AsRawFd for EventLoop<'_> {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
     }
 }
 
-impl AsFd for EventLoop {
+impl AsFd for EventLoop<'_> {
     fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the Display owns the loop fd and keeps it open until it
+        // drops, which the `'d` borrow of it outlasts.
         unsafe { BorrowedFd::borrow_raw(self.fd) }
     }
 }

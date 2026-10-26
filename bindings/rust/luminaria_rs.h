@@ -197,11 +197,11 @@ public:
     SessionShim(const SessionShim&) = delete;
     SessionShim& operator=(const SessionShim&) = delete;
 
-    bool switch_to(int vt, rust::String& error);
+    bool switch_to(int vt, rust::String& error) const;
     bool active() const;
     rust::String seat_name() const;
     // 0 = nothing queued, 1 = became inactive, 2 = became active.
-    std::uint32_t next_activity();
+    std::uint32_t next_activity() const;
 
     struct Impl;
     Impl& impl() const;
@@ -311,12 +311,12 @@ public:
     XdgShellShim(const XdgShellShim&) = delete;
     XdgShellShim& operator=(const XdgShellShim&) = delete;
 
-    void set_bounds(std::int32_t width, std::int32_t height);
-    bool next_toplevel_event(ToplevelEventRaw& out);
-    void toplevel_configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height);
-    void toplevel_set_maximized(std::uint64_t surface_id, bool on);
-    void toplevel_set_activated(std::uint64_t surface_id, bool on);
-    void toplevel_close(std::uint64_t surface_id);
+    void set_bounds(std::int32_t width, std::int32_t height) const;
+    bool next_toplevel_event(ToplevelEventRaw& out) const;
+    void toplevel_configure(std::uint64_t surface_id, std::int32_t width, std::int32_t height) const;
+    void toplevel_set_maximized(std::uint64_t surface_id, bool on) const;
+    void toplevel_set_activated(std::uint64_t surface_id, bool on) const;
+    void toplevel_close(std::uint64_t surface_id) const;
 
     struct Impl;
     Impl& impl() const;
@@ -333,36 +333,36 @@ public:
     SeatShim(const SeatShim&) = delete;
     SeatShim& operator=(const SeatShim&) = delete;
 
-    void set_capabilities(bool keyboard, bool pointer, bool touch);
-    bool set_keymap(rust::Str xkb_text);
+    void set_capabilities(bool keyboard, bool pointer, bool touch) const;
+    bool set_keymap(rust::Str xkb_text) const;
     rust::String keymap() const;
 
-    void set_keyboard_focus(std::uint64_t surface_id);
+    void set_keyboard_focus(std::uint64_t surface_id) const;
     std::uint64_t keyboard_focus() const;
-    void notify_key(std::uint32_t key, bool pressed);
+    void notify_key(std::uint32_t key, bool pressed) const;
     void notify_modifiers(std::uint32_t depressed, std::uint32_t latched,
-                          std::uint32_t locked, std::uint32_t group);
+                          std::uint32_t locked, std::uint32_t group) const;
 
-    void pointer_enter(std::uint64_t surface_id, double sx, double sy);
-    void pointer_clear_focus();
+    void pointer_enter(std::uint64_t surface_id, double sx, double sy) const;
+    void pointer_clear_focus() const;
     std::uint64_t pointer_focus() const;
     std::uint64_t pointer_grab() const;
-    void pointer_motion(double sx, double sy);
-    void pointer_button(std::uint32_t button, bool pressed);
-    void pointer_axis(double dx, double dy);
-    void pointer_axis_discrete(std::int32_t dx_steps, std::int32_t dy_steps);
-    void pointer_axis_stop(bool horizontal, bool vertical);
+    void pointer_motion(double sx, double sy) const;
+    void pointer_button(std::uint32_t button, bool pressed) const;
+    void pointer_axis(double dx, double dy) const;
+    void pointer_axis_discrete(std::int32_t dx_steps, std::int32_t dy_steps) const;
+    void pointer_axis_stop(bool horizontal, bool vertical) const;
 
     std::uint64_t cursor_surface() const;
     bool cursor_hidden() const;
     std::int32_t cursor_hotspot_x() const;
     std::int32_t cursor_hotspot_y() const;
 
-    void touch_down(std::uint64_t surface_id, std::int32_t id, double x, double y);
-    void touch_motion(std::int32_t id, double x, double y);
-    void touch_up(std::int32_t id);
-    void touch_frame();
-    void touch_cancel();
+    void touch_down(std::uint64_t surface_id, std::int32_t id, double x, double y) const;
+    void touch_motion(std::int32_t id, double x, double y) const;
+    void touch_up(std::int32_t id) const;
+    void touch_frame() const;
+    void touch_cancel() const;
     std::uint64_t touch_focus(std::int32_t id) const;
 
     struct Impl;
@@ -590,13 +590,13 @@ public:
 
     bool gpu_enabled() const;
     rust::String gpu_error() const;
-    bool reset(SceneOutputShim& state, OutputShim& output, std::uint32_t drm_format, rust::String& error);
+    bool reset(SceneOutputShim& state, OutputShim& output, std::uint32_t drm_format, rust::String& error) const;
     int present(SceneOutputShim& state, OutputShim& output, rust::Slice<const SceneItemRaw> items,
-                float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error);
-    void set_presentation(const PresentationShim& presentation);
-    void clear_presentation();
-    void update_cursor();
-    rust::Vec<std::uint8_t> read_back(SceneOutputShim& state, rust::String& error);
+                float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const;
+    void set_presentation(const PresentationShim& presentation) const;
+    void clear_presentation() const;
+    void update_cursor() const;
+    rust::Vec<std::uint8_t> read_back(SceneOutputShim& state, rust::String& error) const;
     bool vulkan_handles(VulkanHandlesRaw& out) const;
 
     struct Impl;
@@ -614,9 +614,9 @@ public:
     OutputLayoutShim(const OutputLayoutShim&) = delete;
     OutputLayoutShim& operator=(const OutputLayoutShim&) = delete;
 
-    void add(OutputShim& output, std::int32_t x, std::int32_t y);
-    void add_auto(OutputShim& output);
-    void remove(OutputShim& output);
+    void add(OutputShim& output, std::int32_t x, std::int32_t y) const;
+    void add_auto(OutputShim& output) const;
+    void remove(OutputShim& output) const;
     Rect bounds() const;
     Rect output_box(const OutputShim& output) const;
 
@@ -648,8 +648,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<CursorShim> cursor_new(SceneRendererShim& renderer, const OutputLayoutShim& layout,
-                                      SeatShim& seat, rust::String& error);
+std::unique_ptr<CursorShim> cursor_new(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                      const SeatShim& seat, rust::String& error);
 
 class FrameShim {
 public:
@@ -671,7 +671,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<FrameShim> frame_new(OutputShim& output, VulkanRendererShim& renderer, rust::String& error);
+std::unique_ptr<FrameShim> frame_new(OutputShim& output, const VulkanRendererShim& renderer, rust::String& error);
 
 class CpuCompositorShim {
 public:
@@ -721,7 +721,7 @@ SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, 
 // Desktop Protocols
 // ============================================================================
 
-void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, XdgShellShim& shell);
+void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, const XdgShellShim& shell);
 
 std::uint32_t workspace_manager_create_group(WorkspaceManagerShim& wm);
 std::uint32_t workspace_manager_create_workspace(WorkspaceManagerShim& wm, std::uint32_t group, rust::Str name);

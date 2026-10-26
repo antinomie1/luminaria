@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::pin::Pin;
 
 use crate::backend::Output;
-use crate::core::{Display, Error};
+use crate::core::{Display, Error, Holds};
 use crate::ffi;
 use crate::protocol::{Presentation, Seat, SurfaceId};
 use crate::shell::{OutputLayout, SceneItem};
@@ -113,14 +113,16 @@ impl VulkanRenderer {
     }
 }
 
-/// The `zwp_linux_dmabuf_v1` global.
-pub struct LinuxDmabuf {
+/// The `zwp_linux_dmabuf_v1` global. Borrows the [`Display`], and the
+/// [`VulkanRenderer`] it advertises formats from and imports into.
+pub struct LinuxDmabuf<'a> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::LinuxDmabufShim>,
+    _borrows: Holds<'a>,
 }
 
-impl LinuxDmabuf {
-    pub fn new(display: &Display, renderer: Option<&VulkanRenderer>) -> Result<Self, Error> {
+impl<'a> LinuxDmabuf<'a> {
+    pub fn new(display: &'a Display, renderer: Option<&'a VulkanRenderer>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = if let Some(vk) = renderer {
             ffi::linux_dmabuf_new(&display.raw, &vk.raw, &mut err)
@@ -130,56 +132,64 @@ impl LinuxDmabuf {
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 }
 
 /// The `wp_linux_drm_syncobj_manager_v1` global for explicit synchronization.
-pub struct DrmSyncobjManager {
+pub struct DrmSyncobjManager<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::DrmSyncobjManagerShim>,
+    _display: Holds<'d>,
 }
 
-impl DrmSyncobjManager {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> DrmSyncobjManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::drm_syncobj_manager_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
 
 /// The screencopy protocol manager (`zwlr_screencopy_manager_v1` and `ext_image_copy_capture_manager_v1`).
-pub struct ScreencopyManager {
+pub struct ScreencopyManager<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::ScreencopyManagerShim>,
+    _display: Holds<'d>,
 }
 
-impl ScreencopyManager {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> ScreencopyManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::screencopy_manager_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
 
 /// Per-output scene rendering state (GPU ledger or CPU scratch).
-pub struct SceneOutput {
+///
+/// The first [`SceneRenderer::reset`] or [`SceneRenderer::present`] binds it to
+/// that renderer, whose textures and render targets it then caches, so `'r` is
+/// the renderer's borrow: the renderer cannot drop while this does not.
+pub struct SceneOutput<'r> {
     pub(crate) raw: cxx::UniquePtr<ffi::SceneOutputShim>,
+    _renderer: Holds<'r>,
 }
 
-impl SceneOutput {
+impl SceneOutput<'_> {
     pub fn new() -> Self {
         Self {
             raw: ffi::scene_output_new(),
+            _renderer: Holds::new(),
         }
     }
 
@@ -188,7 +198,7 @@ impl SceneOutput {
     }
 }
 
-impl Default for SceneOutput {
+impl Default for SceneOutput<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -215,6 +225,10 @@ impl SceneOutcome {
 }
 
 /// Unified scene presenter over Vulkan GPU and CPU fallback.
+///
+/// [`Cursor`] and every [`SceneOutput`] keep it borrowed while they live, so
+/// its methods take `&self`. It borrows nothing itself, which is what lets it
+/// be declared before the [`Display`] and so be the last thing to go.
 pub struct SceneRenderer {
     pub(crate) raw: cxx::UniquePtr<ffi::SceneRendererShim>,
 }
@@ -231,10 +245,6 @@ impl SceneRenderer {
         }
     }
 
-    fn pin(&mut self) -> Pin<&mut ffi::SceneRendererShim> {
-        self.raw.pin_mut()
-    }
-
     pub fn gpu_enabled(&self) -> bool {
         self.raw.gpu_enabled()
     }
@@ -243,9 +253,11 @@ impl SceneRenderer {
         self.raw.gpu_error()
     }
 
-    pub fn reset(
-        &mut self,
-        state: &mut SceneOutput,
+    /// Bind `state` to `output` and to this renderer, and size its render
+    /// targets for the output's current mode.
+    pub fn reset<'r>(
+        &'r self,
+        state: &mut SceneOutput<'r>,
         output: &mut Output,
         drm_format: u32,
     ) -> Result<(), Error> {
@@ -253,7 +265,7 @@ impl SceneRenderer {
         let mut s_pin = state.raw.pin_mut();
         let mut o_pin = output.raw.pin_mut();
         if self
-            .pin()
+            .raw
             .reset(s_pin.as_mut(), o_pin.as_mut(), drm_format, &mut err)
         {
             Ok(())
@@ -262,9 +274,9 @@ impl SceneRenderer {
         }
     }
 
-    pub fn present(
-        &mut self,
-        state: &mut SceneOutput,
+    pub fn present<'r>(
+        &'r self,
+        state: &mut SceneOutput<'r>,
         output: &mut Output,
         items: &[SceneItem],
         background: Color,
@@ -273,7 +285,7 @@ impl SceneRenderer {
         let mut err = String::new();
         let mut s_pin = state.raw.pin_mut();
         let mut o_pin = output.raw.pin_mut();
-        let res = self.pin().present(
+        let res = self.raw.present(
             s_pin.as_mut(),
             o_pin.as_mut(),
             &raw_items,
@@ -290,16 +302,20 @@ impl SceneRenderer {
         }
     }
 
-    pub fn set_presentation(&mut self, presentation: Option<&Presentation>) {
+    /// Where presentation feedback goes. The renderer usually outlives the
+    /// global (it is declared before the `Display`), so there is no borrow
+    /// here: a `Presentation` that drops first unhooks itself, and feedback
+    /// simply stops.
+    pub fn set_presentation(&self, presentation: Option<&Presentation<'_>>) {
         if let Some(pres) = presentation {
-            self.pin().set_presentation(&pres.raw);
+            self.raw.set_presentation(&pres.raw);
         } else {
-            self.pin().clear_presentation();
+            self.raw.clear_presentation();
         }
     }
 
-    pub fn update_cursor(&mut self) {
-        self.pin().update_cursor();
+    pub fn update_cursor(&self) {
+        self.raw.update_cursor();
     }
 
     /// The GPU's raw Vulkan handles; `None` when this renderer fell back to the
@@ -310,10 +326,10 @@ impl SceneRenderer {
         self.raw.vulkan_handles(&mut h).then(|| h.into())
     }
 
-    pub fn read_back(&mut self, state: &mut SceneOutput) -> Result<Vec<u8>, Error> {
+    pub fn read_back(&self, state: &mut SceneOutput<'_>) -> Result<Vec<u8>, Error> {
         let mut err = String::new();
         let mut s_pin = state.raw.pin_mut();
-        let vec = self.pin().read_back(s_pin.as_mut(), &mut err);
+        let vec = self.raw.read_back(s_pin.as_mut(), &mut err);
         if vec.is_empty() && !err.is_empty() {
             Err(Error(err))
         } else {
@@ -323,24 +339,57 @@ impl SceneRenderer {
 }
 
 /// The cursor/pointer presentation manager: KMS planes, sprite themes, and screencopy.
-pub struct Cursor {
+///
+/// It keeps the renderer (it installs itself as the renderer's cursor source),
+/// the layout and the seat borrowed for as long as it lives, so they are
+/// declared before it and drop after it:
+///
+/// ```no_run
+/// # use luminaria::{core::Display, gpu::{Cursor, SceneRenderer, VulkanOptions},
+/// #                 protocol::Seat, shell::OutputLayout};
+/// let renderer = SceneRenderer::new(&VulkanOptions::default())?;
+/// let display = Display::new()?;
+/// let layout = OutputLayout::new()?;
+/// let seat = Seat::new(&display, "seat0")?;
+/// let _cursor = Cursor::new(&renderer, &layout, &seat)?;
+/// seat.set_capabilities(true, true, false); // still usable: the borrow is shared
+/// # Ok::<(), luminaria::core::Error>(())
+/// ```
+///
+/// Dropping one of them first does not compile, even though the cursor is not
+/// touched again — its own drop is what would read the freed `Seat`:
+///
+/// ```compile_fail,E0505
+/// # use luminaria::{core::Display, gpu::{Cursor, SceneRenderer, VulkanOptions},
+/// #                 protocol::Seat, shell::OutputLayout};
+/// let renderer = SceneRenderer::new(&VulkanOptions::default())?;
+/// let display = Display::new()?;
+/// let layout = OutputLayout::new()?;
+/// let seat = Seat::new(&display, "seat0")?;
+/// let _cursor = Cursor::new(&renderer, &layout, &seat)?;
+/// drop(seat); // error[E0505]: cannot move out of `seat` because it is borrowed
+/// # Ok::<(), luminaria::core::Error>(())
+/// ```
+pub struct Cursor<'a> {
     raw: cxx::UniquePtr<ffi::CursorShim>,
+    _borrows: Holds<'a>,
 }
 
-impl Cursor {
+impl<'a> Cursor<'a> {
     pub fn new(
-        renderer: &mut SceneRenderer,
-        layout: &OutputLayout,
-        seat: &mut Seat,
+        renderer: &'a SceneRenderer,
+        layout: &'a OutputLayout,
+        seat: &'a Seat<'_>,
     ) -> Result<Self, Error> {
         let mut err = String::new();
-        let mut r_pin = renderer.raw.pin_mut();
-        let mut s_pin = seat.raw.pin_mut();
-        let raw = ffi::cursor_new(r_pin.as_mut(), &layout.raw, s_pin.as_mut(), &mut err);
+        let raw = ffi::cursor_new(&renderer.raw, &layout.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 
@@ -393,20 +442,29 @@ impl Presented {
 }
 
 /// The per-output immediate-mode GPU frame ledger.
-pub struct Frame {
+///
+/// It caches textures the [`VulkanRenderer`] owns, so it borrows the renderer.
+/// The output is another matter: it belongs to its backend, and a monitor can
+/// be unplugged under a live `Frame`. When the output goes, the frame goes with
+/// it and every method here becomes a no-op (`submit` and `reset` fail), so
+/// drop it along with whatever else was built for that output.
+pub struct Frame<'r> {
     raw: cxx::UniquePtr<ffi::FrameShim>,
+    _renderer: Holds<'r>,
 }
 
-impl Frame {
-    pub fn new(output: &mut Output, renderer: &mut VulkanRenderer) -> Result<Self, Error> {
+impl<'r> Frame<'r> {
+    pub fn new(output: &mut Output, renderer: &'r VulkanRenderer) -> Result<Self, Error> {
         let mut err = String::new();
         let mut o_pin = output.raw.pin_mut();
-        let mut r_pin = renderer.raw.pin_mut();
-        let raw = ffi::frame_new(o_pin.as_mut(), r_pin.as_mut(), &mut err);
+        let raw = ffi::frame_new(o_pin.as_mut(), &renderer.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self {
+                raw,
+                _renderer: Holds::new(),
+            })
         }
     }
 
@@ -463,6 +521,10 @@ impl Frame {
 }
 
 /// Direct client scanout bypass evaluator.
+///
+/// It borrows nothing: the output it imports into is its backend's, and when
+/// that output goes (unplugged, or the backend dropped) the C++ side stops
+/// calling into it by itself, so `available()` turns false and `id_for` says no.
 pub struct DirectScanout {
     raw: cxx::UniquePtr<ffi::DirectScanoutShim>,
 }

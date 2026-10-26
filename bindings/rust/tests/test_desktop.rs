@@ -13,14 +13,14 @@ fn test_desktop_protocols() {
 
     let display = Display::new().expect("failed to create display");
     let seat = Seat::new(&display, "seat0").expect("Seat failed");
-    let mut xdg_shell = XdgShell::new(&display).expect("XdgShell failed");
+    let xdg_shell = XdgShell::new(&display).expect("XdgShell failed");
     let layout = OutputLayout::new().expect("OutputLayout failed");
     let ddm = DataDeviceManager::new(&display, &seat).expect("DataDevice failed");
     let tim = TextInputManager::new(&display, &seat).expect("TextInput failed");
 
     // Foreign toplevel
     let mut ftm = ForeignToplevelManager::new(&display).expect("ForeignToplevel failed");
-    ftm.track(&mut xdg_shell);
+    ftm.track(&xdg_shell);
 
     // Workspace manager
     let mut wm = WorkspaceManager::new(&display).expect("WorkspaceManager failed");

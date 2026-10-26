@@ -336,26 +336,16 @@ impl KeymapState {
     }
 }
 
-/// Single pixel (BGRA).
+/// One RGBA8 pixel, byte for byte `luminaria::Pixel`: the layout of what
+/// [`SceneRenderer::read_back`](crate::gpu::SceneRenderer::read_back) returns
+/// and [`Output::commit_frame`](crate::backend::Output::commit_frame) takes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pixel {
-    pub b: u8,
-    pub g: u8,
     pub r: u8,
+    pub g: u8,
+    pub b: u8,
     pub a: u8,
-}
-
-/// Single plane of a Linux dmabuf.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DmabufPlane {
-    pub fd: i32,
-    pub width: i32,
-    pub height: i32,
-    pub format: u32,
-    pub offset: u32,
-    pub stride: u32,
-    pub modifier: u64,
 }
 
 /// Validates whether a pixel buffer layout safely fits within a slice/memory region.

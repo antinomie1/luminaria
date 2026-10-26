@@ -3,7 +3,7 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 
-use crate::core::{Display, Error};
+use crate::core::{Display, Error, Holds};
 use crate::ffi;
 use crate::util::{Color, Mode, Transform};
 
@@ -161,19 +161,21 @@ pub struct OutputId(pub u64);
 
 pub use crate::util::Mode as OutputMode;
 
-/// Headless software backend for tests and offscreen rendering.
-pub struct HeadlessBackend {
+/// Headless software backend for tests and offscreen rendering. Its timer is a
+/// source on the display's event loop, so it borrows the [`Display`].
+pub struct HeadlessBackend<'d> {
     raw: cxx::UniquePtr<ffi::HeadlessBackendShim>,
+    _display: Holds<'d>,
 }
 
-impl HeadlessBackend {
-    pub fn new(display: &Display, interval_ms: u32) -> Result<Self, Error> {
+impl<'d> HeadlessBackend<'d> {
+    pub fn new(display: &'d Display, interval_ms: u32) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::headless_backend_new(&display.raw, interval_ms, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 
@@ -196,19 +198,21 @@ impl HeadlessBackend {
     }
 }
 
-/// Nested Wayland backend driving a host Wayland window.
-pub struct WaylandBackend {
+/// Nested Wayland backend driving a host Wayland window. The host connection
+/// is a source on the display's event loop, so it borrows the [`Display`].
+pub struct WaylandBackend<'d> {
     raw: cxx::UniquePtr<ffi::WaylandBackendShim>,
+    _display: Holds<'d>,
 }
 
-impl WaylandBackend {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> WaylandBackend<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::wayland_backend_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 
@@ -262,25 +266,27 @@ impl WaylandBackend {
     }
 }
 
-/// libseat session management for bare-metal KMS/DRM backends.
-pub struct Session {
+/// libseat session management for bare-metal KMS/DRM backends. The backends
+/// built on it keep it borrowed, which is why its methods take `&self`.
+pub struct Session<'d> {
     pub(crate) raw: cxx::UniquePtr<ffi::SessionShim>,
+    _display: Holds<'d>,
 }
 
-impl Session {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> Session<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::session_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 
-    pub fn switch_to(&mut self, vt: i32) -> Result<(), Error> {
+    pub fn switch_to(&self, vt: i32) -> Result<(), Error> {
         let mut err = String::new();
-        if self.raw.pin_mut().switch_to(vt, &mut err) {
+        if self.raw.switch_to(vt, &mut err) {
             Ok(())
         } else {
             Err(Error(err))
@@ -298,8 +304,8 @@ impl Session {
     /// The next VT switch, oldest first: `Some(false)` when the session was
     /// taken away, `Some(true)` when it came back. On the way out, release every
     /// key and button a client was told is down; on the way back, repaint.
-    pub fn next_activity(&mut self) -> Option<bool> {
-        match self.raw.pin_mut().next_activity() {
+    pub fn next_activity(&self) -> Option<bool> {
+        match self.raw.next_activity() {
             1 => Some(false),
             2 => Some(true),
             _ => None,
@@ -307,16 +313,19 @@ impl Session {
     }
 }
 
-/// KMS/DRM backend for bare-metal display presentation.
-pub struct DrmBackend {
+/// KMS/DRM backend for bare-metal display presentation. It borrows the
+/// [`Display`] (its page flips and hotplug monitor are event-loop sources) and
+/// the [`Session`] it opened the card through.
+pub struct DrmBackend<'a> {
     raw: cxx::UniquePtr<ffi::DrmBackendShim>,
+    _borrows: Holds<'a>,
 }
 
-impl DrmBackend {
+impl<'a> DrmBackend<'a> {
     pub fn new(
-        display: &Display,
+        display: &'a Display,
         device: Option<&str>,
-        session: Option<&Session>,
+        session: Option<&'a Session<'_>>,
     ) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = if let Some(sess) = session {
@@ -327,7 +336,7 @@ impl DrmBackend {
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 
@@ -366,7 +375,7 @@ impl DrmBackend {
 /// crate), derive the renderer's GPU from it (`gpu::DrmDeviceId::from_fd`), or
 /// dup it for `gbm`; never close it, and never modeset or atomic-commit
 /// through it — the KMS state is luminaria's.
-impl AsFd for DrmBackend {
+impl AsFd for DrmBackend<'_> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         // SAFETY: the backend owns the fd and keeps it open until it drops,
         // which the borrow on `self` outlasts.
@@ -374,7 +383,7 @@ impl AsFd for DrmBackend {
     }
 }
 
-impl AsRawFd for DrmBackend {
+impl AsRawFd for DrmBackend<'_> {
     fn as_raw_fd(&self) -> RawFd {
         self.raw.fd()
     }
@@ -390,14 +399,17 @@ pub enum DrmEvent {
     OutputRemoved(OutputId),
 }
 
-/// libinput input device manager for evdev keyboards, pointers, and touchscreens.
-pub struct LibinputBackend {
+/// libinput input device manager for evdev keyboards, pointers, and
+/// touchscreens. Borrows the [`Display`] and the [`Session`] that opens its
+/// devices, like [`DrmBackend`].
+pub struct LibinputBackend<'a> {
     raw: cxx::UniquePtr<ffi::LibinputBackendShim>,
+    _borrows: Holds<'a>,
 }
 
-impl LibinputBackend {
+impl<'a> LibinputBackend<'a> {
     /// Every input device udev reports on the seat, opened at `start()`.
-    pub fn new(display: &Display, session: Option<&Session>) -> Result<Self, Error> {
+    pub fn new(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = if let Some(sess) = session {
             ffi::libinput_backend_new(&display.raw, &sess.raw, &mut err)
@@ -407,12 +419,12 @@ impl LibinputBackend {
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 
     /// Exactly the devices handed to `add_device()`, and nothing udev finds.
-    pub fn new_path(display: &Display, session: Option<&Session>) -> Result<Self, Error> {
+    pub fn new_path(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = if let Some(sess) = session {
             ffi::libinput_backend_new_path(&display.raw, &sess.raw, &mut err)
@@ -422,7 +434,7 @@ impl LibinputBackend {
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 

@@ -7,6 +7,12 @@ use crate::protocol::SurfaceId;
 use crate::util::{Color, Rect};
 
 /// Manages arrangement of multiple outputs in global logical coordinates.
+///
+/// [`Cursor`](crate::gpu::Cursor) and
+/// [`OutputManager`](crate::desktop::OutputManager) keep it borrowed while they
+/// live, so its methods take `&self`. It holds the outputs added to it by
+/// pointer, but needs no borrow of them: each one leaves the layout by itself
+/// when it is destroyed.
 pub struct OutputLayout {
     pub(crate) raw: cxx::UniquePtr<ffi::OutputLayoutShim>,
 }
@@ -21,25 +27,19 @@ impl OutputLayout {
         }
     }
 
-    pub fn add(&mut self, output: &mut Output, x: i32, y: i32) {
-        let mut lay = self.raw.pin_mut();
-        let mut out = output.raw.pin_mut();
-        lay.as_mut().add(out.as_mut(), x, y);
+    pub fn add(&self, output: &mut Output, x: i32, y: i32) {
+        self.raw.add(output.raw.pin_mut(), x, y);
     }
 
     /// Place `output` to the right of everything already placed.
-    pub fn add_auto(&mut self, output: &mut Output) {
-        let mut lay = self.raw.pin_mut();
-        let mut out = output.raw.pin_mut();
-        lay.as_mut().add_auto(out.as_mut());
+    pub fn add_auto(&self, output: &mut Output) {
+        self.raw.add_auto(output.raw.pin_mut());
     }
 
     /// An output that is destroyed (a monitor unplugged) leaves the layout by
     /// itself, before Rust hears of it; removing it by hand is for policy.
-    pub fn remove(&mut self, output: &mut Output) {
-        let mut lay = self.raw.pin_mut();
-        let mut out = output.raw.pin_mut();
-        lay.as_mut().remove(out.as_mut());
+    pub fn remove(&self, output: &mut Output) {
+        self.raw.remove(output.raw.pin_mut());
     }
 
     pub fn output_box(&self, output: &Output) -> Rect {

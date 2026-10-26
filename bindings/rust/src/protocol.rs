@@ -1,8 +1,6 @@
 //! Wayland protocol globals and managers: Compositor, XdgShell, Seat, LayerShell, etc.
 
-use std::pin::Pin;
-
-use crate::core::{Display, Error};
+use crate::core::{Display, Error, Holds};
 use crate::ffi;
 use crate::util::{Rect, Transform};
 
@@ -59,37 +57,39 @@ impl SurfaceId {
 }
 
 /// The `wl_compositor` global.
-pub struct Compositor {
+pub struct Compositor<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::CompositorShim>,
+    _display: Holds<'d>,
 }
 
-impl Compositor {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> Compositor<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::compositor_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
 
 /// The `wl_subcompositor` global.
-pub struct Subcompositor {
+pub struct Subcompositor<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::SubcompositorShim>,
+    _display: Holds<'d>,
 }
 
-impl Subcompositor {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> Subcompositor<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::subcompositor_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
@@ -103,33 +103,36 @@ pub enum ToplevelEvent {
     Destroy(SurfaceId),
 }
 
-/// The `xdg_wm_base` (xdg-shell) global.
-pub struct XdgShell {
+/// The `xdg_wm_base` (xdg-shell) global. Its methods take `&self` because
+/// [`ForeignToplevelManager::track`](crate::desktop::ForeignToplevelManager::track)
+/// keeps it borrowed.
+pub struct XdgShell<'d> {
     pub(crate) raw: cxx::UniquePtr<ffi::XdgShellShim>,
+    _display: Holds<'d>,
 }
 
-impl XdgShell {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> XdgShell<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::xdg_shell_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 
-    pub fn set_bounds(&mut self, width: i32, height: i32) {
-        self.raw.pin_mut().set_bounds(width, height);
+    pub fn set_bounds(&self, width: i32, height: i32) {
+        self.raw.set_bounds(width, height);
     }
 
     /// Pull the next toplevel lifecycle event.
-    pub fn next_event(&mut self) -> Option<ToplevelEvent> {
+    pub fn next_event(&self) -> Option<ToplevelEvent> {
         let mut raw = ffi::ToplevelEventRaw {
             kind: 0,
             surface_id: 0,
         };
-        if self.raw.pin_mut().next_toplevel_event(&mut raw) {
+        if self.raw.next_toplevel_event(&mut raw) {
             let surface = SurfaceId(raw.surface_id);
             Some(match raw.kind {
                 0 => ToplevelEvent::Created(surface),
@@ -143,59 +146,59 @@ impl XdgShell {
         }
     }
 
-    pub fn configure(&mut self, surface: SurfaceId, width: i32, height: i32) {
+    pub fn configure(&self, surface: SurfaceId, width: i32, height: i32) {
         self.raw
-            .pin_mut()
             .toplevel_configure(surface.0, width, height);
     }
 
-    pub fn set_maximized(&mut self, surface: SurfaceId, on: bool) {
-        self.raw.pin_mut().toplevel_set_maximized(surface.0, on);
+    pub fn set_maximized(&self, surface: SurfaceId, on: bool) {
+        self.raw.toplevel_set_maximized(surface.0, on);
     }
 
-    pub fn set_activated(&mut self, surface: SurfaceId, on: bool) {
-        self.raw.pin_mut().toplevel_set_activated(surface.0, on);
+    pub fn set_activated(&self, surface: SurfaceId, on: bool) {
+        self.raw.toplevel_set_activated(surface.0, on);
     }
 
-    pub fn close(&mut self, surface: SurfaceId) {
-        self.raw.pin_mut().toplevel_close(surface.0);
+    pub fn close(&self, surface: SurfaceId) {
+        self.raw.toplevel_close(surface.0);
     }
 }
 
 /// The `wl_seat` global.
-pub struct Seat {
+///
+/// [`Cursor`](crate::gpu::Cursor) and the seat-bound managers
+/// ([`DataDeviceManager`], [`TextInputManager`], ...) keep it borrowed while
+/// they live — the C++ objects hold a `Seat&` — so its methods take `&self`.
+pub struct Seat<'d> {
     pub(crate) raw: cxx::UniquePtr<ffi::SeatShim>,
+    _display: Holds<'d>,
 }
 
-impl Seat {
-    pub fn new(display: &Display, name: &str) -> Result<Self, Error> {
+impl<'d> Seat<'d> {
+    pub fn new(display: &'d Display, name: &str) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::seat_new(&display.raw, name, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 
-    fn pin(&mut self) -> Pin<&mut ffi::SeatShim> {
-        self.raw.pin_mut()
+    pub fn set_capabilities(&self, keyboard: bool, pointer: bool, touch: bool) {
+        self.raw.set_capabilities(keyboard, pointer, touch);
     }
 
-    pub fn set_capabilities(&mut self, keyboard: bool, pointer: bool, touch: bool) {
-        self.pin().set_capabilities(keyboard, pointer, touch);
-    }
-
-    pub fn set_keymap(&mut self, xkb_text: &str) -> bool {
-        self.pin().set_keymap(xkb_text)
+    pub fn set_keymap(&self, xkb_text: &str) -> bool {
+        self.raw.set_keymap(xkb_text)
     }
 
     pub fn keymap(&self) -> String {
         self.raw.keymap()
     }
 
-    pub fn set_keyboard_focus(&mut self, surface: Option<SurfaceId>) {
-        self.pin().set_keyboard_focus(surface.map_or(0, |s| s.0));
+    pub fn set_keyboard_focus(&self, surface: Option<SurfaceId>) {
+        self.raw.set_keyboard_focus(surface.map_or(0, |s| s.0));
     }
 
     pub fn keyboard_focus(&self) -> Option<SurfaceId> {
@@ -205,21 +208,21 @@ impl Seat {
         }
     }
 
-    pub fn notify_key(&mut self, key: u32, pressed: bool) {
-        self.pin().notify_key(key, pressed);
+    pub fn notify_key(&self, key: u32, pressed: bool) {
+        self.raw.notify_key(key, pressed);
     }
 
-    pub fn notify_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        self.pin()
+    pub fn notify_modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        self.raw
             .notify_modifiers(depressed, latched, locked, group);
     }
 
-    pub fn pointer_enter(&mut self, surface: SurfaceId, sx: f64, sy: f64) {
-        self.pin().pointer_enter(surface.0, sx, sy);
+    pub fn pointer_enter(&self, surface: SurfaceId, sx: f64, sy: f64) {
+        self.raw.pointer_enter(surface.0, sx, sy);
     }
 
-    pub fn pointer_clear_focus(&mut self) {
-        self.pin().pointer_clear_focus();
+    pub fn pointer_clear_focus(&self) {
+        self.raw.pointer_clear_focus();
     }
 
     pub fn pointer_focus(&self) -> Option<SurfaceId> {
@@ -236,24 +239,24 @@ impl Seat {
         }
     }
 
-    pub fn pointer_motion(&mut self, sx: f64, sy: f64) {
-        self.pin().pointer_motion(sx, sy);
+    pub fn pointer_motion(&self, sx: f64, sy: f64) {
+        self.raw.pointer_motion(sx, sy);
     }
 
-    pub fn pointer_button(&mut self, button: u32, pressed: bool) {
-        self.pin().pointer_button(button, pressed);
+    pub fn pointer_button(&self, button: u32, pressed: bool) {
+        self.raw.pointer_button(button, pressed);
     }
 
-    pub fn pointer_axis(&mut self, dx: f64, dy: f64) {
-        self.pin().pointer_axis(dx, dy);
+    pub fn pointer_axis(&self, dx: f64, dy: f64) {
+        self.raw.pointer_axis(dx, dy);
     }
 
-    pub fn pointer_axis_discrete(&mut self, dx_steps: i32, dy_steps: i32) {
-        self.pin().pointer_axis_discrete(dx_steps, dy_steps);
+    pub fn pointer_axis_discrete(&self, dx_steps: i32, dy_steps: i32) {
+        self.raw.pointer_axis_discrete(dx_steps, dy_steps);
     }
 
-    pub fn pointer_axis_stop(&mut self, horizontal: bool, vertical: bool) {
-        self.pin().pointer_axis_stop(horizontal, vertical);
+    pub fn pointer_axis_stop(&self, horizontal: bool, vertical: bool) {
+        self.raw.pointer_axis_stop(horizontal, vertical);
     }
 
     pub fn cursor_surface(&self) -> Option<SurfaceId> {
@@ -271,24 +274,24 @@ impl Seat {
         (self.raw.cursor_hotspot_x(), self.raw.cursor_hotspot_y())
     }
 
-    pub fn touch_down(&mut self, surface: SurfaceId, id: i32, x: f64, y: f64) {
-        self.pin().touch_down(surface.0, id, x, y);
+    pub fn touch_down(&self, surface: SurfaceId, id: i32, x: f64, y: f64) {
+        self.raw.touch_down(surface.0, id, x, y);
     }
 
-    pub fn touch_motion(&mut self, id: i32, x: f64, y: f64) {
-        self.pin().touch_motion(id, x, y);
+    pub fn touch_motion(&self, id: i32, x: f64, y: f64) {
+        self.raw.touch_motion(id, x, y);
     }
 
-    pub fn touch_up(&mut self, id: i32) {
-        self.pin().touch_up(id);
+    pub fn touch_up(&self, id: i32) {
+        self.raw.touch_up(id);
     }
 
-    pub fn touch_frame(&mut self) {
-        self.pin().touch_frame();
+    pub fn touch_frame(&self) {
+        self.raw.touch_frame();
     }
 
-    pub fn touch_cancel(&mut self) {
-        self.pin().touch_cancel();
+    pub fn touch_cancel(&self) {
+        self.raw.touch_cancel();
     }
 
     pub fn touch_focus(&self, id: i32) -> Option<SurfaceId> {
@@ -300,32 +303,34 @@ impl Seat {
 }
 
 /// The `zwlr_layer_shell_v1` global.
-pub struct LayerShell {
+pub struct LayerShell<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::LayerShellShim>,
+    _display: Holds<'d>,
 }
 
-impl LayerShell {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> LayerShell<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::layer_shell_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
 
 /// The `wl_output` global publisher.
-pub struct OutputGlobal {
+pub struct OutputGlobal<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::OutputGlobalShim>,
+    _display: Holds<'d>,
 }
 
-impl OutputGlobal {
+impl<'d> OutputGlobal<'d> {
     pub fn new(
-        display: &Display,
+        display: &'d Display,
         width: i32,
         height: i32,
         name: &str,
@@ -341,7 +346,7 @@ impl OutputGlobal {
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
@@ -370,19 +375,23 @@ impl CursorTheme {
 
 macro_rules! define_manager {
     ($name:ident, $raw_type:ident, $constructor:ident) => {
-        pub struct $name {
+        pub struct $name<'d> {
             #[allow(dead_code)]
             pub(crate) raw: cxx::UniquePtr<ffi::$raw_type>,
+            _display: Holds<'d>,
         }
 
-        impl $name {
-            pub fn new(display: &Display) -> Result<Self, Error> {
+        impl<'d> $name<'d> {
+            pub fn new(display: &'d Display) -> Result<Self, Error> {
                 let mut err = String::new();
                 let raw = ffi::$constructor(&display.raw, &mut err);
                 if raw.is_null() {
                     Err(Error(err))
                 } else {
-                    Ok(Self { raw })
+                    Ok(Self {
+                        raw,
+                        _display: Holds::new(),
+                    })
                 }
             }
         }
@@ -404,102 +413,118 @@ define_manager!(Presentation, PresentationShim, presentation_new);
 define_manager!(BackgroundEffectManager, BackgroundEffectManagerShim, background_effect_manager_new);
 define_manager!(XdgToplevelIconManager, XdgToplevelIconManagerShim, xdg_toplevel_icon_manager_new);
 
-pub struct TextInputManager {
+/// The `zwp_text_input_manager_v3` global. It routes through the [`Seat`] it was created for,
+/// which it keeps borrowed.
+pub struct TextInputManager<'a> {
     pub(crate) raw: cxx::UniquePtr<ffi::TextInputManagerShim>,
+    _borrows: Holds<'a>,
 }
 
-impl TextInputManager {
-    pub fn new(display: &Display, seat: &Seat) -> Result<Self, Error> {
+impl<'a> TextInputManager<'a> {
+    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::text_input_manager_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 }
 
-pub struct IdleNotifier {
+pub struct IdleNotifier<'d> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::IdleNotifierShim>,
+    _display: Holds<'d>,
 }
 
-impl IdleNotifier {
-    pub fn new(display: &Display) -> Result<Self, Error> {
+impl<'d> IdleNotifier<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::idle_notifier_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _display: Holds::new() })
         }
     }
 }
 
-pub struct DataDeviceManager {
+/// The `wl_data_device_manager` (clipboard and drag-and-drop) global. It routes through the [`Seat`] it was created for,
+/// which it keeps borrowed.
+pub struct DataDeviceManager<'a> {
     pub(crate) raw: cxx::UniquePtr<ffi::DataDeviceManagerShim>,
+    _borrows: Holds<'a>,
 }
 
-impl DataDeviceManager {
-    pub fn new(display: &Display, seat: &Seat) -> Result<Self, Error> {
+impl<'a> DataDeviceManager<'a> {
+    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::data_device_manager_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 }
 
-pub struct PrimarySelectionManager {
+/// The `zwp_primary_selection_device_manager_v1` global. It routes through the [`Seat`] it was created for,
+/// which it keeps borrowed.
+pub struct PrimarySelectionManager<'a> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::PrimarySelectionManagerShim>,
+    _borrows: Holds<'a>,
 }
 
-impl PrimarySelectionManager {
-    pub fn new(display: &Display, seat: &Seat) -> Result<Self, Error> {
+impl<'a> PrimarySelectionManager<'a> {
+    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::primary_selection_manager_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 }
 
-pub struct RelativePointerManager {
+/// The `zwp_relative_pointer_manager_v1` global. It routes through the [`Seat`] it was created for,
+/// which it keeps borrowed.
+pub struct RelativePointerManager<'a> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::RelativePointerManagerShim>,
+    _borrows: Holds<'a>,
 }
 
-impl RelativePointerManager {
-    pub fn new(display: &Display, seat: &Seat) -> Result<Self, Error> {
+impl<'a> RelativePointerManager<'a> {
+    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::relative_pointer_manager_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 }
 
-pub struct PointerConstraints {
+/// The `zwp_pointer_constraints_v1` global. It routes through the [`Seat`] it was created for,
+/// which it keeps borrowed.
+pub struct PointerConstraints<'a> {
     #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::PointerConstraintsShim>,
+    _borrows: Holds<'a>,
 }
 
-impl PointerConstraints {
-    pub fn new(display: &Display, seat: &Seat) -> Result<Self, Error> {
+impl<'a> PointerConstraints<'a> {
+    pub fn new(display: &'a Display, seat: &'a Seat<'_>) -> Result<Self, Error> {
         let mut err = String::new();
         let raw = ffi::pointer_constraints_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
             Err(Error(err))
         } else {
-            Ok(Self { raw })
+            Ok(Self { raw, _borrows: Holds::new() })
         }
     }
 }
