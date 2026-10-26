@@ -144,6 +144,8 @@ struct IdleNotifier::Impl {
 
     Signal<NewIdleNotification> new_notification;
     Signal<IdleStateChange> state_change;
+
+    ~Impl();
 };
 
 using InMgr = IdleNotifier::Impl;
@@ -218,8 +220,9 @@ void notification_resource_destroy(wl_resource* resource) {
     auto* n = static_cast<NotificationImpl*>(wl_resource_get_user_data(resource));
     IdleNotificationDestroy event{*n};
     n->destroy.emit(event);
-    auto& live = n->mgr_->notifications;
-    live.erase(std::remove(live.begin(), live.end(), n), live.end());
+    if (n->mgr_ != nullptr) {
+        std::erase(n->mgr_->notifications, n);
+    }
     delete n;
 }
 
@@ -261,6 +264,16 @@ const struct ext_idle_notifier_v1_interface manager_impl = {
 };
 
 } // namespace
+
+// The notifications are the client's and outlive us at exit (the Display,
+// declared first, is what destroys a still-connected client). Without their
+// timers nothing but the destroy handler can reach `mgr_` any more.
+IdleNotifier::Impl::~Impl() {
+    for (NotificationImpl* n : notifications) {
+        n->timer_ = EventSource{};
+        n->mgr_ = nullptr;
+    }
+}
 
 IdleNotifier::IdleNotifier(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 IdleNotifier::~IdleNotifier() = default;

@@ -68,6 +68,18 @@ inline void resource_destroy_request(wl_client*, wl_resource* resource) noexcept
     wl_resource_destroy(resource);
 }
 
+/// Leave a client's resource inert: its user data and its destroy handler are
+/// both dropped, so neither a later request nor its eventual destruction reaches
+/// whatever the user data pointed at. For a global's destructor, whose client
+/// objects outlive it: libwayland destroys a still-connected client's resources
+/// only when the Display goes, and the Display is declared first, so it goes
+/// last. Whatever the user data owned must be freed by the caller; a request
+/// handler that can still run must treat null user data as "do nothing".
+inline void detach_resource(wl_resource* resource) noexcept {
+    wl_resource_set_user_data(resource, nullptr);
+    wl_resource_set_destructor(resource, nullptr);
+}
+
 /// Generic bind function for manager/singleton globals.
 /// Instantiates a `wl_resource` and assigns the provided vtable and `user_data` pointer.
 template <const wl_interface* Interface, const auto* VTable, auto Deleter = nullptr>

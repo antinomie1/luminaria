@@ -66,12 +66,11 @@ struct DrmSyncobjManager::Impl {
     WlGlobal global;
     int drm_fd = -1;
     unsigned acquire_timeout_ms = 50;
+    // Every live timeline and per-surface object; each points back here.
+    std::vector<wl_resource*> timelines;
+    std::vector<wl_resource*> sync_surfaces;
 
-    ~Impl() {
-        if (drm_fd >= 0) {
-            close(drm_fd);
-        }
-    }
+    ~Impl();
 };
 
 namespace {
@@ -94,8 +93,11 @@ constexpr struct wp_linux_drm_syncobj_timeline_v1_interface timeline_impl = {
 };
 void timeline_resource_destroy(wl_resource* resource) {
     Timeline* timeline = timeline_of(resource);
-    if (timeline->mgr != nullptr && timeline->mgr->drm_fd >= 0) {
-        drmSyncobjDestroy(timeline->mgr->drm_fd, timeline->handle);
+    if (timeline->mgr != nullptr) {
+        std::erase(timeline->mgr->timelines, resource);
+        if (timeline->mgr->drm_fd >= 0) {
+            drmSyncobjDestroy(timeline->mgr->drm_fd, timeline->handle);
+        }
     }
     delete timeline;
 }
@@ -273,6 +275,9 @@ void sync_surface_resource_destroy(wl_resource* resource) {
     SyncSurface* sync = sync_surface_of(resource);
     // Don't strand the client waiting on a release that will never come.
     signal_release(sync);
+    if (sync->mgr != nullptr) {
+        std::erase(sync->mgr->sync_surfaces, resource);
+    }
     delete sync;
 }
 
@@ -304,6 +309,7 @@ void manager_get_surface(wl_client* client, wl_resource* resource, uint32_t id,
     });
     wl_resource_set_implementation(sync_resource, &sync_surface_impl, sync,
                                    sync_surface_resource_destroy);
+    mgr->sync_surfaces.push_back(sync_resource);
 }
 
 void manager_import_timeline(wl_client* client, wl_resource* resource, uint32_t id, int32_t fd) {
@@ -327,6 +333,7 @@ void manager_import_timeline(wl_client* client, wl_resource* resource, uint32_t 
     auto* timeline = new Timeline{mgr, handle};
     wl_resource_set_implementation(timeline_resource, &timeline_impl, timeline,
                                    timeline_resource_destroy);
+    mgr->timelines.push_back(timeline_resource);
 }
 
 constexpr struct wp_linux_drm_syncobj_manager_v1_interface manager_impl = {
@@ -353,6 +360,23 @@ int open_syncobj_render_node() {
 }
 
 } // namespace
+
+// The client's objects outlive us at exit (the Display, declared first, is what
+// destroys a still-connected client), and their handles live in `drm_fd`, which
+// closing frees. Release what is on screen while the fd still works, then sever.
+DrmSyncobjManager::Impl::~Impl() {
+    for (wl_resource* r : sync_surfaces) {
+        SyncSurface* sync = sync_surface_of(r);
+        signal_release(sync);
+        sync->mgr = nullptr;
+    }
+    for (wl_resource* r : timelines) {
+        timeline_of(r)->mgr = nullptr;
+    }
+    if (drm_fd >= 0) {
+        close(drm_fd);
+    }
+}
 
 DrmSyncobjManager::DrmSyncobjManager(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}

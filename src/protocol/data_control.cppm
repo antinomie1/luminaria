@@ -116,25 +116,15 @@ struct DataControlManager::Impl {
     // Every offer we have handed out, so a selection change can invalidate the
     // previous batch (see the file header).
     std::vector<wl_resource*> offers;
+    // Every live source, so the destructor can sever them too: a source is the
+    // client's and outlives us.
+    std::vector<ControlSource*> sources;
     std::function<bool(wl_client*)> filter;
 
     Signal<SelectionChange>::Connection selection_conn;
     Signal<SelectionChange>::Connection primary_conn;
 
-    ~Impl() {
-        for (wl_resource* r : devices) {
-            wl_resource_set_user_data(r, nullptr);
-            wl_resource_set_destructor(r, nullptr);
-        }
-        for (wl_resource* r : offers) {
-            if (auto* o = static_cast<ControlOffer*>(wl_resource_get_user_data(r))) {
-                o->mgr = nullptr;
-            }
-        }
-        if (display != nullptr && filter) {
-            wl_display_set_global_filter(display, nullptr, nullptr);
-        }
-    }
+    ~Impl();
 };
 
 // A zwlr_data_control_source_v1 dressed up as an ordinary clipboard owner.
@@ -179,7 +169,7 @@ ControlSource* source_of(wl_resource* r) {
 // ---- zwlr_data_control_offer_v1 ----
 void offer_receive(wl_client*, wl_resource* resource, const char* mime, int32_t fd) {
     ControlOffer* offer = offer_of(resource);
-    if (!offer->valid) {
+    if (!offer->valid || offer->mgr == nullptr) {
         // The selection moved on. Closing the pipe unread is how the requester
         // learns there is nothing there — better than silently handing over
         // someone else's clipboard.
@@ -227,6 +217,11 @@ void source_resource_destroy(wl_resource* resource) {
     ControlSource* source = source_of(resource);
     source->destroying_ = true;
     DcMgr* mgr = source->mgr_;
+    if (mgr == nullptr) {
+        delete source; // the manager went first and already took its clipboards
+        return;
+    }
+    std::erase(mgr->sources, source);
     // If it still owns a clipboard, take it away before the object goes: the
     // managers hold SelectionSource pointers non-owningly.
     if (mgr->data_device->selection_source() == source) {
@@ -296,6 +291,9 @@ void broadcast(DcMgr* mgr, const std::vector<std::string>& mimes, bool primary) 
 // ---- zwlr_data_control_device_v1 ----
 void device_set_selection(wl_client*, wl_resource* resource, wl_resource* source_resource) {
     auto* mgr = static_cast<DcMgr*>(wl_resource_get_user_data(resource));
+    if (mgr == nullptr) {
+        return; // the manager is gone; the device is inert
+    }
     if (source_resource == nullptr) {
         mgr->data_device->set_selection(nullptr);
         return;
@@ -313,8 +311,8 @@ void device_set_selection(wl_client*, wl_resource* resource, wl_resource* source
 void device_set_primary_selection(wl_client*, wl_resource* resource,
                                   wl_resource* source_resource) {
     auto* mgr = static_cast<DcMgr*>(wl_resource_get_user_data(resource));
-    if (mgr->primary == nullptr) {
-        return; // bound at v1, ignore
+    if (mgr == nullptr || mgr->primary == nullptr) {
+        return; // the manager is gone, or bound at v1: ignore
     }
     if (source_resource == nullptr) {
         mgr->primary->set_selection(nullptr);
@@ -352,8 +350,9 @@ void manager_create_data_source(wl_client* client, wl_resource* manager_resource
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(resource, &source_impl, new ControlSource(mgr, resource),
-                                   source_resource_destroy);
+    auto* source = new ControlSource(mgr, resource);
+    wl_resource_set_implementation(resource, &source_impl, source, source_resource_destroy);
+    mgr->sources.push_back(source);
 }
 
 void manager_get_data_device(wl_client* client, wl_resource* manager_resource, uint32_t id,
@@ -403,6 +402,36 @@ bool global_filter(const wl_client* client, const wl_global* global, void* data)
 }
 
 } // namespace
+
+// The global can go before its clients do — at exit it always does, because the
+// Display is declared first and only it destroys what is still connected. Sever
+// everything of theirs that points back here.
+DataControlManager::Impl::~Impl() {
+    // First, so taking our sources' clipboards away below does not broadcast
+    // the change back through us.
+    selection_conn.disconnect();
+    primary_conn.disconnect();
+    for (ControlSource* source : sources) {
+        // The clipboards hold it non-owningly and outlive us; once mgr_ is
+        // gone its destroy handler can no longer take it back from them.
+        if (data_device->selection_source() == source) {
+            data_device->set_selection(nullptr);
+        }
+        if (primary != nullptr && primary->selection_source() == source) {
+            primary->set_selection(nullptr);
+        }
+        source->mgr_ = nullptr;
+    }
+    for (wl_resource* r : devices) {
+        detach_resource(r);
+    }
+    for (wl_resource* r : offers) {
+        offer_of(r)->mgr = nullptr;
+    }
+    if (display != nullptr && filter) {
+        wl_display_set_global_filter(display, nullptr, nullptr);
+    }
+}
 
 DataControlManager::DataControlManager(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}

@@ -175,9 +175,12 @@ class LockSurfaceImpl;
 struct SessionLockManager::Impl {
     WlGlobal global;
     LockImpl* current = nullptr;
+    std::vector<LockImpl*> locks; // every live lock, the refused ones too
     bool session_locked = false;
 
     Signal<NewSessionLock> new_lock;
+
+    ~Impl();
 };
 
 using SlMgr = SessionLockManager::Impl;
@@ -191,7 +194,9 @@ public:
             return;
         }
         locked_ = true;
-        mgr_->session_locked = true;
+        if (mgr_ != nullptr) {
+            mgr_->session_locked = true;
+        }
         ext_session_lock_v1_send_locked(resource_);
     }
 
@@ -318,8 +323,10 @@ void lock_surface_resource_destroy(wl_resource* resource) {
     auto* ls = static_cast<LockSurfaceImpl*>(wl_resource_get_user_data(resource));
     SessionLockSurfaceDestroy event{*ls};
     ls->destroy.emit(event);
-    std::erase(ls->lock_->surfaces_, static_cast<SessionLockSurface*>(ls));
-    std::erase(ls->lock_->outputs_, ls->output_);
+    if (ls->lock_ != nullptr) {
+        std::erase(ls->lock_->surfaces_, static_cast<SessionLockSurface*>(ls));
+        std::erase(ls->lock_->outputs_, ls->output_);
+    }
     delete ls;
 }
 
@@ -344,7 +351,9 @@ void lock_unlock_and_destroy(wl_client*, wl_resource* resource) {
                                "unlock_and_destroy before the lock was granted");
         return;
     }
-    lock->mgr_->session_locked = false;
+    if (lock->mgr_ != nullptr) {
+        lock->mgr_->session_locked = false;
+    }
     lock->unlocking_ = true;
     wl_resource_destroy(resource);
 }
@@ -395,12 +404,18 @@ constexpr struct ext_session_lock_v1_interface lock_impl = {
 
 void lock_resource_destroy(wl_resource* resource) {
     auto* lock = static_cast<LockImpl*>(wl_resource_get_user_data(resource));
-    // The lock surfaces are the client's; libwayland destroys them with the
-    // client, and each unhooks itself from `lock->surfaces_` as it goes.
     SessionLockDestroy event{*lock, lock->unlocking_};
     lock->destroy.emit(event);
-    if (lock->mgr_->current == lock) {
-        lock->mgr_->current = nullptr;
+    // The lock surfaces are the client's and may outlive the lock: libwayland
+    // tears a disconnecting client down in object-id order, lock first.
+    for (SessionLockSurface* surface : lock->surfaces_) {
+        static_cast<LockSurfaceImpl*>(surface)->lock_ = nullptr;
+    }
+    if (SlMgr* mgr = lock->mgr_; mgr != nullptr) {
+        std::erase(mgr->locks, lock);
+        if (mgr->current == lock) {
+            mgr->current = nullptr;
+        }
     }
     delete lock;
 }
@@ -418,6 +433,7 @@ void manager_lock(wl_client* client, wl_resource* manager, uint32_t id) {
     }
     auto* lock = new LockImpl(mgr, resource);
     wl_resource_set_implementation(resource, &lock_impl, lock, lock_resource_destroy);
+    mgr->locks.push_back(lock);
     if (mgr->current != nullptr) {
         // One lock at a time. The loser is told so rather than left waiting.
         lock->send_finished();
@@ -435,6 +451,14 @@ constexpr struct ext_session_lock_manager_v1_interface manager_impl = {
 };
 
 } // namespace
+
+// The locks are the client's and outlive us at exit (the Display, declared
+// first, is what destroys a still-connected client).
+SessionLockManager::Impl::~Impl() {
+    for (LockImpl* lock : locks) {
+        lock->mgr_ = nullptr;
+    }
+}
 
 SessionLockManager::SessionLockManager(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}

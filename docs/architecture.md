@@ -115,6 +115,15 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   **`submit()` 答 `unchanged` 时没有 `present`**——这一帧没提交，也就没有翻页可等。那次
   `send_frame_done()` 得在 `frame` 处理里补上：客户端 commit 了却没报 damage 是常事，扣着
   回调就是把它永久冻住。两个示例混成器都是这么写的。
+- **global 先于它的客户端析构，而且这必须是安全的。** 混成器总是先声明 `Display`，所以它最后
+  析构；而 libwayland 只在 `wl_display_destroy` 里才销毁仍连着的客户端的资源。于是退出时，
+  每个协议 global 都已释放，它交给客户端的对象（数据源、offer、会话锁、句柄、timer……）的
+  destroy handler 才开始跑。规矩是：凡是指回 global 的客户端对象，global 都要登记在案，并在
+  `~Impl` 里切断——回指针置空；user_data 本身就是 `Impl` 的资源调 `detach_resource()`
+  （`protocol_helper`）。destroy handler 和此后仍可能被调用的请求处理，把空指针当作「已惰性」。
+  我们**不**要求混成器在析构 global 前先断开客户端，也不为此提供 API：声明顺序本身就该是对的，
+  而不是靠每个混成器记得多调一步。`tests/test_teardown_order.cpp` 守着这条：一个客户端握着每一种
+  回指对象，global 全部析构之后才析构 `Display`，在 ASan 下跑。新增协议时，把你的对象也加进去。
 - **`Frame` 必须比渲染器先销毁。** `Frame` 的 GPU bridge 缓存着属于 `VulkanRenderer` 的
   `GpuTexture`；参考混成器仍把渲染器声明在 `Display` 前面，让所有输出和帧账本先析构。
 - **绝不听客户端的话去索引内存。** 宽高、stride、offset 是客户端独立声明的四个整数，上游
@@ -184,6 +193,11 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
   的所有 per-output 重建，以及客户端 dmabuf direct scanout 仍须在空闲 VT 上验收。渲染与几何有
   `output-layout` / `output-scale` / `gpu-scanout` / `region` / `cursor-theme` 覆盖；`session` 测试在
   没有 seat 的环境里 skip。
+- **运行中途拆掉一个 global 只保证了析构路径。** 各 global 的 `~Impl` 让客户端对象变成惰性，
+  所以 destroy handler 不会再碰已释放的 manager；但客户端绑定的 *manager 资源本身*
+  （`default_bind` 把 user_data 设成 `Impl`）没有登记，global 析构之后客户端再对它发请求，仍是
+  use-after-free。退出时不再 dispatch，所以无害；运行中途移除 global（为热插拔登记了全部资源的
+  `OutputGlobal` 除外）尚不支持。
 - **热插拔只覆盖 connector 状态**：GPU 本身热插拔（拔掉整块显卡 / DRM 设备消失）不处理。
 - **headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
   13ms debug）。这是 wl_shm 呈现的代价。嵌套后端只在父 compositor 没有

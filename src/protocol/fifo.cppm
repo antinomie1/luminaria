@@ -89,6 +89,8 @@ struct FifoObject;
 struct FifoManager::Impl {
     WlGlobal global;
     std::vector<FifoObject*> objects;
+
+    ~Impl();
 };
 
 using FifoMgr = FifoManager::Impl;
@@ -111,6 +113,14 @@ struct FifoObject {
         }
     }
 };
+
+// The objects are the client's and outlive us at exit (the Display, declared
+// first, is what destroys a still-connected client).
+FifoManager::Impl::~Impl() {
+    for (FifoObject* object : objects) {
+        object->mgr = nullptr;
+    }
+}
 
 namespace {
 

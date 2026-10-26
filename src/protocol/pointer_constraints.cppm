@@ -193,6 +193,8 @@ struct PointerConstraints::Impl {
 
     Signal<NewPointerConstraint> new_constraint;
     Signal<SeatPointerFocus>::Connection focus_conn;
+
+    ~Impl();
 };
 
 using PcMgr = PointerConstraints::Impl;
@@ -229,7 +231,7 @@ public:
     [[nodiscard]] bool active() const noexcept override { return active_; }
 
     void activate() override {
-        if (active_ || defunct_ || surface_ == nullptr) {
+        if (active_ || defunct_ || surface_ == nullptr || mgr_ == nullptr) {
             return;
         }
         // The security rule, enforced here so no compositor can forget it.
@@ -253,7 +255,7 @@ public:
             return;
         }
         active_ = false;
-        if (mgr_->active == this) {
+        if (mgr_ != nullptr && mgr_->active == this) {
             mgr_->active = nullptr;
         }
         if (lifetime_ == PointerConstraintLifetime::oneshot) {
@@ -355,11 +357,12 @@ void constraint_resource_destroy(wl_resource* resource) {
     ConstraintImpl* constraint = constraint_of(resource);
     PointerConstraintDestroy event{*constraint};
     constraint->destroy.emit(event);
-    PcMgr* mgr = constraint->mgr_;
-    if (mgr->active == constraint) {
-        mgr->active = nullptr;
+    if (PcMgr* mgr = constraint->mgr_; mgr != nullptr) {
+        if (mgr->active == constraint) {
+            mgr->active = nullptr;
+        }
+        std::erase(mgr->constraints, constraint);
     }
-    std::erase(mgr->constraints, constraint);
     delete constraint;
 }
 
@@ -443,6 +446,15 @@ constexpr struct zwp_pointer_constraints_v1_interface manager_impl = {
 };
 
 } // namespace
+
+// The constraints are the client's and outlive us at exit (the Display,
+// declared first, is what destroys a still-connected client). One that loses
+// its manager can no longer activate.
+PointerConstraints::Impl::~Impl() {
+    for (ConstraintImpl* constraint : constraints) {
+        constraint->mgr_ = nullptr;
+    }
+}
 
 PointerConstraints::PointerConstraints(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}

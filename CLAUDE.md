@@ -347,6 +347,17 @@ example compositors show the shape.
   for semantic teardown tied to that surface, but it is not the memory-safety boundary. Seat,
   data-device, Frame and DirectScanout are the reference implementations. The deterministic
   malformed-stream client in `tests/test_protocol_fuzz.cpp` runs in every ordinary suite.
+- **A global dies before its clients' objects, and that must be safe.** The Display is
+  declared first, so it is destroyed last, and libwayland destroys a still-connected client's
+  resources only inside `wl_display_destroy` — by then every protocol global is freed. Any
+  client object whose glue points back at a global (a source, an offer, a lock, a handle, a
+  timer…) must be registered on the global's `Impl`, and `~Impl` severs it: null the back
+  pointer, or `detach_resource()` (`protocol_helper`) a resource whose user data IS the
+  `Impl`. The destroy handler — and any request handler that can still run — treats null as
+  inert. wl-copy connected at exit used to crash every compositor through
+  `data_device`'s `device_resource_destroy`. Compositors are NOT asked to disconnect clients
+  first; the declaration order has to just work. `tests/test_teardown_order.cpp` holds one of
+  everything and runs the teardown under ASan; a new protocol adds its objects there.
 - **Any retained `wl_resource*` owned by a CLIENT needs a destroy listener.** Buffers are
   the sharp edge: toolkits drop their whole swapchain on resize / hide / re-show, so a
   committed `wl_buffer` dies under you and the next `wl_buffer.release` or readback
@@ -371,7 +382,8 @@ example compositors show the shape.
 4. Add the file to the corresponding xmake target and `export import :<name>;` to that
    target's primary interface (`src/luminaria*.cppm`).
 5. Drop a test in `tests/` — `xmake.lua` turns every `tests/test_*.cpp` into its own binary
-   automatically. Exit 77 to skip when the machine cannot run it.
+   automatically. Exit 77 to skip when the machine cannot run it. If any of your client
+   objects point back at the global, also create one in `tests/test_teardown_order.cpp`.
 
 An XML argument name becomes a C parameter name verbatim, and everything here that
 consumes the generated headers is C++ — so an argument called `namespace`, `class`,

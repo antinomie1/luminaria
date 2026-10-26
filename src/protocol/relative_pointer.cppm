@@ -80,6 +80,14 @@ struct RelativePointerManager::Impl {
     WlGlobal global;
     Seat* seat = nullptr;
     std::vector<wl_resource*> relative_pointers;
+
+    // They are the client's and outlive us at exit (the Display, declared
+    // first, is what destroys a still-connected client).
+    ~Impl() {
+        for (wl_resource* r : relative_pointers) {
+            detach_resource(r);
+        }
+    }
 };
 
 namespace {
@@ -91,8 +99,9 @@ constexpr struct zwp_relative_pointer_v1_interface relative_pointer_impl = {
 };
 
 void relative_pointer_resource_destroy(wl_resource* resource) {
-    auto* mgr = static_cast<RpMgr*>(wl_resource_get_user_data(resource));
-    std::erase(mgr->relative_pointers, resource);
+    if (auto* mgr = static_cast<RpMgr*>(wl_resource_get_user_data(resource))) {
+        std::erase(mgr->relative_pointers, resource);
+    }
 }
 
 void manager_get_relative_pointer(wl_client* client, wl_resource* manager_resource, uint32_t id,

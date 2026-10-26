@@ -146,6 +146,8 @@ struct ForeignToplevelManager::Impl {
     void send_state(wl_resource* handle, const Entry& entry);
     void send_parent(Binding& binding, wl_resource* handle, const Entry& entry);
     void refresh(Entry& entry);
+
+    ~Impl();
 };
 
 namespace {
@@ -225,7 +227,7 @@ constexpr struct zwlr_foreign_toplevel_handle_v1_interface handle_impl = {
 
 void handle_resource_destroy(wl_resource* resource) {
     Handle* h = handle_of(resource);
-    if (h->entry != nullptr) {
+    if (h->entry != nullptr && h->binding != nullptr) {
         h->binding->handles.erase(h->entry);
     }
     delete h;
@@ -279,6 +281,22 @@ void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) 
 }
 
 } // namespace
+
+// The bindings die with us, but the manager and handle resources pointing at
+// them are the client's and outlive us at exit (the Display, declared first, is
+// what destroys a still-connected client). Leave them inert: a handle without
+// an entry already reads as a window that has gone.
+FtImpl::~Impl() {
+    for (auto& b : bindings) {
+        for (auto& [entry, r] : b->handles) {
+            Handle* h = handle_of(r);
+            h->impl = nullptr;
+            h->binding = nullptr;
+            h->entry = nullptr;
+        }
+        detach_resource(b->resource);
+    }
+}
 
 FtEntry& FtImpl::track_toplevel(Toplevel& toplevel) {
     if (FtEntry* existing = entry_for(&toplevel); existing != nullptr) {

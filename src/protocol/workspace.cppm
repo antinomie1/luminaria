@@ -159,6 +159,8 @@ struct WorkspaceManager::Impl {
             ext_workspace_manager_v1_send_done(b->resource);
         }
     }
+
+    ~Impl();
 };
 
 namespace {
@@ -166,6 +168,7 @@ namespace {
 using WsBinding = WorkspaceManager::Impl::Binding;
 
 // user_data of a group/workspace handle. Destroyed with the handle resource.
+// `binding` is nulled when the manager goes first, leaving the handle inert.
 struct Handle {
     WorkspaceManager::Impl* impl;
     WsBinding* binding;
@@ -179,7 +182,9 @@ Handle* handle_of(wl_resource* resource) {
 
 void handle_resource_destroy(wl_resource* resource) {
     Handle* h = handle_of(resource);
-    if (h->is_group) {
+    if (h->binding == nullptr) {
+        // inert: the manager went first
+    } else if (h->is_group) {
         h->binding->group_handles.erase(h->id);
     } else {
         h->binding->workspace_handles.erase(h->id);
@@ -191,18 +196,27 @@ void handle_resource_destroy(wl_resource* resource) {
 
 void workspace_activate(wl_client*, wl_resource* resource) {
     Handle* h = handle_of(resource);
+    if (h->binding == nullptr) {
+        return;
+    }
     h->binding->queued.push_back(
         WorkspaceRequest{WorkspaceRequest::Kind::activate, h->id, 0, ""});
 }
 
 void workspace_deactivate(wl_client*, wl_resource* resource) {
     Handle* h = handle_of(resource);
+    if (h->binding == nullptr) {
+        return;
+    }
     h->binding->queued.push_back(
         WorkspaceRequest{WorkspaceRequest::Kind::deactivate, h->id, 0, ""});
 }
 
 void workspace_remove(wl_client*, wl_resource* resource) {
     Handle* h = handle_of(resource);
+    if (h->binding == nullptr) {
+        return;
+    }
     h->binding->queued.push_back(
         WorkspaceRequest{WorkspaceRequest::Kind::remove, h->id, 0, ""});
 }
@@ -210,6 +224,9 @@ void workspace_remove(wl_client*, wl_resource* resource) {
 void workspace_assign(wl_client*, wl_resource* resource, wl_resource* group_resource) {
     Handle* h = handle_of(resource);
     Handle* gh = handle_of(group_resource);
+    if (h->binding == nullptr) {
+        return;
+    }
     h->binding->queued.push_back(
         WorkspaceRequest{WorkspaceRequest::Kind::assign, h->id, gh->id, ""});
 }
@@ -226,6 +243,9 @@ constexpr struct ext_workspace_handle_v1_interface workspace_handle_impl = {
 
 void group_create_workspace(wl_client*, wl_resource* resource, const char* name) {
     Handle* h = handle_of(resource);
+    if (h->binding == nullptr) {
+        return;
+    }
     h->binding->queued.push_back(WorkspaceRequest{WorkspaceRequest::Kind::create, 0, h->id,
                                                   name != nullptr ? name : ""});
 }
@@ -239,6 +259,9 @@ constexpr struct ext_workspace_group_handle_v1_interface group_handle_impl = {
 
 void manager_commit(wl_client*, wl_resource* resource) {
     auto* b = static_cast<WsBinding*>(wl_resource_get_user_data(resource));
+    if (b == nullptr) {
+        return; // the manager is gone; the binding is inert
+    }
     std::vector<WorkspaceRequest> batch = std::move(b->queued);
     b->queued.clear();
     for (WorkspaceRequest& r : batch) {
@@ -299,6 +322,21 @@ void manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) 
 }
 
 } // namespace
+
+// The bindings die with us, but the manager and handle resources pointing at
+// them are the client's and outlive us at exit (the Display, declared first, is
+// what destroys a still-connected client). Leave them inert.
+WorkspaceManager::Impl::~Impl() {
+    for (auto& b : bindings) {
+        for (auto& [id, r] : b->group_handles) {
+            handle_of(r)->binding = nullptr;
+        }
+        for (auto& [id, r] : b->workspace_handles) {
+            handle_of(r)->binding = nullptr;
+        }
+        detach_resource(b->resource);
+    }
+}
 
 void WorkspaceManager::Impl::send_group(WsBinding& b, const GroupInfo& g) {
     wl_client* client = wl_resource_get_client(b.resource);
