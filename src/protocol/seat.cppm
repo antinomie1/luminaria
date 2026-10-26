@@ -155,13 +155,20 @@ public:
 
     // --- touch ---
     /// Begin a touch point on `surface` at surface-local (x,y). `id` is the slot.
+    /// The point belongs to that surface until it lifts: motion and up go to
+    /// it wherever the finger goes, and each finger can be on a different one.
     void touch_down(Surface& surface, int32_t id, double x, double y);
+    /// (x,y) are local to the surface the point went down on.
     void touch_motion(int32_t id, double x, double y);
     void touch_up(int32_t id);
-    /// End the current set of touch events (send once per input frame).
+    /// End the current set of touch events (send once per input frame). Only
+    /// the clients that got an event since the last frame are sent one.
     void touch_frame();
-    /// The compositor took over the gesture; clients must forget it.
+    /// The compositor took over the gesture; clients must forget it. Every
+    /// point that is down is dropped.
     void touch_cancel();
+    /// The surface touch point `id` went down on; invalid when it is not down.
+    [[nodiscard]] SurfaceId touch_focus(int32_t id) const noexcept;
 
     // --- drag and drop (installed by wl_data_device) ---
     void begin_drag(SeatDragHooks hooks);
@@ -194,7 +201,21 @@ struct Seat::Impl {
 
     SurfaceId kb_focus;
     SurfaceId ptr_focus;
-    SurfaceId touch_focus;
+    /// Which surface each touch point went down on, by slot.
+    struct TouchPoint {
+        int32_t id;
+        SurfaceId surface;
+    };
+    std::vector<TouchPoint> touch_points;
+    /// Surfaces sent a touch event since the last wl_touch.frame: the clients
+    /// owed one, including any whose last point just lifted.
+    std::vector<SurfaceId> touch_owed;
+
+    void owe_touch_frame(SurfaceId surface) {
+        if (std::ranges::find(touch_owed, surface) == touch_owed.end()) {
+            touch_owed.push_back(surface);
+        }
+    }
     SurfaceId cursor;
     /// The implicit pointer grab: who took the first press, and which buttons
     /// are still down. The grab ends on the release of the last one.
@@ -471,9 +492,8 @@ Result<Seat> Seat::create(Display& display, std::string name) {
             }
         }
 
-        if (raw->touch_focus == event.surface) {
-            raw->touch_focus = {};
-        }
+        std::erase_if(raw->touch_points,
+                      [&](const Impl::TouchPoint& p) { return p.surface == event.surface; });
 
         if (raw->cursor == event.surface || pointer_lost) {
             raw->forget_cursor();
@@ -861,64 +881,103 @@ int Seat::cursor_hotspot_y() const noexcept {
 
 // --- touch ---
 
-void Seat::touch_down(Surface& surface, int32_t id, double x, double y) {
-    impl_->touch_focus = surface.id();
-    wl_resource* res = surface.c_resource();
-    wl_client* client = wl_resource_get_client(res);
-    const uint32_t serial = impl_->next_serial();
-    const uint32_t time = now_ms();
-    for (wl_resource* t : impl_->touches) {
+namespace {
+
+/// Every wl_touch the client owning `surface` has bound.
+template <class F>
+void each_touch_of(std::vector<wl_resource*>& touches, Surface& surface, F&& send) {
+    wl_client* client = client_of(surface);
+    for (wl_resource* t : touches) {
         if (wl_resource_get_client(t) == client) {
-            wl_touch_send_down(t, serial, time, res, id, wl_fixed_from_double(x),
-                               wl_fixed_from_double(y));
+            send(t);
         }
     }
+}
+
+} // namespace
+
+void Seat::touch_down(Surface& surface, int32_t id, double x, double y) {
+    // A slot that is already down is a missed up; the new surface takes it.
+    std::erase_if(impl_->touch_points, [id](const Impl::TouchPoint& p) { return p.id == id; });
+    impl_->touch_points.push_back({id, surface.id()});
+    impl_->owe_touch_frame(surface.id());
+    wl_resource* res = surface.c_resource();
+    const uint32_t serial = impl_->next_serial();
+    const uint32_t time = now_ms();
+    each_touch_of(impl_->touches, surface, [&](wl_resource* t) {
+        wl_touch_send_down(t, serial, time, res, id, wl_fixed_from_double(x),
+                           wl_fixed_from_double(y));
+    });
 }
 
 void Seat::touch_motion(int32_t id, double x, double y) {
-    Surface* focus = surface_from_id(impl_->touch_focus);
+    Surface* focus = surface_from_id(touch_focus(id));
     if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(*focus);
+    impl_->owe_touch_frame(focus->id());
     const uint32_t time = now_ms();
-    for (wl_resource* t : impl_->touches) {
-        if (wl_resource_get_client(t) == client) {
-            wl_touch_send_motion(t, time, id, wl_fixed_from_double(x), wl_fixed_from_double(y));
-        }
-    }
+    each_touch_of(impl_->touches, *focus, [&](wl_resource* t) {
+        wl_touch_send_motion(t, time, id, wl_fixed_from_double(x), wl_fixed_from_double(y));
+    });
 }
 
 void Seat::touch_up(int32_t id) {
-    Surface* focus = surface_from_id(impl_->touch_focus);
+    Surface* focus = surface_from_id(touch_focus(id));
+    std::erase_if(impl_->touch_points, [id](const Impl::TouchPoint& p) { return p.id == id; });
     if (focus == nullptr) {
         return;
     }
-    wl_client* client = client_of(*focus);
+    impl_->owe_touch_frame(focus->id());
     const uint32_t serial = impl_->next_serial();
     const uint32_t time = now_ms();
-    for (wl_resource* t : impl_->touches) {
-        if (wl_resource_get_client(t) == client) {
-            wl_touch_send_up(t, serial, time, id);
-        }
-    }
+    each_touch_of(impl_->touches, *focus,
+                  [&](wl_resource* t) { wl_touch_send_up(t, serial, time, id); });
 }
 
 void Seat::touch_frame() {
-    for (wl_resource* t : impl_->touches) {
-        if (wl_resource_get_version(t) >= WL_TOUCH_FRAME_SINCE_VERSION) {
-            wl_touch_send_frame(t);
+    // Once per client, however many of its surfaces were touched.
+    std::vector<wl_client*> sent;
+    for (const SurfaceId owed : impl_->touch_owed) {
+        Surface* surface = surface_from_id(owed);
+        if (surface == nullptr || std::ranges::find(sent, client_of(*surface)) != sent.end()) {
+            continue;
         }
+        sent.push_back(client_of(*surface));
+        each_touch_of(impl_->touches, *surface, [](wl_resource* t) {
+            if (wl_resource_get_version(t) >= WL_TOUCH_FRAME_SINCE_VERSION) {
+                wl_touch_send_frame(t);
+            }
+        });
     }
+    impl_->touch_owed.clear();
 }
 
 void Seat::touch_cancel() {
-    for (wl_resource* t : impl_->touches) {
-        if (wl_resource_get_version(t) >= WL_TOUCH_CANCEL_SINCE_VERSION) {
-            wl_touch_send_cancel(t);
+    std::vector<wl_client*> sent;
+    for (const Impl::TouchPoint& p : impl_->touch_points) {
+        Surface* surface = surface_from_id(p.surface);
+        if (surface == nullptr || std::ranges::find(sent, client_of(*surface)) != sent.end()) {
+            continue;
+        }
+        sent.push_back(client_of(*surface));
+        each_touch_of(impl_->touches, *surface, [](wl_resource* t) {
+            if (wl_resource_get_version(t) >= WL_TOUCH_CANCEL_SINCE_VERSION) {
+                wl_touch_send_cancel(t);
+            }
+        });
+    }
+    impl_->touch_points.clear();
+    impl_->touch_owed.clear();
+}
+
+SurfaceId Seat::touch_focus(int32_t id) const noexcept {
+    for (const Impl::TouchPoint& p : impl_->touch_points) {
+        if (p.id == id) {
+            return p.surface;
         }
     }
-    impl_->touch_focus = {};
+    return {};
 }
 
 // --- drag and drop ---

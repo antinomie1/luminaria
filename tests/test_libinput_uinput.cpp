@@ -13,6 +13,12 @@
 // no character, a five-pixel pointer move and one wheel notch are recoverable,
 // and a button press — which would click whatever the cursor happens to be
 // over — is never sent.
+//
+// A touchscreen cannot be made harmless the same way: the desktop maps it onto
+// its own screen, and a touch there is a tap on whatever is under the finger.
+// So that half only runs when asked for with LUMINARIA_TEST_TOUCH=1 — on a CI
+// machine with no desktop, or one where a tap near the left middle of the
+// screen is known to be safe.
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
@@ -134,6 +140,51 @@ Uinput make_device(const char* name, const std::vector<uint16_t>& keys,
     device.node = node_of(device.fd);
     return device;
 }
+
+/// A two-finger multitouch screen (MT protocol B), 0..1000 on both axes.
+/// INPUT_PROP_DIRECT + ABS_X/Y + BTN_TOUCH is what udev calls a touchscreen.
+Uinput make_touchscreen(const char* name) {
+    Uinput device;
+    device.fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (device.fd < 0) {
+        return device;
+    }
+    ioctl(device.fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+    ioctl(device.fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(device.fd, UI_SET_KEYBIT, BTN_TOUCH);
+    ioctl(device.fd, UI_SET_EVBIT, EV_ABS);
+    const auto axis = [&](uint16_t code, int32_t min, int32_t max, int32_t resolution) {
+        ioctl(device.fd, UI_SET_ABSBIT, code);
+        struct uinput_abs_setup abs {};
+        abs.code = code;
+        abs.absinfo.minimum = min;
+        abs.absinfo.maximum = max;
+        abs.absinfo.resolution = resolution; // units per mm: a 100 mm panel
+        ioctl(device.fd, UI_ABS_SETUP, &abs);
+    };
+    axis(ABS_X, 0, 1000, 10);
+    axis(ABS_Y, 0, 1000, 10);
+    axis(ABS_MT_SLOT, 0, 1, 0);
+    axis(ABS_MT_TRACKING_ID, 0, 65535, 0);
+    axis(ABS_MT_POSITION_X, 0, 1000, 10);
+    axis(ABS_MT_POSITION_Y, 0, 1000, 10);
+    struct uinput_setup setup {};
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor = 0x4c55;
+    setup.id.product = 0x4d4a;
+    std::snprintf(setup.name, sizeof setup.name, "%s", name);
+    if (ioctl(device.fd, UI_DEV_SETUP, &setup) < 0 || ioctl(device.fd, UI_DEV_CREATE) < 0) {
+        close(device.fd);
+        device.fd = -1;
+        return device;
+    }
+    device.node = node_of(device.fd);
+    return device;
+}
+
+/// libinput normalises as (value - min) / (max - min + 1); the tolerance also
+/// admits a plain (max - min), so the test pins the space, not the rounding.
+bool near(double got, int32_t raw) { return std::abs(got - raw / 1000.0) < 1e-3; }
 
 /// Run the event loop for `ms`, so libinput gets to read what was injected.
 void pump(luminaria::Display& display, unsigned ms) {
@@ -265,5 +316,83 @@ int main() {
     assert(!backend->capabilities().pointer);
 
     keyboard.destroy();
+
+    // --- touch: two fingers down, one moves, both lift ---
+    const char* opt_in = std::getenv("LUMINARIA_TEST_TOUCH");
+    if (opt_in == nullptr || std::strcmp(opt_in, "1") != 0) {
+        std::fprintf(stderr, "note: touch not exercised; set LUMINARIA_TEST_TOUCH=1 "
+                             "(it taps the running desktop's screen)\n");
+        return 0;
+    }
+    Uinput screen = make_touchscreen("luminaria-test-touchscreen");
+    if (screen.fd < 0 || screen.node.empty()) {
+        std::fprintf(stderr, "skip: cannot create a uinput touchscreen (%s)\n",
+                     std::strerror(errno));
+        return 77;
+    }
+    // One record per event, in order, so the frames between them are checked.
+    struct Touch {
+        char kind; // d(own) m(otion) u(p) f(rame) c(ancel)
+        int32_t id;
+        double x, y;
+    };
+    std::vector<Touch> touches;
+    auto on_down = backend->touch_down().connect(
+        [&](luminaria::TouchDownEvent& e) { touches.push_back({'d', e.id, e.x, e.y}); });
+    auto on_tmotion = backend->touch_motion().connect(
+        [&](luminaria::TouchMotionEvent& e) { touches.push_back({'m', e.id, e.x, e.y}); });
+    auto on_up = backend->touch_up().connect(
+        [&](luminaria::TouchUpEvent& e) { touches.push_back({'u', e.id, 0, 0}); });
+    auto on_tframe = backend->touch_frame().connect(
+        [&](luminaria::TouchFrameEvent&) { touches.push_back({'f', -1, 0, 0}); });
+    auto on_cancel = backend->touch_cancel().connect(
+        [&](luminaria::TouchCancelEvent& e) { touches.push_back({'c', e.id, 0, 0}); });
+    assert(backend->add_device(screen.node));
+    pump(*display, 60);
+    assert(backend->capabilities().touch);
+
+    screen.emit(EV_ABS, ABS_MT_SLOT, 0);
+    screen.emit(EV_ABS, ABS_MT_TRACKING_ID, 1);
+    screen.emit(EV_ABS, ABS_MT_POSITION_X, 250);
+    screen.emit(EV_ABS, ABS_MT_POSITION_Y, 500);
+    screen.emit(EV_KEY, BTN_TOUCH, 1);
+    screen.emit(EV_ABS, ABS_X, 250);
+    screen.emit(EV_ABS, ABS_Y, 500);
+    screen.sync();
+    screen.emit(EV_ABS, ABS_MT_SLOT, 1);
+    screen.emit(EV_ABS, ABS_MT_TRACKING_ID, 2);
+    screen.emit(EV_ABS, ABS_MT_POSITION_X, 750);
+    screen.emit(EV_ABS, ABS_MT_POSITION_Y, 250);
+    screen.sync();
+    screen.emit(EV_ABS, ABS_MT_SLOT, 0);
+    screen.emit(EV_ABS, ABS_MT_POSITION_X, 300);
+    screen.emit(EV_ABS, ABS_X, 300);
+    screen.sync();
+    screen.emit(EV_ABS, ABS_MT_SLOT, 1);
+    screen.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    screen.sync();
+    screen.emit(EV_ABS, ABS_MT_SLOT, 0);
+    screen.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    screen.emit(EV_KEY, BTN_TOUCH, 0);
+    screen.sync();
+    pump(*display, 120);
+
+    assert(touches.size() == 10);
+    // Each sample is its own frame, so every event is followed by one.
+    for (size_t i = 1; i < touches.size(); i += 2) {
+        assert(touches[i].kind == 'f');
+    }
+    // The ids are seat slots: the first two free ones.
+    assert(touches[0].kind == 'd' && touches[0].id == 0);
+    assert(near(touches[0].x, 250) && near(touches[0].y, 500));
+    assert(touches[2].kind == 'd' && touches[2].id == 1);
+    assert(near(touches[2].x, 750) && near(touches[2].y, 250));
+    // Only the axis that changed moved; the other is carried over.
+    assert(touches[4].kind == 'm' && touches[4].id == 0);
+    assert(near(touches[4].x, 300) && near(touches[4].y, 500));
+    assert(touches[6].kind == 'u' && touches[6].id == 1);
+    assert(touches[8].kind == 'u' && touches[8].id == 0);
+
+    screen.destroy();
     return 0;
 }

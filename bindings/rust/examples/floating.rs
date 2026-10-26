@@ -157,7 +157,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         while let Some(event) = server.next_event() {
-            if log_events && !matches!(event, Event::PointerMotion { .. }) {
+            if log_events
+                && !matches!(
+                    event,
+                    Event::PointerMotion { .. } | Event::TouchMotion { .. }
+                )
+            {
                 println!("floating: {event:?}");
             }
             if handle(&mut server, &mut wm, event).is_break() {
@@ -286,6 +291,10 @@ fn handle(server: &mut Server, wm: &mut Wm, event: Event) -> ControlFlow<()> {
                 wm.focus(server, Some(id));
             }
         }
+        // A tap focuses like a click; the client under the finger already has it.
+        Event::TouchDown {
+            window: Some(id), ..
+        } => wm.focus(server, Some(id)),
         Event::PointerMotion { x, y, .. } => {
             wm.pointer = (x, y);
             match wm.grab {

@@ -77,6 +77,36 @@ enum class Transform : std::uint8_t {
     return static_cast<Transform>(flip | rot);
 }
 
+/// A point in units of a space's own size: (0,0) top-left, (1,1) bottom-right.
+struct UnitPoint {
+    double x, y;
+};
+
+/// Map a point given in units of the framebuffer — what a touchscreen glued
+/// to that panel reports — into the same units of the logical space, i.e. the
+/// output's layout box. The inverse of `transform_box` for one point; scale
+/// does not enter into it, because both sides are fractions of their size.
+[[nodiscard]] constexpr UnitPoint transform_unit_point(Transform t, UnitPoint device) noexcept {
+    UnitPoint p = device;
+    switch (transform_rotation(t)) {
+    case 90:
+        p = {device.y, 1.0 - device.x};
+        break;
+    case 180:
+        p = {1.0 - device.x, 1.0 - device.y};
+        break;
+    case 270:
+        p = {1.0 - device.y, device.x};
+        break;
+    default:
+        break;
+    }
+    if (transform_flipped(t)) {
+        p.x = 1.0 - p.x; // the flip happens first going out, so last coming back
+    }
+    return p;
+}
+
 /// Map a box from logical coordinates onto a `device_w`x`device_h` framebuffer.
 /// `scale` is the integer output scale: 2 means one logical unit is 2 pixels.
 ///

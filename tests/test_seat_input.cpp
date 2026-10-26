@@ -95,9 +95,12 @@ const wl_pointer_listener kPointerListener{ptr_enter,       ptr_leave,     ptr_m
                                            ptr_button,      ptr_axis,      ptr_frame,
                                            ptr_axis_source, ptr_axis_stop, ptr_axis_discrete};
 
-void touch_down(void* data, wl_touch*, uint32_t, uint32_t, wl_surface*, int32_t, wl_fixed_t x,
+void touch_down(void* data, wl_touch*, uint32_t, uint32_t, wl_surface*, int32_t id, wl_fixed_t x,
                 wl_fixed_t y) {
     auto* st = static_cast<ClientState*>(data);
+    if (id != 0) {
+        return; // the per-slot checks below are asserted on the server side
+    }
     st->got_touch_down = true;
     st->touch_x = wl_fixed_to_double(x);
     st->touch_y = wl_fixed_to_double(y);
@@ -198,6 +201,7 @@ int main() {
     };
     std::vector<CursorEvent> cursor_events;
     bool cursor_input_transparent = false;
+    bool touch_slots_ok = false;
 
     auto cc = seat->cursor_changed().connect([&](luminaria::SeatCursorChange& e) {
         luminaria::Surface* cursor = luminaria::surface_from_id(e.surface);
@@ -232,6 +236,18 @@ int main() {
             seat->touch_motion(0, 12.0, 23.0);
             seat->touch_up(0);
             seat->touch_frame();
+            // Two fingers on two surfaces: each slot stays with the surface
+            // it went down on, an up frees only its own, a cancel frees all.
+            seat->touch_down(*surface, 5, 1.0, 1.0);
+            seat->touch_down(*first_surface, 6, 1.0, 1.0);
+            seat->touch_motion(5, 2.0, 2.0);
+            seat->touch_frame();
+            bool ok = seat->touch_focus(5) == surface->id() &&
+                      seat->touch_focus(6) == first_surface->id() && !seat->touch_focus(0).valid();
+            seat->touch_up(6);
+            ok = ok && !seat->touch_focus(6).valid() && seat->touch_focus(5) == surface->id();
+            seat->touch_cancel();
+            touch_slots_ok = ok && !seat->touch_focus(5).valid();
         }));
     });
 
@@ -260,6 +276,7 @@ int main() {
     assert(g_client.got_touch_motion);
     assert(g_client.got_touch_up);
     assert(g_client.got_touch_frame);
+    assert(touch_slots_ok);
 
     assert(cursor_set);
     assert(cursor_surface_is_first);
