@@ -3,7 +3,7 @@
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
 use crate::util::{Color, Mode, Transform};
 
@@ -74,7 +74,7 @@ impl Output {
         if self.pin().set_mode(width, height, refresh_mhz, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -86,7 +86,7 @@ impl Output {
         {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -100,7 +100,7 @@ impl Output {
         if self.pin().commit_frame(rgba, width, height, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -117,7 +117,7 @@ impl Output {
         if self.pin().move_cursor(x, y, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -126,7 +126,7 @@ impl Output {
         if self.pin().hide_cursor(&mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -223,7 +223,7 @@ impl<'d> HeadlessBackend<'d> {
         let mut err = String::new();
         let raw = ffi::headless_backend_new(&display.raw, interval_ms, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -232,7 +232,7 @@ impl<'d> HeadlessBackend<'d> {
     pub fn add_output(&mut self, width: i32, height: i32) -> Result<Output, Error> {
         let raw_output = self.raw.pin_mut().add_output(width, height);
         if raw_output.is_null() {
-            Err(Error("failed to create headless output".into()))
+            Err(Error::new(ErrorKind::Backend, "failed to create headless output"))
         } else {
             Ok(Output::from_raw(raw_output))
         }
@@ -243,7 +243,7 @@ impl<'d> HeadlessBackend<'d> {
         if self.raw.pin_mut().start(&mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 }
@@ -260,7 +260,7 @@ impl<'d> WaylandBackend<'d> {
         let mut err = String::new();
         let raw = ffi::wayland_backend_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -269,7 +269,7 @@ impl<'d> WaylandBackend<'d> {
     pub fn add_output(&mut self, width: i32, height: i32) -> Result<Output, Error> {
         let raw_output = self.raw.pin_mut().add_output(width, height);
         if raw_output.is_null() {
-            Err(Error("failed to create wayland output".into()))
+            Err(Error::new(ErrorKind::Backend, "failed to create wayland output"))
         } else {
             Ok(Output::from_raw(raw_output))
         }
@@ -280,7 +280,7 @@ impl<'d> WaylandBackend<'d> {
         if self.raw.pin_mut().start(&mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -360,7 +360,7 @@ impl<'d> Session<'d> {
         let mut err = String::new();
         let raw = ffi::session_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -371,7 +371,7 @@ impl<'d> Session<'d> {
         if self.raw.switch_to(vt, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -416,7 +416,7 @@ impl<'a> DrmBackend<'a> {
             ffi::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
         };
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -429,7 +429,7 @@ impl<'a> DrmBackend<'a> {
         if self.raw.pin_mut().start(&mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -499,7 +499,7 @@ impl<'a> LibinputBackend<'a> {
             ffi::libinput_backend_new_standalone(&display.raw, &mut err)
         };
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -514,7 +514,7 @@ impl<'a> LibinputBackend<'a> {
             ffi::libinput_backend_new_path_standalone(&display.raw, &mut err)
         };
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -525,7 +525,7 @@ impl<'a> LibinputBackend<'a> {
         if self.raw.pin_mut().start(&mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 
@@ -534,7 +534,7 @@ impl<'a> LibinputBackend<'a> {
         if self.raw.pin_mut().add_device(path, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Backend, err))
         }
     }
 

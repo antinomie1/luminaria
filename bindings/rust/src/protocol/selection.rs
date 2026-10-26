@@ -3,7 +3,7 @@
 
 use std::os::fd::{IntoRawFd, OwnedFd};
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
 
 use super::Seat;
@@ -21,7 +21,7 @@ macro_rules! selection_manager {
                 let mut err = String::new();
                 let raw = ffi::$new(&display.raw, &seat.raw, &mut err);
                 if raw.is_null() {
-                    Err(Error(err))
+                    Err(Error::new(ErrorKind::Protocol, err))
                 } else {
                     Ok(Self { raw, _borrows: Holds::new() })
                 }

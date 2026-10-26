@@ -9,16 +9,91 @@ use std::time::Duration;
 
 use crate::ffi;
 
+/// Category of error originating from luminaria operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Failure during initialization of core objects (display, socket, shm).
+    Init,
+    /// Failure in event loop dispatch or source handling.
+    EventLoop,
+    /// Backend failure (DRM modesetting, libinput, session, headless, nested).
+    Backend,
+    /// GPU or Vulkan rendering failure.
+    Gpu,
+    /// Wayland protocol global creation or request processing failure.
+    Protocol,
+    /// Shell layout, compositing, or tree failure.
+    Shell,
+    /// Invalid arguments, bounds, or buffer dimensions.
+    InvalidArgument,
+    /// Other unclassified or internal error.
+    Other,
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Init => write!(f, "initialization error"),
+            Self::EventLoop => write!(f, "event loop error"),
+            Self::Backend => write!(f, "backend error"),
+            Self::Gpu => write!(f, "gpu error"),
+            Self::Protocol => write!(f, "protocol error"),
+            Self::Shell => write!(f, "shell error"),
+            Self::InvalidArgument => write!(f, "invalid argument"),
+            Self::Other => write!(f, "other error"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(pub(crate) String);
+pub struct Error {
+    pub(crate) kind: ErrorKind,
+    pub(crate) message: String,
+}
+
+impl Error {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Self {
+            kind: ErrorKind::Other,
+            message: s,
+        }
+    }
+}
+
+impl From<&str> for Error {
+    fn from(s: &str) -> Self {
+        Self {
+            kind: ErrorKind::Other,
+            message: s.to_owned(),
+        }
+    }
+}
 
 /// What a wrapper keeps borrowed for as long as it lives: the C++ object behind
 /// it holds a reference or pointer to whatever `'a` was taken from.
@@ -50,7 +125,7 @@ impl Display {
         let mut err = String::new();
         let raw = ffi::display_new(&mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Init, err))
         } else {
             Ok(Self { raw })
         }
@@ -61,7 +136,7 @@ impl Display {
         let mut err = String::new();
         let name = self.raw.add_socket_auto(&mut err);
         if name.is_empty() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Init, err))
         } else {
             Ok(name)
         }
@@ -73,7 +148,7 @@ impl Display {
         if self.raw.add_socket(name, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Init, err))
         }
     }
 
@@ -83,7 +158,7 @@ impl Display {
         if self.raw.init_shm(&mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Init, err))
         }
     }
 
@@ -102,7 +177,7 @@ impl Display {
         let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
         let ret = self.raw.dispatch(ms);
         if ret < 0 {
-            Err(Error(format!("event loop dispatch error: {ret}")))
+            Err(Error::new(ErrorKind::EventLoop, format!("event loop dispatch error: {ret}")))
         } else {
             Ok(ret)
         }

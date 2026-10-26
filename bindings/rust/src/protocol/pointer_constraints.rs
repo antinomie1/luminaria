@@ -1,6 +1,6 @@
 //! pointer-constraints: games and 3D views locking or confining the pointer.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 use crate::util::Rect;
 
@@ -37,7 +37,7 @@ impl<'a> PointerConstraints<'a> {
         let mut err = String::new();
         let raw = ffi::pointer_constraints_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }

@@ -10,8 +10,8 @@ Crate 逐类型公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop` 三个
 
 Crate 按库的职责分层组织为以下模块：
 
-- **`core`**：`Display`（拥有 `wl_display` 和事件循环）、`EventLoop`、`KeyRouter`、`Error`。
-- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`。
+- **`core`**：`Display`（拥有 `wl_display` 和事件循环）、`EventLoop`、`KeyRouter`、`Error`（可模式匹配的 `ErrorKind` 分类）。
+- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Point`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`（可选 `mint` 与 `glam` 特性支持零样板几何转换）。
 - **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）、`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）。
 - **`protocol`**：Wayland 核心协议全局对象：`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
 - **`gpu`**（对应 `luminaria.gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退）、`SceneOutput`、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
@@ -72,6 +72,7 @@ display.flush_clients();
 ```sh
 cargo run --example minimal                                        # 嵌套在当前桌面
 LUMINARIA_BACKEND=headless LUMINARIA_EXIT_MS=500 cargo run --example minimal  # 冒烟测试
+cargo run --example calloop                                        # calloop 事件循环集成示例
 ```
 
 更多组装细节可参考 `tests/test_custom_compositor.rs`。
@@ -103,19 +104,56 @@ LUMINARIA_BACKEND=headless LUMINARIA_EXIT_MS=500 cargo run --example minimal  # 
 
 ## 外部事件循环集成
 
-`Display` 和 `EventLoop` 均实现了 `AsFd` 与 `AsRawFd`，可以直接嵌入外部事件循环（如 `poll`、`epoll`、`mio`、`calloop`）：
+`Display` 和 `EventLoop` 均实现了 `AsFd` 与 `AsRawFd`，可以直接嵌入外部事件循环（如 `calloop`、`epoll`、`tokio`）。
+
+### Calloop
+
+参见完整工作示例 `examples/calloop.rs`：将 `Display` 的底层事件循环文件描述符包装为 `calloop::generic::Generic` 注册至事件循环，在可读回调中执行非阻塞 `display.dispatch(Some(Duration::ZERO))` 并排干协议事件队列：
 
 ```rust
 use std::os::fd::AsRawFd;
 use std::time::Duration;
+use calloop::{generic::{FdWrapper, Generic}, EventLoop, Interest, Mode, PostAction};
 use luminaria::core::Display;
 
+let mut event_loop = EventLoop::<()>::try_new()?;
+let handle = event_loop.handle();
 let display = Display::new()?;
-let loop_fd = display.as_raw_fd();
 
-// 注册 loop_fd 到外部事件循环的读事件。当可读时进行非阻塞派发：
-display.dispatch(Some(Duration::ZERO))?;
-display.flush_clients();
+// Safe: display 活过事件循环
+unsafe {
+    handle.insert_source(
+        Generic::new(FdWrapper::new(display.as_raw_fd()), Interest::READ, Mode::Level),
+        |_readiness, _fd, _shared| {
+            display.dispatch(Some(Duration::ZERO))?;
+            // 排干事件队列并按需渲染...
+            Ok(PostAction::Continue)
+        },
+    )?;
+}
+```
+
+### Tokio
+
+注意 luminaria 的所有对象均**未实现 `Send`**（单线程事件循环架构）。使用 Tokio 时：
+1. 必须使用单线程运行时（`tokio::runtime::Builder::new_current_thread()`）或在 `tokio::task::LocalSet` 内运行。
+2. 将 `display.as_fd()` 包装进 `tokio::io::unix::AsyncFd`：
+
+```rust
+use std::os::fd::AsFd;
+use std::time::Duration;
+use tokio::io::unix::AsyncFd;
+use luminaria::core::Display;
+
+async fn run(display: Display) -> Result<(), Box<dyn std::error::Error>> {
+    let async_fd = AsyncFd::new(display.as_fd())?;
+    loop {
+        let mut guard = async_fd.readable().await?;
+        display.dispatch(Some(Duration::ZERO))?;
+        // 在此处排干协议事件队列...
+        guard.clear_ready();
+    }
+}
 ```
 
 ---

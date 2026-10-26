@@ -1,7 +1,7 @@
 //! Shell primitives: OutputLayout, immediate-mode SceneItem, hit-testing, and software CpuCompositor.
 
 use crate::backend::Output;
-use crate::core::Error;
+use crate::core::{Error, ErrorKind};
 use crate::ffi;
 use crate::protocol::{Layer, LayerShell, SurfaceId, XdgShell};
 use crate::util::{Color, Rect};
@@ -21,7 +21,7 @@ impl OutputLayout {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi::output_layout_new();
         if raw.is_null() {
-            Err(Error("failed to create output layout".into()))
+            Err(Error::new(ErrorKind::Shell, "failed to create output layout"))
         } else {
             Ok(Self { raw })
         }
@@ -273,7 +273,7 @@ impl CpuCompositor {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi::cpu_compositor_new();
         if raw.is_null() {
-            Err(Error("failed to create cpu compositor".into()))
+            Err(Error::new(ErrorKind::Shell, "failed to create cpu compositor"))
         } else {
             Ok(Self { raw })
         }
@@ -319,7 +319,7 @@ impl PopupTree {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi::popup_tree_new();
         if raw.is_null() {
-            Err(Error("failed to create popup tree".into()))
+            Err(Error::new(ErrorKind::Shell, "failed to create popup tree"))
         } else {
             Ok(Self { raw })
         }
@@ -389,7 +389,7 @@ impl LayerManager {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi::layer_manager_new();
         if raw.is_null() {
-            Err(Error("failed to create layer manager".into()))
+            Err(Error::new(ErrorKind::Shell, "failed to create layer manager"))
         } else {
             Ok(Self { raw })
         }

@@ -1,7 +1,7 @@
 //! Idle: clients that keep the screen awake (idle-inhibit) and clients told
 //! when the user went idle (ext-idle-notify).
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 
 use super::SurfaceId;
@@ -30,7 +30,7 @@ impl<'d> IdleInhibitManager<'d> {
         let mut err = String::new();
         let raw = ffi::idle_inhibit_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -109,7 +109,7 @@ impl<'d> IdleNotifier<'d> {
         let mut err = String::new();
         let raw = ffi::idle_notifier_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }

@@ -1,7 +1,7 @@
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-use luminaria::core::{Display, KeyRouter};
+use luminaria::core::{Display, Error, ErrorKind, KeyRouter};
 
 #[test]
 fn test_display_creation_and_sockets() {
@@ -40,4 +40,24 @@ fn test_key_router() {
     assert!(router.unconsume(1));
     assert!(!router.is_consumed(1));
     assert!(!router.unconsume(1));
+}
+
+#[test]
+fn test_error_kind_matching() {
+    let err = Error::new(ErrorKind::Init, "socket bind failed");
+    match err.kind() {
+        ErrorKind::Init => {}
+        _ => panic!("expected ErrorKind::Init"),
+    }
+    assert_eq!(err.message(), "socket bind failed");
+    assert_eq!(err.to_string(), "socket bind failed");
+
+    // Verify std::error::Error impl
+    let std_err: &dyn std::error::Error = &err;
+    assert_eq!(std_err.to_string(), "socket bind failed");
+
+    // Verify From<String> and From<&str>
+    let from_str: Error = "test error".into();
+    assert_eq!(from_str.kind(), ErrorKind::Other);
+    assert_eq!(from_str.message(), "test error");
 }

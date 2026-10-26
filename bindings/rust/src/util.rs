@@ -48,6 +48,79 @@ impl Color {
     }
 }
 
+impl From<(f32, f32, f32, f32)> for Color {
+    fn from((r, g, b, a): (f32, f32, f32, f32)) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
+impl From<Color> for (f32, f32, f32, f32) {
+    fn from(c: Color) -> Self {
+        (c.r, c.g, c.b, c.a)
+    }
+}
+
+impl From<[f32; 4]> for Color {
+    fn from([r, g, b, a]: [f32; 4]) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
+impl From<Color> for [f32; 4] {
+    fn from(c: Color) -> Self {
+        [c.r, c.g, c.b, c.a]
+    }
+}
+
+impl From<(f32, f32, f32)> for Color {
+    fn from((r, g, b): (f32, f32, f32)) -> Self {
+        Self::rgb(r, g, b)
+    }
+}
+
+impl From<[f32; 3]> for Color {
+    fn from([r, g, b]: [f32; 3]) -> Self {
+        Self::rgb(r, g, b)
+    }
+}
+
+/// A 2D point.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Point<T = f64> {
+    pub x: T,
+    pub y: T,
+}
+
+impl<T> Point<T> {
+    pub const fn new(x: T, y: T) -> Self {
+        Self { x, y }
+    }
+}
+
+impl<T> From<(T, T)> for Point<T> {
+    fn from((x, y): (T, T)) -> Self {
+        Self { x, y }
+    }
+}
+
+impl<T> From<Point<T>> for (T, T) {
+    fn from(p: Point<T>) -> Self {
+        (p.x, p.y)
+    }
+}
+
+impl<T> From<[T; 2]> for Point<T> {
+    fn from([x, y]: [T; 2]) -> Self {
+        Self { x, y }
+    }
+}
+
+impl<T> From<Point<T>> for [T; 2] {
+    fn from(p: Point<T>) -> Self {
+        [p.x, p.y]
+    }
+}
+
 /// A rectangle in global logical coordinates.
 pub use ffi::Rect;
 
@@ -67,6 +140,14 @@ impl Rect {
             width,
             height,
         }
+    }
+
+    pub const fn origin(&self) -> Point<i32> {
+        Point::new(self.x, self.y)
+    }
+
+    pub const fn size(&self) -> Point<i32> {
+        Point::new(self.width, self.height)
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -136,6 +217,42 @@ impl Rect {
             r.height = (self.height + dy).max(min_h);
         }
         r
+    }
+}
+
+impl From<(i32, i32, i32, i32)> for Rect {
+    fn from((x, y, width, height): (i32, i32, i32, i32)) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+impl From<Rect> for (i32, i32, i32, i32) {
+    fn from(r: Rect) -> Self {
+        (r.x, r.y, r.width, r.height)
+    }
+}
+
+impl From<[i32; 4]> for Rect {
+    fn from([x, y, width, height]: [i32; 4]) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+impl From<Rect> for [i32; 4] {
+    fn from(r: Rect) -> Self {
+        [r.x, r.y, r.width, r.height]
+    }
+}
+
+impl From<(Point<i32>, Point<i32>)> for Rect {
+    fn from((origin, size): (Point<i32>, Point<i32>)) -> Self {
+        Self { x: origin.x, y: origin.y, width: size.x, height: size.y }
+    }
+}
+
+impl From<Rect> for (Point<i32>, Point<i32>) {
+    fn from(r: Rect) -> Self {
+        (Point::new(r.x, r.y), Point::new(r.width, r.height))
     }
 }
 
@@ -298,7 +415,7 @@ impl KeymapState {
         let mut err = String::new();
         let raw = ffi::keymap_state_from_layout(layout, &mut err);
         if raw.is_null() {
-            Err(crate::core::Error(err))
+            Err(crate::core::Error::new(crate::core::ErrorKind::InvalidArgument, err))
         } else {
             Ok(Self { raw })
         }
@@ -308,7 +425,7 @@ impl KeymapState {
         let mut err = String::new();
         let raw = ffi::keymap_state_from_text(text, &mut err);
         if raw.is_null() {
-            Err(crate::core::Error(err))
+            Err(crate::core::Error::new(crate::core::ErrorKind::InvalidArgument, err))
         } else {
             Ok(Self { raw })
         }
@@ -361,3 +478,148 @@ pub fn layout_fits(
 
 /// One display mode a monitor supports.
 pub use ffi::Mode;
+
+#[cfg(feature = "mint")]
+mod mint_impls {
+    use super::*;
+
+    impl<T> From<mint::Point2<T>> for Point<T> {
+        fn from(p: mint::Point2<T>) -> Self {
+            Self { x: p.x, y: p.y }
+        }
+    }
+
+    impl<T> From<Point<T>> for mint::Point2<T> {
+        fn from(p: Point<T>) -> Self {
+            Self { x: p.x, y: p.y }
+        }
+    }
+
+    impl<T> From<mint::Vector2<T>> for Point<T> {
+        fn from(v: mint::Vector2<T>) -> Self {
+            Self { x: v.x, y: v.y }
+        }
+    }
+
+    impl<T> From<Point<T>> for mint::Vector2<T> {
+        fn from(p: Point<T>) -> Self {
+            Self { x: p.x, y: p.y }
+        }
+    }
+
+    impl From<mint::Vector4<f32>> for Color {
+        fn from(v: mint::Vector4<f32>) -> Self {
+            Self { r: v.x, g: v.y, b: v.z, a: v.w }
+        }
+    }
+
+    impl From<Color> for mint::Vector4<f32> {
+        fn from(c: Color) -> Self {
+            Self { x: c.r, y: c.g, z: c.b, w: c.a }
+        }
+    }
+
+    impl From<mint::Vector4<i32>> for Rect {
+        fn from(v: mint::Vector4<i32>) -> Self {
+            Self { x: v.x, y: v.y, width: v.z, height: v.w }
+        }
+    }
+
+    impl From<Rect> for mint::Vector4<i32> {
+        fn from(r: Rect) -> Self {
+            Self { x: r.x, y: r.y, z: r.width, w: r.height }
+        }
+    }
+
+    impl From<(mint::Point2<i32>, mint::Vector2<i32>)> for Rect {
+        fn from((p, v): (mint::Point2<i32>, mint::Vector2<i32>)) -> Self {
+            Self { x: p.x, y: p.y, width: v.x, height: v.y }
+        }
+    }
+
+    impl From<Rect> for (mint::Point2<i32>, mint::Vector2<i32>) {
+        fn from(r: Rect) -> Self {
+            (
+                mint::Point2 { x: r.x, y: r.y },
+                mint::Vector2 { x: r.width, y: r.height },
+            )
+        }
+    }
+}
+
+#[cfg(feature = "glam")]
+mod glam_impls {
+    use super::*;
+
+    impl From<glam::Vec4> for Color {
+        fn from(v: glam::Vec4) -> Self {
+            Self { r: v.x, g: v.y, b: v.z, a: v.w }
+        }
+    }
+
+    impl From<Color> for glam::Vec4 {
+        fn from(c: Color) -> Self {
+            Self::new(c.r, c.g, c.b, c.a)
+        }
+    }
+
+    impl From<glam::DVec2> for Point<f64> {
+        fn from(v: glam::DVec2) -> Self {
+            Self { x: v.x, y: v.y }
+        }
+    }
+
+    impl From<Point<f64>> for glam::DVec2 {
+        fn from(p: Point<f64>) -> Self {
+            Self::new(p.x, p.y)
+        }
+    }
+
+    impl From<glam::Vec2> for Point<f32> {
+        fn from(v: glam::Vec2) -> Self {
+            Self { x: v.x, y: v.y }
+        }
+    }
+
+    impl From<Point<f32>> for glam::Vec2 {
+        fn from(p: Point<f32>) -> Self {
+            Self::new(p.x, p.y)
+        }
+    }
+
+    impl From<glam::IVec2> for Point<i32> {
+        fn from(v: glam::IVec2) -> Self {
+            Self { x: v.x, y: v.y }
+        }
+    }
+
+    impl From<Point<i32>> for glam::IVec2 {
+        fn from(p: Point<i32>) -> Self {
+            Self::new(p.x, p.y)
+        }
+    }
+
+    impl From<glam::IVec4> for Rect {
+        fn from(v: glam::IVec4) -> Self {
+            Self { x: v.x, y: v.y, width: v.z, height: v.w }
+        }
+    }
+
+    impl From<Rect> for glam::IVec4 {
+        fn from(r: Rect) -> Self {
+            Self::new(r.x, r.y, r.width, r.height)
+        }
+    }
+
+    impl From<(glam::IVec2, glam::IVec2)> for Rect {
+        fn from((p, s): (glam::IVec2, glam::IVec2)) -> Self {
+            Self { x: p.x, y: p.y, width: s.x, height: s.y }
+        }
+    }
+
+    impl From<Rect> for (glam::IVec2, glam::IVec2) {
+        fn from(r: Rect) -> Self {
+            (glam::IVec2::new(r.x, r.y), glam::IVec2::new(r.width, r.height))
+        }
+    }
+}

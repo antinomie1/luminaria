@@ -134,3 +134,43 @@ fn presentation_link_survives_either_drop_order() {
     }
     drop(presentation);
 }
+
+#[test]
+fn test_scene_renderer_images_and_dmabuf() {
+    let display = Display::new().expect("Display failed");
+    display.init_shm().expect("shm failed");
+
+    let renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
+
+    // LinuxDmabuf from SceneRenderer
+    let dmabuf = LinuxDmabuf::from_scene_renderer(&display, &renderer);
+    assert!(dmabuf.is_ok(), "LinuxDmabuf::from_scene_renderer should succeed");
+    let dmabuf2 = renderer.create_linux_dmabuf(&display);
+    assert!(dmabuf2.is_ok(), "renderer.create_linux_dmabuf should succeed");
+
+    // Test image management
+    assert!(!renderer.has_image(42));
+    let raw_rgba = vec![255u8; 16 * 16 * 4];
+    assert!(renderer.set_image(42, 16, 16, &raw_rgba).is_ok());
+    assert!(renderer.has_image(42));
+
+    // Invalid dimensions or size
+    assert!(renderer.set_image(43, 0, 16, &raw_rgba).is_err());
+    assert!(renderer.set_image(43, 16, 16, &raw_rgba[..10]).is_err());
+
+    let mut backend = HeadlessBackend::new(&display, 16).expect("HeadlessBackend failed");
+    let mut output = backend.add_output(320, 240).expect("add_output failed");
+    let mut state = SceneOutput::new();
+    renderer.reset(&mut state, &mut output, 0x34325258).expect("reset failed");
+
+    let scene = vec![
+        SceneItem::rect(Rect::new(0, 0, 320, 240), Color::rgb(0.1, 0.1, 0.1)),
+        SceneItem::image(Rect::new(10, 10, 16, 16), 42),
+    ];
+    let outcome = renderer.present(&mut state, &mut output, &scene, Color::rgb(0.0, 0.0, 0.0));
+    assert!(outcome.is_ok(), "present with image item should succeed: {outcome:?}");
+
+    renderer.remove_image(42);
+    assert!(!renderer.has_image(42));
+    renderer.clear_images();
+}

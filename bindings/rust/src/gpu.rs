@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::pin::Pin;
 
 use crate::backend::Output;
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
 use crate::protocol::{Presentation, Seat, SurfaceId};
 use crate::shell::{OutputLayout, SceneItem};
@@ -96,7 +96,7 @@ impl VulkanRenderer {
         let (has_drm, drm) = options.drm_device_raw();
         let raw = ffi::vulkan_renderer_new(has_drm, &drm, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self { raw })
         }
@@ -130,7 +130,22 @@ impl<'a> LinuxDmabuf<'a> {
             ffi::linux_dmabuf_new_headless(&display.raw, &mut err)
         };
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
+        } else {
+            Ok(Self { raw, _borrows: Holds::new() })
+        }
+    }
+
+    /// Create `LinuxDmabuf` backed by the GPU of a [`SceneRenderer`]. If the
+    /// renderer fell back to the CPU, a headless dmabuf manager is created.
+    pub fn from_scene_renderer(
+        display: &'a Display,
+        renderer: &'a SceneRenderer,
+    ) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::linux_dmabuf_new_from_scene_renderer(&display.raw, &renderer.raw, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -149,7 +164,7 @@ impl<'d> DrmSyncobjManager<'d> {
         let mut err = String::new();
         let raw = ffi::drm_syncobj_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -168,7 +183,7 @@ impl<'d> ScreencopyManager<'d> {
         let mut err = String::new();
         let raw = ffi::screencopy_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -239,7 +254,7 @@ impl SceneRenderer {
         let (has_drm, drm) = options.drm_device_raw();
         let raw = ffi::scene_renderer_new(has_drm, &drm, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self { raw })
         }
@@ -270,7 +285,7 @@ impl SceneRenderer {
         {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         }
     }
 
@@ -296,7 +311,7 @@ impl SceneRenderer {
             &mut err,
         );
         if res < 0 {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(SceneOutcome::from_raw(res))
         }
@@ -331,10 +346,47 @@ impl SceneRenderer {
         let mut s_pin = state.raw.pin_mut();
         let vec = self.raw.read_back(s_pin.as_mut(), &mut err);
         if vec.is_empty() && !err.is_empty() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(vec)
         }
+    }
+
+    /// Create [`LinuxDmabuf`] backed by this renderer's GPU.
+    pub fn create_linux_dmabuf<'a>(&'a self, display: &'a Display) -> Result<LinuxDmabuf<'a>, Error> {
+        LinuxDmabuf::from_scene_renderer(display, self)
+    }
+
+    /// Register compositor-owned image pixels for a given serial, accepting
+    /// tightly-packed RGBA `&[u8]` pixels (e.g. from the `image` crate).
+    pub fn set_image(
+        &self,
+        serial: u64,
+        width: i32,
+        height: i32,
+        rgba: &[u8],
+    ) -> Result<(), Error> {
+        let mut err = String::new();
+        if self.raw.set_image(serial, width, height, rgba, &mut err) {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::InvalidArgument, err))
+        }
+    }
+
+    /// Remove previously registered image pixels for `serial`.
+    pub fn remove_image(&self, serial: u64) {
+        self.raw.remove_image(serial);
+    }
+
+    /// Clear all registered images.
+    pub fn clear_images(&self) {
+        self.raw.clear_images();
+    }
+
+    /// Whether an image is registered under `serial`.
+    pub fn has_image(&self, serial: u64) -> bool {
+        self.raw.has_image(serial)
     }
 }
 
@@ -384,7 +436,7 @@ impl<'a> Cursor<'a> {
         let mut err = String::new();
         let raw = ffi::cursor_new(&renderer.raw, &layout.raw, &seat.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self {
                 raw,
@@ -405,7 +457,7 @@ impl<'a> Cursor<'a> {
         let mut err = String::new();
         let raw = ffi::cursor_new_with_shapes(&renderer.raw, &layout.raw, &seat.raw, &shapes.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self {
                 raw,
@@ -480,7 +532,7 @@ impl<'r> Frame<'r> {
         let mut o_pin = output.raw.pin_mut();
         let raw = ffi::frame_new(o_pin.as_mut(), &renderer.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Self {
                 raw,
@@ -498,7 +550,7 @@ impl<'r> Frame<'r> {
         if self.pin().reset(drm_format, &mut err) {
             Ok(())
         } else {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         }
     }
 
@@ -530,7 +582,7 @@ impl<'r> Frame<'r> {
             &mut err,
         );
         if res < 0 {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Gpu, err))
         } else {
             Ok(Presented::from_raw(res))
         }
@@ -555,7 +607,7 @@ impl DirectScanout {
         let mut o_pin = output.raw.pin_mut();
         let raw = ffi::direct_scanout_new(o_pin.as_mut());
         if raw.is_null() {
-            Err(Error("failed to initialize direct scanout".into()))
+            Err(Error::new(ErrorKind::Gpu, "failed to initialize direct scanout"))
         } else {
             Ok(Self { raw })
         }

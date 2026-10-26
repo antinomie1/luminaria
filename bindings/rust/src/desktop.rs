@@ -1,6 +1,6 @@
 //! Desktop shell protocols: taskbars, workspaces, screen locking, output configuration, and input methods.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 use crate::gpu::VulkanRenderer;
 use crate::protocol::{DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell};
@@ -54,7 +54,7 @@ impl<'d> ForeignToplevelManager<'d> {
         let mut err = String::new();
         let raw = ffi::foreign_toplevel_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -127,7 +127,7 @@ impl<'d> WorkspaceManager<'d> {
         let mut err = String::new();
         let raw = ffi::workspace_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -203,7 +203,7 @@ impl<'d> SessionLockManager<'d> {
         let mut err = String::new();
         let raw = ffi::session_lock_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -352,7 +352,7 @@ impl<'a> OutputManager<'a> {
         let mut err = String::new();
         let raw = ffi::output_manager_new(&display.raw, &layout.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -392,7 +392,7 @@ impl<'a> DataControlManager<'a> {
         let mut err = String::new();
         let raw = ffi::data_control_manager_new(&display.raw, &ddm.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -431,7 +431,7 @@ impl<'a> InputMethodManager<'a> {
         let mut err = String::new();
         let raw = ffi::input_method_manager_new(&display.raw, &seat.raw, &tim.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
@@ -539,7 +539,7 @@ impl<'a> DesktopGlobals<'a> {
             ffi::desktop_globals_new_headless(&display.raw, seat_name, &mut err)
         };
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }

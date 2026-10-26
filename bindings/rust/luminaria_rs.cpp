@@ -1104,7 +1104,13 @@ rust::Vec<rust::String> to_rust(const std::vector<std::string>& v) {
     return out;
 }
 
-lm::SceneItem scene_item(const SceneItemRaw& raw) {
+struct StoredImage {
+    int width = 0;
+    int height = 0;
+    std::vector<lm::Pixel> pixels;
+};
+
+lm::SceneItem scene_item(const SceneItemRaw& raw, const std::unordered_map<std::uint64_t, StoredImage>* images = nullptr) {
     lm::SceneItem it{};
     it.kind = static_cast<lm::SceneItem::Kind>(raw.kind);
     it.box = lm::Box{raw.x, raw.y, raw.width, raw.height};
@@ -1122,13 +1128,19 @@ lm::SceneItem scene_item(const SceneItemRaw& raw) {
     it.blur.xray = raw.blur_xray;
     it.shadow.color = lm::Color{raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a};
     it.shadow.feather = raw.shadow_feather;
+    if (it.kind == lm::SceneItem::Kind::image && images != nullptr) {
+        auto it_img = images->find(it.serial);
+        if (it_img != images->end()) {
+            it.pixels = std::span<const lm::Pixel>{it_img->second.pixels.data(), it_img->second.pixels.size()};
+        }
+    }
     return it;
 }
 
-std::vector<lm::SceneItem> scene_items(rust::Slice<const SceneItemRaw> items) {
+std::vector<lm::SceneItem> scene_items(rust::Slice<const SceneItemRaw> items, const std::unordered_map<std::uint64_t, StoredImage>* images = nullptr) {
     std::vector<lm::SceneItem> scene;
     scene.reserve(items.size());
-    for (const auto& raw : items) scene.push_back(scene_item(raw));
+    for (const auto& raw : items) scene.push_back(scene_item(raw, images));
     return scene;
 }
 
@@ -1668,6 +1680,9 @@ Rect LayerShellShim::arrange(std::uint64_t surface_id, Rect full, Rect& usable) 
 
 struct OutputGlobalShim::Impl {
     std::optional<lm::OutputGlobal> global;
+    std::int32_t logical_x = 0;
+    std::int32_t logical_y = 0;
+    std::int32_t refresh_mhz = 60000;
 };
 OutputGlobalShim::~OutputGlobalShim() = default;
 OutputGlobalShim::OutputGlobalShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1689,9 +1704,12 @@ std::unique_ptr<OutputGlobalShim> output_global_new(const DisplayShim& display, 
 }
 
 void OutputGlobalShim::set_logical_position(std::int32_t x, std::int32_t y) const {
+    impl_->logical_x = x;
+    impl_->logical_y = y;
     if (impl_->global) impl_->global->set_logical_position(x, y);
 }
 void OutputGlobalShim::set_mode(std::int32_t width, std::int32_t height, std::int32_t refresh_mhz) const {
+    if (refresh_mhz > 0) impl_->refresh_mhz = refresh_mhz;
     if (impl_->global) impl_->global->set_mode(width, height, refresh_mhz);
 }
 void OutputGlobalShim::set_scale(std::int32_t scale) const {
@@ -1700,6 +1718,17 @@ void OutputGlobalShim::set_scale(std::int32_t scale) const {
 void OutputGlobalShim::set_transform(std::uint32_t transform) const {
     if (impl_->global) impl_->global->set_transform(static_cast<lm::Transform>(transform));
 }
+
+std::int32_t OutputGlobalShim::logical_x() const { return impl_->logical_x; }
+std::int32_t OutputGlobalShim::logical_y() const { return impl_->logical_y; }
+std::int32_t OutputGlobalShim::logical_width() const { return impl_->global ? impl_->global->logical_width() : 0; }
+std::int32_t OutputGlobalShim::logical_height() const { return impl_->global ? impl_->global->logical_height() : 0; }
+std::int32_t OutputGlobalShim::width() const { return impl_->global ? impl_->global->width() : 0; }
+std::int32_t OutputGlobalShim::height() const { return impl_->global ? impl_->global->height() : 0; }
+std::int32_t OutputGlobalShim::scale() const { return impl_->global ? impl_->global->scale() : 1; }
+std::uint32_t OutputGlobalShim::transform() const { return impl_->global ? static_cast<std::uint32_t>(impl_->global->transform()) : 0; }
+std::int32_t OutputGlobalShim::refresh_mhz() const { return impl_->refresh_mhz; }
+rust::String OutputGlobalShim::name() const { return impl_->global ? to_rust(impl_->global->name()) : rust::String(""); }
 
 namespace {
 
@@ -2560,6 +2589,7 @@ bool SceneOutputShim::gpu_output() const {
 struct SceneRendererShim::Impl {
     std::unique_ptr<lm::SceneRenderer> renderer;
     PresentationShim::Impl* presentation = nullptr;
+    std::unordered_map<std::uint64_t, StoredImage> images;
 
     void link(PresentationShim::Impl* to);
     ~Impl() { link(nullptr); }
@@ -2614,6 +2644,21 @@ std::unique_ptr<SceneRendererShim> scene_renderer_new(bool has_drm_device, const
     }
 }
 
+std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new_from_scene_renderer(const DisplayShim& display, const SceneRendererShim& renderer, rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        lm::VulkanRenderer* gpu = renderer.impl().renderer ? renderer.impl().renderer->gpu() : nullptr;
+        auto r = lm::LinuxDmabuf::create(*display.impl().display, gpu);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<LinuxDmabufShim::Impl>();
+        impl->dmabuf.emplace(std::move(*r));
+        return std::make_unique<LinuxDmabufShim>(std::move(impl));
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nullptr;
+    }
+}
+
 bool SceneRendererShim::gpu_enabled() const {
     return impl_->renderer ? impl_->renderer->gpu_enabled() : false;
 }
@@ -2629,7 +2674,7 @@ bool SceneRendererShim::reset(SceneOutputShim& state, OutputShim& output, std::u
 int SceneRendererShim::present(SceneOutputShim& state, OutputShim& output, rust::Slice<const SceneItemRaw> items,
                              float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const {
     if (!impl_->renderer || !output.impl().output) { error = "null object"; return -1; }
-    const std::vector<lm::SceneItem> scene = scene_items(items);
+    const std::vector<lm::SceneItem> scene = scene_items(items, &impl_->images);
     auto r = impl_->renderer->present(state.impl().state, *output.impl().output, scene, lm::Color{bg_r, bg_g, bg_b, bg_a});
     if (!r) { error = to_rust(r.error().message); return -1; }
     return static_cast<int>(*r);
@@ -2660,6 +2705,41 @@ bool SceneRendererShim::vulkan_handles(VulkanHandlesRaw& out) const {
     if (!impl_->renderer || impl_->renderer->gpu() == nullptr) return false;
     out = handles_raw(*impl_->renderer->gpu());
     return true;
+}
+
+bool SceneRendererShim::set_image(std::uint64_t serial, std::int32_t width, std::int32_t height,
+                                rust::Slice<const std::uint8_t> rgba, rust::String& error) const {
+    if (width <= 0 || height <= 0) {
+        error = "image dimensions must be positive";
+        return false;
+    }
+    const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const std::size_t bytes = count * 4;
+    if (rgba.size() < bytes) {
+        error = "image buffer too small for dimensions";
+        return false;
+    }
+    StoredImage img;
+    img.width = width;
+    img.height = height;
+    img.pixels.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        img.pixels[i] = lm::Pixel{rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2], rgba[i * 4 + 3]};
+    }
+    impl_->images[serial] = std::move(img);
+    return true;
+}
+
+void SceneRendererShim::remove_image(std::uint64_t serial) const {
+    impl_->images.erase(serial);
+}
+
+void SceneRendererShim::clear_images() const {
+    impl_->images.clear();
+}
+
+bool SceneRendererShim::has_image(std::uint64_t serial) const {
+    return impl_->images.find(serial) != impl_->images.end();
 }
 
 struct OutputLayoutShim::Impl {

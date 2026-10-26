@@ -33,6 +33,7 @@ struct PointerConstraintInfoRaw;
 struct TextInputInfoRaw;
 
 class OutputGlobalShim;
+class SceneRendererShim;
 
 // ============================================================================
 // Core & Util
@@ -436,6 +437,17 @@ public:
     void set_scale(std::int32_t scale) const;
     void set_transform(std::uint32_t transform) const;
 
+    std::int32_t logical_x() const;
+    std::int32_t logical_y() const;
+    std::int32_t logical_width() const;
+    std::int32_t logical_height() const;
+    std::int32_t width() const;
+    std::int32_t height() const;
+    std::int32_t scale() const;
+    std::uint32_t transform() const;
+    std::int32_t refresh_mhz() const;
+    rust::String name() const;
+
     struct Impl;
     Impl& impl() const;
     explicit OutputGlobalShim(std::unique_ptr<Impl> impl) noexcept;
@@ -738,6 +750,7 @@ private:
 
 std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new(const DisplayShim& display, const VulkanRendererShim& renderer, rust::String& error);
 std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new_headless(const DisplayShim& display, rust::String& error);
+std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new_from_scene_renderer(const DisplayShim& display, const SceneRendererShim& renderer, rust::String& error);
 
 class SceneOutputShim {
 public:
@@ -772,6 +785,10 @@ public:
     void update_cursor() const;
     rust::Vec<std::uint8_t> read_back(SceneOutputShim& state, rust::String& error) const;
     bool vulkan_handles(VulkanHandlesRaw& out) const;
+    bool set_image(std::uint64_t serial, std::int32_t width, std::int32_t height, rust::Slice<const std::uint8_t> rgba, rust::String& error) const;
+    void remove_image(std::uint64_t serial) const;
+    void clear_images() const;
+    bool has_image(std::uint64_t serial) const;
 
     struct Impl;
     Impl& impl() const;

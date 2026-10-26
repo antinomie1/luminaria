@@ -1,6 +1,6 @@
 //! xdg-activation: a client asking for one of its windows to be focused.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 
 use super::SurfaceId;
@@ -46,7 +46,7 @@ impl<'d> XdgActivation<'d> {
         let mut err = String::new();
         let raw = ffi::xdg_activation_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }

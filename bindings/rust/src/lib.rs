@@ -535,6 +535,16 @@ pub(crate) mod ffi {
         fn set_mode(self: &OutputGlobalShim, width: i32, height: i32, refresh_mhz: i32);
         fn set_scale(self: &OutputGlobalShim, scale: i32);
         fn set_transform(self: &OutputGlobalShim, transform: u32);
+        fn logical_x(self: &OutputGlobalShim) -> i32;
+        fn logical_y(self: &OutputGlobalShim) -> i32;
+        fn logical_width(self: &OutputGlobalShim) -> i32;
+        fn logical_height(self: &OutputGlobalShim) -> i32;
+        fn width(self: &OutputGlobalShim) -> i32;
+        fn height(self: &OutputGlobalShim) -> i32;
+        fn scale(self: &OutputGlobalShim) -> i32;
+        fn transform(self: &OutputGlobalShim) -> u32;
+        fn refresh_mhz(self: &OutputGlobalShim) -> i32;
+        fn name(self: &OutputGlobalShim) -> String;
 
         type CursorThemeShim;
         fn cursor_theme_load(name: &str, size: i32, error: &mut String) -> UniquePtr<CursorThemeShim>;
@@ -684,6 +694,7 @@ pub(crate) mod ffi {
         type LinuxDmabufShim;
         fn linux_dmabuf_new(display: &DisplayShim, renderer: &VulkanRendererShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
         fn linux_dmabuf_new_headless(display: &DisplayShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
+        fn linux_dmabuf_new_from_scene_renderer(display: &DisplayShim, renderer: &SceneRendererShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
 
         type SceneOutputShim;
         fn scene_output_new() -> UniquePtr<SceneOutputShim>;
@@ -702,6 +713,10 @@ pub(crate) mod ffi {
         // Only `raw-vulkan` reads these.
         #[allow(dead_code)]
         fn vulkan_handles(self: &SceneRendererShim, out: &mut VulkanHandlesRaw) -> bool;
+        fn set_image(self: &SceneRendererShim, serial: u64, width: i32, height: i32, rgba: &[u8], error: &mut String) -> bool;
+        fn remove_image(self: &SceneRendererShim, serial: u64);
+        fn clear_images(self: &SceneRendererShim);
+        fn has_image(self: &SceneRendererShim, serial: u64) -> bool;
 
         type OutputLayoutShim;
         fn output_layout_new() -> UniquePtr<OutputLayoutShim>;

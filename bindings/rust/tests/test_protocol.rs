@@ -21,7 +21,35 @@ fn test_core_protocols_instantiation() {
     assert!(!seat.keymap().is_empty());
 
     let _layer_shell = LayerShell::new(&display).expect("LayerShell failed");
-    let _output_global = OutputGlobal::new(&display, 1920, 1080, "test-output").expect("OutputGlobal failed");
+    let output_global = OutputGlobal::with_properties(
+        &display,
+        1920,
+        1080,
+        "test-output",
+        (100, 200),
+        144000,
+        2,
+        luminaria::util::Transform::Normal,
+    ).expect("OutputGlobal with_properties failed");
+    assert_eq!(output_global.position(), (100, 200));
+    assert_eq!(output_global.logical_position(), (100, 200));
+    assert_eq!(output_global.scale(), 2);
+    assert_eq!(output_global.refresh_mhz(), 144000);
+    assert_eq!(output_global.transform(), luminaria::util::Transform::Normal);
+    assert_eq!(output_global.name(), "test-output");
+    assert_eq!(output_global.size(), (1920, 1080));
+    assert_eq!(output_global.width(), 1920);
+    assert_eq!(output_global.height(), 1080);
+    assert_eq!(output_global.logical_size(), (960, 540)); // 1920/2, 1080/2
+    assert_eq!(output_global.logical_width(), 960);
+    assert_eq!(output_global.logical_height(), 540);
+
+    output_global.set_position(300, 400);
+    assert_eq!(output_global.position(), (300, 400));
+    output_global.set_scale(1);
+    assert_eq!(output_global.scale(), 1);
+    assert_eq!(output_global.logical_size(), (1920, 1080));
+
     let _cursor_theme = CursorTheme::load("default", 24);
 
     // Protocol Managers

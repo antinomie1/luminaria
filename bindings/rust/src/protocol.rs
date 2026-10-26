@@ -7,7 +7,7 @@
 //! surface's [`SurfaceId`] or by an id the binding assigns, never by a
 //! reference; each lookup happens on the call, and a stale name finds nothing.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
 use crate::util::{Rect, Transform};
 
@@ -112,7 +112,7 @@ impl<'d> Compositor<'d> {
         let mut err = String::new();
         let raw = ffi::compositor_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -146,7 +146,7 @@ impl<'d> Subcompositor<'d> {
         let mut err = String::new();
         let raw = ffi::subcompositor_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -175,16 +175,39 @@ impl<'d> OutputGlobal<'d> {
             &mut err,
         );
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
+    }
+
+    pub fn with_properties(
+        display: &'d Display,
+        width: i32,
+        height: i32,
+        name: &str,
+        position: (i32, i32),
+        refresh_mhz: i32,
+        scale: i32,
+        transform: Transform,
+    ) -> Result<Self, Error> {
+        let global = Self::new(display, width, height, name)?;
+        global.set_logical_position(position.0, position.1);
+        global.set_mode(width, height, refresh_mhz);
+        global.set_scale(scale);
+        global.set_transform(transform);
+        Ok(global)
     }
 }
 
 impl OutputGlobal<'_> {
     /// Where this output sits in the layout, as xdg-output reports it.
     pub fn set_logical_position(&self, x: i32, y: i32) {
+        self.raw.set_logical_position(x, y);
+    }
+
+    /// Alias for [`Self::set_logical_position`].
+    pub fn set_position(&self, x: i32, y: i32) {
         self.raw.set_logical_position(x, y);
     }
 
@@ -200,6 +223,66 @@ impl OutputGlobal<'_> {
     pub fn set_transform(&self, transform: Transform) {
         self.raw.set_transform(transform as u32);
     }
+
+    /// Current logical position in global layout coordinates.
+    pub fn logical_position(&self) -> (i32, i32) {
+        (self.raw.logical_x(), self.raw.logical_y())
+    }
+
+    /// Alias for [`Self::logical_position`].
+    pub fn position(&self) -> (i32, i32) {
+        self.logical_position()
+    }
+
+    /// Size in layout coordinates.
+    pub fn logical_size(&self) -> (i32, i32) {
+        (self.raw.logical_width(), self.raw.logical_height())
+    }
+
+    /// Physical mode resolution (width, height).
+    pub fn size(&self) -> (i32, i32) {
+        (self.raw.width(), self.raw.height())
+    }
+
+    /// Physical width in pixels.
+    pub fn width(&self) -> i32 {
+        self.raw.width()
+    }
+
+    /// Physical height in pixels.
+    pub fn height(&self) -> i32 {
+        self.raw.height()
+    }
+
+    /// Logical width in layout coordinates.
+    pub fn logical_width(&self) -> i32 {
+        self.raw.logical_width()
+    }
+
+    /// Logical height in layout coordinates.
+    pub fn logical_height(&self) -> i32 {
+        self.raw.logical_height()
+    }
+
+    /// Integer output scale factor.
+    pub fn scale(&self) -> i32 {
+        self.raw.scale()
+    }
+
+    /// Output rotation/reflection transform.
+    pub fn transform(&self) -> Transform {
+        Transform::from_u32(self.raw.transform())
+    }
+
+    /// Output refresh rate in milli-Hertz (e.g. 60000 for 60Hz).
+    pub fn refresh_mhz(&self) -> i32 {
+        self.raw.refresh_mhz()
+    }
+
+    /// The name of this output (e.g. "eDP-1", "HEADLESS-1").
+    pub fn name(&self) -> String {
+        self.raw.name()
+    }
 }
 
 /// An Xcursor theme.
@@ -213,7 +296,7 @@ impl CursorTheme {
         let mut err = String::new();
         let raw = ffi::cursor_theme_load(name, size, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw })
         }
@@ -237,7 +320,7 @@ macro_rules! define_manager {
                 let mut err = String::new();
                 let raw = ffi::$constructor(&display.raw, &mut err);
                 if raw.is_null() {
-                    Err(Error(err))
+                    Err(Error::new(ErrorKind::Protocol, err))
                 } else {
                     Ok(Self {
                         raw,
@@ -296,7 +379,7 @@ impl<'d> XdgDecorationManager<'d> {
         let mut err = String::new();
         let raw = ffi::xdg_decoration_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -346,7 +429,7 @@ impl<'d> CursorShapeManager<'d> {
         let mut err = String::new();
         let raw = ffi::cursor_shape_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -387,7 +470,7 @@ impl<'d> XdgToplevelIconManager<'d> {
         let mut err = String::new();
         let raw = ffi::xdg_toplevel_icon_manager_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
@@ -426,7 +509,7 @@ impl<'a> RelativePointerManager<'a> {
         let mut err = String::new();
         let raw = ffi::relative_pointer_manager_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }

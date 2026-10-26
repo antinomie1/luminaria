@@ -1,6 +1,6 @@
 //! text-input-v3: a client's text field talking to an input method.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 use crate::util::Rect;
 
@@ -36,7 +36,7 @@ impl<'a> TextInputManager<'a> {
         let mut err = String::new();
         let raw = ffi::text_input_manager_new(&display.raw, &seat.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }

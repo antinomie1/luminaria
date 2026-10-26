@@ -34,7 +34,7 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 | `InputMethodManager<'a>` | `Display`、`Seat`、`TextInputManager` |
 | `OutputManager<'a>` | `Display`、`OutputLayout` |
 | `ForeignToplevelManager<'d>` | `Display`；`track(&shell)` 之后还有那个 `XdgShell` |
-| `LinuxDmabuf<'a>`、`DesktopGlobals<'a>` | `Display`，以及传入的 `VulkanRenderer` |
+| `LinuxDmabuf<'a>`、`DesktopGlobals<'a>` | `Display`，以及传入的 `VulkanRenderer` 或 `SceneRenderer` |
 | `Cursor<'a>` | `SceneRenderer`、`OutputLayout`、`Seat` |
 | `SceneOutput<'r>` | 第一次 `reset()` / `present()` 它的 `SceneRenderer`（它缓存该渲染器的纹理与渲染目标） |
 | `Frame<'r>` | `VulkanRenderer` |
@@ -663,9 +663,20 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 
 与 C++ 版仍有的差别，都是绑定还没导出的东西：
 
-- 没有 `LinuxDmabuf`：它要一个 `VulkanRenderer`，而 `SceneRenderer` 不把自己那个交出来；GPU 客户端只能走 wl_shm。
 - 映射时不发首选缓冲缩放与分数缩放：`Surface::set_preferred_buffer_scale` 与 `FractionalScaleManager::set_scale` 没有导出。
 - 子表面树（`Surface::surface_tree`）没有导出：按住按钮时，抓取落在子表面上的指针按其窗口原点换算坐标。
+
+现已补全的跨 crate 互操作与功能支持：
+
+- **`LinuxDmabuf` 与 GPU 共享**：可通过 `LinuxDmabuf::from_scene_renderer(&display, &renderer)`（或 `renderer.create_linux_dmabuf(&display)`）直接从 `SceneRenderer` 创建；`examples/minimal.rs` 已接驳该协议，GPU 客户端可直接走零拷贝 dmabuf。
+- **光标形状协议 (`cursor-shape`)**：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接入光标引擎，自动呈现客户端请求的命名光标形状，已在 `examples/minimal.rs` 中完整启用。
+- **图像数据输入 (`SceneItem::image`)**：`SceneRenderer::set_image(serial, width, height, rgba: &[u8])` 接受紧凑排布的原始 RGBA `&[u8]` 字节切片（`image` crate 的图像缓冲区可直接传入），与场景中的 `SceneItem::image(rect, serial)` 对应；GPU 路径按 serial 自动去重缓存与动态上传，CPU 路径自动回退合成。
+- **显示器配置 (`OutputGlobal`)**：支持完整的 `position()`、`logical_position()`、`size()`、`logical_size()`、`scale()`、`transform()`、`refresh_mhz()`、`name()` 查询与设置，并提供 `with_properties()` 构造器。
+- **分类错误类型 (`core::ErrorKind`)**：`core::Error` 现包含可模式匹配的 `ErrorKind`（`err.kind()`），涵盖 `Init`、`EventLoop`、`Backend`、`Gpu`、`Protocol`、`Shell`、`InvalidArgument`、`Other`；保留 `Display` 与 `std::error::Error` 实现，可无缝配合 `?` 操作符、`anyhow` 与 `thiserror`。
+- **几何类型转换 (`mint` / `glam` 特性)**：提供可选 cargo 特性 `mint` 与 `glam`，为 `Rect`、`Color`、`Point` 提供 `From`/`Into` 实现，避免调用者受孤儿规则限制而编写 newtype 包装。
+- **事件循环集成 (`calloop` 与 `tokio`)**：
+  - **`calloop`**：`Display` 实现了 `AsFd`，可将其文件描述符通过 `calloop::generic::Generic` 注册至 calloop 事件循环（详见 `examples/calloop.rs`）。就绪时调用 `display.dispatch(Some(Duration::ZERO))` 排干底层事件与定时器，随后调用各协议包装对象的 `next_event()` 排干事件队列。
+  - **`tokio`**：注意 luminaria 所有类型均为 `!Send`（所有 Wayland 对象、后端句柄与 C++ 状态均绑定至创建 `wl_display` 的单线程主循环）。因此在 tokio 中必须使用单线程运行时（`tokio::runtime::Builder::new_current_thread()`）或在 `tokio::task::LocalSet` 内运行；使用 `tokio::io::unix::AsyncFd::new(display.as_fd())` 监听可读就绪事件，随后执行非阻塞 `display.dispatch(Some(Duration::ZERO))` 并清空就绪标记（`guard.clear_ready()`）。
 
 整个绑定现已完整转发全部信号（C++ 产生信号时将 `EventRaw` 入队，Rust 侧通过对应包装类型的 `next_event()` 取出）：
 

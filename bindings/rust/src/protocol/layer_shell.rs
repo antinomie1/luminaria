@@ -1,6 +1,6 @@
 //! wlr-layer-shell: panels, docks, wallpapers, notifications, lock screens.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 use crate::util::Rect;
 
@@ -79,7 +79,7 @@ impl<'d> LayerShell<'d> {
         let mut err = String::new();
         let raw = ffi::layer_shell_new(&display.raw, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }

@@ -19,10 +19,8 @@
 //! unchanged — is `SceneRenderer`'s.
 //!
 //! Where it still differs from its twin, because the binding does not expose
-//! it yet: no `LinuxDmabuf` on the renderer's GPU (`SceneRenderer` does not
-//! hand out its `VulkanRenderer`), no cursor-shape manager for `Cursor`, no
-//! preferred buffer scale or fractional scale sent on map, and a pointer grab
-//! held by a subsurface is routed as if it sat at its window's origin.
+//! it yet: no preferred buffer scale or fractional scale sent on map, and a
+//! pointer grab held by a subsurface is routed as if it sat at its window's origin.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -32,7 +30,9 @@ use luminaria::backend::{
     Output, Session, WaylandBackend,
 };
 use luminaria::core::{Display, Error, KeyRouter};
-use luminaria::gpu::{Cursor, DrmDeviceId, SceneOutcome, SceneOutput, SceneRenderer, VulkanOptions};
+use luminaria::gpu::{
+    Cursor, DrmDeviceId, LinuxDmabuf, SceneOutcome, SceneOutput, SceneRenderer, VulkanOptions,
+};
 use luminaria::protocol::{
     Compositor, CursorShapeManager, DataDeviceManager, FractionalScaleManager, OutputGlobal, PopupArea, PopupEvent,
     Presentation, Seat, SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent,
@@ -419,6 +419,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("minimal: renderer = CPU ({})", renderer.gpu_error());
     }
     renderer.set_presentation(Some(&presentation));
+    let _dmabuf = if renderer.gpu_enabled() {
+        LinuxDmabuf::from_scene_renderer(&display, &renderer).ok()
+    } else {
+        None
+    };
     let mut cursor = Cursor::new_with_shapes(&renderer, &layout, &seat, &cursor_shape)?;
 
     let mut screens: Vec<Screen> = Vec::new();

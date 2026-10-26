@@ -1,6 +1,6 @@
 //! wl_seat: keyboard, pointer and touch routing, and what focus did.
 
-use crate::core::{Display, Error, Holds};
+use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 
 use super::SurfaceId;
@@ -36,7 +36,7 @@ impl<'d> Seat<'d> {
         let mut err = String::new();
         let raw = ffi::seat_new(&display.raw, name, &mut err);
         if raw.is_null() {
-            Err(Error(err))
+            Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
         }
