@@ -53,6 +53,7 @@ mod ffi {
         Auto,
         Nested,
         Headless,
+        Drm,
     }
 
     #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ mod ffi {
         width: i32,
         height: i32,
         server_side_decorations: bool,
+        drm_device: String,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,7 @@ mod ffi {
         OutputNew,
         OutputDestroy,
         CloseRequested,
+        SessionActive,
     }
 
     /// Flat on purpose: cxx cannot carry a Rust enum with payloads, so every
@@ -214,25 +217,38 @@ impl BitOrAssign for Mods {
 /// Where the compositor shows up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    /// A window in the parent compositor if `WAYLAND_DISPLAY` reaches one,
-    /// otherwise headless.
+    /// The first that works of: a window in the parent compositor (when
+    /// `WAYLAND_DISPLAY` reaches one); [`Backend::Drm`], but only when a
+    /// libseat session can be had, i.e. on a real VT and not over ssh or in
+    /// CI; headless.
     #[default]
     Auto,
     /// A window in the parent compositor, or fail.
     Nested,
     /// No display at all; for tests and CI.
     Headless,
+    /// Bare metal: KMS for the screens, libinput for input, libseat for
+    /// device access and VT switching. Run it from a free VT.
+    ///
+    /// Without a libseat session (no seatd or logind seat) it still starts
+    /// from a logged-in VT, but VT switching is then disabled.
+    /// Ctrl+Alt+F1..F12 switch VTs and are never seen by the window manager.
+    Drm,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub backend: Backend,
     /// Output size in pixels (the nested window, or the headless output).
+    /// Ignored on [`Backend::Drm`], where each monitor keeps its own mode.
     pub width: i32,
     pub height: i32,
     /// Ask clients not to draw their own title bars. You then draw whatever
     /// frame you want with [`Item::Border`] / [`Item::Rect`].
     pub server_side_decorations: bool,
+    /// [`Backend::Drm`] only: the card to drive, e.g. `/dev/dri/card1`.
+    /// `None` picks the first card with a connected monitor.
+    pub drm_device: Option<String>,
 }
 
 impl Default for Config {
@@ -242,6 +258,7 @@ impl Default for Config {
             width: 1280,
             height: 800,
             server_side_decorations: false,
+            drm_device: None,
         }
     }
 }
@@ -306,6 +323,12 @@ pub enum Event {
     OutputDestroy(OutputId),
     /// The user closed the nested window. Nothing is torn down; stopping is up to you.
     CloseRequested,
+    /// [`Backend::Drm`]: our VT was switched away from (`false`) or back to
+    /// (`true`). While inactive there is no input and nothing reaches the
+    /// screen; held keys have already been released to clients.
+    SessionActive {
+        active: bool,
+    },
 }
 
 impl Event {
@@ -349,6 +372,7 @@ impl Event {
             },
             K::OutputDestroy => Event::OutputDestroy(OutputId(e.output)),
             K::CloseRequested => Event::CloseRequested,
+            K::SessionActive => Event::SessionActive { active: e.on },
             _ => return None,
         })
     }
@@ -448,10 +472,12 @@ impl Server {
                 Backend::Auto => ffi::BackendKind::Auto,
                 Backend::Nested => ffi::BackendKind::Nested,
                 Backend::Headless => ffi::BackendKind::Headless,
+                Backend::Drm => ffi::BackendKind::Drm,
             },
             width: config.width,
             height: config.height,
             server_side_decorations: config.server_side_decorations,
+            drm_device: config.drm_device.unwrap_or_default(),
         };
         let mut error = String::new();
         let raw = ffi::server_new(&raw_config, &mut error);

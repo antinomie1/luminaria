@@ -26,7 +26,29 @@ server.run(|server, event| {
 ```sh
 cargo run --example floating                                    # 嵌套在当前会话里
 LUMINARIA_BACKEND=headless LUMINARIA_EXIT_MS=500 cargo run --example floating
+LUMINARIA_BACKEND=drm cargo run --example floating              # 裸机，在空闲 VT 上跑
 ```
+
+## 后端
+
+`Config::backend` 选输出到哪里：
+
+| 值 | 含义 |
+|---|---|
+| `Auto`（默认） | 依次尝试：嵌套 → DRM（只在拿得到 libseat session 时，即确实坐在一个 VT 上，ssh/CI 不会误入）→ headless |
+| `Nested` | 宿主混成器里的一个窗口，失败就报错 |
+| `Headless` | 不显示，给测试和 CI 用 |
+| `Drm` | 裸机：KMS 出图、libinput 输入、libseat 管设备和 VT 切换。`Config::drm_device` 指定显卡，`None` 选第一块接了显示器的 |
+
+裸机上 shim 额外做的事（都是机制，不是策略）：libinput 相对位移 → 指针位置（从第一块屏中央
+起步）、硬件光标平面（光标在 plane 上时移动鼠标不重绘）、按插着的设备通告 seat 能力、
+热插拔显示器、**Ctrl+Alt+F1..F12 切 VT**——按 keymap 给出的 `XF86Switch_VT_n` 判断，切走前把
+客户端那边按住的键全部松开，窗口管理器绑不到也拦不住它。切走/切回会收到
+`Event::SessionActive { active }`。
+
+没有 libseat session（既没有 logind seat 也没有 seatd）时 `Drm` 仍能从已登录的 VT 启动，
+但 VT 切换会被禁用——这时请绑一个退出键（示例里是 Logo+Escape），第一次试的时候再加上
+`LUMINARIA_EXIT_MS=10000` 兜底。
 
 ## 构建
 
@@ -74,5 +96,5 @@ xmake.lua          shim 的 xmake 子工程，includes("../..") 引入 luminaria
 
 ## 还没有的
 
-DRM/libinput 裸机后端（目前只有嵌套和 headless）、layer-shell、截屏、桌面特权协议、
-触摸、交互式缩放的辅助。
+layer-shell、截屏、桌面特权协议、触摸、交互式缩放的辅助、裸机上的输出模式/缩放/旋转设置
+（目前每块屏保持连接器的首选模式，scale 1）。

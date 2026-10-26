@@ -133,6 +133,8 @@ struct Server::Impl {
     //    connections are gone before any object they point into.
     lm::SceneRenderer renderer;
     std::optional<lm::Display> display;
+    // Before both bare-metal backends, which hold a pointer to it.
+    std::optional<lm::Session> session;
 
     std::optional<lm::Compositor> compositor;
     std::optional<lm::Subcompositor> subcompositor;
@@ -148,11 +150,13 @@ struct Server::Impl {
     std::optional<lm::PrimarySelectionManager> primary_selection;
     std::optional<lm::FifoManager> fifo;
     std::optional<lm::CommitTimingManager> commit_timing;
+    std::optional<lm::TearingControlManager> tearing;
     std::optional<lm::LinuxDmabuf> dmabuf;
     std::optional<lm::DrmSyncobjManager> syncobj;
 
     std::unique_ptr<lm::Backend> backend;
     lm::WaylandBackend* nested = nullptr; // == backend.get() when nested; input comes from it
+    std::optional<lm::LibinputBackend> input; // bare metal only
 
     std::string socket;
     lm::OutputLayout layout;
@@ -176,6 +180,7 @@ struct Server::Impl {
     lm::SurfaceId ptr_focus;
     std::uint64_t ptr_window = 0;
     int buttons_down = 0;
+    std::vector<std::uint32_t> held; // keys a client was told are down
 
     Conn<lm::NewOutput> on_new_output;
     Conn<lm::NewToplevel> on_new_toplevel;
@@ -190,6 +195,10 @@ struct Server::Impl {
     Conn<lm::ModifiersEvent> on_mods;
     Conn<lm::KeymapChange> on_keymap;
     Conn<lm::HostCloseRequest> on_close;
+    Conn<lm::PointerMotionEvent> on_rel_motion;
+    Conn<lm::InputCapabilities> on_caps;
+    Conn<lm::SessionActive> on_session;
+    Conn<lm::SeatPointerFocus> on_pointer_focus;
 
     std::vector<SurfaceWatch> surfaces;
     std::vector<std::unique_ptr<OutputEntry>> outputs;
@@ -486,6 +495,11 @@ struct Server::Impl {
                                                "luminaria-" + std::to_string(o->id));
         if (global) {
             global->set_logical_position(box.x, box.y);
+            if (const auto modes = output.modes(); !modes.empty()) {
+                global->set_modes(modes); // a real monitor: tell clients what it can do
+                global->set_mode(output.width(), output.height(),
+                                 output.current_mode().refresh_mhz);
+            }
             o->global.emplace(std::move(*global));
         } else {
             warn("wl_output", global.error());
@@ -516,62 +530,108 @@ struct Server::Impl {
         e.width = box.width;
         e.height = box.height;
         events.push_back(e);
+
+        // libinput only reports deltas, so the pointer needs somewhere to
+        // start; the middle of the first screen is where users look for it.
+        if (input.has_value() && !pointer.present()) {
+            pointer.move_to(box.x + box.width / 2.0, box.y + box.height / 2.0, layout.bounds());
+        }
         output.schedule_frame();
+    }
+
+    // ------------------------------------------------------------- input
+    //
+    // Two sources, one path: the nested backend reports absolute positions
+    // inside the host window, libinput reports deltas. Both end in
+    // pointer_moved(), and buttons, axes and keys are the same events.
+
+    /// The cursor moved or changed picture. On a KMS cursor plane that is one
+    /// small atomic commit and no repaint; composited, it is a frame on every
+    /// output it could be drawn on.
+    void refresh_cursor() {
+        const lm::SceneCursor sprite = cursors.sprite(pointer, *seat);
+        for (const auto& o : outputs) {
+            if (o->output == nullptr) {
+                continue;
+            }
+            const lm::Box view = layout.box_of(*o->output);
+            lm::SceneCursor local = sprite;
+            local.x -= view.x;
+            local.y -= view.y;
+            if (!renderer.set_cursor_plane(o->state, *o->output, local)) {
+                o->output->schedule_frame();
+            }
+        }
+    }
+
+    /// The pointer is somewhere new: draw it there and tell the client under it.
+    void pointer_moved() {
+        refresh_cursor();
+        update_pointer_focus();
+        Event ev{};
+        ev.kind = EventKind::PointerMotion;
+        ev.window = ptr_window;
+        ev.x = pointer.x();
+        ev.y = pointer.y();
+        events.push_back(ev);
+    }
+
+    void pointer_left() {
+        pointer.leave();
+        ptr_focus = {};
+        ptr_window = 0;
+        seat->pointer_clear_focus();
+        schedule_all(); // take the composited cursor off the screen
+    }
+
+    void button(std::uint32_t code, bool pressed) {
+        if (pressed) {
+            (void)popup_tree.dismiss_grabs_outside(ptr_focus); // menu semantics
+        }
+        buttons_down = std::max(0, buttons_down + (pressed ? 1 : -1));
+        Event ev{};
+        ev.kind = EventKind::PointerButton;
+        ev.window = ptr_window;
+        ev.code = code;
+        ev.on = pressed;
+        ev.x = pointer.x();
+        ev.y = pointer.y();
+        events.push_back(ev);
+        if (ptr_focus.valid()) {
+            seat->pointer_button(code, pressed);
+        }
+        if (!pressed && buttons_down == 0) {
+            update_pointer_focus(); // the grab ended; re-pick what is under it
+        }
+    }
+
+    void axis(const lm::PointerAxisEvent& e) {
+        // Notches win over the smooth deltas that accompany them.
+        if (e.dx_steps != 0 || e.dy_steps != 0) {
+            seat->pointer_axis_discrete(e.dx_steps, e.dy_steps);
+        } else if (e.dx != 0.0 || e.dy != 0.0) {
+            seat->pointer_axis(e.dx, e.dy);
+        }
+        if (e.stop_horizontal || e.stop_vertical) {
+            seat->pointer_axis_stop(e.stop_horizontal, e.stop_vertical);
+        }
     }
 
     void watch_input(lm::WaylandBackend& host) {
         on_motion = host.pointer_motion.connect([this](lm::PointerMotionAbsEvent& e) {
-            schedule_all(); // the cursor is composited; it moving is a repaint
-            if (e.x < 0) {  // left the host window
-                pointer.leave();
-                ptr_focus = {};
-                ptr_window = 0;
-                seat->pointer_clear_focus();
+            if (e.x < 0) { // left the host window
+                pointer_left();
                 return;
             }
             const lm::Box origin = outputs.empty() || outputs.front()->output == nullptr
                                        ? lm::Box{}
                                        : layout.box_of(*outputs.front()->output);
             pointer.move_to(origin.x + e.x, origin.y + e.y, layout.bounds());
-            update_pointer_focus();
-            Event ev{};
-            ev.kind = EventKind::PointerMotion;
-            ev.window = ptr_window;
-            ev.x = pointer.x();
-            ev.y = pointer.y();
-            events.push_back(ev);
+            pointer_moved();
         });
-        on_button = host.pointer_button.connect([this](lm::PointerButtonEvent& e) {
-            if (e.pressed) {
-                (void)popup_tree.dismiss_grabs_outside(ptr_focus); // menu semantics
-            }
-            buttons_down = std::max(0, buttons_down + (e.pressed ? 1 : -1));
-            Event ev{};
-            ev.kind = EventKind::PointerButton;
-            ev.window = ptr_window;
-            ev.code = e.button;
-            ev.on = e.pressed;
-            ev.x = pointer.x();
-            ev.y = pointer.y();
-            events.push_back(ev);
-            if (ptr_focus.valid()) {
-                seat->pointer_button(e.button, e.pressed);
-            }
-            if (!e.pressed && buttons_down == 0) {
-                update_pointer_focus(); // the grab ended; re-pick what is under it
-            }
-        });
-        on_axis = host.pointer_axis.connect([this](lm::PointerAxisEvent& e) {
-            // Notches win over the smooth deltas that accompany them.
-            if (e.dx_steps != 0 || e.dy_steps != 0) {
-                seat->pointer_axis_discrete(e.dx_steps, e.dy_steps);
-            } else if (e.dx != 0.0 || e.dy != 0.0) {
-                seat->pointer_axis(e.dx, e.dy);
-            }
-            if (e.stop_horizontal || e.stop_vertical) {
-                seat->pointer_axis_stop(e.stop_horizontal, e.stop_vertical);
-            }
-        });
+        on_button = host.pointer_button.connect(
+            [this](lm::PointerButtonEvent& e) { button(e.button, e.pressed); });
+        on_axis = host.pointer_axis.connect([this](lm::PointerAxisEvent& e) { axis(e); });
         on_key = host.key.connect([this](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
         on_mods = host.modifiers.connect([this](lm::ModifiersEvent& e) {
             if (keymap.has_value()) {
@@ -587,6 +647,28 @@ struct Server::Impl {
             [this](lm::HostCloseRequest&) { push(EventKind::CloseRequested); });
     }
 
+    void watch_input(lm::LibinputBackend& devices) {
+        on_rel_motion = devices.pointer_motion().connect([this](lm::PointerMotionEvent& e) {
+            if (pointer.move_by(e.dx, e.dy, layout.bounds()) || !pointer.present()) {
+                pointer_moved();
+            }
+        });
+        on_button = devices.pointer_button().connect(
+            [this](lm::PointerButtonEvent& e) { button(e.button, e.pressed); });
+        on_axis = devices.pointer_axis().connect([this](lm::PointerAxisEvent& e) { axis(e); });
+        on_key = devices.key().connect([this](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
+        // libinput's own xkb state already took this; the seat only relays it.
+        on_mods = devices.modifiers().connect([this](lm::ModifiersEvent& e) {
+            seat->notify_modifiers(e.depressed, e.latched, e.locked, e.group);
+        });
+        // Advertise what is plugged in: a client that binds a wl_pointer no
+        // device can drive waits forever. Touch is never routed, so never
+        // claimed.
+        on_caps = devices.capabilities_changed().connect([this](lm::InputCapabilities& caps) {
+            seat->set_capabilities(caps.keyboard, caps.pointer, false);
+        });
+    }
+
     void use_keymap(const std::string& text) {
         if (auto k = lm::KeymapState::from_text(text); k) {
             keymap.emplace(std::move(*k));
@@ -598,17 +680,57 @@ struct Server::Impl {
         }
     }
 
+    /// Whichever xkb state the keys are being interpreted against: libinput's
+    /// on bare metal, ours (built from the host's keymap) when nested.
+    const lm::KeymapState* key_state() const {
+        if (input.has_value()) {
+            return &input->keymap_state();
+        }
+        return keymap.has_value() ? &*keymap : nullptr;
+    }
+
+    /// Every key a client was told is down, as up — before the input it came
+    /// from goes away (a VT switch), so nothing stays logically held.
+    void release_held_keys() {
+        for (const std::uint32_t k : held) {
+            seat->notify_key(k, false);
+        }
+        held.clear();
+        seat->notify_modifiers(0, 0, 0, 0);
+    }
+
     void key(std::uint32_t keycode, bool pressed) {
         if (!pressed) {
-            if (!keys.unconsume(keycode)) { // the release of a binding stays ours
-                seat->notify_key(keycode, false);
+            if (keys.unconsume(keycode)) { // the release of a key we kept stays ours
+                return;
             }
+            std::erase(held, keycode);
+            seat->notify_key(keycode, false);
             return;
         }
-        if (keymap.has_value() && !bindings.empty()) {
-            const lm::ModifiersEvent m = keymap->modifiers();
+        // A press of a key we still think we consumed: its release was lost,
+        // which is exactly what happens to the key that switched VTs away
+        // (input is suspended before it comes up). Forget it, or this press's
+        // release would be swallowed and the client would see the key stuck.
+        (void)keys.unconsume(keycode);
+        if (const lm::KeymapState* ks = key_state(); ks != nullptr) {
+            const std::uint32_t raw = ks->keysym(keycode);
+            // Ctrl+Alt+Fn, which the keymap itself turns into XF86Switch_VT_n.
+            // Mechanism, not policy: on bare metal it is the way out, and it
+            // must work whatever the window manager binds.
+            if (session.has_value() && raw >= XKB_KEY_XF86Switch_VT_1 &&
+                raw <= XKB_KEY_XF86Switch_VT_12) {
+                keys.consume(keycode);
+                release_held_keys();
+                const int vt = static_cast<int>(raw - XKB_KEY_XF86Switch_VT_1) + 1;
+                if (auto s = session->switch_to(vt); !s) {
+                    warn("VT switch", s.error());
+                }
+                return;
+            }
+            const lm::ModifiersEvent m = ks->modifiers();
             const std::uint32_t mods = (m.depressed | m.latched) & kBindableMods;
-            const std::uint32_t sym = xkb_keysym_to_lower(keymap->keysym(keycode));
+            const std::uint32_t sym = xkb_keysym_to_lower(raw);
             for (const Binding& b : bindings) {
                 if (b.mods == mods && b.keysym == sym) {
                     keys.consume(keycode);
@@ -618,7 +740,49 @@ struct Server::Impl {
                 }
             }
         }
+        held.push_back(keycode);
         seat->notify_key(keycode, true);
+    }
+
+    /// The bare-metal pair. On failure everything is left as it was, so the
+    /// caller can still fall back to headless.
+    std::string open_drm(const Config& config, bool need_session) {
+        if (auto s = lm::Session::create(display->event_loop()); s) {
+            session.emplace(std::move(*s));
+        } else if (need_session) {
+            return "session: " + s.error().message;
+        } else {
+            // Works from a logged-in VT, but a VT switch is then unsafe.
+            warn("libseat session (none; VT switching disabled)", s.error());
+        }
+        lm::Session* seat_session = session.has_value() ? &*session : nullptr;
+        const std::string device(config.drm_device);
+        auto drm = device.empty()
+                       ? lm::DrmBackend::create(display->event_loop(), seat_session)
+                       : lm::DrmBackend::create(display->event_loop(), device, seat_session);
+        if (!drm) {
+            session.reset();
+            return drm.error().message;
+        }
+        auto devices = lm::LibinputBackend::create(display->event_loop(), seat_session);
+        if (!devices) {
+            session.reset();
+            return "libinput: " + devices.error().message;
+        }
+        backend = std::make_unique<lm::DrmBackend>(std::move(*drm));
+        input.emplace(std::move(*devices));
+        if (session.has_value()) {
+            on_session = session->activity().connect([this](lm::SessionActive& e) {
+                if (!e.active) {
+                    release_held_keys();
+                } else {
+                    schedule_all(); // back on our VT: repaint what the other one drew over
+                }
+                push(EventKind::SessionActive);
+                events.back().on = e.active;
+            });
+        }
+        return {};
     }
 
     std::string init(const Config& config) {
@@ -657,6 +821,7 @@ struct Server::Impl {
                    "primary-selection");
         LUM_CREATE(fifo, lm::FifoManager::create(*display), "wp-fifo");
         LUM_CREATE(commit_timing, lm::CommitTimingManager::create(*display), "wp-commit-timing");
+        LUM_CREATE(tearing, lm::TearingControlManager::create(*display), "tearing-control");
 #undef LUM_CREATE
 
         // Optional: only with a GPU, and the compositor works without either.
@@ -688,13 +853,23 @@ struct Server::Impl {
             surfaces.push_back({e.surface.id(), e.surface.commit.connect(
                                                     [this](lm::SurfaceCommit&) { schedule_all(); })});
         });
+        // A cursor-shape request, a client cursor surface, and leaving the
+        // window that set either: each changes the picture, which on a cursor
+        // plane is a re-upload and composited is a repaint. refresh_cursor()
+        // does whichever applies.
         on_cursor_shape = cursor_shape->request().connect([this](lm::CursorShapeRequest& r) {
             cursors.set_shape(r.name);
-            schedule_all();
+            refresh_cursor();
         });
         on_cursor_change = seat->cursor_changed().connect([this](lm::SeatCursorChange&) {
             cursors.set_surface_cursor();
-            schedule_all();
+            refresh_cursor();
+        });
+        on_pointer_focus = seat->pointer_focus_changed().connect([this](lm::SeatPointerFocus&) {
+            // A named shape belongs to the client that asked for it; without
+            // this a text field's I-beam follows the pointer across the screen.
+            cursors.set_shape("default");
+            refresh_cursor();
         });
         // xdg_positioner's constraint solving needs to know where the parent
         // is and what screen it is on, or menus hang off the edge.
@@ -713,18 +888,27 @@ struct Server::Impl {
             return false;
         });
 
-        // Backend: a window in the parent compositor when there is one,
-        // otherwise headless.
+        // Backend. Auto tries, in order: a window in the parent compositor;
+        // the bare-metal pair, but only with a libseat session, i.e. when this
+        // process really sits on a seat (a VT, not ssh or CI); headless.
         const int width = config.width > 0 ? config.width : 1280;
         const int height = config.height > 0 ? config.height : 800;
-        if (config.backend != BackendKind::Headless) {
+        const BackendKind want = config.backend;
+        if (want == BackendKind::Auto || want == BackendKind::Nested) {
             if (auto wb = lm::WaylandBackend::create(display->event_loop()); wb) {
                 auto owned = std::make_unique<lm::WaylandBackend>(std::move(*wb));
                 nested = owned.get();
                 nested->add_output(width, height, "luminaria");
                 backend = std::move(owned);
-            } else if (config.backend == BackendKind::Nested) {
+            } else if (want == BackendKind::Nested) {
                 return "nested backend: " + wb.error().message;
+            }
+        }
+        if (backend == nullptr && (want == BackendKind::Auto || want == BackendKind::Drm)) {
+            if (std::string why = open_drm(config, want == BackendKind::Auto); !why.empty()) {
+                if (want == BackendKind::Drm) {
+                    return why;
+                }
             }
         }
         if (backend == nullptr) {
@@ -737,6 +921,14 @@ struct Server::Impl {
         if (nested != nullptr) {
             watch_input(*nested);
         }
+        if (input.has_value()) {
+            watch_input(*input);
+            // The backend computes modifier masks against ITS keymap, so the
+            // seat must hand clients the same one.
+            if (!seat->set_keymap(input->keymap())) {
+                std::fprintf(stderr, "luminaria-rs: libinput keymap rejected by the seat\n");
+            }
+        }
 
         auto socket_name = display->add_socket_auto();
         if (!socket_name) {
@@ -744,13 +936,22 @@ struct Server::Impl {
         }
         socket = std::move(*socket_name);
 
+        if (input.has_value()) {
+            if (auto s = input->start(); !s) {
+                return "libinput: " + s.error().message;
+            }
+            const lm::InputCapabilities caps = input->capabilities();
+            seat->set_capabilities(caps.keyboard, caps.pointer, false);
+        }
         if (auto s = backend->start(); !s) {
             return "backend: " + s.error().message;
         }
         if (nested != nullptr && !nested->keymap().empty()) {
             use_keymap(nested->keymap()); // already arrived during start()
-        } else if (auto k = lm::KeymapState::from_layout(); k) {
-            keymap.emplace(std::move(*k));
+        } else if (!input.has_value()) {
+            if (auto k = lm::KeymapState::from_layout(); k) {
+                keymap.emplace(std::move(*k));
+            }
         }
         return {};
     }

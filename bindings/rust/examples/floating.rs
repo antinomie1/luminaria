@@ -3,6 +3,10 @@
 //!
 //!   cargo run --example floating            # nested in the current session
 //!   LUMINARIA_EXIT_MS=500 cargo run --example floating   # smoke test
+//!   LUMINARIA_BACKEND=drm cargo run --example floating   # bare metal, from a free VT
+//!
+//! LUMINARIA_BACKEND is auto|nested|headless|drm; LUMINARIA_DRM_DEVICE picks
+//! the card. On bare metal Ctrl+Alt+Fn still switches VTs.
 //!
 //! Logo+Return opens $TERMINAL (default foot), Logo+q closes the focused
 //! window, Logo+Escape quits.
@@ -57,10 +61,13 @@ impl Wm {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = match std::env::var("LUMINARIA_BACKEND").as_deref() {
         Ok("headless") => Backend::Headless,
+        Ok("nested") => Backend::Nested,
+        Ok("drm") => Backend::Drm,
         _ => Backend::Auto,
     };
     let mut server = Server::new(Config {
         backend,
+        drm_device: std::env::var("LUMINARIA_DRM_DEVICE").ok(),
         ..Config::default()
     })?;
     let socket = server.socket_name();
@@ -201,6 +208,12 @@ fn handle(
         }
         Event::Binding(b) if b == quit => return ControlFlow::Break(()),
         Event::CloseRequested => return ControlFlow::Break(()),
+        Event::SessionActive { active } => {
+            println!(
+                "floating: session {}",
+                if active { "active" } else { "inactive" }
+            );
+        }
         _ => {}
     }
     ControlFlow::Continue(())
