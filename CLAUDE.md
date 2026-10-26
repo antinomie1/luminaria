@@ -204,7 +204,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   passes theirs. Each texture's descriptor set is written once and cached on the
   `GpuTexture` (the view it binds never changes); dead textures' sets go back on a free
   list, but only once every submit that could still be sampling through them has
-  retired — `Impl::reap()` gates that on the timeline counter.
+  retired — `Impl::reap()` gates that on the timeline counter. **The images go the same
+  way:** a drawn `GpuTexture` or `ScanoutTarget` that dies hands its image, view and memory
+  to `Impl::retiring_images` instead of destroying them under a pending command buffer
+  (a window closing, a monitor unplugged, exit). `tests/test_render_inflight.cpp` runs
+  under the validation layer and asserts `vulkan_validation_errors() == 0`; it is the
+  only way to see this class, since every readback forces the sync that hides it.
   **A steady-state `render_to` allocates nothing** (`tests/test_render_alloc.cpp` counts it,
   the same way `test_frame` does for the shell): the regions and the barrier list are `Impl`
   scratch, dynamic rendering needs no framebuffer at all, and command buffers and the

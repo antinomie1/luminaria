@@ -358,6 +358,12 @@ struct DrmDeviceId {
 [[nodiscard]] std::optional<DrmDeviceId> drm_device_id(int fd) noexcept;
 [[nodiscard]] std::optional<DrmDeviceId> drm_device_id(const std::string& path) noexcept;
 
+/// How many errors the validation layer has reported in this process, across
+/// every renderer. Always 0 unless LUMINARIA_VK_VALIDATION is set and the layer
+/// is installed. Tests assert on it: an error the layer logs is otherwise just
+/// a line on stderr that nothing fails on.
+[[nodiscard]] std::uint64_t vulkan_validation_errors() noexcept;
+
 struct VulkanOptions {
     /// The DRM device the compositor scans out through. The physical device
     /// whose primary or render node this is (VK_EXT_physical_device_drm) wins
@@ -585,8 +591,10 @@ public:
 
 private:
     // A GpuTexture caches a descriptor set the renderer owns, and hands it back
-    // when it dies; that needs to name the renderer's Impl.
+    // when it dies; it and ScanoutTarget also hand back images a submit may
+    // still be using. Both need to name the renderer's Impl.
     friend class GpuTexture;
+    friend class ScanoutTarget;
     friend class FragmentShader;
     friend class Frame;
 
@@ -664,6 +672,18 @@ struct InFlight {
 /// what `after` records.
 struct RetiredSet {
     vk::DescriptorSet set;
+    std::uint64_t after;
+};
+
+/// The image behind a texture that is gone, kept alive for the same reason as
+/// its set: a submit still in flight may be sampling it, and destroying the
+/// view or freeing the memory under a pending command buffer is undefined
+/// (VUID-vkDestroyImageView-imageView-01026, VUID-vkFreeMemory-memory-00677).
+/// Member order is destruction order reversed: view, then image, then memory.
+struct RetiredImage {
+    vk::raii::DeviceMemory memory;
+    vk::raii::Image image;
+    vk::raii::ImageView view;
     std::uint64_t after;
 };
 
@@ -782,6 +802,7 @@ struct VulkanRenderer::Impl {
     std::vector<vk::raii::DescriptorPool> set_pools;
     std::vector<vk::DescriptorSet> free_sets;
     std::vector<RetiredSet> retiring;
+    std::vector<RetiredImage> retiring_images;
     std::uint32_t sets_in_pool = 0; ///< allocated out of set_pools.back()
 
     QuadPipeline& quad_pipeline(vk::Format format);
@@ -821,6 +842,7 @@ struct VulkanRenderer::Impl {
             free_sets.push_back(r.set);
             return true;
         });
+        std::erase_if(retiring_images, [&](const RetiredImage& r) { return r.after <= done; });
     }
 };
 
@@ -872,12 +894,17 @@ bool validation_requested() {
     return v != nullptr && *v != '\0' && std::string_view{v} != "0";
 }
 
+std::atomic<std::uint64_t> g_validation_errors{0};
+
 VKAPI_ATTR vk::Bool32 VKAPI_CALL log_validation(vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
                                                 vk::DebugUtilsMessageTypeFlagsEXT,
                                                 const vk::DebugUtilsMessengerCallbackDataEXT* data,
                                                 void*) {
-    const char* level =
-        severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "error" : "warning";
+    const bool error = severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
+    if (error) {
+        g_validation_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    const char* level = error ? "error" : "warning";
     std::fprintf(stderr, "luminaria: vulkan %s: %s\n", level,
                  data != nullptr && data->pMessage != nullptr ? data->pMessage : "(no message)");
     return VK_FALSE; // never abort the call that triggered it
@@ -906,6 +933,10 @@ struct DeviceChoice {
 
 } // namespace
 
+std::uint64_t vulkan_validation_errors() noexcept {
+    return g_validation_errors.load(std::memory_order_relaxed);
+}
+
 std::optional<DrmDeviceId> drm_device_id(int fd) noexcept {
     struct stat st{};
     if (fd < 0 || fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
@@ -929,6 +960,9 @@ VulkanRenderer::~VulkanRenderer() {
     if (impl_ && !impl_->in_flight.empty()) {
         impl_->queue.waitIdle();
         impl_->in_flight.clear();
+    }
+    if (impl_) {
+        impl_->retiring_images.clear(); // drained above, or never submitted
     }
 }
 VulkanRenderer::VulkanRenderer(VulkanRenderer&&) noexcept = default;
@@ -1798,6 +1832,9 @@ struct ScanoutTarget::Impl {
     std::optional<vk::raii::DeviceMemory> readback_memory;
     std::uint8_t* readback_map = nullptr;
     bool readback_coherent = true; // false: needs an explicit invalidate
+    // Where the image goes when the target dies while a submit may still be
+    // drawing into it (a monitor unplugged, a mode change, shutdown).
+    VulkanRenderer::Impl* owner = nullptr;
 
     ~Impl() {
         if (plane.fd >= 0) {
@@ -1821,8 +1858,15 @@ struct OffscreenTarget::Impl {
 
 GpuTexture::GpuTexture(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 GpuTexture::~GpuTexture() {
+    // `owner` is set the first time the texture is drawn. Never drawn, nothing
+    // can still be reading it, and its image goes now; drawn, it waits for the
+    // GPU with its descriptor set.
     if (impl_ && impl_->owner != nullptr) {
-        impl_->owner->retire_set(impl_->set);
+        VulkanRenderer::Impl& owner = *impl_->owner;
+        owner.retire_set(impl_->set);
+        owner.retiring_images.push_back(RetiredImage{std::move(impl_->memory),
+                                                     std::move(impl_->image),
+                                                     std::move(impl_->view), owner.submits});
     }
 }
 GpuTexture::GpuTexture(GpuTexture&&) noexcept = default;
@@ -1878,7 +1922,16 @@ int BlurChain::height() const noexcept { return impl_->result.height(); }
 int BlurChain::max_passes() const noexcept { return static_cast<int>(impl_->levels.size()); }
 
 ScanoutTarget::ScanoutTarget(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-ScanoutTarget::~ScanoutTarget() = default;
+ScanoutTarget::~ScanoutTarget() {
+    // Rendered into at least once: the last submit may still be writing it, so
+    // the image waits for the timeline like a dead texture does.
+    if (impl_ && impl_->owner != nullptr && impl_->has_content) {
+        VulkanRenderer::Impl& owner = *impl_->owner;
+        owner.retiring_images.push_back(RetiredImage{std::move(impl_->memory),
+                                                     std::move(impl_->image),
+                                                     std::move(impl_->view), owner.submits});
+    }
+}
 ScanoutTarget::ScanoutTarget(ScanoutTarget&&) noexcept = default;
 ScanoutTarget& ScanoutTarget::operator=(ScanoutTarget&&) noexcept = default;
 const DmabufPlane& ScanoutTarget::plane() const noexcept { return impl_->plane; }
@@ -2485,10 +2538,12 @@ Result<ScanoutTarget> VulkanRenderer::create_scanout(int width, int height,
                           chosen.drmFormatModifier};
         // Aggregate-new, not make_unique: Impl closes the fd in its destructor,
         // which costs it the implicit move constructor.
-        return ScanoutTarget{std::unique_ptr<ScanoutTarget::Impl>(
+        auto target = std::unique_ptr<ScanoutTarget::Impl>(
             new ScanoutTarget::Impl{std::move(image), std::move(memory), std::move(view), fmt,
                                     plane, false, UniqueFd{}, std::nullopt, std::nullopt,
-                                    nullptr, true})};
+                                    nullptr, true});
+        target->owner = impl_.get();
+        return ScanoutTarget{std::move(target)};
     } catch (const std::exception& e) {
         return fail(std::string{"vulkan scanout alloc: "} + e.what());
     }
