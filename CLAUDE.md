@@ -173,7 +173,9 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `text_input` (text-input-v3), `idle_inhibit`, `data_control`
   (wlr-data-control, bridged into `data_device` through `SelectionSource`),
   `session_lock` (ext-session-lock, which fails CLOSED: a lock client that dies leaves
-  the session locked), `input_method` (input-method-v2, bridged to `text_input`).
+  the session locked), `input_method` (input-method-v2, bridged to `text_input`),
+  `output_management` (wlr-output-management: heads described from `Output` +
+  `OutputLayout`, apply/test handed to the compositor as one `OutputConfigRequest`).
 - **`vulkan`** — two paths. GPU: `GpuTexture` (client dmabuf imported with no copy, or
   shm pixels uploaded once) drawn by `render_to()` as textured quads into a `ScanoutTarget`,
   a render target allocated with a DRM format modifier and exported as a dmabuf. Its inputs

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -191,6 +192,7 @@ struct Server::Impl {
     std::optional<lm::ScreencopyManager> screencopy;
     std::optional<lm::ForeignToplevelManager> foreign;
     std::optional<lm::WorkspaceManager> workspaces;
+    std::optional<lm::OutputManager> output_manager;
     std::optional<lm::SessionLockManager> locks;
     std::optional<lm::Seat> seat;
     std::optional<lm::DataDeviceManager> data_device;
@@ -230,6 +232,7 @@ struct Server::Impl {
     bool wm_grab = false;         // Rust is dragging something: clients see no motion
     std::vector<std::uint32_t> held; // keys a client was told are down
     std::uint32_t workspace_group = 0;
+    bool applying_outputs = false; // inside an output-management apply: one update at the end
 
     // The lock screen. `lock_pending`: a lock was asked for and the screens
     // are already blanked, but not every output has shown that yet, so the
@@ -261,6 +264,7 @@ struct Server::Impl {
     Conn<lm::ForeignToplevelRequest> on_foreign;
     Conn<lm::ActivationRequest> on_activate;
     Conn<lm::WorkspaceRequest> on_workspace;
+    Conn<lm::OutputConfigRequest> on_output_config;
     Conn<lm::IdleInhibitChange> on_inhibit;
     Conn<lm::NewSessionLock> on_new_lock;
     Conn<lm::NewSessionLockSurface> on_lock_surface;
@@ -312,6 +316,15 @@ struct Server::Impl {
     OutputEntry* output(std::uint64_t id) const {
         for (const auto& o : outputs) {
             if (o->id == id && o->output != nullptr) {
+                return o.get();
+            }
+        }
+        return nullptr;
+    }
+
+    OutputEntry* entry_of(const lm::Output* output) const {
+        for (const auto& o : outputs) {
+            if (output != nullptr && o->output == output) {
                 return o.get();
             }
         }
@@ -923,6 +936,9 @@ struct Server::Impl {
             warn("wl_output", global.error());
         }
         shell->set_bounds(box.width, box.height);
+        // The same name as the wl_output, which is what kanshi matches on.
+        output_manager->add_head(output, {.name = "luminaria-" + std::to_string(o->id),
+                                          .description = backend_description()});
 
         o->on_frame = output.frame.connect([this, o](lm::FrameEvent&) { draw(*o); });
         o->on_present =
@@ -1006,7 +1022,110 @@ struct Server::Impl {
         if (locked()) {
             reconfigure_lock_surfaces();
         }
+        if (!applying_outputs) {
+            output_manager->update(); // wlr-randr and kanshi see it too
+        }
         o.output->schedule_frame();
+    }
+
+    std::string backend_description() const {
+        if (nested != nullptr) {
+            return "luminaria nested output";
+        }
+        return input.has_value() ? "luminaria DRM output" : "luminaria headless output";
+    }
+
+    // The three set_output_* below are both Rust's and wlr-output-management's.
+
+    void set_scale(OutputEntry& o, int scale) {
+        o.output->set_scale(scale);
+        if (auto s = renderer.reset(o.state, *o.output, DRM_FORMAT_XRGB8888); !s) {
+            warn("render target (falling back to CPU)", s.error());
+        }
+        relayout(o);
+    }
+
+    void set_transform(OutputEntry& o, lm::Transform transform) {
+        o.output->set_transform(transform);
+        if (auto s = renderer.reset(o.state, *o.output, DRM_FORMAT_XRGB8888); !s) {
+            warn("render target (falling back to CPU)", s.error());
+        }
+        relayout(o);
+    }
+
+    void set_position(OutputEntry& o, int x, int y) {
+        layout.add(*o.output, x, y);
+        relayout(o);
+    }
+
+    /// Whether `output` can be driven at `mode`: one it lists, or — for an
+    /// output with no list (nested, headless) — the size it already has.
+    static bool has_mode(const lm::Output& output, const lm::OutputMode& mode) {
+        const auto fits = [&](const lm::OutputMode& m) {
+            return m.width == mode.width && m.height == mode.height &&
+                   (mode.refresh_mhz == 0 || m.refresh_mhz == 0 ||
+                    m.refresh_mhz == mode.refresh_mhz);
+        };
+        const auto modes = output.modes();
+        return modes.empty() ? fits(output.current_mode()) : std::ranges::any_of(modes, fits);
+    }
+
+    /// wlr-output-management (wlr-randr, kanshi). Mechanism, not policy: a
+    /// configuration this machine can drive is applied as asked, through the
+    /// same paths as Rust's set_output_*, and Rust hears OutputChange as usual.
+    /// What cannot be done here is refused before anything changes: switching
+    /// a head off (an output only leaves the layout by being unplugged),
+    /// adaptive sync, a mode the output does not list. A fractional scale is
+    /// rounded, which the protocol allows.
+    void configure_outputs(lm::OutputConfigRequest& r) {
+        for (const lm::OutputHeadConfig& h : r.heads) {
+            if (entry_of(h.output) == nullptr || !h.enabled || h.adaptive_sync.value_or(false) ||
+                (h.mode && !has_mode(*h.output, *h.mode)) ||
+                (h.scale && std::lround(*h.scale) < 1)) {
+                return; // `failed`
+            }
+        }
+        if (r.test) {
+            r.verdict = lm::OutputConfigVerdict::succeeded;
+            return;
+        }
+        applying_outputs = true;
+        // Modes first: they are the only part a backend can still refuse, and
+        // a refusal undoes the ones that already switched.
+        std::vector<std::pair<lm::Output*, lm::OutputMode>> switched;
+        for (const lm::OutputHeadConfig& h : r.heads) {
+            if (!h.mode) {
+                continue;
+            }
+            const lm::OutputMode before = h.output->current_mode();
+            if (auto s = h.output->set_mode(h.mode->width, h.mode->height, h.mode->refresh_mhz);
+                !s) {
+                warn("wlr-output-management mode", s.error());
+                for (auto it = switched.rbegin(); it != switched.rend(); ++it) {
+                    (void)it->first->set_mode(it->second.width, it->second.height,
+                                              it->second.refresh_mhz);
+                }
+                applying_outputs = false;
+                output_manager->update();
+                return;
+            }
+            switched.emplace_back(h.output, before);
+        }
+        for (const lm::OutputHeadConfig& h : r.heads) {
+            OutputEntry& o = *entry_of(h.output);
+            if (h.scale && std::lround(*h.scale) != o.output->scale()) {
+                set_scale(o, static_cast<int>(std::lround(*h.scale)));
+            }
+            if (h.transform && *h.transform != o.output->transform()) {
+                set_transform(o, *h.transform);
+            }
+            if (h.position) {
+                set_position(o, h.position->x, h.position->y);
+            }
+        }
+        applying_outputs = false;
+        output_manager->update();
+        r.verdict = lm::OutputConfigVerdict::succeeded;
     }
 
     bool capture(std::uint64_t id, int x, int y, int w, int h, std::vector<std::uint8_t>& rgba) {
@@ -1473,6 +1592,8 @@ struct Server::Impl {
         LUM_CREATE(screencopy, lm::ScreencopyManager::create(*display), "screencopy");
         LUM_CREATE(foreign, lm::ForeignToplevelManager::create(*display), "foreign-toplevel");
         LUM_CREATE(workspaces, lm::WorkspaceManager::create(*display), "ext-workspace");
+        LUM_CREATE(output_manager, lm::OutputManager::create(*display, layout),
+                   "wlr-output-management");
         LUM_CREATE(locks, lm::SessionLockManager::create(*display), "session-lock");
         LUM_CREATE(seat, lm::Seat::create(*display), "wl_seat");
         LUM_CREATE(data_device, lm::DataDeviceManager::create(*display, *seat), "data-device");
@@ -1552,6 +1673,8 @@ struct Server::Impl {
                 push(EventKind::RequestActivate, w->id);
             }
         });
+        on_output_config = output_manager->request().connect(
+            [this](lm::OutputConfigRequest& r) { configure_outputs(r); });
         on_workspace = workspaces->request().connect([this](lm::WorkspaceRequest& r) {
             if (r.kind == lm::WorkspaceRequest::Kind::activate) {
                 push(EventKind::WorkspaceActivate);
@@ -1882,30 +2005,19 @@ bool Server::set_output_mode(std::uint64_t id, std::int32_t width, std::int32_t 
 
 void Server::set_output_scale(std::uint64_t id, std::int32_t scale) {
     if (OutputEntry* o = impl_->output(id); o != nullptr) {
-        o->output->set_scale(scale);
-        if (auto s = impl_->renderer.reset(o->state, *o->output, DRM_FORMAT_XRGB8888); !s) {
-            warn("render target (falling back to CPU)", s.error());
-        }
-        impl_->relayout(*o);
+        impl_->set_scale(*o, scale);
     }
 }
 
 void Server::set_output_transform(std::uint64_t id, std::uint32_t transform) {
-    OutputEntry* o = impl_->output(id);
-    if (o == nullptr || transform > 7) {
-        return;
+    if (OutputEntry* o = impl_->output(id); o != nullptr && transform <= 7) {
+        impl_->set_transform(*o, static_cast<lm::Transform>(transform));
     }
-    o->output->set_transform(static_cast<lm::Transform>(transform));
-    if (auto s = impl_->renderer.reset(o->state, *o->output, DRM_FORMAT_XRGB8888); !s) {
-        warn("render target (falling back to CPU)", s.error());
-    }
-    impl_->relayout(*o);
 }
 
 void Server::set_output_position(std::uint64_t id, std::int32_t x, std::int32_t y) {
     if (OutputEntry* o = impl_->output(id); o != nullptr) {
-        impl_->layout.add(*o->output, x, y);
-        impl_->relayout(*o);
+        impl_->set_position(*o, x, y);
     }
 }
 

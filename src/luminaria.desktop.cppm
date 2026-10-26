@@ -7,6 +7,7 @@ export import :data_control;
 export import :desktop_globals;
 export import :foreign_toplevel;
 export import :input_method;
+export import :output_management;
 export import :session_lock;
 export import :workspace;
 

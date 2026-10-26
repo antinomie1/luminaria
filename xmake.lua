@@ -188,6 +188,7 @@ target("luminaria")
             {"wlr-foreign-toplevel-management-unstable-v1", "scl"},
             {"wlr-data-control-unstable-v1", "scl"},
             {"input-method-unstable-v2",     "scl"},
+            {"wlr-output-management-unstable-v1", "scl"},
         }
 
         -- os.scriptdir(), never os.projectdir(): when this xmake.lua is pulled
@@ -293,6 +294,7 @@ target("luminaria-desktop")
     add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
               "src/protocol/desktop_globals.cppm",
               "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
+              "src/protocol/output_management.cppm",
               "src/protocol/session_lock.cppm", "src/protocol/workspace.cppm",
               {public = true})
 
@@ -358,7 +360,7 @@ local gpu_tests = {
 }
 local desktop_tests = {
     test_data_control = true, test_foreign_toplevel = true, test_input_method = true,
-    test_session_lock = true, test_workspace = true,
+    test_output_management = true, test_session_lock = true, test_workspace = true,
 }
 
 for _, file in ipairs(os.files("tests/test_*.cpp")) do
