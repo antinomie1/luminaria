@@ -30,8 +30,10 @@ xmake                     # build the library and the examples
 xmake build -a            # ...and every test binary
 xmake test                # run all tests
 xmake test test_dmabuf/*  # run one
-xmake build tinyluminaria # one target
+xmake build minimal       # one target
 xmake f -m release        # optimised build; debug is the default
+xmake build -a -j4        # cap the parallelism: one clang module unit can take 1-2 GB,
+                          # and the default job count (~1 per thread) has exhausted 32 GB
 
 # under a sanitizer — see the comment in xmake.lua for what each does NOT catch
 xmake f --sanitize=address --toolchain=clang && xmake build -a
@@ -65,7 +67,7 @@ src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
-src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
+src/shell/               cpu_compositor cursor cursor_manager frame scene scene_renderer output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
 src/detail/wayland_fwd.h the one remaining header
 ```
@@ -116,13 +118,14 @@ src/detail/wayland_fwd.h the one remaining header
   headers themselves and get the same types — the forward declarations are attached to the
   global module precisely so that works.
 
-Running the example compositors:
+Running the example compositor — one, `examples/minimal.cpp`, the C++ twin of
+`bindings/rust/examples/minimal.rs` (same window policy, same bindings; keep the two in step):
 
 ```sh
-WAYLAND_DISPLAY=wayland-0 ./build/examples/tinyluminaria   # nested; prints its own socket name
-LUMINARIA_BACKEND=headless ./build/examples/tinyluminaria  # force headless
-LUMINARIA_EXIT_MS=200 ...                                  # auto-terminate (used by smoke test)
-./build/examples/luminaria-tty                             # bare-metal DRM+libinput, needs a free VT
+xmake run minimal                                # nested; prints its own socket name
+LUMINARIA_BACKEND=headless xmake run minimal     # force headless
+LUMINARIA_EXIT_MS=200 ...                        # auto-terminate (smoke tests)
+LUMINARIA_BACKEND=drm xmake run minimal          # bare-metal DRM+libinput, needs a free VT
 ```
 
 Test environment notes: most tests drive real protocol traffic through an **in-process
@@ -266,24 +269,36 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   All three fallbacks are runtime — no Vulkan device, an output whose targets would not
   allocate, `submit()` answering `Presented::fallback` — and all three land on the same CPU
   arm. `SceneItem::tag` is the caller's own identity; luminaria never reads it and only
-  hands it back from a hit. `KeymapState`
+  hands it back from a hit. **`SceneRenderer` also answers the display:** `reset()` binds a
+  `SceneOutput` to its output, after which that output's `present` releases the frame
+  callbacks of everything the frame drew and sends presentation feedback (to the
+  `Presentation` given by `set_presentation()`), an `unchanged` frame releases them on the
+  spot, and the CPU path watches what it drew for commits the way `Frame` does on the GPU.
+  `tests/test_scene_present.cpp` guards all three, on a test output that — like DRM and
+  unlike headless — presents only what was committed. **`Cursor`** (`shell/cursor.cppm`,
+  `luminaria.gpu`) is the pointer and its picture end to end: it loads the theme, follows
+  cursor-shape requests and the client sprite (re-uploading an animated one on each commit),
+  forgets the shape when pointer focus moves, installs itself as the renderer's cursor
+  source, and on every move puts the sprite on each output's KMS cursor plane or asks that
+  output for a frame. Where the pointer goes stays the compositor's (`move_to`/`move_by`
+  take the bounds); `capture()` serves screencopy's cursor sessions. `KeymapState`
   (`util/keymap.cppm`) is the shared RAII xkb wrapper both `LibinputBackend`
   (`keymap_state()`) and compositor shortcut handling read keysyms/modifiers from.
   `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits
   in the global coordinate space, in *logical* units (`transform.cppm` holds the
   logical↔device mapping and nothing else does). `region.cppm` is the disjoint-box set both
   damage and wl_region are built on.
-Per-frame flow in a compositor built on this (see `examples/tinyluminaria.cpp`,
-`examples/tty_compositor.cpp`): `Output::frame` fires → `Frame::begin(view)` → one
-`Frame::place(surface, x, y)` per mapped toplevel (which expands its subsurface tree),
-then popups anchored to their parents, then the cursor when there is no cursor plane →
-`Frame::submit(background)`. Inside that: Frame's GPU bridge imports or uploads each client
+Per-frame flow in a compositor built on this (see `examples/minimal.cpp`): `Output::frame`
+fires → the compositor builds its `SceneItem` list (windows, then `PopupTree::append_to`) in
+the output's coordinates → `SceneRenderer::present()`, which on the GPU path is
+`Frame::begin(view)` → one `Frame::place()` per item (expanding its subsurface tree), then the
+cursor when no plane carries it → `Frame::submit(background)`. Inside that: Frame's GPU bridge imports or uploads each client
 buffer, `VulkanRenderer::render_to(ScanoutTarget)` composites, and
 `Output::commit_scanout()` flips — or the whole composite is skipped and one client's own
 buffer goes to the CRTC. Outputs without dmabuf scanout (headless, nested) still composite
 on the GPU and only the finished frame crosses to the CPU: `read_scanout()` →
-`commit_frame()`. Input goes the other way: backend input signal → `Frame::surface_at()`
-→ `Seat` focus + event routing.
+`commit_frame()`. Input goes the other way: backend input signal → `Cursor::move_to()` →
+`scene_hit_test()` on the same list → `Seat` focus + event routing.
 
 Two bridges expose client buffers: `Surface::current_buffer_dmabuf()` lets Frame import dmabuf
 straight into `VulkanRenderer` with no readback; `Surface::current_buffer_rgba()` handles shm and
@@ -297,7 +312,7 @@ skips the renderer entirely when handed to `Output::import_scanout()`, and `Dire
 uncropped surface whose buffer is in a layout the display advertised — caches the imports per
 wl_buffer (a client rotates a swapchain; importing per frame would leak framebuffers), and
 holds the buffer through `Surface::hold_buffer()` so the client is not told it may redraw
-into a frame the display hardware is still scanning out. `luminaria-tty` uses it.
+into a frame the display hardware is still scanning out. `Frame::submit()` uses it.
 
 **Surface coordinates are not buffer pixels.** A client can hand over a denser buffer
 (`set_buffer_scale`), a rotated one (`set_buffer_transform`), or crop and stretch it
@@ -308,18 +323,20 @@ region decides, not the buffer rectangle.
 
 **The renderer must outlive the Display.** Each `Frame` caches `GpuTexture`s owned by the
 `VulkanRenderer`, so the renderer has to be declared *before* the `Display`
-(locals are destroyed in reverse order). Both examples do this with a comment; getting it
-wrong aborts inside `vk::raii` at shutdown.
+(locals are destroyed in reverse order). `examples/minimal.cpp` and the Rust shim do this
+with a comment; getting it wrong aborts inside `vk::raii` at shutdown.
 
-**Frame callbacks are the compositor's job.** `wl_surface.frame` is NOT answered on commit —
-answering there makes clients render frames the display never shows. They queue until the
-compositor calls `Surface::send_frame_done(time_ms)`, which belongs in the `Output::present`
-handler (alongside `Presentation::notify_presented`). Forget it and every client freezes after
-one frame. Damage works the same way: `Surface::damage()` accumulates until whoever rendered it
-calls `clear_damage()`. The one exception is `Presented::unchanged`: nothing was committed, so
-no `present` follows, and the same `send_frame_done()` has to happen in the `frame` handler
-instead — a client that commits without damaging anything is otherwise frozen for good. Both
-example compositors show the shape.
+**Frame callbacks belong to whoever presents.** `wl_surface.frame` is NOT answered on commit
+— answering there makes clients render frames the display never shows. They queue until
+`Surface::send_frame_done(time_ms)`, which belongs in the `Output::present` handler (alongside
+`Presentation::notify_presented`). Forget it and every client freezes after one frame. Damage
+works the same way: `Surface::damage()` accumulates until whoever rendered it calls
+`clear_damage()`. The one exception is `Presented::unchanged`: nothing was committed, so no
+`present` follows, and the same `send_frame_done()` has to happen in the `frame` handler
+instead — a client that commits without damaging anything is otherwise frozen for good.
+`SceneRenderer` does all of this itself; only a compositor that drives `Frame` directly still
+owes it. Note that headless reports a `present` before *every* frame, committed or not, so
+headless alone never shows a missing `unchanged` release — DRM does.
 
 ## Conventions that matter here
 

@@ -1,8 +1,9 @@
 // GPU and bare-metal extension: Vulkan, KMS/input/session, dmabuf protocols,
-// screencopy, direct scanout and the per-output Frame ledger.
+// screencopy, direct scanout, the per-output Frame ledger and the cursor.
 export module luminaria.gpu;
 
 export import luminaria;
+export import :cursor;
 export import :direct_scanout;
 export import :drm;
 export import :drm_syncobj;

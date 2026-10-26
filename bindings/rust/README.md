@@ -1,8 +1,8 @@
 # luminaria（Rust 绑定）
 
 用 [cxx](https://cxx.rs) 从 Rust 调用 luminaria。C++ 侧做所有混成器都一样做的事
-（全局对象、渲染、帧节拍、帧回调、presentation 反馈、popup、layer-shell、光标、指针焦点、
-截屏、锁屏、输入法），Rust 侧只剩窗口管理：窗口放哪、叠放顺序、尺寸、焦点、快捷键、工作区。
+（全局对象、渲染、帧节拍、popup、layer-shell、指针焦点、截屏、锁屏、输入法；帧回调、
+presentation 反馈和光标则直接是库里的 `SceneRenderer` 与 `Cursor`），Rust 侧只剩窗口管理：窗口放哪、叠放顺序、尺寸、焦点、快捷键、工作区。
 
 ```rust
 use luminaria::{Config, Event, Item, Server};
@@ -21,7 +21,18 @@ server.run(|server, event| {
 })?;
 ```
 
-完整示例见 `examples/floating.rs`（层叠放置、点击聚焦、拖标题栏移动、拖边缘缩放、
+两个示例。`examples/minimal.rs` 是还能日常用的最小混成器（约 100 行）：每个窗口最大化到
+panel 之外的区域，新的在最上面，点击或任务栏激活即置顶，Logo+Return 开终端、Logo+Tab 轮换、
+Logo+q 关窗、Logo+Escape 退出；popup、panel、光标、剪贴板这些全由库处理。它和仓库根目录的
+C++ 示例 `examples/minimal.cpp` 是一对：窗口策略和快捷键相同，改一边要同步另一边（C++ 那份
+没有 layer-shell，所以可用区域就是整块输出）：
+
+```sh
+cargo run --example minimal
+cargo build -j4 --examples   # 内存不宽裕时限并行度：build.rs 把它原样交给 xmake
+```
+
+完整一些的见 `examples/floating.rs`（层叠放置、点击聚焦、拖标题栏移动、拖边缘缩放、
 避开 panel 的最大化、最小化、两个工作区）：
 
 ```sh

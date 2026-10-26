@@ -24,13 +24,13 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
 - `Output::set_mode()` 后 scanout target、layout、`wl_output` 的整链重建。
 - 客户端 dmabuf 的直接扫描（当前 Konsole 验证只有 GPU 合成，日志中 `scanout=0`）。
 
-做法：空闲 VT 上跑 `luminaria-tty`，用 `scripts/tty-check.sh` 留证；下一轮优先接第二台显示器，
+做法：空闲 VT 上跑 `minimal`（`LUMINARIA_BACKEND=drm`），用 `scripts/tty-check.sh` 留证；下一轮优先接第二台显示器，
 再用可全屏 dmabuf 客户端触发直出。
 
 ### 1. bench harness + 三个数进 CI
 
 - **空闲态每秒 atomic 提交次数**，目标 **0**。第 2 步按设计已经做到（空闲时没有提交，
-  `luminaria-tty` 那行 `frames/s` 就不该再出现），但只在 headless 上量过；真机复核与
+  `minimal` 那行 `frames/s` 就不该再出现），但只在 headless 上量过；真机复核与
   CI 门禁都还欠着，否则半年后又会悄悄回到 60。
 - **稳态 RSS**（单客户端）。
 - **每帧 GPU 提交耗时 p99**。
@@ -73,7 +73,7 @@ Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜�
   `test_input_method` 用一个同时扮演应用与输入法的客户端跑完整个来回。XML 上游不发，
   vendored 到 `protocol/`。
 
-三个核心协议已注册进 `tinyluminaria`；两个 desktop 协议按 ADR 0003 只在 `luminaria.desktop`
+三个核心协议已注册进 Rust 绑定（C++ 的 `minimal` 只开最小可用的那一组 global）；两个 desktop 协议按 ADR 0003 只在 `luminaria.desktop`
 里，需要 compositor 自己创建。剩下的收尾在下面「已知的天花板」里。
 
 ### 4. 视觉特效地基 —— 给「带模糊与轻动画的混成器」用
@@ -151,13 +151,12 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 
 ## 源码里活着的标记
 
-只剩四处（空操作桩为 0）：
+只剩两处（空操作桩为 0）：
 
 | 位置 | 内容 |
 |------|------|
 | `region.cppm:14` | `Region` 的操作 O(n)、合并 O(n²)。矩形数量成为问题时换 `pixman_region32` |
 | `tearing_control.cppm:96` | 重复的 tearing_control 对象不发协议错误 |
-| `tty_compositor.cpp:13` | 示例里窗口固定偏移层叠，无移动/缩放/堆叠 UI |
 
 ## 已知的天花板（不是 bug，是没做完的地方）
 
@@ -184,6 +183,12 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 - **`LibinputBackend` 只发相对指针运动** —— 绝对定位设备（触摸屏、数位板，以及虚拟机给客户机
   的那块 tablet）的 `LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE` 不处理，于是虚拟机里指针根本
   不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
-- **`luminaria-tty` 示例还没接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
+- **C++ 的 `minimal` 不接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
   触摸面板），Rust 绑定也接好了（映射到第一块输出、`scene_hit_test`、按 slot 路由）；C++ 示例
-  `tty_compositor.cpp` 还没照做，所以它的 `set_capabilities()` 仍传 touch=false。
+  为了保持最小没有照做，所以它的 `set_capabilities()` 传 touch=false。
+- **CPU 合成路径从不空闲** —— `SceneRenderer::present()` 的 CPU 分支每次都合成、提交并再要
+  一帧，没有 GPU 路径那样的 `unchanged`，于是没有 GPU 的输出（headless、嵌套、CI）静止时
+  也按帧间隔整屏重画。CPU 分支已经像 `Frame` 一样盯着画过的表面的 commit，缺的是"这一帧与
+  上一帧相同就不提交"的判定（场景列表比较加客户端 damage）。
+- **headless 在每一帧之前都报一次 `present`，不管提交过没有** —— 于是 headless 上看不出
+  `unchanged` 帧漏发帧回调；`test_scene_present` 因此自带一个只在提交后才 present 的测试输出。

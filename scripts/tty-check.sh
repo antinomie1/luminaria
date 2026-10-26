@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tty-check.sh — 在真机上跑 luminaria-tty，退出后生成一份可以直接交出去的日志报告。
+# tty-check.sh — 在真机上跑 minimal（DRM 后端），退出后生成一份可以直接交出去的日志报告。
 #
 # 用途是 TODO 第 0 项：整条 DRM 路径只能在真显示器上确认，而"确认了什么"必须留下证据。
 # 脚本本身不判断画面对不对（那要人眼），它做的是：把运行环境记下来、给混成器的输出打上
@@ -9,9 +9,9 @@
 #   ./scripts/tty-check.sh --no-client      # 只跑混成器，自己开客户端
 #   ./scripts/tty-check.sh --client foot    # 指定客户端
 #   ./scripts/tty-check.sh --device /dev/dri/card1
-#   ./scripts/tty-check.sh --bin ./build/.../luminaria-tty   # 换一个构建
+#   ./scripts/tty-check.sh --bin ./build/.../minimal         # 换一个构建
 #
-# 必须从一个空闲 VT 上跑（Ctrl+Alt+F3 登录，桌面停掉）。混成器里按 Esc 退出。
+# 必须从一个空闲 VT 上跑（Ctrl+Alt+F3 登录，桌面停掉）。混成器里按 Logo+Escape 退出。
 set -uo pipefail
 
 # ------------------------------------------------------------------ 参数
@@ -39,11 +39,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$BIN" ]]; then
-    BIN="$REPO/build/linux/x86_64/debug/luminaria-tty"
-    [[ -x "$BIN" ]] || BIN="$REPO/build/linux/x86_64/release/luminaria-tty"
+    BIN="$REPO/build/linux/x86_64/debug/minimal"
+    [[ -x "$BIN" ]] || BIN="$REPO/build/linux/x86_64/release/minimal"
 fi
 if [[ ! -x "$BIN" ]]; then
-    echo "找不到 luminaria-tty，先构建：xmake f -y --toolchain=clang && xmake build luminaria-tty" >&2
+    echo "找不到 minimal，先构建：xmake f -y --toolchain=clang && xmake build -j4 minimal" >&2
     exit 1
 fi
 
@@ -117,20 +117,20 @@ fi
 # ------------------------------------------------------------------ 运行前提示
 cat <<EOF
 
-  luminaria-tty 真机验证 —— 日志写到
+  minimal 真机验证（DRM 后端）—— 日志写到
       $OUT
 
   接下来屏幕会被混成器接管。请按顺序做这几件事，每一项在日志里都留得下痕迹：
 
-    1. 看背景色出来（深蓝灰 #1a1a21），指针能动
+    1. 看背景色出来（深蓝灰 #1f2129），指针能动
     2. ${CLIENT:-（未启动客户端，自己开一个）} 会自动连上 —— 确认窗口画出来了
     3. 指针移到窗口上，滚一下滚轮，按几下 Shift / 字母键
-    4. 打开标题栏菜单，测试最大化/还原；最小化或关闭放在最后
+    4. Logo+Return 再开一个终端，Logo+Tab 轮换、点击置顶；Logo+q 关窗放在最后
     5. 有第二台显示器的话，插拔一次
     6. Ctrl+Alt+F1 切走，再 Ctrl+Alt+F$(fgconsole 2>/dev/null || echo N) 切回来
-    7. 按 Esc 退出
+    7. 按 Logo+Escape 退出
 
-  卡死的话：切到别的 VT，pkill luminaria-tty。
+  卡死的话：切到别的 VT，pkill -x minimal。
 
 EOF
 if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
@@ -147,7 +147,7 @@ if [[ -n "$CLIENT" ]]; then
     (
         for _ in $(seq 1 100); do
             sock="$(grep -m1 -o 'WAYLAND_DISPLAY=[^ ]*' "$RUN_LOG" 2>/dev/null | head -1 | cut -d= -f2)"
-            if [[ -n "$sock" ]] && grep -q 'luminaria-tty: output [0-9]' "$RUN_LOG" 2>/dev/null; then
+            if [[ -n "$sock" ]] && grep -q 'minimal: output [0-9]' "$RUN_LOG" 2>/dev/null; then
                 export WAYLAND_DISPLAY="$sock"
                 export QT_QPA_PLATFORM=wayland GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland
                 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -163,6 +163,7 @@ fi
 
 : >"$RUN_LOG"
 (
+    export LUMINARIA_BACKEND=drm
     if [[ -n "$DEVICE" ]]; then "$BIN" "$DEVICE"; else "$BIN"; fi
     echo $? >"$OUT/exit-code"
 ) 2>&1 | while IFS= read -r line; do
@@ -206,7 +207,7 @@ read -r MAX_COMPOSITED MAX_SCANOUT MAX_UNCHANGED MAX_FALLBACK STAT_LINES <<<"$(
                 if (kv[1] == "composited" && kv[2] + 0 > c) c = kv[2] + 0
                 if (kv[1] == "scanout"    && kv[2] + 0 > s) s = kv[2] + 0
                 if (kv[1] == "unchanged"  && kv[2] + 0 > u) u = kv[2] + 0
-                if (kv[1] == "fallback"   && kv[2] + 0 > f) f = kv[2] + 0
+                if (kv[1] == "cpu"        && kv[2] + 0 > f) f = kv[2] + 0
             }
         }
         END { printf "%d %d %d %d %d\n", c, s, u, f, n }
@@ -219,7 +220,7 @@ verdict() { # verdict <条件为真的判定> <否则的判定> <条件…>
 row() { printf '| %s | %s | %s |\n' "$1" "$2" "$3" >>"$REPORT"; }
 
 {
-    echo "# luminaria-tty 真机验证 — $STAMP"
+    echo "# minimal 真机验证（DRM）— $STAMP"
     echo
     echo "- 主机 \`$(uname -n)\`，内核 \`$(uname -sr)\`"
     echo "- 提交 \`$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)\`，退出码 \`$EXIT_CODE\`"
@@ -238,13 +239,13 @@ else
     row "libseat 会话" "**无**（VT 切换不安全）" "$(grep -m1 'session = none' "$RUN_LOG" | sed 's/^[0-9:]* //')"
 fi
 
-if grep -q 'luminaria-tty: output [0-9]' "$RUN_LOG"; then
-    row "atomic 模式设置 + 翻页" "OK" "$(grep -m1 'luminaria-tty: output [0-9]' "$RUN_LOG" | sed 's/^[0-9:]* //')"
+if grep -q 'minimal: output [0-9]' "$RUN_LOG"; then
+    row "atomic 模式设置 + 翻页" "OK" "$(grep -m1 'minimal: output [0-9]' "$RUN_LOG" | sed 's/^[0-9:]* //')"
 else
     row "atomic 模式设置 + 翻页" "**没发生**" "日志里没有 output 行"
 fi
 
-OUTPUT_COUNT="$(count_re 'luminaria-tty: output [0-9]')"
+OUTPUT_COUNT="$(count_re 'minimal: output [0-9]')"
 if [[ "$OUTPUT_COUNT" -gt 1 ]] || has "output removed"; then
     row "多输出 / 热插拔" "有事件（$OUTPUT_COUNT 次 output，$(count_of 'output removed') 次移除）" "见 run.log"
 else
@@ -263,8 +264,8 @@ else
 fi
 
 if [[ "$OUTPUT_COUNT" -gt 0 ]]; then
-    if has "falling back to CPU read-back scanout"; then
-        row "GPU dmabuf 扫描输出" "**降级为 CPU 回读**" "falling back to CPU read-back scanout"
+    if has "compositing on the CPU"; then
+        row "GPU dmabuf 扫描输出" "**降级为 CPU 合成**" "$(grep -m1 'compositing on the CPU' "$RUN_LOG" | sed 's/^[0-9:]* //')"
     else
         row "GPU dmabuf 扫描输出" "OK（没有降级）" "没有 fallback 日志"
     fi
@@ -310,7 +311,7 @@ else
 fi
 
 if [[ "$EXIT_CODE" == "0" ]]; then
-    row "退出" "干净（Esc）" "exit 0"
+    row "退出" "干净（Logo+Escape）" "exit 0"
 else
     row "退出" "**异常退出 $EXIT_CODE**" "见下面的错误行"
 fi
@@ -319,7 +320,7 @@ fi
     echo
     echo "## 错误行"
     echo
-    ERRORS="$(grep -nE 'submit:|drm:|scanout:|vulkan:|input:|failed|rejected|error' "$RUN_LOG" | grep -v 'cursor plane' || true)"
+    ERRORS="$(grep -nE 'present:|render target:|drm:|vulkan:|input:|failed|rejected|error' "$RUN_LOG" | grep -v 'cursor plane' || true)"
     if [[ -n "$ERRORS" ]]; then
         echo '```'
         echo "$ERRORS"
@@ -332,7 +333,7 @@ fi
     echo "## 帧统计"
     echo
     if [[ "${STAT_LINES:-0}" -gt 0 ]]; then
-        echo "共 $STAT_LINES 条 frames/s 行，峰值 composited=$MAX_COMPOSITED scanout=$MAX_SCANOUT unchanged=$MAX_UNCHANGED fallback=$MAX_FALLBACK。"
+        echo "共 $STAT_LINES 条 frames/s 行，峰值 composited=$MAX_COMPOSITED scanout=$MAX_SCANOUT unchanged=$MAX_UNCHANGED cpu=$MAX_FALLBACK。"
         echo
         echo '```'
         grep 'frames/s' "$RUN_LOG" | head -20

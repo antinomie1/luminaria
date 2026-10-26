@@ -101,7 +101,10 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 上合成，只有成品帧过一次 CPU：`read_scanout()` → `commit_frame()`。输入反向走：后端输入信号
 → `Frame::surface_at()` 得到 `SurfaceId` → 当场 `surface_from_id()` → `Seat` 焦点与路由。
 
-参考实现见 `examples/tty_compositor.cpp`（裸机）与 `examples/tinyluminaria.cpp`（嵌套/无头）。
+参考实现见 `examples/minimal.cpp`（嵌套 / 裸机 / 无头同一份）。它走的是 `SceneRenderer`：
+上面这条 `Frame` 流水线在它里面，`present` 事件的应答（帧回调、presentation 反馈、
+`unchanged` 时的补发）也在它里面；光标是 `Cursor` 的（主题、cursor-shape、客户端光标表面、
+KMS 光标平面或合成）。示例只剩"窗口放哪、谁拿键盘、按键做什么"。
 
 ## 几条会咬人的规矩
 
@@ -189,7 +192,7 @@ src/detail/wayland_fwd.h 唯一剩下的头文件
   「原生装饰」按定义就是宿主画的，自绘一套是另一回事。
 - **popup 的 `constraint_adjustment` 需要 compositor 配合**：必须调
   `XdgShell::set_popup_constraint_query()` 告诉 shell 父窗口在哪，否则贴边菜单仍会溢出
-  —— shell 层无从知道窗口摆在哪个位置。`tinyluminaria` 已接线。
+  —— shell 层无从知道窗口摆在哪个位置。`examples/minimal.cpp` 已接线。
 - **DRM 真机覆盖尚未完成**：一台 1920×1080@60Hz 显示器已经验证 atomic 翻页、`IN_FENCE_FD` /
   `OUT_FENCE_PTR`、libinput、硬件光标平面和 VT 切换；多输出分配、udev connector 热插拔、模式切换
   的所有 per-output 重建，以及客户端 dmabuf direct scanout 仍须在空闲 VT 上验收。渲染与几何有

@@ -3,12 +3,13 @@
 //
 // This is an ordinary translation unit that imports a module, not a module
 // unit, so it has no `module;` line: includes first, then the import, exactly
-// like examples/tinyluminaria.cpp.
+// like examples/minimal.cpp.
 //
-// What it is: tinyluminaria's and luminaria-tty's wiring with the policy taken
-// out. Everything every compositor writes the same way — globals, renderer,
-// frame pump, frame callbacks, presentation feedback, popups, layer shell, the
-// cursor, pointer focus, screen capture, the lock screen, input methods — is
+// What it is: a compositor's wiring with the policy taken out. What every
+// compositor does the same way and the library already does — the frame pump,
+// frame callbacks, presentation feedback, the cursor — is the library's
+// (`SceneRenderer`, `Cursor`); the rest of that list — globals, popups, layer
+// shell, pointer focus, screen capture, the lock screen, input methods — is
 // done here. What a window manager decides — where windows go, their stacking,
 // sizes, focus, bindings, workspaces — is Rust's, and arrives as plain calls.
 //
@@ -141,16 +142,10 @@ struct OutputEntry {
     std::optional<lm::OutputGlobal> global;
     lm::Box usable;           // what layer-shell exclusive zones leave, global coordinates
     bool drew_locked = false; // the last frame on screen showed only the lock
-    std::vector<lm::SurfaceId> drawn; // roots of the last frame, for presentation feedback
     Conn<lm::FrameEvent> on_frame;
     Conn<lm::PresentEvent> on_present;
     Conn<lm::OutputDestroy> on_destroy;
     Conn<lm::OutputModeChange> on_mode;
-};
-
-struct SurfaceWatch {
-    lm::SurfaceId surface;
-    Conn<lm::SurfaceCommit> on_commit;
 };
 
 struct Binding {
@@ -218,12 +213,13 @@ struct Server::Impl {
 
     std::string socket;
     lm::OutputLayout layout;
-    lm::Pointer pointer;
-    lm::CursorManager cursors;
     lm::PopupTree popup_tree;
     lm::LayerManager layers;
     std::optional<lm::KeymapState> keymap; // nested: built from the host's keymap
     lm::KeyRouter keys;
+    // The pointer and its picture. After the renderer, the layout, the seat,
+    // cursor-shape and screencopy, all of which it borrows.
+    std::optional<lm::Cursor> cursor;
     lm::Color background{0.1f, 0.1f, 0.12f, 1.0f};
 
     std::vector<Item> items;            // Rust's list, global logical coordinates
@@ -257,10 +253,6 @@ struct Server::Impl {
     Conn<lm::NewToplevel> on_new_toplevel;
     Conn<lm::NewPopup> on_new_popup;
     Conn<lm::NewLayerSurface> on_new_layer;
-    Conn<lm::NewSurface> on_new_surface;
-    Conn<lm::CursorShapeRequest> on_cursor_shape;
-    Conn<lm::SeatCursorChange> on_cursor_change;
-    Conn<lm::SeatPointerFocus> on_pointer_focus;
     Conn<lm::PointerMotionAbsEvent> on_motion;
     Conn<lm::PointerMotionEvent> on_rel_motion;
     Conn<lm::PointerButtonEvent> on_button;
@@ -285,7 +277,6 @@ struct Server::Impl {
     Conn<lm::NewSessionLockSurface> on_lock_surface;
     Conn<lm::SessionLockDestroy> on_lock_destroy;
 
-    std::vector<SurfaceWatch> surfaces;
     std::vector<std::unique_ptr<LockSurfaceEntry>> lock_surfaces;
     std::vector<std::unique_ptr<OutputEntry>> outputs;
     std::vector<std::unique_ptr<LayerEntry>> layer_entries;
@@ -361,11 +352,13 @@ struct Server::Impl {
         return nullptr;
     }
 
+    const lm::Pointer& pointer() const { return cursor->pointer(); }
+
     /// "Compositor's choice": the output under the pointer, else the first.
     OutputEntry* default_output() const {
-        if (pointer.present()) {
-            if (lm::Output* on = layout.at(static_cast<int>(pointer.x()),
-                                           static_cast<int>(pointer.y()));
+        if (pointer().present()) {
+            if (lm::Output* on = layout.at(static_cast<int>(pointer().x()),
+                                           static_cast<int>(pointer().y()));
                 on != nullptr) {
                 for (const auto& o : outputs) {
                     if (o->output == on) {
@@ -604,11 +597,11 @@ struct Server::Impl {
     /// own coordinates, wherever the pointer is. Otherwise: whatever is under
     /// the pointer.
     void update_pointer_focus() {
-        if (!pointer.present()) {
+        if (!pointer().present()) {
             return;
         }
         build_scene();
-        const lm::SceneHit hit = lm::scene_hit_test(scene, pointer.x(), pointer.y());
+        const lm::SceneHit hit = lm::scene_hit_test(scene, pointer().x(), pointer().y());
         ptr_window = hit.hit ? hit.tag : 0;
         if (wm_grab) {
             return; // the window manager is moving or resizing something
@@ -616,7 +609,7 @@ struct Server::Impl {
         if (const lm::SurfaceId grab = seat->pointer_grab(); grab.valid() && !seat->dragging()) {
             double ox = 0, oy = 0;
             if (lm::surface_from_id(grab) != nullptr && surface_origin(grab, ox, oy)) {
-                seat->pointer_motion(pointer.x() - ox, pointer.y() - oy);
+                seat->pointer_motion(pointer().x() - ox, pointer().y() - oy);
             }
             return;
         }
@@ -639,52 +632,27 @@ struct Server::Impl {
         build_scene();
         const lm::Box view = layout.box_of(*o.output);
         local.clear();
-        o.drawn.clear();
         for (lm::SceneItem item : scene) {
             item.box.x -= view.x;
             item.box.y -= view.y;
             item.x -= view.x;
             item.y -= view.y;
-            if (item.kind == lm::SceneItem::Kind::surface) {
-                o.drawn.push_back(item.surface);
-            }
             local.push_back(item);
         }
-        lm::SceneCursor cursor = cursors.sprite(pointer, *seat);
-        cursor.x -= view.x;
-        cursor.y -= view.y;
 
+        // Frame callbacks, presentation feedback and the cursor are the
+        // renderer's; what is left here is the lock screen's own bookkeeping.
         const bool showing_lock = locked();
         const lm::Color bg = showing_lock ? lm::Color{0.0f, 0.0f, 0.0f, 1.0f} : background;
-        auto outcome = renderer.present(o.state, *o.output, local, bg, cursor);
+        auto outcome = renderer.present(o.state, *o.output, local, bg);
         if (!outcome) {
             warn("present", outcome.error());
             return;
         }
         o.drew_locked = showing_lock;
         if (*outcome == lm::SceneOutcome::unchanged) {
-            // Nothing was committed, so no `present` follows: release the
-            // callbacks here or a client that committed without damage freezes.
-            renderer.send_frame_done(o.state, now_ms());
-            confirm_lock();
+            confirm_lock(); // the screen already shows what this frame would have
         }
-    }
-
-    void presented(OutputEntry& o, const lm::PresentEvent& pe) {
-        renderer.presented(o.state);
-        renderer.send_frame_done(o.state, pe.time_ms());
-        for (const lm::SurfaceId id : o.drawn) {
-            lm::Surface* root = lm::surface_from_id(id);
-            if (root == nullptr) {
-                continue;
-            }
-            tree.clear();
-            root->surface_tree(tree);
-            for (const lm::SurfaceAt& at : tree) {
-                presentation->notify_presented(*at.surface, pe);
-            }
-        }
-        confirm_lock();
     }
 
     /// ext-session-lock: `locked` may only be sent once no output shows
@@ -712,8 +680,6 @@ struct Server::Impl {
         std::erase_if(layer_entries, [](const auto& l) { return l->dead; });
         std::erase_if(lock_surfaces, [](const auto& l) { return l->dead; });
         std::erase_if(outputs, [](const auto& o) { return o->dead; });
-        std::erase_if(surfaces,
-                      [](const SurfaceWatch& s) { return lm::surface_from_id(s.surface) == nullptr; });
     }
 
     // ------------------------------------------------------------- windows
@@ -957,7 +923,7 @@ struct Server::Impl {
 
         o->on_frame = output.frame.connect([this, o](lm::FrameEvent&) { draw(*o); });
         o->on_present =
-            output.present.connect([this, o](lm::PresentEvent& pe) { presented(*o, pe); });
+            output.present.connect([this](lm::PresentEvent&) { confirm_lock(); });
         o->on_mode = output.mode_changed.connect([this, o](lm::OutputModeChange&) {
             // Everything sized for the old mode has to be rebuilt.
             if (auto s = renderer.reset(o->state, *o->output, DRM_FORMAT_XRGB8888); !s) {
@@ -991,8 +957,8 @@ struct Server::Impl {
 
         // libinput only reports deltas, so the pointer needs somewhere to
         // start; the middle of the first screen is where users look for it.
-        if (input.has_value() && !pointer.present()) {
-            pointer.move_to(box.x + box.width / 2.0, box.y + box.height / 2.0, layout.bounds());
+        if (input.has_value() && !pointer().present()) {
+            cursor->move_to(box.x + box.width / 2.0, box.y + box.height / 2.0);
         }
         if (locked()) {
             reconfigure_lock_surfaces();
@@ -1031,8 +997,10 @@ struct Server::Impl {
         sync_global(o);
         o.usable = {};                       // force the OutputChange below
         arrange(o);
-        if (pointer.present()) {
-            pointer.move_to(pointer.x(), pointer.y(), layout.bounds());
+        // Clamped back into the new layout, and redrawn either way: the same
+        // global position is somewhere else on this output now.
+        if (!pointer().present() || !cursor->move_to(pointer().x(), pointer().y())) {
+            cursor->refresh();
         }
         if (locked()) {
             reconfigure_lock_surfaces();
@@ -1169,34 +1137,8 @@ struct Server::Impl {
     /// For ext-image-copy-capture cursor sessions: the pointer as it looks on
     /// `resource`'s output, if it is there.
     bool capture_cursor(wl_resource* resource, lm::CursorCapture& out) {
-        OutputEntry* o = output_of(resource);
-        if (o == nullptr || !pointer.present() || locked()) {
-            return false;
-        }
-        const lm::Box view = layout.box_of(*o->output);
-        if (!view.contains(static_cast<int>(pointer.x()), static_cast<int>(pointer.y()))) {
-            return false;
-        }
-        const lm::SceneCursor sprite = cursors.sprite(pointer, *seat);
-        if (lm::Surface* client = lm::surface_from_id(sprite.surface); client != nullptr) {
-            if (!client->current_buffer_rgba(out.rgba, out.width, out.height)) {
-                return false;
-            }
-            out.hotspot_x = seat->cursor_hotspot_x();
-            out.hotspot_y = seat->cursor_hotspot_y();
-        } else if (sprite.image != nullptr) {
-            out.rgba = sprite.image->rgba;
-            out.width = sprite.image->width;
-            out.height = sprite.image->height;
-            out.hotspot_x = sprite.image->hotspot_x;
-            out.hotspot_y = sprite.image->hotspot_y;
-        } else {
-            return false;
-        }
-        const int scale = o->output->scale();
-        out.x = static_cast<int>(pointer.x() - view.x) * scale;
-        out.y = static_cast<int>(pointer.y() - view.y) * scale;
-        return true;
+        const OutputEntry* o = output_of(resource);
+        return o != nullptr && !locked() && cursor->capture(*o->output, out);
     }
 
     // ------------------------------------------------------------- lock screen
@@ -1267,45 +1209,23 @@ struct Server::Impl {
     // inside the host window, libinput reports deltas. Both end in
     // pointer_moved(), and buttons, axes and keys are the same events.
 
-    /// The cursor moved or changed picture. On a KMS cursor plane that is one
-    /// small atomic commit and no repaint; composited, it is a frame on every
-    /// output it could be drawn on.
-    void refresh_cursor() {
-        const lm::SceneCursor sprite = cursors.sprite(pointer, *seat);
-        for (const auto& o : outputs) {
-            if (o->output == nullptr) {
-                continue;
-            }
-            const lm::Box view = layout.box_of(*o->output);
-            lm::SceneCursor local_sprite = sprite;
-            local_sprite.x -= view.x;
-            local_sprite.y -= view.y;
-            if (!renderer.set_cursor_plane(o->state, *o->output, local_sprite)) {
-                o->output->schedule_frame();
-            }
-        }
-        screencopy->notify_cursor_changed();
-    }
-
-    /// The pointer is somewhere new: draw it there and tell the client under it.
+    /// The pointer is somewhere new (`Cursor` has already redrawn it): tell
+    /// the client under it.
     void pointer_moved() {
         idle_notify->notify_activity();
-        refresh_cursor();
         update_pointer_focus();
         Event ev{};
         ev.kind = EventKind::PointerMotion;
         ev.window = ptr_window;
-        ev.x = pointer.x();
-        ev.y = pointer.y();
+        ev.x = pointer().x();
+        ev.y = pointer().y();
         events.push_back(ev);
     }
 
     void pointer_left() {
-        pointer.leave();
+        cursor->leave();
         ptr_window = 0;
         seat->pointer_clear_focus();
-        schedule_all(); // take the composited cursor off the screen
-        screencopy->notify_cursor_changed();
     }
 
     /// A click or a touch went down on `target`: what that means for menus
@@ -1335,8 +1255,8 @@ struct Server::Impl {
         ev.window = locked() ? 0 : ptr_window;
         ev.code = code;
         ev.on = pressed;
-        ev.x = pointer.x();
-        ev.y = pointer.y();
+        ev.x = pointer().x();
+        ev.y = pointer().y();
         events.push_back(ev);
         if (seat->pointer_focus().valid()) {
             seat->pointer_button(code, pressed);
@@ -1373,7 +1293,7 @@ struct Server::Impl {
         build_scene();
         const lm::Box bounds =
             lm::CursorManager::pointer_bounds(&*constraints, scene, layout.bounds());
-        if (pointer.move_by(dx, dy, bounds)) {
+        if (cursor->move_by(dx, dy, bounds)) {
             pointer_moved();
         }
     }
@@ -1500,7 +1420,7 @@ struct Server::Impl {
             const lm::Box origin = first == nullptr || first->output == nullptr
                                        ? lm::Box{}
                                        : layout.box_of(*first->output);
-            pointer.move_to(origin.x + e.x, origin.y + e.y, layout.bounds());
+            cursor->move_to(origin.x + e.x, origin.y + e.y);
             pointer_moved();
         });
         on_button = host.pointer_button.connect(
@@ -1774,9 +1694,8 @@ struct Server::Impl {
         decoration->set_default_mode(config.server_side_decorations
                                          ? lm::DecorationMode::server_side
                                          : lm::DecorationMode::client_side);
-        if (auto c = lm::CursorManager::create(); c) {
-            cursors = std::move(*c);
-        } // no theme installed: the cursor is whatever clients set, or none
+        renderer.set_presentation(&*presentation);
+        cursor.emplace(renderer, layout, *seat, &*cursor_shape, &*screencopy);
         workspace_group = workspaces->add_group();
         workspaces->done();
         foreign->track(*shell); // taskbars see every toplevel without our help
@@ -1787,30 +1706,6 @@ struct Server::Impl {
             shell->new_popup().connect([this](lm::NewPopup& e) { watch_popup(e.popup); });
         on_new_layer = layer_shell->new_layer_surface().connect(
             [this](lm::NewLayerSurface& e) { watch_layer(e.layer_surface); });
-        // Without a GPU no Frame is watching surfaces, so a commit would never
-        // reach the screen. Asking twice on the GPU path costs nothing.
-        on_new_surface = compositor->new_surface().connect([this](lm::NewSurface& e) {
-            surfaces.push_back({e.surface.id(), e.surface.commit.connect(
-                                                    [this](lm::SurfaceCommit&) { schedule_all(); })});
-        });
-        // A cursor-shape request, a client cursor surface, and leaving the
-        // window that set either: each changes the picture, which on a cursor
-        // plane is a re-upload and composited is a repaint. refresh_cursor()
-        // does whichever applies.
-        on_cursor_shape = cursor_shape->request().connect([this](lm::CursorShapeRequest& r) {
-            cursors.set_shape(r.name);
-            refresh_cursor();
-        });
-        on_cursor_change = seat->cursor_changed().connect([this](lm::SeatCursorChange&) {
-            cursors.set_surface_cursor();
-            refresh_cursor();
-        });
-        on_pointer_focus = seat->pointer_focus_changed().connect([this](lm::SeatPointerFocus&) {
-            // A named shape belongs to the client that asked for it; without
-            // this a text field's I-beam follows the pointer across the screen.
-            cursors.set_shape("default");
-            refresh_cursor();
-        });
         on_foreign = foreign->request().connect(
             [this](lm::ForeignToplevelRequest& r) { foreign_request(r); });
         on_activate = activation->request_activate().connect([this](lm::ActivationRequest& r) {
@@ -1940,7 +1835,6 @@ struct Server::Impl {
             drop_global(*o);
         }
         outputs.clear();
-        surfaces.clear();
     }
 };
 

@@ -53,6 +53,17 @@ xmake test      # 跑全部测试
 xmake f -m release && xmake   # 优化构建（默认是 debug）
 ```
 
+**内存要看着点。** clang 编一个模块单元要 1–2 GB，xmake 默认的并行度约等于线程数，
+20 线程的机器上能吃满 32 GB 再压垮 swap，整机卡死。内存不宽裕就限并行度，或者干脆把
+构建关进一个有上限的 cgroup，超了只杀构建：
+
+```sh
+xmake build -a -j4
+systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 xmake build -a -j4
+```
+
+Rust 绑定的 `build.rs` 把 cargo 的并行度原样交给 xmake，所以那边用 `cargo build -j4`。
+
 多数测试用**进程内 `libwayland-client`**（socketpair）驱动真实协议，无需 GPU /
 父 compositor；Vulkan 测试用真 GPU；`wayland-nested` 连真父 compositor（有
 `WAYLAND_DISPLAY` 才跑）。跑不了的测试以 **exit 77** 自我跳过（无 GPU / 无空闲 VT /
@@ -60,23 +71,27 @@ xmake f -m release && xmake   # 优化构建（默认是 debug）
 
 ## 运行
 
+示例只有一个：`examples/minimal.cpp`，与 `bindings/rust/examples/minimal.rs` 是一对——
+同样的窗口策略（每个窗口最大化到输出上、新的在最上面、点击置顶），同样的快捷键：
+Logo+Return 开 `$TERMINAL`（默认 foot）、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出。
+光标与帧回调全由库处理（`Cursor`、`SceneRenderer`），示例里只剩混成器自己的决定。
+
 **嵌套**（在现有桌面里开一个窗口，暴露自己的 `WAYLAND_DISPLAY` 供客户端连接）：
 
 ```sh
-WAYLAND_DISPLAY=wayland-0 ./build/examples/tinyluminaria &
-WAYLAND_DISPLAY=<打印的 socket 路径> weston-terminal
-# 或 LUMINARIA_BACKEND=headless 强制无头模式；LUMINARIA_OUTPUT=1280x800 改输出尺寸
+xmake run minimal &
+WAYLAND_DISPLAY=<打印的 socket 名> weston-terminal
+# 或 LUMINARIA_BACKEND=headless 强制无头模式；LUMINARIA_EXIT_MS=500 到点自动退出
 ```
 
 **裸机**（需切到空闲 VT、停掉桌面，对该 VT 有 DRM master + 输入 ACL）：
 
 ```sh
-./build/examples/luminaria-tty                 # 自动探测 /dev/dri/card*，可传 card1 显式指定
+LUMINARIA_BACKEND=drm xmake run minimal          # 自动探测 /dev/dri/card*，可传 card1 显式指定
 ```
 
-`luminaria-tty` 是完整裸机 compositor：DRM 输出 + libinput 输入 + wl_compositor /
-xdg-shell / seat，每帧用 Vulkan 合成 mapped 客户端窗口后扫描到显示器，键盘路由到
-聚焦窗口，Esc 退出。它打印自己的 `WAYLAND_DISPLAY`，从另一 VT / ssh 指客户端过来：
+裸机上它是完整的 compositor：DRM 输出 + libinput 输入 + libseat，GPU 合成或直出，硬件光标
+平面，Ctrl+Alt+Fn 切 VT。它打印自己的 `WAYLAND_DISPLAY`，从另一 VT / ssh 指客户端过来：
 
 ```sh
 WAYLAND_DISPLAY=wayland-1 weston-terminal
