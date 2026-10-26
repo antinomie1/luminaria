@@ -173,7 +173,9 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `text_input` (text-input-v3), `idle_inhibit`, `data_control`
   (wlr-data-control, bridged into `data_device` through `SelectionSource`),
   `session_lock` (ext-session-lock, which fails CLOSED: a lock client that dies leaves
-  the session locked), `input_method` (input-method-v2, bridged to `text_input`).
+  the session locked), `input_method` (input-method-v2, bridged to `text_input`),
+  `output_management` (wlr-output-management: heads described from `Output` +
+  `OutputLayout`, apply/test handed to the compositor as one `OutputConfigRequest`).
 - **`vulkan`** — Vulkan 1.3 is the floor (ADR 0007): the instance asks for 1.3, features are
   queried and enabled through one `StructureChain<Features2, Vulkan11, Vulkan12, Vulkan13>`
   (synchronization2, dynamicRendering, timelineSemaphore), and a device without them is

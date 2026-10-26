@@ -60,6 +60,7 @@ LUMINARIA_BACKEND=drm cargo run --example floating              # 裸机，在�
 | ext-session-lock | 锁定即只画锁屏、只给锁屏输入、快捷键全部失效；所有输出都画出锁屏后才回 `locked`；锁屏程序崩溃时保持锁定（fails closed） | `Event::SessionLock`、`is_locked()`，仅供知情 |
 | wlr-screencopy / ext-image-copy-capture | 从已上屏的画面读回（含 dmabuf 目标），光标作为单独的捕获源 | — |
 | foreign-toplevel、xdg-activation | 任务栏列表自动同步；关闭请求直接执行；只有有效 token 才能转移焦点 | 转成 `RequestActivate` / `RequestMaximize` / `RequestMinimize` 等同一套事件 |
+| wlr-output-management | 每个输出一个 head（名字与 wl_output 相同），热插拔与任何 `set_output_*` 之后自动重发；`wlr-randr` / kanshi 的 apply 直接执行（见下） | 照常收到 `Event::OutputChange` |
 | ext-workspace | 一个 group，覆盖所有输出 | `add_workspace` / `activate_workspace` / `remove_workspace`；`Event::WorkspaceActivate` |
 | text-input-v3 + input-method-v2 | 输入法抢键盘时按键转给它；候选框贴在文本光标下 | — |
 | pointer-constraints、relative-pointer | 指针锁定/限制随指针焦点生效；裸机上发相对位移 | — |
@@ -73,6 +74,13 @@ LUMINARIA_BACKEND=drm cargo run --example floating              # 裸机，在�
 输出（裸机上才有意义）：`output_modes`、`set_output_mode`、`set_output_scale`、
 `set_output_transform`、`set_output_position`，之后都会收到 `Event::OutputChange`。键盘布局用
 `set_keyboard_layout("de")`；嵌套时按键来自宿主，跟随宿主的布局。
+
+用户用 `wlr-randr` / kanshi 改输出时，shim 把它当作机制直接执行，不经过 Rust 审批，也不新增任何
+Rust API：配置走的就是上面那几个 `set_output_*` 的同一条路径，Rust 照常收到
+`Event::OutputChange`，和自己调用时分不出区别。先整体校验再动手，做不到的整份拒绝（`failed`），
+什么都不改：关掉某个输出（输出只会因拔掉而离开 layout）、开启自适应同步、输出不支持的 mode。
+小数 scale 四舍五入成整数，协议允许这样做。mode 切换是唯一可能被后端当场拒绝的一步，所以最先做，
+失败时把已经切过的输出切回去。
 
 ## 构建
 
@@ -132,6 +140,4 @@ xmake.lua          shim 的 xmake 子工程，includes("../..") 引入 luminaria
 
 - **触摸。** Seat 支持 `touch_*`，但 `LibinputBackend` 只报告设备有没有触摸能力、不发触摸事件，
   嵌套后端也不转发；要先在库里补上这一层。
-- **wlr-output-management**（让 `wlr-randr`/kanshi 改输出）：库里没有这个协议；目前只能由
-  Rust 调 `set_output_*`。
 - 截屏注册的输出尺寸是客户端绑定 wl_output 时的尺寸；改模式后新绑定的客户端才拿到新尺寸。

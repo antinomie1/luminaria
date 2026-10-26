@@ -143,7 +143,7 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 ```
 src/luminaria.cppm       基础接口单元（协议 + core + 嵌套/headless）
 src/luminaria.gpu.cppm   Vulkan / DRM / libinput / session / GPU 协议
-src/luminaria.desktop.cppm  workspace / foreign-toplevel / data-control
+src/luminaria.desktop.cppm  workspace / foreign-toplevel / data-control / output-management …
 src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland

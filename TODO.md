@@ -143,7 +143,7 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 
 - **摆放策略**（平铺 / 浮动 / 工作区切换逻辑）—— 每个混成器自己实现，见 `CONTEXT.md`。
 - **窗口装饰绘制** —— 库不画标题栏，所以 `xdg-decoration` 默认答 client-side。
-- **output-management / gamma-control / tablet-v2 / pointer-gestures** —— 完整桌面要，
+- **gamma-control / tablet-v2 / pointer-gestures** —— 完整桌面要，
   但混成器可以自己实现，且都不影响那三个数。
 - **VRR / 动态刷新率**（低功耗第三级）—— 收益大，但依赖真机数据，等第 0 步之后再判断。
 
