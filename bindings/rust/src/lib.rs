@@ -1,9 +1,21 @@
 //! Rust bindings for luminaria, a Wayland compositor library.
 //!
-//! The C++ side (`luminaria_rs.cpp`) does everything every compositor does
-//! the same way: globals, renderer, frame pacing, frame callbacks, popups,
-//! the cursor, pointer focus. What is left is window management, and that is
-//! this API:
+//! Luminaria provides three C++23 modules:
+//! - `luminaria`: Core protocols, utilities, event loop, display, and nested/headless backends.
+//! - `luminaria.gpu`: Vulkan renderer, DRM/KMS, libinput, session, screencopy, direct scanout, and GPU frame ledgers.
+//! - `luminaria.desktop`: Privileged desktop-shell protocols (foreign-toplevel, workspaces, session-lock, output-management, data-control, input-method).
+//!
+//! You can use the high-level [`Server`] facade for a ready-made compositor policy,
+//! or assemble low-level library components directly from the submodules:
+//! - [`util`]: Box, Rect, Color, Transform, Region, KeymapState, Pixel.
+//! - [`core`]: Display, EventLoop, Error, KeyRouter.
+//! - [`backend`]: Output, HeadlessBackend, WaylandBackend, DrmBackend, LibinputBackend, Session.
+//! - [`protocol`]: Compositor, Subcompositor, XdgShell, Seat, LayerShell, and core protocol managers.
+//! - [`gpu`]: VulkanRenderer, SceneRenderer, Frame, Cursor, DirectScanout, LinuxDmabuf, Screencopy.
+//! - [`desktop`]: ForeignToplevelManager, WorkspaceManager, SessionLockManager, OutputManager, DataControlManager, InputMethodManager.
+//! - [`shell`]: OutputLayout, SceneItem, SceneHit, scene_hit_test, CpuCompositor, PopupTree.
+//!
+//! # High-level Example
 //!
 //! ```no_run
 //! use luminaria::{Config, Event, Item, Server};
@@ -31,23 +43,26 @@
 //! })
 //! .unwrap();
 //! ```
-//!
-//! # Threading and re-entrancy
-//!
-//! C++ never calls into Rust. Wayland callbacks only queue [`Event`]s, which
-//! you take with [`Server::next_event`] after [`Server::dispatch`] returns, so
-//! every method here is called while no C++ callback is on the stack. That is
-//! why `&mut Server` can simply be handed to your event handler.
-//!
-//! [`Server`] is neither `Send` nor `Sync`: libwayland is single-threaded.
 
-use std::fmt;
-use std::ops::{BitOr, BitOrAssign, ControlFlow};
-use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
+pub mod backend;
+pub mod core;
+pub mod desktop;
+pub mod gpu;
+pub mod protocol;
+pub mod server;
+pub mod shell;
+pub mod util;
+
+// Re-exports for 100% backward compatibility with existing users and examples
+pub use core::Error;
+pub use server::{
+    edge, keysym, Backend, BindingId, Config, Event, Item, Mods, OutputId, Server, WindowId,
+    WorkspaceId,
+};
+pub use util::{Color, Mode, Rect, Transform};
 
 #[cxx::bridge(namespace = "lum")]
-mod ffi {
+pub(crate) mod ffi {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum BackendKind {
         Auto,
@@ -93,8 +108,6 @@ mod ffi {
         TouchUp,
     }
 
-    /// Flat on purpose: cxx cannot carry a Rust enum with payloads, so every
-    /// kind uses the fields it needs and `Event::from_raw` gives it a shape.
     #[derive(Debug, Clone, Copy)]
     struct Event {
         kind: EventKind,
@@ -157,6 +170,59 @@ mod ffi {
         preferred: bool,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct SceneItemRaw {
+        kind: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        surface_id: u64,
+        surface_x: i32,
+        surface_y: i32,
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
+        thickness: i32,
+        serial: u64,
+        tag: u64,
+        accepts_input: bool,
+        alpha: f32,
+        corner_radius: f32,
+        blur_enabled: bool,
+        blur_xray: bool,
+        shadow_r: f32,
+        shadow_g: f32,
+        shadow_b: f32,
+        shadow_a: f32,
+        shadow_feather: f32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SceneHitRaw {
+        hit: bool,
+        tag: u64,
+        surface_id: u64,
+        sx: f64,
+        sy: f64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ToplevelEventRaw {
+        kind: u32,
+        surface_id: u64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct BackendInputEventRaw {
+        kind: u32,
+        code: u32,
+        pressed: bool,
+        x: f64,
+        y: f64,
+    }
+
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
 
@@ -212,739 +278,327 @@ mod ffi {
         fn activate_workspace(self: Pin<&mut Server>, workspace: u32);
 
         fn is_locked(self: &Server) -> bool;
+
+        // Core & Util Shims
+        type DisplayShim;
+        fn display_new(error: &mut String) -> UniquePtr<DisplayShim>;
+        fn fd(self: &DisplayShim) -> i32;
+        fn add_socket_auto(self: &DisplayShim, error: &mut String) -> String;
+        fn add_socket(self: &DisplayShim, name: &str, error: &mut String) -> bool;
+        fn init_shm(self: &DisplayShim, error: &mut String) -> bool;
+        fn run(self: &DisplayShim);
+        fn terminate(self: &DisplayShim);
+        fn dispatch(self: &DisplayShim, timeout_ms: i32) -> i32;
+        fn flush_clients(self: &DisplayShim);
+
+        type KeymapStateShim;
+        fn keymap_state_from_layout(layout: &str, error: &mut String) -> UniquePtr<KeymapStateShim>;
+        fn keymap_state_from_text(text: &str, error: &mut String) -> UniquePtr<KeymapStateShim>;
+        fn text(self: &KeymapStateShim) -> String;
+        fn key_keysym(self: &KeymapStateShim, code: u32) -> u32;
+        fn update_key(self: Pin<&mut KeymapStateShim>, code: u32, pressed: bool);
+        fn modifiers_depressed(self: &KeymapStateShim) -> u32;
+        fn modifiers_latched(self: &KeymapStateShim) -> u32;
+        fn modifiers_locked(self: &KeymapStateShim) -> u32;
+        fn modifiers_group(self: &KeymapStateShim) -> u32;
+
+        type RegionShim;
+        fn region_new() -> UniquePtr<RegionShim>;
+        fn region_from_box(x: i32, y: i32, width: i32, height: i32) -> UniquePtr<RegionShim>;
+        fn add(self: Pin<&mut RegionShim>, x: i32, y: i32, width: i32, height: i32);
+        fn subtract_box(self: Pin<&mut RegionShim>, x: i32, y: i32, width: i32, height: i32);
+        fn subtract_region(self: Pin<&mut RegionShim>, other: &RegionShim);
+        fn intersect_box(self: Pin<&mut RegionShim>, x: i32, y: i32, width: i32, height: i32);
+        fn intersect_region(self: Pin<&mut RegionShim>, other: &RegionShim);
+        fn empty(self: &RegionShim) -> bool;
+        fn clear(self: Pin<&mut RegionShim>);
+        fn contains(self: &RegionShim, x: i32, y: i32) -> bool;
+        fn extents(self: &RegionShim) -> Rect;
+        fn rects(self: &RegionShim) -> Vec<Rect>;
+
+        fn layout_fits_raw(width: i32, height: i32, stride: u32, offset: u32, total_size: usize) -> bool;
+
+        // Backend & Output
+        type OutputShim;
+        fn width(self: &OutputShim) -> i32;
+        fn height(self: &OutputShim) -> i32;
+        fn scale(self: &OutputShim) -> i32;
+        fn set_scale(self: Pin<&mut OutputShim>, scale: i32);
+        fn transform(self: &OutputShim) -> u32;
+        fn set_transform(self: Pin<&mut OutputShim>, transform: u32);
+        fn logical_width(self: &OutputShim) -> i32;
+        fn logical_height(self: &OutputShim) -> i32;
+        fn schedule_frame(self: Pin<&mut OutputShim>);
+        fn frame_scheduled(self: &OutputShim) -> bool;
+        fn modes(self: &OutputShim) -> Vec<Mode>;
+        fn current_mode(self: &OutputShim) -> Mode;
+        fn set_mode(self: Pin<&mut OutputShim>, width: i32, height: i32, refresh_mhz: i32, error: &mut String) -> bool;
+        fn commit(self: Pin<&mut OutputShim>, r: f32, g: f32, b: f32, a: f32, error: &mut String) -> bool;
+        fn commit_frame(self: Pin<&mut OutputShim>, rgba: &[u8], width: i32, height: i32, error: &mut String) -> bool;
+        fn scanout_modifiers(self: &OutputShim, drm_format: u32) -> Vec<u64>;
+        fn has_cursor_plane(self: &OutputShim) -> bool;
+        fn move_cursor(self: Pin<&mut OutputShim>, x: i32, y: i32, error: &mut String) -> bool;
+        fn hide_cursor(self: Pin<&mut OutputShim>, error: &mut String) -> bool;
+        fn take_frame(self: Pin<&mut OutputShim>) -> bool;
+
+        type HeadlessBackendShim;
+        fn headless_backend_new(display: &DisplayShim, interval_ms: u32, error: &mut String) -> UniquePtr<HeadlessBackendShim>;
+        fn add_output(self: Pin<&mut HeadlessBackendShim>, width: i32, height: i32) -> UniquePtr<OutputShim>;
+        fn start(self: Pin<&mut HeadlessBackendShim>, error: &mut String) -> bool;
+
+        type WaylandBackendShim;
+        fn wayland_backend_new(display: &DisplayShim, error: &mut String) -> UniquePtr<WaylandBackendShim>;
+        fn add_output(self: Pin<&mut WaylandBackendShim>, width: i32, height: i32) -> UniquePtr<OutputShim>;
+        fn start(self: Pin<&mut WaylandBackendShim>, error: &mut String) -> bool;
+        fn keymap(self: &WaylandBackendShim) -> String;
+        fn next_input_event(self: Pin<&mut WaylandBackendShim>, out: &mut BackendInputEventRaw) -> bool;
+
+        type SessionShim;
+        fn session_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SessionShim>;
+        fn switch_to(self: Pin<&mut SessionShim>, vt: i32, error: &mut String) -> bool;
+        fn active(self: &SessionShim) -> bool;
+        fn seat_name(self: &SessionShim) -> String;
+
+        type DrmBackendShim;
+        fn drm_backend_new(display: &DisplayShim, device: &str, session: &SessionShim, error: &mut String) -> UniquePtr<DrmBackendShim>;
+        fn drm_backend_new_standalone(display: &DisplayShim, device: &str, error: &mut String) -> UniquePtr<DrmBackendShim>;
+        fn start(self: Pin<&mut DrmBackendShim>, error: &mut String) -> bool;
+
+        type LibinputBackendShim;
+        fn libinput_backend_new(display: &DisplayShim, session: &SessionShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
+        fn libinput_backend_new_standalone(display: &DisplayShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
+        fn start(self: Pin<&mut LibinputBackendShim>, error: &mut String) -> bool;
+        fn add_device(self: Pin<&mut LibinputBackendShim>, path: &str, error: &mut String) -> bool;
+
+        // Surface inspection
+        fn surface_width(surface_id: u64) -> i32;
+        fn surface_height(surface_id: u64) -> i32;
+        fn buffer_width(surface_id: u64) -> i32;
+        fn buffer_height(surface_id: u64) -> i32;
+        fn buffer_scale(surface_id: u64) -> i32;
+        fn buffer_transform(surface_id: u64) -> u32;
+        fn surface_has_buffer(surface_id: u64) -> bool;
+        fn surface_damage(surface_id: u64) -> Vec<Rect>;
+        fn surface_send_frame_done(surface_id: u64, time_ms: u32);
+        fn surface_accepts_input(surface_id: u64, sx: f64, sy: f64) -> bool;
+
+        // Core Protocols
+        type CompositorShim;
+        fn compositor_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CompositorShim>;
+
+        type SubcompositorShim;
+        fn subcompositor_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SubcompositorShim>;
+
+        type XdgShellShim;
+        fn xdg_shell_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgShellShim>;
+        fn set_bounds(self: Pin<&mut XdgShellShim>, width: i32, height: i32);
+        fn next_toplevel_event(self: Pin<&mut XdgShellShim>, out: &mut ToplevelEventRaw) -> bool;
+        fn toplevel_configure(self: Pin<&mut XdgShellShim>, surface_id: u64, width: i32, height: i32);
+        fn toplevel_set_maximized(self: Pin<&mut XdgShellShim>, surface_id: u64, on: bool);
+        fn toplevel_set_activated(self: Pin<&mut XdgShellShim>, surface_id: u64, on: bool);
+        fn toplevel_close(self: Pin<&mut XdgShellShim>, surface_id: u64);
+
+        type SeatShim;
+        fn seat_new(display: &DisplayShim, name: &str, error: &mut String) -> UniquePtr<SeatShim>;
+        fn set_capabilities(self: Pin<&mut SeatShim>, keyboard: bool, pointer: bool, touch: bool);
+        fn set_keymap(self: Pin<&mut SeatShim>, xkb_text: &str) -> bool;
+        fn keymap(self: &SeatShim) -> String;
+        fn set_keyboard_focus(self: Pin<&mut SeatShim>, surface_id: u64);
+        fn keyboard_focus(self: &SeatShim) -> u64;
+        fn notify_key(self: Pin<&mut SeatShim>, key: u32, pressed: bool);
+        fn notify_modifiers(self: Pin<&mut SeatShim>, depressed: u32, latched: u32, locked: u32, group: u32);
+        fn pointer_enter(self: Pin<&mut SeatShim>, surface_id: u64, sx: f64, sy: f64);
+        fn pointer_clear_focus(self: Pin<&mut SeatShim>);
+        fn pointer_focus(self: &SeatShim) -> u64;
+        fn pointer_grab(self: &SeatShim) -> u64;
+        fn pointer_motion(self: Pin<&mut SeatShim>, sx: f64, sy: f64);
+        fn pointer_button(self: Pin<&mut SeatShim>, button: u32, pressed: bool);
+        fn pointer_axis(self: Pin<&mut SeatShim>, dx: f64, dy: f64);
+        fn pointer_axis_discrete(self: Pin<&mut SeatShim>, dx_steps: i32, dy_steps: i32);
+        fn pointer_axis_stop(self: Pin<&mut SeatShim>, horizontal: bool, vertical: bool);
+        fn cursor_surface(self: &SeatShim) -> u64;
+        fn cursor_hidden(self: &SeatShim) -> bool;
+        fn cursor_hotspot_x(self: &SeatShim) -> i32;
+        fn cursor_hotspot_y(self: &SeatShim) -> i32;
+        fn touch_down(self: Pin<&mut SeatShim>, surface_id: u64, id: i32, x: f64, y: f64);
+        fn touch_motion(self: Pin<&mut SeatShim>, id: i32, x: f64, y: f64);
+        fn touch_up(self: Pin<&mut SeatShim>, id: i32);
+        fn touch_frame(self: Pin<&mut SeatShim>);
+        fn touch_cancel(self: Pin<&mut SeatShim>);
+        fn touch_focus(self: &SeatShim, id: i32) -> u64;
+
+        type LayerShellShim;
+        fn layer_shell_new(display: &DisplayShim, error: &mut String) -> UniquePtr<LayerShellShim>;
+
+        type OutputGlobalShim;
+        fn output_global_new(display: &DisplayShim, width: i32, height: i32, name: &str, error: &mut String) -> UniquePtr<OutputGlobalShim>;
+
+        type CursorThemeShim;
+        fn cursor_theme_load(name: &str, size: i32, error: &mut String) -> UniquePtr<CursorThemeShim>;
+
+        type ViewporterShim;
+        fn viewporter_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ViewporterShim>;
+
+        type FractionalScaleManagerShim;
+        fn fractional_scale_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<FractionalScaleManagerShim>;
+
+        type XdgActivationShim;
+        fn xdg_activation_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgActivationShim>;
+
+        type XdgDecorationManagerShim;
+        fn xdg_decoration_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgDecorationManagerShim>;
+
+        type CursorShapeManagerShim;
+        fn cursor_shape_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CursorShapeManagerShim>;
+
+        type IdleInhibitManagerShim;
+        fn idle_inhibit_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<IdleInhibitManagerShim>;
+
+        type IdleNotifierShim;
+        fn idle_notifier_new(display: &DisplayShim, error: &mut String) -> UniquePtr<IdleNotifierShim>;
+
+        type TextInputManagerShim;
+        fn text_input_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<TextInputManagerShim>;
+
+        type SinglePixelBufferManagerShim;
+        fn single_pixel_buffer_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SinglePixelBufferManagerShim>;
+
+        type TearingControlManagerShim;
+        fn tearing_control_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<TearingControlManagerShim>;
+
+        type ContentTypeManagerShim;
+        fn content_type_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ContentTypeManagerShim>;
+
+        type FifoManagerShim;
+        fn fifo_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<FifoManagerShim>;
+
+        type CommitTimingManagerShim;
+        fn commit_timing_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CommitTimingManagerShim>;
+
+        type PresentationShim;
+        fn presentation_new(display: &DisplayShim, error: &mut String) -> UniquePtr<PresentationShim>;
+
+        type BackgroundEffectManagerShim;
+        fn background_effect_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<BackgroundEffectManagerShim>;
+
+        type XdgToplevelIconManagerShim;
+        fn xdg_toplevel_icon_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgToplevelIconManagerShim>;
+
+        type DrmSyncobjManagerShim;
+        fn drm_syncobj_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<DrmSyncobjManagerShim>;
+
+        type ScreencopyManagerShim;
+        fn screencopy_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ScreencopyManagerShim>;
+
+        type ForeignToplevelManagerShim;
+        fn foreign_toplevel_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ForeignToplevelManagerShim>;
+
+        type WorkspaceManagerShim;
+        fn workspace_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<WorkspaceManagerShim>;
+
+        type SessionLockManagerShim;
+        fn session_lock_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SessionLockManagerShim>;
+
+        type DataDeviceManagerShim;
+        fn data_device_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<DataDeviceManagerShim>;
+
+        type PrimarySelectionManagerShim;
+        fn primary_selection_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<PrimarySelectionManagerShim>;
+
+        type RelativePointerManagerShim;
+        fn relative_pointer_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<RelativePointerManagerShim>;
+
+        type PointerConstraintsShim;
+        fn pointer_constraints_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<PointerConstraintsShim>;
+
+        // GPU Rendering & Shell
+        type VulkanRendererShim;
+        fn vulkan_renderer_new(drm_device: &str, error: &mut String) -> UniquePtr<VulkanRendererShim>;
+        fn scanout_modifiers(self: &VulkanRendererShim, drm_format: u32) -> Vec<u64>;
+
+        type LinuxDmabufShim;
+        fn linux_dmabuf_new(display: &DisplayShim, renderer: &VulkanRendererShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
+        fn linux_dmabuf_new_headless(display: &DisplayShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
+
+        type SceneOutputShim;
+        fn scene_output_new() -> UniquePtr<SceneOutputShim>;
+        fn gpu_output(self: &SceneOutputShim) -> bool;
+
+        type SceneRendererShim;
+        fn scene_renderer_new(drm_device: &str, error: &mut String) -> UniquePtr<SceneRendererShim>;
+        fn gpu_enabled(self: &SceneRendererShim) -> bool;
+        fn gpu_error(self: &SceneRendererShim) -> String;
+        fn reset(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
+        fn present(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, items: &[SceneItemRaw], bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
+        fn set_presentation(self: Pin<&mut SceneRendererShim>, presentation: &PresentationShim);
+        fn clear_presentation(self: Pin<&mut SceneRendererShim>);
+        fn update_cursor(self: Pin<&mut SceneRendererShim>);
+        fn read_back(self: Pin<&mut SceneRendererShim>, state: Pin<&mut SceneOutputShim>, error: &mut String) -> Vec<u8>;
+
+        type OutputLayoutShim;
+        fn output_layout_new() -> UniquePtr<OutputLayoutShim>;
+        fn add(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>, x: i32, y: i32);
+        fn remove(self: Pin<&mut OutputLayoutShim>, output: Pin<&mut OutputShim>);
+        fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
+
+        type CursorShim;
+        fn cursor_new(renderer: Pin<&mut SceneRendererShim>, layout: &OutputLayoutShim, seat: Pin<&mut SeatShim>, error: &mut String) -> UniquePtr<CursorShim>;
+        fn move_to(self: Pin<&mut CursorShim>, x: f64, y: f64, bounds: Rect) -> bool;
+        fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64, bounds: Rect) -> bool;
+        fn leave(self: Pin<&mut CursorShim>);
+        fn refresh(self: Pin<&mut CursorShim>);
+
+        type FrameShim;
+        fn frame_new(output: Pin<&mut OutputShim>, renderer: Pin<&mut VulkanRendererShim>, error: &mut String) -> UniquePtr<FrameShim>;
+        fn reset(self: Pin<&mut FrameShim>, drm_format: u32, error: &mut String) -> bool;
+        fn begin(self: Pin<&mut FrameShim>, vx: i32, vy: i32, vw: i32, vh: i32);
+        fn place_rect(self: Pin<&mut FrameShim>, x: i32, y: i32, width: i32, height: i32, r: f32, g: f32, b: f32, a: f32);
+        fn submit(self: Pin<&mut FrameShim>, bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
+        fn send_frame_done(self: Pin<&mut FrameShim>, time_ms: u32);
+
+        type CpuCompositorShim;
+        fn cpu_compositor_new() -> UniquePtr<CpuCompositorShim>;
+        fn composite_rect(self: Pin<&mut CpuCompositorShim>, x: i32, y: i32, width: i32, height: i32, r: f32, g: f32, b: f32, a: f32);
+        fn finish(self: Pin<&mut CpuCompositorShim>, width: i32, height: i32, bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32) -> Vec<u8>;
+
+        type DirectScanoutShim;
+        fn direct_scanout_new(output: Pin<&mut OutputShim>) -> UniquePtr<DirectScanoutShim>;
+        fn available(self: &DirectScanoutShim) -> bool;
+        fn id_for(self: Pin<&mut DirectScanoutShim>, surface_id: u64) -> u32;
+        fn committed(self: Pin<&mut DirectScanoutShim>, surface_id: u64);
+        fn presented(self: Pin<&mut DirectScanoutShim>);
+        fn clear(self: Pin<&mut DirectScanoutShim>);
+        fn cached(self: &DirectScanoutShim) -> usize;
+
+        fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
+
+        // Desktop Protocols
+        fn foreign_toplevel_track(ftm: Pin<&mut ForeignToplevelManagerShim>, shell: Pin<&mut XdgShellShim>);
+
+        fn workspace_manager_create_group(wm: Pin<&mut WorkspaceManagerShim>) -> u32;
+        fn workspace_manager_create_workspace(wm: Pin<&mut WorkspaceManagerShim>, group: u32, name: &str) -> u32;
+        fn workspace_manager_remove_workspace(wm: Pin<&mut WorkspaceManagerShim>, workspace: u32);
+        fn workspace_manager_activate_workspace(wm: Pin<&mut WorkspaceManagerShim>, workspace: u32);
+
+        fn session_lock_manager_locked(slm: Pin<&mut SessionLockManagerShim>) -> bool;
+
+        type OutputManagerShim;
+        fn output_manager_new(display: &DisplayShim, layout: &OutputLayoutShim, error: &mut String) -> UniquePtr<OutputManagerShim>;
+        fn update(self: Pin<&mut OutputManagerShim>);
+
+        type DataControlManagerShim;
+        fn data_control_manager_new(display: &DisplayShim, ddm: &DataDeviceManagerShim, error: &mut String) -> UniquePtr<DataControlManagerShim>;
+
+        type InputMethodManagerShim;
+        fn input_method_manager_new(display: &DisplayShim, seat: &SeatShim, tim: &TextInputManagerShim, error: &mut String) -> UniquePtr<InputMethodManagerShim>;
+
+        type DesktopGlobalsShim;
+        fn desktop_globals_new(display: &DisplayShim, renderer: &VulkanRendererShim, seat_name: &str, error: &mut String) -> UniquePtr<DesktopGlobalsShim>;
+        fn desktop_globals_new_headless(display: &DisplayShim, seat_name: &str, error: &mut String) -> UniquePtr<DesktopGlobalsShim>;
+
+        type PopupTreeShim;
+        fn popup_tree_new() -> UniquePtr<PopupTreeShim>;
+        fn contains(self: &PopupTreeShim, surface_id: u64) -> bool;
+        fn dismiss_grabs_outside(self: Pin<&mut PopupTreeShim>, surface_id: u64) -> bool;
     }
-}
-
-/// An RGBA colour, each channel in `0.0..=1.0`, not premultiplied.
-pub use ffi::Color;
-
-impl Color {
-    pub const fn rgb(r: f32, g: f32, b: f32) -> Self {
-        Self { r, g, b, a: 1.0 }
-    }
-    pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-}
-
-/// A rectangle in global logical coordinates.
-pub use ffi::Rect;
-
-impl Rect {
-    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    pub fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.x as f64
-            && y >= self.y as f64
-            && x < (self.x + self.width) as f64
-            && y < (self.y + self.height) as f64
-    }
-
-    /// The rectangle an interactive resize from `self` reaches after the
-    /// pointer moved by (`dx`, `dy`): the edges in `edges` (an
-    /// [`Event::RequestResize`] bitmask, see [`edge`]) follow the pointer, the
-    /// opposite ones stay put, and neither axis shrinks below `min`.
-    pub fn resized(&self, edges: u32, dx: i32, dy: i32, min: (i32, i32)) -> Rect {
-        let (min_w, min_h) = (min.0.max(1), min.1.max(1));
-        let mut r = *self;
-        if edges & edge::LEFT != 0 {
-            let w = (self.width - dx).max(min_w);
-            r.x = self.x + self.width - w;
-            r.width = w;
-        } else if edges & edge::RIGHT != 0 {
-            r.width = (self.width + dx).max(min_w);
-        }
-        if edges & edge::TOP != 0 {
-            let h = (self.height - dy).max(min_h);
-            r.y = self.y + self.height - h;
-            r.height = h;
-        } else if edges & edge::BOTTOM != 0 {
-            r.height = (self.height + dy).max(min_h);
-        }
-        r
-    }
-}
-
-/// The bits of xdg_toplevel's resize edge, as [`Event::RequestResize`] carries it.
-pub mod edge {
-    pub const TOP: u32 = 1;
-    pub const BOTTOM: u32 = 2;
-    pub const LEFT: u32 = 4;
-    pub const RIGHT: u32 = 8;
-}
-
-/// One display mode a monitor supports.
-pub use ffi::Mode;
-
-/// How an output is rotated / flipped (wl_output.transform).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Transform {
-    #[default]
-    Normal,
-    Rotate90,
-    Rotate180,
-    Rotate270,
-    Flipped,
-    Flipped90,
-    Flipped180,
-    Flipped270,
-}
-
-/// A workspace, as pagers (ext-workspace) see it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WorkspaceId(u32);
-
-/// A toplevel window. Never reused, so a stale id simply stops resolving:
-/// every call taking one is a no-op once the window is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WindowId(u64);
-
-/// A display output. Never reused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct OutputId(u64);
-
-/// What [`Server::bind`] / [`Server::bind_key`] returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BindingId(u32);
-
-/// Modifier set for a key binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Mods(u32);
-
-impl Mods {
-    // xkb's core modifier bits; the same for every keymap.
-    pub const NONE: Mods = Mods(0);
-    pub const SHIFT: Mods = Mods(1 << 0);
-    pub const CTRL: Mods = Mods(1 << 2);
-    pub const ALT: Mods = Mods(1 << 3);
-    pub const LOGO: Mods = Mods(1 << 6);
-}
-
-impl BitOr for Mods {
-    type Output = Mods;
-    fn bitor(self, rhs: Mods) -> Mods {
-        Mods(self.0 | rhs.0)
-    }
-}
-
-impl BitOrAssign for Mods {
-    fn bitor_assign(&mut self, rhs: Mods) {
-        self.0 |= rhs.0;
-    }
-}
-
-/// Where the compositor shows up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Backend {
-    /// The first that works of: a window in the parent compositor (when
-    /// `WAYLAND_DISPLAY` reaches one); [`Backend::Drm`], but only when a
-    /// libseat session can be had, i.e. on a real VT and not over ssh or in
-    /// CI; headless.
-    #[default]
-    Auto,
-    /// A window in the parent compositor, or fail.
-    Nested,
-    /// No display at all; for tests and CI.
-    Headless,
-    /// Bare metal: KMS for the screens, libinput for input, libseat for
-    /// device access and VT switching. Run it from a free VT.
-    ///
-    /// Without a libseat session (no seatd or logind seat) it still starts
-    /// from a logged-in VT, but VT switching is then disabled.
-    /// Ctrl+Alt+F1..F12 switch VTs and are never seen by the window manager.
-    Drm,
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub backend: Backend,
-    /// Output size in pixels (the nested window, or the headless output).
-    /// Ignored on [`Backend::Drm`], where each monitor keeps its own mode.
-    pub width: i32,
-    pub height: i32,
-    /// Ask clients not to draw their own title bars. You then draw whatever
-    /// frame you want with [`Item::Border`] / [`Item::Rect`].
-    pub server_side_decorations: bool,
-    /// [`Backend::Drm`] only: the card to drive, e.g. `/dev/dri/card1`.
-    /// `None` picks the first card with a connected monitor.
-    pub drm_device: Option<String>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            backend: Backend::Auto,
-            width: 1280,
-            height: 800,
-            server_side_decorations: false,
-            drm_device: None,
-        }
-    }
-}
-
-/// Something happened. Taken with [`Server::next_event`], or handed to the
-/// closure given to [`Server::run`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Event {
-    /// A client created a toplevel. Not drawable until [`Event::WindowMap`].
-    WindowNew(WindowId),
-    /// The window has content: put it in the scene.
-    WindowMap(WindowId),
-    /// Hidden by the client. Keyboard focus, if it had it, is already gone.
-    WindowUnmap(WindowId),
-    /// Gone for good. The id no longer resolves.
-    WindowDestroy(WindowId),
-    /// Title or app id changed; read them with [`Server::title`] / [`Server::app_id`].
-    WindowTitle(WindowId),
-    /// Answer with [`Server::set_maximized`] (or ignore it).
-    RequestMaximize {
-        window: WindowId,
-        on: bool,
-    },
-    /// Answer with [`Server::set_fullscreen`] (or ignore it).
-    RequestFullscreen {
-        window: WindowId,
-        on: bool,
-    },
-    /// Minimize (`on`) or restore: from the window itself, or a taskbar.
-    /// Hide it yourself, then confirm with [`Server::set_minimized`].
-    RequestMinimize {
-        window: WindowId,
-        on: bool,
-    },
-    /// Raise and focus this window: a taskbar click, or an app handing focus
-    /// to another through a valid xdg-activation token.
-    RequestActivate(WindowId),
-    /// The client wants an interactive move (it was dragged by its title bar).
-    RequestMove(WindowId),
-    /// The client wants an interactive resize; `edges` is xdg_toplevel's
-    /// resize_edge bitmask.
-    RequestResize {
-        window: WindowId,
-        edges: u32,
-    },
-    /// Global logical coordinates, and the window under the pointer.
-    PointerMotion {
-        window: Option<WindowId>,
-        x: f64,
-        y: f64,
-    },
-    /// Already forwarded to the client under the pointer; this is a copy for
-    /// you, e.g. for click-to-focus. `button` is an evdev code (`BTN_LEFT` = 272).
-    PointerButton {
-        window: Option<WindowId>,
-        button: u32,
-        pressed: bool,
-        x: f64,
-        y: f64,
-    },
-    /// A finger touched the screen ([`Backend::Drm`] only: libinput
-    /// touchscreens). Global logical coordinates, and the window under the
-    /// finger. Already forwarded to the client there; this copy is for your
-    /// own gestures. `id` is the touch point: unique among the points down at
-    /// once, reused after it lifts.
-    TouchDown {
-        id: i32,
-        window: Option<WindowId>,
-        x: f64,
-        y: f64,
-    },
-    /// Point `id` moved. `window` is still the one it went down on, wherever
-    /// the finger is now — the client keeps getting it, as with a held button.
-    TouchMotion {
-        id: i32,
-        window: Option<WindowId>,
-        x: f64,
-        y: f64,
-    },
-    /// Point `id` lifted, or was cancelled (a VT switch, the device went
-    /// away); either way it is gone.
-    TouchUp {
-        id: i32,
-        window: Option<WindowId>,
-    },
-    /// A key binding fired. The key was not forwarded to any client.
-    Binding(BindingId),
-    OutputNew {
-        output: OutputId,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    },
-    OutputDestroy(OutputId),
-    /// The output's box or usable area changed: a mode, scale, transform or
-    /// position change, or a panel claiming or releasing an exclusive zone.
-    /// Re-read [`Server::output_box`] / [`Server::output_usable`].
-    OutputChange(OutputId),
-    /// The user closed the nested window. Nothing is torn down; stopping is up to you.
-    CloseRequested,
-    /// [`Backend::Drm`]: our VT was switched away from (`false`) or back to
-    /// (`true`). While inactive there is no input and nothing reaches the
-    /// screen; held keys have already been released to clients.
-    SessionActive {
-        active: bool,
-    },
-    /// The screen locker (ext-session-lock) locked or unlocked the session.
-    /// While locked only the lock screen is drawn and gets input, and no
-    /// binding fires; there is nothing to do here but, say, pause things.
-    /// A locker that crashes leaves the session locked until another unlocks it.
-    SessionLock {
-        locked: bool,
-    },
-    /// A pager asked to switch to this workspace. Do it, then
-    /// [`Server::activate_workspace`].
-    WorkspaceActivate(WorkspaceId),
-}
-
-impl Event {
-    fn from_raw(e: &ffi::Event) -> Option<Event> {
-        use ffi::EventKind as K;
-        let window = WindowId(e.window);
-        let under = (e.window != 0).then_some(window);
-        Some(match e.kind {
-            K::WindowNew => Event::WindowNew(window),
-            K::WindowMap => Event::WindowMap(window),
-            K::WindowUnmap => Event::WindowUnmap(window),
-            K::WindowDestroy => Event::WindowDestroy(window),
-            K::WindowTitle => Event::WindowTitle(window),
-            K::RequestMaximize => Event::RequestMaximize { window, on: e.on },
-            K::RequestFullscreen => Event::RequestFullscreen { window, on: e.on },
-            K::RequestMinimize => Event::RequestMinimize { window, on: e.on },
-            K::RequestActivate => Event::RequestActivate(window),
-            K::RequestMove => Event::RequestMove(window),
-            K::RequestResize => Event::RequestResize {
-                window,
-                edges: e.code,
-            },
-            K::PointerMotion => Event::PointerMotion {
-                window: under,
-                x: e.x,
-                y: e.y,
-            },
-            K::PointerButton => Event::PointerButton {
-                window: under,
-                button: e.code,
-                pressed: e.on,
-                x: e.x,
-                y: e.y,
-            },
-            K::TouchDown => Event::TouchDown {
-                id: e.code as i32,
-                window: under,
-                x: e.x,
-                y: e.y,
-            },
-            K::TouchMotion => Event::TouchMotion {
-                id: e.code as i32,
-                window: under,
-                x: e.x,
-                y: e.y,
-            },
-            K::TouchUp => Event::TouchUp {
-                id: e.code as i32,
-                window: under,
-            },
-            K::Binding => Event::Binding(BindingId(e.code)),
-            K::OutputNew => Event::OutputNew {
-                output: OutputId(e.output),
-                x: e.x as i32,
-                y: e.y as i32,
-                width: e.width,
-                height: e.height,
-            },
-            K::OutputDestroy => Event::OutputDestroy(OutputId(e.output)),
-            K::OutputChange => Event::OutputChange(OutputId(e.output)),
-            K::CloseRequested => Event::CloseRequested,
-            K::SessionActive => Event::SessionActive { active: e.on },
-            K::SessionLock => Event::SessionLock { locked: e.on },
-            K::WorkspaceActivate => Event::WorkspaceActivate(WorkspaceId(e.code)),
-            _ => return None,
-        })
-    }
-}
-
-/// One entry in the scene. The list is back to front, in global logical
-/// coordinates, and it is both what is drawn and what the pointer hits.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Item {
-    /// A window with its top-left at (`x`, `y`). That is the corner of the
-    /// window's *content*, excluding any client-drawn shadow, and the window
-    /// is clipped to it. Its popups follow it automatically.
-    Window { id: WindowId, x: i32, y: i32 },
-    /// A solid rectangle. Not hit-tested.
-    Rect {
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        color: Color,
-    },
-    /// A frame `thickness` wide just inside the box. Not hit-tested.
-    Border {
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        thickness: i32,
-        color: Color,
-    },
-}
-
-impl Item {
-    fn to_raw(self) -> ffi::Item {
-        let mut raw = ffi::Item {
-            kind: ffi::ItemKind::Window,
-            window: 0,
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-            thickness: 0,
-            color: Color::rgba(0.0, 0.0, 0.0, 0.0),
-        };
-        match self {
-            Item::Window { id, x, y } => {
-                raw.window = id.0;
-                (raw.x, raw.y) = (x, y);
-            }
-            Item::Rect {
-                x,
-                y,
-                width,
-                height,
-                color,
-            } => {
-                raw.kind = ffi::ItemKind::Rect;
-                (raw.x, raw.y, raw.width, raw.height, raw.color) = (x, y, width, height, color);
-            }
-            Item::Border {
-                x,
-                y,
-                width,
-                height,
-                thickness,
-                color,
-            } => {
-                raw.kind = ffi::ItemKind::Border;
-                (raw.x, raw.y, raw.width, raw.height) = (x, y, width, height);
-                (raw.thickness, raw.color) = (thickness, color);
-            }
-        }
-        raw
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
-
-/// The compositor. Owns the Wayland socket for as long as it lives.
-pub struct Server {
-    raw: cxx::UniquePtr<ffi::Server>,
-}
-
-impl Server {
-    pub fn new(config: Config) -> Result<Server, Error> {
-        let raw_config = ffi::Config {
-            backend: match config.backend {
-                Backend::Auto => ffi::BackendKind::Auto,
-                Backend::Nested => ffi::BackendKind::Nested,
-                Backend::Headless => ffi::BackendKind::Headless,
-                Backend::Drm => ffi::BackendKind::Drm,
-            },
-            width: config.width,
-            height: config.height,
-            server_side_decorations: config.server_side_decorations,
-            drm_device: config.drm_device.unwrap_or_default(),
-        };
-        let mut error = String::new();
-        let raw = ffi::server_new(&raw_config, &mut error);
-        if raw.is_null() {
-            return Err(Error(error));
-        }
-        Ok(Server { raw })
-    }
-
-    fn pin(&mut self) -> std::pin::Pin<&mut ffi::Server> {
-        self.raw.pin_mut()
-    }
-
-    /// The socket clients connect to: set `WAYLAND_DISPLAY` to this.
-    pub fn socket_name(&self) -> String {
-        self.raw.socket_name()
-    }
-
-    /// Wait up to `timeout` (forever with `None`) for something to happen and
-    /// handle it. Afterwards, drain [`Server::next_event`].
-    pub fn dispatch(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
-        let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
-        if self.pin().dispatch(ms) {
-            Ok(())
-        } else {
-            Err(Error(format!(
-                "event loop: {}",
-                std::io::Error::last_os_error()
-            )))
-        }
-    }
-
-    pub fn next_event(&mut self) -> Option<Event> {
-        let mut raw = ffi::Event {
-            kind: ffi::EventKind::CloseRequested,
-            window: 0,
-            output: 0,
-            on: false,
-            code: 0,
-            x: 0.0,
-            y: 0.0,
-            width: 0,
-            height: 0,
-        };
-        while self.pin().next_event(&mut raw) {
-            if let Some(event) = Event::from_raw(&raw) {
-                return Some(event);
-            }
-        }
-        None
-    }
-
-    /// `dispatch` + `next_event` in a loop, until `handler` breaks.
-    pub fn run<F>(&mut self, mut handler: F) -> Result<(), Error>
-    where
-        F: FnMut(&mut Server, Event) -> ControlFlow<()>,
-    {
-        loop {
-            self.dispatch(None)?;
-            while let Some(event) = self.next_event() {
-                if handler(self, event).is_break() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    /// Replace the whole scene. Call it whenever your layout changes; the
-    /// compositor redraws only what actually moved.
-    pub fn set_scene(&mut self, items: &[Item]) {
-        let raw: Vec<ffi::Item> = items.iter().map(|i| i.to_raw()).collect();
-        self.pin().set_scene(&raw);
-    }
-
-    pub fn set_background(&mut self, color: Color) {
-        self.pin()
-            .set_background(color.r, color.g, color.b, color.a);
-    }
-
-    /// Keyboard focus, and the window's "activated" look. `None` unfocuses.
-    pub fn focus(&mut self, window: Option<WindowId>) {
-        self.pin().focus(window.map_or(0, |w| w.0));
-    }
-
-    /// Ask the window to take this size. 0 lets the client choose.
-    pub fn configure(&mut self, window: WindowId, width: i32, height: i32) {
-        self.pin().configure(window.0, width, height);
-    }
-
-    pub fn set_maximized(&mut self, window: WindowId, on: bool) {
-        self.pin().set_maximized(window.0, on);
-    }
-
-    pub fn set_fullscreen(&mut self, window: WindowId, on: bool) {
-        self.pin().set_fullscreen(window.0, on);
-    }
-
-    /// Politely: the client may ask the user first, or ignore it.
-    pub fn close(&mut self, window: WindowId) {
-        self.pin().close(window.0);
-    }
-
-    pub fn title(&self, window: WindowId) -> String {
-        self.raw.window_title(window.0)
-    }
-
-    pub fn app_id(&self, window: WindowId) -> String {
-        self.raw.window_app_id(window.0)
-    }
-
-    /// The window's content size, `(0, 0)` before it has any.
-    pub fn size(&self, window: WindowId) -> (i32, i32) {
-        let s = self.raw.window_size(window.0);
-        (s.width, s.height)
-    }
-
-    /// The smallest size the client says it can be drawn at, `(0, 0)` for none.
-    pub fn min_size(&self, window: WindowId) -> (i32, i32) {
-        let s = self.raw.window_min_size(window.0);
-        (s.width, s.height)
-    }
-
-    /// The window this one is a dialog of, if any.
-    pub fn parent(&self, window: WindowId) -> Option<WindowId> {
-        match self.raw.window_parent(window.0) {
-            0 => None,
-            id => Some(WindowId(id)),
-        }
-    }
-
-    /// The icon name the client set (xdg-toplevel-icon), empty when none.
-    pub fn icon_name(&self, window: WindowId) -> String {
-        self.raw.window_icon_name(window.0)
-    }
-
-    /// Tell the window (and taskbars) that you have hidden it, or shown it again.
-    pub fn set_minimized(&mut self, window: WindowId, on: bool) {
-        self.pin().set_minimized(window.0, on);
-    }
-
-    /// Tiled windows drop their shadows and rounded corners.
-    pub fn set_tiled(&mut self, window: WindowId, on: bool) {
-        self.pin().set_tiled(window.0, on);
-    }
-
-    /// Bracket an interactive resize: clients redraw cheaper while it is on.
-    pub fn set_resizing(&mut self, window: WindowId, on: bool) {
-        self.pin().set_resizing(window.0, on);
-    }
-
-    /// While on, the pointer is yours: clients see no motion or scrolling
-    /// (buttons still reach them, so the press that started a drag ends
-    /// cleanly). Turn it on for an interactive move or resize, off at the end.
-    pub fn grab_pointer(&mut self, on: bool) {
-        self.pin().grab_pointer(on);
-    }
-
-    /// Switch the keyboard layout, e.g. `"de"` or `"us,ru"`. Bare metal only:
-    /// nested, keys arrive in the host's layout. False if xkb rejects it.
-    pub fn set_keyboard_layout(&mut self, layout: &str) -> bool {
-        self.pin().set_keyboard_layout(layout)
-    }
-
-    /// Where the output sits in the global layout, in logical pixels.
-    pub fn output_box(&self, output: OutputId) -> Rect {
-        self.raw.output_box(output.0)
-    }
-
-    /// [`Server::output_box`] minus what panels reserved (layer-shell
-    /// exclusive zones): where windows should go.
-    pub fn output_usable(&self, output: OutputId) -> Rect {
-        self.raw.output_usable(output.0)
-    }
-
-    /// The modes the monitor supports; empty for nested and headless outputs.
-    pub fn output_modes(&self, output: OutputId) -> Vec<Mode> {
-        self.raw.output_modes(output.0)
-    }
-
-    /// Change the monitor's mode. `refresh_mhz` 0 picks the best rate for the
-    /// size. Followed by [`Event::OutputChange`].
-    pub fn set_output_mode(&mut self, output: OutputId, mode: Mode) -> Result<(), Error> {
-        let mut error = String::new();
-        let raw = self.pin();
-        if raw.set_output_mode(
-            output.0,
-            mode.width,
-            mode.height,
-            mode.refresh_mhz,
-            &mut error,
-        ) {
-            Ok(())
-        } else {
-            Err(Error(error))
-        }
-    }
-
-    /// Integer scale (HiDPI). Followed by [`Event::OutputChange`].
-    pub fn set_output_scale(&mut self, output: OutputId, scale: i32) {
-        self.pin().set_output_scale(output.0, scale.max(1));
-    }
-
-    /// Rotate or flip the output. Followed by [`Event::OutputChange`].
-    pub fn set_output_transform(&mut self, output: OutputId, transform: Transform) {
-        self.pin().set_output_transform(output.0, transform as u32);
-    }
-
-    /// Move the output in the global layout. Followed by [`Event::OutputChange`].
-    pub fn set_output_position(&mut self, output: OutputId, x: i32, y: i32) {
-        self.pin().set_output_position(output.0, x, y);
-    }
-
-    /// Publish a workspace to pagers. What a workspace *is* stays yours.
-    pub fn add_workspace(&mut self, name: &str) -> WorkspaceId {
-        WorkspaceId(self.pin().add_workspace(name))
-    }
-
-    pub fn remove_workspace(&mut self, workspace: WorkspaceId) {
-        self.pin().remove_workspace(workspace.0);
-    }
-
-    /// Mark it the active one (and every other inactive).
-    pub fn activate_workspace(&mut self, workspace: WorkspaceId) {
-        self.pin().activate_workspace(workspace.0);
-    }
-
-    /// Whether the lock screen is up. See [`Event::SessionLock`].
-    pub fn is_locked(&self) -> bool {
-        self.raw.is_locked()
-    }
-
-    /// Swallow `keysym` pressed with exactly `mods` and report it as
-    /// [`Event::Binding`] instead of sending it to the focused client.
-    pub fn bind_key(&mut self, mods: Mods, keysym: u32) -> BindingId {
-        BindingId(self.pin().bind_key(mods.0, keysym))
-    }
-
-    /// [`Server::bind_key`] from a spec like `"Logo+Shift+q"` or `"Ctrl+Alt+Delete"`.
-    /// Modifier names: `Shift`, `Ctrl`, `Alt`, `Logo` (also `Super`).
-    pub fn bind(&mut self, spec: &str) -> Result<BindingId, Error> {
-        let mut mods = Mods::NONE;
-        let mut parts: Vec<&str> = spec.split('+').map(str::trim).collect();
-        let key = parts.pop().filter(|k| !k.is_empty());
-        let key = key.ok_or_else(|| Error(format!("binding {spec:?}: no key")))?;
-        for part in parts {
-            mods |= match part.to_ascii_lowercase().as_str() {
-                "shift" => Mods::SHIFT,
-                "ctrl" | "control" => Mods::CTRL,
-                "alt" => Mods::ALT,
-                "logo" | "super" | "mod4" => Mods::LOGO,
-                _ => {
-                    return Err(Error(format!(
-                        "binding {spec:?}: unknown modifier {part:?}"
-                    )));
-                }
-            };
-        }
-        match keysym(key) {
-            0 => Err(Error(format!("binding {spec:?}: unknown key {key:?}"))),
-            sym => Ok(self.bind_key(mods, sym)),
-        }
-    }
-}
-
-impl AsRawFd for Server {
-    /// The event loop's fd, for embedding in another loop: when it is
-    /// readable, call `dispatch(Some(Duration::ZERO))`.
-    fn as_raw_fd(&self) -> RawFd {
-        self.raw.fd()
-    }
-}
-
-/// The xkb keysym called `name` ("Return", "q", "F1"), or 0. Case is ignored
-/// when the exact name does not exist.
-pub fn keysym(name: &str) -> u32 {
-    ffi::keysym_from_name(name)
 }

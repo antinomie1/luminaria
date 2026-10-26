@@ -2098,4 +2098,6 @@ std::uint32_t keysym_from_name(rust::Str name) {
                                      : xkb_keysym_from_name(s.c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
 }
 
+#include "luminaria_rs_shims.inc"
+
 } // namespace lum

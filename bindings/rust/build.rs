@@ -113,6 +113,7 @@ fn main() {
     for path in [
         "luminaria_rs.h",
         "luminaria_rs.cpp",
+        "luminaria_rs_shims.inc",
         "xmake.lua",
         "../../src",
         "../../xmake.lua",
