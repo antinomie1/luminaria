@@ -8,9 +8,9 @@ Luminaria: a minimal Wayland compositor **library** in modern C++23, built on to
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
 built with xmake. Roughly wlroots-shaped but far smaller (30 protocol types vs wlroots' 73).
 
-It ships as three **C++23 named modules** with no public headers: `luminaria` is the
+It ships as **C++23 named modules** with no public headers: `luminaria` is the
 dependency-light protocol/core interface, with opt-in `luminaria.gpu`, `luminaria.desktop`
-extension.
+and `luminaria.text` (fcft + pixman glyph rasterization) extensions.
 All prose docs are in Chinese. `README.md` is the introduction only — no technical detail.
 `CONTEXT.md` is the glossary (what "混成器"/"合成"/"布局" mean here, and what they don't);
 `docs/architecture.md` is the layering, module structure and the rules that bite;
@@ -63,6 +63,7 @@ interface-from-implementation; `src/` is grouped by responsibility instead:
 src/luminaria.cppm       core primary interface — protocol + nested/headless
 src/luminaria.gpu.cppm   GPU primary interface — Vulkan/DRM/input/session
 src/luminaria.desktop.cppm desktop primary interface — privileged shell protocols
+src/luminaria.text.cppm  text primary interface — fcft glyph rasterization
 src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel pixel_layout rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland

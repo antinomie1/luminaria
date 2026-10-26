@@ -2,9 +2,35 @@
 
 用 [cxx](https://cxx.rs) 从 Rust 调用 luminaria。
 
-Crate 逐类型公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop` 三个 C++23 模块的类型与协议能力，由使用者自行组合成混成器；窗口放哪、谁拿键盘、按键做什么，这些策略始终留在 Rust 一侧。
+Crate 逐类型公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop`、`luminaria.text` 四个 C++23 模块的类型与能力，由使用者自行组合成混成器；窗口放哪、谁拿键盘、按键做什么，这些策略始终留在 Rust 一侧。
 
 - 详细 API 说明：参见 [API 文档](docs/api.md)
+
+## 特性开关（cargo features）
+
+绑定跟着 C++ 的模块切（ADR 0003）：**每个模块一个 `#[cxx::bridge]`、一个 shim 翻译单元**，
+cargo 特性决定编译哪些、链接哪些。关掉的模块不进编译、不进链接，也不探测它的系统库。
+
+| 特性 | 默认 | 对应的 C++ 模块 | 打开后多出来的东西 | 额外链接的系统库 |
+|---|---|---|---|---|
+| *（始终有）* | — | `luminaria` | 协议、`Display`、headless / 嵌套后端、`CpuCompositor`、`SceneItem` | wayland-server、wayland-client、xkbcommon |
+| `gpu` | ✅ | `luminaria.gpu` | `gpu` 模块（`VulkanRenderer`/`SceneRenderer`/`Frame`/`Cursor`/`DirectScanout`/`LinuxDmabuf`/`Screencopy`），`backend::DrmBackend`/`LibinputBackend`/`Session` | vulkan、libdrm、libinput、libudev、gbm、libseat |
+| `desktop` | ✅ | `luminaria.desktop` | `desktop` 模块（任务栏、工作区、锁屏、输出管理、剪贴板、输入法） | —（依赖 `gpu`） |
+| `text` | ❌ | `luminaria.text` | `text` 模块（`Font`：字形栅格化与度量） | fcft、fontconfig、pixman |
+| `raw-vulkan` | ❌ | —（隐含 `gpu`） | `VulkanRenderer::raw_handles()` / `SceneRenderer::raw_vulkan_handles()` | — |
+| `mint` / `glam` | ❌ | — | 几何类型的 `From`/`Into` 转换 | — |
+
+`desktop` 依赖 `gpu`：`DesktopGlobals` 要在构造时拿到 `VulkanRenderer`，所以打开 `desktop`
+会自动带上 `gpu`。只写无头合成器（不需要 Vulkan、不需要 DRM/libinput/libseat）时：
+
+```sh
+cargo build --no-default-features            # 只有核心：link line 里没有 vulkan/gbm/libseat
+cargo build --no-default-features --features gpu
+cargo build                                  # 默认：gpu + desktop，与之前完全一致
+```
+
+只用 `--no-default-features` 构建出的二进制，`ldd` 只剩 wayland 与 xkbcommon；这是本绑定
+存在的意义之一，所以它由 `tests/` 里的默认特性组合守着。
 
 ## 模块结构
 
@@ -12,10 +38,11 @@ Crate 按库的职责分层组织为以下模块：
 
 - **`core`**：`Display`（拥有 `wl_display` 和事件循环）、`EventLoop`、`KeyRouter`、`Error`（可模式匹配的 `ErrorKind` 分类）。
 - **`util`**：基础几何与格式工具：`Rect`、`Color`、`Point`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`（可选 `mint` 与 `glam` 特性支持零样板几何转换）。
-- **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）、`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）。
+- **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）；`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）只在特性 `gpu` 下存在。
 - **`protocol`**：Wayland 核心协议全局对象：`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
-- **`gpu`**（对应 `luminaria.gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退）、`SceneOutput`、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
-- **`desktop`**（对应 `luminaria.desktop`）：桌面特权协议管理器：`ForeignToplevelManager`（任务栏窗口列表）、`WorkspaceManager`（ext-workspace 工作区）、`SessionLockManager`（ext-session-lock 锁屏）、`OutputManager`（wlr-output-management 显示器配置）、`DataControlManager`（剪贴板访问）、`InputMethodManager`（输入法协议）、`DesktopGlobals`（标准桌面全局对象套件）。
+- **`gpu`**（对应 `luminaria.gpu`，特性 `gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退）、`SceneOutput`、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
+- **`desktop`**（对应 `luminaria.desktop`，特性 `desktop`）：桌面特权协议管理器：`ForeignToplevelManager`（任务栏窗口列表）、`WorkspaceManager`（ext-workspace 工作区）、`SessionLockManager`（ext-session-lock 锁屏）、`OutputManager`（wlr-output-management 显示器配置）、`DataControlManager`（剪贴板访问）、`InputMethodManager`（输入法协议）、`DesktopGlobals`（标准桌面全局对象套件）。
+- **`text`**（对应 `luminaria.text`，特性 `text`）：`Font`（fcft 字形栅格化与度量）、`decode_utf8`。不画文字的混成器不必链接 fontconfig。
 - **`shell`**：即时模式场景与排版：`OutputLayout`（全局逻辑多屏布局）、`SceneItem`（场景绘制项）、`SceneHit` 与 `scene_hit_test`（命中测试）、`CpuCompositor`（纯 CPU 软件合成器）、`PopupTree`（popup 层次树与 grab 关闭）、`Pointer`。
 
 ---
@@ -176,10 +203,12 @@ async fn run(display: Display) -> Result<(), Box<dyn std::error::Error>> {
 
 ## 构建
 
-构建流程由 `build.rs` 自动编排：
-1. `cxx-build` 处理 `src/lib.rs` 中的桥接定义，生成 FFI 头文件。
-2. `xmake` 编译 luminaria C++23 模块及 `luminaria_rs.cpp` 静态库（自动限制并发编译任务数，防止内存耗尽）。
-3. Cargo 链接生成的静态库与系统依赖（`wayland-server`、`wayland-client`、`xkbcommon`、`vulkan`、`libdrm`、`libinput`、`libudev`、`gbm`、`libseat`）。
+构建流程由 `build.rs` 自动编排，且只做启用的特性要求的事：
+1. `cxx-build` 处理**已启用**的桥接定义（`src/ffi.rs`，以及 `src/ffi_gpu.rs` / `src/ffi_desktop.rs` / `src/ffi_text.rs`），生成 FFI 头文件与胶水代码。
+2. `xmake --modules=gpu,desktop,…` 编译对应的 luminaria C++23 模块与 shim 翻译单元
+   （`luminaria_rs.cpp` / `luminaria_rs_gpu.cpp` / `luminaria_rs_desktop.cpp` / `luminaria_rs_text.cpp`），
+   并行度继承 cargo 的 `-j`，防止模块编译吃光内存。
+3. Cargo 只链接上表里那一行对应的系统库——核心构建不探测、不链接 Vulkan/DRM/libinput/libseat/gbm。
 
 ```sh
 cargo build                 # 构建库与依赖

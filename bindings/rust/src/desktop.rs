@@ -1,7 +1,8 @@
 //! Desktop shell protocols: taskbars, workspaces, screen locking, output configuration, and input methods.
 
 use crate::core::{Display, Error, ErrorKind, Holds};
-use crate::ffi::{self, EventKind};
+use crate::ffi::EventKind;
+use crate::ffi_desktop as ffi;
 use crate::gpu::VulkanRenderer;
 use crate::protocol::{DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell};
 use crate::util::Rect;

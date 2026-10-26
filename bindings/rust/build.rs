@@ -1,11 +1,14 @@
-//! Two compilers, one link.
+//! Two compilers, one link, and only the modules the features asked for.
 //!
-//! 1. cxx-build expands the `#[cxx::bridge]` in src/lib.rs into lib.rs.h and
-//!    lib.rs.cc, and compiles the .cc with `cc`. `cc` cannot build C++
-//!    modules, which is fine: the glue only includes luminaria_rs.h.
-//! 2. xmake builds luminaria and luminaria_rs.cpp (the only module importer),
-//!    with lib.rs.h on its include path from step 1.
-//! 3. Everything is linked here, with the system libraries from pkg-config.
+//! 1. cxx-build expands the enabled `#[cxx::bridge]`es (src/ffi.rs, and one per
+//!    C++ extension module) into headers and .cc glue, and compiles the glue
+//!    with `cc`. `cc` cannot build C++ modules, which is fine: the glue only
+//!    includes the plain shim headers.
+//! 2. xmake builds luminaria and the shim .cpp files for those same modules,
+//!    with the generated headers on its include path from step 1.
+//! 3. Everything is linked here, with the system libraries the enabled modules
+//!    actually need. A core-only build (`--no-default-features`) never names
+//!    Vulkan, libdrm, libinput, libudev, gbm or libseat.
 //!
 //! Both halves must use the same C++ standard library, or a `std::unique_ptr`
 //! crossing the bridge has two layouts. Default: clang for both, which on
@@ -36,8 +39,29 @@ fn main() {
         "LUMINARIA_SANITIZE must be none, address or undefined"
     );
 
+    // Which C++ modules the enabled cargo features ask for. The core module is
+    // always there; `desktop` needs `gpu` (DesktopGlobals takes a VulkanRenderer)
+    // and Cargo's `desktop = ["gpu"]` has already turned that on.
+    let gpu = env::var_os("CARGO_FEATURE_GPU").is_some();
+    let desktop = env::var_os("CARGO_FEATURE_DESKTOP").is_some();
+    let text = env::var_os("CARGO_FEATURE_TEXT").is_some();
+    assert!(
+        !desktop || gpu,
+        "the `desktop` feature must also enable `gpu` (see Cargo.toml)"
+    );
+
     // ---------------------------------------------------------------- 1. glue
-    let mut glue = cxx_build::bridge("src/lib.rs");
+    let mut bridges = vec!["src/ffi.rs"];
+    if gpu {
+        bridges.push("src/ffi_gpu.rs");
+    }
+    if desktop {
+        bridges.push("src/ffi_desktop.rs");
+    }
+    if text {
+        bridges.push("src/ffi_text.rs");
+    }
+    let mut glue = cxx_build::bridges(&bridges);
     glue.compiler(cxx).std("c++20");
     if sanitize != "none" {
         glue.flag(format!("-fsanitize={sanitize}"));
@@ -59,6 +83,17 @@ fn main() {
             .unwrap_or_else(|e| panic!("cannot run xmake (is it installed?): {e}"));
         assert!(status.success(), "xmake {} failed", args.join(" "));
     };
+    let mut modules = vec!["core"];
+    if gpu {
+        modules.push("gpu");
+    }
+    if desktop {
+        modules.push("desktop");
+    }
+    if text {
+        modules.push("text");
+    }
+    let modules_arg = format!("--modules={}", modules.join(","));
     xmake(&[
         "f",
         "-y",
@@ -70,6 +105,7 @@ fn main() {
         build_dir.to_str().expect("OUT_DIR is not UTF-8"),
         &format!("--cxxbridge={}", bridge.display()),
         &format!("--sanitize={sanitize}"),
+        &modules_arg,
     ]);
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "0".into());
     let mut build = vec!["build", "-y", "-P", "."];
@@ -84,35 +120,62 @@ fn main() {
     let libdir = find_archive_dir(&build_dir, "libluminaria-rs.a")
         .expect("xmake built luminaria-rs but its archive is nowhere under the build dir");
     println!("cargo:rustc-link-search=native={}", libdir.display());
-    // Dependents before dependencies: the shim needs luminaria.desktop and
-    // luminaria.gpu, which both need luminaria.
-    for lib in [
-        "luminaria-rs",
-        "luminaria-desktop",
-        "luminaria-gpu",
-        "luminaria",
-    ] {
+    // Dependents before dependencies, and only the modules that were built.
+    let mut libs = vec!["luminaria-rs"];
+    if desktop {
+        libs.push("luminaria-desktop");
+    }
+    if gpu {
+        libs.push("luminaria-gpu");
+    }
+    libs.push("luminaria");
+    if text {
+        libs.push("luminaria-text");
+    }
+    for lib in libs {
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    for pkg in [
-        "wayland-server",
-        "wayland-client",
-        "xkbcommon",
-        "vulkan",
-        "libdrm",
-        "libinput",
-        "libudev",
-        "gbm",
-        "libseat",
-    ] {
+
+    // Only what the enabled modules drag in. luminaria itself needs wayland and
+    // xkbcommon; luminaria.gpu adds the whole bare-metal stack; luminaria.text
+    // adds fcft and its dependencies.
+    let mut pkgs = vec!["wayland-server", "wayland-client", "xkbcommon"];
+    if gpu {
+        pkgs.extend(["vulkan", "libdrm", "libinput", "libudev", "gbm", "libseat"]);
+    }
+    if text {
+        pkgs.extend(["fontconfig", "pixman-1"]);
+    }
+    for pkg in pkgs {
         pkg_config::Config::new()
             .probe(pkg)
             .unwrap_or_else(|e| panic!("pkg-config {pkg}: {e}"));
+    }
+    if text {
+        // fcft's .pc `Requires.private: … tllist`, and a host without tllist's
+        // .pc file (which nothing links against when fcft is shared) makes
+        // pkg-config refuse the whole probe. Link the shared object directly in
+        // that case; its own dependencies are DT_NEEDED entries.
+        if pkg_config::Config::new().probe("fcft").is_err() {
+            println!("cargo:rustc-link-lib=dylib=fcft");
+        }
     }
 
     for path in [
         "luminaria_rs.h",
         "luminaria_rs.cpp",
+        "luminaria_rs_gpu.h",
+        "luminaria_rs_gpu.cpp",
+        "luminaria_rs_desktop.h",
+        "luminaria_rs_desktop.cpp",
+        "luminaria_rs_text.h",
+        "luminaria_rs_text.cpp",
+        "luminaria_rs_internal.h",
+        "src/lib.rs",
+        "src/ffi.rs",
+        "src/ffi_gpu.rs",
+        "src/ffi_desktop.rs",
+        "src/ffi_text.rs",
         "xmake.lua",
         "../../src",
         "../../xmake.lua",
@@ -125,6 +188,9 @@ fn main() {
         "LUMINARIA_SANITIZE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
+    }
+    for feature in ["gpu", "desktop", "text"] {
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_{}", feature.to_uppercase());
     }
 }
 

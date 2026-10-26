@@ -2,7 +2,33 @@
 
 Luminaria 是写 Wayland 混成器的**库**，不是现成的混成器：它提供协议、后端与渲染，窗口放哪、谁拿键盘、按键做什么由使用者决定。
 
-Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与组合各个模块（`core`、`util`、`backend`、`protocol`、`gpu`、`desktop`、`shell`），构建无头测试环境、嵌套调试工具、专用嵌入式显示服务或自定义渲染管线的混成器。
+Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与组合各个模块（`core`、`util`、`backend`、`protocol`、`gpu`、`desktop`、`text`、`shell`），构建无头测试环境、嵌套调试工具、专用嵌入式显示服务或自定义渲染管线的混成器。
+
+## 特性开关：按模块付费
+
+C++ 的模块边界（ADR 0003）在绑定里是一比一复制的：**每个模块一个 `#[cxx::bridge]`
+（`src/ffi.rs` / `src/ffi_gpu.rs` / `src/ffi_desktop.rs` / `src/ffi_text.rs`）、一个 shim 翻译单元
+（`luminaria_rs*.cpp`）**，cargo 特性决定编译哪些、链接哪些。关掉的模块不编译、不链接，
+也不探测它的系统库。
+
+| 特性 | 默认 | C++ 模块 | Rust 模块 / 类型 | 额外链接的系统库 |
+|---|---|---|---|---|
+| *（始终有）* | — | `luminaria` | `core`、`util`、`backend`（`Output`/`HeadlessBackend`/`WaylandBackend`）、`protocol`、`shell` | wayland-server、wayland-client、xkbcommon |
+| `gpu` | ✅ | `luminaria.gpu` | `gpu`，以及 `backend::{DrmBackend, LibinputBackend, Session}` | vulkan、libdrm、libinput、libudev、gbm、libseat |
+| `desktop` | ✅ | `luminaria.desktop` | `desktop` | —（依赖 `gpu`） |
+| `text` | ❌ | `luminaria.text` | `text` | fcft、fontconfig、pixman |
+| `raw-vulkan` | ❌ | —（隐含 `gpu`） | `VulkanRenderer::raw_handles()`、`SceneRenderer::raw_vulkan_handles()` | — |
+| `mint` / `glam` | ❌ | — | `util` 里几何类型的 `From`/`Into` | — |
+
+```sh
+cargo test --no-default-features                 # 只有核心：ldd 里没有 vulkan/gbm/libseat/libinput
+cargo test --no-default-features --features gpu  # 裸机/GPU，不要桌面特权协议
+cargo test                                       # 默认 = gpu + desktop，与 0.0.1 之前完全一致
+cargo test --features text                       # 加上 Font
+```
+
+`desktop` 依赖 `gpu`：`DesktopGlobals::create` 要拿一个 `VulkanRenderer`。`raw-vulkan`
+依赖 `gpu`：没有渲染器就没有句柄。
 
 ---
 
@@ -12,11 +38,12 @@ Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与�
 |---|---|---|
 | **[`core`](#1-core-模块)** | `luminaria:display`, `event_loop`, `expected` | Wayland 服务端根对象、事件循环驱动、文件描述符绑定、错误类型 |
 | **[`util`](#2-util-模块)** | `luminaria:box`, `color`, `transform`, `region`, `keymap` | 纯几何矩形运算、颜色与色彩空间、朝向变换、不相交区域、XKB 键表与像素布局 |
-| **[`backend`](#3-backend-模块)** | `luminaria:output`, `headless`, `wayland`, `drm`, `libinput` | 虚拟无头输出、嵌套窗口后端、裸机 DRM/KMS 输出、libinput 设备驱动与输入事件 |
+| **[`backend`](#3-backend-模块)** | `luminaria:output`, `headless`, `wayland`（`drm`/`libinput` 属 `luminaria.gpu`） | 虚拟无头输出、嵌套窗口后端；特性 `gpu` 下还有裸机 DRM/KMS 输出、libinput 设备驱动 |
 | **[`protocol`](#4-protocol-模块)** | `luminaria:compositor`, `xdg_shell`, `seat`, `layer_shell` 等 | Wayland 核心协议对象（Compositor, SurfaceId, Seat 等）及 16 个核心扩展管理器 |
 | **[`gpu`](#5-gpu-模块)** | `luminaria.gpu:*` | Vulkan 1.3 渲染器、即时帧账本 `Frame`、硬件光标、直出评估 `DirectScanout`、截屏协议 |
 | **[`desktop`](#6-desktop-模块)** | `luminaria.desktop:*` | 任务栏同步、ext-workspace 工作区、ext-session-lock 锁屏、wlr-output-management 显示管理 |
 | **[`shell`](#7-shell-模块)** | `luminaria:output_layout`, `scene`, `cpu_compositor` | 即时模式场景项定义、反向命中测试、多显示器坐标排版、纯 CPU 软件合成器 |
+| **[`text`](#10-text-模块特性-text)** | `luminaria.text` | fcft 字形栅格化与字体度量 |
 
 ---
 
@@ -694,3 +721,28 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
   - `XdgToplevelIconManager`：`next_event() -> Option<ToplevelIconChange>`，并提供 `icon_name(surface)` 查询客户端设定的图标名。
 
 DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 上的运行还没有验证过。
+
+---
+
+## 10. `text` 模块（特性 `text`）
+
+对应 `luminaria.text`：fcft 字形栅格化与字体度量。它是**第四个** C++ 模块，独立于 `luminaria`，
+因为不画文字的混成器不该被迫链接 fontconfig——`Font` 只是把 `luminaria::Font` 原样包一层。
+真正需要它的地方通常是画层表面（panel、通知、锁屏提示）的像素或生成一块 `SceneItem::image`。
+
+```rust
+use luminaria::text::Font;
+use luminaria::util::Color;
+
+let mut font = Font::open("monospace:size=12").expect("a monospace font");
+let mut canvas = vec![0u8; 200 * 32 * 4];             // RGBA8，与 read_back/commit_frame 同布局
+let pen = font.draw(&mut canvas, 200, 32, 4, font.ascent(), "hello",
+                    Color::rgb(1.0, 1.0, 1.0), 200)?;  // 返回最后一个放得下的字形的笔位
+```
+
+- `Font::open(pattern) -> Option<Font>`：fontconfig 模式（`"monospace:size=11"`）；没有匹配的字体时为 `None`。
+- `height()` / `ascent()` / `measure(&str) -> i32`：行高、基线偏移、字符串推进宽度。
+- `draw(...)`：画进紧凑排布的 RGBA8 缓冲区；`right_edge` 之外的字符串被截断。缓冲区小于 `width * height * 4`
+  时返回 `ErrorKind::InvalidArgument`，不会越界写。
+- `decode_utf8(&str) -> Vec<char>`：C++ `luminaria::decode_utf8` 的转发；格式错误的字节变成 U+FFFD
+  （`&str` 里本来也放不进非法字节）。

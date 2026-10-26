@@ -304,7 +304,7 @@ target("luminaria-text")
     luminaria_defaults()
     add_deps("luminaria")
     add_packages("fcft", "pixman", {public = true})
-    add_files("src/text/text.cppm", {public = true})
+    add_files("src/luminaria.text.cppm", "src/text/text.cppm", {public = true})
 
 
 -- --------------------------------------------------------------------- examples
@@ -352,6 +352,9 @@ local desktop_tests = {
     test_output_management = true, test_session_lock = true, test_teardown_order = true,
     test_workspace = true,
 }
+local text_tests = {
+    test_text = true,
+}
 
 for _, file in ipairs(os.files("tests/test_*.cpp")) do
     local name = path.basename(file)
@@ -364,6 +367,8 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
             add_deps("luminaria-gpu")
         elseif desktop_tests[name] then
             add_deps("luminaria-desktop")
+        elseif text_tests[name] then
+            add_deps("luminaria-text")
         else
             add_deps("luminaria")
         end

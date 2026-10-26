@@ -147,19 +147,22 @@ KMS 光标平面或合成）。示例只剩"窗口放哪、谁拿键盘、按键
 src/luminaria.cppm       基础接口单元（协议 + core + 嵌套/headless）
 src/luminaria.gpu.cppm   Vulkan / DRM / libinput / session / GPU 协议
 src/luminaria.desktop.cppm  workspace / foreign-toplevel / data-control / output-management …
+src/luminaria.text.cppm  fcft 字形栅格化与字体度量（默认不构建：另需 fcft + pixman）
 src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel rect_fill region transform
 src/backend/             backend output input_event session drm headless libinput wayland
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
 src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
+src/text/                text（luminaria.text 的唯一分区）
 src/protocol/            30 个 Wayland global，一个一文件
 src/detail/wayland_fwd.h 唯一剩下的头文件
 ```
 
-三个公开 module 的边界见 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)：
+公开 module 的边界见 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)：
 只用 `import luminaria;` 不会编译或链接 Vulkan、libdrm、libinput、libseat 或 GBM；
 桌面专用的三个高权限协议也不会进入基础接口。扩展 module 会 `export import luminaria`，
-所以需要 GPU 的下游只写 `import luminaria.gpu;` 即可。
+所以需要 GPU 的下游只写 `import luminaria.gpu;` 即可。第四个 `luminaria.text`
+（`Font`/`decode_utf8`，依赖 fcft + pixman）同样只按需链接，Rust 绑定把它做成 `text` 特性。
 
 每个 `.cppm` **接口与实现同文件**：先是 `export namespace luminaria { … }`，然后一条
 `// --- implementation` 分隔线，之后是 pimpl 的 `struct X::Impl`、匿名 namespace 里的

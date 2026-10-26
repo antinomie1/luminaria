@@ -1,6 +1,5 @@
 //! Display backends and input drivers: Output, Headless, Wayland, DRM, Libinput, Session.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::pin::Pin;
 
 use crate::core::{Display, Error, ErrorKind, Holds};
@@ -348,278 +347,290 @@ impl<'d> WaylandBackend<'d> {
     }
 }
 
-/// libseat session management for bare-metal KMS/DRM backends. The backends
-/// built on it keep it borrowed, which is why its methods take `&self`.
-pub struct Session<'d> {
-    pub(crate) raw: cxx::UniquePtr<ffi::SessionShim>,
-    _display: Holds<'d>,
+// The bare-metal stack (libseat, KMS, libinput) lives in luminaria.gpu. The
+// value types below stay in core: the nested backend reports them too.
+#[cfg(feature = "gpu")]
+mod bare_metal {
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+
+    use super::*;
+
+    /// libseat session management for bare-metal KMS/DRM backends. The backends
+    /// built on it keep it borrowed, which is why its methods take `&self`.
+    pub struct Session<'d> {
+        pub(crate) raw: cxx::UniquePtr<crate::ffi_gpu::SessionShim>,
+        _display: Holds<'d>,
+    }
+
+    impl<'d> Session<'d> {
+        pub fn new(display: &'d Display) -> Result<Self, Error> {
+            let mut err = String::new();
+            let raw = crate::ffi_gpu::session_new(&display.raw, &mut err);
+            if raw.is_null() {
+                Err(Error::new(ErrorKind::Backend, err))
+            } else {
+                Ok(Self { raw, _display: Holds::new() })
+            }
+        }
+
+        pub fn switch_to(&self, vt: i32) -> Result<(), Error> {
+            let mut err = String::new();
+            if self.raw.switch_to(vt, &mut err) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Backend, err))
+            }
+        }
+
+        pub fn is_active(&self) -> bool {
+            self.raw.active()
+        }
+
+        pub fn seat_name(&self) -> String {
+            self.raw.seat_name()
+        }
+
+        /// The next VT switch, oldest first: `Some(false)` when the session was
+        /// taken away, `Some(true)` when it came back. On the way out, release every
+        /// key and button a client was told is down; on the way back, repaint.
+        pub fn next_activity(&self) -> Option<bool> {
+            match self.raw.next_activity() {
+                1 => Some(false),
+                2 => Some(true),
+                _ => None,
+            }
+        }
+    }
+
+    /// KMS/DRM backend for bare-metal display presentation. It borrows the
+    /// [`Display`] (its page flips and hotplug monitor are event-loop sources) and
+    /// the [`Session`] it opened the card through.
+    pub struct DrmBackend<'a> {
+        raw: cxx::UniquePtr<crate::ffi_gpu::DrmBackendShim>,
+        _borrows: Holds<'a>,
+    }
+
+    impl<'a> DrmBackend<'a> {
+        pub fn new(
+            display: &'a Display,
+            device: Option<&str>,
+            session: Option<&'a Session<'_>>,
+        ) -> Result<Self, Error> {
+            let mut err = String::new();
+            let raw = if let Some(sess) = session {
+                crate::ffi_gpu::drm_backend_new(&display.raw, device.unwrap_or(""), &sess.raw, &mut err)
+            } else {
+                crate::ffi_gpu::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
+            };
+            if raw.is_null() {
+                Err(Error::new(ErrorKind::Backend, err))
+            } else {
+                Ok(Self { raw, _borrows: Holds::new() })
+            }
+        }
+
+        /// Light up the connected monitors. Each arrives as a
+        /// [`DrmEvent::OutputAdded`] after this returns.
+        pub fn start(&mut self) -> Result<(), Error> {
+            let mut err = String::new();
+            if self.raw.pin_mut().start(&mut err) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Backend, err))
+            }
+        }
+
+        /// Re-read the connector list now. Done on every udev hotplug event once
+        /// started; exposed for a manual poke.
+        pub fn scan_connectors(&mut self) {
+            self.raw.pin_mut().scan_connectors();
+        }
+
+        /// The next monitor that appeared or went away, oldest first. Drain it
+        /// after every `Display::dispatch()`.
+        pub fn next_event(&mut self) -> Option<DrmEvent> {
+            let mut kind = 0;
+            let mut removed = 0;
+            let output = self.raw.pin_mut().next_event(&mut kind, &mut removed);
+            match kind {
+                1 => Some(DrmEvent::OutputAdded(Output::from_raw(output))),
+                2 => Some(DrmEvent::OutputRemoved(OutputId(removed))),
+                _ => None,
+            }
+        }
+    }
+
+    /// The card's fd, borrowed for the life of the backend. Query it (the `drm`
+    /// crate), derive the renderer's GPU from it (`gpu::DrmDeviceId::from_fd`), or
+    /// dup it for `gbm`; never close it, and never modeset or atomic-commit
+    /// through it — the KMS state is luminaria's.
+    impl AsFd for DrmBackend<'_> {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            // SAFETY: the backend owns the fd and keeps it open until it drops,
+            // which the borrow on `self` outlasts.
+            unsafe { BorrowedFd::borrow_raw(self.raw.fd()) }
+        }
+    }
+
+    impl AsRawFd for DrmBackend<'_> {
+        fn as_raw_fd(&self) -> RawFd {
+            self.raw.fd()
+        }
+    }
+
+    /// What a [`DrmBackend`] reports about monitors.
+    pub enum DrmEvent {
+        /// A monitor was lit up: at `start()` for every connected one, later on
+        /// hotplug.
+        OutputAdded(Output),
+        /// A monitor went away. The [`Output`] with this id is now inert; drop it,
+        /// along with whatever was built for it.
+        OutputRemoved(OutputId),
+    }
+
+    /// libinput input device manager for evdev keyboards, pointers, and
+    /// touchscreens. Borrows the [`Display`] and the [`Session`] that opens its
+    /// devices, like [`DrmBackend`].
+    pub struct LibinputBackend<'a> {
+        raw: cxx::UniquePtr<crate::ffi_gpu::LibinputBackendShim>,
+        _borrows: Holds<'a>,
+    }
+
+    impl<'a> LibinputBackend<'a> {
+        /// Every input device udev reports on the seat, opened at `start()`.
+        pub fn new(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
+            let mut err = String::new();
+            let raw = if let Some(sess) = session {
+                crate::ffi_gpu::libinput_backend_new(&display.raw, &sess.raw, &mut err)
+            } else {
+                crate::ffi_gpu::libinput_backend_new_standalone(&display.raw, &mut err)
+            };
+            if raw.is_null() {
+                Err(Error::new(ErrorKind::Backend, err))
+            } else {
+                Ok(Self { raw, _borrows: Holds::new() })
+            }
+        }
+
+        /// Exactly the devices handed to `add_device()`, and nothing udev finds.
+        pub fn new_path(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
+            let mut err = String::new();
+            let raw = if let Some(sess) = session {
+                crate::ffi_gpu::libinput_backend_new_path(&display.raw, &sess.raw, &mut err)
+            } else {
+                crate::ffi_gpu::libinput_backend_new_path_standalone(&display.raw, &mut err)
+            };
+            if raw.is_null() {
+                Err(Error::new(ErrorKind::Backend, err))
+            } else {
+                Ok(Self { raw, _borrows: Holds::new() })
+            }
+        }
+
+        pub fn start(&mut self) -> Result<(), Error> {
+            let mut err = String::new();
+            if self.raw.pin_mut().start(&mut err) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Backend, err))
+            }
+        }
+
+        pub fn add_device(&mut self, path: &str) -> Result<(), Error> {
+            let mut err = String::new();
+            if self.raw.pin_mut().add_device(path, &mut err) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Backend, err))
+            }
+        }
+
+        /// The layout modifier masks are computed against. Hand the same text to
+        /// `Seat::set_keymap()`.
+        pub fn keymap(&self) -> String {
+            self.raw.keymap()
+        }
+
+        /// Replace the layout; false (and the old one kept) if it does not compile.
+        pub fn set_keymap(&mut self, xkb_text: &str) -> bool {
+            self.raw.pin_mut().set_keymap(xkb_text)
+        }
+
+        /// What the open devices can do. Empty until `start()`.
+        pub fn capabilities(&self) -> InputCapabilities {
+            InputCapabilities::from_bits(self.raw.capabilities())
+        }
+
+        /// The next input event, oldest first. Drain it after every
+        /// `Display::dispatch()`.
+        pub fn next_input_event(&mut self) -> Option<LibinputEvent> {
+            let mut raw = crate::ffi_gpu::LibinputEventRaw {
+                kind: 0,
+                code: 0,
+                keysym: 0,
+                pressed: false,
+                x: 0.0,
+                y: 0.0,
+                steps_x: 0,
+                steps_y: 0,
+                id: 0,
+                flags: 0,
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            };
+            if !self.raw.pin_mut().next_input_event(&mut raw) {
+                return None;
+            }
+            let modifiers = Modifiers {
+                depressed: raw.depressed,
+                latched: raw.latched,
+                locked: raw.locked,
+                group: raw.group,
+            };
+            Some(match raw.kind {
+                0 => LibinputEvent::Key {
+                    key: raw.code,
+                    pressed: raw.pressed,
+                    keysym: raw.keysym,
+                    modifiers,
+                },
+                1 => LibinputEvent::Modifiers(modifiers),
+                2 => LibinputEvent::Motion { dx: raw.x, dy: raw.y },
+                3 => LibinputEvent::Button {
+                    button: raw.code,
+                    pressed: raw.pressed,
+                },
+                4 => LibinputEvent::Axis {
+                    dx: raw.x,
+                    dy: raw.y,
+                    dx_steps: raw.steps_x,
+                    dy_steps: raw.steps_y,
+                    stop_horizontal: raw.flags & 1 != 0,
+                    stop_vertical: raw.flags & 2 != 0,
+                },
+                5 => LibinputEvent::TouchDown {
+                    id: raw.id,
+                    x: raw.x,
+                    y: raw.y,
+                },
+                6 => LibinputEvent::TouchMotion {
+                    id: raw.id,
+                    x: raw.x,
+                    y: raw.y,
+                },
+                7 => LibinputEvent::TouchUp { id: raw.id },
+                8 => LibinputEvent::TouchFrame,
+                9 => LibinputEvent::TouchCancel { id: raw.id },
+                _ => LibinputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
+            })
+        }
+    }
 }
 
-impl<'d> Session<'d> {
-    pub fn new(display: &'d Display) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = ffi::session_new(&display.raw, &mut err);
-        if raw.is_null() {
-            Err(Error::new(ErrorKind::Backend, err))
-        } else {
-            Ok(Self { raw, _display: Holds::new() })
-        }
-    }
-
-    pub fn switch_to(&self, vt: i32) -> Result<(), Error> {
-        let mut err = String::new();
-        if self.raw.switch_to(vt, &mut err) {
-            Ok(())
-        } else {
-            Err(Error::new(ErrorKind::Backend, err))
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.raw.active()
-    }
-
-    pub fn seat_name(&self) -> String {
-        self.raw.seat_name()
-    }
-
-    /// The next VT switch, oldest first: `Some(false)` when the session was
-    /// taken away, `Some(true)` when it came back. On the way out, release every
-    /// key and button a client was told is down; on the way back, repaint.
-    pub fn next_activity(&self) -> Option<bool> {
-        match self.raw.next_activity() {
-            1 => Some(false),
-            2 => Some(true),
-            _ => None,
-        }
-    }
-}
-
-/// KMS/DRM backend for bare-metal display presentation. It borrows the
-/// [`Display`] (its page flips and hotplug monitor are event-loop sources) and
-/// the [`Session`] it opened the card through.
-pub struct DrmBackend<'a> {
-    raw: cxx::UniquePtr<ffi::DrmBackendShim>,
-    _borrows: Holds<'a>,
-}
-
-impl<'a> DrmBackend<'a> {
-    pub fn new(
-        display: &'a Display,
-        device: Option<&str>,
-        session: Option<&'a Session<'_>>,
-    ) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = if let Some(sess) = session {
-            ffi::drm_backend_new(&display.raw, device.unwrap_or(""), &sess.raw, &mut err)
-        } else {
-            ffi::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
-        };
-        if raw.is_null() {
-            Err(Error::new(ErrorKind::Backend, err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-
-    /// Light up the connected monitors. Each arrives as a
-    /// [`DrmEvent::OutputAdded`] after this returns.
-    pub fn start(&mut self) -> Result<(), Error> {
-        let mut err = String::new();
-        if self.raw.pin_mut().start(&mut err) {
-            Ok(())
-        } else {
-            Err(Error::new(ErrorKind::Backend, err))
-        }
-    }
-
-    /// Re-read the connector list now. Done on every udev hotplug event once
-    /// started; exposed for a manual poke.
-    pub fn scan_connectors(&mut self) {
-        self.raw.pin_mut().scan_connectors();
-    }
-
-    /// The next monitor that appeared or went away, oldest first. Drain it
-    /// after every `Display::dispatch()`.
-    pub fn next_event(&mut self) -> Option<DrmEvent> {
-        let mut kind = 0;
-        let mut removed = 0;
-        let output = self.raw.pin_mut().next_event(&mut kind, &mut removed);
-        match kind {
-            1 => Some(DrmEvent::OutputAdded(Output::from_raw(output))),
-            2 => Some(DrmEvent::OutputRemoved(OutputId(removed))),
-            _ => None,
-        }
-    }
-}
-
-/// The card's fd, borrowed for the life of the backend. Query it (the `drm`
-/// crate), derive the renderer's GPU from it (`gpu::DrmDeviceId::from_fd`), or
-/// dup it for `gbm`; never close it, and never modeset or atomic-commit
-/// through it — the KMS state is luminaria's.
-impl AsFd for DrmBackend<'_> {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: the backend owns the fd and keeps it open until it drops,
-        // which the borrow on `self` outlasts.
-        unsafe { BorrowedFd::borrow_raw(self.raw.fd()) }
-    }
-}
-
-impl AsRawFd for DrmBackend<'_> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.raw.fd()
-    }
-}
-
-/// What a [`DrmBackend`] reports about monitors.
-pub enum DrmEvent {
-    /// A monitor was lit up: at `start()` for every connected one, later on
-    /// hotplug.
-    OutputAdded(Output),
-    /// A monitor went away. The [`Output`] with this id is now inert; drop it,
-    /// along with whatever was built for it.
-    OutputRemoved(OutputId),
-}
-
-/// libinput input device manager for evdev keyboards, pointers, and
-/// touchscreens. Borrows the [`Display`] and the [`Session`] that opens its
-/// devices, like [`DrmBackend`].
-pub struct LibinputBackend<'a> {
-    raw: cxx::UniquePtr<ffi::LibinputBackendShim>,
-    _borrows: Holds<'a>,
-}
-
-impl<'a> LibinputBackend<'a> {
-    /// Every input device udev reports on the seat, opened at `start()`.
-    pub fn new(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = if let Some(sess) = session {
-            ffi::libinput_backend_new(&display.raw, &sess.raw, &mut err)
-        } else {
-            ffi::libinput_backend_new_standalone(&display.raw, &mut err)
-        };
-        if raw.is_null() {
-            Err(Error::new(ErrorKind::Backend, err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-
-    /// Exactly the devices handed to `add_device()`, and nothing udev finds.
-    pub fn new_path(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = if let Some(sess) = session {
-            ffi::libinput_backend_new_path(&display.raw, &sess.raw, &mut err)
-        } else {
-            ffi::libinput_backend_new_path_standalone(&display.raw, &mut err)
-        };
-        if raw.is_null() {
-            Err(Error::new(ErrorKind::Backend, err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
-        }
-    }
-
-    pub fn start(&mut self) -> Result<(), Error> {
-        let mut err = String::new();
-        if self.raw.pin_mut().start(&mut err) {
-            Ok(())
-        } else {
-            Err(Error::new(ErrorKind::Backend, err))
-        }
-    }
-
-    pub fn add_device(&mut self, path: &str) -> Result<(), Error> {
-        let mut err = String::new();
-        if self.raw.pin_mut().add_device(path, &mut err) {
-            Ok(())
-        } else {
-            Err(Error::new(ErrorKind::Backend, err))
-        }
-    }
-
-    /// The layout modifier masks are computed against. Hand the same text to
-    /// `Seat::set_keymap()`.
-    pub fn keymap(&self) -> String {
-        self.raw.keymap()
-    }
-
-    /// Replace the layout; false (and the old one kept) if it does not compile.
-    pub fn set_keymap(&mut self, xkb_text: &str) -> bool {
-        self.raw.pin_mut().set_keymap(xkb_text)
-    }
-
-    /// What the open devices can do. Empty until `start()`.
-    pub fn capabilities(&self) -> InputCapabilities {
-        InputCapabilities::from_bits(self.raw.capabilities())
-    }
-
-    /// The next input event, oldest first. Drain it after every
-    /// `Display::dispatch()`.
-    pub fn next_input_event(&mut self) -> Option<LibinputEvent> {
-        let mut raw = ffi::LibinputEventRaw {
-            kind: 0,
-            code: 0,
-            keysym: 0,
-            pressed: false,
-            x: 0.0,
-            y: 0.0,
-            steps_x: 0,
-            steps_y: 0,
-            id: 0,
-            flags: 0,
-            depressed: 0,
-            latched: 0,
-            locked: 0,
-            group: 0,
-        };
-        if !self.raw.pin_mut().next_input_event(&mut raw) {
-            return None;
-        }
-        let modifiers = Modifiers {
-            depressed: raw.depressed,
-            latched: raw.latched,
-            locked: raw.locked,
-            group: raw.group,
-        };
-        Some(match raw.kind {
-            0 => LibinputEvent::Key {
-                key: raw.code,
-                pressed: raw.pressed,
-                keysym: raw.keysym,
-                modifiers,
-            },
-            1 => LibinputEvent::Modifiers(modifiers),
-            2 => LibinputEvent::Motion { dx: raw.x, dy: raw.y },
-            3 => LibinputEvent::Button {
-                button: raw.code,
-                pressed: raw.pressed,
-            },
-            4 => LibinputEvent::Axis {
-                dx: raw.x,
-                dy: raw.y,
-                dx_steps: raw.steps_x,
-                dy_steps: raw.steps_y,
-                stop_horizontal: raw.flags & 1 != 0,
-                stop_vertical: raw.flags & 2 != 0,
-            },
-            5 => LibinputEvent::TouchDown {
-                id: raw.id,
-                x: raw.x,
-                y: raw.y,
-            },
-            6 => LibinputEvent::TouchMotion {
-                id: raw.id,
-                x: raw.x,
-                y: raw.y,
-            },
-            7 => LibinputEvent::TouchUp { id: raw.id },
-            8 => LibinputEvent::TouchFrame,
-            9 => LibinputEvent::TouchCancel { id: raw.id },
-            _ => LibinputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
-        })
-    }
-}
+#[cfg(feature = "gpu")]
+pub use bare_metal::*;
 
 /// xkb modifier masks plus the layout group, as `Seat::notify_modifiers()`
 /// takes them.
@@ -639,6 +650,7 @@ pub struct InputCapabilities {
     pub touch: bool,
 }
 
+#[cfg(feature = "gpu")]
 impl InputCapabilities {
     fn from_bits(bits: u32) -> Self {
         Self {

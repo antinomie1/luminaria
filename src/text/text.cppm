@@ -9,7 +9,7 @@ extern "C" {
 
 #include <pixman.h>
 
-export module luminaria.text;
+export module luminaria.text:text;
 
 import std;
 

@@ -3,6 +3,7 @@
 //     import luminaria;          // core protocols + nested/headless backends
 //     import luminaria.gpu;      // Vulkan, DRM/input/session and GPU protocols
 //     import luminaria.desktop;  // privileged desktop-shell protocols
+//     import luminaria.text;     // glyph rasterization and font metrics (fcft + pixman)
 //
 // This is the dependency-light primary interface. Everything below is one of
 // its partitions, one per concept, and each partition file holds both its

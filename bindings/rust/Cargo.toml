@@ -8,10 +8,19 @@ links = "luminaria"
 build = "build.rs"
 
 [features]
-default = []
+# The two C++ extension modules, on by default so existing users see no change.
+# Turning one off drops its bridge, its C++ shim and its system libraries: with
+# `--no-default-features` nothing links Vulkan, libdrm, libinput, libudev, gbm or
+# libseat. `desktop` really does need `gpu` (DesktopGlobals takes a
+# VulkanRenderer), so it turns it on rather than duplicating the constraint.
+default = ["gpu", "desktop"]
+gpu = []
+desktop = ["gpu"]
+# fcft + fontconfig + pixman; see src/text.rs and luminaria.text.
+text = []
 # Raw VkInstance/VkPhysicalDevice/VkDevice/VkQueue for ash users; see
 # docs/api.md §9.4 for what borrowing them obliges the caller to.
-raw-vulkan = []
+raw-vulkan = ["gpu"]
 mint = ["dep:mint"]
 glam = ["dep:glam"]
 
@@ -32,3 +41,48 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
+
+# Tests and examples that only make sense with a module switched on.
+[[test]]
+name = "test_backend"
+required-features = ["gpu"]
+
+[[test]]
+name = "test_gpu"
+required-features = ["gpu"]
+
+[[test]]
+name = "test_desktop"
+required-features = ["desktop"]
+
+[[test]]
+name = "test_desktop_events"
+required-features = ["desktop"]
+
+[[test]]
+name = "test_session_lock"
+required-features = ["desktop"]
+
+[[test]]
+name = "test_text_input"
+required-features = ["desktop"]
+
+[[test]]
+name = "test_teardown"
+required-features = ["desktop"]
+
+[[test]]
+name = "test_escape_hatches"
+required-features = ["gpu"]
+
+[[test]]
+name = "test_text"
+required-features = ["text"]
+
+[[example]]
+name = "minimal"
+required-features = ["gpu", "desktop"]
+
+[[example]]
+name = "calloop"
+required-features = ["gpu"]

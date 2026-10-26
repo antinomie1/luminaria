@@ -6,12 +6,12 @@ use std::pin::Pin;
 
 use crate::backend::Output;
 use crate::core::{Display, Error, ErrorKind, Holds};
-use crate::ffi;
+use crate::ffi_gpu as ffi;
 use crate::protocol::{Presentation, Seat, SurfaceId};
 use crate::shell::{OutputLayout, SceneItem};
 use crate::util::{Color, Rect};
 
-pub use crate::ffi::DrmDeviceId;
+pub use crate::ffi_gpu::DrmDeviceId;
 
 impl DrmDeviceId {
     /// The device an open card or render node refers to; `None` if it is not
