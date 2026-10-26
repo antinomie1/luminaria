@@ -216,6 +216,22 @@ struct SceneOutput::Impl {
     std::vector<SurfaceId> drawn;
     std::vector<SurfaceAt> tree;
     std::vector<SceneCommitWatch> watched;
+    // What the last CPU frame that reached the screen was made of, so that an
+    // identical one is not composited and committed again. `serials` runs
+    // parallel to `items` (the caller's image serial, the cursor image's
+    // identity); the `last_*` vectors are swapped with the live ones after a
+    // composite rather than copied, so a steady frame allocates nothing.
+    std::vector<std::uint64_t> serials;
+    std::vector<CpuItem> last_items;
+    std::vector<std::uint64_t> last_serials;
+    std::vector<SurfaceId> last_drawn;
+    Color last_background;
+    int last_width = 0, last_height = 0;
+    // `cpu_valid`: the pixels on screen came from the `last_*` description.
+    // `cpu_dirty`: a drawn surface has committed since — a new buffer changes
+    // nothing in the description, so this is what notices it.
+    bool cpu_valid = false;
+    bool cpu_dirty = false;
     // Which path the frame on screen came from: a GPU output that fell back
     // drew `drawn`, not its placement list.
     bool drew_on_cpu = false;
@@ -399,6 +415,11 @@ void place_image_item(Frame& frame, VulkanRenderer& gpu, SceneImageCache& cache,
     frame.place(*cache.texture, effect_transform(item), item.serial);
 }
 
+void push_item(SceneOutput::Impl& state, CpuItem item, std::uint64_t serial = 0) {
+    state.items.push_back(item);
+    state.serials.push_back(serial);
+}
+
 /// Append one surface tree to the CPU draw list, and record every surface of it
 /// — roots and subsurfaces — in `drawn`, which is where the CPU path's batch
 /// frame-callback release comes from.
@@ -410,7 +431,35 @@ void append_tree(SceneOutput::Impl& state, const Output& output, Surface& root, 
         state.drawn.push_back(at.surface->id());
     }
     const Box origin = output.to_device({logical_x, logical_y, 1, 1});
-    state.items.emplace_back(CpuView{root.id(), origin.x, origin.y, clip, alpha});
+    push_item(state, CpuView{root.id(), origin.x, origin.y, clip, alpha});
+}
+
+/// Whether two CPU items draw the same pixels. Images compare by where their
+/// pixels live and by `serial`, as the GPU path's texture cache does; the
+/// contents are the caller's word.
+[[nodiscard]] bool same_item(const CpuItem& a, const CpuItem& b) noexcept {
+    if (a.index() != b.index()) {
+        return false;
+    }
+    switch (a.index()) {
+    case 0: {
+        const auto& x = std::get<RectFill>(a);
+        const auto& y = std::get<RectFill>(b);
+        return x.box == y.box && x.color == y.color;
+    }
+    case 1: {
+        const auto& x = std::get<CpuView>(a);
+        const auto& y = std::get<CpuView>(b);
+        return x.surface == y.surface && x.x == y.x && x.y == y.y && x.clip == y.clip &&
+               x.alpha == y.alpha;
+    }
+    default: {
+        const auto& x = std::get<CpuImage>(a);
+        const auto& y = std::get<CpuImage>(b);
+        return x.box == y.box && x.alpha == y.alpha && x.pixels.data() == y.pixels.data() &&
+               x.pixels.size() == y.pixels.size();
+    }
+    }
 }
 
 /// Milliseconds on the clock `PresentEvent` reports, for the frame callbacks
@@ -525,6 +574,7 @@ void SceneOutput::Impl::unbind() noexcept {
     }
     frame.reset();
     watched.clear();
+    cpu_valid = false;
     cursor_plane = {};
     owner = nullptr;
     output = nullptr;
@@ -614,6 +664,7 @@ Status SceneRenderer::reset(SceneOutput& state, Output& output, std::uint32_t dr
     // the scanout buffers it would otherwise keep alive while allocating more.
     self.frame.reset();
     self.images.clear();
+    self.cpu_valid = false; // the new mode's buffer is blank
     if (impl_->gpu == nullptr) {
         return ok();
     }
@@ -814,6 +865,7 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
                 return SceneOutcome::unchanged;
             }
             self.drew_on_cpu = false;
+            self.cpu_valid = false; // what the CPU last drew is not on screen now
             // Nested and headless outputs have no page flip to report this
             // commit; one paced event delivers presentation and then stops.
             output.schedule_frame();
@@ -831,19 +883,20 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
     }
 
     self.items.clear();
+    self.serials.clear();
     self.drawn.clear();
     for (const SceneItem& item : scene) {
         const Box device = output.to_device(item.box);
         switch (item.kind) {
         case SceneItem::Kind::rect:
             if (!device.empty()) {
-                self.items.emplace_back(RectFill{device, faded(item)});
+                push_item(self, RectFill{device, faded(item)});
             }
             break;
         case SceneItem::Kind::border:
             border_rects(device, item.thickness * output.scale(), [&](int x, int y, int w, int h) {
                 if (w > 0 && h > 0) {
-                    self.items.emplace_back(RectFill{{x, y, w, h}, faded(item)});
+                    push_item(self, RectFill{{x, y, w, h}, faded(item)});
                 }
             });
             break;
@@ -851,7 +904,7 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
             // The image is rasterized at its logical size, so a scaled output
             // would want it rasterized larger rather than stretched here.
             if (!device.empty()) {
-                self.items.emplace_back(CpuImage{device, item.pixels, item.alpha});
+                push_item(self, CpuImage{device, item.pixels, item.alpha}, item.serial);
             }
             break;
         case SceneItem::Kind::surface:
@@ -887,16 +940,40 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
         }
         const Box place =
             output.to_device({cursor.x, cursor.y, cursor.image->width, cursor.image->height});
-        self.items.emplace_back(
-            CpuImage{{place.x, place.y, cursor.image->width, cursor.image->height},
-                     impl_->cursor_pixels});
+        push_item(self,
+                  CpuImage{{place.x, place.y, cursor.image->width, cursor.image->height},
+                           impl_->cursor_pixels},
+                  reinterpret_cast<std::uintptr_t>(cursor.image));
     }
 
+    // The CPU path's `unchanged`: the same description of the same screen, and
+    // nothing drawn has committed since. A client committing a new buffer
+    // changes none of the keys, which is what `cpu_dirty` is for. Skipping
+    // means no commit, so no `present` and no further frame is asked for: the
+    // callbacks are released here and the output goes quiet until a commit or
+    // the compositor wakes it.
+    if (self.cpu_valid && !self.cpu_dirty && self.last_width == width &&
+        self.last_height == height && self.last_background == background &&
+        self.drawn == self.last_drawn && self.serials == self.last_serials &&
+        std::ranges::equal(self.items, self.last_items, same_item)) {
+        self.send_frame_done(monotonic_ms());
+        return SceneOutcome::unchanged;
+    }
+
+    self.cpu_valid = false;
     self.cpu.composite(width, height, background, self.items);
     if (Status committed = output.commit_frame(self.cpu.pixels(), width, height); !committed) {
         return std::unexpected(committed.error());
     }
     self.drew_on_cpu = true;
+    self.cpu_valid = true;
+    self.cpu_dirty = false;
+    self.last_width = width;
+    self.last_height = height;
+    self.last_background = background;
+    self.last_drawn = self.drawn; // capacity kept: no allocation once steady
+    std::swap(self.last_items, self.items);
+    std::swap(self.last_serials, self.serials);
     // No `Frame` is watching these surfaces, so their next commit would never
     // reach the screen. One connection per surface for as long as it is drawn;
     // a steady scene adds none.
@@ -911,8 +988,11 @@ Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
             continue;
         }
         Output* out = &output;
-        self.watched.push_back(
-            {id, surface->commit.connect([out](SurfaceCommit&) { out->schedule_frame(); })});
+        SceneOutput::Impl* state = &self;
+        self.watched.push_back({id, surface->commit.connect([out, state](SurfaceCommit&) {
+                                    state->cpu_dirty = true;
+                                    out->schedule_frame();
+                                })});
     }
     // Software outputs report presentation immediately before the next frame;
     // ask for that one event so frame callbacks are paced to what was shown.

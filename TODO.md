@@ -186,9 +186,5 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 - **C++ 的 `minimal` 不接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
   触摸面板），Rust 绑定也接好了（映射到第一块输出、`scene_hit_test`、按 slot 路由）；C++ 示例
   为了保持最小没有照做，所以它的 `set_capabilities()` 传 touch=false。
-- **CPU 合成路径从不空闲** —— `SceneRenderer::present()` 的 CPU 分支每次都合成、提交并再要
-  一帧，没有 GPU 路径那样的 `unchanged`，于是没有 GPU 的输出（headless、嵌套、CI）静止时
-  也按帧间隔整屏重画。CPU 分支已经像 `Frame` 一样盯着画过的表面的 commit，缺的是"这一帧与
-  上一帧相同就不提交"的判定（场景列表比较加客户端 damage）。
 - **headless 在每一帧之前都报一次 `present`，不管提交过没有** —— 于是 headless 上看不出
   `unchanged` 帧漏发帧回调；`test_scene_present` 因此自带一个只在提交后才 present 的测试输出。
