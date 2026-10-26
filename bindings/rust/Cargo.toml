@@ -1,0 +1,15 @@
+[package]
+name = "luminaria"
+version = "0.0.1"
+edition = "2024"
+description = "Rust bindings for the luminaria Wayland compositor library"
+license-file = "../../LICENSE"
+links = "luminaria"
+build = "build.rs"
+
+[dependencies]
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+pkg-config = "0.3"
