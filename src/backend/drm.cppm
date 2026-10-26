@@ -76,6 +76,11 @@ public:
     /// hotplug events once start() has run; exposed for a manual poke.
     void scan_connectors();
 
+    /// The card's fd, borrowed: valid for the life of the backend, never to be
+    /// closed. Pass it to `drm_device_id()` for `VulkanOptions::drm_device`, so
+    /// the renderer is the GPU this card belongs to.
+    [[nodiscard]] int fd() const noexcept;
+
     struct Impl;
 
 private:
@@ -1154,6 +1159,8 @@ Result<DrmBackend> DrmBackend::create(EventLoop loop, std::string device, Sessio
     }
     return backend;
 }
+
+int DrmBackend::fd() const noexcept { return impl_->fd; }
 
 void DrmBackend::scan_connectors() {
     Impl& impl = *impl_;
