@@ -16,9 +16,20 @@ pub(crate) mod ffi {
         fn measure(self: &FontShim, utf8: &str) -> i32;
         /// Draws into tightly packed RGBA pixels (`width * height * 4` bytes)
         /// and returns the pen x after the last glyph that fit.
-        fn draw(self: &FontShim, canvas_rgba: &mut [u8], width: i32, height: i32, x: i32,
-                baseline: i32, utf8: &str, r: f32, g: f32, b: f32, a: f32,
-                right_edge: i32) -> i32;
+        fn draw(
+            self: &FontShim,
+            canvas_rgba: &mut [u8],
+            width: i32,
+            height: i32,
+            x: i32,
+            baseline: i32,
+            utf8: &str,
+            r: f32,
+            g: f32,
+            b: f32,
+            a: f32,
+            right_edge: i32,
+        ) -> i32;
 
         fn text_decode_utf8(utf8: &str) -> Vec<u32>;
     }

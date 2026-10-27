@@ -96,9 +96,15 @@ impl AppState<'_> {
     fn handle(&mut self, events: luminaria::Events) -> Result<(), Error> {
         for event in events {
             match event {
-                Event::Compositor(CompositorEvent::NewSurface(id)) => println!("calloop: new client surface {id:?}"),
-                Event::Compositor(CompositorEvent::Commit(id)) => println!("calloop: surface {id:?} committed"),
-                Event::Compositor(CompositorEvent::Destroy(id)) => println!("calloop: surface {id:?} destroyed"),
+                Event::Compositor(CompositorEvent::NewSurface(id)) => {
+                    println!("calloop: new client surface {id:?}")
+                }
+                Event::Compositor(CompositorEvent::Commit(id)) => {
+                    println!("calloop: surface {id:?} committed")
+                }
+                Event::Compositor(CompositorEvent::Destroy(id)) => {
+                    println!("calloop: surface {id:?} destroyed")
+                }
                 Event::Output(_, OutputEvent::Frame) => self.render_frame()?,
                 _ => {}
             }
@@ -113,10 +119,15 @@ impl AppState<'_> {
             // Compositor-owned image bar at the top (serial 1)
             SceneItem::image(Rect::new(20, 20, 200, 40), 1),
         ];
-        let outcome = self.renderer.present(&mut self.output, &items, Color::rgb(0.1, 0.1, 0.15))?;
+        let outcome =
+            self.renderer
+                .present(&mut self.output, &items, Color::rgb(0.1, 0.1, 0.15))?;
         self.frames_rendered += 1;
         if self.frames_rendered <= 3 {
-            println!("calloop: frame #{} presented ({outcome:?})", self.frames_rendered);
+            println!(
+                "calloop: frame #{} presented ({outcome:?})",
+                self.frames_rendered
+            );
         }
         Ok(())
     }
@@ -144,13 +155,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     renderer.reset(&mut output)?;
 
     // Hand the renderer a 200x40 compositor-owned test bar image (serial 1)
-    let bar_pixels: Vec<u8> = std::iter::repeat_n([40u8, 160, 220, 255], 200 * 40).flatten().collect();
+    let bar_pixels: Vec<u8> = std::iter::repeat_n([40u8, 160, 220, 255], 200 * 40)
+        .flatten()
+        .collect();
     renderer.set_image(1, 200, 40, &bar_pixels)?;
 
     println!("calloop: compositor initialized (WAYLAND_DISPLAY={socket})");
-    println!("calloop: renderer = {}", if renderer.gpu_enabled() { "GPU" } else { "CPU" });
+    println!(
+        "calloop: renderer = {}",
+        if renderer.gpu_enabled() { "GPU" } else { "CPU" }
+    );
 
-    let mut state = AppState { display: &display, renderer: &renderer, output, frames_rendered: 0 };
+    let mut state = AppState {
+        display: &display,
+        renderer: &renderer,
+        output,
+        frames_rendered: 0,
+    };
 
     // Initial frame render
     state.render_frame()?;
@@ -163,30 +184,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register Display's event loop fd as a Generic source.
     // Safe: `state.display` outlives `event_loop`.
     let display_raw_fd = state.display.as_raw_fd();
-    let display_source = unsafe {
-        Generic::new(FdWrapper::new(display_raw_fd), Interest::READ, Mode::Level)
-    };
-    handle.insert_source(
-        display_source,
-        |_readiness, _fd, state| {
+    let display_source =
+        unsafe { Generic::new(FdWrapper::new(display_raw_fd), Interest::READ, Mode::Level) };
+    handle
+        .insert_source(display_source, |_readiness, _fd, state| {
             // Non-blocking dispatch of Wayland events & timers, then what it produced.
-            let events = state.display.dispatch(Some(Duration::ZERO)).map_err(std::io::Error::other)?;
+            let events = state
+                .display
+                .dispatch(Some(Duration::ZERO))
+                .map_err(std::io::Error::other)?;
             state.handle(events).map_err(std::io::Error::other)?;
             state.display.flush_clients();
             Ok(PostAction::Continue)
-        },
-    ).map_err(|e| format!("failed to insert display source: {e}"))?;
+        })
+        .map_err(|e| format!("failed to insert display source: {e}"))?;
     // Auto-exit timer for tests / smoke runs
     if exit_ms > 0 {
         let timer_signal = signal.clone();
-        handle.insert_source(
-            Timer::from_duration(Duration::from_millis(exit_ms)),
-            move |_, _, _| {
-                println!("calloop: exit timer fired after {exit_ms}ms, exiting");
-                timer_signal.stop();
-                TimeoutAction::Drop
-            },
-        ).map_err(|e| format!("failed to insert timer: {e}"))?;
+        handle
+            .insert_source(
+                Timer::from_duration(Duration::from_millis(exit_ms)),
+                move |_, _, _| {
+                    println!("calloop: exit timer fired after {exit_ms}ms, exiting");
+                    timer_signal.stop();
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|e| format!("failed to insert timer: {e}"))?;
     }
 
     println!("calloop: running event loop (will auto-terminate in {exit_ms}ms)...");

@@ -4,11 +4,13 @@
 #[macro_use]
 mod common;
 
-use common::{shm_buffer, ClientSide, Peer, take};
+use common::{ClientSide, Peer, shm_buffer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, Seat, SeatEvent, ToplevelEvent, XdgEvent, XdgShell};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_shm_pool, wl_surface};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::xdg::shell::client::xdg_wm_base;
 
@@ -30,7 +32,14 @@ ignore_events!(State:
 );
 
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
-    fn event(state: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let wl_pointer::Event::Enter { serial, .. } = event {
             state.enter_serial = Some(serial);
         }
@@ -91,13 +100,23 @@ fn focus_and_cursor_changes() {
     common::collect(&display);
     assert_eq!(
         take::<SeatEvent>(),
-        [SeatEvent::KeyboardFocus(Some(s)), SeatEvent::PointerFocus(Some(s))]
+        [
+            SeatEvent::KeyboardFocus(Some(s)),
+            SeatEvent::PointerFocus(Some(s))
+        ]
     );
     peer.go();
 
     peer.wait(&display, "cursor");
     let events = take::<SeatEvent>();
-    let [SeatEvent::CursorChange { surface: Some(c), hotspot: (3, 4), hidden: false }] = events[..] else {
+    let [
+        SeatEvent::CursorChange {
+            surface: Some(c),
+            hotspot: (3, 4),
+            hidden: false,
+        },
+    ] = events[..]
+    else {
         panic!("{events:?}");
     };
     assert_ne!(c, s);
@@ -107,7 +126,14 @@ fn focus_and_cursor_changes() {
 
     peer.wait(&display, "hidden");
     let events = take::<SeatEvent>();
-    let [SeatEvent::CursorChange { surface: None, hidden: true, .. }] = events[..] else {
+    let [
+        SeatEvent::CursorChange {
+            surface: None,
+            hidden: true,
+            ..
+        },
+    ] = events[..]
+    else {
         panic!("{events:?}");
     };
     assert!(seat.cursor_hidden());
@@ -120,7 +146,11 @@ fn focus_and_cursor_changes() {
     assert_eq!(
         take::<SeatEvent>(),
         [
-            SeatEvent::CursorChange { surface: None, hotspot: (0, 0), hidden: false },
+            SeatEvent::CursorChange {
+                surface: None,
+                hotspot: (0, 0),
+                hidden: false
+            },
             SeatEvent::PointerFocus(None),
             SeatEvent::KeyboardFocus(None)
         ]

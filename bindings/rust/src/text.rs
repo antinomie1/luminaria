@@ -67,17 +67,27 @@ impl Font {
         right_edge: i32,
     ) -> Result<i32, Error> {
         if width <= 0 || height <= 0 {
-            return Err(Error::new(ErrorKind::InvalidArgument, "canvas must be non-empty"));
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "canvas must be non-empty",
+            ));
         }
         let needed = width as usize * height as usize * 4;
         if canvas.len() < needed {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
-                format!("canvas holds {} bytes, {}x{} needs {}", canvas.len(), width, height, needed),
+                format!(
+                    "canvas holds {} bytes, {}x{} needs {}",
+                    canvas.len(),
+                    width,
+                    height,
+                    needed
+                ),
             ));
         }
         Ok(self.raw.pin_mut().draw(
-            canvas, width, height, x, baseline, utf8, color.r, color.g, color.b, color.a, right_edge,
+            canvas, width, height, x, baseline, utf8, color.r, color.g, color.b, color.a,
+            right_edge,
         ))
     }
 }

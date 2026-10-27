@@ -17,7 +17,9 @@ fn test_display_creation_and_sockets() {
     let display = Display::new().expect("failed to create display");
     assert!(display.as_raw_fd() >= 0);
 
-    let socket_name = display.add_socket_auto().expect("failed to add auto socket");
+    let socket_name = display
+        .add_socket_auto()
+        .expect("failed to add auto socket");
     assert!(socket_name.starts_with("wayland-"));
 
     display.init_shm().expect("failed to init shm");
@@ -36,13 +38,20 @@ fn test_display_creation_and_sockets() {
 fn test_key_router() {
     let display = Display::new().expect("display");
     let seat = Seat::new(&display, "seat0").expect("seat");
-    let key = |key, pressed| InputEvent::Key { key, pressed, keysym: Keysym::q, modifiers: Default::default() };
+    let key = |key, pressed| InputEvent::Key {
+        key,
+        pressed,
+        keysym: Keysym::q,
+        modifiers: Default::default(),
+    };
     let mut router = KeyRouter::new();
     let mut asked = Vec::new();
     // Only presses are offered, and the binding decides per key.
     for event in [key(1, true), key(1, false), key(2, true), key(2, false)] {
         router.route(&seat, &event, |e| {
-            let &InputEvent::Key { key, .. } = e else { unreachable!() };
+            let &InputEvent::Key { key, .. } = e else {
+                unreachable!()
+            };
             asked.push(key);
             key == 1
         });

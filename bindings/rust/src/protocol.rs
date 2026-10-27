@@ -14,6 +14,7 @@ use crate::ffi;
 use crate::util::{Rect, Transform};
 
 mod activation;
+mod gestures;
 mod idle;
 mod layer_shell;
 mod pointer_constraints;
@@ -23,6 +24,7 @@ mod text_input;
 mod xdg_shell;
 
 pub use activation::*;
+pub use gestures::*;
 pub use idle::*;
 pub use layer_shell::*;
 pub use pointer_constraints::*;
@@ -100,7 +102,11 @@ impl SurfaceId {
             .into_iter()
             .filter_map(|at| {
                 let surface = Self::from_raw(at.surface_id)?;
-                Some(SurfaceAt { surface, x: at.x, y: at.y })
+                Some(SurfaceAt {
+                    surface,
+                    x: at.x,
+                    y: at.y,
+                })
             })
             .collect()
     }
@@ -149,7 +155,10 @@ impl<'d> Compositor<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
@@ -168,7 +177,10 @@ impl<'d> Subcompositor<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
@@ -180,24 +192,16 @@ pub struct OutputGlobal<'d> {
 }
 
 impl<'d> OutputGlobal<'d> {
-    pub fn new(
-        display: &'d Display,
-        width: i32,
-        height: i32,
-        name: &str,
-    ) -> Result<Self, Error> {
+    pub fn new(display: &'d Display, width: i32, height: i32, name: &str) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::output_global_new(
-            &display.raw,
-            width,
-            height,
-            name,
-            &mut err,
-        );
+        let raw = ffi::output_global_new(&display.raw, width, height, name, &mut err);
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -217,7 +221,10 @@ impl<'d> OutputGlobal<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
@@ -347,13 +354,33 @@ macro_rules! define_manager {
 }
 
 define_manager!(Viewporter, ViewporterShim, viewporter_new);
-define_manager!(SinglePixelBufferManager, SinglePixelBufferManagerShim, single_pixel_buffer_manager_new);
-define_manager!(TearingControlManager, TearingControlManagerShim, tearing_control_manager_new);
-define_manager!(ContentTypeManager, ContentTypeManagerShim, content_type_manager_new);
+define_manager!(
+    SinglePixelBufferManager,
+    SinglePixelBufferManagerShim,
+    single_pixel_buffer_manager_new
+);
+define_manager!(
+    TearingControlManager,
+    TearingControlManagerShim,
+    tearing_control_manager_new
+);
+define_manager!(
+    ContentTypeManager,
+    ContentTypeManagerShim,
+    content_type_manager_new
+);
 define_manager!(FifoManager, FifoManagerShim, fifo_manager_new);
-define_manager!(CommitTimingManager, CommitTimingManagerShim, commit_timing_manager_new);
+define_manager!(
+    CommitTimingManager,
+    CommitTimingManagerShim,
+    commit_timing_manager_new
+);
 define_manager!(Presentation, PresentationShim, presentation_new);
-define_manager!(BackgroundEffectManager, BackgroundEffectManagerShim, background_effect_manager_new);
+define_manager!(
+    BackgroundEffectManager,
+    BackgroundEffectManagerShim,
+    background_effect_manager_new
+);
 
 /// The `wp_fractional_scale_manager_v1` global.
 ///
@@ -372,7 +399,10 @@ impl<'d> FractionalScaleManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -424,7 +454,10 @@ impl<'d> XdgDecorationManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -460,7 +493,10 @@ impl<'d> CursorShapeManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
@@ -485,7 +521,10 @@ impl<'d> XdgToplevelIconManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -509,7 +548,10 @@ impl<'a> RelativePointerManager<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 }
@@ -523,7 +565,9 @@ impl CompositorEvent {
             ffi::EventKind::SurfaceCommit => return Some(CompositorEvent::Commit(surface)),
             ffi::EventKind::SurfaceDestroy => return Some(CompositorEvent::Destroy(surface)),
             ffi::EventKind::SurfaceRendered => return Some(CompositorEvent::Rendered(surface)),
-            ffi::EventKind::SurfaceInvalidated => return Some(CompositorEvent::Invalidated(surface)),
+            ffi::EventKind::SurfaceInvalidated => {
+                return Some(CompositorEvent::Invalidated(surface));
+            }
             _ => {}
         }
         None

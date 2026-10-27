@@ -48,7 +48,10 @@ impl<'d> XdgActivation<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 

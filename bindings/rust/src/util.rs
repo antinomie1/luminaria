@@ -223,7 +223,12 @@ impl Rect {
 
 impl From<(i32, i32, i32, i32)> for Rect {
     fn from((x, y, width, height): (i32, i32, i32, i32)) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -235,7 +240,12 @@ impl From<Rect> for (i32, i32, i32, i32) {
 
 impl From<[i32; 4]> for Rect {
     fn from([x, y, width, height]: [i32; 4]) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -247,7 +257,12 @@ impl From<Rect> for [i32; 4] {
 
 impl From<(Point<i32>, Point<i32>)> for Rect {
     fn from((origin, size): (Point<i32>, Point<i32>)) -> Self {
-        Self { x: origin.x, y: origin.y, width: size.x, height: size.y }
+        Self {
+            x: origin.x,
+            y: origin.y,
+            width: size.x,
+            height: size.y,
+        }
     }
 }
 
@@ -342,7 +357,11 @@ impl TryFrom<u32> for Transform {
     type Error = u32;
 
     fn try_from(value: u32) -> Result<Self, u32> {
-        if value <= 7 { Ok(Self::from_u32(value)) } else { Err(value) }
+        if value <= 7 {
+            Ok(Self::from_u32(value))
+        } else {
+            Err(value)
+        }
     }
 }
 
@@ -400,7 +419,9 @@ impl Keysym {
         let mut buffer = [0 as std::ffi::c_char; 64];
         // SAFETY: the buffer and its size are what xkb is told.
         let len = unsafe { xkb_keysym_get_name(self.0, buffer.as_mut_ptr(), buffer.len()) };
-        let len = usize::try_from(len).ok().filter(|&n| n > 0 && n < buffer.len())?;
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|&n| n > 0 && n < buffer.len())?;
         let bytes: Vec<u8> = buffer[..len].iter().map(|&c| c as u8).collect();
         String::from_utf8(bytes).ok()
     }
@@ -463,7 +484,8 @@ impl Region {
     }
 
     pub fn subtract_rect(&mut self, rect: Rect) {
-        self.pin().subtract_box(rect.x, rect.y, rect.width, rect.height);
+        self.pin()
+            .subtract_box(rect.x, rect.y, rect.width, rect.height);
     }
 
     pub fn subtract(&mut self, other: &Region) {
@@ -471,7 +493,8 @@ impl Region {
     }
 
     pub fn intersect_rect(&mut self, rect: Rect) {
-        self.pin().intersect_box(rect.x, rect.y, rect.width, rect.height);
+        self.pin()
+            .intersect_box(rect.x, rect.y, rect.width, rect.height);
     }
 
     pub fn intersect(&mut self, other: &Region) {
@@ -515,7 +538,10 @@ impl KeymapState {
         let mut err = String::new();
         let raw = ffi::keymap_state_from_layout(layout, &mut err);
         if raw.is_null() {
-            Err(crate::core::Error::new(crate::core::ErrorKind::InvalidArgument, err))
+            Err(crate::core::Error::new(
+                crate::core::ErrorKind::InvalidArgument,
+                err,
+            ))
         } else {
             Ok(Self { raw })
         }
@@ -525,7 +551,10 @@ impl KeymapState {
         let mut err = String::new();
         let raw = ffi::keymap_state_from_text(text, &mut err);
         if raw.is_null() {
-            Err(crate::core::Error::new(crate::core::ErrorKind::InvalidArgument, err))
+            Err(crate::core::Error::new(
+                crate::core::ErrorKind::InvalidArgument,
+                err,
+            ))
         } else {
             Ok(Self { raw })
         }
@@ -566,13 +595,7 @@ pub struct Pixel {
 }
 
 /// Validates whether a pixel buffer layout safely fits within a slice/memory region.
-pub fn layout_fits(
-    width: i32,
-    height: i32,
-    stride: u32,
-    offset: u32,
-    total_size: usize,
-) -> bool {
+pub fn layout_fits(width: i32, height: i32, stride: u32, offset: u32, total_size: usize) -> bool {
     ffi::layout_fits_raw(width, height, stride, offset, total_size)
 }
 
@@ -609,31 +632,56 @@ mod mint_impls {
 
     impl From<mint::Vector4<f32>> for Color {
         fn from(v: mint::Vector4<f32>) -> Self {
-            Self { r: v.x, g: v.y, b: v.z, a: v.w }
+            Self {
+                r: v.x,
+                g: v.y,
+                b: v.z,
+                a: v.w,
+            }
         }
     }
 
     impl From<Color> for mint::Vector4<f32> {
         fn from(c: Color) -> Self {
-            Self { x: c.r, y: c.g, z: c.b, w: c.a }
+            Self {
+                x: c.r,
+                y: c.g,
+                z: c.b,
+                w: c.a,
+            }
         }
     }
 
     impl From<mint::Vector4<i32>> for Rect {
         fn from(v: mint::Vector4<i32>) -> Self {
-            Self { x: v.x, y: v.y, width: v.z, height: v.w }
+            Self {
+                x: v.x,
+                y: v.y,
+                width: v.z,
+                height: v.w,
+            }
         }
     }
 
     impl From<Rect> for mint::Vector4<i32> {
         fn from(r: Rect) -> Self {
-            Self { x: r.x, y: r.y, z: r.width, w: r.height }
+            Self {
+                x: r.x,
+                y: r.y,
+                z: r.width,
+                w: r.height,
+            }
         }
     }
 
     impl From<(mint::Point2<i32>, mint::Vector2<i32>)> for Rect {
         fn from((p, v): (mint::Point2<i32>, mint::Vector2<i32>)) -> Self {
-            Self { x: p.x, y: p.y, width: v.x, height: v.y }
+            Self {
+                x: p.x,
+                y: p.y,
+                width: v.x,
+                height: v.y,
+            }
         }
     }
 
@@ -641,7 +689,10 @@ mod mint_impls {
         fn from(r: Rect) -> Self {
             (
                 mint::Point2 { x: r.x, y: r.y },
-                mint::Vector2 { x: r.width, y: r.height },
+                mint::Vector2 {
+                    x: r.width,
+                    y: r.height,
+                },
             )
         }
     }
@@ -653,7 +704,12 @@ mod glam_impls {
 
     impl From<glam::Vec4> for Color {
         fn from(v: glam::Vec4) -> Self {
-            Self { r: v.x, g: v.y, b: v.z, a: v.w }
+            Self {
+                r: v.x,
+                g: v.y,
+                b: v.z,
+                a: v.w,
+            }
         }
     }
 
@@ -701,7 +757,12 @@ mod glam_impls {
 
     impl From<glam::IVec4> for Rect {
         fn from(v: glam::IVec4) -> Self {
-            Self { x: v.x, y: v.y, width: v.z, height: v.w }
+            Self {
+                x: v.x,
+                y: v.y,
+                width: v.z,
+                height: v.w,
+            }
         }
     }
 
@@ -713,13 +774,21 @@ mod glam_impls {
 
     impl From<(glam::IVec2, glam::IVec2)> for Rect {
         fn from((p, s): (glam::IVec2, glam::IVec2)) -> Self {
-            Self { x: p.x, y: p.y, width: s.x, height: s.y }
+            Self {
+                x: p.x,
+                y: p.y,
+                width: s.x,
+                height: s.y,
+            }
         }
     }
 
     impl From<Rect> for (glam::IVec2, glam::IVec2) {
         fn from(r: Rect) -> Self {
-            (glam::IVec2::new(r.x, r.y), glam::IVec2::new(r.width, r.height))
+            (
+                glam::IVec2::new(r.x, r.y),
+                glam::IVec2::new(r.width, r.height),
+            )
         }
     }
 }

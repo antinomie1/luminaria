@@ -16,10 +16,13 @@ use luminaria::util::Rect;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_compositor, wl_keyboard, wl_seat, wl_surface};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
-use wayland_protocols::wp::text_input::zv3::client::{zwp_text_input_manager_v3, zwp_text_input_v3};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::xdg::shell::client::xdg_wm_base;
 use wayland_protocols_misc::zwp_input_method_v2::client::{
-    zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2, zwp_input_popup_surface_v2,
+    zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
+    zwp_input_popup_surface_v2,
 };
 
 #[derive(Default)]
@@ -76,7 +79,9 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for State {
     ) {
         match event {
             zwp_input_method_v2::Event::Activate => state.im_activated += 1,
-            zwp_input_method_v2::Event::SurroundingText { text, .. } => state.im_surrounding = Some(text),
+            zwp_input_method_v2::Event::SurroundingText { text, .. } => {
+                state.im_surrounding = Some(text)
+            }
             _ => {}
         }
     }
@@ -93,8 +98,15 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
     ) {
         match event {
             zwp_input_method_keyboard_grab_v2::Event::Keymap { .. } => state.grab_keymap = true,
-            zwp_input_method_keyboard_grab_v2::Event::Key { key, state: key_state, .. } => {
-                state.grab_keys.push((key, key_state == WEnum::Value(wl_keyboard::KeyState::Pressed)));
+            zwp_input_method_keyboard_grab_v2::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
+                state.grab_keys.push((
+                    key,
+                    key_state == WEnum::Value(wl_keyboard::KeyState::Pressed),
+                ));
             }
             _ => {}
         }
@@ -108,8 +120,10 @@ fn client(conn: Connection, step: ClientSide) {
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let wm: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
-    let text_inputs: zwp_text_input_manager_v3::ZwpTextInputManagerV3 = globals.bind(&qh, 1..=1, ()).unwrap();
-    let input_methods: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let text_inputs: zwp_text_input_manager_v3::ZwpTextInputManagerV3 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let input_methods: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
     let mut state = State::default();
 
     let surface = compositor.create_surface(&qh, ());
@@ -167,7 +181,8 @@ fn text_input_and_input_method() {
     let seat = Seat::new(&display, "seat0").expect("wl_seat");
     seat.set_capabilities(true, false, false);
     let text_inputs = TextInputManager::new(&display, &seat).expect("text-input");
-    let input_methods = InputMethodManager::new(&display, &seat, &text_inputs).expect("input-method");
+    let input_methods =
+        InputMethodManager::new(&display, &seat, &text_inputs).expect("input-method");
 
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "ready");
@@ -211,8 +226,16 @@ fn text_input_and_input_method() {
 
     peer.wait(&display, "grabbed");
     let events = take::<InputMethodEvent>();
-    let [InputMethodEvent::GrabChange { input_method, grabbed: true }, InputMethodEvent::NewPopupSurface { input_method: owner, surface: p }] =
-        events[..]
+    let [
+        InputMethodEvent::GrabChange {
+            input_method,
+            grabbed: true,
+        },
+        InputMethodEvent::NewPopupSurface {
+            input_method: owner,
+            surface: p,
+        },
+    ] = events[..]
     else {
         panic!("{events:?}");
     };
@@ -220,7 +243,10 @@ fn text_input_and_input_method() {
     let im = input_methods.input_method(m);
     assert!(im.has_keyboard_grab());
     assert_eq!(im.popup_surfaces(), [p]);
-    assert_eq!(input_methods.popup_text_input_rectangle(p), Rect::new(10, 20, 1, 15));
+    assert_eq!(
+        input_methods.popup_text_input_rectangle(p),
+        Rect::new(10, 20, 1, 15)
+    );
     im.grab_send_key(100, 30, true);
     peer.go();
 
@@ -230,8 +256,17 @@ fn text_input_and_input_method() {
         [TextInputEvent::Disable(t), TextInputEvent::Commit(t)]
     );
     let events = take::<InputMethodEvent>();
-    assert!(events.contains(&InputMethodEvent::PopupSurfaceDestroy(p)), "{events:?}");
-    assert!(events.contains(&InputMethodEvent::GrabChange { input_method: m, grabbed: false }), "{events:?}");
+    assert!(
+        events.contains(&InputMethodEvent::PopupSurfaceDestroy(p)),
+        "{events:?}"
+    );
+    assert!(
+        events.contains(&InputMethodEvent::GrabChange {
+            input_method: m,
+            grabbed: false
+        }),
+        "{events:?}"
+    );
     assert!(!im.is_active() && !im.has_keyboard_grab());
     peer.go();
 

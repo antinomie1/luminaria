@@ -76,7 +76,10 @@ impl SceneRenderer {
     /// [`reset`](Self::reset) in a format of the caller's choosing.
     pub fn reset_with_format(&self, output: &mut Output, format: DrmFourcc) -> Result<(), Error> {
         let mut err = String::new();
-        if self.raw.reset(output.raw.pin_mut(), format as u32, &mut err) {
+        if self
+            .raw
+            .reset(output.raw.pin_mut(), format as u32, &mut err)
+        {
             Ok(())
         } else {
             Err(Error::new(ErrorKind::Gpu, err))
@@ -85,11 +88,18 @@ impl SceneRenderer {
 
     /// Draw `items`, in `output`'s own logical coordinates, and present them.
     /// Call it on [`OutputEvent::Frame`](crate::backend::OutputEvent::Frame).
-    pub fn present(&self, output: &mut Output, items: &[SceneItem], background: Color) -> Result<SceneOutcome, Error> {
+    pub fn present(
+        &self,
+        output: &mut Output,
+        items: &[SceneItem],
+        background: Color,
+    ) -> Result<SceneOutcome, Error> {
         let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
         let mut err = String::new();
         let (r, g, b, a) = (background.r, background.g, background.b, background.a);
-        let res = self.raw.present(output.raw.pin_mut(), &raw_items, r, g, b, a, &mut err);
+        let res = self
+            .raw
+            .present(output.raw.pin_mut(), &raw_items, r, g, b, a, &mut err);
         SceneOutcome::from_result(res, err)
     }
 
@@ -105,7 +115,16 @@ impl SceneRenderer {
         let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
         let mut err = String::new();
         let (r, g, b, a) = (background.r, background.g, background.b, background.a);
-        let res = self.raw.present_in(&layout.raw, output.raw.pin_mut(), &raw_items, r, g, b, a, &mut err);
+        let res = self.raw.present_in(
+            &layout.raw,
+            output.raw.pin_mut(),
+            &raw_items,
+            r,
+            g,
+            b,
+            a,
+            &mut err,
+        );
         SceneOutcome::from_result(res, err)
     }
 
@@ -150,7 +169,10 @@ impl SceneRenderer {
     }
 
     /// Create [`LinuxDmabuf`] backed by this renderer's GPU.
-    pub fn create_linux_dmabuf<'a>(&'a self, display: &'a Display) -> Result<LinuxDmabuf<'a>, Error> {
+    pub fn create_linux_dmabuf<'a>(
+        &'a self,
+        display: &'a Display,
+    ) -> Result<LinuxDmabuf<'a>, Error> {
         LinuxDmabuf::from_scene_renderer(display, self)
     }
 
@@ -252,7 +274,13 @@ impl<'a> Cursor<'a> {
         shapes: &'a crate::protocol::CursorShapeManager<'_>,
     ) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::cursor_new_with_shapes(&renderer.raw, &layout.raw, &seat.raw, &shapes.raw, &mut err);
+        let raw = ffi::cursor_new_with_shapes(
+            &renderer.raw,
+            &layout.raw,
+            &seat.raw,
+            &shapes.raw,
+            &mut err,
+        );
         if raw.is_null() {
             Err(Error::new(ErrorKind::Gpu, err))
         } else {
@@ -419,7 +447,10 @@ impl DirectScanout {
         let mut o_pin = output.raw.pin_mut();
         let raw = ffi::direct_scanout_new(o_pin.as_mut());
         if raw.is_null() {
-            Err(Error::new(ErrorKind::Gpu, "failed to initialize direct scanout"))
+            Err(Error::new(
+                ErrorKind::Gpu,
+                "failed to initialize direct scanout",
+            ))
         } else {
             Ok(Self { raw })
         }

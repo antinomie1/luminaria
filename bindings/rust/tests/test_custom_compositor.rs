@@ -58,7 +58,9 @@ fn test_custom_compositor_headless_pipeline() {
     assert_eq!(pixels.len(), 1024 * 768 * 4);
 
     // Commit rendered pixels to output
-    output.commit_frame(&pixels, 1024, 768).expect("commit_frame failed");
+    output
+        .commit_frame(&pixels, 1024, 768)
+        .expect("commit_frame failed");
 
     // 6. Drive the display event loop
     let dispatched = display.dispatch(Some(Duration::ZERO));

@@ -1,4 +1,4 @@
-use luminaria::util::{layout_fits, Color, KeymapState, Point, Rect, Region, Transform};
+use luminaria::util::{Color, KeymapState, Point, Rect, Region, Transform, layout_fits};
 
 #[test]
 fn test_rect_geometry() {
@@ -18,7 +18,12 @@ fn test_rect_geometry() {
     assert_eq!(united, Rect::new(10, 20, 140, 200));
 
     // Resizing
-    let resized = r1.resized(luminaria::util::edge::RIGHT | luminaria::util::edge::BOTTOM, 10, 20, (50, 50));
+    let resized = r1.resized(
+        luminaria::util::edge::RIGHT | luminaria::util::edge::BOTTOM,
+        10,
+        20,
+        (50, 50),
+    );
     assert_eq!(resized, Rect::new(10, 20, 110, 220));
 
     // Conversions

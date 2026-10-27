@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::backend::InputEvent;
 use crate::event::Events;
 use crate::ffi;
+pub use crate::protocol::PointerGestures;
 use crate::protocol::Seat;
 
 /// Category of error originating from luminaria operations.
@@ -185,7 +186,10 @@ impl Display {
         let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
         let ret = self.raw.dispatch(ms);
         if ret < 0 {
-            Err(Error::new(ErrorKind::EventLoop, format!("event loop dispatch error: {ret}")))
+            Err(Error::new(
+                ErrorKind::EventLoop,
+                format!("event loop dispatch error: {ret}"),
+            ))
         } else {
             Ok(self.events())
         }
@@ -291,8 +295,15 @@ impl KeyRouter {
     /// A press of a key a binding is thought to still hold means its release
     /// was lost — what happens to the key that switched the VT away — and is
     /// treated as a fresh press.
-    pub fn route(&mut self, seat: &Seat<'_>, event: &InputEvent, binding: impl FnOnce(&InputEvent) -> bool) {
-        let &InputEvent::Key { key, pressed, .. } = event else { return };
+    pub fn route(
+        &mut self,
+        seat: &Seat<'_>,
+        event: &InputEvent,
+        binding: impl FnOnce(&InputEvent) -> bool,
+    ) {
+        let &InputEvent::Key { key, pressed, .. } = event else {
+            return;
+        };
         if !pressed {
             if !self.kept.remove(&key) {
                 seat.notify_key(key, false);

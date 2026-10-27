@@ -6,13 +6,13 @@ mod common;
 
 use std::time::Duration;
 
-use common::{shm_buffer, ClientSide, Peer, take};
+use common::{ClientSide, Peer, shm_buffer, take};
 use luminaria::backend::{HeadlessBackend, OutputEvent};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, CompositorEvent};
+use wayland_client::Connection;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_buffer, wl_compositor, wl_shm, wl_shm_pool, wl_surface};
-use wayland_client::Connection;
 
 struct State;
 
@@ -85,7 +85,11 @@ fn compositor_surface_lifecycle_events() {
     // 4. Surface destroyed
     peer.wait(&display, "surface_destroyed");
     let events = take::<CompositorEvent>();
-    assert_eq!(events.len(), 2, "expected Destroy + Invalidated: {events:?}");
+    assert_eq!(
+        events.len(),
+        2,
+        "expected Destroy + Invalidated: {events:?}"
+    );
     assert_eq!(events[0], CompositorEvent::Destroy(surface_id));
     assert_eq!(events[1], CompositorEvent::Invalidated(surface_id));
 
@@ -106,10 +110,15 @@ fn output_present_events() {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut present = None;
     while std::time::Instant::now() < deadline {
-        let presented = display.dispatch(Some(Duration::from_millis(5))).unwrap().find_map(|e| match e {
-            luminaria::Event::Output(id, OutputEvent::Present(p)) if id == output.id() => Some(p),
-            _ => None,
-        });
+        let presented = display
+            .dispatch(Some(Duration::from_millis(5)))
+            .unwrap()
+            .find_map(|e| match e {
+                luminaria::Event::Output(id, OutputEvent::Present(p)) if id == output.id() => {
+                    Some(p)
+                }
+                _ => None,
+            });
         if presented.is_some() {
             present = presented;
             break;

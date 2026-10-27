@@ -13,13 +13,15 @@ use luminaria::desktop::{
 };
 use luminaria::gpu::{Cursor, SceneRenderer, VulkanOptions};
 use luminaria::protocol::{
-    ActivationEvent, Compositor, CursorShapeManager, DecorationMode, Seat,
-    XdgActivation, XdgDecorationManager, XdgShell, XdgToplevelIconManager,
+    ActivationEvent, Compositor, CursorShapeManager, DecorationMode, Seat, XdgActivation,
+    XdgDecorationManager, XdgShell, XdgToplevelIconManager,
 };
 use luminaria::shell::OutputLayout;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_shm_pool, wl_surface};
-use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+};
+use wayland_client::{Connection, Dispatch, QueueHandle, event_created_child};
 use wayland_protocols::ext::workspace::v1::client::{
     ext_workspace_group_handle_v1, ext_workspace_handle_v1, ext_workspace_manager_v1,
 };
@@ -116,7 +118,15 @@ impl Dispatch<ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1, ()> for 
 }
 
 impl Dispatch<ext_workspace_manager_v1::ExtWorkspaceManagerV1, ()> for State {
-    fn event(_: &mut Self, _: &ext_workspace_manager_v1::ExtWorkspaceManagerV1, _: ext_workspace_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &ext_workspace_manager_v1::ExtWorkspaceManagerV1,
+        _: ext_workspace_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 
     event_created_child!(State, ext_workspace_manager_v1::ExtWorkspaceManagerV1, [
         ext_workspace_manager_v1::EVT_WORKSPACE_GROUP_OPCODE => (ext_workspace_group_handle_v1::ExtWorkspaceGroupHandleV1, ()),
@@ -125,7 +135,15 @@ impl Dispatch<ext_workspace_manager_v1::ExtWorkspaceManagerV1, ()> for State {
 }
 
 impl Dispatch<zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, ()> for State {
-    fn event(_: &mut Self, _: &zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, _: zwlr_foreign_toplevel_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
+        _: zwlr_foreign_toplevel_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 
     event_created_child!(State, zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, [
         zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1, ()),
@@ -133,7 +151,14 @@ impl Dispatch<zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1, ()
 }
 
 impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for State {
-    fn event(state: &mut Self, _: &zwlr_output_manager_v1::ZwlrOutputManagerV1, event: zwlr_output_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &zwlr_output_manager_v1::ZwlrOutputManagerV1,
+        event: zwlr_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let zwlr_output_manager_v1::Event::Done { serial } = event {
             state.output_manager_serial = Some(serial);
         }
@@ -145,7 +170,15 @@ impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for State {
 }
 
 impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for State {
-    fn event(_: &mut Self, _: &zwlr_output_head_v1::ZwlrOutputHeadV1, _: zwlr_output_head_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &zwlr_output_head_v1::ZwlrOutputHeadV1,
+        _: zwlr_output_head_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 
     event_created_child!(State, zwlr_output_head_v1::ZwlrOutputHeadV1, [
         zwlr_output_head_v1::EVT_MODE_OPCODE => (zwlr_output_mode_v1::ZwlrOutputModeV1, ()),
@@ -210,7 +243,10 @@ fn test_decoration_and_icon_events() {
 
     peer.wait(&display, "icon_set");
     let events = take::<luminaria::protocol::ToplevelIconChange>();
-    assert!(!events.is_empty(), "expected ToplevelIconChange: {events:?}");
+    assert!(
+        !events.is_empty(),
+        "expected ToplevelIconChange: {events:?}"
+    );
     let ev = &events[0];
     assert_eq!(ev.name, "my-test-app");
     assert_eq!(icon_mgr.icon_name(ev.surface), "my-test-app");
@@ -285,7 +321,10 @@ fn test_cursor_shape_events() {
 
     peer.wait(&display, "shape_set");
     let requests = take::<luminaria::protocol::CursorShapeRequest>();
-    assert!(!requests.is_empty(), "expected CursorShapeRequest: {requests:?}");
+    assert!(
+        !requests.is_empty(),
+        "expected CursorShapeRequest: {requests:?}"
+    );
     let req = &requests[0];
     assert_eq!(req.name, "pointer");
     peer.finish(&display);
@@ -355,7 +394,10 @@ fn client_workspace_and_foreign(conn: Connection, step: ClientSide) {
 
     // Workspaces: request create workspace in group
     queue.roundtrip(&mut state).unwrap();
-    let group = state.group_handle.as_ref().expect("expected workspace group handle");
+    let group = state
+        .group_handle
+        .as_ref()
+        .expect("expected workspace group handle");
     group.create_workspace("work-ws-1".into());
     ws_mgr.commit();
     queue.roundtrip(&mut state).unwrap();
@@ -374,7 +416,10 @@ fn client_workspace_and_foreign(conn: Connection, step: ClientSide) {
     step.step("toplevel_created");
 
     // Client requests maximize on foreign toplevel handle
-    let handle = state.foreign_handle.as_ref().expect("expected foreign toplevel handle");
+    let handle = state
+        .foreign_handle
+        .as_ref()
+        .expect("expected foreign toplevel handle");
     handle.set_maximized();
     queue.roundtrip(&mut state).unwrap();
     step.step("foreign_maximized");
@@ -395,7 +440,10 @@ fn test_workspace_and_foreign_toplevel_events() {
 
     peer.wait(&display, "workspace_requested");
     let ws_events = take::<luminaria::desktop::WorkspaceRequest>();
-    assert!(!ws_events.is_empty(), "expected WorkspaceRequest: {ws_events:?}");
+    assert!(
+        !ws_events.is_empty(),
+        "expected WorkspaceRequest: {ws_events:?}"
+    );
     let ws_req = &ws_events[0];
     assert_eq!(ws_req.kind, WorkspaceRequestKind::Create);
     assert_eq!(ws_req.name, "work-ws-1");
@@ -414,7 +462,10 @@ fn test_workspace_and_foreign_toplevel_events() {
 
     peer.wait(&display, "foreign_maximized");
     let ft_events = take::<luminaria::desktop::ForeignToplevelRequest>();
-    assert!(!ft_events.is_empty(), "expected ForeignToplevelRequest: {ft_events:?}");
+    assert!(
+        !ft_events.is_empty(),
+        "expected ForeignToplevelRequest: {ft_events:?}"
+    );
     let ft_req = &ft_events[0];
     assert_eq!(ft_req.kind, ForeignToplevelRequestKind::Maximize);
     peer.finish(&display);
@@ -450,7 +501,10 @@ fn test_output_management_events() {
 
     peer.wait(&display, "config_applied");
     let requests = take::<luminaria::desktop::OutputConfigRequest>();
-    assert!(!requests.is_empty(), "expected OutputConfigRequest: {requests:?}");
+    assert!(
+        !requests.is_empty(),
+        "expected OutputConfigRequest: {requests:?}"
+    );
     let req = &requests[0];
     assert!(!req.test); // applied, not test
     peer.finish(&display);

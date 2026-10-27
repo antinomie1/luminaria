@@ -97,14 +97,27 @@ pub(crate) mod ffi {
 
         // CursorTheme
         type CursorThemeShim;
-        fn cursor_theme_load(name: &str, size: i32, error: &mut String) -> UniquePtr<CursorThemeShim>;
+        fn cursor_theme_load(
+            name: &str,
+            size: i32,
+            error: &mut String,
+        ) -> UniquePtr<CursorThemeShim>;
 
         // SceneRenderer
         type SceneRendererShim;
-        fn scene_renderer_new(has_drm_device: bool, drm_device: &DrmDeviceId, error: &mut String) -> UniquePtr<SceneRendererShim>;
+        fn scene_renderer_new(
+            has_drm_device: bool,
+            drm_device: &DrmDeviceId,
+            error: &mut String,
+        ) -> UniquePtr<SceneRendererShim>;
         fn gpu_enabled(self: &SceneRendererShim) -> bool;
         fn gpu_error(self: &SceneRendererShim) -> String;
-        fn reset(self: &SceneRendererShim, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
+        fn reset(
+            self: &SceneRendererShim,
+            output: Pin<&mut OutputShim>,
+            drm_format: u32,
+            error: &mut String,
+        ) -> bool;
         fn present(
             self: &SceneRendererShim,
             output: Pin<&mut OutputShim>,
@@ -133,7 +146,14 @@ pub(crate) mod ffi {
         fn read_back(self: &SceneRendererShim, output: &OutputShim, error: &mut String) -> Vec<u8>;
         #[allow(dead_code)]
         fn vulkan_handles(self: &SceneRendererShim, out: &mut VulkanHandlesRaw) -> bool;
-        fn set_image(self: &SceneRendererShim, serial: u64, width: i32, height: i32, rgba: &[u8], error: &mut String) -> bool;
+        fn set_image(
+            self: &SceneRendererShim,
+            serial: u64,
+            width: i32,
+            height: i32,
+            rgba: &[u8],
+            error: &mut String,
+        ) -> bool;
         fn remove_image(self: &SceneRendererShim, serial: u64);
         fn clear_images(self: &SceneRendererShim);
         fn has_image(self: &SceneRendererShim, serial: u64) -> bool;
@@ -169,11 +189,32 @@ pub(crate) mod ffi {
 
         // Frame
         type FrameShim;
-        fn frame_new(output: Pin<&mut OutputShim>, renderer: &VulkanRendererShim, error: &mut String) -> UniquePtr<FrameShim>;
+        fn frame_new(
+            output: Pin<&mut OutputShim>,
+            renderer: &VulkanRendererShim,
+            error: &mut String,
+        ) -> UniquePtr<FrameShim>;
         fn reset(self: Pin<&mut FrameShim>, drm_format: u32, error: &mut String) -> bool;
         fn begin(self: Pin<&mut FrameShim>, vx: i32, vy: i32, vw: i32, vh: i32);
-        fn place_rect(self: Pin<&mut FrameShim>, x: i32, y: i32, width: i32, height: i32, r: f32, g: f32, b: f32, a: f32);
-        fn submit(self: Pin<&mut FrameShim>, bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
+        fn place_rect(
+            self: Pin<&mut FrameShim>,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            r: f32,
+            g: f32,
+            b: f32,
+            a: f32,
+        );
+        fn submit(
+            self: Pin<&mut FrameShim>,
+            bg_r: f32,
+            bg_g: f32,
+            bg_b: f32,
+            bg_a: f32,
+            error: &mut String,
+        ) -> i32;
         fn send_frame_done(self: Pin<&mut FrameShim>, time_ms: u32);
 
         // DirectScanout
@@ -198,17 +239,37 @@ pub(crate) mod ffi {
         // LayerManager
         type LayerManagerShim;
         fn layer_manager_new() -> UniquePtr<LayerManagerShim>;
-        fn add(self: Pin<&mut LayerManagerShim>, shell: &LayerShellShim, surface_id: u64, output_id: u32) -> bool;
+        fn add(
+            self: Pin<&mut LayerManagerShim>,
+            shell: &LayerShellShim,
+            surface_id: u64,
+            output_id: u32,
+        ) -> bool;
         fn remove(self: Pin<&mut LayerManagerShim>, surface_id: u64);
         fn set_mapped(self: Pin<&mut LayerManagerShim>, surface_id: u64, mapped: bool);
-        fn arrange(self: Pin<&mut LayerManagerShim>, output_id: u32, full: Rect, usable: Rect) -> Rect;
+        fn arrange(
+            self: Pin<&mut LayerManagerShim>,
+            output_id: u32,
+            full: Rect,
+            usable: Rect,
+        ) -> Rect;
         fn append_to(self: &LayerManagerShim, output_id: u32, layer: u32) -> Vec<SceneItemRaw>;
         fn keyboard_target(self: &LayerManagerShim, surface_id: u64) -> u64;
         fn close_output(self: Pin<&mut LayerManagerShim>, output_id: u32);
 
         // Scene hit testing
         fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
-        fn raw_scene_route_pointer(seat: &SeatShim, items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
-        fn raw_scene_surface_origin(items: &[SceneItemRaw], surface_id: u64, x: &mut f64, y: &mut f64) -> bool;
+        fn raw_scene_route_pointer(
+            seat: &SeatShim,
+            items: &[SceneItemRaw],
+            x: f64,
+            y: f64,
+        ) -> SceneHitRaw;
+        fn raw_scene_surface_origin(
+            items: &[SceneItemRaw],
+            surface_id: u64,
+            x: &mut f64,
+            y: &mut f64,
+        ) -> bool;
     }
 }

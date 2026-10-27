@@ -39,19 +39,24 @@ impl<'a> PointerConstraints<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 }
 
 impl PointerConstraints<'_> {
-
     /// The constraint on `surface`, if there is one now.
     pub fn constraint(&self, surface: SurfaceId) -> Option<PointerConstraint<'_>> {
         let mut info = ffi::PointerConstraintInfoRaw::default();
         self.raw
             .constraint_info(surface.0, &mut info)
-            .then_some(PointerConstraint { mgr: self.raw.as_ref()?, surface })
+            .then_some(PointerConstraint {
+                mgr: self.raw.as_ref()?,
+                surface,
+            })
     }
 
     /// The surface whose constraint is active.
@@ -93,7 +98,9 @@ impl PointerConstraint<'_> {
 
     /// The region in surface coordinates, `None` for the whole surface.
     pub fn region(&self) -> Option<Vec<Rect>> {
-        self.info().has_region.then(|| self.mgr.constraint_region(self.surface.0))
+        self.info()
+            .has_region
+            .then(|| self.mgr.constraint_region(self.surface.0))
     }
 
     /// Where a locked client would like the cursor drawn when it unlocks.
@@ -122,7 +129,9 @@ impl PointerConstraintEvent {
         return Some(match raw.kind {
             EventKind::NewPointerConstraint => PointerConstraintEvent::New(surface),
             EventKind::PointerConstraintDestroy => PointerConstraintEvent::Destroy(surface),
-            EventKind::PointerConstraintRegionChange => PointerConstraintEvent::RegionChange(surface),
+            EventKind::PointerConstraintRegionChange => {
+                PointerConstraintEvent::RegionChange(surface)
+            }
             _ => return None,
         });
         None

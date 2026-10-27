@@ -46,14 +46,15 @@ use crate::backend::{BackendEvent, InputEvent, Output, OutputEvent, OutputId, Pr
 use crate::core::Display;
 #[cfg(feature = "desktop")]
 use crate::desktop::{
-    ForeignToplevelRequest, InputMethodEvent, OutputConfigRequest, SessionLockEvent, WorkspaceRequest,
+    CtmEvent, ForeignToplevelRequest, GammaEvent, InputMethodEvent, OutputConfigRequest,
+    SessionLockEvent, VirtualKeyEvent, VirtualModifiersEvent, VirtualPointerEvent,
+    WorkspaceRequest,
 };
 use crate::ffi::{self, EventKind as K};
 use crate::protocol::{
     ActivationEvent, CompositorEvent, CursorShapeRequest, DecorationRequest, IdleInhibitEvent,
-    IdleNotifierEvent, LayerSurfaceEvent, PointerConstraintEvent, SeatEvent, SelectionChange, SurfaceId,
-    TextInputEvent,
-    ToplevelIconChange, ToplevelEvent, PopupEvent, XdgEvent,
+    IdleNotifierEvent, LayerSurfaceEvent, PointerConstraintEvent, PopupEvent, SeatEvent,
+    SelectionChange, SurfaceId, TextInputEvent, ToplevelEvent, ToplevelIconChange, XdgEvent,
 };
 
 /// Something luminaria reports, from whichever wrapper forwarded it.
@@ -78,6 +79,10 @@ pub enum Event {
     /// The VT came back (`true`) or was taken away (`false`). On the way out,
     /// `Seat::release_keys()`; on the way back, repaint.
     SessionActive(bool),
+    /// A GPU device was removed from the system.
+    GpuRemoved,
+    /// A new GPU device was added to the system.
+    GpuAdded(String),
     Compositor(CompositorEvent),
     /// Something a toplevel did or asked for, named by its surface.
     Toplevel(SurfaceId, ToplevelEvent),
@@ -105,6 +110,16 @@ pub enum Event {
     OutputConfig(OutputConfigRequest),
     #[cfg(feature = "desktop")]
     InputMethod(InputMethodEvent),
+    #[cfg(feature = "desktop")]
+    Gamma(GammaEvent),
+    #[cfg(feature = "desktop")]
+    Ctm(CtmEvent),
+    #[cfg(feature = "desktop")]
+    VirtualKey(VirtualKeyEvent),
+    #[cfg(feature = "desktop")]
+    VirtualModifiers(VirtualModifiersEvent),
+    #[cfg(feature = "desktop")]
+    VirtualPointer(VirtualPointerEvent),
 }
 
 impl Event {
@@ -128,10 +143,16 @@ impl Event {
             K::HostCloseRequest => Event::HostCloseRequest,
             K::SessionActive => Event::SessionActive(true),
             K::SessionInactive => Event::SessionActive(false),
-            K::NewSurface | K::SurfaceCommit | K::SurfaceDestroy | K::SurfaceRendered | K::SurfaceInvalidated => {
-                Event::Compositor(CompositorEvent::from_raw(raw)?)
+            K::GpuRemoved => Event::GpuRemoved,
+            K::GpuAdded => Event::GpuAdded(raw.text),
+            K::NewSurface
+            | K::SurfaceCommit
+            | K::SurfaceDestroy
+            | K::SurfaceRendered
+            | K::SurfaceInvalidated => Event::Compositor(CompositorEvent::from_raw(raw)?),
+            K::SeatKeyboardFocus | K::SeatPointerFocus | K::SeatCursorChange => {
+                Event::Seat(SeatEvent::from_raw(raw)?)
             }
-            K::SeatKeyboardFocus | K::SeatPointerFocus | K::SeatCursorChange => Event::Seat(SeatEvent::from_raw(raw)?),
             K::NewLayerSurface
             | K::LayerSurfaceMap
             | K::LayerSurfaceUnmap
@@ -144,28 +165,40 @@ impl Event {
             K::DecorationRequest => Event::Decoration(DecorationRequest::from_raw(raw)?),
             K::CursorShapeRequest => Event::CursorShape(CursorShapeRequest::from_raw(raw)?),
             K::ToplevelIconChange => Event::ToplevelIcon(ToplevelIconChange::from_raw(raw)?),
-            K::ActivationRequest | K::ActivationTokenRequest => Event::Activation(ActivationEvent::from_raw(raw)?),
+            K::ActivationRequest | K::ActivationTokenRequest => {
+                Event::Activation(ActivationEvent::from_raw(raw)?)
+            }
             K::NewIdleInhibitor | K::IdleInhibitorDestroy | K::IdleInhibitChange => {
                 Event::IdleInhibit(IdleInhibitEvent::from_raw(raw)?)
             }
             K::NewIdleNotification | K::IdleNotificationDestroy | K::IdleStateChange => {
                 Event::IdleNotifier(IdleNotifierEvent::from_raw(raw)?)
             }
-            K::NewTextInput | K::TextInputEnable | K::TextInputDisable | K::TextInputCommit | K::TextInputDestroy => {
-                Event::TextInput(TextInputEvent::from_raw(raw)?)
-            }
-            K::NewPointerConstraint | K::PointerConstraintDestroy | K::PointerConstraintRegionChange => {
+            K::NewTextInput
+            | K::TextInputEnable
+            | K::TextInputDisable
+            | K::TextInputCommit
+            | K::TextInputDestroy => Event::TextInput(TextInputEvent::from_raw(raw)?),
+            K::NewPointerConstraint
+            | K::PointerConstraintDestroy
+            | K::PointerConstraintRegionChange => {
                 Event::PointerConstraint(PointerConstraintEvent::from_raw(raw)?)
             }
-            K::SelectionChange | K::PrimarySelectionChange => Event::Selection(SelectionChange::from_raw(raw)?),
+            K::SelectionChange | K::PrimarySelectionChange => {
+                Event::Selection(SelectionChange::from_raw(raw)?)
+            }
             #[cfg(feature = "desktop")]
-            K::ForeignToplevelRequest => Event::ForeignToplevel(ForeignToplevelRequest::from_raw(raw)?),
+            K::ForeignToplevelRequest => {
+                Event::ForeignToplevel(ForeignToplevelRequest::from_raw(raw)?)
+            }
             #[cfg(feature = "desktop")]
             K::WorkspaceRequest => Event::Workspace(WorkspaceRequest::from_raw(raw)?),
             #[cfg(feature = "desktop")]
-            K::NewSessionLock | K::NewLockSurface | K::LockSurfaceMap | K::LockSurfaceDestroy | K::SessionLockDestroy => {
-                Event::SessionLock(SessionLockEvent::from_raw(raw)?)
-            }
+            K::NewSessionLock
+            | K::NewLockSurface
+            | K::LockSurfaceMap
+            | K::LockSurfaceDestroy
+            | K::SessionLockDestroy => Event::SessionLock(SessionLockEvent::from_raw(raw)?),
             #[cfg(feature = "desktop")]
             K::OutputConfigRequest => Event::OutputConfig(OutputConfigRequest::from_raw(raw)?),
             #[cfg(feature = "desktop")]
@@ -174,6 +207,20 @@ impl Event {
             | K::InputMethodDestroy
             | K::NewInputPopupSurface
             | K::InputPopupSurfaceDestroy => Event::InputMethod(InputMethodEvent::from_raw(raw)?),
+            #[cfg(feature = "desktop")]
+            K::GammaChange => Event::Gamma(GammaEvent::from_raw(raw)?),
+            #[cfg(feature = "desktop")]
+            K::CtmChange => Event::Ctm(CtmEvent::from_raw(raw)?),
+            #[cfg(feature = "desktop")]
+            K::VirtualKey => Event::VirtualKey(VirtualKeyEvent::from_raw(raw)?),
+            #[cfg(feature = "desktop")]
+            K::VirtualModifiers => Event::VirtualModifiers(VirtualModifiersEvent::from_raw(raw)?),
+            #[cfg(feature = "desktop")]
+            K::VirtualPointerMotion
+            | K::VirtualPointerMotionAbsolute
+            | K::VirtualPointerButton
+            | K::VirtualPointerAxis
+            | K::VirtualPointerFrame => Event::VirtualPointer(VirtualPointerEvent::from_raw(raw)?),
             _ => match XdgEvent::from_raw(&raw)? {
                 XdgEvent::Toplevel(surface, event) => Event::Toplevel(surface, event),
                 XdgEvent::Popup(surface, event) => Event::Popup(surface, event),
@@ -228,7 +275,9 @@ impl Display {
                 _ => out.extend(Event::from_raw(raw)),
             }
         }
-        Events { inner: out.into_iter() }
+        Events {
+            inner: out.into_iter(),
+        }
     }
 }
 
@@ -275,6 +324,11 @@ payload! {
     SessionLock(SessionLockEvent),
     OutputConfig(OutputConfigRequest),
     InputMethod(InputMethodEvent),
+    Gamma(GammaEvent),
+    Ctm(CtmEvent),
+    VirtualKey(VirtualKeyEvent),
+    VirtualModifiers(VirtualModifiersEvent),
+    VirtualPointer(VirtualPointerEvent),
 }
 
 impl TryFrom<Event> for BackendEvent {

@@ -5,16 +5,18 @@
 #[macro_use]
 mod common;
 
-use common::{shm_buffer, ClientSide, Peer, take};
+use common::{ClientSide, Peer, shm_buffer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{
-    Compositor, KeyboardInteractivity, Layer, LayerShell, LayerSurfaceEvent, Margins, OutputGlobal, PopupEvent,
-    SurfaceId, XdgEvent, XdgShell,
+    Compositor, KeyboardInteractivity, Layer, LayerShell, LayerSurfaceEvent, Margins, OutputGlobal,
+    PopupEvent, SurfaceId, XdgEvent, XdgShell,
 };
 use luminaria::shell::{LayerManager, PopupTree, SceneItem};
-use luminaria::util::{edge, Rect};
+use luminaria::util::{Rect, edge};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_compositor, wl_output, wl_shm, wl_shm_pool, wl_surface};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_output, wl_shm, wl_shm_pool, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_wm_base};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -40,7 +42,14 @@ ignore_events!(State:
 );
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
-    fn event(_: &mut Self, wm: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        _: &mut Self,
+        wm: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let xdg_wm_base::Event::Ping { serial } = event {
             wm.pong(serial);
         }
@@ -48,7 +57,14 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
 }
 
 impl Dispatch<xdg_surface::XdgSurface, ()> for State {
-    fn event(_: &mut Self, xs: &xdg_surface::XdgSurface, event: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        _: &mut Self,
+        xs: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let xdg_surface::Event::Configure { serial } = event {
             xs.ack_configure(serial);
         }
@@ -65,7 +81,11 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
                 ls.ack_configure(serial);
                 state.configures.push((width, height));
             }
@@ -88,7 +108,14 @@ fn client(conn: Connection, step: ClientSide) {
 
     // A panel along the top, for whichever output the compositor picks.
     let surface = compositor.create_surface(&qh, ());
-    let panel = layers.get_layer_surface(&surface, None, zwlr_layer_shell_v1::Layer::Top, "panel".into(), &qh, ());
+    let panel = layers.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Top,
+        "panel".into(),
+        &qh,
+        (),
+    );
     panel.set_size(0, 30);
     panel.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
     panel.set_exclusive_zone(30);
@@ -159,7 +186,12 @@ fn layer_surfaces_through_the_layer_manager() {
     peer.wait(&display, "committed");
     let events = take::<(SurfaceId, LayerSurfaceEvent)>();
     let (panel, wall) = match events[..] {
-        [(p, LayerSurfaceEvent::Created), _, (w, LayerSurfaceEvent::Created), _] => (p, w),
+        [
+            (p, LayerSurfaceEvent::Created),
+            _,
+            (w, LayerSurfaceEvent::Created),
+            _,
+        ] => (p, w),
         _ => panic!("{events:?}"),
     };
     assert_eq!(
@@ -178,7 +210,13 @@ fn layer_surfaces_through_the_layer_manager() {
     assert_eq!(ls.desired_size(), (0, 30));
     assert_eq!(ls.exclusive_zone(), 30);
     assert_eq!(ls.exclusive_edge(), 0);
-    assert_eq!(ls.margins(), Margins { top: 5, ..Margins::default() });
+    assert_eq!(
+        ls.margins(),
+        Margins {
+            top: 5,
+            ..Margins::default()
+        }
+    );
     assert_eq!(ls.keyboard_interactivity(), KeyboardInteractivity::OnDemand);
     assert!(!ls.is_mapped());
     assert!(!ls.has_output() && !ls.is_on(&output));
@@ -198,11 +236,18 @@ fn layer_surfaces_through_the_layer_manager() {
     peer.go();
 
     peer.wait(&display, "mapped");
-    assert_eq!(take::<(SurfaceId, LayerSurfaceEvent)>(), [(panel, LayerSurfaceEvent::Map)]);
+    assert_eq!(
+        take::<(SurfaceId, LayerSurfaceEvent)>(),
+        [(panel, LayerSurfaceEvent::Map)]
+    );
     assert!(ls.is_mapped());
     manager.set_mapped(panel, true);
     let usable = manager.arrange(OUTPUT, full, full);
-    assert_eq!(usable, Rect::new(0, 35, 1000, 765), "zone plus margin come off the top");
+    assert_eq!(
+        usable,
+        Rect::new(0, 35, 1000, 765),
+        "zone plus margin come off the top"
+    );
     // The same layout, one surface by hand.
     let mut by_hand = full;
     assert_eq!(ls.arrange(full, &mut by_hand), Rect::new(0, 5, 1000, 30));
@@ -234,12 +279,18 @@ fn layer_surfaces_through_the_layer_manager() {
 
     ls.close();
     common::collect(&display);
-    assert_eq!(take::<(SurfaceId, LayerSurfaceEvent)>(), [(panel, LayerSurfaceEvent::Unmap)]);
+    assert_eq!(
+        take::<(SurfaceId, LayerSurfaceEvent)>(),
+        [(panel, LayerSurfaceEvent::Unmap)]
+    );
     peer.go();
 
     peer.wait(&display, "destroyed");
     let events = take::<(SurfaceId, LayerSurfaceEvent)>();
-    assert!(events.contains(&(panel, LayerSurfaceEvent::Destroy)), "{events:?}");
+    assert!(
+        events.contains(&(panel, LayerSurfaceEvent::Destroy)),
+        "{events:?}"
+    );
     // The manager let go of it by itself.
     assert_eq!(manager.keyboard_target(panel), None);
     let mut scene: Vec<SceneItem> = Vec::new();

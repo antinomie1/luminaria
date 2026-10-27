@@ -2,9 +2,9 @@
 
 use std::pin::Pin;
 
-use crate::core::{Error, ErrorKind};
 #[cfg(feature = "backend")]
 use crate::core::{Display, Holds};
+use crate::core::{Error, ErrorKind};
 use crate::ffi;
 #[cfg(feature = "backend")]
 use crate::ffi_backend;
@@ -99,12 +99,7 @@ impl Output {
         }
     }
 
-    pub fn commit_frame(
-        &mut self,
-        rgba: &[u8],
-        width: i32,
-        height: i32,
-    ) -> Result<(), Error> {
+    pub fn commit_frame(&mut self, rgba: &[u8], width: i32, height: i32) -> Result<(), Error> {
         let mut err = String::new();
         if self.pin().commit_frame(rgba, width, height, &mut err) {
             Ok(())
@@ -233,14 +228,20 @@ impl<'d> HeadlessBackend<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Backend, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
     pub fn add_output(&mut self, width: i32, height: i32) -> Result<Output, Error> {
         let raw_output = self.raw.pin_mut().add_output(width, height);
         if raw_output.is_null() {
-            Err(Error::new(ErrorKind::Backend, "failed to create headless output"))
+            Err(Error::new(
+                ErrorKind::Backend,
+                "failed to create headless output",
+            ))
         } else {
             Ok(Output::from_raw(raw_output))
         }
@@ -272,14 +273,20 @@ impl<'d> WaylandBackend<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Backend, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
     pub fn add_output(&mut self, width: i32, height: i32) -> Result<Output, Error> {
         let raw_output = self.raw.pin_mut().add_output(width, height);
         if raw_output.is_null() {
-            Err(Error::new(ErrorKind::Backend, "failed to create wayland output"))
+            Err(Error::new(
+                ErrorKind::Backend,
+                "failed to create wayland output",
+            ))
         } else {
             Ok(Output::from_raw(raw_output))
         }
@@ -304,7 +311,6 @@ impl<'d> WaylandBackend<'d> {
     pub fn capabilities(&self) -> InputCapabilities {
         InputCapabilities::from_bits(self.raw.capabilities())
     }
-
 }
 
 /// Input from the host window arrives as [`crate::Event::Input`]: absolute
@@ -354,7 +360,10 @@ mod bare_metal {
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
-                Ok(Self { raw: SessionRaw::Owned(raw), _display: Holds::new() })
+                Ok(Self {
+                    raw: SessionRaw::Owned(raw),
+                    _display: Holds::new(),
+                })
             }
         }
 
@@ -408,14 +417,26 @@ mod bare_metal {
         ) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_backend::drm_backend_new(&display.raw, device.unwrap_or(""), sess.shim(), &mut err)
+                crate::ffi_backend::drm_backend_new(
+                    &display.raw,
+                    device.unwrap_or(""),
+                    sess.shim(),
+                    &mut err,
+                )
             } else {
-                crate::ffi_backend::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
+                crate::ffi_backend::drm_backend_new_standalone(
+                    &display.raw,
+                    device.unwrap_or(""),
+                    &mut err,
+                )
             };
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
-                Ok(Self { raw, _borrows: Holds::new() })
+                Ok(Self {
+                    raw,
+                    _borrows: Holds::new(),
+                })
             }
         }
 
@@ -435,7 +456,6 @@ mod bare_metal {
         pub fn scan_connectors(&mut self) {
             self.raw.pin_mut().scan_connectors();
         }
-
     }
 
     /// The card's fd, borrowed for the life of the backend. Query it (the `drm`
@@ -476,12 +496,18 @@ mod bare_metal {
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
-                Ok(Self { raw, _borrows: Holds::new() })
+                Ok(Self {
+                    raw,
+                    _borrows: Holds::new(),
+                })
             }
         }
 
         /// Exactly the devices handed to `add_device()`, and nothing udev finds.
-        pub fn new_path(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
+        pub fn new_path(
+            display: &'a Display,
+            session: Option<&'a Session<'_>>,
+        ) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
                 crate::ffi_backend::libinput_backend_new_path(&display.raw, sess.shim(), &mut err)
@@ -491,7 +517,10 @@ mod bare_metal {
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
-                Ok(Self { raw, _borrows: Holds::new() })
+                Ok(Self {
+                    raw,
+                    _borrows: Holds::new(),
+                })
             }
         }
 
@@ -528,7 +557,6 @@ mod bare_metal {
         pub fn capabilities(&self) -> InputCapabilities {
             InputCapabilities::from_bits(self.raw.capabilities())
         }
-
     }
 
     /// Relative motion, touch, and `Capabilities` as devices come and go, all
@@ -581,15 +609,20 @@ mod bare_metal {
         type Err = Error;
 
         fn from_str(text: &str) -> Result<Self, Error> {
-            [BackendKind::Auto, BackendKind::Nested, BackendKind::Drm, BackendKind::Headless]
-                .into_iter()
-                .find(|k| k.name() == text)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidArgument,
-                        format!("backend \"{text}\": expected auto, nested, drm or headless"),
-                    )
-                })
+            [
+                BackendKind::Auto,
+                BackendKind::Nested,
+                BackendKind::Drm,
+                BackendKind::Headless,
+            ]
+            .into_iter()
+            .find(|k| k.name() == text)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidArgument,
+                    format!("backend \"{text}\": expected auto, nested, drm or headless"),
+                )
+            })
         }
     }
 
@@ -656,7 +689,10 @@ mod bare_metal {
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
-                Ok(Self { raw, _display: Holds::new() })
+                Ok(Self {
+                    raw,
+                    _display: Holds::new(),
+                })
             }
         }
 
@@ -809,22 +845,44 @@ pub enum InputEvent {
     /// The layout keys are now read against. Forward to `Seat::set_keymap()`.
     KeymapChange(String),
     /// Relative (libinput): the compositor owns where the pointer is.
-    Motion { dx: f64, dy: f64 },
+    Motion {
+        dx: f64,
+        dy: f64,
+    },
     /// Absolute (nested), in `output`'s coordinates; `None` if the window it
     /// is over was not one this backend handed out.
-    MotionAbsolute { x: f64, y: f64, output: Option<OutputId> },
+    MotionAbsolute {
+        x: f64,
+        y: f64,
+        output: Option<OutputId>,
+    },
     /// The pointer left every output (nested: it left our windows).
     PointerLeave,
-    Button { button: u32, pressed: bool },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
     Axis(PointerAxis),
     /// Normalised to the touchscreen, (0,0) to (1,1); mapping onto an output
     /// is the compositor's.
-    TouchDown { id: i32, x: f64, y: f64 },
-    TouchMotion { id: i32, x: f64, y: f64 },
-    TouchUp { id: i32 },
+    TouchDown {
+        id: i32,
+        x: f64,
+        y: f64,
+    },
+    TouchMotion {
+        id: i32,
+        x: f64,
+        y: f64,
+    },
+    TouchUp {
+        id: i32,
+    },
     /// Close the burst with `Seat::touch_frame()`.
     TouchFrame,
-    TouchCancel { id: i32 },
+    TouchCancel {
+        id: i32,
+    },
     /// What the devices can do changed. Forward to `Seat::set_capabilities()`.
     Capabilities(InputCapabilities),
 }
@@ -868,7 +926,10 @@ impl InputEvent {
             },
             K::Modifiers => InputEvent::Modifiers(modifiers),
             K::KeymapChange => InputEvent::KeymapChange(raw.text),
-            K::Motion => InputEvent::Motion { dx: raw.x, dy: raw.y },
+            K::Motion => InputEvent::Motion {
+                dx: raw.x,
+                dy: raw.y,
+            },
             K::MotionAbsolute => InputEvent::MotionAbsolute {
                 x: raw.x,
                 y: raw.y,

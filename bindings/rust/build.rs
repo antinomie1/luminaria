@@ -224,7 +224,10 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
     for feature in ["backend", "render", "shell", "gpu", "desktop", "text"] {
-        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_{}", feature.to_uppercase());
+        println!(
+            "cargo:rerun-if-env-changed=CARGO_FEATURE_{}",
+            feature.to_uppercase()
+        );
     }
 }
 
@@ -244,25 +247,35 @@ fn find_archive_dir(dir: &Path, name: &str) -> Option<PathBuf> {
 /// associated constant per `#define XKB_KEY_<name> 0x…` in the system's
 /// xkbcommon-keysyms.h, so the table is the one the C++ side compiles against.
 fn keysyms(out: &Path) {
-    let include = pkg_config::get_variable("xkbcommon", "includedir").unwrap_or_else(|_| "/usr/include".into());
+    let include = pkg_config::get_variable("xkbcommon", "includedir")
+        .unwrap_or_else(|_| "/usr/include".into());
     let header = Path::new(&include).join("xkbcommon/xkbcommon-keysyms.h");
-    let text = std::fs::read_to_string(&header)
-        .unwrap_or_else(|e| panic!("{}: {e}", header.display()));
+    let text =
+        std::fs::read_to_string(&header).unwrap_or_else(|e| panic!("{}: {e}", header.display()));
     println!("cargo:rerun-if-changed={}", header.display());
     let keywords = [
-        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if",
-        "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-        "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "async",
-        "await", "dyn", "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof",
-        "unsized", "virtual", "yield", "try", "gen",
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+        "gen",
     ];
     let mut rust = String::from("impl Keysym {\n");
     for line in text.lines() {
-        let Some(rest) = line.strip_prefix("#define XKB_KEY_") else { continue };
+        let Some(rest) = line.strip_prefix("#define XKB_KEY_") else {
+            continue;
+        };
         let mut parts = rest.split_whitespace();
-        let (Some(name), Some(value)) = (parts.next(), parts.next()) else { continue };
-        let Some(hex) = value.strip_prefix("0x") else { continue };
-        let Ok(value) = u32::from_str_radix(hex, 16) else { continue };
+        let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Some(hex) = value.strip_prefix("0x") else {
+            continue;
+        };
+        let Ok(value) = u32::from_str_radix(hex, 16) else {
+            continue;
+        };
         let ident = if name.starts_with(|c: char| c.is_ascii_digit()) {
             format!("_{name}")
         } else if keywords.contains(&name) {
@@ -270,7 +283,9 @@ fn keysyms(out: &Path) {
         } else {
             name.to_owned()
         };
-        rust.push_str(&format!("    pub const {ident}: Keysym = Keysym({value:#x});\n"));
+        rust.push_str(&format!(
+            "    pub const {ident}: Keysym = Keysym({value:#x});\n"
+        ));
     }
     rust.push_str("}\n");
     std::fs::write(out.join("keysyms.rs"), rust).expect("write keysyms.rs");

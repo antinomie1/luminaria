@@ -19,14 +19,17 @@ fn test_scene_renderer_and_output() {
     let renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
 
     // Reset output target
-    renderer.reset_with_format(&mut output, DrmFourcc::Argb8888).expect("reset failed");
+    renderer
+        .reset_with_format(&mut output, DrmFourcc::Argb8888)
+        .expect("reset failed");
 
     // Present a scene
     let scene = vec![
         SceneItem::rect(Rect::new(0, 0, 800, 600), Color::rgb(0.2, 0.2, 0.2)),
         SceneItem::border(Rect::new(100, 100, 200, 200), 4, Color::rgb(1.0, 1.0, 0.0)),
     ];
-    let outcome = renderer.present(&mut output, &scene, Color::rgb(0.0, 0.0, 0.0))
+    let outcome = renderer
+        .present(&mut output, &scene, Color::rgb(0.0, 0.0, 0.0))
         .expect("present failed");
     println!("Scene outcome: {:?}", outcome);
 
@@ -143,9 +146,15 @@ fn test_scene_renderer_images_and_dmabuf() {
 
     // LinuxDmabuf from SceneRenderer
     let dmabuf = LinuxDmabuf::from_scene_renderer(&display, &renderer);
-    assert!(dmabuf.is_ok(), "LinuxDmabuf::from_scene_renderer should succeed");
+    assert!(
+        dmabuf.is_ok(),
+        "LinuxDmabuf::from_scene_renderer should succeed"
+    );
     let dmabuf2 = renderer.create_linux_dmabuf(&display);
-    assert!(dmabuf2.is_ok(), "renderer.create_linux_dmabuf should succeed");
+    assert!(
+        dmabuf2.is_ok(),
+        "renderer.create_linux_dmabuf should succeed"
+    );
 
     // Test image management
     assert!(!renderer.has_image(42));
@@ -166,7 +175,10 @@ fn test_scene_renderer_images_and_dmabuf() {
         SceneItem::image(Rect::new(10, 10, 16, 16), 42),
     ];
     let outcome = renderer.present(&mut output, &scene, Color::rgb(0.0, 0.0, 0.0));
-    assert!(outcome.is_ok(), "present with image item should succeed: {outcome:?}");
+    assert!(
+        outcome.is_ok(),
+        "present with image item should succeed: {outcome:?}"
+    );
 
     renderer.remove_image(42);
     assert!(!renderer.has_image(42));
@@ -187,7 +199,10 @@ fn cursor_starts_in_the_middle_of_the_first_output() {
     assert!(layout.primary_box().is_empty());
     layout.add_auto(&mut output);
     assert_eq!(layout.primary_box(), Rect::new(0, 0, 640, 480));
-    assert_eq!(output.refresh_hz(), f64::from(output.current_mode().refresh_mhz) / 1000.0);
+    assert_eq!(
+        output.refresh_hz(),
+        f64::from(output.current_mode().refresh_mhz) / 1000.0
+    );
 
     // Nothing has said otherwise yet, so the first output found it in the middle.
     assert_eq!(cursor.position(), Some((320.0, 240.0)));

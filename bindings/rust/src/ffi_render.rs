@@ -37,24 +37,59 @@ pub(crate) mod ffi {
         fn drm_device_id_from_path(path: &str, out: &mut DrmDeviceId) -> bool;
 
         type VulkanRendererShim;
-        fn vulkan_renderer_new(has_drm_device: bool, drm_device: &DrmDeviceId, error: &mut String) -> UniquePtr<VulkanRendererShim>;
+        fn vulkan_renderer_new(
+            has_drm_device: bool,
+            drm_device: &DrmDeviceId,
+            error: &mut String,
+        ) -> UniquePtr<VulkanRendererShim>;
         fn scanout_modifiers(self: &VulkanRendererShim, drm_format: u32) -> Vec<u64>;
         #[allow(dead_code)]
         fn handles(self: &VulkanRendererShim) -> VulkanHandlesRaw;
 
         type CpuCompositorShim;
         fn cpu_compositor_new() -> UniquePtr<CpuCompositorShim>;
-        fn composite_rect(self: Pin<&mut CpuCompositorShim>, x: i32, y: i32, width: i32, height: i32, r: f32, g: f32, b: f32, a: f32);
-        fn finish(self: Pin<&mut CpuCompositorShim>, width: i32, height: i32, bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32) -> Vec<u8>;
+        fn composite_rect(
+            self: Pin<&mut CpuCompositorShim>,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            r: f32,
+            g: f32,
+            b: f32,
+            a: f32,
+        );
+        fn finish(
+            self: Pin<&mut CpuCompositorShim>,
+            width: i32,
+            height: i32,
+            bg_r: f32,
+            bg_g: f32,
+            bg_b: f32,
+            bg_a: f32,
+        ) -> Vec<u8>;
 
         type LinuxDmabufShim;
-        fn linux_dmabuf_new(display: &DisplayShim, renderer: &VulkanRendererShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
-        fn linux_dmabuf_new_headless(display: &DisplayShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
+        fn linux_dmabuf_new(
+            display: &DisplayShim,
+            renderer: &VulkanRendererShim,
+            error: &mut String,
+        ) -> UniquePtr<LinuxDmabufShim>;
+        fn linux_dmabuf_new_headless(
+            display: &DisplayShim,
+            error: &mut String,
+        ) -> UniquePtr<LinuxDmabufShim>;
 
         type DrmSyncobjManagerShim;
-        fn drm_syncobj_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<DrmSyncobjManagerShim>;
+        fn drm_syncobj_manager_new(
+            display: &DisplayShim,
+            error: &mut String,
+        ) -> UniquePtr<DrmSyncobjManagerShim>;
 
         type ScreencopyManagerShim;
-        fn screencopy_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ScreencopyManagerShim>;
+        fn screencopy_manager_new(
+            display: &DisplayShim,
+            error: &mut String,
+        ) -> UniquePtr<ScreencopyManagerShim>;
     }
 }

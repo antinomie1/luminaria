@@ -11,9 +11,12 @@ fn test_headless_backend_and_output() {
     }
 
     let display = Display::new().expect("failed to create display");
-    let mut backend = HeadlessBackend::new(&display, 16).expect("failed to create headless backend");
+    let mut backend =
+        HeadlessBackend::new(&display, 16).expect("failed to create headless backend");
 
-    let mut output = backend.add_output(1920, 1080).expect("failed to add output");
+    let mut output = backend
+        .add_output(1920, 1080)
+        .expect("failed to add output");
     assert_eq!(output.width(), 1920);
     assert_eq!(output.height(), 1080);
     assert_eq!(output.scale(), 1);
@@ -38,11 +41,15 @@ fn test_headless_backend_and_output() {
     assert!(output.frame_scheduled());
 
     // Commit solid color
-    output.commit(Color::rgb(0.1, 0.2, 0.3)).expect("commit failed");
+    output
+        .commit(Color::rgb(0.1, 0.2, 0.3))
+        .expect("commit failed");
 
     // Commit pixel frame (1920x1080 * 4 bytes)
     let pixels = vec![255u8; 1920 * 1080 * 4];
-    output.commit_frame(&pixels, 1920, 1080).expect("commit_frame failed");
+    output
+        .commit_frame(&pixels, 1920, 1080)
+        .expect("commit_frame failed");
 
     // Start backend
     backend.start().expect("start failed");

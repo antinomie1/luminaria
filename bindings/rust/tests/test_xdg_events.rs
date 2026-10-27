@@ -5,17 +5,22 @@
 #[macro_use]
 mod common;
 
-use common::{shm_buffer, ClientSide, Peer, take};
+use common::{ClientSide, Peer, shm_buffer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{
-    Compositor, PopupArea, PopupEvent, Seat, SurfaceId, ToplevelEvent, ToplevelStates, XdgEvent, XdgShell,
+    Compositor, PopupArea, PopupEvent, Seat, SurfaceId, ToplevelEvent, ToplevelStates, XdgEvent,
+    XdgShell,
 };
-use luminaria::shell::{scene_hit_test, PopupTree, SceneItem};
-use luminaria::util::{edge, Rect};
+use luminaria::shell::{PopupTree, SceneItem, scene_hit_test};
+use luminaria::util::{Rect, edge};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_compositor, wl_seat, wl_shm, wl_shm_pool, wl_surface};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, QueueHandle};
-use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 
 #[derive(Default)]
 struct State {
@@ -40,7 +45,14 @@ ignore_events!(State:
 );
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
-    fn event(_: &mut Self, wm: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        _: &mut Self,
+        wm: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let xdg_wm_base::Event::Ping { serial } = event {
             wm.pong(serial);
         }
@@ -48,7 +60,14 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
 }
 
 impl Dispatch<xdg_surface::XdgSurface, ()> for State {
-    fn event(_: &mut Self, xs: &xdg_surface::XdgSurface, event: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        _: &mut Self,
+        xs: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let xdg_surface::Event::Configure { serial } = event {
             xs.ack_configure(serial);
         }
@@ -56,9 +75,20 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
 }
 
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
-    fn event(state: &mut Self, _: &xdg_toplevel::XdgToplevel, event: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &xdg_toplevel::XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, states } => {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
                 let states = states
                     .chunks_exact(4)
                     .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
@@ -72,9 +102,21 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
 }
 
 impl Dispatch<xdg_popup::XdgPopup, ()> for State {
-    fn event(state: &mut Self, _: &xdg_popup::XdgPopup, event: xdg_popup::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match event {
-            xdg_popup::Event::Configure { x, y, width, height } => state.popup_configures.push((x, y, width, height)),
+            xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => state.popup_configures.push((x, y, width, height)),
             xdg_popup::Event::Repositioned { token } => state.repositioned = Some(token),
             xdg_popup::Event::PopupDone => state.popup_done = true,
             _ => {}
@@ -90,7 +132,13 @@ struct Globals {
     seat: wl_seat::WlSeat,
 }
 
-fn bind(conn: &Connection) -> (Globals, wayland_client::EventQueue<State>, QueueHandle<State>) {
+fn bind(
+    conn: &Connection,
+) -> (
+    Globals,
+    wayland_client::EventQueue<State>,
+    QueueHandle<State>,
+) {
     let (globals, queue) = registry_queue_init::<State>(conn).expect("registry");
     let qh = queue.handle();
     let g = Globals {
@@ -140,13 +188,21 @@ fn toplevel_client(conn: Connection, step: ClientSide) {
     dialog.set_parent(None);
     queue.roundtrip(&mut state).unwrap();
     // Nobody but the compositor answers a request, and it has not yet.
-    assert!(state.toplevel_configures.iter().all(|(_, _, s)| !s.contains(&MAXIMIZED)));
+    assert!(
+        state
+            .toplevel_configures
+            .iter()
+            .all(|(_, _, s)| !s.contains(&MAXIMIZED))
+    );
     step.step("requests");
 
     queue.roundtrip(&mut state).unwrap();
     let (w, h, states) = state.toplevel_configures.last().unwrap().clone();
     assert_eq!((w, h), (300, 200));
-    assert!(states.contains(&MAXIMIZED) && states.contains(&ACTIVATED), "{states:?}");
+    assert!(
+        states.contains(&MAXIMIZED) && states.contains(&ACTIVATED),
+        "{states:?}"
+    );
     step.step("configured");
 
     queue.roundtrip(&mut state).unwrap();
@@ -160,7 +216,9 @@ fn toplevel_events_requests_and_state() {
     display.init_shm().expect("wl_shm");
     let _compositor = Compositor::new(&display).expect("wl_compositor");
     // Answering maximize/fullscreen/minimize ourselves, so they arrive as events.
-    let shell = XdgShell::new(&display).expect("xdg-shell").forward_window_requests();
+    let shell = XdgShell::new(&display)
+        .expect("xdg-shell")
+        .forward_window_requests();
     let seat = Seat::new(&display, "seat0").expect("wl_seat");
 
     let mut peer = Peer::spawn(&display, toplevel_client);
@@ -203,8 +261,21 @@ fn toplevel_events_requests_and_state() {
             XdgEvent::Toplevel(a, ToplevelEvent::RequestFullscreen(false)),
             XdgEvent::Toplevel(a, ToplevelEvent::RequestMinimize),
             XdgEvent::Toplevel(a, ToplevelEvent::RequestMove { serial: 7 }),
-            XdgEvent::Toplevel(a, ToplevelEvent::RequestResize { serial: 8, edges: edge::BOTTOM | edge::RIGHT }),
-            XdgEvent::Toplevel(a, ToplevelEvent::RequestWindowMenu { serial: 9, x: 10, y: 20 }),
+            XdgEvent::Toplevel(
+                a,
+                ToplevelEvent::RequestResize {
+                    serial: 8,
+                    edges: edge::BOTTOM | edge::RIGHT
+                }
+            ),
+            XdgEvent::Toplevel(
+                a,
+                ToplevelEvent::RequestWindowMenu {
+                    serial: 9,
+                    x: 10,
+                    y: 20
+                }
+            ),
             XdgEvent::Toplevel(b, ToplevelEvent::Created),
             XdgEvent::Toplevel(b, ToplevelEvent::ParentChange(Some(a))),
             XdgEvent::Toplevel(b, ToplevelEvent::ParentChange(None)),
@@ -222,7 +293,10 @@ fn toplevel_events_requests_and_state() {
     common::collect(&display);
     assert_eq!(
         take::<XdgEvent>(),
-        [XdgEvent::Toplevel(a, ToplevelEvent::StateChange), XdgEvent::Toplevel(a, ToplevelEvent::StateChange)]
+        [
+            XdgEvent::Toplevel(a, ToplevelEvent::StateChange),
+            XdgEvent::Toplevel(a, ToplevelEvent::StateChange)
+        ]
     );
     let states = t.states();
     assert!(states.maximized && states.activated && !states.fullscreen);
@@ -243,7 +317,10 @@ fn toplevel_events_requests_and_state() {
             _ => None,
         })
         .collect();
-    assert!(destroyed.contains(&a) && destroyed.contains(&b), "{destroyed:?}");
+    assert!(
+        destroyed.contains(&a) && destroyed.contains(&b),
+        "{destroyed:?}"
+    );
     assert!(shell.toplevel(a).is_none());
     assert!(shell.toplevels().is_empty());
     assert_eq!(t.title(), "", "a stale handle reads nothing");
@@ -324,14 +401,25 @@ fn popups_through_the_tree_into_the_scene() {
 
     peer.wait(&display, "popup mapped");
     let events = take::<XdgEvent>();
-    let XdgEvent::Popup(p, PopupEvent::Created { parent: Some(created_on) }) = events[0] else {
+    let XdgEvent::Popup(
+        p,
+        PopupEvent::Created {
+            parent: Some(created_on),
+        },
+    ) = events[0]
+    else {
         panic!("{events:?}");
     };
     assert_eq!(created_on, parent);
     assert_eq!(
         events,
         [
-            XdgEvent::Popup(p, PopupEvent::Created { parent: Some(parent) }),
+            XdgEvent::Popup(
+                p,
+                PopupEvent::Created {
+                    parent: Some(parent)
+                }
+            ),
             XdgEvent::Popup(p, PopupEvent::Grab { serial: 42 }),
             XdgEvent::Popup(p, PopupEvent::Map),
         ]
@@ -364,7 +452,10 @@ fn popups_through_the_tree_into_the_scene() {
     peer.go();
 
     peer.wait(&display, "repositioned");
-    assert_eq!(take::<XdgEvent>(), [XdgEvent::Popup(p, PopupEvent::Reposition)]);
+    assert_eq!(
+        take::<XdgEvent>(),
+        [XdgEvent::Popup(p, PopupEvent::Reposition)]
+    );
     assert_eq!(popup.geometry(), Rect::new(-10, 10, 50, 40));
 
     // A click on the parent is outside the popup: the grab goes.
@@ -377,7 +468,10 @@ fn popups_through_the_tree_into_the_scene() {
     peer.go();
 
     peer.wait(&display, "popup destroyed");
-    assert_eq!(take::<XdgEvent>(), [XdgEvent::Popup(p, PopupEvent::Destroy)]);
+    assert_eq!(
+        take::<XdgEvent>(),
+        [XdgEvent::Popup(p, PopupEvent::Destroy)]
+    );
     // The tree let go of it by itself, before Rust heard of the destroy.
     assert!(!tree.contains(p));
     let mut scene = vec![window];

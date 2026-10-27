@@ -2,7 +2,7 @@
 //! Skips (exit 0 with a note) when the machine has no usable font, which is the
 //! common case in a container without fontconfig fonts.
 
-use luminaria::text::{decode_utf8, Font};
+use luminaria::text::{Font, decode_utf8};
 use luminaria::util::Color;
 
 #[test]
@@ -29,14 +29,38 @@ fn font_metrics_and_drawing() {
     let (width, height) = (128, 32);
     let mut canvas = vec![0u8; (width * height * 4) as usize];
     let pen = font
-        .draw(&mut canvas, width, height, 4, font.ascent() + 2, "Hi", Color::rgb(1.0, 1.0, 1.0), width)
+        .draw(
+            &mut canvas,
+            width,
+            height,
+            4,
+            font.ascent() + 2,
+            "Hi",
+            Color::rgb(1.0, 1.0, 1.0),
+            width,
+        )
         .expect("draw");
     assert!(pen > 4, "pen did not advance");
 
     // Something was actually rasterized into the alpha channel.
-    assert!(canvas.chunks_exact(4).any(|px| px[3] != 0), "no glyph pixels");
+    assert!(
+        canvas.chunks_exact(4).any(|px| px[3] != 0),
+        "no glyph pixels"
+    );
 
     // A canvas that is too small is refused rather than overrun.
     let mut tiny = vec![0u8; 4];
-    assert!(font.draw(&mut tiny, 128, 32, 0, 0, "Hi", Color::rgb(1.0, 1.0, 1.0), 128).is_err());
+    assert!(
+        font.draw(
+            &mut tiny,
+            128,
+            32,
+            0,
+            0,
+            "Hi",
+            Color::rgb(1.0, 1.0, 1.0),
+            128
+        )
+        .is_err()
+    );
 }

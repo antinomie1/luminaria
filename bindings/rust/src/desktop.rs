@@ -3,9 +3,11 @@
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::EventKind;
 use crate::ffi_desktop as ffi;
-use crate::protocol::{DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell};
-use crate::util::Rect;
+use crate::protocol::{
+    DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell,
+};
 use crate::shell::OutputLayout;
+use crate::util::Rect;
 
 /// Taskbar and window switcher request kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +58,10 @@ impl<'d> ForeignToplevelManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -114,7 +119,10 @@ impl<'d> WorkspaceManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -146,14 +154,20 @@ pub enum SessionLockEvent {
     NewLock(LockId),
     /// The lock client made `surface` its lock surface for one output.
     /// Configure it to that output's size.
-    NewSurface { lock: LockId, surface: SurfaceId },
+    NewSurface {
+        lock: LockId,
+        surface: SurfaceId,
+    },
     SurfaceMap(SurfaceId),
     SurfaceDestroy(SurfaceId),
     /// The lock object is gone. `unlocked`: the client unlocked in order.
     /// Otherwise it died holding the lock, and the session STAYS locked
     /// ([`SessionLockManager::is_locked`] says so) until a new lock client
     /// unlocks it.
-    LockDestroy { lock: LockId, unlocked: bool },
+    LockDestroy {
+        lock: LockId,
+        unlocked: bool,
+    },
 }
 
 /// Screen locking protocol manager (`ext_session_lock_manager_v1`). It fails
@@ -171,13 +185,15 @@ impl<'d> SessionLockManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
 
 impl SessionLockManager<'_> {
-
     /// True from the first `send_locked` until a client's orderly unlock.
     pub fn is_locked(&self) -> bool {
         self.raw.locked()
@@ -194,7 +210,10 @@ impl SessionLockManager<'_> {
 
     /// A lock by id. Once its client is gone every call on it is a no-op.
     pub fn lock(&self, lock: LockId) -> SessionLock<'_> {
-        SessionLock { mgr: &*self.raw, lock }
+        SessionLock {
+            mgr: &*self.raw,
+            lock,
+        }
     }
 
     /// The lock surface whose surface is `surface`, if there is one now.
@@ -202,7 +221,10 @@ impl SessionLockManager<'_> {
         let mut info = ffi::LockSurfaceInfoRaw::default();
         self.raw
             .lock_surface_info(surface.0, &mut info)
-            .then_some(LockSurface { mgr: self.raw.as_ref()?, surface })
+            .then_some(LockSurface {
+                mgr: self.raw.as_ref()?,
+                surface,
+            })
     }
 }
 
@@ -234,7 +256,11 @@ impl SessionLock<'_> {
     }
 
     pub fn surfaces(&self) -> Vec<SurfaceId> {
-        self.mgr.lock_surfaces(self.lock.0).into_iter().map(SurfaceId).collect()
+        self.mgr
+            .lock_surfaces(self.lock.0)
+            .into_iter()
+            .map(SurfaceId)
+            .collect()
     }
 }
 
@@ -277,7 +303,8 @@ impl LockSurface<'_> {
 
     /// Size it to its output. Returns the configure serial.
     pub fn configure(&self, width: u32, height: u32) -> u32 {
-        self.mgr.lock_surface_configure(self.surface.0, width, height)
+        self.mgr
+            .lock_surface_configure(self.surface.0, width, height)
     }
 }
 
@@ -301,7 +328,10 @@ impl<'a> OutputManager<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 
@@ -329,7 +359,10 @@ impl<'a> DataControlManager<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 }
@@ -343,10 +376,16 @@ pub enum InputMethodEvent {
     New(InputMethodId),
     /// It took (or released) the keyboard: while grabbed, keys go to it
     /// through [`InputMethod::grab_send_key`] instead of the focused client.
-    GrabChange { input_method: InputMethodId, grabbed: bool },
+    GrabChange {
+        input_method: InputMethodId,
+        grabbed: bool,
+    },
     Destroy(InputMethodId),
     /// A candidate window. Draw it next to [`InputMethodManager::popup_text_input_rectangle`].
-    NewPopupSurface { input_method: InputMethodId, surface: SurfaceId },
+    NewPopupSurface {
+        input_method: InputMethodId,
+        surface: SurfaceId,
+    },
     PopupSurfaceDestroy(SurfaceId),
 }
 
@@ -368,23 +407,31 @@ impl<'a> InputMethodManager<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 }
 
 impl InputMethodManager<'_> {
-
     /// The input method bound to the seat.
     pub fn current(&self) -> Option<InputMethod<'_>> {
         match self.raw.current() {
             0 => None,
-            id => Some(InputMethod { mgr: self.raw.as_ref()?, id: InputMethodId(id) }),
+            id => Some(InputMethod {
+                mgr: self.raw.as_ref()?,
+                id: InputMethodId(id),
+            }),
         }
     }
 
     pub fn input_method(&self, id: InputMethodId) -> InputMethod<'_> {
-        InputMethod { mgr: &*self.raw, id }
+        InputMethod {
+            mgr: &*self.raw,
+            id,
+        }
     }
 
     /// The text cursor a candidate window belongs next to, in the coordinates
@@ -421,7 +468,8 @@ impl InputMethod<'_> {
     }
 
     pub fn grab_send_modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        self.mgr.grab_send_modifiers(self.id.0, depressed, latched, locked, group);
+        self.mgr
+            .grab_send_modifiers(self.id.0, depressed, latched, locked, group);
     }
 
     pub fn grab_send_repeat_info(&self, rate: i32, delay: i32) {
@@ -429,7 +477,11 @@ impl InputMethod<'_> {
     }
 
     pub fn popup_surfaces(&self) -> Vec<SurfaceId> {
-        self.mgr.popup_surfaces(self.id.0).into_iter().map(SurfaceId).collect()
+        self.mgr
+            .popup_surfaces(self.id.0)
+            .into_iter()
+            .map(SurfaceId)
+            .collect()
     }
 }
 
@@ -518,9 +570,292 @@ impl InputMethodEvent {
                 input_method,
                 surface: SurfaceId(raw.other),
             },
-            EventKind::InputPopupSurfaceDestroy => InputMethodEvent::PopupSurfaceDestroy(SurfaceId(raw.id)),
+            EventKind::InputPopupSurfaceDestroy => {
+                InputMethodEvent::PopupSurfaceDestroy(SurfaceId(raw.id))
+            }
             _ => return None,
         });
         None
+    }
+}
+
+/// 16-bit RGB gamma table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GammaRamp {
+    pub red: Vec<u16>,
+    pub green: Vec<u16>,
+    pub blue: Vec<u16>,
+}
+
+/// A gamma change event from a client (`zwlr_gamma_control_v1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GammaEvent {
+    pub output_resource: u64,
+    pub has_ramp: bool,
+}
+
+impl GammaEvent {
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<GammaEvent> {
+        match raw.kind {
+            EventKind::GammaChange => Some(GammaEvent {
+                output_resource: raw.id,
+                has_ramp: raw.flag,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Output gamma ramp control manager (`zwlr_gamma_control_manager_v1`).
+pub struct GammaControlManager<'d> {
+    pub(crate) raw: cxx::UniquePtr<ffi::GammaControlManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> GammaControlManager<'d> {
+    pub fn new(display: &'d Display, gamma_size: u32) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::gamma_control_manager_new(&display.raw, gamma_size, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
+        }
+    }
+
+    pub fn gamma_size(&self) -> u32 {
+        self.raw.gamma_size()
+    }
+
+    pub fn ramp(&self, output_resource: u64) -> Option<GammaRamp> {
+        let mut red = Vec::new();
+        let mut green = Vec::new();
+        let mut blue = Vec::new();
+        if self
+            .raw
+            .get_ramp(output_resource, &mut red, &mut green, &mut blue)
+        {
+            Some(GammaRamp { red, green, blue })
+        } else {
+            None
+        }
+    }
+}
+
+/// A Color Transform Matrix (CTM) update event (`hyprland_ctm_control_v1`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtmEvent {
+    pub output_resource: u64,
+}
+
+impl CtmEvent {
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<CtmEvent> {
+        match raw.kind {
+            EventKind::CtmChange => Some(CtmEvent {
+                output_resource: raw.id,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Output Color Transform Matrix manager (`hyprland_ctm_control_manager_v1`).
+pub struct CtmControlManager<'d> {
+    pub(crate) raw: cxx::UniquePtr<ffi::CtmControlManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> CtmControlManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::ctm_control_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
+        }
+    }
+
+    pub fn matrix(&self, output_resource: u64) -> Option<[f64; 9]> {
+        let mut mat = Vec::new();
+        if self.raw.get_ctm(output_resource, &mut mat) && mat.len() == 9 {
+            let mut arr = [0.0; 9];
+            arr.copy_from_slice(&mat);
+            Some(arr)
+        } else {
+            None
+        }
+    }
+}
+
+/// Virtual keyboard key event (`zwp_virtual_keyboard_v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualKeyEvent {
+    pub seat_resource: u64,
+    pub time: u32,
+    pub key: u32,
+    pub pressed: bool,
+}
+
+impl VirtualKeyEvent {
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<VirtualKeyEvent> {
+        match raw.kind {
+            EventKind::VirtualKey => Some(VirtualKeyEvent {
+                seat_resource: raw.id,
+                time: raw.serial,
+                key: raw.value,
+                pressed: raw.flag,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Virtual keyboard modifier and group event (`zwp_virtual_keyboard_v1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualModifiersEvent {
+    pub seat_resource: u64,
+    pub depressed: u32,
+    pub latched: u32,
+    pub locked: u32,
+    pub group: u32,
+}
+
+impl VirtualModifiersEvent {
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<VirtualModifiersEvent> {
+        match raw.kind {
+            EventKind::VirtualModifiers => Some(VirtualModifiersEvent {
+                seat_resource: raw.id,
+                depressed: raw.value,
+                latched: raw.serial,
+                locked: raw.x as u32,
+                group: raw.y as u32,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Virtual keyboard manager (`zwp_virtual_keyboard_manager_v1`).
+pub struct VirtualKeyboardManager<'d> {
+    pub(crate) _raw: cxx::UniquePtr<ffi::VirtualKeyboardManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> VirtualKeyboardManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::virtual_keyboard_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self {
+                _raw: raw,
+                _display: Holds::new(),
+            })
+        }
+    }
+}
+
+/// Virtual pointer event (`zwlr_virtual_pointer_v1`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum VirtualPointerEvent {
+    Motion {
+        seat_resource: u64,
+        time: u32,
+        dx: f64,
+        dy: f64,
+    },
+    MotionAbsolute {
+        seat_resource: u64,
+        output_resource: u64,
+        time: u32,
+        x: u32,
+        y: u32,
+        x_extent: u32,
+        y_extent: u32,
+    },
+    Button {
+        seat_resource: u64,
+        time: u32,
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        seat_resource: u64,
+        time: u32,
+        axis: u32,
+        value: f64,
+    },
+    Frame {
+        seat_resource: u64,
+    },
+}
+
+impl VirtualPointerEvent {
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<VirtualPointerEvent> {
+        match raw.kind {
+            EventKind::VirtualPointerMotion => Some(VirtualPointerEvent::Motion {
+                seat_resource: raw.id,
+                time: raw.serial,
+                dx: raw.x as f64 / 256.0,
+                dy: raw.y as f64 / 256.0,
+            }),
+            EventKind::VirtualPointerMotionAbsolute => {
+                let y_extent = raw.text.parse::<u32>().unwrap_or(0);
+                Some(VirtualPointerEvent::MotionAbsolute {
+                    seat_resource: raw.id,
+                    output_resource: raw.other,
+                    time: raw.serial,
+                    x: raw.x as u32,
+                    y: raw.y as u32,
+                    x_extent: raw.value,
+                    y_extent,
+                })
+            }
+            EventKind::VirtualPointerButton => Some(VirtualPointerEvent::Button {
+                seat_resource: raw.id,
+                time: raw.serial,
+                button: raw.value,
+                pressed: raw.flag,
+            }),
+            EventKind::VirtualPointerAxis => Some(VirtualPointerEvent::Axis {
+                seat_resource: raw.id,
+                time: raw.serial,
+                axis: raw.value,
+                value: raw.x as f64 / 256.0,
+            }),
+            EventKind::VirtualPointerFrame => Some(VirtualPointerEvent::Frame {
+                seat_resource: raw.id,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Virtual pointer manager (`zwlr_virtual_pointer_manager_v1`).
+pub struct VirtualPointerManager<'d> {
+    pub(crate) _raw: cxx::UniquePtr<ffi::VirtualPointerManagerShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> VirtualPointerManager<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::virtual_pointer_manager_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self {
+                _raw: raw,
+                _display: Holds::new(),
+            })
+        }
     }
 }

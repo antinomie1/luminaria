@@ -23,7 +23,9 @@ use luminaria::Event;
 use luminaria::backend::{AutoBackend, BackendOptions, InputEvent, Modifiers, Output, OutputEvent};
 use luminaria::core::{Display, KeyRouter};
 use luminaria::gpu::{Cursor, LinuxDmabuf, SceneRenderer};
-use luminaria::protocol::{CoreGlobals, OutputGlobal, PopupArea, SurfaceId, ToplevelEvent, XdgShell};
+use luminaria::protocol::{
+    CoreGlobals, OutputGlobal, PopupArea, SurfaceId, ToplevelEvent, XdgShell,
+};
 use luminaria::shell::{OutputLayout, PopupTree, SceneItem, scene_hit_test, scene_route_pointer};
 use luminaria::util::{Color, Keysym, Rect};
 
@@ -47,7 +49,12 @@ const BINDINGS: [(u32, Keysym, Action); 4] = [
 /// Every window sits at the usable area's origin, newest on top, with its
 /// popups above it. Tagged with its own surface, so a hit on one of its
 /// subsurfaces or popups still names the window.
-fn scene(shell: &XdgShell, popups: &PopupTree, stack: &[SurfaceId], usable: Rect) -> Vec<SceneItem> {
+fn scene(
+    shell: &XdgShell,
+    popups: &PopupTree,
+    stack: &[SurfaceId],
+    usable: Rect,
+) -> Vec<SceneItem> {
     let mut items: Vec<SceneItem> = stack
         .iter()
         .filter_map(|&s| {
@@ -55,9 +62,21 @@ fn scene(shell: &XdgShell, popups: &PopupTree, stack: &[SurfaceId], usable: Rect
             // geometry, not the buffer, is what lands on the usable area.
             let g = shell.toplevel(s)?.geometry();
             let framed = g.width > 0 && g.height > 0;
-            let (w, h) = if framed { (g.width, g.height) } else { (s.surface_width(), s.surface_height()) };
+            let (w, h) = if framed {
+                (g.width, g.height)
+            } else {
+                (s.surface_width(), s.surface_height())
+            };
             let (ox, oy) = if framed { (g.x, g.y) } else { (0, 0) };
-            Some(SceneItem::surface(s, Rect::new(usable.x, usable.y, w, h), usable.x - ox, usable.y - oy).with_tag(s.0))
+            Some(
+                SceneItem::surface(
+                    s,
+                    Rect::new(usable.x, usable.y, w, h),
+                    usable.x - ox,
+                    usable.y - oy,
+                )
+                .with_tag(s.0),
+            )
         })
         .collect();
     popups.append_to(&mut items);
@@ -73,8 +92,16 @@ fn popup_areas(items: &[SceneItem], screens: &[Rect], bounds: Rect) -> Vec<Popup
         .filter(|item| item.surface.is_valid())
         .map(|item| {
             let (x, y) = (item.rect.x as f64, item.rect.y as f64);
-            let usable = screens.iter().copied().find(|b| b.contains(x, y)).unwrap_or(bounds);
-            PopupArea { parent: item.surface, parent_box: item.rect, usable }
+            let usable = screens
+                .iter()
+                .copied()
+                .find(|b| b.contains(x, y))
+                .unwrap_or(bounds);
+            PopupArea {
+                parent: item.surface,
+                parent_box: item.rect,
+                usable,
+            }
         })
         .collect()
 }
@@ -86,7 +113,9 @@ fn raise(stack: &mut Vec<SurfaceId>, surface: SurfaceId) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut backend_options = BackendOptions {
-        drm_device: std::env::args().nth(1).or_else(|| std::env::var("LUMINARIA_DRM_DEVICE").ok()),
+        drm_device: std::env::args()
+            .nth(1)
+            .or_else(|| std::env::var("LUMINARIA_DRM_DEVICE").ok()),
         title: "minimal".into(),
         ..BackendOptions::default()
     };
@@ -109,7 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let renderer = SceneRenderer::new(&backend.vulkan_options())?;
     renderer.set_presentation(Some(globals.presentation()));
     // GPU clients hand over dmabufs, imported with no copy.
-    let _dmabuf = renderer.gpu_enabled().then(|| LinuxDmabuf::from_scene_renderer(&display, &renderer).ok()).flatten();
+    let _dmabuf = renderer
+        .gpu_enabled()
+        .then(|| LinuxDmabuf::from_scene_renderer(&display, &renderer).ok())
+        .flatten();
     let mut cursor = Cursor::new_with_shapes(&renderer, &layout, seat, globals.cursor_shape())?;
 
     // Each output with the wl_output that follows it, dropped together.
@@ -151,7 +183,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     layout.add_auto(&mut output);
                     let name = format!("minimal-{}", outputs.len() + 1);
-                    let wl_output = OutputGlobal::for_output(&display, &output, &layout, &name).ok();
+                    let wl_output =
+                        OutputGlobal::for_output(&display, &output, &layout, &name).ok();
                     outputs.push((output, wl_output));
                     relayout = true;
                 }
@@ -174,7 +207,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Render at the output's density: the integer hint and, for
                     // clients that speak fractional-scale, the exact scale.
                     if let Some((first, _)) = outputs.first() {
-                        globals.fractional_scale().set_scale(surface, first.scale() as f64);
+                        globals
+                            .fractional_scale()
+                            .set_scale(surface, first.scale() as f64);
                     }
                     raise(&mut stack, surface);
                     restacked = true;
@@ -193,12 +228,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // motion and leave from the host window), not in how.
                 Event::Input(input) => match input {
                     InputEvent::Key { .. } => keys.route(seat, &input, |e| {
-                        let &InputEvent::Key { keysym, modifiers, .. } = e else { return false };
+                        let &InputEvent::Key {
+                            keysym, modifiers, ..
+                        } = e
+                        else {
+                            return false;
+                        };
                         if backend.session().is_some_and(|s| s.switch_vt_for(keysym)) {
                             seat.release_keys(); // their releases arrive on the other VT
                             return true;
                         }
-                        let binding = BINDINGS.iter().find(|&&(m, k, _)| m == modifiers.held() && k == keysym.to_lower());
+                        let binding = BINDINGS
+                            .iter()
+                            .find(|&&(m, k, _)| m == modifiers.held() && k == keysym.to_lower());
                         actions.extend(binding.map(|&(_, _, action)| action));
                         binding.is_some()
                     }),
@@ -227,7 +269,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if pressed {
                             popups.dismiss_grabs_outside(seat.pointer_focus()); // a click outside a menu closes it
                             if let Some((x, y)) = at {
-                                let hit = scene_hit_test(&scene(shell, &popups, &stack, usable), x, y);
+                                let hit =
+                                    scene_hit_test(&scene(shell, &popups, &stack, usable), x, y);
                                 if hit.tag != 0 && stack.last() != Some(&SurfaceId(hit.tag)) {
                                     raise(&mut stack, SurfaceId(hit.tag));
                                     restacked = true;

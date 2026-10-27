@@ -107,7 +107,10 @@ impl CpuCompositor {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi::cpu_compositor_new();
         if raw.is_null() {
-            Err(Error::new(ErrorKind::Shell, "failed to create cpu compositor"))
+            Err(Error::new(
+                ErrorKind::Shell,
+                "failed to create cpu compositor",
+            ))
         } else {
             Ok(Self { raw })
         }
@@ -157,7 +160,10 @@ impl<'a> LinuxDmabuf<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Gpu, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 
@@ -169,11 +175,18 @@ impl<'a> LinuxDmabuf<'a> {
         renderer: &'a crate::gpu::SceneRenderer,
     ) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = crate::ffi_shell::linux_dmabuf_new_from_scene_renderer(&display.raw, &renderer.raw, &mut err);
+        let raw = crate::ffi_shell::linux_dmabuf_new_from_scene_renderer(
+            &display.raw,
+            &renderer.raw,
+            &mut err,
+        );
         if raw.is_null() {
             Err(Error::new(ErrorKind::Gpu, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 }
@@ -192,7 +205,10 @@ impl<'d> DrmSyncobjManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Gpu, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
@@ -211,7 +227,10 @@ impl<'d> ScreencopyManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Gpu, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }

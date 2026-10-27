@@ -25,7 +25,10 @@ impl OutputLayout {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi::output_layout_new();
         if raw.is_null() {
-            Err(Error::new(ErrorKind::Shell, "failed to create output layout"))
+            Err(Error::new(
+                ErrorKind::Shell,
+                "failed to create output layout",
+            ))
         } else {
             Ok(Self { raw })
         }
@@ -131,19 +134,33 @@ impl SceneItem {
     }
 
     pub fn surface(surface: SurfaceId, rect: Rect, origin_x: i32, origin_y: i32) -> Self {
-        Self { surface, surface_origin: (origin_x, origin_y), ..Self::base(SceneKind::Surface, rect) }
+        Self {
+            surface,
+            surface_origin: (origin_x, origin_y),
+            ..Self::base(SceneKind::Surface, rect)
+        }
     }
 
     pub fn rect(rect: Rect, color: Color) -> Self {
-        Self { color, ..Self::base(SceneKind::Rect, rect) }
+        Self {
+            color,
+            ..Self::base(SceneKind::Rect, rect)
+        }
     }
 
     pub fn border(rect: Rect, thickness: i32, color: Color) -> Self {
-        Self { color, thickness, ..Self::base(SceneKind::Border, rect) }
+        Self {
+            color,
+            thickness,
+            ..Self::base(SceneKind::Border, rect)
+        }
     }
 
     pub fn image(rect: Rect, serial: u64) -> Self {
-        Self { serial, ..Self::base(SceneKind::Image, rect) }
+        Self {
+            serial,
+            ..Self::base(SceneKind::Image, rect)
+        }
     }
 
     pub fn with_alpha(mut self, alpha: f32) -> Self {
@@ -251,7 +268,13 @@ pub fn scene_hit_test(items: &[SceneItem], x: f64, y: f64) -> SceneHit {
 impl SceneHit {
     #[cfg(feature = "shell")]
     fn from_raw(raw: ffi_shell::SceneHitRaw) -> Self {
-        Self { hit: raw.hit, tag: raw.tag, surface: SurfaceId::from_raw(raw.surface_id), sx: raw.sx, sy: raw.sy }
+        Self {
+            hit: raw.hit,
+            tag: raw.tag,
+            surface: SurfaceId::from_raw(raw.surface_id),
+            sx: raw.sx,
+            sy: raw.sy,
+        }
     }
 }
 
@@ -261,9 +284,16 @@ impl SceneHit {
 /// the point gets focus, or focus is cleared over nothing. Answers the hit
 /// under the point either way.
 #[cfg(feature = "shell")]
-pub fn scene_route_pointer(seat: &crate::protocol::Seat<'_>, items: &[SceneItem], x: f64, y: f64) -> SceneHit {
+pub fn scene_route_pointer(
+    seat: &crate::protocol::Seat<'_>,
+    items: &[SceneItem],
+    x: f64,
+    y: f64,
+) -> SceneHit {
     let raw_items: Vec<ffi_shell::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
-    SceneHit::from_raw(ffi_shell::raw_scene_route_pointer(&seat.raw, &raw_items, x, y))
+    SceneHit::from_raw(ffi_shell::raw_scene_route_pointer(
+        &seat.raw, &raw_items, x, y,
+    ))
 }
 
 /// Where `surface`'s own origin is drawn in `items`: a root's item origin, or
@@ -334,7 +364,9 @@ impl PopupTree {
     /// popup, dismiss the grabbing ones. True when one was dismissed, which
     /// is when the click should not reach a client.
     pub fn dismiss_grabs_outside(&mut self, surface: Option<SurfaceId>) -> bool {
-        self.raw.pin_mut().dismiss_grabs_outside(surface.map_or(0, |s| s.0))
+        self.raw
+            .pin_mut()
+            .dismiss_grabs_outside(surface.map_or(0, |s| s.0))
     }
 }
 
@@ -354,7 +386,10 @@ impl LayerManager {
     pub fn new() -> Result<Self, Error> {
         let raw = ffi_shell::layer_manager_new();
         if raw.is_null() {
-            Err(Error::new(ErrorKind::Shell, "failed to create layer manager"))
+            Err(Error::new(
+                ErrorKind::Shell,
+                "failed to create layer manager",
+            ))
         } else {
             Ok(Self { raw })
         }
@@ -385,7 +420,12 @@ impl LayerManager {
     /// Push `output`'s mapped surfaces of `layer` onto `scene`, where the last
     /// [`arrange`](Self::arrange) put them.
     pub fn append_to(&self, scene: &mut Vec<SceneItem>, output: u32, layer: Layer) {
-        scene.extend(self.raw.append_to(output, layer as u32).iter().map(SceneItem::from_raw));
+        scene.extend(
+            self.raw
+                .append_to(output, layer as u32)
+                .iter()
+                .map(SceneItem::from_raw),
+        );
     }
 
     /// The mapped layer surface `surface` belongs to, if it may take keyboard

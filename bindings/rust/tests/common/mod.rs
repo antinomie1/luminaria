@@ -38,7 +38,9 @@ thread_local! {
 /// One dispatch of the display, flushing what it produced to the clients. Its
 /// events go to the inbox, for [`take`].
 pub fn dispatch(display: &Display) {
-    let events = display.dispatch(Some(Duration::from_millis(5))).expect("dispatch");
+    let events = display
+        .dispatch(Some(Duration::from_millis(5)))
+        .expect("dispatch");
     display.flush_clients();
     INBOX.with_borrow_mut(|inbox| inbox.extend(events));
 }
@@ -109,7 +111,10 @@ impl ClientSide {
 
 impl Peer {
     /// Connect a client to `display` and run `script` on it in a thread.
-    pub fn spawn(display: &Display, script: impl FnOnce(Connection, ClientSide) + Send + 'static) -> Self {
+    pub fn spawn(
+        display: &Display,
+        script: impl FnOnce(Connection, ClientSide) + Send + 'static,
+    ) -> Self {
         let (server, client) = UnixStream::pair().expect("socketpair");
         // SAFETY: the display is live, and libwayland takes the fd over.
         let c = unsafe { wl_client_create(display.as_ptr(), server.into_raw_fd()) };
@@ -118,9 +123,19 @@ impl Peer {
         let (go, go_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let conn = Connection::from_socket(client).expect("wayland connection");
-            script(conn, ClientSide { reached: reached_tx, go: go_rx });
+            script(
+                conn,
+                ClientSide {
+                    reached: reached_tx,
+                    go: go_rx,
+                },
+            );
         });
-        Self { reached, go, thread: Some(thread) }
+        Self {
+            reached,
+            go,
+            thread: Some(thread),
+        }
     }
 
     /// Dispatch until the client reaches `what`. A client that panicked
@@ -139,7 +154,10 @@ impl Peer {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            assert!(Instant::now() < deadline, "timed out waiting for the client to reach {what}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the client to reach {what}"
+            );
             dispatch(display);
         }
     }
@@ -155,7 +173,10 @@ impl Peer {
         self.go();
         let deadline = Instant::now() + TIMEOUT;
         while !self.thread.as_ref().is_some_and(|t| t.is_finished()) {
-            assert!(Instant::now() < deadline, "timed out waiting for the client to finish");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the client to finish"
+            );
             dispatch(display);
         }
         self.join_thread();
@@ -207,7 +228,12 @@ fn shm_file(size: u64) -> File {
 }
 
 /// An ARGB8888 buffer of `width`x`height`, all zero (transparent black).
-pub fn shm_buffer<D>(shm: &wl_shm::WlShm, qh: &QueueHandle<D>, width: i32, height: i32) -> wl_buffer::WlBuffer
+pub fn shm_buffer<D>(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<D>,
+    width: i32,
+    height: i32,
+) -> wl_buffer::WlBuffer
 where
     D: Dispatch<wl_shm_pool::WlShmPool, ()> + Dispatch<wl_buffer::WlBuffer, ()> + 'static,
 {
@@ -241,8 +267,11 @@ macro_rules! ignore_events {
 /// The registry, for `registry_queue_init`.
 macro_rules! registry_state {
     ($state:ty) => {
-        impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
-            for $state
+        impl
+            wayland_client::Dispatch<
+                wayland_client::protocol::wl_registry::WlRegistry,
+                wayland_client::globals::GlobalListContents,
+            > for $state
         {
             fn event(
                 _: &mut Self,

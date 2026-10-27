@@ -8,7 +8,9 @@ use std::fs::File;
 
 use luminaria::backend::{HeadlessBackend, InputCapabilities, LibinputBackend};
 use luminaria::core::Display;
-use luminaria::gpu::{DirectScanout, DrmDeviceId, Frame, SceneRenderer, VulkanOptions, VulkanRenderer};
+use luminaria::gpu::{
+    DirectScanout, DrmDeviceId, Frame, SceneRenderer, VulkanOptions, VulkanRenderer,
+};
 use luminaria::protocol::SurfaceId;
 use luminaria::shell::OutputLayout;
 use luminaria::util::{Color, Rect};
@@ -53,7 +55,12 @@ fn libinput_path_context_starts_empty() {
     assert!(!input.keymap().is_empty(), "the console layout compiles");
     assert!(input.add_device("/nonexistent/event0").is_err());
     let events = display.dispatch(Some(std::time::Duration::ZERO)).unwrap();
-    assert!(events.filter(|e| matches!(e, luminaria::Event::Input(_))).count() == 0);
+    assert!(
+        events
+            .filter(|e| matches!(e, luminaria::Event::Input(_)))
+            .count()
+            == 0
+    );
 
     let keymap = input.keymap();
     assert!(input.set_keymap(&keymap));
@@ -83,7 +90,11 @@ fn output_identity_and_liveness() {
     // them by itself, before Rust could have told it to.
     drop(backend);
     assert!(!a.is_alive() && !b.is_alive());
-    assert!(layout.bounds().width <= 0, "dead outputs still laid out: {:?}", layout.bounds());
+    assert!(
+        layout.bounds().width <= 0,
+        "dead outputs still laid out: {:?}",
+        layout.bounds()
+    );
     layout.remove(&mut a); // and a late removal is harmless
 }
 
@@ -119,7 +130,10 @@ fn output_dependants_survive_their_output() {
     };
     let mut frame = renderer.as_ref().map(|renderer| {
         let mut frame = Frame::new(&mut output, renderer).expect("frame");
-        assert!(frame.reset(luminaria::util::DrmFourcc::Xrgb8888).is_ok(), "headless has a render target");
+        assert!(
+            frame.reset(luminaria::util::DrmFourcc::Xrgb8888).is_ok(),
+            "headless has a render target"
+        );
         assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_ok());
         frame
     });
@@ -138,7 +152,10 @@ fn output_dependants_survive_their_output() {
     assert_eq!(direct.cached(), 0);
 
     if let Some(frame) = frame.as_mut() {
-        assert!(frame.reset(luminaria::util::DrmFourcc::Xrgb8888).is_err(), "reset after hotplug fails");
+        assert!(
+            frame.reset(luminaria::util::DrmFourcc::Xrgb8888).is_err(),
+            "reset after hotplug fails"
+        );
         assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_err());
         frame.begin(Rect::new(0, 0, 640, 480));
         frame.place_rect(Rect::new(0, 0, 10, 10), Color::rgb(1.0, 0.0, 0.0));
@@ -180,7 +197,10 @@ mod raw_vulkan {
 
         let scene = SceneRenderer::new(&VulkanOptions::default()).expect("scene renderer");
         match scene.raw_vulkan_handles() {
-            Some(s) => assert!(s.device != 0 && s.device != h.device, "a renderer of its own"),
+            Some(s) => assert!(
+                s.device != 0 && s.device != h.device,
+                "a renderer of its own"
+            ),
             None => assert!(!scene.gpu_enabled()),
         }
     }

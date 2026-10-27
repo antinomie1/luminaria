@@ -12,7 +12,10 @@ pub struct IdleInhibitorId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleInhibitEvent {
-    NewInhibitor { inhibitor: IdleInhibitorId, surface: SurfaceId },
+    NewInhibitor {
+        inhibitor: IdleInhibitorId,
+        surface: SurfaceId,
+    },
     InhibitorDestroy(IdleInhibitorId),
     /// Whether any visible inhibitor now keeps the session awake.
     Changed(bool),
@@ -32,13 +35,15 @@ impl<'d> IdleInhibitManager<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
 
 impl IdleInhibitManager<'_> {
-
     pub fn is_inhibited(&self) -> bool {
         self.raw.inhibited()
     }
@@ -71,7 +76,10 @@ pub enum IdleNotifierEvent {
     NewNotification(IdleNotificationId),
     NotificationDestroy(IdleNotificationId),
     /// Its timeout ran out (`idled`), or activity came back.
-    StateChange { notification: IdleNotificationId, idled: bool },
+    StateChange {
+        notification: IdleNotificationId,
+        idled: bool,
+    },
 }
 
 /// What a client asked to be told about.
@@ -97,13 +105,15 @@ impl<'d> IdleNotifier<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
 
 impl IdleNotifier<'_> {
-
     /// The user did something: every notification resumes and restarts.
     pub fn notify_activity(&self) {
         self.raw.notify_activity();
@@ -129,11 +139,13 @@ impl IdleNotifier<'_> {
 
     pub fn notification(&self, notification: IdleNotificationId) -> Option<IdleNotificationInfo> {
         let mut info = ffi::IdleNotificationInfoRaw::default();
-        self.raw.notification_info(notification.0, &mut info).then_some(IdleNotificationInfo {
-            timeout_ms: info.timeout_ms,
-            idled: info.idled,
-            input_only: info.input_only,
-        })
+        self.raw
+            .notification_info(notification.0, &mut info)
+            .then_some(IdleNotificationInfo {
+                timeout_ms: info.timeout_ms,
+                idled: info.idled,
+                input_only: info.input_only,
+            })
     }
 }
 
@@ -145,7 +157,9 @@ impl IdleInhibitEvent {
                 inhibitor: IdleInhibitorId(raw.id),
                 surface: SurfaceId(raw.other),
             },
-            EventKind::IdleInhibitorDestroy => IdleInhibitEvent::InhibitorDestroy(IdleInhibitorId(raw.id)),
+            EventKind::IdleInhibitorDestroy => {
+                IdleInhibitEvent::InhibitorDestroy(IdleInhibitorId(raw.id))
+            }
             EventKind::IdleInhibitChange => IdleInhibitEvent::Changed(raw.flag),
             _ => return None,
         });
@@ -159,8 +173,13 @@ impl IdleNotifierEvent {
         let notification = IdleNotificationId(raw.id);
         return Some(match raw.kind {
             EventKind::NewIdleNotification => IdleNotifierEvent::NewNotification(notification),
-            EventKind::IdleNotificationDestroy => IdleNotifierEvent::NotificationDestroy(notification),
-            EventKind::IdleStateChange => IdleNotifierEvent::StateChange { notification, idled: raw.flag },
+            EventKind::IdleNotificationDestroy => {
+                IdleNotifierEvent::NotificationDestroy(notification)
+            }
+            EventKind::IdleStateChange => IdleNotifierEvent::StateChange {
+                notification,
+                idled: raw.flag,
+            },
             _ => return None,
         });
         None

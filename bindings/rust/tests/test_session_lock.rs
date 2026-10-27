@@ -5,12 +5,14 @@
 #[macro_use]
 mod common;
 
-use common::{shm_buffer, ClientSide, Peer, take};
+use common::{ClientSide, Peer, shm_buffer, take};
 use luminaria::core::Display;
 use luminaria::desktop::{SessionLockEvent, SessionLockManager};
 use luminaria::protocol::{Compositor, OutputGlobal};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_compositor, wl_output, wl_shm, wl_shm_pool, wl_surface};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_output, wl_shm, wl_shm_pool, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
@@ -60,7 +62,12 @@ impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for Stat
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let ext_session_lock_surface_v1::Event::Configure { serial, width, height } = event {
+        if let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
             surface.ack_configure(serial);
             state.configures.push((width, height));
         }
@@ -74,7 +81,13 @@ struct Globals {
     locks: ext_session_lock_manager_v1::ExtSessionLockManagerV1,
 }
 
-fn bind(conn: &Connection) -> (Globals, wayland_client::EventQueue<State>, QueueHandle<State>) {
+fn bind(
+    conn: &Connection,
+) -> (
+    Globals,
+    wayland_client::EventQueue<State>,
+    QueueHandle<State>,
+) {
     let (globals, queue) = registry_queue_init::<State>(conn).expect("registry");
     let qh = queue.handle();
     let g = Globals {
@@ -123,7 +136,11 @@ fn lock_surface_and_orderly_unlock() {
     let mut peer = Peer::spawn(&display, orderly_client);
     peer.wait(&display, "locking");
     let events = take::<SessionLockEvent>();
-    let [SessionLockEvent::NewLock(l), SessionLockEvent::NewSurface { lock, surface: s }] = events[..] else {
+    let [
+        SessionLockEvent::NewLock(l),
+        SessionLockEvent::NewSurface { lock, surface: s },
+    ] = events[..]
+    else {
         panic!("{events:?}");
     };
     assert_eq!(lock, l);
@@ -139,7 +156,10 @@ fn lock_surface_and_orderly_unlock() {
     peer.go();
 
     peer.wait(&display, "mapped");
-    assert_eq!(take::<SessionLockEvent>(), [SessionLockEvent::SurfaceMap(s)]);
+    assert_eq!(
+        take::<SessionLockEvent>(),
+        [SessionLockEvent::SurfaceMap(s)]
+    );
     assert!(ls.is_mapped());
     // Every output is covered: now the client may be told.
     locks.lock(l).send_locked();
@@ -152,7 +172,10 @@ fn lock_surface_and_orderly_unlock() {
         take::<SessionLockEvent>(),
         [
             SessionLockEvent::SurfaceDestroy(s),
-            SessionLockEvent::LockDestroy { lock: l, unlocked: true }
+            SessionLockEvent::LockDestroy {
+                lock: l,
+                unlocked: true
+            }
         ]
     );
     assert!(!locks.is_locked());
@@ -191,7 +214,10 @@ fn a_lock_client_that_dies_leaves_the_session_locked() {
 
     assert_eq!(
         take::<SessionLockEvent>(),
-        [SessionLockEvent::LockDestroy { lock: l, unlocked: false }]
+        [SessionLockEvent::LockDestroy {
+            lock: l,
+            unlocked: false
+        }]
     );
     assert!(locks.is_locked(), "fails closed");
     assert!(locks.current().is_none());

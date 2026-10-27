@@ -81,24 +81,31 @@ impl<'d> LayerShell<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
 
 impl LayerShell<'_> {
-
     /// Every layer surface alive now, in no particular order.
     pub fn layer_surfaces(&self) -> Vec<SurfaceId> {
-        self.raw.layer_surfaces().into_iter().map(SurfaceId).collect()
+        self.raw
+            .layer_surfaces()
+            .into_iter()
+            .map(SurfaceId)
+            .collect()
     }
 
     /// The layer surface whose surface is `surface`, if there is one now.
     pub fn layer_surface(&self, surface: SurfaceId) -> Option<LayerSurface<'_>> {
         let mut info = ffi::LayerSurfaceInfoRaw::default();
-        self.raw
-            .info(surface.0, &mut info)
-            .then_some(LayerSurface { shell: self.raw.as_ref()?, surface })
+        self.raw.info(surface.0, &mut info).then_some(LayerSurface {
+            shell: self.raw.as_ref()?,
+            surface,
+        })
     }
 }
 

@@ -39,7 +39,10 @@ impl<'d> Seat<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 
@@ -71,7 +74,12 @@ impl<'d> Seat<'d> {
     }
 
     pub fn notify_modifiers(&self, modifiers: Modifiers) {
-        let Modifiers { depressed, latched, locked, group } = modifiers;
+        let Modifiers {
+            depressed,
+            latched,
+            locked,
+            group,
+        } = modifiers;
         self.raw.notify_modifiers(depressed, latched, locked, group);
     }
 

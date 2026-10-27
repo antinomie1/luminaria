@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use luminaria::backend::{AutoBackend, BackendKind, BackendOptions, Session};
 use luminaria::Event;
+use luminaria::backend::{AutoBackend, BackendKind, BackendOptions, Session};
 use luminaria::core::Display;
 
 /// One output arrives at start(), the size asked for, and nothing else is there.
@@ -46,7 +46,12 @@ fn test_auto_backend_picks() {
     // Headless by name: whatever else the machine has, it is not tried.
     {
         let display = Display::new().expect("display");
-        let options = BackendOptions { kind: BackendKind::Headless, width: 640, height: 480, ..Default::default() };
+        let options = BackendOptions {
+            kind: BackendKind::Headless,
+            width: 640,
+            height: 480,
+            ..Default::default()
+        };
         let mut backend = AutoBackend::new(&display, &options).expect("headless");
         check_headless(&display, &mut backend, 640, 480);
     }
@@ -54,7 +59,8 @@ fn test_auto_backend_picks() {
     // Auto with no parent compositor and no seat. libwayland falls back to
     // wayland-0 without WAYLAND_DISPLAY, so the runtime dir is an empty one;
     // libseat fails outright on a backend name it does not have.
-    let runtime = std::env::temp_dir().join(format!("luminaria-auto-backend-{}", std::process::id()));
+    let runtime =
+        std::env::temp_dir().join(format!("luminaria-auto-backend-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).expect("runtime dir");
     // SAFETY: the only test in this binary, so no other thread reads the
     // environment while it changes.
@@ -76,7 +82,10 @@ fn test_auto_backend_picks() {
     // Asked for by name, the same machine fails instead of falling back.
     {
         let display = Display::new().expect("display");
-        let options = BackendOptions { kind: BackendKind::Nested, ..Default::default() };
+        let options = BackendOptions {
+            kind: BackendKind::Nested,
+            ..Default::default()
+        };
         assert!(AutoBackend::new(&display, &options).is_err());
     }
     let _ = std::fs::remove_dir(&runtime);

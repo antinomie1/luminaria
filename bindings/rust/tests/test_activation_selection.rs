@@ -5,19 +5,24 @@
 #[macro_use]
 mod common;
 
-use std::io::{pipe, Read, Write};
+use std::io::{Read, Write, pipe};
 use std::os::fd::OwnedFd;
 
 use common::{ClientSide, Peer, take};
-use luminaria::protocol::SelectionChange;
 use luminaria::core::Display;
-use luminaria::protocol::{Compositor, DataDeviceManager, PrimarySelectionManager, Seat, XdgActivation};
+use luminaria::protocol::SelectionChange;
+use luminaria::protocol::{
+    Compositor, DataDeviceManager, PrimarySelectionManager, Seat, XdgActivation,
+};
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_seat, wl_surface};
-use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::protocol::{
+    wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_seat,
+    wl_surface,
+};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, event_created_child};
 use wayland_protocols::wp::primary_selection::zv1::client::{
-    zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1, zwp_primary_selection_offer_v1,
-    zwp_primary_selection_source_v1,
+    zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
+    zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
 };
 use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xdg_activation_v1};
 
@@ -56,7 +61,15 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
 }
 
 impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
-    fn event(_: &mut Self, _: &wl_data_device::WlDataDevice, _: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_data_device::WlDataDevice,
+        _: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 
     event_created_child!(State, wl_data_device::WlDataDevice, [
         wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
@@ -82,12 +95,21 @@ impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, ()> 
 /// What either kind of source answers a read with.
 fn answer(state: &mut State, mime_type: &str, fd: OwnedFd, contents: &[u8]) {
     assert_eq!(mime_type, "text/plain");
-    std::fs::File::from(fd).write_all(contents).expect("write selection");
+    std::fs::File::from(fd)
+        .write_all(contents)
+        .expect("write selection");
     state.sent += 1;
 }
 
 impl Dispatch<wl_data_source::WlDataSource, ()> for State {
-    fn event(state: &mut Self, _: &wl_data_source::WlDataSource, event: wl_data_source::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let wl_data_source::Event::Send { mime_type, fd } = event {
             answer(state, &mime_type, fd, b"clipboard");
         }
@@ -151,7 +173,9 @@ fn activation_requests() {
     let (spent, forged) = (&requests[0], &requests[1]);
     assert!(spent.token_valid);
     assert_eq!(spent.app_id, "org.luminaria.test");
-    let launcher = spent.requesting_surface.expect("the token named its surface");
+    let launcher = spent
+        .requesting_surface
+        .expect("the token named its surface");
     assert_ne!(spent.surface, launcher);
     assert!(!forged.token_valid);
     assert_eq!(forged.surface, launcher);
@@ -163,7 +187,8 @@ fn selection_client(conn: Connection, step: ClientSide) {
     let (globals, mut queue) = registry_queue_init::<State>(&conn).expect("registry");
     let qh = queue.handle();
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
-    let devices: wl_data_device_manager::WlDataDeviceManager = globals.bind(&qh, 1..=3, ()).unwrap();
+    let devices: wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
     let primaries: zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1 =
         globals.bind(&qh, 1..=1, ()).unwrap();
     let mut state = State::default();
@@ -203,8 +228,14 @@ fn selection_changes_and_reads() {
     assert_eq!(
         take::<SelectionChange>(),
         [
-            SelectionChange { primary: false, mime_types: vec!["text/plain".to_string()] },
-            SelectionChange { primary: true, mime_types: vec!["text/plain".to_string()] },
+            SelectionChange {
+                primary: false,
+                mime_types: vec!["text/plain".to_string()]
+            },
+            SelectionChange {
+                primary: true,
+                mime_types: vec!["text/plain".to_string()]
+            },
         ]
     );
     assert_eq!(clipboard.selection_mime_types(), ["text/plain"]);
@@ -222,7 +253,9 @@ fn selection_changes_and_reads() {
     clip_read.read_to_string(&mut text).expect("read clipboard");
     assert_eq!(text, "clipboard");
     text.clear();
-    primary_read.read_to_string(&mut text).expect("read primary");
+    primary_read
+        .read_to_string(&mut text)
+        .expect("read primary");
     assert_eq!(text, "primary");
     peer.go();
 
@@ -230,11 +263,20 @@ fn selection_changes_and_reads() {
     assert_eq!(
         take::<SelectionChange>(),
         [
-            SelectionChange { primary: false, mime_types: Vec::new() },
-            SelectionChange { primary: true, mime_types: Vec::new() },
+            SelectionChange {
+                primary: false,
+                mime_types: Vec::new()
+            },
+            SelectionChange {
+                primary: true,
+                mime_types: Vec::new()
+            },
         ]
     );
     let (_, unused) = pipe().expect("pipe");
-    assert!(!clipboard.selection_receive("text/plain", unused.into()), "nothing to read");
+    assert!(
+        !clipboard.selection_receive("text/plain", unused.into()),
+        "nothing to read"
+    );
     peer.finish(&display);
 }

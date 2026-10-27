@@ -60,8 +60,15 @@ impl SelectionChange {
             crate::ffi::EventKind::PrimarySelectionChange => true,
             _ => return None,
         };
-        let mime_types = if raw.text.is_empty() { Vec::new() } else { raw.text.lines().map(str::to_owned).collect() };
-        Some(Self { primary, mime_types })
+        let mime_types = if raw.text.is_empty() {
+            Vec::new()
+        } else {
+            raw.text.lines().map(str::to_owned).collect()
+        };
+        Some(Self {
+            primary,
+            mime_types,
+        })
     }
 }
 

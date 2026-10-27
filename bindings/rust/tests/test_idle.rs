@@ -5,14 +5,20 @@
 #[macro_use]
 mod common;
 
-use common::{pump, ClientSide, Peer, take};
+use common::{ClientSide, Peer, pump, take};
 use luminaria::core::Display;
-use luminaria::protocol::{Compositor, IdleInhibitEvent, IdleInhibitManager, IdleNotifier, IdleNotifierEvent, Seat};
+use luminaria::protocol::{
+    Compositor, IdleInhibitEvent, IdleInhibitManager, IdleNotifier, IdleNotifierEvent, Seat,
+};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_compositor, wl_seat, wl_surface};
 use wayland_client::{Connection, Dispatch, QueueHandle};
-use wayland_protocols::ext::idle_notify::v1::client::{ext_idle_notification_v1, ext_idle_notifier_v1};
-use wayland_protocols::wp::idle_inhibit::zv1::client::{zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1, ext_idle_notifier_v1,
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
+};
 
 #[derive(Default)]
 struct State {
@@ -51,7 +57,8 @@ fn inhibit_client(conn: Connection, step: ClientSide) {
     let (globals, mut queue) = registry_queue_init::<State>(&conn).expect("registry");
     let qh = queue.handle();
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
-    let inhibits: zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let inhibits: zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
     let mut state = State::default();
 
     let surface = compositor.create_surface(&qh, ());
@@ -73,27 +80,43 @@ fn inhibitors_count_while_visible() {
     let mut peer = Peer::spawn(&display, inhibit_client);
     peer.wait(&display, "inhibiting");
     let events = take::<IdleInhibitEvent>();
-    let [IdleInhibitEvent::NewInhibitor { inhibitor, surface }, IdleInhibitEvent::Changed(true)] = events[..] else {
+    let [
+        IdleInhibitEvent::NewInhibitor { inhibitor, surface },
+        IdleInhibitEvent::Changed(true),
+    ] = events[..]
+    else {
         panic!("{events:?}");
     };
     assert_eq!(inhibits.inhibitor_surface(inhibitor), Some(surface));
-    assert!(inhibits.is_visible(inhibitor), "visible until the compositor says otherwise");
+    assert!(
+        inhibits.is_visible(inhibitor),
+        "visible until the compositor says otherwise"
+    );
     assert!(inhibits.is_inhibited());
     assert_eq!(inhibits.inhibitor_count(), 1);
 
     // Off screen: it no longer keeps anything awake.
     inhibits.set_visible(inhibitor, false);
     common::collect(&display);
-    assert_eq!(take::<IdleInhibitEvent>(), [IdleInhibitEvent::Changed(false)]);
+    assert_eq!(
+        take::<IdleInhibitEvent>(),
+        [IdleInhibitEvent::Changed(false)]
+    );
     assert!(!inhibits.is_inhibited());
     inhibits.set_visible(inhibitor, true);
     common::collect(&display);
-    assert_eq!(take::<IdleInhibitEvent>(), [IdleInhibitEvent::Changed(true)]);
+    assert_eq!(
+        take::<IdleInhibitEvent>(),
+        [IdleInhibitEvent::Changed(true)]
+    );
     peer.go();
 
     peer.wait(&display, "released");
     let events = take::<IdleInhibitEvent>();
-    assert!(events.contains(&IdleInhibitEvent::InhibitorDestroy(inhibitor)), "{events:?}");
+    assert!(
+        events.contains(&IdleInhibitEvent::InhibitorDestroy(inhibitor)),
+        "{events:?}"
+    );
     assert_eq!(events.last(), Some(&IdleInhibitEvent::Changed(false)));
     assert!(!inhibits.is_inhibited());
     assert_eq!(inhibits.inhibitor_count(), 0);
@@ -146,7 +169,13 @@ fn notifications_idle_and_resume() {
         seen.extend(take::<IdleNotifierEvent>());
         !seen.is_empty()
     });
-    assert_eq!(seen, [IdleNotifierEvent::StateChange { notification: n, idled: true }]);
+    assert_eq!(
+        seen,
+        [IdleNotifierEvent::StateChange {
+            notification: n,
+            idled: true
+        }]
+    );
     assert!(notifier.notification(n).unwrap().idled);
     assert_eq!(notifier.idled_count(), 1);
     peer.go();
@@ -156,7 +185,10 @@ fn notifications_idle_and_resume() {
     common::collect(&display);
     assert_eq!(
         take::<IdleNotifierEvent>(),
-        [IdleNotifierEvent::StateChange { notification: n, idled: false }]
+        [IdleNotifierEvent::StateChange {
+            notification: n,
+            idled: false
+        }]
     );
     assert_eq!(notifier.idled_count(), 0);
     notifier.set_inhibited(true);
@@ -164,7 +196,10 @@ fn notifications_idle_and_resume() {
     peer.go();
 
     peer.wait(&display, "done");
-    assert_eq!(take::<IdleNotifierEvent>(), [IdleNotifierEvent::NotificationDestroy(n)]);
+    assert_eq!(
+        take::<IdleNotifierEvent>(),
+        [IdleNotifierEvent::NotificationDestroy(n)]
+    );
     assert_eq!(notifier.notification(n), None);
     assert_eq!(notifier.notification_count(), 0);
     peer.finish(&display);

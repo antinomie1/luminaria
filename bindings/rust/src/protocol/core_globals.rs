@@ -3,8 +3,9 @@
 use crate::core::{Display, Error};
 
 use super::{
-    Compositor, CursorShapeManager, DataDeviceManager, FractionalScaleManager, Presentation, PrimarySelectionManager,
-    Seat, SinglePixelBufferManager, Subcompositor, Viewporter, XdgDecorationManager, XdgShell,
+    Compositor, CursorShapeManager, DataDeviceManager, FractionalScaleManager, Presentation,
+    PrimarySelectionManager, Seat, SinglePixelBufferManager, Subcompositor, Viewporter,
+    XdgDecorationManager, XdgShell,
 };
 
 /// wl_shm, wl_compositor, wl_subcompositor, xdg-shell, wl_seat, the clipboard

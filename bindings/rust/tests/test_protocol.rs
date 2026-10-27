@@ -21,14 +21,18 @@ fn test_core_protocols_instantiation() {
     assert!(!seat.keymap().is_empty());
 
     let _layer_shell = LayerShell::new(&display).expect("LayerShell failed");
-    let output_global = OutputGlobal::new(&display, 1920, 1080, "test-output").expect("OutputGlobal failed");
+    let output_global =
+        OutputGlobal::new(&display, 1920, 1080, "test-output").expect("OutputGlobal failed");
     output_global.set_logical_position(100, 200);
     output_global.set_mode(1920, 1080, 144000);
     output_global.set_scale(2);
     assert_eq!(output_global.logical_position(), (100, 200));
     assert_eq!(output_global.scale(), 2);
     assert_eq!(output_global.refresh_mhz(), 144000);
-    assert_eq!(output_global.transform(), luminaria::util::Transform::Normal);
+    assert_eq!(
+        output_global.transform(),
+        luminaria::util::Transform::Normal
+    );
     assert_eq!(output_global.name(), "test-output");
     assert_eq!(output_global.size(), (1920, 1080));
     assert_eq!(output_global.width(), 1920);
@@ -64,9 +68,12 @@ fn test_core_protocols_instantiation() {
 
     // Seat globals
     let _data_device = DataDeviceManager::new(&display, &seat).expect("DataDevice failed");
-    let _primary_sel = PrimarySelectionManager::new(&display, &seat).expect("PrimarySelection failed");
-    let _relative_ptr = RelativePointerManager::new(&display, &seat).expect("RelativePointer failed");
-    let _ptr_constraints = PointerConstraints::new(&display, &seat).expect("PointerConstraints failed");
+    let _primary_sel =
+        PrimarySelectionManager::new(&display, &seat).expect("PrimarySelection failed");
+    let _relative_ptr =
+        RelativePointerManager::new(&display, &seat).expect("RelativePointer failed");
+    let _ptr_constraints =
+        PointerConstraints::new(&display, &seat).expect("PointerConstraints failed");
     let _text_input = TextInputManager::new(&display, &seat).expect("TextInput failed");
 }
 

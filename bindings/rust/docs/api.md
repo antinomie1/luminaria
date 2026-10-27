@@ -483,6 +483,7 @@ let _commit_timing   = CommitTimingManager::new(&display)?;
 let _presentation    = Presentation::new(&display)?;
 let _bg_effect       = BackgroundEffectManager::new(&display)?;
 let _icon_mgr        = XdgToplevelIconManager::new(&display)?;
+let _gestures        = PointerGestures::new(&display)?;
 
 // 依赖 Seat 的席位协议
 let _data_device     = DataDeviceManager::new(&display, &seat)?;
@@ -491,6 +492,11 @@ let _relative_ptr    = RelativePointerManager::new(&display, &seat)?;
 let _ptr_constraints = PointerConstraints::new(&display, &seat)?;
 let _text_input      = TextInputManager::new(&display, &seat)?;
 ```
+
+- **`PointerGestures`**：`zwp_pointer_gestures_v1` (v3) 触摸板手势支持。向客户端分发手势：
+  - `send_swipe_begin(surface, serial, time_ms, fingers)` / `send_swipe_update(time_ms, dx, dy)` / `send_swipe_end(serial, time_ms, cancelled)`
+  - `send_pinch_begin(surface, serial, time_ms, fingers)` / `send_pinch_update(time_ms, dx, dy, scale, rotation_deg)` / `send_pinch_end(serial, time_ms, cancelled)`
+  - `send_hold_begin(surface, serial, time_ms, fingers)` / `send_hold_end(serial, time_ms, cancelled)`
 
 ---
 
@@ -571,6 +577,10 @@ match outcome {
   之间的桥接它自己完成。事件 `Event::InputMethod(InputMethodEvent)`：`New`、`GrabChange { input_method, grabbed }`、`Destroy`、
   `NewPopupSurface { input_method, surface }`、`PopupSurfaceDestroy`。抢占键盘期间按键经 `input_method(id).grab_send_key(...)`
   送给输入法，候选窗口放在 `popup_text_input_rectangle(surface)` 旁边。
+- **`GammaControlManager`**：`zwlr_gamma_control_manager_v1`。输出伽马曲线查找表管理（夜间模式等）。`gamma_size()` 返回查找表条目数，`ramp(output_res)` 查询当前设定的 16 位 RGB 曲线。事件 `Event::Gamma(GammaEvent { output_resource, has_ramp })`。
+- **`CtmControlManager`**：`hyprland_ctm_control_manager_v1` (v2)。输出色彩变换矩阵（CTM）控制。`matrix(output_res)` 查询当前提交的 3×3 行优先变换矩阵。事件 `Event::Ctm(CtmEvent { output_resource })`。
+- **`VirtualKeyboardManager`**：`zwp_virtual_keyboard_manager_v1`。接收客户端虚拟键盘按键与修饰键注入。事件 `Event::VirtualKey(VirtualKeyEvent)`、`Event::VirtualModifiers(VirtualModifiersEvent)`。
+- **`VirtualPointerManager`**：`zwlr_virtual_pointer_manager_v1` (v2)。接收客户端虚拟指针移动、按键与轴滚轮注入。事件 `Event::VirtualPointer(VirtualPointerEvent)`（`Motion`、`MotionAbsolute`、`Button`、`Axis`、`Frame`）。
 
 ---
 

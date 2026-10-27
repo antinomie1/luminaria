@@ -6,12 +6,16 @@
 #[macro_use]
 mod common;
 
-use common::{dispatch, ClientSide, Peer, take};
+use common::{ClientSide, Peer, dispatch, take};
 use luminaria::core::Display;
-use luminaria::protocol::{Compositor, CompositorEvent, FractionalScaleManager, Subcompositor, SurfaceId};
+use luminaria::protocol::{
+    Compositor, CompositorEvent, FractionalScaleManager, Subcompositor, SurfaceId,
+};
 use luminaria::util::Transform;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_compositor, wl_output, wl_subcompositor, wl_subsurface, wl_surface};
+use wayland_client::protocol::{
+    wl_compositor, wl_output, wl_subcompositor, wl_subsurface, wl_surface,
+};
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
@@ -43,7 +47,9 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_surface::Event::PreferredBufferScale { factor } => state.preferred_scale = Some(factor),
+            wl_surface::Event::PreferredBufferScale { factor } => {
+                state.preferred_scale = Some(factor)
+            }
             wl_surface::Event::PreferredBufferTransform { transform } => {
                 state.preferred_transform = transform.into_result().ok()
             }
@@ -103,7 +109,11 @@ fn client_scales(conn: Connection, step: ClientSide) {
         Some(wl_output::Transform::_90),
         "preferred transform"
     );
-    assert_eq!(state.fractional_scale, Some(180), "fractional scale in 120ths");
+    assert_eq!(
+        state.fractional_scale,
+        Some(180),
+        "fractional scale in 120ths"
+    );
     step.step("scaled");
 
     // 2.0 is 240 in 120ths.
@@ -166,7 +176,11 @@ fn surface_tree_reports_subsurface_offsets() {
     let tree = root.surface_tree();
     assert!(tree.len() >= 2, "parent and child, got {tree:?}");
     assert_eq!((tree[0].surface, tree[0].x, tree[0].y), (root, 0, 0));
-    assert_eq!((tree[1].x, tree[1].y), (12, 34), "subsurface offset: {tree:?}");
+    assert_eq!(
+        (tree[1].x, tree[1].y),
+        (12, 34),
+        "subsurface offset: {tree:?}"
+    );
     assert_ne!(tree[1].surface, root);
 
     // A stale id finds nothing rather than faulting.

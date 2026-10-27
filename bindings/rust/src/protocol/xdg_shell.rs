@@ -20,12 +20,21 @@ pub enum ToplevelEvent {
     RequestFullscreen(bool),
     RequestMinimize,
     /// Interactive move, started from the click with this input serial.
-    RequestMove { serial: u32 },
+    RequestMove {
+        serial: u32,
+    },
     /// Interactive resize; `edges` is a [`crate::util::edge`] bitmask.
-    RequestResize { serial: u32, edges: u32 },
+    RequestResize {
+        serial: u32,
+        edges: u32,
+    },
     /// Right-click on the client's own decorations, at (`x`, `y`) in its
     /// surface: it wants the compositor's window menu.
-    RequestWindowMenu { serial: u32, x: i32, y: i32 },
+    RequestWindowMenu {
+        serial: u32,
+        x: i32,
+        y: i32,
+    },
     /// The title or app id changed.
     IdentityChange,
     /// One of the compositor's own setters changed the window's state.
@@ -39,14 +48,18 @@ pub enum ToplevelEvent {
 pub enum PopupEvent {
     /// `parent` is the xdg parent's surface, `None` for a popup a layer
     /// surface will claim (see [`LayerSurfaceEvent::NewPopup`](super::LayerSurfaceEvent::NewPopup)).
-    Created { parent: Option<SurfaceId> },
+    Created {
+        parent: Option<SurfaceId>,
+    },
     Map,
     Unmap,
     Destroy,
     /// The client repositioned it; its geometry changed.
     Reposition,
     /// It asked for an explicit grab, from the click with this serial.
-    Grab { serial: u32 },
+    Grab {
+        serial: u32,
+    },
 }
 
 /// An xdg-shell event ([`crate::Event::Toplevel`] or [`crate::Event::Popup`]), named by the surface it is about.
@@ -66,10 +79,16 @@ impl XdgEvent {
             EventKind::ToplevelMap => toplevel(ToplevelEvent::Map),
             EventKind::ToplevelUnmap => toplevel(ToplevelEvent::Unmap),
             EventKind::ToplevelDestroy => toplevel(ToplevelEvent::Destroy),
-            EventKind::ToplevelRequestMaximize => toplevel(ToplevelEvent::RequestMaximize(raw.flag)),
-            EventKind::ToplevelRequestFullscreen => toplevel(ToplevelEvent::RequestFullscreen(raw.flag)),
+            EventKind::ToplevelRequestMaximize => {
+                toplevel(ToplevelEvent::RequestMaximize(raw.flag))
+            }
+            EventKind::ToplevelRequestFullscreen => {
+                toplevel(ToplevelEvent::RequestFullscreen(raw.flag))
+            }
             EventKind::ToplevelRequestMinimize => toplevel(ToplevelEvent::RequestMinimize),
-            EventKind::ToplevelRequestMove => toplevel(ToplevelEvent::RequestMove { serial: raw.serial }),
+            EventKind::ToplevelRequestMove => {
+                toplevel(ToplevelEvent::RequestMove { serial: raw.serial })
+            }
             EventKind::ToplevelRequestResize => toplevel(ToplevelEvent::RequestResize {
                 serial: raw.serial,
                 edges: raw.value,
@@ -81,7 +100,9 @@ impl XdgEvent {
             }),
             EventKind::ToplevelIdentityChange => toplevel(ToplevelEvent::IdentityChange),
             EventKind::ToplevelStateChange => toplevel(ToplevelEvent::StateChange),
-            EventKind::ToplevelParentChange => toplevel(ToplevelEvent::ParentChange(SurfaceId::from_raw(raw.other))),
+            EventKind::ToplevelParentChange => {
+                toplevel(ToplevelEvent::ParentChange(SurfaceId::from_raw(raw.other)))
+            }
             EventKind::NewPopup => popup(PopupEvent::Created {
                 parent: SurfaceId::from_raw(raw.other),
             }),
@@ -152,7 +173,10 @@ impl<'d> XdgShell<'d> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _display: Holds::new() })
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
         }
     }
 }
@@ -192,15 +216,19 @@ impl XdgShell<'_> {
         let mut info = ffi::ToplevelInfoRaw::default();
         self.raw
             .toplevel_info(surface.0, &mut info)
-            .then_some(Toplevel { shell: self.raw.as_ref()?, surface })
+            .then_some(Toplevel {
+                shell: self.raw.as_ref()?,
+                surface,
+            })
     }
 
     /// The popup whose surface is `surface`, if there is one now.
     pub fn popup(&self, surface: SurfaceId) -> Option<Popup<'_>> {
         let mut info = ffi::PopupInfoRaw::default();
-        self.raw
-            .popup_info(surface.0, &mut info)
-            .then_some(Popup { shell: self.raw.as_ref()?, surface })
+        self.raw.popup_info(surface.0, &mut info).then_some(Popup {
+            shell: self.raw.as_ref()?,
+            surface,
+        })
     }
 
     /// Replace the areas popups are kept inside. The shell asks while it places
@@ -288,7 +316,10 @@ impl Toplevel<'_> {
     /// Ask the client to take this size (0 = its choice) with the current
     /// states. Returns the configure serial.
     pub fn configure(&self, size: impl Into<Point<i32>>) -> u32 {
-        let Point { x: width, y: height } = size.into();
+        let Point {
+            x: width,
+            y: height,
+        } = size.into();
         self.shell.toplevel_configure(self.surface.0, width, height)
     }
 
@@ -299,7 +330,8 @@ impl Toplevel<'_> {
     }
 
     pub fn set_fullscreen(&self, on: bool) {
-        self.shell.toplevel_set_state(self.surface.0, FULLSCREEN, on);
+        self.shell
+            .toplevel_set_state(self.surface.0, FULLSCREEN, on);
     }
 
     pub fn set_activated(&self, on: bool) {

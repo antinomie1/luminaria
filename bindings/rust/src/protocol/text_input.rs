@@ -38,13 +38,15 @@ impl<'a> TextInputManager<'a> {
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
         }
     }
 }
 
 impl TextInputManager<'_> {
-
     /// The enabled text input of the keyboard-focused client.
     pub fn focused(&self) -> Option<TextInputId> {
         match self.raw.focused() {
@@ -57,7 +59,10 @@ impl TextInputManager<'_> {
         let mut info = ffi::TextInputInfoRaw::default();
         self.raw
             .text_input_info(id.0, &mut info)
-            .then_some(TextInput { mgr: self.raw.as_ref()?, id })
+            .then_some(TextInput {
+                mgr: self.raw.as_ref()?,
+                id,
+            })
     }
 }
 
@@ -117,7 +122,8 @@ impl TextInput<'_> {
 
     // The send_* calls queue state the client applies at the next send_done.
     pub fn send_preedit_string(&self, text: &str, cursor_begin: i32, cursor_end: i32) {
-        self.mgr.send_preedit_string(self.id.0, text, cursor_begin, cursor_end);
+        self.mgr
+            .send_preedit_string(self.id.0, text, cursor_begin, cursor_end);
     }
 
     pub fn send_commit_string(&self, text: &str) {
@@ -125,7 +131,8 @@ impl TextInput<'_> {
     }
 
     pub fn send_delete_surrounding_text(&self, before: u32, after: u32) {
-        self.mgr.send_delete_surrounding_text(self.id.0, before, after);
+        self.mgr
+            .send_delete_surrounding_text(self.id.0, before, after);
     }
 
     pub fn send_done(&self) {

@@ -50,14 +50,14 @@
 
 pub mod backend;
 pub mod core;
-pub mod event;
 #[cfg(feature = "desktop")]
 pub mod desktop;
-#[cfg(feature = "render")]
-pub mod render;
+pub mod event;
 #[cfg(feature = "shell")]
 pub mod gpu;
 pub mod protocol;
+#[cfg(feature = "render")]
+pub mod render;
 pub mod shell;
 #[cfg(feature = "text")]
 pub mod text;

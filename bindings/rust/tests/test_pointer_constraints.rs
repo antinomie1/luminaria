@@ -7,7 +7,9 @@ mod common;
 
 use common::{ClientSide, Peer, take};
 use luminaria::core::Display;
-use luminaria::protocol::{Compositor, PointerConstraintEvent, PointerConstraintKind, PointerConstraints, Seat};
+use luminaria::protocol::{
+    Compositor, PointerConstraintEvent, PointerConstraintKind, PointerConstraints, Seat,
+};
 use luminaria::util::Rect;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_compositor, wl_pointer, wl_region, wl_seat, wl_surface};
@@ -56,7 +58,8 @@ fn client(conn: Connection, step: ClientSide) {
     let qh = queue.handle();
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
-    let constraints: zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let constraints: zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
     let mut state = State::default();
 
     let pointer = seat.get_pointer(&qh, ());
@@ -65,7 +68,8 @@ fn client(conn: Connection, step: ClientSide) {
     let editor = compositor.create_surface(&qh, ());
     let region = compositor.create_region(&qh, ());
     region.add(0, 0, 10, 10);
-    let confine = constraints.confine_pointer(&editor, &pointer, Some(&region), Lifetime::Oneshot, &qh, ());
+    let confine =
+        constraints.confine_pointer(&editor, &pointer, Some(&region), Lifetime::Oneshot, &qh, ());
     queue.roundtrip(&mut state).unwrap();
     step.step("requested");
 
@@ -74,7 +78,11 @@ fn client(conn: Connection, step: ClientSide) {
     step.step("locked");
 
     queue.roundtrip(&mut state).unwrap();
-    assert_eq!((state.locked, state.unlocked), (1, 1), "losing focus unlocks");
+    assert_eq!(
+        (state.locked, state.unlocked),
+        (1, 1),
+        "losing focus unlocks"
+    );
     lock.set_cursor_position_hint(5.0, 6.0);
     game.commit();
     let wider = compositor.create_region(&qh, ());
@@ -101,7 +109,11 @@ fn constraints_follow_pointer_focus() {
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "requested");
     let events = take::<PointerConstraintEvent>();
-    let [PointerConstraintEvent::New(game), PointerConstraintEvent::New(editor)] = events[..] else {
+    let [
+        PointerConstraintEvent::New(game),
+        PointerConstraintEvent::New(editor),
+    ] = events[..]
+    else {
         panic!("{events:?}");
     };
     let lock = constraints.constraint(game).expect("lock");
@@ -130,7 +142,10 @@ fn constraints_follow_pointer_focus() {
     peer.go();
 
     peer.wait(&display, "updated");
-    assert_eq!(take::<PointerConstraintEvent>(), [PointerConstraintEvent::RegionChange(editor)]);
+    assert_eq!(
+        take::<PointerConstraintEvent>(),
+        [PointerConstraintEvent::RegionChange(editor)]
+    );
     assert_eq!(confine.region(), Some(vec![Rect::new(0, 0, 20, 20)]));
     assert_eq!(lock.cursor_hint(), Some((5.0, 6.0)));
     peer.go();
@@ -138,7 +153,10 @@ fn constraints_follow_pointer_focus() {
     peer.wait(&display, "destroyed");
     assert_eq!(
         take::<PointerConstraintEvent>(),
-        [PointerConstraintEvent::Destroy(game), PointerConstraintEvent::Destroy(editor)]
+        [
+            PointerConstraintEvent::Destroy(game),
+            PointerConstraintEvent::Destroy(editor)
+        ]
     );
     assert!(constraints.constraint(game).is_none());
     assert!(!lock.is_active());

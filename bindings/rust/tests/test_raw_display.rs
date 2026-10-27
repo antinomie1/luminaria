@@ -122,7 +122,8 @@ unsafe extern "C" fn extra_bind(client: *mut c_void, data: *mut c_void, version:
 
 unsafe extern "C" fn extra_destroy(resource: *mut c_void) {
     // SAFETY: the user data is the Arc leaked in `extra_bind`, taken back once.
-    let counter = unsafe { Arc::from_raw(wl_resource_get_user_data(resource) as *const AtomicUsize) };
+    let counter =
+        unsafe { Arc::from_raw(wl_resource_get_user_data(resource) as *const AtomicUsize) };
     counter.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -167,7 +168,9 @@ unsafe extern "C" fn on_global(
     version: u32,
 ) {
     let globals = unsafe { &mut *(data as *mut Globals) };
-    let interface = unsafe { CStr::from_ptr(interface) }.to_string_lossy().into_owned();
+    let interface = unsafe { CStr::from_ptr(interface) }
+        .to_string_lossy()
+        .into_owned();
     globals.push((name, interface, version));
 }
 
@@ -251,7 +254,9 @@ fn extra_global_through_raw_display() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let globals = loop {
-        display.dispatch(Some(Duration::from_millis(10))).expect("dispatch");
+        display
+            .dispatch(Some(Duration::from_millis(10)))
+            .expect("dispatch");
         display.flush_clients();
         if let Ok(globals) = report_rx.try_recv() {
             break globals;
@@ -261,7 +266,10 @@ fn extra_global_through_raw_display() {
 
     // The raw global coexists with luminaria's own.
     let has = |name: &str| globals.iter().any(|(_, interface, _)| interface == name);
-    assert!(has("lum_test_extra"), "client did not see the extra global: {globals:?}");
+    assert!(
+        has("lum_test_extra"),
+        "client did not see the extra global: {globals:?}"
+    );
     assert!(has("wl_compositor"), "{globals:?}");
     assert!(has("wl_seat"), "{globals:?}");
     assert_eq!(extra.state.binds.load(Ordering::SeqCst), 1);
@@ -272,11 +280,17 @@ fn extra_global_through_raw_display() {
     // destroys the client and, with it, the resource whose handler must not
     // touch the global's (freed) state.
     drop(extra);
-    display.dispatch(Some(Duration::ZERO)).expect("dispatch after global destroy");
+    display
+        .dispatch(Some(Duration::ZERO))
+        .expect("dispatch after global destroy");
     drop(seat);
     drop(compositor);
     drop(display);
-    assert_eq!(destroyed.load(Ordering::SeqCst), 1, "resource destroy handler did not run");
+    assert_eq!(
+        destroyed.load(Ordering::SeqCst),
+        1,
+        "resource destroy handler did not run"
+    );
 
     go_tx.send(()).unwrap();
     client.join().unwrap();
