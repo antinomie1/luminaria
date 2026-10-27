@@ -6,6 +6,7 @@ use std::pin::Pin;
 use crate::core::{Display, Holds};
 use crate::core::{Error, ErrorKind};
 use crate::ffi;
+use crate::protocol::TabletInput;
 #[cfg(feature = "backend")]
 use crate::ffi_backend;
 use crate::util::{Color, DrmFourcc, Keysym, Mode, Transform};
@@ -114,6 +115,35 @@ impl Output {
 
     pub fn has_cursor_plane(&self) -> bool {
         self.raw.has_cursor_plane()
+    }
+
+    /// Whether this display, on this connector, can do variable refresh
+    /// (FreeSync, G-Sync Compatible, VESA Adaptive-Sync): the display waits for
+    /// the frame instead of the frame waiting for the display, so a game
+    /// rendering 97 fps is shown at 97 Hz and a still desktop lets the panel idle
+    /// down. False for headless and nested outputs.
+    pub fn vrr_capable(&self) -> bool {
+        self.raw.vrr_capable()
+    }
+
+    /// Whether variable refresh is asked for. A request that has not yet
+    /// reached the hardware (it rides on the next commit) already reads as on.
+    pub fn vrr_enabled(&self) -> bool {
+        self.raw.vrr_enabled()
+    }
+
+    /// Turn variable refresh on or off. Takes effect with the next commit — on a
+    /// compositor that only commits when something changed, the next frame with
+    /// damage, which is when it matters. Asking for it where
+    /// [`vrr_capable`](Self::vrr_capable) is false is an error; if the kernel
+    /// refuses it later, VRR falls back to off rather than failing every commit.
+    pub fn set_vrr(&mut self, enabled: bool) -> Result<(), Error> {
+        let mut err = String::new();
+        if self.pin().set_vrr(enabled, &mut err) {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::Backend, err))
+        }
     }
 
     pub fn move_cursor(&mut self, x: i32, y: i32) -> Result<(), Error> {
@@ -885,6 +915,9 @@ pub enum InputEvent {
     },
     /// What the devices can do changed. Forward to `Seat::set_capabilities()`.
     Capabilities(InputCapabilities),
+    /// A graphics tablet, a pen over it, or its pad: feed it to
+    /// [`TabletManager`](crate::protocol::TabletManager).
+    Tablet(TabletInput),
 }
 
 impl InputEvent {
@@ -906,6 +939,23 @@ impl InputEvent {
             group: 0,
             output: 0,
             text: String::new(),
+            device: 0,
+            tool: 0,
+            time: 0,
+            tool_type: 0,
+            serial: 0,
+            wacom_id: 0,
+            caps: 0,
+            mode: 0,
+            vid: 0,
+            pid: 0,
+            bustype: 0,
+            path: String::new(),
+            axes: ffi::TabletAxesRaw::default(),
+            pad_buttons: 0,
+            pad_rings: 0,
+            pad_strips: 0,
+            groups: Vec::new(),
         }
     }
 
@@ -961,7 +1011,12 @@ impl InputEvent {
             K::TouchUp => InputEvent::TouchUp { id: raw.id },
             K::TouchFrame => InputEvent::TouchFrame,
             K::TouchCancel => InputEvent::TouchCancel { id: raw.id },
-            _ => InputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
+            K::Capabilities => InputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
+            // Every other kind is a tablet event.
+            _ => TabletInput::from_raw(&raw).map_or_else(
+                || InputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
+                InputEvent::Tablet,
+            ),
         }
     }
 }

@@ -81,6 +81,64 @@ void foreign_toplevel_track(ForeignToplevelManagerShim &ftm,
   ftm.track(shell);
 }
 
+// ---- ext-foreign-toplevel-list ---------------------------------------------
+
+struct ForeignToplevelListShim::Impl {
+  std::optional<lm::ForeignToplevelList> list;
+};
+ForeignToplevelListShim::~ForeignToplevelListShim() = default;
+ForeignToplevelListShim::ForeignToplevelListShim(
+    std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+ForeignToplevelListShim::Impl &ForeignToplevelListShim::impl() const {
+  return *impl_;
+}
+
+std::unique_ptr<ForeignToplevelListShim>
+foreign_toplevel_list_new(const DisplayShim &display, rust::String &error) {
+  try {
+    lm::Display *disp = raw_ptr(display);
+    if (!disp) {
+      error = "display not initialized";
+      return nullptr;
+    }
+    auto r = lm::ForeignToplevelList::create(*disp);
+    if (!r) {
+      error = to_rust(r.error().message);
+      return nullptr;
+    }
+    auto impl = std::make_unique<ForeignToplevelListShim::Impl>();
+    impl->list.emplace(std::move(*r));
+    return std::make_unique<ForeignToplevelListShim>(std::move(impl));
+  } catch (const std::exception &e) {
+    error = e.what();
+    return nullptr;
+  }
+}
+void ForeignToplevelListShim::track(const XdgShellShim &shell) {
+  lm::XdgShell *sh = raw_ptr(shell);
+  if (impl_->list && sh) {
+    impl_->list->track(*sh);
+  }
+}
+void foreign_toplevel_list_track(ForeignToplevelListShim &list,
+                                 const XdgShellShim &shell) {
+  list.track(shell);
+}
+std::uint32_t ForeignToplevelListShim::toplevel_count() const {
+  return impl_->list ? static_cast<std::uint32_t>(impl_->list->toplevel_count())
+                     : 0;
+}
+
+namespace {
+lm::Toplevel *resolve_foreign_toplevel(wl_resource *handle) {
+  return lm::ForeignToplevelList::toplevel_for(handle);
+}
+} // namespace
+std::size_t foreign_toplevel_list_resolver() {
+  return reinterpret_cast<std::size_t>(&resolve_foreign_toplevel);
+}
+
 struct WorkspaceManagerShim::Impl {
   std::optional<lm::WorkspaceManager> mgr;
   Events events;

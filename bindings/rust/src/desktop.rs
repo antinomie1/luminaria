@@ -74,6 +74,42 @@ impl<'d> ForeignToplevelManager<'d> {
     }
 }
 
+/// The `ext_foreign_toplevel_list_v1` global: every mapped window with a title,
+/// an app id and a stable opaque identifier, and nothing a client could do to
+/// one — the read-only list a screen-sharing portal picks a window from. Pair it
+/// with [`ScreencopyManager::enable_toplevel_capture`](crate::render::ScreencopyManager::enable_toplevel_capture)
+/// to capture the window picked.
+pub struct ForeignToplevelList<'d> {
+    pub(crate) raw: cxx::UniquePtr<ffi::ForeignToplevelListShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> ForeignToplevelList<'d> {
+    pub fn new(display: &'d Display) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::foreign_toplevel_list_new(&display.raw, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self {
+                raw,
+                _display: Holds::new(),
+            })
+        }
+    }
+
+    /// Publish every window of `shell` and keep the list current by itself.
+    /// The shell stays borrowed for as long as the list lives.
+    pub fn track(&mut self, shell: &'d XdgShell<'_>) {
+        ffi::foreign_toplevel_list_track(self.raw.pin_mut(), &shell.raw);
+    }
+
+    /// How many windows are announced right now.
+    pub fn toplevel_count(&self) -> u32 {
+        self.raw.toplevel_count()
+    }
+}
+
 /// A workspace request kind from a pager or panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceRequestKind {

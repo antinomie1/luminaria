@@ -56,6 +56,28 @@ fn test_headless_backend_and_output() {
 }
 
 #[test]
+fn test_headless_output_has_no_variable_refresh() {
+    let temp_dir = std::env::temp_dir().join("luminaria_test_backend_vrr_runtime");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &temp_dir);
+    }
+
+    let display = Display::new().expect("failed to create display");
+    let mut backend =
+        HeadlessBackend::new(&display, 16).expect("failed to create headless backend");
+    let mut output = backend.add_output(800, 600).expect("failed to add output");
+
+    // Nothing virtual can do FreeSync, and saying so is an error, not a lie.
+    assert!(!output.vrr_capable());
+    assert!(!output.vrr_enabled());
+    assert!(output.set_vrr(true).is_err());
+    assert!(!output.vrr_enabled());
+    // Turning it off where it is off is fine.
+    output.set_vrr(false).expect("disabling is always allowed");
+}
+
+#[test]
 fn test_session_handling_skipped_by_default() {
     // Only run if specifically opted-in from a free VT to prevent taking over the host session
     if std::env::var("LUMINARIA_TEST_HARDWARE").as_deref() != Ok("1") {

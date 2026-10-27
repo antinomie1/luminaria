@@ -233,4 +233,40 @@ impl<'d> ScreencopyManager<'d> {
             })
         }
     }
+
+    /// Publish `ext_foreign_toplevel_image_capture_source_manager_v1`: a client
+    /// holding a handle from `list` can capture THAT WINDOW — not the screen —
+    /// through the same `ext-image-copy-capture` sessions an output capture
+    /// uses. This is single-window screen sharing (Zoom, Teams, Discord,
+    /// browsers through xdg-desktop-portal).
+    ///
+    /// The window is rendered from its own surface tree, so what the recipient
+    /// sees does not depend on what covers it or where it sits on the layout.
+    /// Captures are paced by the window's own commits, so an idle shared window
+    /// costs no wake-ups; the session is stopped when the window is destroyed
+    /// and re-advertises its size when the window is resized.
+    ///
+    /// The list must already track the shell (`ForeignToplevelList::track`).
+    #[cfg(feature = "desktop")]
+    pub fn enable_toplevel_capture(
+        &mut self,
+        display: &'d Display,
+        list: &crate::desktop::ForeignToplevelList<'_>,
+    ) -> Result<(), Error> {
+        // The list is only needed to prove it exists: the resolver is a static
+        // function that reads the handle's own state.
+        let _ = list;
+        let mut err = String::new();
+        let resolver = crate::ffi_desktop::foreign_toplevel_list_resolver();
+        if ffi::screencopy_enable_toplevel_capture(
+            self.raw.pin_mut(),
+            &display.raw,
+            resolver,
+            &mut err,
+        ) {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::Gpu, err))
+        }
+    }
 }

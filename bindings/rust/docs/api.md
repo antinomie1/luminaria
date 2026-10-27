@@ -64,7 +64,8 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 | `DataControlManager<'a>` | `Display`、`DataDeviceManager` |
 | `InputMethodManager<'a>` | `Display`、`Seat`、`TextInputManager` |
 | `OutputManager<'a>` | `Display`、`OutputLayout` |
-| `ForeignToplevelManager<'d>` | `Display`；`track(&shell)` 之后还有那个 `XdgShell` |
+| `ForeignToplevelManager<'d>`、`ForeignToplevelList<'d>` | `Display`；`track(&shell)` 之后还有那个 `XdgShell` |
+| `TabletManager<'d>`、`ColorManager<'d>`、`ColorRepresentationManager<'d>` | `Display` |
 | `LinuxDmabuf<'a>` | `Display`，以及传入的 `VulkanRenderer` 或 `SceneRenderer` |
 | `Cursor<'a>` | `SceneRenderer`、`OutputLayout`、`Seat` |
 | `Frame<'r>` | `VulkanRenderer` |
@@ -228,6 +229,10 @@ let (depressed, latched, locked, group) = keymap.modifiers();
 - 输出上发生的事以 `Event::Output(id, OutputEvent)` 到来：`Frame`（`schedule_frame()` 要的那一帧到了，现在画）、
   `Present`（一帧上了屏）、`ModeChanged`（`set_mode()` 落地；渲染器、布局与跟随的 `OutputGlobal` 已经跟上）。
 - `output.move_cursor(x, y)` / `output.hide_cursor()`：驱动硬件独立 KMS 光标平面。
+- `output.vrr_capable()` / `output.vrr_enabled()` / `output.set_vrr(bool)`：可变刷新率（FreeSync / Adaptive-Sync）。面板跟着帧走：
+  空闲桌面让面板降到自己范围的底，游戏渲染多快就刷多快。`set_vrr` 随下一次提交生效；在 `vrr_capable()` 为假的输出
+  （headless、嵌套、不支持的显示器）上开启返回 `Err`，关闭永远成功；内核事后拒绝则退回关闭。何时开是混成器的策略，
+  `examples/minimal.rs` 用 `LUMINARIA_VRR=1`。
 
 ### 常用后端
 - **`HeadlessBackend`**：无头后端。
@@ -559,6 +564,12 @@ match outcome {
   let mut ftm = ForeignToplevelManager::new(&display)?;
   ftm.track(&xdg_shell); // 自动镜像跟踪 xdg_shell 内部所有窗口生命周期；此后 xdg_shell 被 ftm 借住
   ```
+- **`ForeignToplevelList`**：`ext_foreign_toplevel_list_v1`，只读窗口列表（标题、app id、不透明标识符），不能激活或关闭，所以
+  屏幕共享门户与沙盒里的录屏程序可以拿它；与 `ScreencopyManager` 合起来做**单窗口共享**（见 §9.6）：
+  ```rust
+  let mut list = ForeignToplevelList::new(&display)?;
+  list.track(&xdg_shell);
+  ```
 - **`WorkspaceManager`**：为分页器提供 `ext-workspace` 支持：
   ```rust
   let mut wm = WorkspaceManager::new(&display)?;
@@ -877,6 +888,30 @@ Rust 版一个带 lifetime 的结构体都没写。行数：C++ 639 → 500 → 
   - `XdgToplevelIconManager`：`Event::ToplevelIcon(ToplevelIconChange)`，并提供 `icon_name(surface)` 查询客户端设定的图标名。
 
 DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 上的运行还没有验证过。
+
+### 9.6 单窗口共享、数位板、色彩管理
+
+- **单窗口捕获**（`render` + `desktop`）：腾讯会议 / Zoom / Discord / 浏览器选「共享窗口」走的路。
+  ```rust
+  let mut list = ForeignToplevelList::new(&display)?;
+  list.track(&xdg_shell);
+  let mut screencopy = ScreencopyManager::new(&display)?;
+  screencopy.enable_toplevel_capture(&display, &list)?;
+  ```
+  窗口从它自己的表面树合成，与被谁盖住、是否最小化无关；按窗口自己的 commit 出帧（没变就不答，零唤醒）；缩放时重发尺寸；
+  销毁时会话停止。C++ 侧的 `ToplevelResolveFunc` 在这里是 `ForeignToplevelList` 的静态解析函数（`luminaria.render` 不依赖
+  `luminaria.desktop`，所以两边用函数地址接起来）。默认 CPU 渲染，读 shm / 单像素 / LINEAR dmabuf。
+- **数位板**（`protocol::TabletManager`，`zwp_tablet_manager_v2`）：板子、笔具、pad 三种对象分开管。后端把数位板事件作为
+  `Event::Input(InputEvent::Tablet(TabletInput))` 送来（`DeviceAdded` / `Proximity` / `Axis` / `Tip` / `Button` /
+  `PadButton` / `PadRing` / `PadStrip`，位置按板子归一化）；混成器映射到布局、找笔下表面，再调 `add_tablet` / `add_tool` /
+  `add_pad` 与 `tool_proximity_in` / `tool_motion` / `tool_pressure` / `tool_tilt` / `tool_button` / `tool_frame` 等。
+  C++ 的一步到位 `feed()` 要回调 `locate`，而 C++ 从不调用 Rust，所以 Rust 版把这几步留给调用方。客户端改笔的光标是
+  `Event::TabletCursor`；`wp_cursor_shape` 的请求带 `tablet_tool`。
+- **色彩管理**（`protocol::ColorManager`、`ColorRepresentationManager`）：协商，不是转换——两个渲染器都不在色彩空间之间换算。
+  `ColorSupport::SrgbOnly`（默认）让客户端都渲染 sRGB；`Full` 只给自己有色彩管线的混成器。`set_output_description` /
+  `set_preferred` 告诉客户端显示器与表面最好用什么；读客户端的声明用 `SurfaceId::image_description()` /
+  `render_intent()` / `color_representation()`，`ImageDescription::is_srgb()` 是「不需要转换」的判断。
+- **提交队列**（FIFO / commit-timing）是库内部的行为变化，Rust 没有新 API：被扣住的提交现在逐次排队而不是塌缩成一帧。
 
 ---
 

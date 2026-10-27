@@ -29,6 +29,10 @@ struct LayerSurfaceInfoRaw;
 struct IdleNotificationInfoRaw;
 struct PointerConstraintInfoRaw;
 struct TextInputInfoRaw;
+struct PadGroupRaw;
+struct TabletAxesRaw;
+struct ImageDescriptionRaw;
+struct ColorRepresentationRaw;
 
 class OutputGlobalShim;
 class OutputShim;
@@ -168,6 +172,9 @@ public:
 
   rust::Vec<std::uint64_t> scanout_modifiers(std::uint32_t drm_format) const;
   bool has_cursor_plane() const;
+  bool vrr_capable() const;
+  bool vrr_enabled() const;
+  bool set_vrr(bool enabled, rust::String &error);
   bool move_cursor(std::int32_t x, std::int32_t y, rust::String &error);
   bool hide_cursor(rust::String &error);
   bool alive() const;
@@ -691,5 +698,120 @@ private:
 };
 
 std::unique_ptr<OutputLayoutShim> output_layout_new();
+
+// ============================================================================
+// Graphics tablets (zwp_tablet_manager_v2)
+// ============================================================================
+
+class TabletManagerShim {
+public:
+  ~TabletManagerShim();
+  TabletManagerShim(const TabletManagerShim &) = delete;
+  TabletManagerShim &operator=(const TabletManagerShim &) = delete;
+
+  std::uint32_t add_tablet(rust::Str name, std::uint16_t vid, std::uint16_t pid,
+                           rust::Str path, std::uint32_t bustype) const;
+  void remove_tablet(std::uint32_t tablet) const;
+  std::uint32_t add_tool(std::uint32_t tool_type, std::uint64_t serial,
+                         std::uint64_t wacom_id, std::uint32_t caps) const;
+  void remove_tool(std::uint32_t tool) const;
+  std::uint32_t add_pad(rust::Str path, std::uint32_t buttons,
+                        std::uint32_t rings, std::uint32_t strips,
+                        const rust::Vec<PadGroupRaw> &groups) const;
+  void remove_pad(std::uint32_t pad) const;
+  std::uint32_t tablet_count() const;
+  std::uint32_t tool_count() const;
+  std::uint32_t pad_count() const;
+
+  void tool_proximity_in(std::uint32_t tool, std::uint32_t tablet,
+                         std::uint64_t surface_id) const;
+  void tool_proximity_out(std::uint32_t tool) const;
+  std::uint64_t tool_focus(std::uint32_t tool) const;
+  void tool_down(std::uint32_t tool) const;
+  void tool_up(std::uint32_t tool) const;
+  void tool_motion(std::uint32_t tool, double x, double y) const;
+  void tool_pressure(std::uint32_t tool, double pressure) const;
+  void tool_distance(std::uint32_t tool, double distance) const;
+  void tool_tilt(std::uint32_t tool, double x_deg, double y_deg) const;
+  void tool_rotation(std::uint32_t tool, double degrees) const;
+  void tool_slider(std::uint32_t tool, double position) const;
+  void tool_wheel(std::uint32_t tool, double degrees, std::int32_t clicks) const;
+  void tool_button(std::uint32_t tool, std::uint32_t button, bool pressed) const;
+  void tool_frame(std::uint32_t tool, std::uint32_t time_ms) const;
+
+  void pad_enter(std::uint32_t pad, std::uint32_t tablet,
+                 std::uint64_t surface_id) const;
+  void pad_leave(std::uint32_t pad) const;
+  void pad_button(std::uint32_t pad, std::uint32_t time_ms, std::uint32_t button,
+                  bool pressed) const;
+  void pad_ring(std::uint32_t pad, std::uint32_t ring, double angle,
+                std::uint32_t time_ms) const;
+  void pad_strip(std::uint32_t pad, std::uint32_t strip, double position,
+                 std::uint32_t time_ms) const;
+  void pad_mode_switch(std::uint32_t pad, std::uint32_t group,
+                       std::uint32_t mode, std::uint32_t time_ms) const;
+
+  struct Impl;
+  Impl &impl() const;
+  explicit TabletManagerShim(std::unique_ptr<Impl> impl) noexcept;
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<TabletManagerShim> tablet_manager_new(const DisplayShim &display,
+                                                      rust::String &error);
+
+// ============================================================================
+// Colour (wp-color-management-v1, wp-color-representation-v1)
+// ============================================================================
+
+class ColorManagerShim {
+public:
+  ~ColorManagerShim();
+  ColorManagerShim(const ColorManagerShim &) = delete;
+  ColorManagerShim &operator=(const ColorManagerShim &) = delete;
+
+  void set_output_description(const OutputGlobalShim &output,
+                              const ImageDescriptionRaw &description) const;
+  void output_description(const OutputGlobalShim &output,
+                          ImageDescriptionRaw &out) const;
+  void set_default_preferred(const ImageDescriptionRaw &description) const;
+  void set_preferred(std::uint64_t surface_id,
+                     const ImageDescriptionRaw &description) const;
+
+  struct Impl;
+  Impl &impl() const;
+  explicit ColorManagerShim(std::unique_ptr<Impl> impl) noexcept;
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<ColorManagerShim> color_manager_new(const DisplayShim &display,
+                                                    bool full,
+                                                    rust::String &error);
+
+class ColorRepresentationManagerShim {
+public:
+  ~ColorRepresentationManagerShim();
+  ColorRepresentationManagerShim(const ColorRepresentationManagerShim &) = delete;
+  ColorRepresentationManagerShim &
+  operator=(const ColorRepresentationManagerShim &) = delete;
+
+  struct Impl;
+  Impl &impl() const;
+  explicit ColorRepresentationManagerShim(std::unique_ptr<Impl> impl) noexcept;
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<ColorRepresentationManagerShim>
+color_representation_manager_new(const DisplayShim &display, bool extended,
+                                 rust::String &error);
+
+bool surface_image_description(std::uint64_t surface_id,
+                               ImageDescriptionRaw &out);
+std::uint32_t surface_render_intent(std::uint64_t surface_id);
+bool surface_color_representation(std::uint64_t surface_id,
+                                  ColorRepresentationRaw &out);
 
 } // namespace lum

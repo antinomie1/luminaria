@@ -33,6 +33,28 @@ foreign_toplevel_manager_new(const DisplayShim &display, rust::String &error);
 void foreign_toplevel_track(ForeignToplevelManagerShim &ftm,
                             const XdgShellShim &shell);
 
+class ForeignToplevelListShim {
+public:
+  ~ForeignToplevelListShim();
+  ForeignToplevelListShim(const ForeignToplevelListShim &) = delete;
+  ForeignToplevelListShim &operator=(const ForeignToplevelListShim &) = delete;
+
+  void track(const XdgShellShim &shell);
+  std::uint32_t toplevel_count() const;
+
+  struct Impl;
+  Impl &impl() const;
+  explicit ForeignToplevelListShim(std::unique_ptr<Impl> impl) noexcept;
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<ForeignToplevelListShim>
+foreign_toplevel_list_new(const DisplayShim &display, rust::String &error);
+void foreign_toplevel_list_track(ForeignToplevelListShim &list,
+                                 const XdgShellShim &shell);
+std::size_t foreign_toplevel_list_resolver();
+
 class WorkspaceManagerShim {
 public:
   ~WorkspaceManagerShim();

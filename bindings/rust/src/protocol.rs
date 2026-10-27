@@ -14,22 +14,26 @@ use crate::ffi;
 use crate::util::{Rect, Transform};
 
 mod activation;
+mod color;
 mod gestures;
 mod idle;
 mod layer_shell;
 mod pointer_constraints;
 mod seat;
 mod selection;
+mod tablet;
 mod text_input;
 mod xdg_shell;
 
 pub use activation::*;
+pub use color::*;
 pub use gestures::*;
 pub use idle::*;
 pub use layer_shell::*;
 pub use pointer_constraints::*;
 pub use seat::*;
 pub use selection::*;
+pub use tablet::*;
 pub use text_input::*;
 pub use xdg_shell::*;
 
@@ -476,6 +480,8 @@ pub struct CursorShapeRequest {
     pub serial: u32,
     pub shape: u32,
     pub name: String,
+    /// The tablet tool this is for ([`TabletManager`]'s id), `None` for a pointer.
+    pub tablet_tool: Option<TabletToolId>,
 }
 
 /// The `wp_cursor_shape_manager_v1` global.
@@ -600,6 +606,7 @@ impl CursorShapeRequest {
                     serial: raw.serial,
                     shape: raw.value,
                     name: raw.text,
+                    tablet_tool: (raw.id != 0).then_some(raw.id as TabletToolId),
                 });
             }
             _ => {}

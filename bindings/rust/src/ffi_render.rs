@@ -91,5 +91,13 @@ pub(crate) mod ffi {
             display: &DisplayShim,
             error: &mut String,
         ) -> UniquePtr<ScreencopyManagerShim>;
+        /// `resolver` is the address of a `Toplevel* (*)(wl_resource*)`; the
+        /// desktop bridge's `foreign_toplevel_list_resolver()` is one.
+        fn screencopy_enable_toplevel_capture(
+            mgr: Pin<&mut ScreencopyManagerShim>,
+            display: &DisplayShim,
+            resolver: usize,
+            error: &mut String,
+        ) -> bool;
     }
 }

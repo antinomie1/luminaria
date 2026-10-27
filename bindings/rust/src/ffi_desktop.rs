@@ -43,6 +43,21 @@ pub(crate) mod ffi {
         ) -> UniquePtr<ForeignToplevelManagerShim>;
         fn foreign_toplevel_track(ftm: Pin<&mut ForeignToplevelManagerShim>, shell: &XdgShellShim);
 
+        type ForeignToplevelListShim;
+        fn foreign_toplevel_list_new(
+            display: &DisplayShim,
+            error: &mut String,
+        ) -> UniquePtr<ForeignToplevelListShim>;
+        fn foreign_toplevel_list_track(
+            list: Pin<&mut ForeignToplevelListShim>,
+            shell: &XdgShellShim,
+        );
+        fn toplevel_count(self: &ForeignToplevelListShim) -> u32;
+        /// Address of the C++ function that turns an
+        /// `ext_foreign_toplevel_handle_v1` resource into a window, for
+        /// `ScreencopyManager::enable_toplevel_capture`.
+        fn foreign_toplevel_list_resolver() -> usize;
+
         type WorkspaceManagerShim;
         fn workspace_manager_new(
             display: &DisplayShim,

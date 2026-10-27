@@ -74,6 +74,10 @@ name = "test_desktop"
 required-features = ["desktop"]
 
 [[test]]
+name = "test_capture"
+required-features = ["desktop", "render"]
+
+[[test]]
 name = "test_desktop_events"
 required-features = ["desktop"]
 

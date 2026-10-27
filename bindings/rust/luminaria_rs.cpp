@@ -1669,6 +1669,8 @@ cursor_shape_manager_new(const DisplayShim &display, rust::String &error) {
           ev.serial = req.serial;
           ev.value = req.shape;
           ev.text = req.name ? to_rust(req.name) : rust::String("");
+          // A tablet tool's request names the tool (0 for a pointer's).
+          ev.id = lm::TabletManager::tool_id_of(req.tablet_tool);
           raw->events.push(std::move(ev));
         });
     return std::make_unique<CursorShapeManagerShim>(std::move(impl));
@@ -2566,6 +2568,442 @@ bool is_output(wl_resource *resource, const OutputGlobalShim &global) {
   const auto &g = global.impl().global;
   return resource != nullptr && g &&
          g->resource_for(wl_resource_get_client(resource)) == resource;
+}
+
+
+// ---- variable refresh (VRR) --------------------------------------------------
+
+bool OutputShim::vrr_capable() const {
+  return impl_->output ? impl_->output->vrr_capable() : false;
+}
+bool OutputShim::vrr_enabled() const {
+  return impl_->output ? impl_->output->vrr_enabled() : false;
+}
+bool OutputShim::set_vrr(bool enabled, rust::String &error) {
+  if (!impl_->output) {
+    error = "output destroyed";
+    return false;
+  }
+  auto st = impl_->output->set_vrr(enabled);
+  if (!st) {
+    error = to_rust(st.error().message);
+    return false;
+  }
+  return true;
+}
+
+// ---- tablets (zwp_tablet_manager_v2) -----------------------------------------
+
+struct TabletManagerShim::Impl {
+  std::optional<lm::TabletManager> mgr;
+  Events events;
+  Conn<lm::TabletToolCursorRequest> on_cursor;
+};
+TabletManagerShim::~TabletManagerShim() = default;
+TabletManagerShim::TabletManagerShim(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+TabletManagerShim::Impl &TabletManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<TabletManagerShim> tablet_manager_new(const DisplayShim &display,
+                                                      rust::String &error) {
+  try {
+    if (!display.impl().display) {
+      error = "display not initialized";
+      return nullptr;
+    }
+    auto r = lm::TabletManager::create(*display.impl().display);
+    if (!r) {
+      error = to_rust(r.error().message);
+      return nullptr;
+    }
+    auto impl = std::make_unique<TabletManagerShim::Impl>();
+    impl->mgr.emplace(std::move(*r));
+    auto *raw = impl.get();
+    raw->on_cursor = raw->mgr->cursor_request().connect(
+        [raw](lm::TabletToolCursorRequest &req) {
+          EventRaw ev = event(EventKind::TabletToolCursor, req.tool,
+                              u64_from_id(req.surface));
+          ev.serial = req.serial;
+          ev.x = req.hotspot_x;
+          ev.y = req.hotspot_y;
+          raw->events.push(std::move(ev));
+        });
+    return std::make_unique<TabletManagerShim>(std::move(impl));
+  } catch (const std::exception &e) {
+    error = e.what();
+    return nullptr;
+  }
+}
+
+namespace {
+lm::TabletManager *tablets(const TabletManagerShim &s) {
+  return s.impl().mgr ? &*s.impl().mgr : nullptr;
+}
+lm::Surface *surface_of(std::uint64_t id) {
+  return lm::surface_from_id(id_from_u64(id));
+}
+} // namespace
+
+std::uint32_t TabletManagerShim::add_tablet(rust::Str name, std::uint16_t vid,
+                                            std::uint16_t pid, rust::Str path,
+                                            std::uint32_t bustype) const {
+  lm::TabletManager *m = tablets(*this);
+  if (m == nullptr)
+    return 0;
+  return m->add_tablet(lm::TabletInfo{std::string(name), vid, pid,
+                                      std::string(path), bustype});
+}
+void TabletManagerShim::remove_tablet(std::uint32_t tablet) const {
+  if (auto *m = tablets(*this))
+    m->remove_tablet(tablet);
+}
+std::uint32_t TabletManagerShim::add_tool(std::uint32_t tool_type,
+                                          std::uint64_t serial,
+                                          std::uint64_t wacom_id,
+                                          std::uint32_t caps) const {
+  lm::TabletManager *m = tablets(*this);
+  if (m == nullptr)
+    return 0;
+  lm::TabletToolInfo info;
+  info.type = static_cast<lm::TabletToolType>(tool_type);
+  info.hardware_serial = serial;
+  info.hardware_id_wacom = wacom_id;
+  info.caps = lm::TabletToolCaps{
+      .tilt = (caps & 1u) != 0,     .pressure = (caps & 2u) != 0,
+      .distance = (caps & 4u) != 0, .rotation = (caps & 8u) != 0,
+      .slider = (caps & 16u) != 0,  .wheel = (caps & 32u) != 0};
+  return m->add_tool(info);
+}
+void TabletManagerShim::remove_tool(std::uint32_t tool) const {
+  if (auto *m = tablets(*this))
+    m->remove_tool(tool);
+}
+std::uint32_t
+TabletManagerShim::add_pad(rust::Str path, std::uint32_t buttons,
+                           std::uint32_t rings, std::uint32_t strips,
+                           const rust::Vec<PadGroupRaw> &groups) const {
+  lm::TabletManager *m = tablets(*this);
+  if (m == nullptr)
+    return 0;
+  lm::TabletPadInfo info;
+  info.path = std::string(path);
+  info.layout.buttons = buttons;
+  info.layout.rings = rings;
+  info.layout.strips = strips;
+  for (const PadGroupRaw &g : groups) {
+    lm::TabletPadGroup out;
+    out.modes = g.modes;
+    out.buttons.assign(g.buttons.begin(), g.buttons.end());
+    out.rings.assign(g.rings.begin(), g.rings.end());
+    out.strips.assign(g.strips.begin(), g.strips.end());
+    info.layout.groups.push_back(std::move(out));
+  }
+  return m->add_pad(info);
+}
+void TabletManagerShim::remove_pad(std::uint32_t pad) const {
+  if (auto *m = tablets(*this))
+    m->remove_pad(pad);
+}
+std::uint32_t TabletManagerShim::tablet_count() const {
+  auto *m = tablets(*this);
+  return m != nullptr ? static_cast<std::uint32_t>(m->tablet_count()) : 0;
+}
+std::uint32_t TabletManagerShim::tool_count() const {
+  auto *m = tablets(*this);
+  return m != nullptr ? static_cast<std::uint32_t>(m->tool_count()) : 0;
+}
+std::uint32_t TabletManagerShim::pad_count() const {
+  auto *m = tablets(*this);
+  return m != nullptr ? static_cast<std::uint32_t>(m->pad_count()) : 0;
+}
+void TabletManagerShim::tool_proximity_in(std::uint32_t tool,
+                                          std::uint32_t tablet,
+                                          std::uint64_t surface_id) const {
+  lm::Surface *s = surface_of(surface_id);
+  if (auto *m = tablets(*this); m != nullptr && s != nullptr)
+    m->tool_proximity_in(tool, tablet, *s);
+}
+void TabletManagerShim::tool_proximity_out(std::uint32_t tool) const {
+  if (auto *m = tablets(*this))
+    m->tool_proximity_out(tool);
+}
+std::uint64_t TabletManagerShim::tool_focus(std::uint32_t tool) const {
+  auto *m = tablets(*this);
+  return m != nullptr ? u64_from_id(m->tool_focus(tool)) : 0;
+}
+void TabletManagerShim::tool_down(std::uint32_t tool) const {
+  if (auto *m = tablets(*this))
+    m->tool_down(tool);
+}
+void TabletManagerShim::tool_up(std::uint32_t tool) const {
+  if (auto *m = tablets(*this))
+    m->tool_up(tool);
+}
+void TabletManagerShim::tool_motion(std::uint32_t tool, double x, double y) const {
+  if (auto *m = tablets(*this))
+    m->tool_motion(tool, x, y);
+}
+void TabletManagerShim::tool_pressure(std::uint32_t tool, double v) const {
+  if (auto *m = tablets(*this))
+    m->tool_pressure(tool, v);
+}
+void TabletManagerShim::tool_distance(std::uint32_t tool, double v) const {
+  if (auto *m = tablets(*this))
+    m->tool_distance(tool, v);
+}
+void TabletManagerShim::tool_tilt(std::uint32_t tool, double x, double y) const {
+  if (auto *m = tablets(*this))
+    m->tool_tilt(tool, x, y);
+}
+void TabletManagerShim::tool_rotation(std::uint32_t tool, double v) const {
+  if (auto *m = tablets(*this))
+    m->tool_rotation(tool, v);
+}
+void TabletManagerShim::tool_slider(std::uint32_t tool, double v) const {
+  if (auto *m = tablets(*this))
+    m->tool_slider(tool, v);
+}
+void TabletManagerShim::tool_wheel(std::uint32_t tool, double degrees,
+                                   std::int32_t clicks) const {
+  if (auto *m = tablets(*this))
+    m->tool_wheel(tool, degrees, clicks);
+}
+void TabletManagerShim::tool_button(std::uint32_t tool, std::uint32_t button,
+                                    bool pressed) const {
+  if (auto *m = tablets(*this))
+    m->tool_button(tool, button, pressed);
+}
+void TabletManagerShim::tool_frame(std::uint32_t tool, std::uint32_t time_ms) const {
+  if (auto *m = tablets(*this))
+    m->tool_frame(tool, time_ms);
+}
+void TabletManagerShim::pad_enter(std::uint32_t pad, std::uint32_t tablet,
+                                  std::uint64_t surface_id) const {
+  lm::Surface *s = surface_of(surface_id);
+  if (auto *m = tablets(*this); m != nullptr && s != nullptr)
+    m->pad_enter(pad, tablet, *s);
+}
+void TabletManagerShim::pad_leave(std::uint32_t pad) const {
+  if (auto *m = tablets(*this))
+    m->pad_leave(pad);
+}
+void TabletManagerShim::pad_button(std::uint32_t pad, std::uint32_t time_ms,
+                                   std::uint32_t button, bool pressed) const {
+  if (auto *m = tablets(*this))
+    m->pad_button(pad, time_ms, button, pressed);
+}
+void TabletManagerShim::pad_ring(std::uint32_t pad, std::uint32_t ring,
+                                 double angle, std::uint32_t time_ms) const {
+  if (auto *m = tablets(*this))
+    m->pad_ring(pad, ring, angle, time_ms);
+}
+void TabletManagerShim::pad_strip(std::uint32_t pad, std::uint32_t strip,
+                                  double position, std::uint32_t time_ms) const {
+  if (auto *m = tablets(*this))
+    m->pad_strip(pad, strip, position, time_ms);
+}
+void TabletManagerShim::pad_mode_switch(std::uint32_t pad, std::uint32_t group,
+                                        std::uint32_t mode,
+                                        std::uint32_t time_ms) const {
+  if (auto *m = tablets(*this))
+    m->pad_mode_switch(pad, group, mode, time_ms);
+}
+
+// ---- colour management -------------------------------------------------------
+
+namespace {
+
+lm::PrimarySet primaries_from(const rust::Vec<double> &v, lm::PrimarySet fallback) {
+  if (v.size() < 8)
+    return fallback;
+  return lm::PrimarySet{{v[0], v[1]}, {v[2], v[3]}, {v[4], v[5]}, {v[6], v[7]}};
+}
+void primaries_to(const lm::PrimarySet &p, rust::Vec<double> &out) {
+  out.clear();
+  for (double d : {p.red.x, p.red.y, p.green.x, p.green.y, p.blue.x, p.blue.y,
+                   p.white.x, p.white.y})
+    out.push_back(d);
+}
+
+lm::ImageDescription description_from(const ImageDescriptionRaw &raw) {
+  lm::ImageDescription d;
+  if (raw.named_primaries != 0) {
+    d.named_primaries = static_cast<lm::Primaries>(raw.named_primaries);
+    d.primaries = lm::primaries_of(*d.named_primaries);
+  } else {
+    d.named_primaries.reset();
+    d.primaries = primaries_from(raw.primaries, d.primaries);
+  }
+  if (raw.transfer_function != 0) {
+    d.transfer_function =
+        static_cast<lm::TransferFunction>(raw.transfer_function);
+  } else {
+    d.transfer_function.reset();
+    d.power = raw.power;
+  }
+  d.min_luminance = raw.min_luminance;
+  d.max_luminance = raw.max_luminance;
+  d.reference_luminance = raw.reference_luminance;
+  if (raw.target_primaries.size() >= 8)
+    d.target_primaries = primaries_from(raw.target_primaries, d.primaries);
+  if (raw.has_target_luminance)
+    d.target_luminance =
+        std::pair{raw.target_min_luminance, raw.target_max_luminance};
+  if (raw.max_cll >= 0)
+    d.max_cll = static_cast<std::uint32_t>(raw.max_cll);
+  if (raw.max_fall >= 0)
+    d.max_fall = static_cast<std::uint32_t>(raw.max_fall);
+  return d;
+}
+
+void description_to(const lm::ImageDescription &d, ImageDescriptionRaw &out) {
+  out.named_primaries =
+      d.named_primaries ? static_cast<std::uint32_t>(*d.named_primaries) : 0;
+  primaries_to(d.primaries, out.primaries);
+  out.transfer_function =
+      d.transfer_function ? static_cast<std::uint32_t>(*d.transfer_function) : 0;
+  out.power = d.power;
+  out.min_luminance = d.min_luminance;
+  out.max_luminance = d.max_luminance;
+  out.reference_luminance = d.reference_luminance;
+  out.target_primaries.clear();
+  if (d.target_primaries)
+    primaries_to(*d.target_primaries, out.target_primaries);
+  out.has_target_luminance = d.target_luminance.has_value();
+  out.target_min_luminance = d.target_luminance ? d.target_luminance->first : 0.0;
+  out.target_max_luminance = d.target_luminance ? d.target_luminance->second : 0.0;
+  out.max_cll = d.max_cll ? static_cast<std::int64_t>(*d.max_cll) : -1;
+  out.max_fall = d.max_fall ? static_cast<std::int64_t>(*d.max_fall) : -1;
+  out.identity = d.identity;
+}
+
+} // namespace
+
+struct ColorManagerShim::Impl {
+  std::optional<lm::ColorManager> mgr;
+};
+ColorManagerShim::~ColorManagerShim() = default;
+ColorManagerShim::ColorManagerShim(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+ColorManagerShim::Impl &ColorManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<ColorManagerShim> color_manager_new(const DisplayShim &display,
+                                                    bool full,
+                                                    rust::String &error) {
+  try {
+    if (!display.impl().display) {
+      error = "display not initialized";
+      return nullptr;
+    }
+    auto r = lm::ColorManager::create(*display.impl().display,
+                                      full ? lm::ColorSupport::full()
+                                           : lm::ColorSupport::srgb_only());
+    if (!r) {
+      error = to_rust(r.error().message);
+      return nullptr;
+    }
+    auto impl = std::make_unique<ColorManagerShim::Impl>();
+    impl->mgr.emplace(std::move(*r));
+    return std::make_unique<ColorManagerShim>(std::move(impl));
+  } catch (const std::exception &e) {
+    error = e.what();
+    return nullptr;
+  }
+}
+
+void ColorManagerShim::set_output_description(
+    const OutputGlobalShim &output, const ImageDescriptionRaw &description) const {
+  const auto &g = output.impl().global;
+  if (impl_->mgr && g)
+    impl_->mgr->set_output_description(*g, description_from(description));
+}
+void ColorManagerShim::output_description(const OutputGlobalShim &output,
+                                          ImageDescriptionRaw &out) const {
+  const auto &g = output.impl().global;
+  description_to(impl_->mgr && g ? impl_->mgr->output_description(*g)
+                                 : lm::ImageDescription::srgb(),
+                 out);
+}
+void ColorManagerShim::set_default_preferred(
+    const ImageDescriptionRaw &description) const {
+  if (impl_->mgr)
+    impl_->mgr->set_default_preferred(description_from(description));
+}
+void ColorManagerShim::set_preferred(std::uint64_t surface_id,
+                                     const ImageDescriptionRaw &description) const {
+  if (lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+      s != nullptr && impl_->mgr)
+    impl_->mgr->set_preferred(*s, description_from(description));
+}
+
+struct ColorRepresentationManagerShim::Impl {
+  std::optional<lm::ColorRepresentationManager> mgr;
+};
+ColorRepresentationManagerShim::~ColorRepresentationManagerShim() = default;
+ColorRepresentationManagerShim::ColorRepresentationManagerShim(
+    std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+ColorRepresentationManagerShim::Impl &ColorRepresentationManagerShim::impl() const {
+  return *impl_;
+}
+
+std::unique_ptr<ColorRepresentationManagerShim>
+color_representation_manager_new(const DisplayShim &display, bool extended,
+                                 rust::String &error) {
+  try {
+    if (!display.impl().display) {
+      error = "display not initialized";
+      return nullptr;
+    }
+    lm::ColorRepresentationSupport support;
+    if (extended) {
+      support.alpha_modes.push_back(lm::AlphaMode::straight);
+      for (auto c : {lm::Coefficients::bt709, lm::Coefficients::bt601,
+                     lm::Coefficients::bt2020}) {
+        support.coefficients.push_back({c, lm::ColorRange::full});
+        support.coefficients.push_back({c, lm::ColorRange::limited});
+      }
+      support.coefficients.push_back(
+          {lm::Coefficients::identity, lm::ColorRange::limited});
+    }
+    auto r = lm::ColorRepresentationManager::create(*display.impl().display,
+                                                    std::move(support));
+    if (!r) {
+      error = to_rust(r.error().message);
+      return nullptr;
+    }
+    auto impl = std::make_unique<ColorRepresentationManagerShim::Impl>();
+    impl->mgr.emplace(std::move(*r));
+    return std::make_unique<ColorRepresentationManagerShim>(std::move(impl));
+  } catch (const std::exception &e) {
+    error = e.what();
+    return nullptr;
+  }
+}
+
+bool surface_image_description(std::uint64_t surface_id, ImageDescriptionRaw &out) {
+  lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+  if (s == nullptr || s->image_description() == nullptr)
+    return false;
+  description_to(*s->image_description(), out);
+  return true;
+}
+std::uint32_t surface_render_intent(std::uint64_t surface_id) {
+  lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+  return s != nullptr ? static_cast<std::uint32_t>(s->render_intent()) : 0;
+}
+bool surface_color_representation(std::uint64_t surface_id,
+                                  ColorRepresentationRaw &out) {
+  lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+  if (s == nullptr)
+    return false;
+  const lm::ColorRepresentation &c = s->color_representation();
+  out.alpha_mode = c.alpha_mode ? static_cast<std::uint32_t>(*c.alpha_mode) + 1 : 0;
+  out.coefficients = c.coefficients ? static_cast<std::uint32_t>(*c.coefficients) : 0;
+  out.range = c.range ? static_cast<std::uint32_t>(*c.range) : 0;
+  out.chroma_location =
+      c.chroma_location ? static_cast<std::uint32_t>(*c.chroma_location) : 0;
+  return true;
 }
 
 } // namespace lum

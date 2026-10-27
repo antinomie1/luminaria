@@ -151,6 +151,9 @@ pub(crate) mod ffi {
         // GPU hotplug:
         GpuRemoved,
         GpuAdded,
+        // zwp_tablet_tool_v2.set_cursor: `id` is the tool, `other` the cursor's
+        // surface (0 hides it), `serial`, `x`/`y` the hotspot.
+        TabletToolCursor,
     }
 
     /// One luminaria signal, queued by the shim until Rust drains it. Which
@@ -270,6 +273,74 @@ pub(crate) mod ffi {
         TouchFrame,
         TouchCancel,
         Capabilities,
+        // Graphics tablets (see `TabletInput`). `device` is the tablet or pad.
+        TabletDeviceAdded,
+        TabletDeviceRemoved,
+        TabletToolProximity,
+        TabletToolAxis,
+        TabletToolTip,
+        TabletToolButton,
+        TabletPadButton,
+        TabletPadRing,
+        TabletPadStrip,
+    }
+
+    /// One pad mode group: how many modes it has, and which controls it owns.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct PadGroupRaw {
+        modes: u32,
+        buttons: Vec<u32>,
+        rings: Vec<u32>,
+        strips: Vec<u32>,
+    }
+
+    /// One sample of a tool's axes; only those named in `changed` are meaningful.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    struct TabletAxesRaw {
+        changed: u32,
+        x: f64,
+        y: f64,
+        pressure: f64,
+        distance: f64,
+        tilt_x: f64,
+        tilt_y: f64,
+        rotation: f64,
+        slider: f64,
+        wheel_degrees: f64,
+        wheel_clicks: i32,
+    }
+
+    /// A colour space (`wp_image_description_v1`). `named_primaries` and
+    /// `transfer_function` are the protocol's numbers, 0 for "not named"
+    /// (custom chromaticities, a pure power curve). `primaries` and
+    /// `target_primaries` are red, green, blue, white as x, y pairs. `max_cll`
+    /// and `max_fall` are -1 when unset.
+    #[derive(Debug, Clone, PartialEq)]
+    struct ImageDescriptionRaw {
+        named_primaries: u32,
+        primaries: Vec<f64>,
+        transfer_function: u32,
+        power: f64,
+        min_luminance: f64,
+        max_luminance: f64,
+        reference_luminance: f64,
+        target_primaries: Vec<f64>,
+        has_target_luminance: bool,
+        target_min_luminance: f64,
+        target_max_luminance: f64,
+        max_cll: i64,
+        max_fall: i64,
+        identity: u64,
+    }
+
+    /// `wp_color_representation_surface_v1` state; 0 is "not set" in each field
+    /// and `alpha_mode` is the protocol's value plus one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct ColorRepresentationRaw {
+        alpha_mode: u32,
+        coefficients: u32,
+        range: u32,
+        chroma_location: u32,
     }
 
     /// `kind` says which of the other fields mean something. `x`/`y` are the
@@ -294,6 +365,24 @@ pub(crate) mod ffi {
         group: u32,
         output: u64,
         text: String,
+        // Tablets: the device, the tool (and what it is), the sample, the pad.
+        device: u32,
+        tool: u64,
+        time: u32,
+        tool_type: u32,
+        serial: u64,
+        wacom_id: u64,
+        caps: u32,
+        mode: u32,
+        vid: u32,
+        pid: u32,
+        bustype: u32,
+        path: String,
+        axes: TabletAxesRaw,
+        pad_buttons: u32,
+        pad_rings: u32,
+        pad_strips: u32,
+        groups: Vec<PadGroupRaw>,
     }
 
     unsafe extern "C++" {
@@ -385,6 +474,9 @@ pub(crate) mod ffi {
         ) -> bool;
         fn scanout_modifiers(self: &OutputShim, drm_format: u32) -> Vec<u64>;
         fn has_cursor_plane(self: &OutputShim) -> bool;
+        fn vrr_capable(self: &OutputShim) -> bool;
+        fn vrr_enabled(self: &OutputShim) -> bool;
+        fn set_vrr(self: Pin<&mut OutputShim>, enabled: bool, error: &mut String) -> bool;
         fn move_cursor(self: Pin<&mut OutputShim>, x: i32, y: i32, error: &mut String) -> bool;
         fn hide_cursor(self: Pin<&mut OutputShim>, error: &mut String) -> bool;
         fn alive(self: &OutputShim) -> bool;
@@ -728,6 +820,101 @@ pub(crate) mod ffi {
             fingers: u32,
         );
         fn send_hold_end(self: &PointerGesturesShim, serial: u32, time_ms: u32, cancelled: bool);
+
+        type TabletManagerShim;
+        fn tablet_manager_new(
+            display: &DisplayShim,
+            error: &mut String,
+        ) -> UniquePtr<TabletManagerShim>;
+        fn add_tablet(
+            self: &TabletManagerShim,
+            name: &str,
+            vid: u16,
+            pid: u16,
+            path: &str,
+            bustype: u32,
+        ) -> u32;
+        fn remove_tablet(self: &TabletManagerShim, tablet: u32);
+        fn add_tool(
+            self: &TabletManagerShim,
+            tool_type: u32,
+            serial: u64,
+            wacom_id: u64,
+            caps: u32,
+        ) -> u32;
+        fn remove_tool(self: &TabletManagerShim, tool: u32);
+        fn add_pad(
+            self: &TabletManagerShim,
+            path: &str,
+            buttons: u32,
+            rings: u32,
+            strips: u32,
+            groups: &Vec<PadGroupRaw>,
+        ) -> u32;
+        fn remove_pad(self: &TabletManagerShim, pad: u32);
+        fn tablet_count(self: &TabletManagerShim) -> u32;
+        fn tool_count(self: &TabletManagerShim) -> u32;
+        fn pad_count(self: &TabletManagerShim) -> u32;
+        fn tool_proximity_in(self: &TabletManagerShim, tool: u32, tablet: u32, surface_id: u64);
+        fn tool_proximity_out(self: &TabletManagerShim, tool: u32);
+        fn tool_focus(self: &TabletManagerShim, tool: u32) -> u64;
+        fn tool_down(self: &TabletManagerShim, tool: u32);
+        fn tool_up(self: &TabletManagerShim, tool: u32);
+        fn tool_motion(self: &TabletManagerShim, tool: u32, x: f64, y: f64);
+        fn tool_pressure(self: &TabletManagerShim, tool: u32, pressure: f64);
+        fn tool_distance(self: &TabletManagerShim, tool: u32, distance: f64);
+        fn tool_tilt(self: &TabletManagerShim, tool: u32, x_deg: f64, y_deg: f64);
+        fn tool_rotation(self: &TabletManagerShim, tool: u32, degrees: f64);
+        fn tool_slider(self: &TabletManagerShim, tool: u32, position: f64);
+        fn tool_wheel(self: &TabletManagerShim, tool: u32, degrees: f64, clicks: i32);
+        fn tool_button(self: &TabletManagerShim, tool: u32, button: u32, pressed: bool);
+        fn tool_frame(self: &TabletManagerShim, tool: u32, time_ms: u32);
+        fn pad_enter(self: &TabletManagerShim, pad: u32, tablet: u32, surface_id: u64);
+        fn pad_leave(self: &TabletManagerShim, pad: u32);
+        fn pad_button(self: &TabletManagerShim, pad: u32, time_ms: u32, button: u32, pressed: bool);
+        fn pad_ring(self: &TabletManagerShim, pad: u32, ring: u32, angle: f64, time_ms: u32);
+        fn pad_strip(self: &TabletManagerShim, pad: u32, strip: u32, position: f64, time_ms: u32);
+        fn pad_mode_switch(
+            self: &TabletManagerShim,
+            pad: u32,
+            group: u32,
+            mode: u32,
+            time_ms: u32,
+        );
+
+        type ColorManagerShim;
+        fn color_manager_new(
+            display: &DisplayShim,
+            full: bool,
+            error: &mut String,
+        ) -> UniquePtr<ColorManagerShim>;
+        fn set_output_description(
+            self: &ColorManagerShim,
+            output: &OutputGlobalShim,
+            description: &ImageDescriptionRaw,
+        );
+        fn output_description(
+            self: &ColorManagerShim,
+            output: &OutputGlobalShim,
+            out: &mut ImageDescriptionRaw,
+        );
+        fn set_default_preferred(self: &ColorManagerShim, description: &ImageDescriptionRaw);
+        fn set_preferred(
+            self: &ColorManagerShim,
+            surface_id: u64,
+            description: &ImageDescriptionRaw,
+        );
+
+        type ColorRepresentationManagerShim;
+        fn color_representation_manager_new(
+            display: &DisplayShim,
+            extended: bool,
+            error: &mut String,
+        ) -> UniquePtr<ColorRepresentationManagerShim>;
+
+        fn surface_image_description(surface_id: u64, out: &mut ImageDescriptionRaw) -> bool;
+        fn surface_render_intent(surface_id: u64) -> u32;
+        fn surface_color_representation(surface_id: u64, out: &mut ColorRepresentationRaw) -> bool;
 
         // Shell primitives that are core, not GPU: the output layout, the scene
         // hit-test, the CPU compositor, popups and layer surfaces.

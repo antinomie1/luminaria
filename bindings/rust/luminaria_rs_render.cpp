@@ -160,6 +160,20 @@ std::unique_ptr<ScreencopyManagerShim> screencopy_manager_new(const DisplayShim&
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
 
+bool screencopy_enable_toplevel_capture(ScreencopyManagerShim& mgr, const DisplayShim& display,
+                                        std::size_t resolver, rust::String& error) {
+    try {
+        lm::Display* disp = raw_ptr(display);
+        if (!disp || !mgr.impl().mgr || resolver == 0) { error = "display or resolver missing"; return false; }
+        using Resolver = lm::Toplevel* (*)(wl_resource*);
+        auto fn = reinterpret_cast<Resolver>(resolver);
+        auto st = mgr.impl().mgr->enable_toplevel_capture(
+            *disp, [fn](wl_resource* handle) { return fn(handle); });
+        if (!st) { error = to_rust(st.error().message); return false; }
+        return true;
+    } catch (const std::exception& e) { error = e.what(); return false; }
+}
+
 struct CpuCompositorShim::Impl {
     lm::CpuCompositor comp;
     std::vector<lm::CpuItem> items;

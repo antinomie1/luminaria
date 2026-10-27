@@ -6,6 +6,9 @@
 //!   LUMINARIA_BACKEND=drm cargo run --example minimal                 # bare metal, from a free VT
 //!   LUMINARIA_BACKEND=headless LUMINARIA_EXIT_MS=500 cargo run --example minimal
 //!
+//! LUMINARIA_VRR=1 turns variable refresh (FreeSync / Adaptive-Sync) on for
+//! every monitor that has it.
+//!
 //! LUMINARIA_BACKEND is auto (nested, then DRM when a libseat session can be
 //! had, then headless) | nested | drm | headless. On DRM the card is the first
 //! argument or LUMINARIA_DRM_DEVICE, else the first one with a monitor;
@@ -182,6 +185,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("minimal: render target: {e}; compositing on the CPU");
                     }
                     layout.add_auto(&mut output);
+                    // Variable refresh on a monitor that has it: the panel
+                    // follows the frames, so an idle desktop idles it and a game
+                    // runs as fast as it renders.
+                    if std::env::var("LUMINARIA_VRR").is_ok_and(|v| !v.is_empty() && v != "0")
+                        && output.vrr_capable()
+                    {
+                        let _ = output.set_vrr(true);
+                    }
                     let name = format!("minimal-{}", outputs.len() + 1);
                     let wl_output =
                         OutputGlobal::for_output(&display, &output, &layout, &name).ok();

@@ -54,7 +54,8 @@ use crate::ffi::{self, EventKind as K};
 use crate::protocol::{
     ActivationEvent, CompositorEvent, CursorShapeRequest, DecorationRequest, IdleInhibitEvent,
     IdleNotifierEvent, LayerSurfaceEvent, PointerConstraintEvent, PopupEvent, SeatEvent,
-    SelectionChange, SurfaceId, TextInputEvent, ToplevelEvent, ToplevelIconChange, XdgEvent,
+    SelectionChange, SurfaceId, TabletCursorRequest, TextInputEvent, ToplevelEvent,
+    ToplevelIconChange, XdgEvent,
 };
 
 /// Something luminaria reports, from whichever wrapper forwarded it.
@@ -92,6 +93,8 @@ pub enum Event {
     Layer(SurfaceId, LayerSurfaceEvent),
     Decoration(DecorationRequest),
     CursorShape(CursorShapeRequest),
+    /// A client set or hid the cursor its tablet tool shows.
+    TabletCursor(TabletCursorRequest),
     ToplevelIcon(ToplevelIconChange),
     Activation(ActivationEvent),
     IdleInhibit(IdleInhibitEvent),
@@ -164,6 +167,7 @@ impl Event {
             }
             K::DecorationRequest => Event::Decoration(DecorationRequest::from_raw(raw)?),
             K::CursorShapeRequest => Event::CursorShape(CursorShapeRequest::from_raw(raw)?),
+            K::TabletToolCursor => Event::TabletCursor(TabletCursorRequest::from_raw(raw)?),
             K::ToplevelIconChange => Event::ToplevelIcon(ToplevelIconChange::from_raw(raw)?),
             K::ActivationRequest | K::ActivationTokenRequest => {
                 Event::Activation(ActivationEvent::from_raw(raw)?)
@@ -308,6 +312,7 @@ payload! {
     Seat(SeatEvent),
     Decoration(DecorationRequest),
     CursorShape(CursorShapeRequest),
+    TabletCursor(TabletCursorRequest),
     ToplevelIcon(ToplevelIconChange),
     Activation(ActivationEvent),
     IdleInhibit(IdleInhibitEvent),

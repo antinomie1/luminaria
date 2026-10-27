@@ -42,6 +42,22 @@ inline std::uint32_t caps_bits(lm::InputCapabilities c) {
     return (c.keyboard ? 1u : 0u) | (c.pointer ? 2u : 0u) | (c.touch ? 4u : 0u);
 }
 
+inline TabletAxesRaw tablet_axes_raw(const lm::TabletAxes& a) {
+    TabletAxesRaw r{};
+    r.changed = a.changed;
+    r.x = a.x;
+    r.y = a.y;
+    r.pressure = a.pressure;
+    r.distance = a.distance;
+    r.tilt_x = a.tilt_x;
+    r.tilt_y = a.tilt_y;
+    r.rotation = a.rotation;
+    r.slider = a.slider;
+    r.wheel_degrees = a.wheel_degrees;
+    r.wheel_clicks = a.wheel_clicks;
+    return r;
+}
+
 // One `lm::InputEvent` for Rust, whichever source emitted it. Absolute motion
 // leaves `output` 0: only the source knows which `OutputShim` id its output got.
 inline InputEventRaw input_event_raw(const lm::InputEvent& event) {
@@ -107,6 +123,82 @@ inline InputEventRaw input_event_raw(const lm::InputEvent& event) {
             } else if constexpr (std::is_same_v<E, lm::TouchCancelEvent>) {
                 r.kind = InputEventKind::TouchCancel;
                 r.id = e.id;
+            } else if constexpr (std::is_same_v<E, lm::TabletDeviceAdded>) {
+                r.kind = InputEventKind::TabletDeviceAdded;
+                r.device = e.device;
+                r.text = to_rust(e.name);
+                r.path = to_rust(e.path);
+                r.vid = e.vid;
+                r.pid = e.pid;
+                r.bustype = e.bustype;
+                r.flags = e.is_pad ? 1u : 0u;
+                r.pad_buttons = e.pad.buttons;
+                r.pad_rings = e.pad.rings;
+                r.pad_strips = e.pad.strips;
+                for (const lm::TabletPadGroup& g : e.pad.groups) {
+                    PadGroupRaw out{};
+                    out.modes = g.modes;
+                    for (auto b : g.buttons) out.buttons.push_back(b);
+                    for (auto ring : g.rings) out.rings.push_back(ring);
+                    for (auto strip : g.strips) out.strips.push_back(strip);
+                    r.groups.push_back(std::move(out));
+                }
+            } else if constexpr (std::is_same_v<E, lm::TabletDeviceRemoved>) {
+                r.kind = InputEventKind::TabletDeviceRemoved;
+                r.device = e.device;
+            } else if constexpr (std::is_same_v<E, lm::TabletToolProximityEvent>) {
+                r.kind = InputEventKind::TabletToolProximity;
+                r.device = e.device;
+                r.tool = e.tool;
+                r.pressed = e.in;
+                r.tool_type = static_cast<std::uint32_t>(e.type);
+                r.serial = e.serial;
+                r.wacom_id = e.wacom_id;
+                r.caps = (e.caps.tilt ? 1u : 0u) | (e.caps.pressure ? 2u : 0u) |
+                         (e.caps.distance ? 4u : 0u) | (e.caps.rotation ? 8u : 0u) |
+                         (e.caps.slider ? 16u : 0u) | (e.caps.wheel ? 32u : 0u);
+                r.axes = tablet_axes_raw(e.axes);
+                r.time = e.time_ms;
+            } else if constexpr (std::is_same_v<E, lm::TabletToolAxisEvent>) {
+                r.kind = InputEventKind::TabletToolAxis;
+                r.device = e.device;
+                r.tool = e.tool;
+                r.axes = tablet_axes_raw(e.axes);
+                r.time = e.time_ms;
+            } else if constexpr (std::is_same_v<E, lm::TabletToolTipEvent>) {
+                r.kind = InputEventKind::TabletToolTip;
+                r.device = e.device;
+                r.tool = e.tool;
+                r.pressed = e.down;
+                r.axes = tablet_axes_raw(e.axes);
+                r.time = e.time_ms;
+            } else if constexpr (std::is_same_v<E, lm::TabletToolButtonEvent>) {
+                r.kind = InputEventKind::TabletToolButton;
+                r.device = e.device;
+                r.tool = e.tool;
+                r.code = e.button;
+                r.pressed = e.pressed;
+                r.time = e.time_ms;
+            } else if constexpr (std::is_same_v<E, lm::TabletPadButtonEvent>) {
+                r.kind = InputEventKind::TabletPadButton;
+                r.device = e.device;
+                r.code = e.button;
+                r.pressed = e.pressed;
+                r.group = e.group;
+                r.mode = e.mode;
+                r.time = e.time_ms;
+            } else if constexpr (std::is_same_v<E, lm::TabletPadRingEvent>) {
+                r.kind = InputEventKind::TabletPadRing;
+                r.device = e.device;
+                r.code = e.ring;
+                r.x = e.angle;
+                r.time = e.time_ms;
+            } else if constexpr (std::is_same_v<E, lm::TabletPadStripEvent>) {
+                r.kind = InputEventKind::TabletPadStrip;
+                r.device = e.device;
+                r.code = e.strip;
+                r.x = e.position;
+                r.time = e.time_ms;
             } else {
                 static_assert(std::is_same_v<E, lm::InputCapabilities>);
                 r.kind = InputEventKind::Capabilities;
