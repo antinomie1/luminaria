@@ -427,7 +427,7 @@ target("luminaria-gpu")
 target("luminaria-desktop")
     set_kind("static")
     luminaria_defaults()
-    add_deps("luminaria", "luminaria-gpu")
+    add_deps("luminaria")
     add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
               "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
               "src/protocol/output_management.cppm",
@@ -503,7 +503,12 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
         if gpu_tests[name] then
             add_deps("luminaria-gpu")
         elseif desktop_tests[name] then
+            -- desktop does not need gpu; a test that holds one of everything
+            -- imports both.
             add_deps("luminaria-desktop")
+            if name == "test_teardown_order" then
+                add_deps("luminaria-gpu")
+            end
         elseif text_tests[name] then
             add_deps("luminaria-text")
         else

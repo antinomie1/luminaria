@@ -101,6 +101,10 @@ public:
 
     [[nodiscard]] int scale() const noexcept;
     [[nodiscard]] Transform transform() const noexcept;
+    [[nodiscard]] int refresh_mhz() const noexcept;
+    /// Where xdg-output says this output sits in the layout.
+    [[nodiscard]] int logical_x() const noexcept;
+    [[nodiscard]] int logical_y() const noexcept;
 
     /// Size in layout coordinates: the mode divided by the scale, with the axes
     /// swapped when the transform rotates. This is what xdg-output reports.
@@ -445,6 +449,9 @@ void OutputGlobal::set_transform(Transform transform) {
 }
 
 int OutputGlobal::scale() const noexcept { return impl_->scale; }
+int OutputGlobal::refresh_mhz() const noexcept { return impl_->refresh_mhz; }
+int OutputGlobal::logical_x() const noexcept { return impl_->logical_x; }
+int OutputGlobal::logical_y() const noexcept { return impl_->logical_y; }
 Transform OutputGlobal::transform() const noexcept { return impl_->transform; }
 int OutputGlobal::logical_width() const noexcept { return impl_->logical_width(); }
 int OutputGlobal::logical_height() const noexcept { return impl_->logical_height(); }
