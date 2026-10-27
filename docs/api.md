@@ -134,14 +134,22 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ### 3.3 Signal & Observer
 - **`Signal<Event>`** (`luminaria:signal`): 类型安全的事件发布/订阅机制。
-  - `Connection connect(std::function<void(Event&)> slot)`: 注册观察者。
+  - `Connection connect(F&& slot)`: 注册观察者。`slot` 收事件，或者什么都不收（`[&] { ... }`）——用不着事件的回调不必再把事件类型写一遍。
   - `void emit(Event& event)`: 触发信号（重入安全：触发期间新增的槽在下一轮才生效，移除的槽立即标记失效）。
   - `std::size_t slot_count() const noexcept`: 当前活跃槽位计数。
   - **`Signal<Event>::Connection`**: RAII 订阅句柄，移动语义。析构或调用 `disconnect()` 自动退订；当 `Signal` 先销毁时自动安全失效。
+- **`Connections`** (`luminaria:signal`): 一袋任意信号类型的连接，给不值得单独起名字的那些。`connections += sig.connect(...)`；
+  信号已经死掉的连接是惰性的，袋子长大时顺手清掉，所以一个反复开关的窗口不会攒下垃圾。袋子析构时全部断开，
+  **要声明在回调所捕获的一切之后**——这也让回调不会在 `Display` 析构、客户端对象被销毁时碰到已经没了的局部变量。
+- **`match(variant, handlers...)` / `Overloaded`** (`luminaria:match`): 一个变体的每个分支一个处理函数，取代每个使用 `InputEvent` 的
+  代码上方那三行 overload 惯用法。
+- **`to_optional(Result<T>)`** (`luminaria:expected`): “建不出来就算了”——有值给值，否则 `nullopt`。`Result` 就是 `std::expected`，
+  `and_then` / `transform` / `or_else` / `value_or` 本来就有。
 
 ### 3.4 Geometry & Color & Math
 - **`Box`** (`luminaria:box`): `{ int x, y, width, height; }`
   - `bool empty() const`, `bool contains(int px, int py) const`
+  - `Size size() const`, `Point center() const`；`Size` 是 `{ int width, height; }`，`Point` 是 `{ double x, y; }`。
   - `Box intersection(const Box& o) const`, `Box union_with(const Box& o) const`
 - **`Color`** (`luminaria:color`): `{ float r, g, b, a; }`（各分量范围 `[0.0f, 1.0f]`）。
 - **`Pixel`** (`luminaria:pixel`): `{ uint8_t r, g, b, a; }`（未预乘或预乘 8 位 RGBA）。
@@ -315,6 +323,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - 将 `std::vector<SceneItem>` 自动分发至 `Frame` 或 `CpuCompositor`，透明处理运行时 GPU 降级。
   - `Status reset(SceneOutput&, Output&, uint32_t drm_format = XRGB8888)`：每块输出调一次，之后的 mode 变化自己重新分配。
   - `present(state, output, scene, background)`（输出坐标）与 `present(state, output, scene, background, const OutputLayout&)`（全局坐标）。
+  - `SceneStats stats() const`：`present()` 到目前为止按结果（composited / scanout / unchanged / cpu）数过的帧，看空闲屏幕是不是真的安静下来。
 
 ### 6.3 DirectScanout (直出决策, `luminaria.gpu`)
 - **`DirectScanout`** (`luminaria.gpu:direct_scanout`): 评估单全屏表面是否满足 KMS 硬件直出要求（无旋转、无裁剪、格式匹配），并管理导入缓存与 `Surface::hold_buffer()`。
@@ -323,6 +332,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`OutputLayout`** (`luminaria:output_layout`): 全局逻辑坐标系管理。不可移动：它盯着装进来的每块输出，销毁的自己离开、换 mode 的保留位置换上新尺寸。
   - `void add(Output&, int x, int y)`, `void add_auto(Output&)`, `void remove(const Output&)`
   - `Output* at(int x, int y) const`, `Box box_of(const Output&) const`
+  - `Output* primary() const`, `Box primary_box() const`：第一块放进来的输出（窗口没有更好主意时去的那块），没有时为空 / 空盒。
   - `Signal<OutputLayoutChange> changed`：任何输出的格子变了（含它自己做的变化）。
 - **`Pointer`** (`luminaria:pointer`): 全局光标坐标与约束状态。
 - **`PopupTree`** (`luminaria:popup`): XDG 弹出菜单（Popup）树管理与 Grab 仲裁。`explicit PopupTree(XdgShell&)` 从创建到销毁自己跟踪 shell 的每个 popup，`Signal<PopupTreeChange> changed` 在映射 / 取消映射 / 重定位 / 销毁时广播；layer surface 的 popup 用 `set_parent()` 指定父表面。
@@ -356,7 +366,8 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`XdgShell`** (`luminaria:xdg_shell`):
   - `static Result<XdgShell> create(Display& display)`
   - 信号：`new_toplevel()`, `new_popup()`
-  - **`Toplevel`**: `configure(int w, int h, std::span<const State> states)`, `close()`, `set_bounds(int max_w, int max_h)`.
+  - `set_bounds(int w, int h)` / `set_bounds(Size)`；`focus(Seat&, Toplevel*)`：让这个窗口（空指针 = 没有）独自拿到 activated 状态和 `seat` 的键盘焦点，原来的那个取消激活，焦点窗口销毁时自己忘掉——混成器不必再留“哪个是激活的”这个变量。
+  - **`Toplevel`**: `configure(int w, int h)` / `configure(Size)`（返回 serial）, `close()`, `set_bounds(int max_w, int max_h)`.
     - 请求信号：`request_maximize`, `request_fullscreen`, `request_minimize`, `request_move`, `request_resize`, `request_window_menu`.
   - **`Popup`**: `configure(const Box& geometry)`, `reposition(...)`, `popup_done()`.
 - **`LayerShell`** (`luminaria:layer_shell`): `zwlr_layer_shell_v1` 实现。

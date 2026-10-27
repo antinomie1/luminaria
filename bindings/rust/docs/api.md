@@ -240,7 +240,7 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   let mut output = backend.add_output(1280, 800)?;
   backend.start()?;
   ```
-- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器以 `Event::Backend` 到来与离开，输入以 `Event::Input`，VT 切换以 `Event::SessionActive`；`Session::switch_vt_for(keysym)` 是 Ctrl+Alt+Fn 那个绑定。见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
+- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器以 `Event::OutputAdded` / `Event::OutputRemoved` 到来与离开，输入以 `Event::Input`，VT 切换以 `Event::SessionActive`；`Session::switch_vt_for(keysym)` 是 Ctrl+Alt+Fn 那个绑定。见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
 - **`AutoBackend`**（特性 `gpu`，C++ `AutoBackend`）：替调用者挑后端。auto 依次试嵌套、能拿到 libseat 会话时的
   DRM（ssh、CI 因此不会误上 VT）、无头；按名字要某一种时失败就是错误而不回退，DRM 这时没有会话也照跑。
   会话、显卡、libinput 都归它，Rust 只借 `Display`。读环境变量仍是调用者的事，`"auto".parse::<BackendKind>()`
@@ -253,15 +253,15 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   backend.start()?;                                             // 先 libinput，后后端
   for event in display.dispatch(None)? {
       match event {
-          Event::Backend(BackendEvent::OutputAdded(output)) => { /* ... */ }
-          Event::Backend(BackendEvent::OutputRemoved(id)) => { /* 布局和渲染器已经放手 */ }
+          Event::OutputAdded(output) => { /* ... */ }
+          Event::OutputRemoved(id) => { /* 布局和渲染器已经放手 */ }
           Event::HostCloseRequest => { /* 只有嵌套会有 */ }
           _ => {}
       }
   }
   if let Some(session) = backend.session() { session.switch_to(2)?; } // 只在 DRM 上
   ```
-  嵌套与无头那一块输出也以 `BackendEvent::OutputAdded` 到来（`start()` 时），所以三种后端只有一条输出路径。
+  嵌套与无头那一块输出也以 `Event::OutputAdded` 到来（`start()` 时），所以三种后端只有一条输出路径。
 
 ### 输入：`InputSource`
 嵌套的 `WaylandBackend`、裸机的 `LibinputBackend` 与 `AutoBackend` 都实现（封闭的）`InputSource` trait，输入以
@@ -276,7 +276,7 @@ for event in display.dispatch(None)? {
     let Event::Input(input) = event else { continue };
     match input {
         InputEvent::Key { .. } => keys.route(&seat, &input, |e| /* 快捷键？ */ false),
-        InputEvent::Modifiers(m) => seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group),
+        InputEvent::Modifiers(m) => seat.notify_modifiers(m),
         InputEvent::Axis(axis) => seat.pointer_axis_event(axis),
         // Motion / MotionAbsolute / PointerLeave / Button / Capabilities / Touch*
         _ => {}
@@ -309,7 +309,7 @@ for event in display.dispatch(None)? {
 ```rust
 for event in display.dispatch(Some(Duration::from_millis(16)))? {
     match event {
-        Event::Xdg(XdgEvent::Toplevel(surface, e)) => { /* ... */ }
+        Event::Toplevel(surface, e) => { /* ... */ }
         Event::Layer(surface, e) => { /* LayerSurfaceEvent */ }
         Event::Seat(e) => { /* SeatEvent */ }
         Event::Output(id, OutputEvent::Frame) => { /* 画这一块 */ }
@@ -323,6 +323,8 @@ for event in display.dispatch(Some(Duration::from_millis(16)))? {
 - **顺序就是信号的顺序。** 不同 global 的事件按发生先后交错，而不是按 global 分组。
 - **每个载荷都能 `TryFrom<Event>` 取回**（不是它时原样还回事件），例如
   `events.filter_map(|e| XdgEvent::try_from(e).ok())`；`(OutputId, OutputEvent)` 与 `(SurfaceId, LayerSurfaceEvent)` 也一样。
+  输出和 xdg 窗口的事件是平的（`Event::OutputAdded` / `OutputRemoved` / `Toplevel` / `Popup`），一个 match 分支就把整件事说完；
+  `BackendEvent` 与 `XdgEvent` 是把各自这一族收在一起的类型，给 `TryFrom` 用。
 - **混成器自己的调用触发的信号**（`seat.set_keyboard_focus()` 发出的焦点事件之类）同样进队列，在下一次
   `dispatch()` 或 `display.events()` 时出现，而不是当场返回。
 - **一个线程一个 `Display`。** 队列按线程分，同一线程上的第二个 `Display` 会收到第一个的事件。
@@ -386,8 +388,8 @@ seat.touch_frame();
 - `seat.release_keys()`：松开客户端以为按着的每个键并清修饰键（切 VT 时）。
 
 ### `XdgShell`
-发布 `xdg_wm_base`（toplevel 与 popup）。事件是 `Event::Xdg`：`XdgEvent::Toplevel(SurfaceId, ToplevelEvent)` 或
-`XdgEvent::Popup(SurfaceId, PopupEvent)`：
+发布 `xdg_wm_base`（toplevel 与 popup）。事件是 `Event::Toplevel(SurfaceId, ToplevelEvent)` 或
+`Event::Popup(SurfaceId, PopupEvent)`：
 
 - `ToplevelEvent`：`Created`、`Map`、`Unmap`、`Destroy`；客户端的请求 `RequestMaximize(bool)`、`RequestFullscreen(bool)`、
   `RequestMinimize`（这三个只在 `forward_window_requests()` 之后到来，否则库自己批准）、`RequestMove { serial }`、`RequestResize { serial, edges }`（`util::edge` 位掩码）、
@@ -397,26 +399,26 @@ seat.touch_frame();
 
 ```rust
 let shell = XdgShell::new(&display)?.forward_window_requests(); // 全屏请求归我们答
-shell.set_bounds(1920, 1080);
+shell.set_bounds((1920, 1080));
 let popups = PopupTree::new(&shell)?; // 从此自己跟随每个 popup
 for event in display.dispatch(None)? {
     match event {
-        Event::Xdg(XdgEvent::Toplevel(s, ToplevelEvent::Created)) => {
+        Event::Toplevel(s, ToplevelEvent::Created) => {
             let t = shell.toplevel(s).unwrap();
             t.set_maximized(true);
-            t.configure(1920, 1080);
+            t.configure((1920, 1080));
         }
-        Event::Xdg(XdgEvent::Toplevel(s, ToplevelEvent::RequestFullscreen(on))) => {
+        Event::Toplevel(s, ToplevelEvent::RequestFullscreen(on)) => {
             if let Some(t) = shell.toplevel(s) { t.set_fullscreen(on) }
         }
-        Event::Xdg(XdgEvent::Popup(..)) => { /* 要一帧；树已经知道了 */ }
+        Event::Popup(..) => { /* 要一帧；树已经知道了 */ }
         _ => {}
     }
 }
 ```
 
 - `Toplevel`：`title()`、`app_id()`、`parent()`、`is_mapped()`、`min_size()`、`max_size()`、`geometry()`（窗口几何，
-  不含客户端阴影）、`pending_size()`、`states()`；`configure(w, h) -> serial`、`set_maximized` / `set_fullscreen` /
+  不含客户端阴影）、`pending_size()`、`states()`；`configure(size) -> serial`（`size` 是 `(w, h)` 或 `rect.size()`）、`set_maximized` / `set_fullscreen` /
   `set_activated` / `set_resizing` / `set_tiled` / `set_minimized`、`close()`。`shell.toplevels()` 列出全部。
 - `Popup`：`parent()`、`is_mapped()`、`has_grab()`、`geometry()`（相对父窗口几何）、`dismiss()`。
 - `set_popup_constraint_areas(&[PopupArea { parent, parent_box, usable }])`：每个可能当 popup 父亲的 surface 画在哪、
@@ -523,7 +525,7 @@ match outcome {
 
 ### `Cursor`
 指针及其图像：主题、cursor-shape、客户端精灵、KMS 光标平面。`Cursor::new(&renderer, &layout, &seat)?`
-借用这三者直到它 drop（见上文"借用关系"）。`move_to` / `move_by` / `leave` / `position` / `refresh`。
+借用这三者直到它 drop（见上文"借用关系"）。`move_to(x, y)` / `move_by(dx, dy)`（夹在整个布局里；第一块输出出现时指针自己站在它中间）、`move_to_within` / `move_by_within`（要自己给边界，指针约束那种）、`leave` / `position` / `refresh`。
 
 ### `Frame`
 逐输出的即时模式 GPU 帧账本。如果需要手动绕过 `SceneRenderer` 直接驱动 Vulkan 帧绘制，可使用 `Frame`。
@@ -660,7 +662,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. 注册每个混成器都要的协议接口
     let globals = CoreGlobals::new(&display)?;
-    globals.shell().set_bounds(1024, 768);
+    globals.shell().set_bounds((1024, 768));
     globals.seat().set_capabilities(true, true, false);
 
     // 4. 多屏坐标排版
@@ -760,7 +762,7 @@ let renderer = SceneRenderer::new(&options)?;
 - **`LibinputBackend` 是一个 `InputSource`**（见 §3「输入」）：按键、修饰键、相对移动、按钮、滚轮
   （平滑量 + 刻度 + 停止标记）、触摸（down/motion/up/frame/cancel，坐标归一化到触摸屏）、设备能力变化。
   另有 `set_keymap()`，以及对应 `create_path()` 的 `LibinputBackend::new_path()`。
-- **`Event::Backend(BackendEvent)`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`，DRM 与 `AutoBackend` 都是它。
+- **`Event::OutputAdded(Output)` 与 `Event::OutputRemoved(OutputId)`**，DRM 与 `AutoBackend` 都是它们（`BackendEvent` 把两者收成一族，给 `TryFrom` 用）。
   `start()` 时已有的显示器也以 `OutputAdded` 到来。显示器被拔掉后，手里的 `Output` 仍可安全调用，只是一切都成了
   空操作（`Output::is_alive()` 为 false），收到 `OutputRemoved` 时丢掉即可。`Output::id()` 是比较身份用的。
 - **`OutputLayout::add_auto()` / `bounds()`**：从左到右排；所有输出的外框，相对指针就夹在里面。
@@ -798,7 +800,7 @@ ADR 0003 约束的是**核心模块**收什么协议；Vulkan 本来就在 `lumi
 `minimal.rs` 与 `minimal.cpp` 的后端选择相同：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
 auto 依次尝试嵌套、能拿到 libseat 会话时的 DRM、无头；显卡取第一个参数或 `LUMINARIA_DRM_DEVICE`；
 Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满第一块；显示器热插拔、模式变化、VT 切走时放开
-按键、DRM 上每秒一行帧统计，都与 C++ 版一致。有了 §4 的事件，弹出菜单也一致了：`PopupTree` 把 popup 放进场景，
+按键、都与 C++ 版一致；DRM 上每秒一行的帧统计和其它诊断行只在 C++ 版里（`LUMINARIA_TRACE=1`，`scripts/tty-check.sh` 读的就是它），Rust 版不带。有了 §4 的事件，弹出菜单也一致了：`PopupTree` 把 popup 放进场景，
 点在菜单外面关掉它，`set_popup_constraint_areas` 让贴边的菜单翻转；窗口按窗口几何摆放；`OutputGlobal`
 告诉客户端位置、模式、缩放与朝向。C++ 版没有 layer shell 与锁屏，所以 Rust 版也没有（两者保持同步）；
 它们的用法见 `tests/test_layer_shell.rs`、`tests/test_session_lock.rs`。
@@ -807,7 +809,7 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 跟随输出与布局的 `OutputGlobal`、跟随 shell 的 `PopupTree`、`scene_route_pointer`、`KeyRouter::route` +
 `Session::switch_vt_for` + `Seat::release_keys`、`Seat::follow`、用布局坐标的 `present`。两者剩下的差别只在
 语言本身：C++ 在信号回调里处理，Rust 在 `dispatch()` 返回的事件上 match；popup 约束 C++ 同步回答、Rust 事先告知；
-Rust 版一个带 lifetime 的结构体都没写。行数：C++ 639 → 500，Rust 677 → 420。
+Rust 版一个带 lifetime 的结构体都没写。行数：C++ 639 → 500 → 365，Rust 677 → 420 → 322。
 
 - **窗口状态请求**：两边都不回答 maximize / fullscreen / minimize，由库按兜底批准（Rust 不调
   `forward_window_requests()`）。

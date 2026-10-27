@@ -12,7 +12,8 @@
 //
 // Where the pointer goes stays the compositor's: input routing, pointer
 // constraints and which output a device maps to are decisions, so `move_to()`
-// and `move_by()` take the position (and the bounds) from the caller. What the
+// and `move_by()` take the position from the caller, and the bounds only when a
+// pointer constraint narrows them. What the
 // pointer looks like, and getting that onto every screen, is this type's.
 //
 // It draws through `SceneRenderer`: it installs itself as the renderer's cursor

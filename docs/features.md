@@ -15,7 +15,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 
 | 模块 | 内容 | 测试 |
 |---|---|---|
-| core | `Result<T>` / `Error`、`CUnique` 句柄 RAII、`Signal<Event>` + RAII `Connection`（emit 期间 connect/disconnect 安全）、`Display`、`EventLoop` + `EventSource` | signal, core |
+| core | `Result<T>` / `Error`、`CUnique` 句柄 RAII、`Signal<Event>` + RAII `Connection`（emit 期间 connect/disconnect 安全；回调可以不收事件，`connect([&] { ... })`）、`Connections`（一袋任意信号类型的连接，信号死掉的自己清掉）、`match()` / `Overloaded`、`to_optional(Result)`、`Display`、`EventLoop` + `EventSource` | signal, core |
 | core | `SurfaceId{index,generation}` + `surface_from_id()`：销毁后清槽并推进代际，槽复用也不会让旧身份指向新客户端；焦点、拖放、帧摆位、纹理缓存和直出 hold 全部按 id 留存 | surface-handle, seat-input, dnd-surface-destroy, frame |
 | util | `Box`、`Color`、`Pixel`、`Rect`（constexpr） | box |
 | util | `KeymapState` —— RAII 的 xkb 包装：按布局名 / 文本编译 keymap，喂 evdev 键码读出 keysym 与修饰键掩码。只给键盘**状态**，不给绑定与动作；`LibinputBackend` 内部就持有一个（`keymap_state()` 可读），与 `Seat::set_keymap()` 共用同一份布局，keysym 与客户端看到的按键不会各算各的 | keymap |
@@ -127,11 +127,12 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | shell | **场景表 `SceneItem` / `SceneRenderer`** —— 一张有序列表同时被画和被命中：四种图元（客户端表面树、纯色矩形、窗口边框、混成器自有像素块），`SceneRenderer` 按现有硬件喂给 `Frame` 或 `CpuCompositor`，`scene_hit_test()` 读同一张表回答"这点上是什么"。上层因此每种图元只写一遍，不必维护 `Placement` / `CpuItem` 两套实现；三种降级（无 Vulkan 设备、输出配不出渲染目标、`submit()` 答 `fallback`）全在运行时落到同一个 CPU 分支。`tag` 是调用方身份，库不解释、命中时原样交还 | scene, scene_renderer |
 | shell | **纯色矩形图元 `Frame::place_rect(x, y, w, h, color)`** —— 混成器-owned 的立即模式原语（边框、背景面板、遮罩、光标底）：不参与命中测试、不报自己的 damage，移动 / 换色由摆位 diff 恢复，代价恰好两个矩形；与表面同 z 序，GPU 侧走无纹理的 solid pipeline，CPU 侧就是 `RectFill` 图元 | frame |
 | shell | **`SceneRenderer` 替混成器应答显示器** —— `reset()`（默认 XRGB8888，每块输出调一次，之后的 mode 变化自己重新分配）把 `SceneOutput` 绑到输出上，此后该输出的 `present` 自己释放本帧画过的全部表面的帧回调并发 presentation 反馈（`set_presentation()`），`unchanged` 的那帧当场补发，CPU 路径像 GPU 路径的 `Frame` 一样盯着画过的表面的 commit，并且同样会空闲 —— 图元列表、图像 serial、背景色与上一次提交的 CPU 帧相同且其间没有被画表面 commit 时，不合成、不提交、不再要帧，当场补发帧回调并答 `unchanged`；输出销毁或 `SceneOutput` 销毁时自动解绑。`present()` 回答 `composited` / `scanout` / `unchanged` / `cpu`；带 `OutputLayout` 的重载接受全局坐标的场景表，移到该输出自己的坐标（复用 scratch，稳态不分配） | scene_present |
-| shell | **`Cursor`：指针与它的图像，一条龙** —— 加载主题、跟随 cursor-shape 请求与客户端光标表面（动画光标每次 commit 重传）、指针焦点换客户端时回到默认箭头；作为 `SceneRenderer` 的光标源，每次移动在有 KMS 光标平面的输出上只挪平面、其余输出要一帧；按输出裁掉不在该屏上的精灵；`capture()` 供 ext-image-copy-capture 光标会话。指针往哪走仍由混成器决定（`move_to` / `move_by` 收边界） | scene_present |
+| shell | **`Cursor`：指针与它的图像，一条龙** —— 加载主题、跟随 cursor-shape 请求与客户端光标表面（动画光标每次 commit 重传）、指针焦点换客户端时回到默认箭头；作为 `SceneRenderer` 的光标源，每次移动在有 KMS 光标平面的输出上只挪平面、其余输出要一帧；按输出裁掉不在该屏上的精灵；`capture()` 供 ext-image-copy-capture 光标会话。指针往哪走仍由混成器决定（`move_to` / `move_by` 默认夹在整个布局里，收边界的是指针约束要的那种；直接收后端的相对 / 绝对运动事件，绝对运动落在事件指明的输出、没指明就是第一块；第一块输出出现时指针自己站在它中间，直到有设备另说） | scene_present |
 | shell | **输入路由的机制** —— `scene_route_pointer(seat, scene, x, y)`：按住按钮期间运动按 grab 表面（含子表面，`scene_surface_origin()`）自己的坐标发过去，否则把焦点给命中的表面；`KeyRouter::route(seat, event, binding)`：按下先给快捷键，被留下的键连同松开一起留下，松开丢失（切 VT）后的再次按下当新按下；`Seat::release_keys()`：松开客户端以为按着的每个键并清修饰键；`Session::switch_vt_for(keysym)`：Ctrl+Alt+Fn；`Seat::follow(source)`：立即采用输入源的 keymap 与 capabilities 并跟随其后的变化（touch 只在要求时公布） | key-router, subsurface |
 | shell | **`PopupTree(shell)` 跟随 shell** —— 每个 xdg_popup 从创建到销毁由树自己跟踪（映射、取消映射、重定位、销毁），变化在 `changed` 上广播；layer surface 的 popup 用 `set_parent()` 指定父表面 | popup |
 | protocol | **`CoreGlobals`** —— 一次创建每个可用混成器都要的 global：wl_shm、wl_compositor、wl_subcompositor、xdg-shell、wl_seat、剪贴板与 primary selection、single-pixel-buffer、presentation-time、viewporter、fractional-scale、cursor-shape、xdg-decoration，按借用关系排好析构顺序 | key-router |
-| example | `minimal`（嵌套 / DRM / headless 同一份，与 Rust 的 `minimal` 一对：最大化窗口栈、点击置顶、Logo+Return/Tab/q/Escape） | scene_present |
+| example | `minimal`（嵌套 / DRM / headless 同一份，与 Rust 的 `minimal` 一对：最大化窗口栈、点击置顶、Logo+Return/Tab/q/Escape；C++ 365 行，Rust 322 行）。`LUMINARIA_TRACE=1` 时 `examples/trace.cppm` 打出 `scripts/tty-check.sh` 要读的那些行 | scene_present |
+| shell | **`XdgShell::focus(seat, toplevel)`** —— 一扇窗口独自拿到 activated 状态和键盘焦点，原来的取消激活，销毁时自己忘掉；`OutputLayout::primary()` / `primary_box()`、`Output::refresh_hz()`、`SceneRenderer::stats()`（按结果数过的帧）、`Size` / `Point` / `Box::size()` / `Box::center()` 和接 `Size` 的 `configure()` / `set_bounds()` 是同一类：示例里手写过的那几步 | toplevel_state, output_layout, scene_present |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |
 
 ---

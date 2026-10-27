@@ -104,6 +104,9 @@ compositor 的输出打时间戳、按需拉起一个客户端，退出后在 `l
 `report.md` —— 模式设置、硬件光标平面、GPU 直出、VT 切换、热插拔、空闲翻页数逐项勾出来，
 连同原始日志。屏幕被接管之前它会先把要做的动作列出来。
 
+脚本给 `minimal` 设了 `LUMINARIA_TRACE=1`：证据行（会话、输出、输入设备、窗口 map、每秒帧统计）由
+`examples/trace.cppm` 打出，`minimal.cpp` 本身不再带诊断代码。
+
 ```sh
 ./scripts/tty-check.sh                 # 自动挑客户端
 ./scripts/tty-check.sh --no-client     # 只跑 compositor

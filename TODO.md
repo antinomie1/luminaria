@@ -150,6 +150,29 @@ Rust 677 → 420 行。`CoreGlobals`；跟随输出的 `OutputLayout` 与 `Outpu
 `DesktopGlobals`、`single_pixel_buffer_color()`、`dmabuf_buffer_to_rgba()`，desktop 模块因此不再
 依赖 gpu 模块。
 
+**第二轮：表层啰嗦（同日）。** 只改写法，不动架构，也没有加窗口栈。C++ 500 → 365 行，Rust 420 → 322 行。
+`Signal::connect` 接零参回调；`Connections` 取代 `Window` / `Screen` 里为了保管连接而存在的成员；`match()` /
+`Overloaded` 取代 `std::visit` 惯用法；`to_optional(Result)`；`Size` / `Point`、`Box::size()` / `center()`、接
+`Size` 的 `configure()` / `set_bounds()`；`XdgShell::focus(seat, toplevel)` 取代“哪个窗口是激活的”那个变量；
+`OutputLayout::primary()` / `primary_box()`、`Output::refresh_hz()`；`Cursor` 直接收后端的运动事件、
+绝对运动缺省落在第一块输出、第一块输出出现时自己居中；`dismiss_grabs_outside()` 去掉 `[[nodiscard]]`；
+`SceneRenderer::stats()`。`tty-check.sh` 读的诊断行搬到 `examples/trace.cppm`（`LUMINARIA_TRACE=1`）。Rust：
+`Event::OutputAdded` / `OutputRemoved` / `Toplevel` / `Popup` 取代两层嵌套，`Seat::notify_modifiers` 收事件，
+`Cursor::move_to` 不再每次传边界（要边界的是 `move_to_within`）。
+
+**这一轮没做的，以及为什么：**
+- `Result` 的 monadic 操作：`Result` 本来就是 `std::expected`，`and_then` / `transform` / `or_else` / `value_or`
+  已经在，没有东西可加；缺的只是“建不出来就算了”那一行，由 `to_optional` 补上。
+- 空事件类型收敛（`ToplevelMap` / `Unmap` / `Destroy`、`PopupMap`……）：零参回调以后调用处已经看不到这些名字；
+  它们仍是 `Signal<…>` 的类型参数，收成一个别名省不下代码，还要动测试和 Rust shim 里每处 `Conn<…>`。
+- 让连接“跟着发出它的对象一起死”（不经任何持有者）：回调捕获的是 `main` 里的局部变量，而 `Display` 在最后销毁，
+  客户端对象在 `wl_display_destroy` 里才死——那时这些局部变量早没了，回调会踩进去。所以用 `Connections`，
+  它在被捕获者之后声明、先于它们死。
+- 接 `Box` 的 `configure()`：丢掉位置的重载读起来像是位置有用；调用处写 `box.size()`。
+- 绝对运动映射到输出，Rust 一侧：C++ 的 `Cursor::move_to(const PointerMotionAbsEvent&)` 需要 `Output*`，而 Rust 的
+  `OutputId` 在 C++ 里没有反查表；`minimal.rs` 保留那三行，其余（居中、边界）已由库给默认值。
+- `CursorManager::pointer_bounds()` 和 `send_relative_motion()` 按约定保持不变。
+
 Rust 绑定改成一条事件流：shim 把每个信号按触发顺序推进同一个线程内队列，`Display::dispatch()`
 返回 `Event`；各 global 的 `next_event()`、`Output::take_frame()` / `take_mode_changed()`、
 `take_close_request()`、`next_activity()`、`next_selection_change()` 都没有了。`SceneOutput` 收进了
