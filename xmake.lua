@@ -245,6 +245,7 @@ target("luminaria")
               "src/backend/wayland.cppm", {public = true})
     add_files("src/protocol/client_buffer.cppm", "src/protocol/commit_timing.cppm",
               "src/protocol/compositor.cppm", "src/protocol/content_type.cppm",
+              "src/protocol/core_globals.cppm",
               "src/protocol/background_effect.cppm",
               "src/protocol/cursor_shape.cppm", "src/protocol/data_device.cppm",
               "src/protocol/fifo.cppm",
@@ -428,7 +429,6 @@ target("luminaria-desktop")
     luminaria_defaults()
     add_deps("luminaria", "luminaria-gpu")
     add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
-              "src/protocol/desktop_globals.cppm",
               "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
               "src/protocol/output_management.cppm",
               "src/protocol/session_lock.cppm", "src/protocol/workspace.cppm",

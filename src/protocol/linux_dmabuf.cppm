@@ -67,14 +67,6 @@ private:
     explicit LinuxDmabuf(std::unique_ptr<Impl> impl) noexcept;
 };
 
-/// If `buffer` is a dmabuf wl_buffer minted by this global, decode it to
-/// tightly-packed RGBA8 in `out` (setting width/height); returns true. LINEAR
-/// buffers are mmap'd; others go through the renderer stored at creation. Returns
-/// false for any other buffer (the caller falls back to shm). The compositor's
-/// render bridge calls this when wl_shm_buffer_get() comes back null.
-[[nodiscard]] bool dmabuf_buffer_to_rgba(wl_resource* buffer, std::vector<std::uint8_t>& out,
-                                         int& width, int& height);
-
 /// Plane + format metadata for a dmabuf wl_buffer minted by this global. Used by
 /// screencopy to write a captured frame into a client's dmabuf target, and by
 /// the renderer to import it as a GPU texture without a CPU round trip.
@@ -664,15 +656,6 @@ bool DmabufBuffer::rgba(std::vector<std::uint8_t>& out, int& width, int& height)
 bool DmabufBuffer::dmabuf(DmabufPlane& out) const noexcept {
     out = DmabufPlane{fd, width_value, height_value, format, offset, stride, modifier};
     return true;
-}
-
-bool dmabuf_buffer_to_rgba(wl_resource* buffer, std::vector<std::uint8_t>& out, int& width,
-                           int& height) {
-    const DmabufBuffer* buf = as_dmabuf(buffer);
-    if (buf == nullptr) {
-        return false;
-    }
-    return buf->rgba(out, width, height);
 }
 
 bool dmabuf_buffer_info(wl_resource* buffer, DmabufInfo& out) {

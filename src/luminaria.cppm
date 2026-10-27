@@ -25,6 +25,7 @@ export import :color;
 export import :commit_timing;
 export import :compositor;
 export import :content_type;
+export import :core_globals;
 export import :cpu_compositor;
 export import :cursor_manager;
 export import :cursor_shape;

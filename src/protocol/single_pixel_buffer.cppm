@@ -50,11 +50,6 @@ private:
     explicit SinglePixelBufferManager(std::unique_ptr<Impl> impl) noexcept;
 };
 
-/// If `buffer` is a single-pixel wl_buffer, write its colour into `rgba` as
-/// RGBA8 and return true; false for any other buffer. Alpha is pre-multiplied,
-/// same convention as the wl_shm ARGB8888 path.
-[[nodiscard]] bool single_pixel_buffer_color(wl_resource* buffer, std::uint8_t rgba[4]);
-
 } // namespace luminaria
 
 // --------------------------------------------------------------- implementation
@@ -127,15 +122,5 @@ Result<SinglePixelBufferManager> SinglePixelBufferManager::create(Display& displ
     return SinglePixelBufferManager{std::move(impl)};
 }
 
-bool single_pixel_buffer_color(wl_resource* buffer, std::uint8_t rgba[4]) {
-    auto* px = dynamic_cast<SinglePixel*>(client_buffer_from_resource(buffer));
-    if (px == nullptr) {
-        return false;
-    }
-    for (int i = 0; i < 4; ++i) {
-        rgba[i] = px->pixel[i];
-    }
-    return true;
-}
 
 } // namespace luminaria
