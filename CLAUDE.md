@@ -132,7 +132,10 @@ src/detail/wayland_fwd.h the one remaining header
 Running the example compositor — one, `examples/minimal.cpp`, the C++ twin of
 `bindings/rust/examples/minimal.rs`. The two are kept in step: same window policy, same bindings,
 same backend choice, same popups, dmabuf, cursor shapes, preferred and fractional scale, and the
-same subsurface-aware pointer grab. Adding a visible behaviour to one means adding it to the
+same subsurface-aware pointer grab. The Rust binding hands every signal back through one
+stream: each shim pushes onto a per-thread queue in emission order, and
+`Display::dispatch()` returns it as `Event`s (`bindings/rust/src/event.rs`), so there is no
+per-global queue to forget. Adding a visible behaviour to one means adding it to the
 other; `bindings/rust/docs/api.md` §9.5 records what the Rust one does with it:
 
 ```sh
@@ -165,8 +168,10 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   connector's mode list), `LibinputBackend` (bare-metal input
   signals). Every `Output` carries a `scale` and a `Transform`; `Output::destroy` fires when a
   monitor goes away and `Output::mode_changed` when a `set_mode()` lands — everything
-  sized for the old mode (scanout targets, scanout imports, the layout box, the
-  `OutputGlobal`) has to be rebuilt there. `Session` (libseat, `session.cppm`) owns the device fds and tells
+  sized for the old mode is rebuilt by its owner, not by the compositor: a `SceneOutput`
+  that was `reset()` reallocates, `OutputLayout` keeps the output's position and takes its
+  new size, and an `OutputGlobal` made with `create(display, output, layout)` re-sends the
+  mode. A destroyed output leaves the layout by itself. `Session` (libseat, `session.cppm`) owns the device fds and tells
   both bare-metal backends when the VT is taken away. `AutoBackend` (`auto_backend.cppm`,
   `luminaria.gpu`) is the pick every compositor would otherwise copy: nested, else DRM only
   when a `Session` can be had (so ssh/CI never land on a VT), else headless — or the one kind
@@ -290,7 +295,8 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   All three fallbacks are runtime — no Vulkan device, an output whose targets would not
   allocate, `submit()` answering `Presented::fallback` — and all three land on the same CPU
   arm. `SceneItem::tag` is the caller's own identity; luminaria never reads it and only
-  hands it back from a hit. **`SceneRenderer` also answers the display:** `reset()` binds a
+  hands it back from a hit. **`SceneRenderer` also answers the display:** `reset()` (XRGB8888
+  unless told otherwise; once per output, a later mode change reallocates by itself) binds a
   `SceneOutput` to its output, after which that output's `present` releases the frame
   callbacks of everything the frame drew and sends presentation feedback (to the
   `Presentation` given by `set_presentation()`), an `unchanged` frame releases them on the
@@ -312,11 +318,22 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   (`keymap_state()`) and compositor shortcut handling read keysyms/modifiers from.
   `OutputLayout` (`output_layout.cppm`) is the one place that knows where each output sits
   in the global coordinate space, in *logical* units (`transform.cppm` holds the
-  logical↔device mapping and nothing else does). `region.cppm` is the disjoint-box set both
+  logical↔device mapping and nothing else does). It watches every output it holds and
+  announces each change on `changed`, which `Cursor` and following `OutputGlobal`s listen to;
+  it is therefore not movable. `PopupTree(shell)` follows every xdg_popup the same way, from
+  creation to destruction, and announces on `changed`. `scene_route_pointer(seat, scene, x, y)`
+  is the pointer half of input routing — an implicit grab gets motion in the grab surface's
+  coordinates (`scene_surface_origin()`), otherwise the hit surface gets focus. On the
+  keyboard side `KeyRouter::route(seat, event, binding)` keeps a binding's key whole (its
+  release too), `Seat::release_keys()` releases what a client was told is down (a VT switch,
+  with `Session::switch_vt_for(keysym)`), and `Seat::follow(InputSource&)` adopts the source's
+  keymap and capabilities and follows their changes. `CoreGlobals`
+  (`protocol/core_globals.cppm`) creates the dozen globals every usable compositor needs. `region.cppm` is the disjoint-box set both
   damage and wl_region are built on.
 Per-frame flow in a compositor built on this (see `examples/minimal.cpp`): `Output::frame`
 fires → the compositor builds its `SceneItem` list (windows, then `PopupTree::append_to`) in
-the output's coordinates → `SceneRenderer::present()`, which on the GPU path is
+layout coordinates → `SceneRenderer::present(..., layout)` moves it into the output's own
+(or the overload without a layout takes output coordinates), which on the GPU path is
 `Frame::begin(view)` → one `Frame::place()` per item (expanding its subsurface tree), then the
 cursor when no plane carries it → `Frame::submit(background)`. Inside that: Frame's GPU bridge imports or uploads each client
 buffer, `VulkanRenderer::render_to(ScanoutTarget)` composites, and
@@ -324,7 +341,7 @@ buffer, `VulkanRenderer::render_to(ScanoutTarget)` composites, and
 buffer goes to the CRTC. Outputs without dmabuf scanout (headless, nested) still composite
 on the GPU and only the finished frame crosses to the CPU: `read_scanout()` →
 `commit_frame()`. Input goes the other way: backend input signal → `Cursor::move_to()` →
-`scene_hit_test()` on the same list → `Seat` focus + event routing.
+`scene_route_pointer()` on the same list → `Seat` focus + event routing.
 
 Two bridges expose client buffers: `Surface::current_buffer_dmabuf()` lets Frame import dmabuf
 straight into `VulkanRenderer` with no readback; `Surface::current_buffer_rgba()` handles shm and
@@ -347,10 +364,14 @@ into a frame the display hardware is still scanning out. `Frame::submit()` uses 
 `buffer_width()`. Hit-testing goes through `Surface::accepts_input()` so the client's input
 region decides, not the buffer rectangle.
 
-**The renderer must outlive the Display.** Each `Frame` caches `GpuTexture`s owned by the
-`VulkanRenderer`, so the renderer has to be declared *before* the `Display`
-(locals are destroyed in reverse order). `examples/minimal.cpp` and its Rust twin do this
-with a comment; getting it wrong aborts inside `vk::raii` at shutdown.
+**The renderer must outlive what caches its textures.** Each `Frame` (inside a
+`SceneOutput`), the `Cursor` and `LinuxDmabuf` hold `GpuTexture`s or pointers owned by the
+`VulkanRenderer`, so the renderer has to be declared *before* all of them (locals are
+destroyed in reverse order); nothing tied to the `Display` itself holds one, so it does not
+have to outlive the `Display`. `examples/minimal.cpp` declares it right after the backend
+whose card it renders for; getting the order wrong aborts inside `vk::raii` at shutdown. The
+Rust binding keeps every output's state inside its `SceneRenderer`, and the borrow checker
+enforces the rest.
 
 **Frame callbacks belong to whoever presents.** `wl_surface.frame` is NOT answered on commit
 — answering there makes clients render frames the display never shows. They queue until

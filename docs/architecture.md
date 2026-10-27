@@ -29,6 +29,9 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   `mode_changed`。四个实现：`HeadlessBackend`（软件帧泵）、`WaylandBackend`（嵌套在父
   混成器里）、`DrmBackend`（KMS atomic）、`LibinputBackend`（裸机输入）。`Session`（libseat）
   决定现在谁有权碰 GPU 和输入设备。
+  **为旧 mode 准备的东西由各自的主人重建，不归混成器**：`reset()` 过的 `SceneOutput` 自己
+  重新分配，`OutputLayout` 保留位置、换上新尺寸，`OutputGlobal::create(display, output, layout)`
+  建的 wl_output 自己重发 mode；输出销毁时也自己离开 layout。
   **`frame` 是要来的，不是自己转的**：一次 `Output::schedule_frame()` 换一个 `frame` 事件。
   没人要，就没有 vblank 订阅、没有内核回调、没有进程唤醒——静止的屏幕在这一层是零开销。
   DRM 的帧来自翻页完成，嵌套的来自父混成器的 frame callback，headless 的定时器不再自己续。
@@ -71,8 +74,15 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
   pipeline（`GpuTextureFill::solid`），与表面共用遮挡剔除与 damage scissor。
   帧回调的批量发送也是外壳层的：`Frame::send_frame_done(time)` 对本帧摆位里的全部表面
   按同一时间戳发 `wl_surface.frame`，`Presented::unchanged` 分支同样用它补发。
-  另有 `OutputLayout`（输出在全局坐标系里的位置，逻辑单位）与 `DirectScanout`（全屏单窗口
-  免合成的直出决策）。
+  另有 `OutputLayout`（输出在全局坐标系里的位置，逻辑单位；盯着它装的每块输出，每次变化在
+  `changed` 上广播，`Cursor` 和跟随式 `OutputGlobal` 都听它，因此不可移动）与 `DirectScanout`
+  （全屏单窗口免合成的直出决策）。
+  输入路由里每个混成器都要重写的机制也在这一层：`scene_route_pointer(seat, scene, x, y)`
+  （按下按钮期间把运动按 grab 表面自己的坐标发过去，否则把焦点给命中的表面）、
+  `KeyRouter::route(seat, event, binding)`（被快捷键吃掉的键连同它的松开一起留下）、
+  `Seat::release_keys()`（切 VT 时松开客户端以为还按着的键）、`Seat::follow(source)`（跟随输入源
+  的 keymap 与 capabilities）。`PopupTree(shell)` 从创建到销毁自己跟着每个 xdg_popup。
+  `CoreGlobals` 一次创建每个可用混成器都要的那十来个 global。
 
   没有 Vulkan 时，同一套图元语义由 **CPU 合成器** 提供：`CpuCompositor`（核心模块，
   headless / 嵌套 / 测试通用）把一棵表面树（含 subsurface、buffer scale / transform /

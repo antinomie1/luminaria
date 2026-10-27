@@ -33,7 +33,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | 协议 | `xdg_popup` + `xdg_positioner` v3 — 菜单 / tooltip / 下拉框：anchor / gravity / offset 完整求解，**`constraint_adjustment` 真正施加**（flip → slide → resize，逐轴独立；父窗口位置由 `XdgShell::set_popup_constraint_query()` 提供），`grab`、`reposition` + `repositioned`、父级销毁时级联 `popup_done` | popup |
 | 协议 | `zxdg_decoration_manager_v1` — 谁画标题栏。客户端问、compositor 答，答案有约束力。库不画装饰，所以默认答 client-side（无框窗口比双标题栏更糟） | scaling |
 | 协议 | `wp_viewporter` — 裁剪 + 拉伸一块 buffer。视频播放器免重编码加黑边；小数缩放的客户端用它声明"我这块整数 buffer 代表多大的逻辑尺寸" | scaling |
-| 协议 | `wp_fractional_scale_v1` — 输出的真实缩放，以 120 分之一为单位（180 = 1.5x）。`wl_output.scale` 是整数，说不出 150% | scaling |
+| 协议 | `wp_fractional_scale_v1` — 输出的真实缩放（线上以 120 分之一为单位，180 = 1.5x）。`wl_output.scale` 是整数，说不出 150%。`FractionalScaleManager::set_scale(surface, 1.5)` 同时发精确值与向上取整的整数提示 | scaling |
 | 协议 | `wl_subcompositor` / `wl_subsurface` — 子表面树、相对定位、`place_above`/`place_below` 堆叠、**sync/desync 语义**（同步子表面的 commit 缓存到父级 commit 时原子提交）；`Surface::surface_tree()` / `surface_at()` 供渲染与命中测试共用 | subsurface |
 | 协议 | `wl_seat` v5 — 键盘（xkb keymap）+ 指针 + 触摸，焦点 enter/leave + 事件路由（触摸按 slot 各记各的表面，两根手指可以分别在两个客户端上，`touch_frame` 只发给本帧收到过事件的客户端）；滚轮（平滑 axis / 离散 notch / axis_stop）、`set_cursor`（发信号给 compositor 合成光标；**"客户端要求不显示指针"与"客户端没表态"是两种状态**，`cursor_hidden()` 分开报告，合成器据此决定画不画自己的箭头；光标表面自动标记为 `input_transparent()` —— 它就画在指针上，不排除的话指针下面的命中测试永远命中光标自己）；**焦点安全**：键盘/指针/触摸/光标都留 `SurfaceId`，每次发送前解析，被销毁的聚焦表面自动失效 | seat, seat-input |
 | 协议 | `wl_data_device_manager` v3 — 剪贴板（选区随键盘焦点转移）+ 拖放（drag 期间 seat 把指针交给 data device，enter/motion/drop 全流程，dnd actions）；数据经管道在客户端之间直传，compositor 不读内容 | data-device, dnd |
@@ -112,6 +112,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | 模块 | 内容 | 测试 |
 |---|---|---|
 | layout | `OutputLayout` —— 输出在全局坐标系里的位置：`add_auto()` 横向排列、`box_of()` / `bounds()` / `at(x,y)` 命中、`intersecting(box)` 求窗口跨屏时各屏该画哪一块。用的是**逻辑尺寸**，所以旋转/HiDPI 输出占的格子跟它的 mode 不一样 | output-layout |
+| layout | **跟随输出** —— `OutputLayout` 盯着它装的每块输出：销毁的自己离开、换 mode 的保留位置换上新尺寸，每次变化在 `changed` 上广播；`OutputGlobal::create(display, output, layout)` 建的 wl_output 跟着 mode / scale / transform 与位置走，输出销毁后停止跟随。这两件事原来是每个混成器都要写的 handler，漏写前者就在每次命中测试都读的表里留下悬空 `Output*` | output-follow |
 | layout | `Transform` + `Output::scale()` —— 每输出旋转/翻转（值与 `WL_OUTPUT_TRANSFORM_*` 一致）与整数缩放。`transform_box()` 是逻辑坐标 → 帧缓冲像素的唯一映射，`transform_invert()` 供输入反向映射 | output-layout, output-scale |
 
 ## 外壳层 / 示例
@@ -125,8 +126,11 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | shell | **批量帧回调** —— `Frame::send_frame_done(time)`（本帧摆位里的全部表面，同一时间戳）与自由函数 `send_frame_done(ids, time)`（任意表面列表），把每个 compositor 都要手写的遍历收进库；`Presented::unchanged` 分支同样用它补发（没 `present` 的那帧，客户端不能饿死） | cpu_compositor |
 | shell | **场景表 `SceneItem` / `SceneRenderer`** —— 一张有序列表同时被画和被命中：四种图元（客户端表面树、纯色矩形、窗口边框、混成器自有像素块），`SceneRenderer` 按现有硬件喂给 `Frame` 或 `CpuCompositor`，`scene_hit_test()` 读同一张表回答"这点上是什么"。上层因此每种图元只写一遍，不必维护 `Placement` / `CpuItem` 两套实现；三种降级（无 Vulkan 设备、输出配不出渲染目标、`submit()` 答 `fallback`）全在运行时落到同一个 CPU 分支。`tag` 是调用方身份，库不解释、命中时原样交还 | scene, scene_renderer |
 | shell | **纯色矩形图元 `Frame::place_rect(x, y, w, h, color)`** —— 混成器-owned 的立即模式原语（边框、背景面板、遮罩、光标底）：不参与命中测试、不报自己的 damage，移动 / 换色由摆位 diff 恢复，代价恰好两个矩形；与表面同 z 序，GPU 侧走无纹理的 solid pipeline，CPU 侧就是 `RectFill` 图元 | frame |
-| shell | **`SceneRenderer` 替混成器应答显示器** —— `reset()` 把 `SceneOutput` 绑到输出上，此后该输出的 `present` 自己释放本帧画过的全部表面的帧回调并发 presentation 反馈（`set_presentation()`），`unchanged` 的那帧当场补发，CPU 路径像 GPU 路径的 `Frame` 一样盯着画过的表面的 commit，并且同样会空闲 —— 图元列表、图像 serial、背景色与上一次提交的 CPU 帧相同且其间没有被画表面 commit 时，不合成、不提交、不再要帧，当场补发帧回调并答 `unchanged`；输出销毁或 `SceneOutput` 销毁时自动解绑。`present()` 回答 `composited` / `scanout` / `unchanged` / `cpu` | scene_present |
+| shell | **`SceneRenderer` 替混成器应答显示器** —— `reset()`（默认 XRGB8888，每块输出调一次，之后的 mode 变化自己重新分配）把 `SceneOutput` 绑到输出上，此后该输出的 `present` 自己释放本帧画过的全部表面的帧回调并发 presentation 反馈（`set_presentation()`），`unchanged` 的那帧当场补发，CPU 路径像 GPU 路径的 `Frame` 一样盯着画过的表面的 commit，并且同样会空闲 —— 图元列表、图像 serial、背景色与上一次提交的 CPU 帧相同且其间没有被画表面 commit 时，不合成、不提交、不再要帧，当场补发帧回调并答 `unchanged`；输出销毁或 `SceneOutput` 销毁时自动解绑。`present()` 回答 `composited` / `scanout` / `unchanged` / `cpu`；带 `OutputLayout` 的重载接受全局坐标的场景表，移到该输出自己的坐标（复用 scratch，稳态不分配） | scene_present |
 | shell | **`Cursor`：指针与它的图像，一条龙** —— 加载主题、跟随 cursor-shape 请求与客户端光标表面（动画光标每次 commit 重传）、指针焦点换客户端时回到默认箭头；作为 `SceneRenderer` 的光标源，每次移动在有 KMS 光标平面的输出上只挪平面、其余输出要一帧；按输出裁掉不在该屏上的精灵；`capture()` 供 ext-image-copy-capture 光标会话。指针往哪走仍由混成器决定（`move_to` / `move_by` 收边界） | scene_present |
+| shell | **输入路由的机制** —— `scene_route_pointer(seat, scene, x, y)`：按住按钮期间运动按 grab 表面（含子表面，`scene_surface_origin()`）自己的坐标发过去，否则把焦点给命中的表面；`KeyRouter::route(seat, event, binding)`：按下先给快捷键，被留下的键连同松开一起留下，松开丢失（切 VT）后的再次按下当新按下；`Seat::release_keys()`：松开客户端以为按着的每个键并清修饰键；`Session::switch_vt_for(keysym)`：Ctrl+Alt+Fn；`Seat::follow(source)`：立即采用输入源的 keymap 与 capabilities 并跟随其后的变化（touch 只在要求时公布） | key-router, subsurface |
+| shell | **`PopupTree(shell)` 跟随 shell** —— 每个 xdg_popup 从创建到销毁由树自己跟踪（映射、取消映射、重定位、销毁），变化在 `changed` 上广播；layer surface 的 popup 用 `set_parent()` 指定父表面 | popup |
+| protocol | **`CoreGlobals`** —— 一次创建每个可用混成器都要的 global：wl_shm、wl_compositor、wl_subcompositor、xdg-shell、wl_seat、剪贴板与 primary selection、single-pixel-buffer、presentation-time、viewporter、fractional-scale、cursor-shape、xdg-decoration，按借用关系排好析构顺序 | key-router |
 | example | `minimal`（嵌套 / DRM / headless 同一份，与 Rust 的 `minimal` 一对：最大化窗口栈、点击置顶、Logo+Return/Tab/q/Escape） | scene_present |
 | 生命周期 | 关闭的窗口在下帧回收，无残留条目 | — |
 

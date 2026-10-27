@@ -140,6 +140,32 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 
 ---
 
+### 5. API 简化 —— 第一轮已完成（2026-10-27）
+
+每个混成器都会重抄的机制收回了库里，两个 `minimal` 各少了约三分之一：C++ 639 → 500 行，
+Rust 677 → 420 行。`CoreGlobals`；跟随输出的 `OutputLayout` 与 `OutputGlobal`；`reset()` 之后
+自己跟着 mode 走、接受布局坐标的 `SceneRenderer`；跟随 shell 的 `PopupTree`；`scene_route_pointer`；
+`KeyRouter::route` + `Seat::release_keys` + `Session::switch_vt_for`；`Seat::follow`；合并了整数提示的
+`FractionalScaleManager::set_scale(double)`。renderer 不再需要早于 `Display` 声明。删掉了
+`DesktopGlobals`、`single_pixel_buffer_color()`、`dmabuf_buffer_to_rgba()`，desktop 模块因此不再
+依赖 gpu 模块。
+
+Rust 绑定改成一条事件流：shim 把每个信号按触发顺序推进同一个线程内队列，`Display::dispatch()`
+返回 `Event`；各 global 的 `next_event()`、`Output::take_frame()` / `take_mode_changed()`、
+`take_close_request()`、`next_activity()`、`next_selection_change()` 都没有了。`SceneOutput` 收进了
+`SceneRenderer`，所以用户代码不必再写 `Screen<'a>`。`Keysym` 由系统的 xkbcommon 头文件生成，
+fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize / fullscreen / minimize
+请求默认由库批准，`XdgShell::forward_window_requests()` 才交给 Rust。
+
+还没定的（每条都可能是 break，等第二个下游混成器来检验）：
+
+- `CursorManager::pointer_bounds()` / `send_relative_motion()` 两个静态 helper 没有使用者，
+  但指针约束总要有人算边界——留着，等有混成器接 pointer-constraints 时再定去留。
+- Rust 的线程内事件队列意味着**一个线程只能有一个 `Display`**（同线程第二个会收到第一个的事件）；
+  测试与示例都满足，要不要在创建时直接拒绝第二个，待定。
+- 混成器自己调用触发的信号（`set_keyboard_focus` 之类）在 Rust 里要到下一次 `dispatch()` /
+  `events()` 才出现，不是当场返回。
+
 ## 明确不做
 
 - **摆放策略**（平铺 / 浮动 / 工作区切换逻辑）—— 每个混成器自己实现，见 `CONTEXT.md`。
@@ -187,6 +213,6 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 - **没有混成器接触摸** —— `LibinputBackend` 的 `input()` 已经发 `Touch*Event`（坐标归一化到
   触摸面板），但映射到哪块输出、`scene_hit_test`、按 slot 路由这一层没有任何示例在做：C++ 的
   `minimal` 为了保持最小没接，`set_capabilities()` 传 touch=false；Rust 绑定的
-  `LibinputBackend::next_input_event()` 已经带出 `Touch*` 事件，Rust 的 `minimal` 同样没接。
+  `Event::Input` 已经带出 `Touch*` 事件，Rust 的 `minimal` 同样没接。
 - **headless 在每一帧之前都报一次 `present`，不管提交过没有** —— 于是 headless 上看不出
   `unchanged` 帧漏发帧回调；`test_scene_present` 因此自带一个只在提交后才 present 的测试输出。

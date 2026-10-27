@@ -32,6 +32,7 @@
    - [6.3 DirectScanout (直出决策)](#63-directscanout-直出决策)
    - [6.4 OutputLayout & Pointer & PopupTree & LayerManager](#64-outputlayout--pointer--popuptree--layermanager)
 7. [Wayland 核心协议对象 (`luminaria`)](#7-wayland-核心协议对象-luminaria)
+   - [7.0 CoreGlobals & OutputGlobal](#70-coreglobals--outputglobal)
    - [7.1 Compositor & Surface & Subcompositor](#71-compositor--surface--subcompositor)
    - [7.2 XdgShell & LayerShell](#72-xdgshell--layershell)
    - [7.3 Seat & DataDevice & PrimarySelection](#73-seat--datadevice--primaryselection)
@@ -49,7 +50,6 @@
    - [9.3 DataControl (剪贴板管理器)](#93-datacontrol-剪贴板管理器)
    - [9.4 SessionLock (锁屏)](#94-sessionlock-锁屏)
    - [9.5 InputMethod (输入法引擎)](#95-inputmethod-输入法引擎)
-   - [9.6 DesktopGlobals 便捷装配](#96-desktopglobals-便捷装配)
 10. [架构约束、生命周期与安全规矩](#10-架构约束生命周期与安全规矩)
 
 ---
@@ -165,10 +165,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `void update_modifiers(ModifiersEvent e)`: 推进修饰键状态。
   - `uint32_t keysym(uint32_t evdev_code) const`: 解析 keysym。
   - `ModifiersEvent modifiers() const`: 获取当前有效修饰键掩码。
-- **`KeyRouter`** (`luminaria:input_router`): 快捷键吞噬追踪与修饰键同步器。
-  - `void consume(uint32_t keycode)` / `bool unconsume(uint32_t keycode)`
-  - `static void sync_modifiers(KeymapState&, Seat&, const ModifiersEvent&)`
-  - `static void release_held_modifiers(KeymapState&, Seat&, const std::set<uint32_t>&)`
+- **`KeyRouter`** (`luminaria:input_router`): 在混成器快捷键与焦点客户端之间分配键盘，每个键保持完整。
+  - `template <class Binding> void route(Seat&, const KeyEvent&, Binding&& binding)`：按下先交给 `binding`（`bool(const KeyEvent&)`），答 true 则这个键连同它的松开都留下；其余交给 `Seat`。松开丢失（切 VT）后的再次按下按新按下处理。
+- 与之配合的 `Seat::release_keys()`（松开客户端以为按着的键并清修饰键）、`Seat::follow(InputSource&, bool touch = false)`（立即采用并跟随输入源的 keymap 与 capabilities）、`Session::switch_vt_for(keysym)`（Ctrl+Alt+Fn）。
 
 ---
 
@@ -310,23 +309,32 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `shadow_box` 可让投影包围大于图元本身的外框（例如客户端表面外的服务端装饰）；空矩形表示使用 `box`。
   - `std::uint64_t tag`: 混成器自定义标识符（库不解析，命中测试原样返回）。
 - **`SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y)`**: 全图元命中测试。
+- **`std::optional<ScenePoint> scene_surface_origin(scene, SurfaceId)`**：某表面（含子表面）的原点画在哪。
+- **`SceneHit scene_route_pointer(Seat&, scene, double x, double y)`**：指针路由——有隐式 grab 时按 grab 表面自己的坐标发运动，否则把焦点给命中的表面或清掉焦点。
 - **`SceneRenderer`** (`luminaria.gpu:scene_renderer`):
   - 将 `std::vector<SceneItem>` 自动分发至 `Frame` 或 `CpuCompositor`，透明处理运行时 GPU 降级。
+  - `Status reset(SceneOutput&, Output&, uint32_t drm_format = XRGB8888)`：每块输出调一次，之后的 mode 变化自己重新分配。
+  - `present(state, output, scene, background)`（输出坐标）与 `present(state, output, scene, background, const OutputLayout&)`（全局坐标）。
 
 ### 6.3 DirectScanout (直出决策, `luminaria.gpu`)
 - **`DirectScanout`** (`luminaria.gpu:direct_scanout`): 评估单全屏表面是否满足 KMS 硬件直出要求（无旋转、无裁剪、格式匹配），并管理导入缓存与 `Surface::hold_buffer()`。
 
 ### 6.4 OutputLayout & Pointer & PopupTree & LayerManager
-- **`OutputLayout`** (`luminaria:output_layout`): 全局逻辑坐标系管理。
+- **`OutputLayout`** (`luminaria:output_layout`): 全局逻辑坐标系管理。不可移动：它盯着装进来的每块输出，销毁的自己离开、换 mode 的保留位置换上新尺寸。
   - `void add(Output&, int x, int y)`, `void add_auto(Output&)`, `void remove(const Output&)`
   - `Output* at(int x, int y) const`, `Box box_of(const Output&) const`
+  - `Signal<OutputLayoutChange> changed`：任何输出的格子变了（含它自己做的变化）。
 - **`Pointer`** (`luminaria:pointer`): 全局光标坐标与约束状态。
-- **`PopupTree`** (`luminaria:popup`): XDG 弹出菜单（Popup）树管理与 Grab 仲裁。
+- **`PopupTree`** (`luminaria:popup`): XDG 弹出菜单（Popup）树管理与 Grab 仲裁。`explicit PopupTree(XdgShell&)` 从创建到销毁自己跟踪 shell 的每个 popup，`Signal<PopupTreeChange> changed` 在映射 / 取消映射 / 重定位 / 销毁时广播；layer surface 的 popup 用 `set_parent()` 指定父表面。
 - **`LayerManager`** (`luminaria:layer`): Layer-shell 四层拓扑与排版计算器。
 
 ---
 
 ## 7. Wayland 核心协议对象 (`luminaria`)
+
+### 7.0 CoreGlobals & OutputGlobal
+- **`CoreGlobals`** (`luminaria:core_globals`): `static Result<CoreGlobals> create(Display&, std::string seat_name = "seat0")` 一次创建每个可用混成器都要的 global——wl_shm、wl_compositor、wl_subcompositor、xdg-shell、wl_seat、剪贴板与 primary selection、single-pixel-buffer、presentation-time、viewporter、fractional-scale、cursor-shape、xdg-decoration——并按借用关系排好析构顺序。访问器：`compositor()`、`shell()`、`seat()`、`data_device()`、`presentation()`、`fractional_scale()`、`cursor_shape()` 等。linux-dmabuf（需要渲染器）与 desktop 模块的特权协议仍单独创建。
+- **`OutputGlobal`** (`luminaria:output_global`): `create(Display&, Output&, OutputLayout&, std::string name = {})` 建一个跟随输出与布局的 wl_output（+ xdg-output）：mode 变化重发 mode / scale / transform，布局变化重发位置，输出销毁后停止跟随；空名字取 `luminaria-<n>`。`create(Display&, width, height, name)` 留给不来自后端的输出。
 
 ### 7.1 Compositor & Surface & Subcompositor
 - **`Compositor`** (`luminaria:compositor`):
@@ -375,7 +383,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ### 7.5 Viewporter & FractionalScale & ContentType & XdgDecoration
 - **`Viewporter`** (`luminaria:viewporter`): 客户端源裁剪与目标拉伸支持。
-- **`FractionalScaleManager`** (`luminaria:fractional_scale`): `wp_fractional_scale_v1`（以 120 为基数的分数缩放通告）。
+- **`FractionalScaleManager`** (`luminaria:fractional_scale`): `wp_fractional_scale_v1`。`set_scale(Surface&, double scale)` 同时发精确值（线上以 120 为基数）和向上取整的 `preferred_buffer_scale` 整数提示。
 - **`ContentTypeManager`** (`luminaria:content_type`): 视频、游戏、图片等画质与显示模式提示。
 - **`XdgDecorationManager`** (`luminaria:xdg_decoration`): 服务端/客户端装饰协商（默认答 Client-side）。
 - **`XdgToplevelIconManager`** (`luminaria:xdg_toplevel_icon`): 发布 `xdg_toplevel_icon_manager_v1`；`icon_for(toplevel)` 返回客户端图标名和已复制的 RGBA 尺寸集，`changed()` 在图标替换时发信号。
@@ -433,9 +441,6 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`InputMethodManager`** (`luminaria.desktop:input_method`): `zwp_input_method_v2`
   - 输入法键盘抓取与候选字浮窗，与 `TextInput` 自动桥接。
 
-### 9.6 DesktopGlobals 便捷装配
-- **`DesktopGlobals`** (`luminaria.desktop:desktop_globals`): 一键式为 Display 注册所有特权桌面协议。
-
 ---
 
 ## 10. 架构约束、生命周期与安全规矩
@@ -445,7 +450,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 为确保系统稳健性，使用 Luminaria 时必须严格遵守以下法则：
 
-1. **对象销毁逆序**：`VulkanRenderer` 必须在 `Display` 之前声明（确保 `Frame` 与其持有的 `GpuTexture` 先于渲染器析构）。
+1. **对象销毁逆序**：`SceneRenderer` / `VulkanRenderer` 必须在缓存其纹理的对象（`SceneOutput` / `Frame`、`Cursor`、`LinuxDmabuf`）之前声明，确保它们先于渲染器析构；不必早于 `Display`。
 2. **表面引用跨事件循环隔离**：禁止跨 Dispatch 存储 `Surface*`，必须存储 `SurfaceId`，并在使用前通过 `surface_from_id(id)` 动态解析。
 3. **坐标系与像素对齐**：
    - 布局、命中测试、子表面偏移**一律使用逻辑尺寸**（`surface_width()` / `surface_height()`）。
