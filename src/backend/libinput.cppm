@@ -95,8 +95,9 @@ public:
     /// Relative motion, buttons, one `PointerAxisEvent` per libinput scroll
     /// event (wheel notches in `d*_steps` alongside their smooth value), keys,
     /// `ModifiersEvent` only when the masks actually changed, touchscreen
-    /// points normalised to the panel (see `TouchDownEvent`), and
-    /// `InputCapabilities` as devices come and go.
+    /// points normalised to the panel (see `TouchDownEvent`), graphics-tablet
+    /// devices, tools and pads (see `TabletDeviceAdded`; feed them to a
+    /// `TabletManager`), and `InputCapabilities` as devices come and go.
     [[nodiscard]] Signal<InputEvent>& input() noexcept override;
 
     struct Impl;
@@ -141,6 +142,11 @@ struct LibinputBackend::Impl {
 
     Signal<InputEvent> input;
 
+    // Tablets and their pads get ids of our own: libinput_device pointers are
+    // not something an event should carry, and a pointer can be reused.
+    std::map<libinput_device*, std::uint32_t> tablet_ids;
+    std::uint32_t next_tablet_id = 1;
+
     void emit(InputEvent event) { input.emit(event); }
 
     ~Impl() {
@@ -169,7 +175,229 @@ struct LibinputBackend::Impl {
         emit(now);
     }
 
+    void tablet_added(libinput_device* device) {
+        const bool pad = libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0;
+        if (!pad && libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TABLET_TOOL) == 0) {
+            return;
+        }
+        TabletDeviceAdded added;
+        added.device = next_tablet_id++;
+        added.name = libinput_device_get_name(device);
+        added.vid = static_cast<std::uint16_t>(libinput_device_get_id_vendor(device));
+        added.pid = static_cast<std::uint16_t>(libinput_device_get_id_product(device));
+        added.path = std::string("/dev/input/") + libinput_device_get_sysname(device);
+        added.is_pad = pad;
+        if (pad) {
+            TabletPadLayout& layout = added.pad;
+            layout.buttons = static_cast<std::uint32_t>(
+                std::max(0, libinput_device_tablet_pad_get_num_buttons(device)));
+            layout.rings = static_cast<std::uint32_t>(
+                std::max(0, libinput_device_tablet_pad_get_num_rings(device)));
+            layout.strips = static_cast<std::uint32_t>(
+                std::max(0, libinput_device_tablet_pad_get_num_strips(device)));
+            const int groups = libinput_device_tablet_pad_get_num_mode_groups(device);
+            for (int g = 0; g < groups; ++g) {
+                libinput_tablet_pad_mode_group* group =
+                    libinput_device_tablet_pad_get_mode_group(device, static_cast<unsigned>(g));
+                if (group == nullptr) {
+                    continue;
+                }
+                TabletPadGroup out;
+                out.modes = static_cast<std::uint32_t>(
+                    std::max(1u, libinput_tablet_pad_mode_group_get_num_modes(group)));
+                for (std::uint32_t b = 0; b < layout.buttons; ++b) {
+                    if (libinput_tablet_pad_mode_group_has_button(group, b) != 0) {
+                        out.buttons.push_back(b);
+                    }
+                }
+                for (std::uint32_t r = 0; r < layout.rings; ++r) {
+                    if (libinput_tablet_pad_mode_group_has_ring(group, r) != 0) {
+                        out.rings.push_back(r);
+                    }
+                }
+                for (std::uint32_t t = 0; t < layout.strips; ++t) {
+                    if (libinput_tablet_pad_mode_group_has_strip(group, t) != 0) {
+                        out.strips.push_back(t);
+                    }
+                }
+                layout.groups.push_back(std::move(out));
+            }
+        }
+        tablet_ids[device] = added.device;
+        emit(std::move(added));
+    }
+
+    void tablet_removed(libinput_device* device) {
+        auto it = tablet_ids.find(device);
+        if (it == tablet_ids.end()) {
+            return;
+        }
+        const std::uint32_t id = it->second;
+        tablet_ids.erase(it);
+        emit(TabletDeviceRemoved{id});
+    }
+
+    static TabletToolType tool_type(libinput_tablet_tool* tool) {
+        switch (libinput_tablet_tool_get_type(tool)) {
+        case LIBINPUT_TABLET_TOOL_TYPE_ERASER:
+            return TabletToolType::eraser;
+        case LIBINPUT_TABLET_TOOL_TYPE_BRUSH:
+            return TabletToolType::brush;
+        case LIBINPUT_TABLET_TOOL_TYPE_PENCIL:
+            return TabletToolType::pencil;
+        case LIBINPUT_TABLET_TOOL_TYPE_AIRBRUSH:
+            return TabletToolType::airbrush;
+        case LIBINPUT_TABLET_TOOL_TYPE_MOUSE:
+            return TabletToolType::mouse;
+        case LIBINPUT_TABLET_TOOL_TYPE_LENS:
+            return TabletToolType::lens;
+        default:
+            return TabletToolType::pen;
+        }
+    }
+
+    /// What the tool in this event reports. `everything` on proximity-in, where
+    /// the client needs the whole starting state; otherwise only what moved.
+    static TabletAxes tool_axes(libinput_event_tablet_tool* e, bool everything) {
+        libinput_tablet_tool* tool = libinput_event_tablet_tool_get_tool(e);
+        TabletAxes a;
+        if (everything || libinput_event_tablet_tool_x_has_changed(e) != 0 ||
+            libinput_event_tablet_tool_y_has_changed(e) != 0) {
+            a.changed |= TabletAxes::position;
+            a.x = libinput_event_tablet_tool_get_x_transformed(e, 1);
+            a.y = libinput_event_tablet_tool_get_y_transformed(e, 1);
+        }
+        if (libinput_tablet_tool_has_pressure(tool) != 0 &&
+            (everything || libinput_event_tablet_tool_pressure_has_changed(e) != 0)) {
+            a.changed |= TabletAxes::pressure_axis;
+            a.pressure = libinput_event_tablet_tool_get_pressure(e);
+        }
+        if (libinput_tablet_tool_has_distance(tool) != 0 &&
+            (everything || libinput_event_tablet_tool_distance_has_changed(e) != 0)) {
+            a.changed |= TabletAxes::distance_axis;
+            a.distance = libinput_event_tablet_tool_get_distance(e);
+        }
+        if (libinput_tablet_tool_has_tilt(tool) != 0 &&
+            (everything || libinput_event_tablet_tool_tilt_x_has_changed(e) != 0 ||
+             libinput_event_tablet_tool_tilt_y_has_changed(e) != 0)) {
+            a.changed |= TabletAxes::tilt;
+            a.tilt_x = libinput_event_tablet_tool_get_tilt_x(e);
+            a.tilt_y = libinput_event_tablet_tool_get_tilt_y(e);
+        }
+        if (libinput_tablet_tool_has_rotation(tool) != 0 &&
+            (everything || libinput_event_tablet_tool_rotation_has_changed(e) != 0)) {
+            a.changed |= TabletAxes::rotation_axis;
+            a.rotation = libinput_event_tablet_tool_get_rotation(e);
+        }
+        if (libinput_tablet_tool_has_slider(tool) != 0 &&
+            (everything || libinput_event_tablet_tool_slider_has_changed(e) != 0)) {
+            a.changed |= TabletAxes::slider_axis;
+            a.slider = libinput_event_tablet_tool_get_slider_position(e);
+        }
+        // A wheel is a delta, so it only means something when it moved.
+        if (libinput_tablet_tool_has_wheel(tool) != 0 &&
+            libinput_event_tablet_tool_wheel_has_changed(e) != 0) {
+            a.changed |= TabletAxes::wheel_axis;
+            a.wheel_degrees = libinput_event_tablet_tool_get_wheel_delta(e);
+            a.wheel_clicks =
+                static_cast<std::int32_t>(libinput_event_tablet_tool_get_wheel_delta_discrete(e));
+        }
+        return a;
+    }
+
+    void handle_tablet_tool(libinput_event* event, libinput_event_type type) {
+        auto* e = libinput_event_get_tablet_tool_event(event);
+        auto* tool = libinput_event_tablet_tool_get_tool(e);
+        auto it = tablet_ids.find(libinput_event_get_device(event));
+        if (it == tablet_ids.end()) {
+            return;
+        }
+        const std::uint32_t device = it->second;
+        const auto tool_id = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(tool));
+        const auto time = libinput_event_tablet_tool_get_time(e);
+        switch (type) {
+        case LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY: {
+            TabletToolProximityEvent p;
+            p.device = device;
+            p.tool = tool_id;
+            p.in = libinput_event_tablet_tool_get_proximity_state(e) ==
+                   LIBINPUT_TABLET_TOOL_PROXIMITY_STATE_IN;
+            p.type = tool_type(tool);
+            p.serial = libinput_tablet_tool_get_serial(tool);
+            p.wacom_id = libinput_tablet_tool_get_tool_id(tool);
+            p.caps = TabletToolCaps{
+                .tilt = libinput_tablet_tool_has_tilt(tool) != 0,
+                .pressure = libinput_tablet_tool_has_pressure(tool) != 0,
+                .distance = libinput_tablet_tool_has_distance(tool) != 0,
+                .rotation = libinput_tablet_tool_has_rotation(tool) != 0,
+                .slider = libinput_tablet_tool_has_slider(tool) != 0,
+                .wheel = libinput_tablet_tool_has_wheel(tool) != 0};
+            p.axes = tool_axes(e, p.in);
+            p.time_ms = time;
+            emit(std::move(p));
+            break;
+        }
+        case LIBINPUT_EVENT_TABLET_TOOL_AXIS: {
+            TabletToolAxisEvent a{device, tool_id, tool_axes(e, false), time};
+            if (a.axes.changed != 0) {
+                emit(std::move(a));
+            }
+            break;
+        }
+        case LIBINPUT_EVENT_TABLET_TOOL_TIP: {
+            TabletToolTipEvent t{device, tool_id,
+                                 libinput_event_tablet_tool_get_tip_state(e) ==
+                                     LIBINPUT_TABLET_TOOL_TIP_DOWN,
+                                 tool_axes(e, false), time};
+            emit(std::move(t));
+            break;
+        }
+        case LIBINPUT_EVENT_TABLET_TOOL_BUTTON: {
+            emit(TabletToolButtonEvent{device, tool_id, libinput_event_tablet_tool_get_button(e),
+                                       libinput_event_tablet_tool_get_button_state(e) ==
+                                           LIBINPUT_BUTTON_STATE_PRESSED,
+                                       time});
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    void handle_tablet_pad(libinput_event* event, libinput_event_type type) {
+        auto* e = libinput_event_get_tablet_pad_event(event);
+        auto it = tablet_ids.find(libinput_event_get_device(event));
+        if (it == tablet_ids.end()) {
+            return;
+        }
+        const std::uint32_t device = it->second;
+        const auto time = libinput_event_tablet_pad_get_time(e);
+        switch (type) {
+        case LIBINPUT_EVENT_TABLET_PAD_BUTTON: {
+            libinput_tablet_pad_mode_group* group = libinput_event_tablet_pad_get_mode_group(e);
+            const std::uint32_t group_index =
+                group != nullptr ? libinput_tablet_pad_mode_group_get_index(group) : 0;
+            emit(TabletPadButtonEvent{device, libinput_event_tablet_pad_get_button_number(e),
+                                      libinput_event_tablet_pad_get_button_state(e) ==
+                                          LIBINPUT_BUTTON_STATE_PRESSED,
+                                      group_index, libinput_event_tablet_pad_get_mode(e), time});
+            break;
+        }
+        case LIBINPUT_EVENT_TABLET_PAD_RING:
+            emit(TabletPadRingEvent{device, libinput_event_tablet_pad_get_ring_number(e),
+                                    libinput_event_tablet_pad_get_ring_position(e), time});
+            break;
+        case LIBINPUT_EVENT_TABLET_PAD_STRIP:
+            emit(TabletPadStripEvent{device, libinput_event_tablet_pad_get_strip_number(e),
+                                     libinput_event_tablet_pad_get_strip_position(e), time});
+            break;
+        default:
+            break;
+        }
+    }
+
     void device_added(libinput_device* device) {
+        tablet_added(device);
         InputCapabilities c{
             libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
             libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_POINTER) != 0,
@@ -179,6 +407,7 @@ struct LibinputBackend::Impl {
     }
 
     void device_removed(libinput_device* device) {
+        tablet_removed(device);
         devices.erase(device);
         recompute_capabilities();
     }
@@ -326,6 +555,17 @@ struct LibinputBackend::Impl {
             case LIBINPUT_EVENT_TOUCH_CANCEL:
             case LIBINPUT_EVENT_TOUCH_FRAME:
                 handle_touch(event, type);
+                break;
+            case LIBINPUT_EVENT_TABLET_TOOL_PROXIMITY:
+            case LIBINPUT_EVENT_TABLET_TOOL_AXIS:
+            case LIBINPUT_EVENT_TABLET_TOOL_TIP:
+            case LIBINPUT_EVENT_TABLET_TOOL_BUTTON:
+                handle_tablet_tool(event, type);
+                break;
+            case LIBINPUT_EVENT_TABLET_PAD_BUTTON:
+            case LIBINPUT_EVENT_TABLET_PAD_RING:
+            case LIBINPUT_EVENT_TABLET_PAD_STRIP:
+                handle_tablet_pad(event, type);
                 break;
             default:
                 break;

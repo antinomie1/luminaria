@@ -51,6 +51,7 @@
 #include "presentation-time-client-protocol.h"
 #include "primary-selection-unstable-v1-client-protocol.h"
 #include "relative-pointer-unstable-v1-client-protocol.h"
+#include "tablet-v2-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
@@ -348,6 +349,14 @@ void run_client(int fd) {
     }
   }
 
+  // A tablet seat: the tablet, a tool and a pad (with its group, ring and
+  // strip) all point back at the manager, and a tool is in range of this window.
+  if (auto *tablet_mgr = bind<zwp_tablet_manager_v2>(
+          st, zwp_tablet_manager_v2_interface)) {
+    zwp_tablet_manager_v2_get_tablet_seat(tablet_mgr, seat);
+    wl_display_roundtrip(display);
+  }
+
   // Gestures, gamma, CTM, virtual keyboard, and virtual pointer.
   auto *pg =
       bind<zwp_pointer_gestures_v1>(st, zwp_pointer_gestures_v1_interface);
@@ -460,6 +469,17 @@ int main() {
     auto ctm = must(luminaria::CtmControlManager::create(*display));
     auto vk_mgr = must(luminaria::VirtualKeyboardManager::create(*display));
     auto vp_mgr = must(luminaria::VirtualPointerManager::create(*display));
+    auto tablets = must(luminaria::TabletManager::create(*display));
+    (void)tablets.add_tablet({.name = "Teardown Tablet", .path = "/dev/input/event0"});
+    (void)tablets.add_tool({});
+    (void)tablets.add_pad({.path = "/dev/input/event1",
+                           .layout = {.buttons = 2,
+                                      .rings = 1,
+                                      .strips = 1,
+                                      .groups = {{.modes = 2,
+                                                  .buttons = {0, 1},
+                                                  .rings = {0},
+                                                  .strips = {0}}}}});
     auto window_list = must(luminaria::ForeignToplevelList::create(*display));
     window_list.track(shell);
     auto screencopy = must(luminaria::ScreencopyManager::create(*display));

@@ -66,6 +66,7 @@ export import :seat;
 export import :signal;
 export import :single_pixel_buffer;
 export import :subcompositor;
+export import :tablet;
 export import :tearing_control;
 export import :text_input;
 export import :transform;

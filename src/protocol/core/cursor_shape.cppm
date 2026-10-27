@@ -36,10 +36,13 @@ class Display;
 /// `name` is the matching XDG/CSS cursor name ("default", "not-allowed", …),
 /// which is what a cursor theme is indexed by. `name` is a static string.
 struct CursorShapeRequest {
-    wl_resource* pointer; // the wl_pointer this applies to
+    wl_resource* pointer; // the wl_pointer this applies to; null for a tablet tool
     std::uint32_t serial; // the enter serial the client is answering
     std::uint32_t shape;
     const char* name;
+    /// The zwp_tablet_tool_v2 this applies to, null for a pointer.
+    /// `TabletManager::tool_id_of()` says which tool it is.
+    wl_resource* tablet_tool = nullptr;
 };
 
 /// The wp_cursor_shape_manager_v1 global (version 2). Move-only; pointer-stable
@@ -93,7 +96,32 @@ constexpr std::array<const char*, 36> kShapeNames{
 
 struct ShapeDevice {
     Signal<CursorShapeRequest>* request = nullptr;
-    wl_resource* pointer = nullptr; // null for a tablet tool
+    wl_resource* pointer = nullptr;     // null for a tablet tool
+    wl_resource* tablet_tool = nullptr; // null for a pointer, and once the tool is destroyed
+    bool for_tool = false;              // made by get_tablet_tool_v2
+    wl_listener tool_destroyed{};
+
+    ShapeDevice(Signal<CursorShapeRequest>* request, wl_resource* pointer, wl_resource* tool)
+        : request(request), pointer(pointer), tablet_tool(tool), for_tool(tool != nullptr) {
+        if (tool != nullptr) {
+            // The client owns the tool object and may destroy it first; the
+            // device must not name a resource that is gone.
+            tool_destroyed.notify = [](wl_listener* l, void*) {
+                auto* self = wl_container_of(l, static_cast<ShapeDevice*>(nullptr), tool_destroyed);
+                self->tablet_tool = nullptr;
+                wl_list_remove(&self->tool_destroyed.link);
+                wl_list_init(&self->tool_destroyed.link);
+            };
+            wl_resource_add_destroy_listener(tool, &tool_destroyed);
+        }
+    }
+    ~ShapeDevice() {
+        if (tool_destroyed.notify != nullptr) {
+            wl_list_remove(&tool_destroyed.link);
+        }
+    }
+    ShapeDevice(const ShapeDevice&) = delete;
+    ShapeDevice& operator=(const ShapeDevice&) = delete;
 };
 
 void device_set_shape(wl_client* client, wl_resource* resource, uint32_t serial, uint32_t shape) {
@@ -105,7 +133,10 @@ void device_set_shape(wl_client* client, wl_resource* resource, uint32_t serial,
     }
     (void)client;
     auto* device = static_cast<ShapeDevice*>(wl_resource_get_user_data(resource));
-    CursorShapeRequest event{device->pointer, serial, shape, name};
+    if (device->for_tool && device->tablet_tool == nullptr) {
+        return; // the tool is gone; there is nothing to give a shape to
+    }
+    CursorShapeRequest event{device->pointer, serial, shape, name, device->tablet_tool};
     device->request->emit(event);
 }
 
@@ -114,9 +145,10 @@ constexpr struct wp_cursor_shape_device_v1_interface device_impl = {
     .set_shape = device_set_shape,
 };
 
-void make_device(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* pointer) {
+void make_device(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* pointer,
+                 wl_resource* tablet_tool = nullptr) {
     auto* signal = static_cast<Signal<CursorShapeRequest>*>(wl_resource_get_user_data(manager));
-    auto device = std::make_unique<ShapeDevice>(signal, pointer);
+    auto device = std::make_unique<ShapeDevice>(signal, pointer, tablet_tool);
     create_user_resource<ShapeDevice, &wp_cursor_shape_device_v1_interface, &device_impl>(
         client, wl_resource_get_version(manager), id, std::move(device), manager);
 }
@@ -126,11 +158,12 @@ void manager_get_pointer(wl_client* client, wl_resource* manager, uint32_t id,
     make_device(client, manager, id, pointer);
 }
 
-// We ship no tablet support, but the object still has to exist or the client
-// dies on a null slot the moment it asks.
+// The request names the tool it is for; the compositor resolves it with
+// `TabletManager::tool_id_of()` while handling the signal. The device watches
+// the tool resource, so a request after the tool's destruction is dropped.
 void manager_get_tablet_tool_v2(wl_client* client, wl_resource* manager, uint32_t id,
-                                wl_resource* /*tablet_tool*/) {
-    make_device(client, manager, id, nullptr);
+                                wl_resource* tablet_tool) {
+    make_device(client, manager, id, nullptr, tablet_tool);
 }
 
 constexpr struct wp_cursor_shape_manager_v1_interface manager_impl = {
