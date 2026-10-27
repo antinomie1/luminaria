@@ -177,7 +177,10 @@ fn main() {
         "src/ffi_desktop.rs",
         "src/ffi_text.rs",
         "xmake.lua",
+        // Directories are scanned recursively: any file under src/ (a .cppm,
+        // a shader) or protocol/ (the XML luminaria vendors) reruns xmake.
         "../../src",
+        "../../protocol",
         "../../xmake.lua",
     ] {
         println!("cargo:rerun-if-changed={path}");

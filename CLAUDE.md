@@ -51,6 +51,16 @@ output names (`mesonbuild/scripts/depscan.py`), so ninja dies with "inputs may n
 inputs" on GCC. xmake scans and orders module units correctly for GCC; that is the whole
 reason for the switch.
 
+**xmake's incremental module build is not trusted on its own.** It records only a unit's own
+source in its dependfile and saves that dependfile *before* compiling, so an object can be
+skipped although a module it imports changed in an earlier run (`xmake`, then
+`xmake build -a`: the tests keep the old layout) or although its own compile never ran (a
+failed or interrupted build). The `luminaria.module_staleness` rule in `xmake.lua` closes
+both: before each build it deletes every object older than its source, the module units it
+imports (transitively, across targets) or the project headers they include. Every luminaria
+target gets it through `luminaria_defaults()`; a target that imports luminaria from outside
+that function (the Rust shim) adds the rule itself. `xmake build -r` is still the big hammer.
+
 Generated code lands in `build/generated/`: protocol glue is refreshed at configure time;
 shader SPIR-V is also freshness-checked before every GPU build.
 

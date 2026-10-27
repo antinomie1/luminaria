@@ -33,9 +33,145 @@ if standalone then
     set_defaultmode("debug")
 end
 
+-- xmake's incremental C++ module build does not know what an object was built
+-- FROM. Two holes, both reproduced against xmake 3.1.2 + clang:
+--
+--   * A unit's dependfile lists only its own source. clang's -MD output names no
+--     .pcm, so "an imported module changed" is noticed only by recursion inside
+--     the SAME run that rebuilds that module. Edit src/backend/wayland.cppm, run
+--     `xmake` (library + examples, tests are not default), then `xmake build -a`:
+--     the library is fresh by then, so no test object is ever recompiled, and the
+--     test runs with the old layout of WaylandBackend baked in.
+--   * should_build() saves the dependfile BEFORE the compile. A build that fails
+--     or is killed part-way leaves every unit it had decided to rebuild marked
+--     fresh, compiled or not: libinput.cppm's object kept its old body while its
+--     importers were rebuilt against the new BMI, and the link broke.
+--
+-- So before anything is scanned or scheduled, compare each object against the
+-- newest of everything it reaches — its source, the module units it imports
+-- (transitively, across targets), and the project headers they include (which
+-- xmake does not track for module units either) — and delete it when it is
+-- older. A missing object is the one signal every xmake path honours: the
+-- module builder treats it as lastmtime 0, the plain-object rule as "build".
+-- Only an object's own successful compile can make it newer again, so an
+-- interrupted build cannot fake freshness here.
+rule("luminaria.module_staleness")
+    before_prepare(function (target)
+        import("core.cache.memcache")
+        -- Process-wide: ~80 test targets share the same library sources, and
+        -- each file is read once however many targets ask about it.
+        local cache = memcache.cache("luminaria.module_staleness")
+
+        -- What one file declares: the module it is, what it imports, what it
+        -- includes. A line-based match is enough for this tree's style (one
+        -- declaration per line, as clang-format leaves them).
+        local function scan(file)
+            local info = cache:get2("scan", file)
+            if info then
+                return info
+            end
+            info = {imports = {}, includes = {}}
+            for line in (io.readfile(file) or ""):gmatch("[^\n]*") do
+                local name = line:match("^%s*export%s+module%s+([%w_.:]+)%s*;")
+                          or line:match("^%s*module%s+([%w_.:]+)%s*;")
+                if name then
+                    info.module = name
+                end
+                local imported = line:match("^%s*export%s+import%s+([%w_.:]+)%s*;")
+                              or line:match("^%s*import%s+([%w_.:]+)%s*;")
+                if imported then
+                    table.insert(info.imports, imported)
+                end
+                local quote, header = line:match("^%s*#%s*include%s*([<\"])([^>\"]+)[>\"]")
+                if header then
+                    table.insert(info.includes, {header = header, quoted = quote == "\""})
+                end
+            end
+            cache:set2("scan", file, info)
+            return info
+        end
+
+        -- The module units this target can import (its own and its deps'), and
+        -- the include dirs a header may come from. Only -I dirs: packages arrive
+        -- as -isystem, so system headers are never followed.
+        local providers = {}
+        local includedirs = {}
+        for _, t in ipairs(table.join({target}, target:orderdeps())) do
+            for _, file in ipairs(t:sourcefiles()) do
+                local info = scan(path.absolute(file))
+                if info.module and not providers[info.module] then
+                    providers[info.module] = path.absolute(file)
+                end
+            end
+            for _, dir in ipairs(t:get("includedirs")) do
+                table.insert(includedirs, path.absolute(dir))
+            end
+        end
+        local function resolve_import(name, info)
+            if name:startswith(":") then
+                local primary = (info.module or ""):match("^([^:]+)")
+                return primary and providers[primary .. name]
+            end
+            return providers[name]
+        end
+        local function resolve_include(include, file)
+            if include.quoted then
+                local candidate = path.join(path.directory(file), include.header)
+                if os.isfile(candidate) then
+                    return candidate
+                end
+            end
+            for _, dir in ipairs(includedirs) do
+                local candidate = path.join(dir, include.header)
+                if os.isfile(candidate) then
+                    return candidate
+                end
+            end
+        end
+
+        -- Newest mtime over a file and everything it reaches. Module names are
+        -- unique across the project, so the answer is the same from any target.
+        local function newest(file, visiting)
+            local known = cache:get2("newest", file)
+            if known then
+                return known
+            end
+            if visiting[file] then
+                return 0
+            end
+            visiting[file] = true
+            local info = scan(file)
+            local mtime = os.mtime(file)
+            for _, imported in ipairs(info.imports) do
+                local dep = resolve_import(imported, info)
+                if dep then
+                    mtime = math.max(mtime, newest(dep, visiting))
+                end
+            end
+            for _, include in ipairs(info.includes) do
+                local dep = resolve_include(include, file)
+                if dep then
+                    mtime = math.max(mtime, newest(dep, visiting))
+                end
+            end
+            visiting[file] = nil
+            cache:set2("newest", file, mtime)
+            return mtime
+        end
+
+        for _, file in ipairs(target:sourcefiles()) do
+            local objectfile = target:objectfile(file)
+            if os.isfile(objectfile) and newest(path.absolute(file), {}) > os.mtime(objectfile) then
+                os.rm(objectfile)
+            end
+        end
+    end)
+rule_end()
+
 local function luminaria_defaults()
     set_languages("c11", "c++23")
     set_policy("build.c++.modules", true)
+    add_rules("luminaria.module_staleness")
     -- Partial designated-init of libwayland's C *_interface vtables is idiomatic;
     -- unlisted request slots are intentionally null. Silence that one warning,
     -- keep everything else fatal.

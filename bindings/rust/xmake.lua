@@ -45,6 +45,9 @@ target("luminaria-rs")
     set_kind("static")
     set_languages("c11", "c++23")
     set_policy("build.c++.modules", true)
+    -- Defined in luminaria's xmake.lua: deletes objects older than the module
+    -- units they import, which xmake's own incremental build can miss.
+    add_rules("luminaria.module_staleness")
     -- The same warning set luminaria builds with, minus the vtable idiom.
     set_warnings("all", "extra", "pedantic", "error")
     add_cxxflags("-Wno-missing-field-initializers")
