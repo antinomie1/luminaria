@@ -193,7 +193,7 @@ fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize
 
 - **摆放策略**（平铺 / 浮动 / 工作区切换逻辑）—— 每个混成器自己实现，见 `CONTEXT.md`。
 - **窗口装饰绘制** —— 库不画标题栏，所以 `xdg-decoration` 默认答 client-side。
-- **gamma-control / tablet-v2 / pointer-gestures** —— 完整桌面要，
+- **tablet-v2** —— 完整桌面要，
   但混成器可以自己实现，且都不影响那三个数。
 - **VRR / 动态刷新率**（低功耗第三级）—— 收益大，但依赖真机数据，等第 0 步之后再判断。
 
@@ -221,9 +221,6 @@ fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize
   再给客户端，库拿不到键盘就替不了这个决定；keymap 已经替你发了。候选窗的摆放同理。
 - **popup 的 `constraint_adjustment` 要混成器配合** —— 不调
   `XdgShell::set_popup_constraint_query()` 就拿不到父窗口位置，贴边菜单会溢出。
-- **GPU 设备热插拔不处理** —— 只跟踪 connector 状态，整块显卡消失不管。
-- **headless 后端每帧一次全屏 CPU 读回** —— wl_shm 呈现的代价；嵌套后端只在父混成器没有
-  `zwp_linux_dmabuf_v1` 时才付，DRM 后端从不付。
 - **`xdg_activation` 不校验 serial** —— 库没有"这个客户端最近收到过哪些 serial"的账，
   防焦点窃取要混成器自己核对。
 - **`data_control` 的 filter 无法链式叠加** —— libwayland 的 `wl_display` 只有一个 global

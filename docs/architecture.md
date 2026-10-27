@@ -215,15 +215,14 @@ src/detail/wayland_fwd.h   唯一剩下的头文件
   的所有 per-output 重建，以及客户端 dmabuf direct scanout 仍须在空闲 VT 上验收。渲染与几何有
   `output-layout` / `output-scale` / `gpu-scanout` / `region` / `cursor-theme` 覆盖；`session` 测试在
   没有 seat 的环境里 skip。
-- **运行中途拆掉一个 global 只保证了析构路径。** 各 global 的 `~Impl` 让客户端对象变成惰性，
-  所以 destroy handler 不会再碰已释放的 manager；但客户端绑定的 *manager 资源本身*
-  （`default_bind` 把 user_data 设成 `Impl`）没有登记，global 析构之后客户端再对它发请求，仍是
-  use-after-free。退出时不再 dispatch，所以无害；运行中途移除 global（为热插拔登记了全部资源的
-  `OutputGlobal` 除外）尚不支持。
-- **热插拔只覆盖 connector 状态**：GPU 本身热插拔（拔掉整块显卡 / DRM 设备消失）不处理。
-- **headless 后端每帧有一次全屏 CPU 读回**（`read_scanout`，800×600 约 2.6ms release /
-  13ms debug）。这是 wl_shm 呈现的代价。嵌套后端只在父 compositor 没有
-  `zwp_linux_dmabuf_v1` 时才付这个代价，DRM 后端从来不付 —— 两者都直接扫描输出 dmabuf。
+- **运行中途动态移除 global 已完全支持**：`destroy_global_safe()` 先调用 `wl_global_remove()` 并设置 user_data 为空，
+  在事件循环上延迟执行 `wl_global_destroy()`，避免客户端飞行中 `wl_registry.bind` 触发协议错误；
+  配合 `GlobalBindingTracker` 自动解绑 manager 资源并在析构时 `detach_resource`，杜绝 use-after-free。
+- **GPU 设备热插拔已支持**：`DrmBackend` 与 `AutoBackend` 监听 DRM 子系统的 udev add/remove 事件，
+  显卡被拔出时销毁对应输出并发出 `device_removed` / `gpu_removed` 信号，插入新显卡时发出 `device_added` / `gpu_added` 信号。
+- **headless 后端与 CPU 读回优化**：`read_scanout()` 改用 32 位整字位运算消除 Debug 模式下的逐字节标量循环；
+  同时 `Output` 支持 `requires_commit_pixels()` 与 `set_frame_reader()`，无头与 CI 模式下默认无需逐帧执行阻塞读回，
+  仅在调用 `last_frame()` 或 `read_back()` 时按需回读。
 - **默认构建是 debug（`-O0`）**，逐像素转换会慢 5 倍。跑真实负载用 `xmake f -m release`。
 - **模块化踩到两个 gcc 16 的坑**：接口单元里 defaulted 的 hidden-friend `operator==` 会
   ICE（改成成员形式），`std::function` / `std::make_shared` 要求每个实例化点都能看见

@@ -84,9 +84,9 @@ src/backend/base/          backend output input_event output_layout (abstract ba
 src/backend/               drm headless libinput session wayland
 src/render/                vulkan cpu_compositor + quad.{vert,frag} + solid.frag
 src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
-src/protocol/core/         27 Wayland globals in core
+src/protocol/core/         28 Wayland globals in core
 src/protocol/render/       drm_syncobj linux_dmabuf screencopy
-src/protocol/desktop/      data_control foreign_toplevel input_method output_management session_lock workspace
+src/protocol/desktop/      ctm_control data_control foreign_toplevel gamma_control input_method output_management session_lock virtual_keyboard virtual_pointer workspace
 src/detail/wayland_fwd.h   the one remaining header
 ```
 

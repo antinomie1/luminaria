@@ -50,6 +50,10 @@
    - [9.3 DataControl (剪贴板管理器)](#93-datacontrol-剪贴板管理器)
    - [9.4 SessionLock (锁屏)](#94-sessionlock-锁屏)
    - [9.5 InputMethod (输入法引擎)](#95-inputmethod-输入法引擎)
+   - [9.6 GammaControl (伽马曲线调节)](#96-gammacontrol-伽马曲线调节)
+   - [9.7 CtmControl (色彩变换矩阵)](#97-ctmcontrol-色彩变换矩阵)
+   - [9.8 VirtualKeyboard (虚拟键盘输入注入)](#98-virtualkeyboard-虚拟键盘输入注入)
+   - [9.9 VirtualPointer (虚拟指针输入注入)](#99-virtualpointer-虚拟指针输入注入)
 10. [架构约束、生命周期与安全规矩](#10-架构约束生命周期与安全规矩)
 
 ---
@@ -214,6 +218,8 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`HeadlessBackend`** (`luminaria:headless`):
   - `static Result<HeadlessBackend> create(EventLoop loop, int width = 800, int height = 600)`
   - `Output& create_output(int width, int height)`: 动态创建虚拟无头输出。
+  - `HeadlessOutput`: 虚拟输出。支持 `requires_commit_pixels()`（默认为 true 兼容读取 `last_frame()`，可设为 false 避免逐帧 CPU 回读；环境变量 `LUMINARIA_NO_READBACK=1` 可全局禁用同步读回）。
+  - `void set_requires_commit_pixels(bool required)`: 开关逐帧 CPU 提交；为 false 时只有在测试调用 `last_frame()` 时才懒惰回读。
 - **`WaylandBackend`** (`luminaria:wayland`):
   - `static Result<WaylandBackend> create(EventLoop loop, Display& display, int width, int height, std::string_view title)`
   - 嵌套在宿主 Wayland 混成器内运行，支持父级 dmabuf 直出。
@@ -227,7 +233,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `bool active() const`, `Signal<SessionActive>& active_changed()`
 - **`DrmBackend`** (`luminaria.backend:drm`): KMS Atomic Modesetting 裸机显示驱动。
   - `static Result<DrmBackend> create(EventLoop loop, Session& session, std::string_view card_path = "")`
-  - 监听 udev connector 热插拔，为每个活跃显示器构建 `DrmOutput`；支持硬件光标平面（Hardware Cursor Plane）、Atomic 翻页与显式 Fence（`IN_FENCE_FD` / `OUT_FENCE_PTR`）。
+  - 监听 udev connector 热插拔与 GPU 节点热插拔，为每个活跃显示器构建 `DrmOutput`；支持硬件光标平面（Hardware Cursor Plane）、Atomic 翻页与显式 Fence（`IN_FENCE_FD` / `OUT_FENCE_PTR`）。
+  - `Signal<DrmDeviceRemoved> device_removed`: 本显卡被移除/拔出时发射，自动安全清理关联输出。
+  - `Signal<DrmDeviceAdded> device_added`: 检测到系统中插入新显卡设备节点时发射。
 - **`LibinputBackend`** (`luminaria.backend:libinput`): 裸机输入设备事件源。
   - `static Result<LibinputBackend> create(EventLoop loop, Session& session)`
   - 是一个 `InputSource`：相对移动、按钮、滚轮、按键、修饰键（仅在变化时）、触摸、设备增删引起的能力变化，全经 `input()`。`set_keymap()` 成功时也发 `KeymapChange`。
@@ -249,6 +257,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - 取用：`kind()`（不会是 `automatic`）、`Backend& backend()`（订阅 `new_output`）、`InputSource* input()`（嵌套后端或
   libinput，无头为空）、`WaylandBackend* nested()`（`close_requested` 由调用者回答）、`DrmBackend* drm()`、
   `LibinputBackend* libinput()`、`Session* session()`（VT 切换与 `activity()`，只在 DRM 上）、`session_error()`、
+  `Signal<DrmDeviceRemoved>& gpu_removed()`、`Signal<DrmDeviceAdded>& gpu_added()`、
   `const VulkanOptions& vulkan_options()`（交给 `SceneRenderer` / `VulkanRenderer`）。
 - **`Status start()`**：先 libinput，后后端。
 - 会话、显卡后端、libinput 都归它所有，按"会话最后析构"的顺序声明；它是 pimpl，所以移动它不会让 `Session*` 失效。
@@ -276,7 +285,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`VulkanRenderer`**:
   - `static Result<VulkanRenderer> create(...)`: 初始化 Vulkan 实例与物理设备。
   - `Status render_to(ScanoutTarget& target, Color background, std::span<const GpuTextureFill> fills, const Region& repaint, const OutputMapping& mapping, RenderSync sync)`: 执行多边形合并渲染，支持不透明遮挡剔除、独立 Damage Scissor、Fence 异步编排。
-  - `Result<std::vector<Pixel>> read_scanout(ScanoutTarget& target)`: 回读渲染结果至 CPU（用于无 dmabuf 呈现）。
+  - `Status read_scanout(ScanoutTarget& target, std::vector<Pixel>& out)`: 回读渲染结果至 CPU（32 位整字快速回读，消除逐字节标量循环与二次拷贝）。
 
 ### 5.3 CursorTheme & Text/Font
 - **`CursorTheme`** (`luminaria:cursor_theme`):
@@ -403,10 +412,11 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`XdgDecorationManager`** (`luminaria:xdg_decoration`): 服务端/客户端装饰协商（默认答 Client-side）。
 - **`XdgToplevelIconManager`** (`luminaria:xdg_toplevel_icon`): 发布 `xdg_toplevel_icon_manager_v1`；`icon_for(toplevel)` 返回客户端图标名和已复制的 RGBA 尺寸集，`changed()` 在图标替换时发信号。
 
-### 7.6 PointerConstraints & RelativePointer & CursorShape
+### 7.6 PointerConstraints & RelativePointer & CursorShape & PointerGestures
 - **`PointerConstraints`** (`luminaria:pointer_constraints`): 指针锁定（Locked Pointer）与约束（Confined Pointer）。
 - **`RelativePointerManager`** (`luminaria:relative_pointer`): 相对运动事件（无界 FPS 视角控制）。
 - **`CursorShapeManager`** (`luminaria:cursor_shape`): `wp_cursor_shape_v1` 标准系统光标形状协商。
+- **`PointerGestures`** (`luminaria:pointer_gestures`): `zwp_pointer_gestures_v1` (v3)。支持 `swipe`（多指滑动）、`pinch`（双指缩放旋转）与 `hold`（多指按住）手势事件下发。
 
 ### 7.7 TextInput & IdleInhibit & IdleNotify & BackgroundEffect
 - **`TextInputManager`** (`luminaria:text_input`): `zwp_text_input_v3` 客户端文本输入。
@@ -456,6 +466,22 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`InputMethodManager`** (`luminaria.desktop:input_method`): `zwp_input_method_v2`
   - 输入法键盘抓取与候选字浮窗，与 `TextInput` 自动桥接。
 
+### 9.6 GammaControl (伽马曲线调节)
+- **`GammaControlManager`** (`luminaria.desktop:gamma_control`): `zwlr_gamma_control_manager_v1`
+  - 管理输出的 16 位 RGB 查找表（夜间模式、色温调节），支持设置通过 shm fd 传输的 gamma table，销毁时自动还原默认查找表。
+
+### 9.7 CtmControl (色彩变换矩阵)
+- **`CtmControlManager`** (`luminaria.desktop:ctm_control`): `hyprland_ctm_control_v1` (v2)
+  - 允许特权客户端配置输出的 3×3 行优先色彩变换矩阵（CTM），带非负值检验与独占互斥控制。
+
+### 9.8 VirtualKeyboard (虚拟键盘输入注入)
+- **`VirtualKeyboardManager`** (`luminaria.desktop:virtual_keyboard`): `zwp_virtual_keyboard_v1`
+  - 接收虚拟键盘注入事件，提供 `key_event()` 与 `modifiers_event()` 信号。
+
+### 9.9 VirtualPointer (虚拟指针输入注入)
+- **`VirtualPointerManager`** (`luminaria.desktop:virtual_pointer`): `zwlr_virtual_pointer_v1` (v2)
+  - 接收虚拟指针相对位移、绝对坐标定位、按钮、滚轮与帧同步事件。
+
 ---
 
 ## 10. 架构约束、生命周期与安全规矩
@@ -475,3 +501,4 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
    - 正常呈现时在 `Output::present` 中调用 `Frame::send_frame_done(time_ms)`。
    - `submit()` 返回 `Presented::unchanged` 时，必须在当次 `Output::frame` 处理器内补发 `send_frame_done()`，避免无 Damage 提交的客户端永久冻结。
 5. **客户端内存防御性校验**：直接读取 `wl_shm` 或 DMA 缓冲时，必须先经 `layout_fits()` 校验 stride、offset 与内存长度，杜绝野指针越界。
+6. **运行中途动态移除 Global 的安全模式**：使用 `WlGlobal::reset()` 或 `destroy_global_safe()`，先通过 `wl_global_remove()` 撤回公告，并在事件循环定时器上延迟释放底层的 `wl_global`，避免客户端飞行中的 `wl_registry.bind` 触发致命协议错误；配合 `GlobalBindingTracker` 自动登记绑定的 manager 资源并在全局对象析构时执行 `detach_resource()`，彻底杜绝 use-after-free。

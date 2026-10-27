@@ -1,11 +1,15 @@
 // luminaria/backend/headless.cppm — virtual backend with no real hardware.
 //
-// Outputs exist purely in memory; frames are pumped by a software timer. This is
-// the CI/test backend — no GPU, no display server required.
+// Outputs exist purely in memory; frames are pumped by a software timer. This
+// is the CI/test backend — no GPU, no display server required.
 
 module;
 
-
+#include <cstdint>
+#include <drm_fourcc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 export module luminaria.backend:headless;
 
@@ -16,92 +20,130 @@ import luminaria;
 export namespace luminaria {
 
 class HeadlessOutput final : public Output {
-    EventSource frame_timer_;
-    unsigned interval_ms_;
-    std::vector<Pixel> last_frame_;
+  EventSource frame_timer_;
+  unsigned interval_ms_;
+  mutable std::vector<Pixel> last_frame_;
+  bool requires_commit_pixels_ = true;
+  std::function<std::span<const Pixel>()> frame_reader_;
 
 public:
-    HeadlessOutput(EventLoop loop, int width, int height, unsigned interval_ms);
+  HeadlessOutput(EventLoop loop, int width, int height, unsigned interval_ms);
 
-    Status commit(Color color) override;
-    Status commit_frame(std::span<const Pixel> rgba, int width, int height) override;
+  Status commit(Color color) override;
+  Status commit_frame(std::span<const Pixel> rgba, int width,
+                      int height) override;
 
-    /// The most recently presented frame (for tests/inspection).
-    [[nodiscard]] const std::vector<Pixel>& last_frame() const noexcept { return last_frame_; }
+  [[nodiscard]] bool requires_commit_pixels() const noexcept override {
+    return requires_commit_pixels_;
+  }
+  void set_requires_commit_pixels(bool required) noexcept {
+    requires_commit_pixels_ = required;
+  }
+  void set_frame_reader(
+      std::function<std::span<const Pixel>()> fn) noexcept override {
+    frame_reader_ = std::move(fn);
+  }
 
-    /// Ask for the first frame. Every later one is asked for the same way every
-    /// other backend's is — `Output::schedule_frame()`. The timer only paces
-    /// requests; it does not manufacture them, so an idle headless output ticks
-    /// exactly zero times a second.
-    void start_pump();
+  /// The most recently presented frame (lazily read back on demand for
+  /// tests/inspection).
+  [[nodiscard]] const std::vector<Pixel> &last_frame() const noexcept;
+
+  /// Ask for the first frame. Every later one is asked for the same way every
+  /// other backend's is — `Output::schedule_frame()`. The timer only paces
+  /// requests; it does not manufacture them, so an idle headless output ticks
+  /// exactly zero times a second.
+  void start_pump();
 
 protected:
-    void arm_frame() override;
+  void arm_frame() override;
 };
 
 class HeadlessBackend final : public Backend {
-    EventLoop loop_;
-    unsigned interval_ms_;
-    std::vector<std::unique_ptr<HeadlessOutput>> outputs_;
-    bool started_ = false;
+  EventLoop loop_;
+  unsigned interval_ms_;
+  std::vector<std::unique_ptr<HeadlessOutput>> outputs_;
+  bool started_ = false;
 
 public:
-    explicit HeadlessBackend(EventLoop loop, unsigned frame_interval_ms = 16);
+  explicit HeadlessBackend(EventLoop loop, unsigned frame_interval_ms = 16);
 
-    /// Add a virtual output. Call before start().
-    Output& add_output(int width, int height);
+  /// Add a virtual output. Call before start().
+  Output &add_output(int width, int height);
 
-    Status start() override;
+  Status start() override;
 };
 
 } // namespace luminaria
 
-// --------------------------------------------------------------- implementation
+// ---------------------------------------------------------------
+// implementation
 namespace luminaria {
 
-HeadlessOutput::HeadlessOutput(EventLoop loop, int width, int height, unsigned interval_ms)
+HeadlessOutput::HeadlessOutput(EventLoop loop, int width, int height,
+                               unsigned interval_ms)
     : Output(width, height), interval_ms_(interval_ms) {
-    // One-shot: emit_software_frame() clears the request, and a handler that
-    // wants another frame re-arms the timer through schedule_frame().
-    frame_timer_ = loop.add_timer([this] { emit_software_frame(interval_ms_ * 1000000u); });
+  if (const char *env = std::getenv("LUMINARIA_NO_READBACK");
+      env != nullptr && env[0] != '0') {
+    requires_commit_pixels_ = false;
+  }
+  // One-shot: emit_software_frame() clears the request, and a handler that
+  // wants another frame re-arms the timer through schedule_frame().
+  frame_timer_ =
+      loop.add_timer([this] { emit_software_frame(interval_ms_ * 1000000u); });
 }
 
 Status HeadlessOutput::commit(Color color) {
-    last_committed_ = color;
-    return ok();
+  last_committed_ = color;
+  return ok();
 }
 
-Status HeadlessOutput::commit_frame(std::span<const Pixel> rgba, int width, int height) {
-    if (width != width_ || height != height_ ||
-        rgba.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
-        return fail("headless: frame size mismatch");
+Status HeadlessOutput::commit_frame(std::span<const Pixel> rgba, int width,
+                                    int height) {
+  if (width != width_ || height != height_ ||
+      rgba.size() !=
+          static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
+    return fail("headless: frame size mismatch");
+  }
+  last_frame_.assign(rgba.begin(), rgba.end());
+  frame_reader_ = nullptr;
+  return ok();
+}
+
+const std::vector<Pixel> &HeadlessOutput::last_frame() const noexcept {
+  if (frame_reader_) {
+    auto pixels = frame_reader_();
+    if (!pixels.empty()) {
+      last_frame_.assign(pixels.begin(), pixels.end());
     }
-    last_frame_.assign(rgba.begin(), rgba.end());
-    return ok();
+  }
+  return last_frame_;
 }
 
-void HeadlessOutput::arm_frame() { frame_timer_.arm(interval_ms_ == 0 ? 1 : interval_ms_); }
+void HeadlessOutput::arm_frame() {
+  frame_timer_.arm(interval_ms_ == 0 ? 1 : interval_ms_);
+}
 
 void HeadlessOutput::start_pump() { schedule_frame(); }
 
 HeadlessBackend::HeadlessBackend(EventLoop loop, unsigned frame_interval_ms)
     : loop_(loop), interval_ms_(frame_interval_ms) {}
 
-Output& HeadlessBackend::add_output(int width, int height) {
-    outputs_.push_back(std::make_unique<HeadlessOutput>(loop_, width, height, interval_ms_));
-    return *outputs_.back();
+Output &HeadlessBackend::add_output(int width, int height) {
+  outputs_.push_back(
+      std::make_unique<HeadlessOutput>(loop_, width, height, interval_ms_));
+  return *outputs_.back();
 }
 
 Status HeadlessBackend::start() {
-    started_ = true;
-    for (auto& out : outputs_) {
-        NewOutput event{*out};
-        new_output.emit(event);
-    }
-    for (auto& out : outputs_) {
-        out->start_pump();
-    }
-    return ok();
+  started_ = true;
+  for (auto &out : outputs_) {
+    NewOutput event{*out};
+    new_output.emit(event);
+  }
+  for (auto &out : outputs_) {
+    out->start_pump();
+  }
+  return ok();
 }
 
 } // namespace luminaria

@@ -307,6 +307,7 @@ target("luminaria")
             {"xdg-toplevel-icon-v1",          "staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml",         "scl"},
             {"relative-pointer-unstable-v1",  "unstable/relative-pointer/relative-pointer-unstable-v1.xml", "scl"},
             {"pointer-constraints-unstable-v1", "unstable/pointer-constraints/pointer-constraints-unstable-v1.xml", "scl"},
+            {"pointer-gestures-unstable-v1",  "unstable/pointer-gestures/pointer-gestures-unstable-v1.xml", "scl"},
             {"text-input-unstable-v3",        "unstable/text-input/text-input-unstable-v3.xml",             "scl"},
             {"idle-inhibit-unstable-v1",      "unstable/idle-inhibit/idle-inhibit-unstable-v1.xml",         "scl"},
             {"ext-idle-notify-v1",            "staging/ext-idle-notify/ext-idle-notify-v1.xml",             "scl"},
@@ -326,6 +327,10 @@ target("luminaria")
             {"wlr-data-control-unstable-v1", "scl"},
             {"input-method-unstable-v2",     "scl"},
             {"wlr-output-management-unstable-v1", "scl"},
+            {"wlr-gamma-control-unstable-v1", "scl"},
+            {"hyprland-ctm-control-v1",      "scl"},
+            {"virtual-keyboard-unstable-v1", "scl"},
+            {"wlr-virtual-pointer-unstable-v1", "scl"},
         }
 
         -- os.scriptdir(), never os.projectdir(): when this xmake.lua is pulled
@@ -499,11 +504,12 @@ local shell_tests = {
     test_wayland_nested = true, test_xray_blur = true,
     test_layer_shell = true, test_popup = true, test_scene = true, test_subsurface = true,
     test_cursor_theme = true, test_cursor_capture = true, test_screencopy_bounds = true,
-    test_syncobj = true, test_render_output = true,
+    test_syncobj = true, test_render_output = true, test_drm_hotplug = true,
 }
 local desktop_tests = {
     test_data_control = true, test_foreign_toplevel = true, test_input_method = true,
     test_output_management = true, test_session_lock = true, test_workspace = true,
+    test_gamma_control = true, test_ctm_control = true, test_virtual_input = true,
 }
 local text_tests = {
     test_text = true,

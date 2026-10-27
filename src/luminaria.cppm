@@ -56,6 +56,7 @@ export import :output_layout;
 export import :pixel;
 export import :pixel_layout;
 export import :pointer_constraints;
+export import :pointer_gestures;
 export import :presentation_time;
 export import :protocol_helper;
 export import :rect_fill;
