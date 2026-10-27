@@ -30,6 +30,9 @@ struct PointerConstraintInfoRaw;
 struct TextInputInfoRaw;
 
 class OutputGlobalShim;
+class OutputShim;
+class OutputLayoutShim;
+class SeatShim;
 
 // ============================================================================
 // Core & Util
@@ -49,6 +52,11 @@ public:
     void terminate() const;
     int dispatch(int timeout_ms) const;
     void flush_clients() const;
+    // The next queued event of every shim on this thread, oldest first: 0 for
+    // none, 1 an event in `out`, 2 an input event in `input`, 3 an output
+    // added (`out.id`), which take_output() then hands over.
+    std::uint32_t next_event(EventRaw& out, InputEventRaw& input) const;
+    std::unique_ptr<OutputShim> take_output() const;
     // The wl_display, borrowed: see Display::as_ptr in src/core.rs.
     std::size_t raw_display() const;
 
@@ -148,9 +156,6 @@ public:
     bool has_cursor_plane() const;
     bool move_cursor(std::int32_t x, std::int32_t y, rust::String& error);
     bool hide_cursor(rust::String& error);
-    bool take_frame();
-    bool take_mode_changed();
-    bool next_event(EventRaw& out) const;
     bool alive() const;
     std::uint64_t id() const;
 
@@ -188,10 +193,10 @@ public:
     std::unique_ptr<OutputShim> add_output(std::int32_t width, std::int32_t height);
     bool start(rust::String& error);
     rust::String keymap() const;
-    bool next_input_event(InputEventRaw& out);
     // keyboard, pointer, touch as bits 0, 1, 2.
     std::uint32_t capabilities() const;
-    bool take_close_request();
+    // lm::Seat::follow on this backend's input.
+    void follow_seat(const SeatShim& seat, bool touch) const;
 
     struct Impl;
     Impl& impl() const;
@@ -212,7 +217,6 @@ public:
     CompositorShim(const CompositorShim&) = delete;
     CompositorShim& operator=(const CompositorShim&) = delete;
 
-    bool next_event(EventRaw& out) const;
 
     struct Impl;
     Impl& impl() const;
@@ -262,7 +266,9 @@ public:
     XdgShellShim& operator=(const XdgShellShim&) = delete;
 
     void set_bounds(std::int32_t width, std::int32_t height) const;
-    bool next_event(EventRaw& out) const;
+    // From now on, maximize/fullscreen/minimize requests of toplevels created
+    // later are Rust's to answer; until then the library grants them itself.
+    void forward_window_requests() const;
     rust::Vec<std::uint64_t> toplevels() const;
 
     // Toplevels and popups are named by their wl_surface's SurfaceId and
@@ -303,6 +309,7 @@ public:
     void notify_key(std::uint32_t key, bool pressed) const;
     void notify_modifiers(std::uint32_t depressed, std::uint32_t latched,
                           std::uint32_t locked, std::uint32_t group) const;
+    void release_keys() const;
 
     void pointer_enter(std::uint64_t surface_id, double sx, double sy) const;
     void pointer_clear_focus() const;
@@ -328,7 +335,6 @@ public:
     void touch_cancel() const;
     std::uint64_t touch_focus(std::int32_t id) const;
 
-    bool next_event(EventRaw& out) const;
 
     struct Impl;
     Impl& impl() const;
@@ -345,7 +351,6 @@ public:
     LayerShellShim(const LayerShellShim&) = delete;
     LayerShellShim& operator=(const LayerShellShim&) = delete;
 
-    bool next_event(EventRaw& out) const;
     rust::Vec<std::uint64_t> layer_surfaces() const;
     bool info(std::uint64_t surface_id, LayerSurfaceInfoRaw& out) const;
     rust::String scope(std::uint64_t surface_id) const;
@@ -394,6 +399,10 @@ private:
 
 std::unique_ptr<OutputGlobalShim> output_global_new(const DisplayShim& display, std::int32_t width,
                                                    std::int32_t height, rust::Str name, rust::String& error);
+// lm::OutputGlobal::create(display, output, layout, name): follows both.
+std::unique_ptr<OutputGlobalShim> output_global_for(const DisplayShim& display, const OutputShim& output,
+                                                   const OutputLayoutShim& layout, rust::Str name,
+                                                   rust::String& error);
 
 class CursorThemeShim {
 public:
@@ -450,7 +459,6 @@ public:
     LUM_SHIM_BOILERPLATE(XdgDecorationManagerShim)
     void set_default_mode(std::uint32_t mode) const;
     std::uint32_t default_mode() const;
-    bool next_event(EventRaw& out) const;
 private:
     std::unique_ptr<Impl> impl_;
 };
@@ -459,9 +467,8 @@ std::unique_ptr<XdgDecorationManagerShim> xdg_decoration_manager_new(const Displ
 class FractionalScaleManagerShim {
 public:
     LUM_SHIM_BOILERPLATE(FractionalScaleManagerShim)
-    // Tells `surface` to render for a scale of `scale_120ths / 120`. Surfaces
-    // with no wp_fractional_scale_v1 object are skipped by the library.
-    void set_scale(std::uint64_t surface_id, std::int32_t scale_120ths) const;
+    // lm::FractionalScaleManager::set_scale: the exact scale and the integer hint.
+    void set_scale(std::uint64_t surface_id, double scale) const;
 private:
     std::unique_ptr<Impl> impl_;
 };
@@ -470,7 +477,6 @@ std::unique_ptr<FractionalScaleManagerShim> fractional_scale_manager_new(const D
 class CursorShapeManagerShim {
 public:
     LUM_SHIM_BOILERPLATE(CursorShapeManagerShim)
-    bool next_event(EventRaw& out) const;
 private:
     std::unique_ptr<Impl> impl_;
 };
@@ -479,7 +485,6 @@ std::unique_ptr<CursorShapeManagerShim> cursor_shape_manager_new(const DisplaySh
 class XdgToplevelIconManagerShim {
 public:
     LUM_SHIM_BOILERPLATE(XdgToplevelIconManagerShim)
-    bool next_event(EventRaw& out) const;
     rust::String icon_name(std::uint64_t surface_id) const;
 private:
     std::unique_ptr<Impl> impl_;
@@ -489,7 +494,6 @@ std::unique_ptr<XdgToplevelIconManagerShim> xdg_toplevel_icon_manager_new(const 
 class XdgActivationShim {
 public:
     LUM_SHIM_BOILERPLATE(XdgActivationShim)
-    bool next_event(EventRaw& out) const;
     void set_grant_tokens(bool grant) const;
 private:
     std::unique_ptr<Impl> impl_;
@@ -499,7 +503,6 @@ std::unique_ptr<XdgActivationShim> xdg_activation_new(const DisplayShim& display
 class IdleInhibitManagerShim {
 public:
     LUM_SHIM_BOILERPLATE(IdleInhibitManagerShim)
-    bool next_event(EventRaw& out) const;
     bool inhibited() const;
     std::size_t inhibitor_count() const;
     std::uint64_t inhibitor_surface(std::uint64_t inhibitor) const;
@@ -513,7 +516,6 @@ std::unique_ptr<IdleInhibitManagerShim> idle_inhibit_manager_new(const DisplaySh
 class IdleNotifierShim {
 public:
     LUM_SHIM_BOILERPLATE(IdleNotifierShim)
-    bool next_event(EventRaw& out) const;
     void notify_activity() const;
     void set_inhibited(bool inhibited) const;
     bool inhibited() const;
@@ -530,7 +532,6 @@ public:
     ~DataDeviceManagerShim();
     DataDeviceManagerShim(const DataDeviceManagerShim&) = delete;
     DataDeviceManagerShim& operator=(const DataDeviceManagerShim&) = delete;
-    bool next_selection_change(rust::Vec<rust::String>& mime_types) const;
     rust::Vec<rust::String> selection_mime_types() const;
     // Takes ownership of `fd` either way.
     bool selection_receive(rust::Str mime, int fd) const;
@@ -547,7 +548,6 @@ public:
     ~PrimarySelectionManagerShim();
     PrimarySelectionManagerShim(const PrimarySelectionManagerShim&) = delete;
     PrimarySelectionManagerShim& operator=(const PrimarySelectionManagerShim&) = delete;
-    bool next_selection_change(rust::Vec<rust::String>& mime_types) const;
     rust::Vec<rust::String> selection_mime_types() const;
     // Takes ownership of `fd` either way.
     bool selection_receive(rust::Str mime, int fd) const;
@@ -578,7 +578,6 @@ public:
     PointerConstraintsShim(const PointerConstraintsShim&) = delete;
     PointerConstraintsShim& operator=(const PointerConstraintsShim&) = delete;
     // Constraints are named by the surface they constrain: one per surface.
-    bool next_event(EventRaw& out) const;
     bool constraint_info(std::uint64_t surface_id, PointerConstraintInfoRaw& out) const;
     rust::Vec<Rect> constraint_region(std::uint64_t surface_id) const;
     void activate(std::uint64_t surface_id) const;
@@ -597,7 +596,6 @@ public:
     ~TextInputManagerShim();
     TextInputManagerShim(const TextInputManagerShim&) = delete;
     TextInputManagerShim& operator=(const TextInputManagerShim&) = delete;
-    bool next_event(EventRaw& out) const;
     std::uint64_t focused() const;
     bool text_input_info(std::uint64_t text_input, TextInputInfoRaw& out) const;
     rust::String surrounding_text(std::uint64_t text_input) const;
@@ -659,6 +657,8 @@ private:
 std::unique_ptr<CpuCompositorShim> cpu_compositor_new();
 
 SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, double y);
+SceneHitRaw raw_scene_route_pointer(const SeatShim& seat, rust::Slice<const SceneItemRaw> items, double x, double y);
+bool raw_scene_surface_origin(rust::Slice<const SceneItemRaw> items, std::uint64_t surface_id, double& x, double& y);
 
 class PopupTreeShim {
 public:
@@ -666,10 +666,8 @@ public:
     PopupTreeShim(const PopupTreeShim&) = delete;
     PopupTreeShim& operator=(const PopupTreeShim&) = delete;
 
-    // `parent` 0: the popup's own xdg parent.
-    bool add(const XdgShellShim& shell, std::uint64_t popup, std::uint64_t parent);
-    void set_mapped(std::uint64_t popup, bool mapped);
-    void remove(std::uint64_t popup);
+    // For a popup whose parent is not an xdg surface (a layer surface's).
+    bool set_parent(const XdgShellShim& shell, std::uint64_t popup, std::uint64_t parent) const;
     // Only the items appended to `scene`.
     rust::Vec<SceneItemRaw> append_to(rust::Slice<const SceneItemRaw> scene) const;
     bool contains(std::uint64_t surface_id) const;
@@ -683,7 +681,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<PopupTreeShim> popup_tree_new();
+std::unique_ptr<PopupTreeShim> popup_tree_new(const XdgShellShim& shell);
 
 class LayerManagerShim {
 public:

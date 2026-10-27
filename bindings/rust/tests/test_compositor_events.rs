@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{drain, shm_buffer, ClientSide, Peer};
+use common::{shm_buffer, ClientSide, Peer, take};
 use luminaria::backend::{HeadlessBackend, OutputEvent};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, CompositorEvent};
@@ -51,13 +51,13 @@ fn client(conn: Connection, step: ClientSide) {
 fn compositor_surface_lifecycle_events() {
     let display = Display::new().expect("display");
     display.init_shm().expect("shm");
-    let compositor = Compositor::new(&display).expect("compositor");
+    let _compositor = Compositor::new(&display).expect("compositor");
 
     let mut peer = Peer::spawn(&display, client);
 
     // 1. Surface created
     peer.wait(&display, "surface_created");
-    let events = drain(|| compositor.next_event());
+    let events = take::<CompositorEvent>();
     assert_eq!(events.len(), 1, "expected NewSurface: {events:?}");
     let surface_id = match events[0] {
         CompositorEvent::NewSurface(id) => id,
@@ -68,7 +68,7 @@ fn compositor_surface_lifecycle_events() {
 
     // 2. Surface committed
     peer.wait(&display, "surface_committed");
-    let events = drain(|| compositor.next_event());
+    let events = take::<CompositorEvent>();
     assert_eq!(events.len(), 1, "expected Commit: {events:?}");
     assert_eq!(events[0], CompositorEvent::Commit(surface_id));
     assert!(surface_id.has_buffer());
@@ -76,14 +76,15 @@ fn compositor_surface_lifecycle_events() {
 
     // 3. Rendered notification
     surface_id.notify_rendered(-1);
-    let events = drain(|| compositor.next_event());
+    common::collect(&display);
+    let events = take::<CompositorEvent>();
     assert_eq!(events.len(), 1, "expected Rendered: {events:?}");
     assert_eq!(events[0], CompositorEvent::Rendered(surface_id));
     peer.go();
 
     // 4. Surface destroyed
     peer.wait(&display, "surface_destroyed");
-    let events = drain(|| compositor.next_event());
+    let events = take::<CompositorEvent>();
     assert_eq!(events.len(), 2, "expected Destroy + Invalidated: {events:?}");
     assert_eq!(events[0], CompositorEvent::Destroy(surface_id));
     assert_eq!(events[1], CompositorEvent::Invalidated(surface_id));
@@ -105,9 +106,12 @@ fn output_present_events() {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut present = None;
     while std::time::Instant::now() < deadline {
-        display.dispatch(Some(Duration::from_millis(5))).unwrap();
-        if let Some(OutputEvent::Present(p)) = output.next_event() {
-            present = Some(p);
+        let presented = display.dispatch(Some(Duration::from_millis(5))).unwrap().find_map(|e| match e {
+            luminaria::Event::Output(id, OutputEvent::Present(p)) if id == output.id() => Some(p),
+            _ => None,
+        });
+        if presented.is_some() {
+            present = presented;
             break;
         }
     }

@@ -44,20 +44,6 @@ impl<'a> TextInputManager<'a> {
 }
 
 impl TextInputManager<'_> {
-    pub fn next_event(&self) -> Option<TextInputEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let id = TextInputId(raw.id);
-            return Some(match raw.kind {
-                EventKind::NewTextInput => TextInputEvent::New(id),
-                EventKind::TextInputEnable => TextInputEvent::Enable(id),
-                EventKind::TextInputDisable => TextInputEvent::Disable(id),
-                EventKind::TextInputCommit => TextInputEvent::Commit(id),
-                EventKind::TextInputDestroy => TextInputEvent::Destroy(id),
-                _ => continue,
-            });
-        }
-    }
 
     /// The enabled text input of the keyboard-focused client.
     pub fn focused(&self) -> Option<TextInputId> {
@@ -144,5 +130,21 @@ impl TextInput<'_> {
 
     pub fn send_done(&self) {
         self.mgr.send_done(self.id.0);
+    }
+}
+
+impl TextInputEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<TextInputEvent> {
+        let id = TextInputId(raw.id);
+        return Some(match raw.kind {
+            EventKind::NewTextInput => TextInputEvent::New(id),
+            EventKind::TextInputEnable => TextInputEvent::Enable(id),
+            EventKind::TextInputDisable => TextInputEvent::Disable(id),
+            EventKind::TextInputCommit => TextInputEvent::Commit(id),
+            EventKind::TextInputDestroy => TextInputEvent::Destroy(id),
+            _ => return None,
+        });
+        None
     }
 }

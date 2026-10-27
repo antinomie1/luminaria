@@ -19,7 +19,6 @@ public:
     ForeignToplevelManagerShim& operator=(const ForeignToplevelManagerShim&) = delete;
 
     void track(const XdgShellShim& shell);
-    bool next_event(EventRaw& out) const;
 
     struct Impl;
     Impl& impl() const;
@@ -40,7 +39,6 @@ public:
     std::uint32_t create_workspace(std::uint32_t group, rust::Str name) const;
     void remove_workspace(std::uint32_t workspace) const;
     void activate_workspace(std::uint32_t workspace) const;
-    bool next_event(EventRaw& out) const;
 
     struct Impl;
     Impl& impl() const;
@@ -56,7 +54,6 @@ public:
     SessionLockManagerShim(const SessionLockManagerShim&) = delete;
     SessionLockManagerShim& operator=(const SessionLockManagerShim&) = delete;
 
-    bool next_event(EventRaw& out) const;
     bool locked() const;
     std::uint64_t current() const;
     bool lock_locked(std::uint64_t lock) const;
@@ -82,7 +79,6 @@ public:
     OutputManagerShim& operator=(const OutputManagerShim&) = delete;
 
     void update();
-    bool next_event(EventRaw& out) const;
     void set_auto_verdict(bool succeed) const;
 
     struct Impl;
@@ -115,7 +111,6 @@ public:
     InputMethodManagerShim(const InputMethodManagerShim&) = delete;
     InputMethodManagerShim& operator=(const InputMethodManagerShim&) = delete;
 
-    bool next_event(EventRaw& out) const;
     std::uint64_t current() const;
     bool active(std::uint64_t input_method) const;
     bool has_keyboard_grab(std::uint64_t input_method) const;
@@ -134,21 +129,5 @@ private:
 };
 
 std::unique_ptr<InputMethodManagerShim> input_method_manager_new(const DisplayShim& display, const SeatShim& seat, const TextInputManagerShim& tim, rust::String& error);
-
-class DesktopGlobalsShim {
-public:
-    ~DesktopGlobalsShim();
-    DesktopGlobalsShim(const DesktopGlobalsShim&) = delete;
-    DesktopGlobalsShim& operator=(const DesktopGlobalsShim&) = delete;
-
-    struct Impl;
-    Impl& impl() const;
-    explicit DesktopGlobalsShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<DesktopGlobalsShim> desktop_globals_new(const DisplayShim& display, const VulkanRendererShim& renderer, rust::Str seat_name, rust::String& error);
-std::unique_ptr<DesktopGlobalsShim> desktop_globals_new_headless(const DisplayShim& display, rust::Str seat_name, rust::String& error);
 
 } // namespace lum

@@ -45,18 +45,6 @@ impl<'a> PointerConstraints<'a> {
 }
 
 impl PointerConstraints<'_> {
-    pub fn next_event(&self) -> Option<PointerConstraintEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let surface = SurfaceId(raw.id);
-            return Some(match raw.kind {
-                EventKind::NewPointerConstraint => PointerConstraintEvent::New(surface),
-                EventKind::PointerConstraintDestroy => PointerConstraintEvent::Destroy(surface),
-                EventKind::PointerConstraintRegionChange => PointerConstraintEvent::RegionChange(surface),
-                _ => continue,
-            });
-        }
-    }
 
     /// The constraint on `surface`, if there is one now.
     pub fn constraint(&self, surface: SurfaceId) -> Option<PointerConstraint<'_>> {
@@ -124,5 +112,19 @@ impl PointerConstraint<'_> {
 
     pub fn deactivate(&self) {
         self.mgr.deactivate(self.surface.0);
+    }
+}
+
+impl PointerConstraintEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<PointerConstraintEvent> {
+        let surface = SurfaceId(raw.id);
+        return Some(match raw.kind {
+            EventKind::NewPointerConstraint => PointerConstraintEvent::New(surface),
+            EventKind::PointerConstraintDestroy => PointerConstraintEvent::Destroy(surface),
+            EventKind::PointerConstraintRegionChange => PointerConstraintEvent::RegionChange(surface),
+            _ => return None,
+        });
+        None
     }
 }

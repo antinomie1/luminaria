@@ -49,7 +49,7 @@ pub enum PopupEvent {
     Grab { serial: u32 },
 }
 
-/// An event from [`XdgShell::next_event`], named by the surface it is about.
+/// An xdg-shell event ([`crate::Event::Xdg`]), named by the surface it is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XdgEvent {
     Toplevel(SurfaceId, ToplevelEvent),
@@ -57,7 +57,7 @@ pub enum XdgEvent {
 }
 
 impl XdgEvent {
-    fn from_raw(raw: &ffi::EventRaw) -> Option<Self> {
+    pub(crate) fn from_raw(raw: &ffi::EventRaw) -> Option<Self> {
         let s = SurfaceId(raw.id);
         let toplevel = |e| Some(Self::Toplevel(s, e));
         let popup = |e| Some(Self::Popup(s, e));
@@ -158,19 +158,19 @@ impl<'d> XdgShell<'d> {
 }
 
 impl XdgShell<'_> {
+    /// Answer maximize, fullscreen and minimize requests yourself, as
+    /// [`ToplevelEvent::RequestMaximize`] and friends. Without this the library
+    /// grants them, as a C++ compositor that listens to none of them gets.
+    /// Affects toplevels created from now on, so call it before the first
+    /// client connects.
+    pub fn forward_window_requests(self) -> Self {
+        self.raw.forward_window_requests();
+        self
+    }
+
     /// The area a maximized window may take (xdg_toplevel.configure_bounds).
     pub fn set_bounds(&self, width: i32, height: i32) {
         self.raw.set_bounds(width, height);
-    }
-
-    /// The next toplevel or popup event, oldest first.
-    pub fn next_event(&self) -> Option<XdgEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            if let Some(event) = XdgEvent::from_raw(&raw) {
-                return Some(event);
-            }
-        }
     }
 
     /// Every toplevel alive now, mapped or not, in no particular order.

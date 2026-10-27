@@ -6,7 +6,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, ClientSide, Peer};
+use common::{ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::desktop::{InputMethodEvent, InputMethodManager};
 use luminaria::protocol::{
@@ -163,7 +163,7 @@ fn client(conn: Connection, step: ClientSide) {
 fn text_input_and_input_method() {
     let display = Display::new().expect("display");
     let _compositor = Compositor::new(&display).expect("wl_compositor");
-    let shell = XdgShell::new(&display).expect("xdg-shell");
+    let _shell = XdgShell::new(&display).expect("xdg-shell");
     let seat = Seat::new(&display, "seat0").expect("wl_seat");
     seat.set_capabilities(true, false, false);
     let text_inputs = TextInputManager::new(&display, &seat).expect("text-input");
@@ -171,14 +171,14 @@ fn text_input_and_input_method() {
 
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "ready");
-    let s = match drain(|| shell.next_event()).first() {
+    let s = match take::<XdgEvent>().first() {
         Some(&XdgEvent::Toplevel(s, ToplevelEvent::Created)) => s,
         other => panic!("{other:?}"),
     };
-    let [TextInputEvent::New(t)] = drain(|| text_inputs.next_event())[..] else {
+    let [TextInputEvent::New(t)] = take::<TextInputEvent>()[..] else {
         panic!("no text input");
     };
-    let [InputMethodEvent::New(m)] = drain(|| input_methods.next_event())[..] else {
+    let [InputMethodEvent::New(m)] = take::<InputMethodEvent>()[..] else {
         panic!("no input method");
     };
     assert_eq!(input_methods.current().map(|im| im.id()), Some(m));
@@ -189,7 +189,7 @@ fn text_input_and_input_method() {
 
     peer.wait(&display, "enabled");
     assert_eq!(
-        drain(|| text_inputs.next_event()),
+        take::<TextInputEvent>(),
         [TextInputEvent::Enable(t), TextInputEvent::Commit(t)]
     );
     assert_eq!(text_inputs.focused(), Some(t));
@@ -210,7 +210,7 @@ fn text_input_and_input_method() {
     peer.go();
 
     peer.wait(&display, "grabbed");
-    let events = drain(|| input_methods.next_event());
+    let events = take::<InputMethodEvent>();
     let [InputMethodEvent::GrabChange { input_method, grabbed: true }, InputMethodEvent::NewPopupSurface { input_method: owner, surface: p }] =
         events[..]
     else {
@@ -226,18 +226,18 @@ fn text_input_and_input_method() {
 
     peer.wait(&display, "disabled");
     assert_eq!(
-        drain(|| text_inputs.next_event()),
+        take::<TextInputEvent>(),
         [TextInputEvent::Disable(t), TextInputEvent::Commit(t)]
     );
-    let events = drain(|| input_methods.next_event());
+    let events = take::<InputMethodEvent>();
     assert!(events.contains(&InputMethodEvent::PopupSurfaceDestroy(p)), "{events:?}");
     assert!(events.contains(&InputMethodEvent::GrabChange { input_method: m, grabbed: false }), "{events:?}");
     assert!(!im.is_active() && !im.has_keyboard_grab());
     peer.go();
 
     peer.wait(&display, "destroyed");
-    assert_eq!(drain(|| input_methods.next_event()), [InputMethodEvent::Destroy(m)]);
-    assert_eq!(drain(|| text_inputs.next_event()), [TextInputEvent::Destroy(t)]);
+    assert_eq!(take::<InputMethodEvent>(), [InputMethodEvent::Destroy(m)]);
+    assert_eq!(take::<TextInputEvent>(), [TextInputEvent::Destroy(t)]);
     assert!(input_methods.current().is_none());
     assert!(text_inputs.text_input(t).is_none());
     peer.finish(&display);

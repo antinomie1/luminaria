@@ -53,10 +53,35 @@ impl OutputLayout {
     }
 }
 
+/// What a [`SceneItem`] paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SceneKind {
+    /// A client surface tree, its root at `surface_origin`, clipped to `rect`.
+    Surface = 0,
+    /// A solid rectangle filling `rect`.
+    Rect = 1,
+    /// A ring `thickness` thick just inside `rect`: a window border.
+    Border = 2,
+    /// Compositor-owned pixels registered with `SceneRenderer::set_image`
+    /// under `serial`.
+    Image = 3,
+}
+
+impl SceneKind {
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Surface,
+            1 => Self::Rect,
+            2 => Self::Border,
+            _ => Self::Image,
+        }
+    }
+}
+
 /// An entry in the immediate-mode scene list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneItem {
-    pub kind: u32, // 0 = surface, 1 = rect, 2 = border, 3 = image
+    pub kind: SceneKind,
     pub rect: Rect,
     pub surface: SurfaceId,
     pub surface_origin: (i32, i32),
@@ -74,12 +99,12 @@ pub struct SceneItem {
 }
 
 impl SceneItem {
-    pub fn surface(surface: SurfaceId, rect: Rect, origin_x: i32, origin_y: i32) -> Self {
+    fn base(kind: SceneKind, rect: Rect) -> Self {
         Self {
-            kind: 0,
+            kind,
             rect,
-            surface,
-            surface_origin: (origin_x, origin_y),
+            surface: SurfaceId::INVALID,
+            surface_origin: (0, 0),
             color: Color::rgba(0.0, 0.0, 0.0, 0.0),
             thickness: 0,
             serial: 0,
@@ -92,66 +117,22 @@ impl SceneItem {
             shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
             shadow_feather: 0.0,
         }
+    }
+
+    pub fn surface(surface: SurfaceId, rect: Rect, origin_x: i32, origin_y: i32) -> Self {
+        Self { surface, surface_origin: (origin_x, origin_y), ..Self::base(SceneKind::Surface, rect) }
     }
 
     pub fn rect(rect: Rect, color: Color) -> Self {
-        Self {
-            kind: 1,
-            rect,
-            surface: SurfaceId::INVALID,
-            surface_origin: (0, 0),
-            color,
-            thickness: 0,
-            serial: 0,
-            tag: 0,
-            accepts_input: true,
-            alpha: 1.0,
-            corner_radius: 0.0,
-            blur_enabled: false,
-            blur_xray: false,
-            shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
-            shadow_feather: 0.0,
-        }
+        Self { color, ..Self::base(SceneKind::Rect, rect) }
     }
 
     pub fn border(rect: Rect, thickness: i32, color: Color) -> Self {
-        Self {
-            kind: 2,
-            rect,
-            surface: SurfaceId::INVALID,
-            surface_origin: (0, 0),
-            color,
-            thickness,
-            serial: 0,
-            tag: 0,
-            accepts_input: true,
-            alpha: 1.0,
-            corner_radius: 0.0,
-            blur_enabled: false,
-            blur_xray: false,
-            shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
-            shadow_feather: 0.0,
-        }
+        Self { color, thickness, ..Self::base(SceneKind::Border, rect) }
     }
 
     pub fn image(rect: Rect, serial: u64) -> Self {
-        Self {
-            kind: 3,
-            rect,
-            surface: SurfaceId::INVALID,
-            surface_origin: (0, 0),
-            color: Color::rgba(0.0, 0.0, 0.0, 0.0),
-            thickness: 0,
-            serial,
-            tag: 0,
-            accepts_input: true,
-            alpha: 1.0,
-            corner_radius: 0.0,
-            blur_enabled: false,
-            blur_xray: false,
-            shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
-            shadow_feather: 0.0,
-        }
+        Self { serial, ..Self::base(SceneKind::Image, rect) }
     }
 
     pub fn with_alpha(mut self, alpha: f32) -> Self {
@@ -188,7 +169,7 @@ impl SceneItem {
 
     pub(crate) fn from_raw(raw: &ffi::SceneItemRaw) -> Self {
         Self {
-            kind: raw.kind,
+            kind: SceneKind::from_raw(raw.kind),
             rect: Rect::new(raw.x, raw.y, raw.width, raw.height),
             surface: SurfaceId(raw.surface_id),
             surface_origin: (raw.surface_x, raw.surface_y),
@@ -208,7 +189,7 @@ impl SceneItem {
 
     pub(crate) fn to_raw(&self) -> ffi::SceneItemRaw {
         ffi::SceneItemRaw {
-            kind: self.kind,
+            kind: self.kind as u32,
             x: self.rect.x,
             y: self.rect.y,
             width: self.rect.width,
@@ -250,18 +231,31 @@ pub struct SceneHit {
 /// Hit-test against `items` (front-to-back, reverse of paint order) at global coordinates (`x`, `y`).
 pub fn scene_hit_test(items: &[SceneItem], x: f64, y: f64) -> SceneHit {
     let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
-    let raw_hit = ffi::raw_scene_hit_test(&raw_items, x, y);
-    SceneHit {
-        hit: raw_hit.hit,
-        tag: raw_hit.tag,
-        surface: if raw_hit.surface_id != 0 {
-            Some(SurfaceId(raw_hit.surface_id))
-        } else {
-            None
-        },
-        sx: raw_hit.sx,
-        sy: raw_hit.sy,
+    SceneHit::from_raw(ffi::raw_scene_hit_test(&raw_items, x, y))
+}
+
+impl SceneHit {
+    fn from_raw(raw: ffi::SceneHitRaw) -> Self {
+        Self { hit: raw.hit, tag: raw.tag, surface: SurfaceId::from_raw(raw.surface_id), sx: raw.sx, sy: raw.sy }
     }
+}
+
+/// Tell `seat` the pointer is at (`x`, `y`) in `items`. With a button held
+/// (an implicit grab) every motion goes to the surface that took the press, in
+/// its own coordinates, wherever the pointer is; otherwise the surface under
+/// the point gets focus, or focus is cleared over nothing. Answers the hit
+/// under the point either way.
+pub fn scene_route_pointer(seat: &crate::protocol::Seat<'_>, items: &[SceneItem], x: f64, y: f64) -> SceneHit {
+    let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+    SceneHit::from_raw(ffi::raw_scene_route_pointer(&seat.raw, &raw_items, x, y))
+}
+
+/// Where `surface`'s own origin is drawn in `items`: a root's item origin, or
+/// that plus a subsurface's offset in its tree. `None` when it is not drawn.
+pub fn scene_surface_origin(items: &[SceneItem], surface: SurfaceId) -> Option<(f64, f64)> {
+    let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+    let (mut x, mut y) = (0.0, 0.0);
+    ffi::raw_scene_surface_origin(&raw_items, surface.0, &mut x, &mut y).then_some((x, y))
 }
 
 /// Software CPU compositor for nested and headless targets.
@@ -304,20 +298,21 @@ impl CpuCompositor {
     }
 }
 
-/// The mapped popups and where they go: above their parents in the scene,
-/// dismissed by a click outside them.
+/// Every popup an [`XdgShell`] creates, from creation to destruction: drawn
+/// above its parent by [`append_to`](Self::append_to), dismissed by a click
+/// outside it. It follows the shell by itself; a compositor only draws it, and
+/// asks for a frame on the shell's popup events.
 ///
-/// It holds each popup it was given until the popup is destroyed, and lets go
-/// of it by itself then; [`remove`](Self::remove) is for policy. It needs no
-/// borrow of the [`XdgShell`]: the shell is only asked, in [`add`](Self::add),
-/// which popup an id names.
+/// It needs no borrow of the shell: the C++ tree it wraps lets go of each
+/// popup when the popup is destroyed, and of the shell's signal when either
+/// side goes first.
 pub struct PopupTree {
     raw: cxx::UniquePtr<ffi::PopupTreeShim>,
 }
 
 impl PopupTree {
-    pub fn new() -> Result<Self, Error> {
-        let raw = ffi::popup_tree_new();
+    pub fn new(shell: &XdgShell<'_>) -> Result<Self, Error> {
+        let raw = ffi::popup_tree_new(&shell.raw);
         if raw.is_null() {
             Err(Error::new(ErrorKind::Shell, "failed to create popup tree"))
         } else {
@@ -325,25 +320,11 @@ impl PopupTree {
         }
     }
 
-    /// Track `popup`, drawn relative to its xdg parent. False if `shell` has
-    /// no such popup (any more).
-    pub fn add(&mut self, shell: &XdgShell<'_>, popup: SurfaceId) -> bool {
-        self.raw.pin_mut().add(&shell.raw, popup.0, 0)
-    }
-
-    /// Track `popup` (or re-parent it) as a child of `parent`: how a layer
-    /// surface's popup, which has no xdg parent, is placed.
-    pub fn add_with_parent(&mut self, shell: &XdgShell<'_>, popup: SurfaceId, parent: SurfaceId) -> bool {
-        self.raw.pin_mut().add(&shell.raw, popup.0, parent.0)
-    }
-
-    /// Only mapped popups are drawn and hit.
-    pub fn set_mapped(&mut self, popup: SurfaceId, mapped: bool) {
-        self.raw.pin_mut().set_mapped(popup.0, mapped);
-    }
-
-    pub fn remove(&mut self, popup: SurfaceId) {
-        self.raw.pin_mut().remove(popup.0);
+    /// Re-parent `popup` onto `parent`: how a layer surface's popup, which has
+    /// no xdg parent, is placed (`LayerSurfaceEvent::NewPopup`). False if
+    /// `shell` has no such popup (any more).
+    pub fn set_parent(&self, shell: &XdgShell<'_>, popup: SurfaceId, parent: SurfaceId) -> bool {
+        self.raw.set_parent(&shell.raw, popup.0, parent.0)
     }
 
     /// Push the mapped popups onto `scene`, each above its parent's surface

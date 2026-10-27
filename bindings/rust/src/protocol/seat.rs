@@ -75,6 +75,21 @@ impl<'d> Seat<'d> {
             .notify_modifiers(depressed, latched, locked, group);
     }
 
+    /// Release every key a client was told is down, and clear the modifiers:
+    /// for when the keyboard stops reaching this seat (a VT switch), and the
+    /// releases themselves never will.
+    pub fn release_keys(&self) {
+        self.raw.release_keys();
+    }
+
+    /// Describe `source`'s devices to clients from now on: its keymap and
+    /// capabilities at once, and every later change. Touch is advertised only
+    /// with `touch`, for a compositor that routes it. Events are not routed:
+    /// keys and the pointer are still the compositor's to deliver.
+    pub fn follow(&self, source: &dyn crate::backend::InputSource, touch: bool) {
+        source.follow(self, touch);
+    }
+
     pub fn pointer_enter(&self, surface: SurfaceId, sx: f64, sy: f64) {
         self.raw.pointer_enter(surface.0, sx, sy);
     }
@@ -175,25 +190,22 @@ impl<'d> Seat<'d> {
     }
 }
 
-
-impl Seat<'_> {
-    /// The next focus or cursor change, oldest first.
-    pub fn next_event(&self) -> Option<SeatEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let surface = SurfaceId::from_raw(raw.id);
-            match raw.kind {
-                EventKind::SeatKeyboardFocus => return Some(SeatEvent::KeyboardFocus(surface)),
-                EventKind::SeatPointerFocus => return Some(SeatEvent::PointerFocus(surface)),
-                EventKind::SeatCursorChange => {
-                    return Some(SeatEvent::CursorChange {
-                        surface,
-                        hotspot: (raw.x, raw.y),
-                        hidden: raw.flag,
-                    });
-                }
-                _ => {}
+impl SeatEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<SeatEvent> {
+        let surface = SurfaceId::from_raw(raw.id);
+        match raw.kind {
+            EventKind::SeatKeyboardFocus => return Some(SeatEvent::KeyboardFocus(surface)),
+            EventKind::SeatPointerFocus => return Some(SeatEvent::PointerFocus(surface)),
+            EventKind::SeatCursorChange => {
+                return Some(SeatEvent::CursorChange {
+                    surface,
+                    hotspot: (raw.x, raw.y),
+                    hidden: raw.flag,
+                });
             }
+            _ => {}
         }
+        None
     }
 }

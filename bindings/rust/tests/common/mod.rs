@@ -19,6 +19,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use luminaria::Event;
 use luminaria::core::Display;
 use wayland_client::protocol::{wl_buffer, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -29,10 +30,46 @@ unsafe extern "C" {
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One dispatch of the display, flushing what it produced to the clients.
+thread_local! {
+    /// Every event the display handed back and no test has taken yet.
+    static INBOX: std::cell::RefCell<Vec<Event>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One dispatch of the display, flushing what it produced to the clients. Its
+/// events go to the inbox, for [`take`].
 pub fn dispatch(display: &Display) {
-    display.dispatch(Some(Duration::from_millis(5))).expect("dispatch");
+    let events = display.dispatch(Some(Duration::from_millis(5))).expect("dispatch");
     display.flush_clients();
+    INBOX.with_borrow_mut(|inbox| inbox.extend(events));
+}
+
+/// What the compositor's own calls queued since the last dispatch (a signal
+/// fired outside one), into the inbox without waiting.
+pub fn collect(display: &Display) {
+    let events = display.events();
+    INBOX.with_borrow_mut(|inbox| inbox.extend(events));
+}
+
+/// Every event of one kind in the inbox, oldest first, taken out of it; the
+/// others stay for whoever asks for them.
+pub fn take<T: TryFrom<Event, Error = Event>>() -> Vec<T> {
+    INBOX.with_borrow_mut(|inbox| {
+        let mut taken = Vec::new();
+        let mut kept = Vec::new();
+        for event in inbox.drain(..) {
+            match T::try_from(event) {
+                Ok(t) => taken.push(t),
+                Err(other) => kept.push(other),
+            }
+        }
+        *inbox = kept;
+        taken
+    })
+}
+
+/// Forget everything in the inbox.
+pub fn clear_inbox() {
+    INBOX.with_borrow_mut(Vec::clear);
 }
 
 /// Dispatch until `done`, for at most ten seconds.

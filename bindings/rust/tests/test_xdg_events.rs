@@ -5,7 +5,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, shm_buffer, ClientSide, Peer};
+use common::{shm_buffer, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{
     Compositor, PopupArea, PopupEvent, Seat, SurfaceId, ToplevelEvent, ToplevelStates, XdgEvent, XdgShell,
@@ -159,12 +159,13 @@ fn toplevel_events_requests_and_state() {
     let display = Display::new().expect("display");
     display.init_shm().expect("wl_shm");
     let _compositor = Compositor::new(&display).expect("wl_compositor");
-    let shell = XdgShell::new(&display).expect("xdg-shell");
+    // Answering maximize/fullscreen/minimize ourselves, so they arrive as events.
+    let shell = XdgShell::new(&display).expect("xdg-shell").forward_window_requests();
     let _seat = Seat::new(&display, "seat0").expect("wl_seat");
 
     let mut peer = Peer::spawn(&display, toplevel_client);
     peer.wait(&display, "mapped");
-    let events = drain(|| shell.next_event());
+    let events = take::<XdgEvent>();
     let XdgEvent::Toplevel(a, ToplevelEvent::Created) = events[0] else {
         panic!("{events:?}");
     };
@@ -189,7 +190,7 @@ fn toplevel_events_requests_and_state() {
     peer.go();
 
     peer.wait(&display, "requests");
-    let events = drain(|| shell.next_event());
+    let events = take::<XdgEvent>();
     let XdgEvent::Toplevel(b, ToplevelEvent::Created) = events[8] else {
         panic!("{events:?}");
     };
@@ -209,16 +210,17 @@ fn toplevel_events_requests_and_state() {
             XdgEvent::Toplevel(b, ToplevelEvent::ParentChange(None)),
         ]
     );
-    // The binding listens to every request, so luminaria's "nobody is
-    // arbitrating" fallback stays out of it: the states are still ours.
+    // Forwarded, so luminaria's "nobody is arbitrating" fallback stays out of
+    // it: the states are still ours.
     assert_eq!(t.states(), ToplevelStates::default());
 
     t.set_maximized(true);
     t.set_activated(true);
     t.set_activated(true); // no change, no event
     assert_ne!(t.configure(300, 200), 0);
+    common::collect(&display);
     assert_eq!(
-        drain(|| shell.next_event()),
+        take::<XdgEvent>(),
         [XdgEvent::Toplevel(a, ToplevelEvent::StateChange), XdgEvent::Toplevel(a, ToplevelEvent::StateChange)]
     );
     let states = t.states();
@@ -233,7 +235,7 @@ fn toplevel_events_requests_and_state() {
     peer.finish(&display);
 
     // The client is gone, and both windows with it.
-    let destroyed: Vec<SurfaceId> = drain(|| shell.next_event())
+    let destroyed: Vec<SurfaceId> = take::<XdgEvent>()
         .into_iter()
         .filter_map(|e| match e {
             XdgEvent::Toplevel(s, ToplevelEvent::Destroy) => Some(s),
@@ -308,18 +310,19 @@ fn popups_through_the_tree_into_the_scene() {
     let _compositor = Compositor::new(&display).expect("wl_compositor");
     let shell = XdgShell::new(&display).expect("xdg-shell");
     let _seat = Seat::new(&display, "seat0").expect("wl_seat");
-    let mut tree = PopupTree::new().expect("popup tree");
+    // Following the shell from before the first popup exists.
+    let mut tree = PopupTree::new(&shell).expect("popup tree");
 
     let mut peer = Peer::spawn(&display, popup_client);
     peer.wait(&display, "parent mapped");
-    let parent = match drain(|| shell.next_event()).first() {
+    let parent = match take::<XdgEvent>().first() {
         Some(&XdgEvent::Toplevel(s, ToplevelEvent::Created)) => s,
         other => panic!("{other:?}"),
     };
     peer.go();
 
     peer.wait(&display, "popup mapped");
-    let events = drain(|| shell.next_event());
+    let events = take::<XdgEvent>();
     let XdgEvent::Popup(p, PopupEvent::Created { parent: Some(created_on) }) = events[0] else {
         panic!("{events:?}");
     };
@@ -338,9 +341,7 @@ fn popups_through_the_tree_into_the_scene() {
     assert!(popup.is_mapped() && popup.has_grab());
     assert!(shell.toplevel(p).is_none(), "a popup is not a toplevel");
 
-    // Into the tree, and from there into the scene above its parent.
-    assert!(tree.add(&shell, p));
-    tree.set_mapped(p, true);
+    // Already in the tree, mapped, and from there into the scene above its parent.
     let window = SceneItem::surface(parent, Rect::new(100, 50, 200, 100), 100, 50).with_tag(7);
     let mut scene = vec![window];
     tree.append_to(&mut scene);
@@ -362,21 +363,20 @@ fn popups_through_the_tree_into_the_scene() {
     peer.go();
 
     peer.wait(&display, "repositioned");
-    assert_eq!(drain(|| shell.next_event()), [XdgEvent::Popup(p, PopupEvent::Reposition)]);
+    assert_eq!(take::<XdgEvent>(), [XdgEvent::Popup(p, PopupEvent::Reposition)]);
     assert_eq!(popup.geometry(), Rect::new(-10, 10, 50, 40));
 
     // A click on the parent is outside the popup: the grab goes.
     assert!(tree.dismiss_grabs_outside(Some(parent)));
-    assert_eq!(drain(|| shell.next_event()), [XdgEvent::Popup(p, PopupEvent::Unmap)]);
+    common::collect(&display);
+    assert_eq!(take::<XdgEvent>(), [XdgEvent::Popup(p, PopupEvent::Unmap)]);
     assert!(!popup.is_mapped());
-    // Dropping one by hand is the compositor's call; it leaves the scene with
-    // it. (A destroy does the same on its own.)
-    tree.remove(p);
+    // Unmapped: out of the scene, without anyone telling the tree.
     assert!(!tree.contains(p));
     peer.go();
 
     peer.wait(&display, "popup destroyed");
-    assert_eq!(drain(|| shell.next_event()), [XdgEvent::Popup(p, PopupEvent::Destroy)]);
+    assert_eq!(take::<XdgEvent>(), [XdgEvent::Popup(p, PopupEvent::Destroy)]);
     // The tree let go of it by itself, before Rust heard of the destroy.
     assert!(!tree.contains(p));
     let mut scene = vec![window];

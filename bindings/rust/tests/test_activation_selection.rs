@@ -8,7 +8,8 @@ mod common;
 use std::io::{pipe, Read, Write};
 use std::os::fd::OwnedFd;
 
-use common::{drain, ClientSide, Peer};
+use common::{ClientSide, Peer, take};
+use luminaria::protocol::SelectionChange;
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, DataDeviceManager, PrimarySelectionManager, Seat, XdgActivation};
 use wayland_client::globals::registry_queue_init;
@@ -133,11 +134,11 @@ fn activation_client(conn: Connection, step: ClientSide) {
 fn activation_requests() {
     let display = Display::new().expect("display");
     let _compositor = Compositor::new(&display).expect("wl_compositor");
-    let activation = XdgActivation::new(&display).expect("xdg-activation");
+    let _activation = XdgActivation::new(&display).expect("xdg-activation");
 
     let mut peer = Peer::spawn(&display, activation_client);
     peer.wait(&display, "activated");
-    let events = drain(|| activation.next_event());
+    let events = take::<luminaria::protocol::ActivationEvent>();
     assert!(events.iter().any(|e| matches!(e, luminaria::protocol::ActivationEvent::TokenRequest(t) if t.app_id == "org.luminaria.test" && t.granted)));
     let requests: Vec<_> = events
         .into_iter()
@@ -199,8 +200,13 @@ fn selection_changes_and_reads() {
 
     let mut peer = Peer::spawn(&display, selection_client);
     peer.wait(&display, "selected");
-    assert_eq!(drain(|| clipboard.next_selection_change()), [vec!["text/plain".to_string()]]);
-    assert_eq!(drain(|| primary.next_selection_change()), [vec!["text/plain".to_string()]]);
+    assert_eq!(
+        take::<SelectionChange>(),
+        [
+            SelectionChange { primary: false, mime_types: vec!["text/plain".to_string()] },
+            SelectionChange { primary: true, mime_types: vec!["text/plain".to_string()] },
+        ]
+    );
     assert_eq!(clipboard.selection_mime_types(), ["text/plain"]);
     assert_eq!(primary.selection_mime_types(), ["text/plain"]);
 
@@ -221,8 +227,13 @@ fn selection_changes_and_reads() {
     peer.go();
 
     peer.wait(&display, "cleared");
-    assert_eq!(drain(|| clipboard.next_selection_change()), [Vec::<String>::new()]);
-    assert_eq!(drain(|| primary.next_selection_change()), [Vec::<String>::new()]);
+    assert_eq!(
+        take::<SelectionChange>(),
+        [
+            SelectionChange { primary: false, mime_types: Vec::new() },
+            SelectionChange { primary: true, mime_types: Vec::new() },
+        ]
+    );
     let (_, unused) = pipe().expect("pipe");
     assert!(!clipboard.selection_receive("text/plain", unused.into()), "nothing to read");
     peer.finish(&display);

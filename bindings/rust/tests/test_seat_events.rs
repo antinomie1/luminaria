@@ -4,7 +4,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, shm_buffer, ClientSide, Peer};
+use common::{shm_buffer, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, Seat, SeatEvent, ToplevelEvent, XdgEvent, XdgShell};
 use wayland_client::globals::registry_queue_init;
@@ -75,27 +75,28 @@ fn focus_and_cursor_changes() {
     let display = Display::new().expect("display");
     display.init_shm().expect("wl_shm");
     let _compositor = Compositor::new(&display).expect("wl_compositor");
-    let shell = XdgShell::new(&display).expect("xdg-shell");
+    let _shell = XdgShell::new(&display).expect("xdg-shell");
     let seat = Seat::new(&display, "seat0").expect("wl_seat");
     seat.set_capabilities(true, true, false);
 
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "ready");
-    let s = match drain(|| shell.next_event()).first() {
+    let s = match take::<XdgEvent>().first() {
         Some(&XdgEvent::Toplevel(s, ToplevelEvent::Created)) => s,
         other => panic!("{other:?}"),
     };
-    assert_eq!(drain(|| seat.next_event()), []);
+    assert_eq!(take::<SeatEvent>(), []);
     seat.set_keyboard_focus(Some(s));
     seat.pointer_enter(s, 10.0, 10.0);
+    common::collect(&display);
     assert_eq!(
-        drain(|| seat.next_event()),
+        take::<SeatEvent>(),
         [SeatEvent::KeyboardFocus(Some(s)), SeatEvent::PointerFocus(Some(s))]
     );
     peer.go();
 
     peer.wait(&display, "cursor");
-    let events = drain(|| seat.next_event());
+    let events = take::<SeatEvent>();
     let [SeatEvent::CursorChange { surface: Some(c), hotspot: (3, 4), hidden: false }] = events[..] else {
         panic!("{events:?}");
     };
@@ -105,7 +106,7 @@ fn focus_and_cursor_changes() {
     peer.go();
 
     peer.wait(&display, "hidden");
-    let events = drain(|| seat.next_event());
+    let events = take::<SeatEvent>();
     let [SeatEvent::CursorChange { surface: None, hidden: true, .. }] = events[..] else {
         panic!("{events:?}");
     };
@@ -115,8 +116,9 @@ fn focus_and_cursor_changes() {
     // compositor's own, which is neither a surface nor hidden.
     seat.pointer_clear_focus();
     seat.set_keyboard_focus(None);
+    common::collect(&display);
     assert_eq!(
-        drain(|| seat.next_event()),
+        take::<SeatEvent>(),
         [
             SeatEvent::CursorChange { surface: None, hotspot: (0, 0), hidden: false },
             SeatEvent::PointerFocus(None),

@@ -53,8 +53,27 @@ namespace lum {
 // Core & Util
 // ============================================================================
 
+std::deque<HubRecord>& hub() {
+    thread_local std::deque<HubRecord> queue;
+    return queue;
+}
+
+void hub_push_output(std::unique_ptr<OutputShim> output) {
+    HubRecord record{HubRecord::Type::output_added, event(EventKind::OutputAdded, output->id()), {}, nullptr};
+    record.output = std::move(output);
+    hub().push_back(std::move(record));
+}
+
 struct DisplayShim::Impl {
     std::optional<lm::Display> display;
+    // An added output between next_event() and take_output().
+    std::unique_ptr<OutputShim> taken;
+
+    // Whatever the display's own teardown queued is nobody's any more.
+    ~Impl() {
+        display.reset();
+        hub().clear();
+    }
 };
 
 DisplayShim::~DisplayShim() = default;
@@ -125,6 +144,19 @@ int DisplayShim::dispatch(int timeout_ms) const {
     wl_display_flush_clients(impl_->display->c_ptr());
     return wl_event_loop_dispatch(impl_->display->event_loop().c_ptr(), timeout_ms);
 }
+
+std::uint32_t DisplayShim::next_event(EventRaw& out, InputEventRaw& input) const {
+    std::deque<HubRecord>& queue = hub();
+    if (queue.empty()) return 0;
+    HubRecord record = std::move(queue.front());
+    queue.pop_front();
+    out = std::move(record.event);
+    input = std::move(record.input);
+    impl_->taken = std::move(record.output);
+    return static_cast<std::uint32_t>(record.type);
+}
+
+std::unique_ptr<OutputShim> DisplayShim::take_output() const { return std::move(impl_->taken); }
 
 void DisplayShim::flush_clients() const {
     if (impl_->display) wl_display_flush_clients(impl_->display->c_ptr());
@@ -287,8 +319,6 @@ struct OutputShim::Impl {
     // Identity that outlives the output, so Rust can match a removal to the
     // Output it holds. Never reused.
     std::uint64_t id = 0;
-    bool frame_pending = false;
-    bool mode_changed = false;
     Events events;
     Conn<lm::OutputDestroy> on_destroy;
     Conn<lm::FrameEvent> on_frame;
@@ -396,17 +426,6 @@ bool OutputShim::hide_cursor(rust::String& error) {
     return true;
 }
 
-bool OutputShim::take_frame() {
-    return std::exchange(impl_->frame_pending, false);
-}
-
-bool OutputShim::take_mode_changed() {
-    return std::exchange(impl_->mode_changed, false);
-}
-
-bool OutputShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
-}
 
 bool OutputShim::alive() const { return impl_->output != nullptr; }
 
@@ -419,17 +438,21 @@ std::unique_ptr<OutputShim> make_output_shim(lm::Output* output) {
     impl->output = output;
     impl->id = next_id.fetch_add(1, std::memory_order_relaxed);
     impl->on_mode = output->mode_changed.connect([impl = impl.get()](lm::OutputModeChange&) {
-        impl->mode_changed = true;
+        impl->events.push(event(EventKind::OutputModeChanged, impl->id));
     });
     impl->on_destroy = output->destroy.connect([impl = impl.get()](lm::OutputDestroy&) {
         impl->output = nullptr;
     });
     impl->on_frame = output->frame.connect([impl = impl.get()](lm::FrameEvent&) {
-        impl->frame_pending = true;
+        impl->events.push(event(EventKind::OutputFrame, impl->id));
     });
     impl->on_present = output->present.connect([impl = impl.get()](lm::PresentEvent& e) {
-        EventRaw ev = event(EventKind::OutputPresent, e.seq, e.tv_sec);
+        // `id` names the output, as every output event does; the vblank
+        // counter rides in x (low half) and y (high half).
+        EventRaw ev = event(EventKind::OutputPresent, impl->id, e.tv_sec);
         ev.serial = e.tv_nsec;
+        ev.x = static_cast<std::int32_t>(static_cast<std::uint32_t>(e.seq));
+        ev.y = static_cast<std::int32_t>(static_cast<std::uint32_t>(e.seq >> 32));
         ev.value = e.refresh_ns;
         ev.flag = e.vsync;
         ev.flag2 = e.hw_clock;
@@ -474,10 +497,8 @@ bool HeadlessBackendShim::start(rust::String& error) {
 
 struct WaylandBackendShim::Impl {
     std::unique_ptr<lm::WaylandBackend> backend;
-    std::deque<InputEventRaw> input_events;
     // Which `OutputShim` id each window got, so absolute motion can name it.
     std::vector<std::pair<const lm::Output*, std::uint64_t>> output_ids;
-    bool close_requested = false;
     Conn<lm::InputEvent> on_input;
     Conn<lm::HostCloseRequest> on_close;
 };
@@ -501,11 +522,10 @@ std::unique_ptr<WaylandBackendShim> wayland_backend_new(const DisplayShim& displ
                     if (output == motion->output) raw.output = id;
                 }
             }
-            raw_impl->input_events.push_back(std::move(raw));
+            hub_push_input(std::move(raw));
         });
-        raw_impl->on_close = raw_impl->backend->close_requested.connect([raw_impl](lm::HostCloseRequest&) {
-            raw_impl->close_requested = true;
-        });
+        raw_impl->on_close = raw_impl->backend->close_requested.connect(
+            [](lm::HostCloseRequest&) { hub_push(event(EventKind::HostCloseRequest)); });
         return std::make_unique<WaylandBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -537,13 +557,8 @@ std::uint32_t WaylandBackendShim::capabilities() const {
     return impl_->backend ? caps_bits(impl_->backend->capabilities()) : 0;
 }
 
-bool WaylandBackendShim::take_close_request() { return std::exchange(impl_->close_requested, false); }
-
-bool WaylandBackendShim::next_input_event(InputEventRaw& out) {
-    if (impl_->input_events.empty()) return false;
-    out = std::move(impl_->input_events.front());
-    impl_->input_events.pop_front();
-    return true;
+void WaylandBackendShim::follow_seat(const SeatShim& seat, bool touch) const {
+    if (impl_->backend && raw_ptr(seat) != nullptr) raw_ptr(seat)->follow(*impl_->backend, touch);
 }
 
 // ============================================================================
@@ -674,9 +689,6 @@ std::unique_ptr<CompositorShim> compositor_new(const DisplayShim& display, rust:
     }
 }
 
-bool CompositorShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
-}
 
 struct SubcompositorShim::Impl {
     std::optional<lm::Subcompositor> subcomp;
@@ -737,6 +749,9 @@ struct XdgShellShim::Impl {
     std::unordered_map<std::uint64_t, std::unique_ptr<PopupEntry>> popups;
     std::vector<Area> areas;
     Events events;
+    // Listening to a request is what turns the library's own answer off, so
+    // the three window-state requests are only listened to once Rust asks.
+    bool forward_requests = false;
     Conn<lm::NewToplevel> on_new_toplevel;
     Conn<lm::NewPopup> on_new_popup;
 
@@ -758,19 +773,21 @@ struct XdgShellShim::Impl {
         };
         entry->on_map = t.map.connect(plain(EventKind::ToplevelMap));
         entry->on_unmap = t.unmap.connect(plain(EventKind::ToplevelUnmap));
-        entry->on_minimize = t.request_minimize.connect(plain(EventKind::ToplevelRequestMinimize));
         entry->on_identity = t.identity_change.connect(plain(EventKind::ToplevelIdentityChange));
         entry->on_state = t.state_change.connect(plain(EventKind::ToplevelStateChange));
-        entry->on_maximize = t.request_maximize.connect([this, id](lm::ToplevelRequestMaximize& e) {
-            EventRaw ev = event(EventKind::ToplevelRequestMaximize, id);
-            ev.flag = e.maximized;
-            events.push(std::move(ev));
-        });
-        entry->on_fullscreen = t.request_fullscreen.connect([this, id](lm::ToplevelRequestFullscreen& e) {
-            EventRaw ev = event(EventKind::ToplevelRequestFullscreen, id);
-            ev.flag = e.fullscreen;
-            events.push(std::move(ev));
-        });
+        if (forward_requests) {
+            entry->on_minimize = t.request_minimize.connect(plain(EventKind::ToplevelRequestMinimize));
+            entry->on_maximize = t.request_maximize.connect([this, id](lm::ToplevelRequestMaximize& e) {
+                EventRaw ev = event(EventKind::ToplevelRequestMaximize, id);
+                ev.flag = e.maximized;
+                events.push(std::move(ev));
+            });
+            entry->on_fullscreen = t.request_fullscreen.connect([this, id](lm::ToplevelRequestFullscreen& e) {
+                EventRaw ev = event(EventKind::ToplevelRequestFullscreen, id);
+                ev.flag = e.fullscreen;
+                events.push(std::move(ev));
+            });
+        }
         entry->on_move = t.request_move.connect([this, id](lm::ToplevelRequestMove& e) {
             EventRaw ev = event(EventKind::ToplevelRequestMove, id);
             ev.serial = e.serial;
@@ -865,7 +882,8 @@ void XdgShellShim::set_bounds(std::int32_t width, std::int32_t height) const {
     if (impl_->shell) impl_->shell->set_bounds(width, height);
 }
 
-bool XdgShellShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
+void XdgShellShim::forward_window_requests() const { impl_->forward_requests = true; }
+
 
 rust::Vec<std::uint64_t> XdgShellShim::toplevels() const {
     rust::Vec<std::uint64_t> out;
@@ -1020,6 +1038,9 @@ void SeatShim::notify_modifiers(std::uint32_t depressed, std::uint32_t latched,
                                std::uint32_t locked, std::uint32_t group) const {
     if (impl_->seat) impl_->seat->notify_modifiers(depressed, latched, locked, group);
 }
+void SeatShim::release_keys() const {
+    if (impl_->seat) impl_->seat->release_keys();
+}
 void SeatShim::pointer_enter(std::uint64_t surface_id, double sx, double sy) const {
     if (!impl_->seat) return;
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
@@ -1092,7 +1113,6 @@ std::uint64_t SeatShim::touch_focus(std::int32_t id) const {
     if (!impl_->seat) return 0;
     return u64_from_id(impl_->seat->touch_focus(id));
 }
-bool SeatShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 
 struct LayerShellShim::Impl {
     struct Entry {
@@ -1156,7 +1176,6 @@ std::unique_ptr<LayerShellShim> layer_shell_new(const DisplayShim& display, rust
     }
 }
 
-bool LayerShellShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 
 rust::Vec<std::uint64_t> LayerShellShim::layer_surfaces() const {
     rust::Vec<std::uint64_t> out;
@@ -1210,9 +1229,6 @@ Rect LayerShellShim::arrange(std::uint64_t surface_id, Rect full, Rect& usable) 
 
 struct OutputGlobalShim::Impl {
     std::optional<lm::OutputGlobal> global;
-    std::int32_t logical_x = 0;
-    std::int32_t logical_y = 0;
-    std::int32_t refresh_mhz = 60000;
 };
 OutputGlobalShim::~OutputGlobalShim() = default;
 OutputGlobalShim::OutputGlobalShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1233,13 +1249,28 @@ std::unique_ptr<OutputGlobalShim> output_global_new(const DisplayShim& display, 
     }
 }
 
+std::unique_ptr<OutputGlobalShim> output_global_for(const DisplayShim& display, const OutputShim& output,
+                                                   const OutputLayoutShim& layout, rust::Str name,
+                                                   rust::String& error) {
+    try {
+        if (!display.impl().display) { error = "display not initialized"; return nullptr; }
+        lm::Output* out = output.impl().output;
+        if (out == nullptr) { error = "output destroyed"; return nullptr; }
+        auto r = lm::OutputGlobal::create(*display.impl().display, *out, raw_ref(layout), std::string(name));
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<OutputGlobalShim::Impl>();
+        impl->global.emplace(std::move(*r));
+        return std::make_unique<OutputGlobalShim>(std::move(impl));
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nullptr;
+    }
+}
+
 void OutputGlobalShim::set_logical_position(std::int32_t x, std::int32_t y) const {
-    impl_->logical_x = x;
-    impl_->logical_y = y;
     if (impl_->global) impl_->global->set_logical_position(x, y);
 }
 void OutputGlobalShim::set_mode(std::int32_t width, std::int32_t height, std::int32_t refresh_mhz) const {
-    if (refresh_mhz > 0) impl_->refresh_mhz = refresh_mhz;
     if (impl_->global) impl_->global->set_mode(width, height, refresh_mhz);
 }
 void OutputGlobalShim::set_scale(std::int32_t scale) const {
@@ -1249,15 +1280,15 @@ void OutputGlobalShim::set_transform(std::uint32_t transform) const {
     if (impl_->global) impl_->global->set_transform(static_cast<lm::Transform>(transform));
 }
 
-std::int32_t OutputGlobalShim::logical_x() const { return impl_->logical_x; }
-std::int32_t OutputGlobalShim::logical_y() const { return impl_->logical_y; }
+std::int32_t OutputGlobalShim::logical_x() const { return impl_->global ? impl_->global->logical_x() : 0; }
+std::int32_t OutputGlobalShim::logical_y() const { return impl_->global ? impl_->global->logical_y() : 0; }
 std::int32_t OutputGlobalShim::logical_width() const { return impl_->global ? impl_->global->logical_width() : 0; }
 std::int32_t OutputGlobalShim::logical_height() const { return impl_->global ? impl_->global->logical_height() : 0; }
 std::int32_t OutputGlobalShim::width() const { return impl_->global ? impl_->global->width() : 0; }
 std::int32_t OutputGlobalShim::height() const { return impl_->global ? impl_->global->height() : 0; }
 std::int32_t OutputGlobalShim::scale() const { return impl_->global ? impl_->global->scale() : 1; }
 std::uint32_t OutputGlobalShim::transform() const { return impl_->global ? static_cast<std::uint32_t>(impl_->global->transform()) : 0; }
-std::int32_t OutputGlobalShim::refresh_mhz() const { return impl_->refresh_mhz; }
+std::int32_t OutputGlobalShim::refresh_mhz() const { return impl_->global ? impl_->global->refresh_mhz() : 0; }
 rust::String OutputGlobalShim::name() const { return impl_->global ? to_rust(impl_->global->name()) : rust::String(""); }
 
 bool LayerShellShim::on_output(std::uint64_t surface_id, const OutputGlobalShim& output) const {
@@ -1332,10 +1363,10 @@ std::unique_ptr<FractionalScaleManagerShim> fractional_scale_manager_new(const D
         return std::make_unique<FractionalScaleManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-void FractionalScaleManagerShim::set_scale(std::uint64_t surface_id, std::int32_t scale_120ths) const {
+void FractionalScaleManagerShim::set_scale(std::uint64_t surface_id, double scale) const {
     if (!impl_->mgr) return;
     lm::Surface* s = lm::surface_from_id(id_from_u64(surface_id));
-    if (s) impl_->mgr->set_scale(*s, scale_120ths);
+    if (s) impl_->mgr->set_scale(*s, scale);
 }
 
 // ---- xdg-decoration --------------------------------------------------------
@@ -1374,9 +1405,6 @@ void XdgDecorationManagerShim::set_default_mode(std::uint32_t mode) const {
 std::uint32_t XdgDecorationManagerShim::default_mode() const {
     return impl_->mgr ? static_cast<std::uint32_t>(impl_->mgr->default_mode()) : 1;
 }
-bool XdgDecorationManagerShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
-}
 
 // ---- cursor-shape ----------------------------------------------------------
 
@@ -1406,9 +1434,6 @@ std::unique_ptr<CursorShapeManagerShim> cursor_shape_manager_new(const DisplaySh
         });
         return std::make_unique<CursorShapeManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
-}
-bool CursorShapeManagerShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
 }
 
 // ---- xdg-toplevel-icon -----------------------------------------------------
@@ -1442,9 +1467,6 @@ std::unique_ptr<XdgToplevelIconManagerShim> xdg_toplevel_icon_manager_new(const 
         });
         return std::make_unique<XdgToplevelIconManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
-}
-bool XdgToplevelIconManagerShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
 }
 rust::String XdgToplevelIconManagerShim::icon_name(std::uint64_t surface_id) const {
     auto it = impl_->icon_names.find(surface_id);
@@ -1490,7 +1512,6 @@ std::unique_ptr<XdgActivationShim> xdg_activation_new(const DisplayShim& display
         return std::make_unique<XdgActivationShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool XdgActivationShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 void XdgActivationShim::set_grant_tokens(bool grant) const { impl_->grant_tokens = grant; }
 
 // ---- idle-inhibit ----------------------------------------------------------
@@ -1540,7 +1561,6 @@ std::unique_ptr<IdleInhibitManagerShim> idle_inhibit_manager_new(const DisplaySh
         return std::make_unique<IdleInhibitManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool IdleInhibitManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 bool IdleInhibitManagerShim::inhibited() const { return impl_->mgr && impl_->mgr->inhibited(); }
 std::size_t IdleInhibitManagerShim::inhibitor_count() const { return impl_->mgr ? impl_->mgr->inhibitor_count() : 0; }
 std::uint64_t IdleInhibitManagerShim::inhibitor_surface(std::uint64_t inhibitor) const {
@@ -1604,7 +1624,6 @@ std::unique_ptr<IdleNotifierShim> idle_notifier_new(const DisplayShim& display, 
         return std::make_unique<IdleNotifierShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool IdleNotifierShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 void IdleNotifierShim::notify_activity() const { if (impl_->mgr) impl_->mgr->notify_activity(); }
 void IdleNotifierShim::set_inhibited(bool inhibited) const { if (impl_->mgr) impl_->mgr->set_inhibited(inhibited); }
 bool IdleNotifierShim::inhibited() const { return impl_->mgr && impl_->mgr->inhibited(); }
@@ -1625,21 +1644,24 @@ bool IdleNotifierShim::notification_info(std::uint64_t notification, IdleNotific
 namespace {
 
 // DataDeviceManager and PrimarySelectionManager have the same three hooks.
-template <class Manager>
+// A change of owner reaches Rust with what the new owner offers in `text`,
+// one mime type per line (a mime type cannot hold a newline).
+template <class Manager, EventKind Kind>
 struct SelectionShimImpl {
     std::optional<Manager> mgr;
-    std::deque<std::vector<std::string>> changes;
     Conn<lm::SelectionChange> on_change;
 
     void watch() {
-        on_change = mgr->selection_changed().connect(
-            [this](lm::SelectionChange& e) { changes.push_back(e.mime_types); });
-    }
-    bool next(rust::Vec<rust::String>& out) {
-        if (changes.empty()) return false;
-        out = to_rust(changes.front());
-        changes.pop_front();
-        return true;
+        on_change = mgr->selection_changed().connect([](lm::SelectionChange& e) {
+            std::string joined;
+            for (const std::string& mime : e.mime_types) {
+                if (!joined.empty()) joined += '\n';
+                joined += mime;
+            }
+            EventRaw ev = event(Kind);
+            ev.text = to_rust(joined);
+            hub_push(std::move(ev));
+        });
     }
     rust::Vec<rust::String> mime_types() const {
         return mgr ? to_rust(mgr->selection_mime_types()) : rust::Vec<rust::String>{};
@@ -1655,7 +1677,7 @@ struct SelectionShimImpl {
 
 } // namespace
 
-struct DataDeviceManagerShim::Impl : SelectionShimImpl<lm::DataDeviceManager> {};
+struct DataDeviceManagerShim::Impl : SelectionShimImpl<lm::DataDeviceManager, EventKind::SelectionChange> {};
 DataDeviceManagerShim::~DataDeviceManagerShim() = default;
 DataDeviceManagerShim::DataDeviceManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 DataDeviceManagerShim::Impl& DataDeviceManagerShim::impl() const { return *impl_; }
@@ -1670,11 +1692,10 @@ std::unique_ptr<DataDeviceManagerShim> data_device_manager_new(const DisplayShim
         return std::make_unique<DataDeviceManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool DataDeviceManagerShim::next_selection_change(rust::Vec<rust::String>& mime_types) const { return impl_->next(mime_types); }
 rust::Vec<rust::String> DataDeviceManagerShim::selection_mime_types() const { return impl_->mime_types(); }
 bool DataDeviceManagerShim::selection_receive(rust::Str mime, int fd) const { return impl_->receive(mime, fd); }
 
-struct PrimarySelectionManagerShim::Impl : SelectionShimImpl<lm::PrimarySelectionManager> {};
+struct PrimarySelectionManagerShim::Impl : SelectionShimImpl<lm::PrimarySelectionManager, EventKind::PrimarySelectionChange> {};
 PrimarySelectionManagerShim::~PrimarySelectionManagerShim() = default;
 PrimarySelectionManagerShim::PrimarySelectionManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 PrimarySelectionManagerShim::Impl& PrimarySelectionManagerShim::impl() const { return *impl_; }
@@ -1689,7 +1710,6 @@ std::unique_ptr<PrimarySelectionManagerShim> primary_selection_manager_new(const
         return std::make_unique<PrimarySelectionManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool PrimarySelectionManagerShim::next_selection_change(rust::Vec<rust::String>& mime_types) const { return impl_->next(mime_types); }
 rust::Vec<rust::String> PrimarySelectionManagerShim::selection_mime_types() const { return impl_->mime_types(); }
 bool PrimarySelectionManagerShim::selection_receive(rust::Str mime, int fd) const { return impl_->receive(mime, fd); }
 
@@ -1754,7 +1774,6 @@ std::unique_ptr<PointerConstraintsShim> pointer_constraints_new(const DisplayShi
         return std::make_unique<PointerConstraintsShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool PointerConstraintsShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 bool PointerConstraintsShim::constraint_info(std::uint64_t surface_id, PointerConstraintInfoRaw& out) const {
     const lm::PointerConstraint* c = impl_->find(surface_id);
     if (c == nullptr) return false;
@@ -1837,7 +1856,6 @@ std::unique_ptr<TextInputManagerShim> text_input_manager_new(const DisplayShim& 
         return std::make_unique<TextInputManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool TextInputManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 std::uint64_t TextInputManagerShim::focused() const {
     if (!impl_->mgr) return 0;
     const lm::TextInput* focused = impl_->mgr->focused();
@@ -1892,32 +1910,9 @@ std::unique_ptr<PresentationShim> presentation_new(const DisplayShim& display, r
 }
 
 struct OutputLayoutShim::Impl {
-    // An output that dies leaves the layout at once. That is not policy: C++
-    // compositors remove it in their Output::destroy handler, while Rust only
-    // hears of it after dispatch() returns, and the Cursor may read the layout
-    // before then.
-    struct Watch {
-        lm::Output* output;
-        Conn<lm::OutputDestroy> on_destroy;
-    };
-
+    // Follows its outputs by itself: one that dies leaves at once, before Rust
+    // hears of it, which is what the Cursor reading it during dispatch needs.
     lm::OutputLayout layout;
-    std::deque<Watch> watches;
-
-    void watch(lm::Output* out) {
-        if (std::ranges::any_of(watches, [out](const Watch& w) { return w.output == out; })) {
-            return;
-        }
-        // Erasing the watch inside its own slot is safe: a Signal never frees
-        // the slot that is running.
-        watches.push_back(Watch{out, out->destroy.connect([this, out](lm::OutputDestroy&) {
-                                    layout.remove(*out);
-                                    unwatch(out);
-                                })});
-    }
-    void unwatch(const lm::Output* output) {
-        std::erase_if(watches, [output](const Watch& w) { return w.output == output; });
-    }
 };
 OutputLayoutShim::~OutputLayoutShim() = default;
 OutputLayoutShim::OutputLayoutShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1930,13 +1925,11 @@ void OutputLayoutShim::add(OutputShim& output, std::int32_t x, std::int32_t y) c
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.add(*out, x, y);
-    impl_->watch(out);
 }
 void OutputLayoutShim::add_auto(OutputShim& output) const {
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.add_auto(*out);
-    impl_->watch(out);
 }
 Rect OutputLayoutShim::bounds() const {
     const auto b = impl_->layout.bounds();
@@ -1946,7 +1939,6 @@ void OutputLayoutShim::remove(OutputShim& output) const {
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.remove(*out);
-    impl_->unwatch(out);
 }
 Rect OutputLayoutShim::output_box(const OutputShim& output) const {
     if (!output.impl().output) return Rect{0, 0, 0, 0};
@@ -1982,6 +1974,34 @@ rust::Vec<std::uint8_t> CpuCompositorShim::finish(std::int32_t width, std::int32
     return out;
 }
 
+namespace {
+SceneHitRaw hit_raw(const lm::SceneHit& hit) {
+    SceneHitRaw out{};
+    out.hit = hit.hit;
+    out.tag = hit.tag;
+    out.surface_id = hit.surface ? u64_from_id(hit.surface->id()) : 0;
+    out.sx = hit.sx;
+    out.sy = hit.sy;
+    return out;
+}
+} // namespace
+
+SceneHitRaw raw_scene_route_pointer(const SeatShim& seat, rust::Slice<const SceneItemRaw> items, double x, double y) {
+    lm::Seat* s = raw_ptr(seat);
+    if (s == nullptr) return SceneHitRaw{};
+    const std::vector<lm::SceneItem> scene = scene_items(items);
+    return hit_raw(lm::scene_route_pointer(*s, scene, x, y));
+}
+
+bool raw_scene_surface_origin(rust::Slice<const SceneItemRaw> items, std::uint64_t surface_id, double& x, double& y) {
+    const std::vector<lm::SceneItem> scene = scene_items(items);
+    const auto origin = lm::scene_surface_origin(scene, id_from_u64(surface_id));
+    if (!origin) return false;
+    x = origin->x;
+    y = origin->y;
+    return true;
+}
+
 SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, double y) {
     const std::vector<lm::SceneItem> scene = scene_items(items);
     auto hit = lm::scene_hit_test(scene, x, y);
@@ -1994,48 +2014,25 @@ SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, 
     return out;
 }
 struct PopupTreeShim::Impl {
-    struct Watch {
-        std::uint64_t id;
-        lm::Popup* popup;
-        Conn<lm::PopupDestroy> on_destroy;
-    };
+    // Follows the shell from creation to destruction by itself.
+    explicit Impl(lm::XdgShell& shell) : tree(shell) {}
     lm::PopupTree tree;
-    std::vector<Watch> watches;
-
-    lm::Popup* find(std::uint64_t id) const {
-        const auto it = std::ranges::find(watches, id, &Watch::id);
-        return it == watches.end() ? nullptr : it->popup;
-    }
-    void forget(std::uint64_t id) {
-        if (lm::Popup* p = find(id); p != nullptr) tree.remove(*p);
-        // Erasing the watch inside its own slot is safe: a Signal never frees
-        // the slot that is running.
-        std::erase_if(watches, [id](const Watch& w) { return w.id == id; });
-    }
 };
 PopupTreeShim::~PopupTreeShim() = default;
 PopupTreeShim::PopupTreeShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 PopupTreeShim::Impl& PopupTreeShim::impl() const { return *impl_; }
 
-std::unique_ptr<PopupTreeShim> popup_tree_new() {
-    return std::make_unique<PopupTreeShim>(std::make_unique<PopupTreeShim::Impl>());
+std::unique_ptr<PopupTreeShim> popup_tree_new(const XdgShellShim& shell) {
+    lm::XdgShell* s = raw_ptr(shell);
+    if (s == nullptr) return nullptr;
+    return std::make_unique<PopupTreeShim>(std::make_unique<PopupTreeShim::Impl>(*s));
 }
-bool PopupTreeShim::add(const XdgShellShim& shell, std::uint64_t popup, std::uint64_t parent) {
+bool PopupTreeShim::set_parent(const XdgShellShim& shell, std::uint64_t popup, std::uint64_t parent) const {
     lm::Popup* p = shell.impl().popup(popup);
     if (p == nullptr) return false;
-    impl_->tree.add(*p, id_from_u64(parent));
-    if (impl_->find(popup) == nullptr) {
-        Impl* raw = impl_.get();
-        impl_->watches.push_back(Impl::Watch{popup, p, p->destroy.connect([raw, popup](lm::PopupDestroy&) {
-                                                 raw->forget(popup);
-                                             })});
-    }
+    impl_->tree.set_parent(*p, id_from_u64(parent));
     return true;
 }
-void PopupTreeShim::set_mapped(std::uint64_t popup, bool mapped) {
-    if (lm::Popup* p = impl_->find(popup); p != nullptr) impl_->tree.set_mapped(*p, mapped);
-}
-void PopupTreeShim::remove(std::uint64_t popup) { impl_->forget(popup); }
 rust::Vec<SceneItemRaw> PopupTreeShim::append_to(rust::Slice<const SceneItemRaw> scene) const {
     std::vector<lm::SceneItem> items = scene_items(scene);
     const std::size_t before = items.size();

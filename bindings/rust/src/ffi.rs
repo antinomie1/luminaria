@@ -146,8 +146,19 @@ pub(crate) mod ffi {
         SurfaceDestroy,
         SurfaceRendered,
         SurfaceInvalidated,
-        // Output:
+        // Output: `id` is the output's.
         OutputPresent,
+        OutputFrame,
+        OutputModeChanged,
+        // Backends: `id` is the output's.
+        OutputAdded,
+        OutputRemoved,
+        HostCloseRequest,
+        SessionActive,
+        SessionInactive,
+        // Selections: `text` is the new owner's mime types, one per line.
+        SelectionChange,
+        PrimarySelectionChange,
         // xdg-decoration:
         DecorationRequest,
         // foreign-toplevel:
@@ -320,6 +331,8 @@ pub(crate) mod ffi {
         fn terminate(self: &DisplayShim);
         fn dispatch(self: &DisplayShim, timeout_ms: i32) -> i32;
         fn flush_clients(self: &DisplayShim);
+        fn next_event(self: &DisplayShim, out: &mut EventRaw, input: &mut InputEventRaw) -> u32;
+        fn take_output(self: &DisplayShim) -> UniquePtr<OutputShim>;
         fn raw_display(self: &DisplayShim) -> usize;
 
         type KeymapStateShim;
@@ -370,9 +383,6 @@ pub(crate) mod ffi {
         fn has_cursor_plane(self: &OutputShim) -> bool;
         fn move_cursor(self: Pin<&mut OutputShim>, x: i32, y: i32, error: &mut String) -> bool;
         fn hide_cursor(self: Pin<&mut OutputShim>, error: &mut String) -> bool;
-        fn take_frame(self: Pin<&mut OutputShim>) -> bool;
-        fn take_mode_changed(self: Pin<&mut OutputShim>) -> bool;
-        fn next_event(self: &OutputShim, out: &mut EventRaw) -> bool;
         fn alive(self: &OutputShim) -> bool;
         fn id(self: &OutputShim) -> u64;
 
@@ -386,9 +396,8 @@ pub(crate) mod ffi {
         fn add_output(self: Pin<&mut WaylandBackendShim>, width: i32, height: i32) -> UniquePtr<OutputShim>;
         fn start(self: Pin<&mut WaylandBackendShim>, error: &mut String) -> bool;
         fn keymap(self: &WaylandBackendShim) -> String;
-        fn next_input_event(self: Pin<&mut WaylandBackendShim>, out: &mut InputEventRaw) -> bool;
         fn capabilities(self: &WaylandBackendShim) -> u32;
-        fn take_close_request(self: Pin<&mut WaylandBackendShim>) -> bool;
+        fn follow_seat(self: &WaylandBackendShim, seat: &SeatShim, touch: bool);
 
         // Surface inspection
         fn surface_width(surface_id: u64) -> i32;
@@ -409,7 +418,6 @@ pub(crate) mod ffi {
         // Core Protocols
         type CompositorShim;
         fn compositor_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CompositorShim>;
-        fn next_event(self: &CompositorShim, out: &mut EventRaw) -> bool;
 
         type SubcompositorShim;
         fn subcompositor_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SubcompositorShim>;
@@ -417,7 +425,7 @@ pub(crate) mod ffi {
         type XdgShellShim;
         fn xdg_shell_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgShellShim>;
         fn set_bounds(self: &XdgShellShim, width: i32, height: i32);
-        fn next_event(self: &XdgShellShim, out: &mut EventRaw) -> bool;
+        fn forward_window_requests(self: &XdgShellShim);
         fn toplevels(self: &XdgShellShim) -> Vec<u64>;
         fn toplevel_info(self: &XdgShellShim, surface_id: u64, out: &mut ToplevelInfoRaw) -> bool;
         fn toplevel_title(self: &XdgShellShim, surface_id: u64) -> String;
@@ -438,6 +446,7 @@ pub(crate) mod ffi {
         fn keyboard_focus(self: &SeatShim) -> u64;
         fn notify_key(self: &SeatShim, key: u32, pressed: bool);
         fn notify_modifiers(self: &SeatShim, depressed: u32, latched: u32, locked: u32, group: u32);
+        fn release_keys(self: &SeatShim);
         fn pointer_enter(self: &SeatShim, surface_id: u64, sx: f64, sy: f64);
         fn pointer_clear_focus(self: &SeatShim);
         fn pointer_focus(self: &SeatShim) -> u64;
@@ -467,11 +476,9 @@ pub(crate) mod ffi {
         fn touch_frame(self: &SeatShim);
         fn touch_cancel(self: &SeatShim);
         fn touch_focus(self: &SeatShim, id: i32) -> u64;
-        fn next_event(self: &SeatShim, out: &mut EventRaw) -> bool;
 
         type LayerShellShim;
         fn layer_shell_new(display: &DisplayShim, error: &mut String) -> UniquePtr<LayerShellShim>;
-        fn next_event(self: &LayerShellShim, out: &mut EventRaw) -> bool;
         fn layer_surfaces(self: &LayerShellShim) -> Vec<u64>;
         fn info(self: &LayerShellShim, surface_id: u64, out: &mut LayerSurfaceInfoRaw) -> bool;
         fn scope(self: &LayerShellShim, surface_id: u64) -> String;
@@ -482,6 +489,13 @@ pub(crate) mod ffi {
 
         type OutputGlobalShim;
         fn output_global_new(display: &DisplayShim, width: i32, height: i32, name: &str, error: &mut String) -> UniquePtr<OutputGlobalShim>;
+        fn output_global_for(
+            display: &DisplayShim,
+            output: &OutputShim,
+            layout: &OutputLayoutShim,
+            name: &str,
+            error: &mut String,
+        ) -> UniquePtr<OutputGlobalShim>;
         fn set_logical_position(self: &OutputGlobalShim, x: i32, y: i32);
         fn set_mode(self: &OutputGlobalShim, width: i32, height: i32, refresh_mhz: i32);
         fn set_scale(self: &OutputGlobalShim, scale: i32);
@@ -505,26 +519,22 @@ pub(crate) mod ffi {
 
         type FractionalScaleManagerShim;
         fn fractional_scale_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<FractionalScaleManagerShim>;
-        fn set_scale(self: &FractionalScaleManagerShim, surface_id: u64, scale_120ths: i32);
+        fn set_scale(self: &FractionalScaleManagerShim, surface_id: u64, scale: f64);
 
         type XdgActivationShim;
         fn xdg_activation_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgActivationShim>;
-        fn next_event(self: &XdgActivationShim, out: &mut EventRaw) -> bool;
         fn set_grant_tokens(self: &XdgActivationShim, grant: bool);
 
         type XdgDecorationManagerShim;
         fn xdg_decoration_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgDecorationManagerShim>;
         fn set_default_mode(self: &XdgDecorationManagerShim, mode: u32);
         fn default_mode(self: &XdgDecorationManagerShim) -> u32;
-        fn next_event(self: &XdgDecorationManagerShim, out: &mut EventRaw) -> bool;
 
         type CursorShapeManagerShim;
         fn cursor_shape_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<CursorShapeManagerShim>;
-        fn next_event(self: &CursorShapeManagerShim, out: &mut EventRaw) -> bool;
 
         type IdleInhibitManagerShim;
         fn idle_inhibit_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<IdleInhibitManagerShim>;
-        fn next_event(self: &IdleInhibitManagerShim, out: &mut EventRaw) -> bool;
         fn inhibited(self: &IdleInhibitManagerShim) -> bool;
         fn inhibitor_count(self: &IdleInhibitManagerShim) -> usize;
         fn inhibitor_surface(self: &IdleInhibitManagerShim, inhibitor: u64) -> u64;
@@ -533,7 +543,6 @@ pub(crate) mod ffi {
 
         type IdleNotifierShim;
         fn idle_notifier_new(display: &DisplayShim, error: &mut String) -> UniquePtr<IdleNotifierShim>;
-        fn next_event(self: &IdleNotifierShim, out: &mut EventRaw) -> bool;
         fn notify_activity(self: &IdleNotifierShim);
         fn set_inhibited(self: &IdleNotifierShim, inhibited: bool);
         fn inhibited(self: &IdleNotifierShim) -> bool;
@@ -543,7 +552,6 @@ pub(crate) mod ffi {
 
         type TextInputManagerShim;
         fn text_input_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<TextInputManagerShim>;
-        fn next_event(self: &TextInputManagerShim, out: &mut EventRaw) -> bool;
         fn focused(self: &TextInputManagerShim) -> u64;
         fn text_input_info(self: &TextInputManagerShim, text_input: u64, out: &mut TextInputInfoRaw) -> bool;
         fn surrounding_text(self: &TextInputManagerShim, text_input: u64) -> String;
@@ -576,17 +584,14 @@ pub(crate) mod ffi {
         type XdgToplevelIconManagerShim;
         fn xdg_toplevel_icon_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgToplevelIconManagerShim>;
         fn icon_name(self: &XdgToplevelIconManagerShim, surface_id: u64) -> String;
-        fn next_event(self: &XdgToplevelIconManagerShim, out: &mut EventRaw) -> bool;
 
         type DataDeviceManagerShim;
         fn data_device_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<DataDeviceManagerShim>;
-        fn next_selection_change(self: &DataDeviceManagerShim, mime_types: &mut Vec<String>) -> bool;
         fn selection_mime_types(self: &DataDeviceManagerShim) -> Vec<String>;
         fn selection_receive(self: &DataDeviceManagerShim, mime: &str, fd: i32) -> bool;
 
         type PrimarySelectionManagerShim;
         fn primary_selection_manager_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<PrimarySelectionManagerShim>;
-        fn next_selection_change(self: &PrimarySelectionManagerShim, mime_types: &mut Vec<String>) -> bool;
         fn selection_mime_types(self: &PrimarySelectionManagerShim) -> Vec<String>;
         fn selection_receive(self: &PrimarySelectionManagerShim, mime: &str, fd: i32) -> bool;
 
@@ -595,7 +600,6 @@ pub(crate) mod ffi {
 
         type PointerConstraintsShim;
         fn pointer_constraints_new(display: &DisplayShim, seat: &SeatShim, error: &mut String) -> UniquePtr<PointerConstraintsShim>;
-        fn next_event(self: &PointerConstraintsShim, out: &mut EventRaw) -> bool;
         fn constraint_info(self: &PointerConstraintsShim, surface_id: u64, out: &mut PointerConstraintInfoRaw) -> bool;
         fn constraint_region(self: &PointerConstraintsShim, surface_id: u64) -> Vec<Rect>;
         fn activate(self: &PointerConstraintsShim, surface_id: u64);
@@ -613,6 +617,8 @@ pub(crate) mod ffi {
         fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
 
         fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
+        fn raw_scene_route_pointer(seat: &SeatShim, items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
+        fn raw_scene_surface_origin(items: &[SceneItemRaw], surface_id: u64, x: &mut f64, y: &mut f64) -> bool;
 
         type CpuCompositorShim;
         fn cpu_compositor_new() -> UniquePtr<CpuCompositorShim>;
@@ -620,10 +626,8 @@ pub(crate) mod ffi {
         fn finish(self: Pin<&mut CpuCompositorShim>, width: i32, height: i32, bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32) -> Vec<u8>;
 
         type PopupTreeShim;
-        fn popup_tree_new() -> UniquePtr<PopupTreeShim>;
-        fn add(self: Pin<&mut PopupTreeShim>, shell: &XdgShellShim, popup: u64, parent: u64) -> bool;
-        fn set_mapped(self: Pin<&mut PopupTreeShim>, popup: u64, mapped: bool);
-        fn remove(self: Pin<&mut PopupTreeShim>, popup: u64);
+        fn popup_tree_new(shell: &XdgShellShim) -> UniquePtr<PopupTreeShim>;
+        fn set_parent(self: &PopupTreeShim, shell: &XdgShellShim, popup: u64, parent: u64) -> bool;
         fn append_to(self: &PopupTreeShim, scene: &[SceneItemRaw]) -> Vec<SceneItemRaw>;
         fn contains(self: &PopupTreeShim, surface_id: u64) -> bool;
         fn active_grab(self: &PopupTreeShim) -> u64;

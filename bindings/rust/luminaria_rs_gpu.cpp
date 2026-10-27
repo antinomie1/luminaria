@@ -29,11 +29,16 @@ namespace lum {
 // Bare-metal Backends (Session, DRM, Libinput)
 // ============================================================================
 
+namespace {
+void forward_activity(lm::SessionActive& e) {
+    hub_push(event(e.active ? EventKind::SessionActive : EventKind::SessionInactive));
+}
+} // namespace
+
 struct SessionShim::Impl {
     // `session` is `owned`, or one an AutoBackendShim lends out.
     std::unique_ptr<lm::Session> owned;
     lm::Session* session = nullptr;
-    std::deque<bool> activity;
     Conn<lm::SessionActive> on_activity;
 };
 
@@ -50,8 +55,7 @@ std::unique_ptr<SessionShim> session_new(const DisplayShim& display, rust::Strin
         auto impl = std::make_unique<SessionShim::Impl>();
         impl->owned = std::make_unique<lm::Session>(std::move(*r));
         impl->session = impl->owned.get();
-        impl->on_activity = impl->session->activity().connect(
-            [raw = impl.get()](lm::SessionActive& e) { raw->activity.push_back(e.active); });
+        impl->on_activity = impl->session->activity().connect(forward_activity);
         return std::make_unique<SessionShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
@@ -66,6 +70,10 @@ bool SessionShim::switch_to(int vt, rust::String& error) const {
     return true;
 }
 
+bool SessionShim::switch_vt_for(std::uint32_t keysym) const {
+    return impl_->session != nullptr && impl_->session->switch_vt_for(keysym);
+}
+
 bool SessionShim::active() const {
     return impl_->session ? impl_->session->active() : false;
 }
@@ -74,21 +82,10 @@ rust::String SessionShim::seat_name() const {
     return "seat0";
 }
 
-std::uint32_t SessionShim::next_activity() const {
-    if (impl_->activity.empty()) return 0;
-    const bool active = impl_->activity.front();
-    impl_->activity.pop_front();
-    return active ? 2 : 1;
-}
-
 namespace {
 
-// A backend's outputs, arriving and leaving, queued for Rust.
+// A backend's outputs, arriving and leaving, forwarded to Rust.
 struct OutputQueue {
-    struct Event {
-        std::unique_ptr<OutputShim> added; // null: a removal
-        std::uint64_t removed = 0;
-    };
     // Hotplug watch on each output the backend reported, keyed by the shim's id.
     struct Watch {
         const lm::Output* output;
@@ -96,12 +93,10 @@ struct OutputQueue {
         Conn<lm::OutputDestroy> on_destroy;
     };
 
-    std::deque<Event> events;
     std::deque<Watch> watches;
     Conn<lm::NewOutput> on_new_output;
 
-    // Every output, the ones start() finds included, reaches Rust as an event:
-    // C++ never calls Rust, so a signal can only leave something to be drained.
+    // Every output, the ones start() finds included, reaches Rust as an event.
     void watch(lm::Backend& backend) {
         on_new_output = backend.new_output.connect([this](lm::NewOutput& e) {
             auto shim = make_output_shim(&e.output);
@@ -110,12 +105,12 @@ struct OutputQueue {
             w.output = &e.output;
             w.id = id;
             w.on_destroy = e.output.destroy.connect([this, id](lm::OutputDestroy&) {
-                events.push_back(Event{nullptr, id});
+                hub_push(event(EventKind::OutputRemoved, id));
                 // Erasing the watch inside its own slot is safe: a Signal never
                 // frees the slot that is running.
                 std::erase_if(watches, [id](const Watch& x) { return x.id == id; });
             });
-            events.push_back(Event{std::move(shim), 0});
+            hub_push_output(std::move(shim));
         });
     }
 
@@ -125,20 +120,6 @@ struct OutputQueue {
             if (w.output == output) return w.id;
         }
         return 0;
-    }
-
-    std::unique_ptr<OutputShim> next(std::uint32_t& kind, std::uint64_t& removed) {
-        kind = 0;
-        if (events.empty()) return nullptr;
-        Event e = std::move(events.front());
-        events.pop_front();
-        if (e.added) {
-            kind = 1;
-            return std::move(e.added);
-        }
-        kind = 2;
-        removed = e.removed;
-        return nullptr;
     }
 };
 
@@ -209,13 +190,8 @@ void DrmBackendShim::scan_connectors() {
     if (impl_->backend) impl_->backend->scan_connectors();
 }
 
-std::unique_ptr<OutputShim> DrmBackendShim::next_event(std::uint32_t& kind, std::uint64_t& removed) {
-    return impl_->outputs.next(kind, removed);
-}
-
 struct LibinputBackendShim::Impl {
     std::unique_ptr<lm::LibinputBackend> backend;
-    std::deque<InputEventRaw> events;
     Conn<lm::InputEvent> on_input;
 
     // A key's keysym and masks are the backend's reading as the key arrived,
@@ -223,8 +199,7 @@ struct LibinputBackendShim::Impl {
     // returns, by which time later keys of the same batch have moved the
     // backend's state on.
     void watch() {
-        on_input = backend->input().connect(
-            [this](lm::InputEvent& e) { events.push_back(input_event_raw(e)); });
+        on_input = backend->input().connect([](lm::InputEvent& e) { hub_push_input(input_event_raw(e)); });
     }
 };
 
@@ -285,19 +260,16 @@ bool LibinputBackendShim::add_device(rust::Str path, rust::String& error) {
     return true;
 }
 
-bool LibinputBackendShim::next_input_event(InputEventRaw& out) {
-    if (impl_->events.empty()) return false;
-    out = std::move(impl_->events.front());
-    impl_->events.pop_front();
-    return true;
-}
-
 rust::String LibinputBackendShim::keymap() const {
     return impl_->backend ? to_rust(impl_->backend->keymap()) : rust::String{};
 }
 
 bool LibinputBackendShim::set_keymap(rust::Str xkb_text) {
     return impl_->backend && impl_->backend->set_keymap(std::string(xkb_text));
+}
+
+void LibinputBackendShim::follow_seat(const SeatShim& seat, bool touch) const {
+    if (impl_->backend && raw_ptr(seat) != nullptr) raw_ptr(seat)->follow(*impl_->backend, touch);
 }
 
 std::uint32_t LibinputBackendShim::capabilities() const {
@@ -309,8 +281,6 @@ struct AutoBackendShim::Impl {
     // Lends out the backend's session, so it goes first.
     std::unique_ptr<SessionShim> session;
     OutputQueue outputs;
-    std::deque<InputEventRaw> input_events;
-    bool close_requested = false;
     Conn<lm::InputEvent> on_input;
     Conn<lm::HostCloseRequest> on_close;
 };
@@ -343,8 +313,7 @@ std::unique_ptr<AutoBackendShim> auto_backend_new(const DisplayShim& display, st
         if (lm::Session* s = backend.session()) {
             auto session = std::make_unique<SessionShim::Impl>();
             session->session = s;
-            session->on_activity = s->activity().connect(
-                [q = session.get()](lm::SessionActive& e) { q->activity.push_back(e.active); });
+            session->on_activity = s->activity().connect(forward_activity);
             raw->session = std::make_unique<SessionShim>(std::move(session));
         }
         if (lm::InputSource* source = backend.input()) {
@@ -355,12 +324,12 @@ std::unique_ptr<AutoBackendShim> auto_backend_new(const DisplayShim& display, st
                 if (const auto* motion = std::get_if<lm::PointerMotionAbsEvent>(&e)) {
                     ev.output = raw->outputs.id_of(motion->output);
                 }
-                raw->input_events.push_back(std::move(ev));
+                hub_push_input(std::move(ev));
             });
         }
         if (lm::WaylandBackend* nested = backend.nested()) {
             raw->on_close = nested->close_requested.connect(
-                [raw](lm::HostCloseRequest&) { raw->close_requested = true; });
+                [](lm::HostCloseRequest&) { hub_push(event(EventKind::HostCloseRequest)); });
         }
         return std::make_unique<AutoBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
@@ -383,17 +352,6 @@ bool AutoBackendShim::start(rust::String& error) {
     return true;
 }
 
-std::unique_ptr<OutputShim> AutoBackendShim::next_event(std::uint32_t& kind, std::uint64_t& removed) {
-    return impl_->outputs.next(kind, removed);
-}
-
-bool AutoBackendShim::next_input_event(InputEventRaw& out) {
-    if (impl_->input_events.empty()) return false;
-    out = std::move(impl_->input_events.front());
-    impl_->input_events.pop_front();
-    return true;
-}
-
 rust::String AutoBackendShim::keymap() const {
     const lm::InputSource* source = impl_->backend->input();
     return source ? to_rust(source->keymap()) : rust::String{};
@@ -404,7 +362,10 @@ std::uint32_t AutoBackendShim::capabilities() const {
     return source ? caps_bits(source->capabilities()) : 0;
 }
 
-bool AutoBackendShim::take_close_request() { return std::exchange(impl_->close_requested, false); }
+void AutoBackendShim::follow_seat(const SeatShim& seat, bool touch) const {
+    lm::InputSource* source = impl_->backend->input();
+    if (source != nullptr && raw_ptr(seat) != nullptr) raw_ptr(seat)->follow(*source, touch);
+}
 
 bool AutoBackendShim::has_session() const { return impl_->session != nullptr; }
 
@@ -568,28 +529,38 @@ std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new_headless(const DisplayShim& di
     }
 }
 
-struct SceneOutputShim::Impl {
-    lm::SceneOutput state;
-};
-SceneOutputShim::~SceneOutputShim() = default;
-SceneOutputShim::SceneOutputShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-SceneOutputShim::Impl& SceneOutputShim::impl() const { return *impl_; }
-
-std::unique_ptr<SceneOutputShim> scene_output_new() {
-    return std::make_unique<SceneOutputShim>(std::make_unique<SceneOutputShim::Impl>());
-}
-bool SceneOutputShim::gpu_output() const {
-    return impl_->state.gpu_output();
-}
-
-// The renderer keeps a plain `Presentation*`, and Rust cannot put a lifetime
-// on that: the renderer is declared before the Display so that it dies last,
-// which makes every global — the Presentation included — die before it. So
-// the link is kept here from both ends, and whichever side goes first severs it.
+// The renderer keeps a plain `Presentation*`, and Rust puts no lifetime on
+// that: the renderer borrows nothing, so it may be declared before or after
+// the Presentation. The link is kept here from both ends, and whichever side
+// goes first severs it.
 struct SceneRendererShim::Impl : PresentationObserver {
     std::unique_ptr<lm::SceneRenderer> renderer;
     PresentationShim::Impl* presentation = nullptr;
     std::unordered_map<std::uint64_t, StoredImage> images;
+    // One per output this renderer has drawn, by OutputShim id. After
+    // `renderer`, so they die first: they cache its textures.
+    struct State {
+        lm::SceneOutput state;
+        Conn<lm::OutputDestroy> on_destroy;
+    };
+    std::unordered_map<std::uint64_t, std::unique_ptr<State>> states;
+
+    lm::SceneOutput& state_for(const OutputShim& output) {
+        const std::uint64_t id = output.id();
+        auto& slot = states[id];
+        if (!slot) {
+            slot = std::make_unique<State>();
+            // Erasing the state inside its own slot is safe: a Signal never
+            // frees the slot that is running.
+            slot->on_destroy = raw_ptr(output)->destroy.connect(
+                [this, id](lm::OutputDestroy&) { states.erase(id); });
+        }
+        return slot->state;
+    }
+    lm::SceneOutput* find_state(const OutputShim& output) const {
+        const auto it = states.find(output.id());
+        return it == states.end() ? nullptr : &it->second->state;
+    }
 
     void on_presentation_destroyed() override {
         presentation = nullptr;
@@ -646,21 +617,36 @@ bool SceneRendererShim::gpu_enabled() const {
 rust::String SceneRendererShim::gpu_error() const {
     return impl_->renderer ? to_rust(std::string(impl_->renderer->gpu_error())) : "not initialized";
 }
-bool SceneRendererShim::reset(SceneOutputShim& state, OutputShim& output, std::uint32_t drm_format, rust::String& error) const {
+bool SceneRendererShim::reset(OutputShim& output, std::uint32_t drm_format, rust::String& error) const {
     lm::Output* out = raw_ptr(output);
-    if (!impl_->renderer || !out) { error = "null object"; return false; }
-    auto st = impl_->renderer->reset(state.impl().state, *out, drm_format);
+    if (!impl_->renderer || !out) { error = "output destroyed"; return false; }
+    auto st = impl_->renderer->reset(impl_->state_for(output), *out, drm_format);
     if (!st) { error = to_rust(st.error().message); return false; }
     return true;
 }
-int SceneRendererShim::present(SceneOutputShim& state, OutputShim& output, rust::Slice<const SceneItemRaw> items,
+int SceneRendererShim::present(OutputShim& output, rust::Slice<const SceneItemRaw> items,
                              float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const {
     lm::Output* out = raw_ptr(output);
-    if (!impl_->renderer || !out) { error = "null object"; return -1; }
+    if (!impl_->renderer || !out) { error = "output destroyed"; return -1; }
     const std::vector<lm::SceneItem> scene = scene_items(items, &impl_->images);
-    auto r = impl_->renderer->present(state.impl().state, *out, scene, lm::Color{bg_r, bg_g, bg_b, bg_a});
+    auto r = impl_->renderer->present(impl_->state_for(output), *out, scene, lm::Color{bg_r, bg_g, bg_b, bg_a});
     if (!r) { error = to_rust(r.error().message); return -1; }
     return static_cast<int>(*r);
+}
+int SceneRendererShim::present_in(const OutputLayoutShim& layout, OutputShim& output,
+                                rust::Slice<const SceneItemRaw> items, float bg_r, float bg_g, float bg_b,
+                                float bg_a, rust::String& error) const {
+    lm::Output* out = raw_ptr(output);
+    if (!impl_->renderer || !out) { error = "output destroyed"; return -1; }
+    const std::vector<lm::SceneItem> scene = scene_items(items, &impl_->images);
+    auto r = impl_->renderer->present(impl_->state_for(output), *out, scene, lm::Color{bg_r, bg_g, bg_b, bg_a},
+                                      raw_ref(layout));
+    if (!r) { error = to_rust(r.error().message); return -1; }
+    return static_cast<int>(*r);
+}
+bool SceneRendererShim::gpu_output(const OutputShim& output) const {
+    const lm::SceneOutput* state = impl_->find_state(output);
+    return state != nullptr && state->gpu_output();
 }
 void SceneRendererShim::set_presentation(const PresentationShim& presentation) const {
     impl_->link(&presentation.impl());
@@ -671,10 +657,11 @@ void SceneRendererShim::clear_presentation() const {
 void SceneRendererShim::update_cursor() const {
     if (impl_->renderer) impl_->renderer->update_cursor();
 }
-rust::Vec<std::uint8_t> SceneRendererShim::read_back(SceneOutputShim& state, rust::String& error) const {
+rust::Vec<std::uint8_t> SceneRendererShim::read_back(const OutputShim& output, rust::String& error) const {
     rust::Vec<std::uint8_t> out;
-    if (!impl_->renderer) { error = "not initialized"; return out; }
-    auto r = impl_->renderer->read_back(state.impl().state);
+    lm::SceneOutput* state = impl_->find_state(output);
+    if (!impl_->renderer || state == nullptr) { error = "nothing presented on this output"; return out; }
+    auto r = impl_->renderer->read_back(*state);
     if (!r) { error = to_rust(r.error().message); return out; }
     const auto& span = *r;
     const auto* ptr = reinterpret_cast<const uint8_t*>(span.data());

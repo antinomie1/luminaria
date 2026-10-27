@@ -15,7 +15,7 @@ C++ 的模块边界（ADR 0003）在绑定里是一比一复制的：**每个模
 |---|---|---|---|---|
 | *（始终有）* | — | `luminaria` | `core`、`util`、`backend`（`Output`/`HeadlessBackend`/`WaylandBackend`）、`protocol`、`shell` | wayland-server、wayland-client、xkbcommon |
 | `gpu` | ✅ | `luminaria.gpu` | `gpu`，以及 `backend::{DrmBackend, LibinputBackend, Session}` | vulkan、libdrm、libinput、libudev、gbm、libseat |
-| `desktop` | ✅ | `luminaria.desktop` | `desktop` | —（依赖 `gpu`） |
+| `desktop` | ✅ | `luminaria.desktop` | `desktop` | — |
 | `text` | ❌ | `luminaria.text` | `text` | fcft、fontconfig、pixman |
 | `raw-vulkan` | ❌ | —（隐含 `gpu`） | `VulkanRenderer::raw_handles()`、`SceneRenderer::raw_vulkan_handles()` | — |
 | `mint` / `glam` | ❌ | — | `util` 里几何类型的 `From`/`Into` | — |
@@ -27,8 +27,7 @@ cargo test                                       # 默认 = gpu + desktop，与 
 cargo test --features text                       # 加上 Font
 ```
 
-`desktop` 依赖 `gpu`：`DesktopGlobals::create` 要拿一个 `VulkanRenderer`。`raw-vulkan`
-依赖 `gpu`：没有渲染器就没有句柄。
+`desktop` 与 `gpu` 互不依赖。`raw-vulkan` 依赖 `gpu`：没有渲染器就没有句柄。
 
 ---
 
@@ -36,7 +35,8 @@ cargo test --features text                       # 加上 Font
 
 | 模块 | 对应 C++ 命名空间与模块 | 核心职责 |
 |---|---|---|
-| **[`core`](#1-core-模块)** | `luminaria:display`, `event_loop`, `expected` | Wayland 服务端根对象、事件循环驱动、文件描述符绑定、错误类型 |
+| **[`core`](#1-core-模块)** | `luminaria:display`, `event_loop`, `expected`, `input_router` | Wayland 服务端根对象、事件循环驱动、文件描述符绑定、错误类型、`KeyRouter` |
+| **[`event`](#事件一条流)** | —（绑定自己的） | `Event`：库报告的一切，按信号触发顺序 |
 | **[`util`](#2-util-模块)** | `luminaria:box`, `color`, `transform`, `region`, `keymap` | 纯几何矩形运算、颜色与色彩空间、朝向变换、不相交区域、XKB 键表与像素布局 |
 | **[`backend`](#3-backend-模块)** | `luminaria:output`, `headless`, `wayland`（`drm`/`libinput` 属 `luminaria.gpu`） | 虚拟无头输出、嵌套窗口后端；特性 `gpu` 下还有裸机 DRM/KMS 输出、libinput 设备驱动 |
 | **[`protocol`](#4-protocol-模块)** | `luminaria:compositor`, `xdg_shell`, `seat`, `layer_shell` 等 | Wayland 核心协议对象（Compositor, SurfaceId, Seat 等）及 16 个核心扩展管理器 |
@@ -57,14 +57,14 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 | 所有协议 global（`Compositor<'d>`、`Seat<'d>`、`XdgShell<'d>`、`Presentation<'d>`……）、`HeadlessBackend<'d>`、`WaylandBackend<'d>`、`AutoBackend<'d>`、`Session<'d>`、`EventLoop<'d>` | `Display` |
 | `AutoBackend::session()` 借出的 `Session<'_>` | 那个 `AutoBackend`（会话归它所有） |
 | `DrmBackend<'a>`、`LibinputBackend<'a>` | `Display`，以及传入的 `Session` |
+| `CoreGlobals<'d>` | `Display`（它装着的两个选区管理器借的 `Seat` 归它自己，所以作为一个值传来传去） |
 | `DataDeviceManager<'a>`、`PrimarySelectionManager<'a>`、`RelativePointerManager<'a>`、`PointerConstraints<'a>`、`TextInputManager<'a>` | `Display`、`Seat` |
 | `DataControlManager<'a>` | `Display`、`DataDeviceManager` |
 | `InputMethodManager<'a>` | `Display`、`Seat`、`TextInputManager` |
 | `OutputManager<'a>` | `Display`、`OutputLayout` |
 | `ForeignToplevelManager<'d>` | `Display`；`track(&shell)` 之后还有那个 `XdgShell` |
-| `LinuxDmabuf<'a>`、`DesktopGlobals<'a>` | `Display`，以及传入的 `VulkanRenderer` 或 `SceneRenderer` |
+| `LinuxDmabuf<'a>` | `Display`，以及传入的 `VulkanRenderer` 或 `SceneRenderer` |
 | `Cursor<'a>` | `SceneRenderer`、`OutputLayout`、`Seat` |
-| `SceneOutput<'r>` | 第一次 `reset()` / `present()` 它的 `SceneRenderer`（它缓存该渲染器的纹理与渲染目标） |
 | `Frame<'r>` | `VulkanRenderer` |
 | `Toplevel<'s>`、`Popup<'s>`、`LayerSurface<'s>`、`LockSurface<'m>`、`SessionLock<'m>`、`PointerConstraint<'m>`、`TextInput<'m>`、`InputMethod<'m>` | 发出它的那个 global（只是查询句柄，见 §4"事件"） |
 
@@ -75,14 +75,15 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 - **只写 lifetime 不够，还要 `Drop`。** 没有 `Drop` 的结构体，dropck 允许它在借用结束后才被隐式析构，
   `drop(seat)` 放在 `Cursor` 之前照样能编译——而 `Cursor` 的析构恰好要碰那个 `Seat`。所以每个带 lifetime 的包装都
   带一个有 `Drop` 的标记字段。`Cursor` 的文档里有一个 `compile_fail` doctest 守着这一点。
-- **`SceneRenderer` 不借任何东西**，所以"renderer 比 Display 活得久"仍然写得出来：最先声明它即可。
-  `set_presentation(Some(&p))` 因此没有借用：renderer 一般比 `Presentation` 活得久，这条链接由 shim 从两头维护，
+- **`SceneRenderer` 不借任何东西**，每块输出的渲染状态也由它自己按输出保存（输出销毁时丢掉），所以用户代码里
+  没有借它的每输出对象；只要在借它的 `Cursor`、`LinuxDmabuf` 之前声明即可。`set_presentation(Some(&p))` 没有借用：renderer 一般比 `Presentation` 活得久，这条链接由 shim 从两头维护，
   哪边先死哪边负责断开，之后反馈只是不再发送。
 - **`Output` 不进生命周期。** 真正的 `lm::Output` 归后端所有，显示器随时可能被拔掉，这不是 Rust 的作用域能表达的。
-  所以和输出有关的都在运行时兜底：`Output` 自己变成空操作（`is_alive()` 为 false）；`OutputLayout` 与 `SceneOutput`
-  自动解除绑定；`DirectScanout` 不再调用它；`Frame` 随输出一起销毁，之后 `reset` / `submit` 返回错误、其余方法为空操作。
+  所以和输出有关的都在运行时兜底：`Output` 自己变成空操作（`is_alive()` 为 false）；`OutputLayout` 与渲染器的
+  每输出状态自动解除绑定，跟随它的 `OutputGlobal` 停止跟随；`DirectScanout` 不再调用它；`Frame` 随输出一起销毁，之后 `reset` / `submit` 返回错误、其余方法为空操作。
 - **结构体不能同时装被借者和借用者**（自引用）。把被借的放在外层——`main` 的局部变量，或一个只装它们的结构体——
-  再让装 `Cursor<'a>`、`SceneOutput<'a>` 的结构体借用它们，如 `examples/minimal.rs` 的 `Screen<'a>`。
+  再让借用者借用它们。`examples/minimal.rs` 一个带 lifetime 的结构体都没写：每块输出和跟随它的 wl_output 放在
+  `Vec<(Output, Option<OutputGlobal>)>` 里，类型推断替它写了 lifetime。
   会话、显卡、libinput 这一组本来就是这种关系（后两者借前者），所以由 `AutoBackend` 在 C++ 一侧一起持有，
   Rust 只借 `Display`。
 
@@ -110,10 +111,13 @@ display.init_shm()?;
 // 4. 获取事件循环句柄（非拥有型，借用 display：EventLoop<'_>）
 let event_loop = display.event_loop();
 
-// 5. 驱动事件分发（None 为阻塞等待，Some(0) 为立即非阻塞轮询）
-let dispatched_events = display.dispatch(Some(Duration::ZERO))?;
+// 5. 一轮：把上一轮产出的发给客户端，等事件循环（None 为阻塞等待，
+//    Some(ZERO) 为立即非阻塞轮询），派发，并返回这一轮发生的一切
+for event in display.dispatch(Some(Duration::ZERO))? {
+    // luminaria::Event
+}
 
-// 6. 向所有客户端刷新待发送的缓冲区数据
+// 6. 现在就把待发送的数据刷给客户端，而不是等下一轮
 display.flush_clients();
 
 // 7. 进入阻塞运行直到被 terminate
@@ -128,13 +132,22 @@ use std::os::fd::AsRawFd;
 
 let raw_fd = display.as_raw_fd();
 // 注册到外部 poller 监听可读事件...
-// 当可读时调用非阻塞派发：
-display.dispatch(Some(std::time::Duration::ZERO))?;
+// 当可读时调用非阻塞派发，并处理返回的事件：
+for event in display.dispatch(Some(std::time::Duration::ZERO))? { /* ... */ }
 display.flush_clients();
 ```
+自己派发事件循环（不经 `dispatch()`）的调用者用 `display.events()` 取走排队的事件，不等待也不派发。
 
 ### `KeyRouter`
-辅助工具，用于记录已被快捷键机制消费（吞噬）的按下按键，确保对应的释放事件（Key Release）同步被吞噬，避免按键状态在客户端处卡死。
+在混成器快捷键与焦点客户端之间分配键盘，每个键保持完整：
+```rust
+keys.route(&seat, &input, |e| {
+    let &InputEvent::Key { keysym, modifiers, .. } = e else { return false };
+    modifiers.held() == Modifiers::LOGO && keysym.to_lower() == Keysym::q // true：这个键归混成器
+});
+```
+按下先交给闭包；答 `true` 的键连同它的松开一起留下，其余交给 `seat`。松开丢失（切 VT）后的再次按下按新按下处理。
+不是按键的事件直接忽略。
 
 ---
 
@@ -209,7 +222,9 @@ let (depressed, latched, locked, group) = keymap.modifiers();
 - `output.modes()`, `output.current_mode()`, `output.set_mode(w, h, refresh_mhz)`：模式管理。
 - `output.commit(color)`：提交全屏纯色。
 - `output.commit_frame(rgba_bytes, width, height)`：提交整帧软件渲染像素。
-- `output.scanout_modifiers(drm_format)`：查询硬件扫描线支持的 DRM 格式修饰符列表。
+- `output.scanout_modifiers(DrmFourcc::Xrgb8888)`：查询硬件扫描线支持的 DRM 格式修饰符列表。
+- 输出上发生的事以 `Event::Output(id, OutputEvent)` 到来：`Frame`（`schedule_frame()` 要的那一帧到了，现在画）、
+  `Present`（一帧上了屏）、`ModeChanged`（`set_mode()` 落地；渲染器、布局与跟随的 `OutputGlobal` 已经跟上）。
 - `output.move_cursor(x, y)` / `output.hide_cursor()`：驱动硬件独立 KMS 光标平面。
 
 ### 常用后端
@@ -225,7 +240,7 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   let mut output = backend.add_output(1280, 800)?;
   backend.start()?;
   ```
-- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器经 `DrmBackend::next_event()` 到来与离开，输入见下一节，VT 切换经 `Session::next_activity()`；见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
+- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器以 `Event::Backend` 到来与离开，输入以 `Event::Input`，VT 切换以 `Event::SessionActive`；`Session::switch_vt_for(keysym)` 是 Ctrl+Alt+Fn 那个绑定。见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
 - **`AutoBackend`**（特性 `gpu`，C++ `AutoBackend`）：替调用者挑后端。auto 依次试嵌套、能拿到 libseat 会话时的
   DRM（ssh、CI 因此不会误上 VT）、无头；按名字要某一种时失败就是错误而不回退，DRM 这时没有会话也照跑。
   会话、显卡、libinput 都归它，Rust 只借 `Display`。读环境变量仍是调用者的事，`"auto".parse::<BackendKind>()`
@@ -234,42 +249,51 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   let options = BackendOptions { kind: std::env::var("LUMINARIA_BACKEND")?.parse()?, ..Default::default() };
   let mut backend = AutoBackend::new(&display, &options)?;      // 宽高、窗口标题、显卡路径都在 options 里
   let renderer = SceneRenderer::new(&backend.vulkan_options())?; // DRM 上是屏幕背后那块 GPU
+  if let Some(source) = backend.input() { seat.follow(source, false); } // 嵌套或 libinput；无头为 None
   backend.start()?;                                             // 先 libinput，后后端
-  while let Some(event) = backend.next_event() { /* BackendEvent::OutputAdded / OutputRemoved */ }
-  if let Some(source) = backend.input() { /* 嵌套或 libinput；无头为 None */ }
-  if backend.take_close_request() { /* 只有嵌套会有 */ }
+  for event in display.dispatch(None)? {
+      match event {
+          Event::Backend(BackendEvent::OutputAdded(output)) => { /* ... */ }
+          Event::Backend(BackendEvent::OutputRemoved(id)) => { /* 布局和渲染器已经放手 */ }
+          Event::HostCloseRequest => { /* 只有嵌套会有 */ }
+          _ => {}
+      }
+  }
   if let Some(session) = backend.session() { session.switch_to(2)?; } // 只在 DRM 上
   ```
   嵌套与无头那一块输出也以 `BackendEvent::OutputAdded` 到来（`start()` 时），所以三种后端只有一条输出路径。
 
 ### 输入：`InputSource`
-嵌套的 `WaylandBackend` 与裸机的 `LibinputBackend` 都实现 `InputSource` trait，给出同一个 `InputEvent`。
-两者的差别在于到来的是哪些分支（相对移动 `Motion` 与触摸来自 libinput，绝对移动 `MotionAbsolute` 与 `PointerLeave`
-来自嵌套窗口），而不在于怎么到来，所以混成器只写一个循环：
+嵌套的 `WaylandBackend`、裸机的 `LibinputBackend` 与 `AutoBackend` 都实现（封闭的）`InputSource` trait，输入以
+`Event::Input(InputEvent)` 到来。两者的差别在于到来的是哪些分支（相对移动 `Motion` 与触摸来自 libinput，绝对移动
+`MotionAbsolute` 与 `PointerLeave` 来自嵌套窗口），而不在于怎么到来，所以混成器只写一个 match：
 
 ```rust
-if let Some(source) = backend.input() { // -> Option<&mut dyn InputSource>
-    while let Some(event) = source.next_input_event() {
-        match event {
-            InputEvent::Key { key, pressed, keysym, modifiers } => { /* 快捷键，否则 seat.notify_key */ }
-            InputEvent::Modifiers(m) => seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group),
-            InputEvent::KeymapChange(text) => { seat.set_keymap(&text); }
-            InputEvent::Axis(axis) => seat.pointer_axis_event(axis),
-            // Motion / MotionAbsolute / PointerLeave / Button / Capabilities / Touch*
-            _ => {}
-        }
+if let Some(source) = backend.input() {
+    seat.follow(source, false); // keymap 与 capabilities 归 seat 跟随；不路由触摸就不公布 touch
+}
+for event in display.dispatch(None)? {
+    let Event::Input(input) = event else { continue };
+    match input {
+        InputEvent::Key { .. } => keys.route(&seat, &input, |e| /* 快捷键？ */ false),
+        InputEvent::Modifiers(m) => seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group),
+        InputEvent::Axis(axis) => seat.pointer_axis_event(axis),
+        // Motion / MotionAbsolute / PointerLeave / Button / Capabilities / Touch*
+        _ => {}
     }
 }
 ```
 
-- `InputEvent::Key` 的 `keysym` 与 `modifiers` 是后端按 `keymap()` 读出、取**这个键之前**的状态：先按 Logo
+- `InputEvent::Key` 的 `keysym`（`util::Keysym`，每个 `XKB_KEY_*` 一个常量：`Keysym::Return`、`Keysym::q`）与
+  `modifiers`（`Modifiers::held()` 是快捷键要比的那一部分，`Modifiers::LOGO` 等常量）是后端按 `keymap()` 读出、取**这个键之前**的状态：先按 Logo
   再按 Return，到来的是带着 Logo 的 Return。快捷键直接对着它匹配，不需要自己的 `KeymapState`。读数在 C++ 信号里
   就拍下，所以同一批后面的按键改掉 xkb 状态也不影响它。
 - `MotionAbsolute { output }` 是 `OutputId`，指明坐标属于哪块输出。
 - `Seat::pointer_axis_event(PointerAxis)`：滚轮同时报刻度和平滑量，刻度优先；分别调 `pointer_axis` 与
   `pointer_axis_discrete` 会让每格滚两次。
-- `keymap()` / `capabilities()` 给出启动时已有的状态，之后的变化以 `KeymapChange` / `Capabilities` 到来。
-- 父级要求关窗不是输入：`WaylandBackend::take_close_request()`。
+- `keymap()` / `capabilities()` 给出启动时已有的状态，之后的变化以 `KeymapChange` / `Capabilities` 到来；
+  `Seat::follow()` 替你跟随这两样。
+- 父级要求关窗不是输入：`Event::HostCloseRequest`。
 
 ---
 
@@ -277,29 +301,42 @@ if let Some(source) = backend.input() { // -> Option<&mut dyn InputSource>
 
 负责向客户端通告和处理 Wayland 协议规范。
 
-### 事件：`next_event()`
+### 事件：一条流
 
-混成器是被 C++ 的 `Signal` 驱动的。绑定不让 C++ 回调 Rust，而是每个 shim 把信号排进自己的队列，
-Rust 在 `Display::dispatch` 返回后用 `next_event()` 一个个取走：
+混成器是被 C++ 的 `Signal` 驱动的。绑定不让 C++ 回调 Rust：每个 shim 把信号按触发的顺序推进**同一条**
+（每线程一条）队列，`Display::dispatch()` 返回时把它整条交回，成为 `luminaria::Event`：
 
 ```rust
-display.dispatch(Some(Duration::from_millis(16)))?;
-while let Some(event) = shell.next_event() { /* XdgEvent */ }
-while let Some((surface, event)) = layers.next_event() { /* LayerSurfaceEvent */ }
-while let Some(event) = seat.next_event() { /* SeatEvent */ }
+for event in display.dispatch(Some(Duration::from_millis(16)))? {
+    match event {
+        Event::Xdg(XdgEvent::Toplevel(surface, e)) => { /* ... */ }
+        Event::Layer(surface, e) => { /* LayerSurfaceEvent */ }
+        Event::Seat(e) => { /* SeatEvent */ }
+        Event::Output(id, OutputEvent::Frame) => { /* 画这一块 */ }
+        _ => {}
+    }
+}
 ```
 
+- **没有要记得取空的队列。** 以前每个 global 一条队列，用了它却忘了每轮取空就一直长；现在只有一条，
+  `dispatch()` 每次都整条交回，不 match 的事件就丢掉。
+- **顺序就是信号的顺序。** 不同 global 的事件按发生先后交错，而不是按 global 分组。
+- **每个载荷都能 `TryFrom<Event>` 取回**（不是它时原样还回事件），例如
+  `events.filter_map(|e| XdgEvent::try_from(e).ok())`；`(OutputId, OutputEvent)` 与 `(SurfaceId, LayerSurfaceEvent)` 也一样。
+- **混成器自己的调用触发的信号**（`seat.set_keyboard_focus()` 发出的焦点事件之类）同样进队列，在下一次
+  `dispatch()` 或 `display.events()` 时出现，而不是当场返回。
+- **一个线程一个 `Display`。** 队列按线程分，同一线程上的第二个 `Display` 会收到第一个的事件。
 - **事件晚于信号到达。** 信号在 `dispatch` 里发出，Rust 看到时对象可能已经又变了、甚至没了。所以客户端创建的对象
   不以引用交给 Rust，而是以名字：有自己 surface 的（toplevel、popup、layer surface、锁屏 surface、指针约束、
   输入法弹窗）用那个 surface 的 `SurfaceId`，其余（锁、idle 通知与抑制器、text input、输入法）用绑定分配、
   永不复用的 id。`shell.toplevel(id)` 之类返回的句柄每次调用都重新查找；对象销毁后 getter 返回默认值、setter 不做事。
-- **替 Rust 立刻做的事，由 shim 自己做。** 对象销毁时必须马上放开它的地方——`PopupTree`、`LayerManager`、
-  `OutputLayout`——shim 监听销毁信号，不等 Rust 取到 `Destroy` 事件。
+- **替 Rust 立刻做的事，由 C++ 自己做。** 对象销毁时必须马上放开它的地方——`PopupTree`、`LayerManager`、
+  `OutputLayout`、`SceneRenderer` 的每输出状态——都在 C++ 里监听销毁信号，不等 Rust 取到事件。
 - **要同步回答的信号无法转发。** `XdgShell` 的 popup 约束查询改成事先告知（`set_popup_constraint_areas`）；
   xdg-activation 的发 token 请求总是批准。
-- **绑定总在监听。** luminaria 对 `request_maximize` / `request_fullscreen` / `request_minimize` 有一个
-  "没人监听就自己批准"的兜底；绑定每个都监听，所以这个兜底不会发生，回答是 Rust 的事（`examples/minimal.rs` 照兜底的样子回答）。
-- **队列不取就一直长。** 用了某个 global，就在每次 `dispatch` 之后把它的队列取空。
+- **maximize / fullscreen / minimize 默认由库回答。** luminaria 对这三个请求有一个"没人监听就自己批准"的兜底，
+  和不监听它们的 C++ 混成器一样生效；要自己回答，`XdgShell::new(&display)?.forward_window_requests()`，
+  之后它们以 `ToplevelEvent::RequestMaximize` 等到来。
 
 ### `Compositor` 与 `SurfaceId`
 - `Compositor::new(&display)?`：发布 `wl_compositor`。
@@ -340,34 +377,39 @@ seat.touch_up(0);
 seat.touch_frame();
 ```
 
-`seat.next_event()` 报告路由的变化，无论谁引起：`SeatEvent::KeyboardFocus(Option<SurfaceId>)`、
+`Event::Seat` 报告路由的变化，无论谁引起：`SeatEvent::KeyboardFocus(Option<SurfaceId>)`、
 `PointerFocus(Option<SurfaceId>)`、`CursorChange { surface, hotspot, hidden }`（指针焦点所在的客户端设置了光标；
 指针离开时光标回到混成器自己的，报为 `surface: None, hidden: false`）。
 
+- `seat.follow(&source, touch)`：跟随输入源（`backend.input()`）的 keymap 与 capabilities，含启动前已有的；
+  touch 只在 `touch` 为 true 时公布。
+- `seat.release_keys()`：松开客户端以为按着的每个键并清修饰键（切 VT 时）。
+
 ### `XdgShell`
-发布 `xdg_wm_base`（toplevel 与 popup）。`next_event()` 返回 `XdgEvent::Toplevel(SurfaceId, ToplevelEvent)` 或
+发布 `xdg_wm_base`（toplevel 与 popup）。事件是 `Event::Xdg`：`XdgEvent::Toplevel(SurfaceId, ToplevelEvent)` 或
 `XdgEvent::Popup(SurfaceId, PopupEvent)`：
 
 - `ToplevelEvent`：`Created`、`Map`、`Unmap`、`Destroy`；客户端的请求 `RequestMaximize(bool)`、`RequestFullscreen(bool)`、
-  `RequestMinimize`、`RequestMove { serial }`、`RequestResize { serial, edges }`（`util::edge` 位掩码）、
+  `RequestMinimize`（这三个只在 `forward_window_requests()` 之后到来，否则库自己批准）、`RequestMove { serial }`、`RequestResize { serial, edges }`（`util::edge` 位掩码）、
   `RequestWindowMenu { serial, x, y }`；`IdentityChange`（标题 / app id）、`StateChange`（混成器的 setter 真的改了状态）、
   `ParentChange(Option<SurfaceId>)`。
 - `PopupEvent`：`Created { parent }`（layer surface 的 popup 为 `None`）、`Map`、`Unmap`、`Destroy`、`Reposition`、`Grab { serial }`。
 
 ```rust
-let shell = XdgShell::new(&display)?;
+let shell = XdgShell::new(&display)?.forward_window_requests(); // 全屏请求归我们答
 shell.set_bounds(1920, 1080);
-while let Some(event) = shell.next_event() {
+let popups = PopupTree::new(&shell)?; // 从此自己跟随每个 popup
+for event in display.dispatch(None)? {
     match event {
-        XdgEvent::Toplevel(s, ToplevelEvent::Created) => {
+        Event::Xdg(XdgEvent::Toplevel(s, ToplevelEvent::Created)) => {
             let t = shell.toplevel(s).unwrap();
             t.set_maximized(true);
             t.configure(1920, 1080);
         }
-        XdgEvent::Toplevel(s, ToplevelEvent::RequestFullscreen(on)) => {
+        Event::Xdg(XdgEvent::Toplevel(s, ToplevelEvent::RequestFullscreen(on))) => {
             if let Some(t) = shell.toplevel(s) { t.set_fullscreen(on) }
         }
-        XdgEvent::Popup(p, PopupEvent::Created { .. }) => { popups.add(&shell, p); }
+        Event::Xdg(XdgEvent::Popup(..)) => { /* 要一帧；树已经知道了 */ }
         _ => {}
     }
 }
@@ -381,7 +423,7 @@ while let Some(event) = shell.next_event() {
   在哪块屏上。shell 摆 popup 时在 `dispatch` 里同步查询，只能用事先告诉它的；场景一变就更新。不在表里的父亲不受约束。
 
 ### `LayerShell`
-发布 `zwlr_layer_shell_v1`（面板、壁纸、通知、锁屏界面）。`next_event()` 返回 `(SurfaceId, LayerSurfaceEvent)`：
+发布 `zwlr_layer_shell_v1`（面板、壁纸、通知、锁屏界面）。事件是 `Event::Layer(SurfaceId, LayerSurfaceEvent)`：
 `Created`、`Map`、`Unmap`、`Destroy`、`StateChange`（提交了新的层 / 锚点 / 尺寸 / 边距 / 独占区，重新排版）、
 `NewPopup(SurfaceId)`（客户端把这个没有 xdg 父亲的 popup 挂到本 layer surface 上，这是唯一知道它归属的地方）。
 
@@ -392,14 +434,31 @@ while let Some(event) = shell.next_event() {
 
 ### 其余协议的事件
 
-| global | `next_event()` 返回 | 查询与回答 |
+| global | 事件（`Event::…`） | 查询与回答 |
 |---|---|---|
-| `IdleInhibitManager` | `IdleInhibitEvent::{NewInhibitor { inhibitor, surface }, InhibitorDestroy, Changed(bool)}` | `is_inhibited()`、`inhibitor_count()`、`set_visible(id, bool)`（只有可见的抑制器生效） |
-| `IdleNotifier` | `IdleNotifierEvent::{NewNotification, NotificationDestroy, StateChange { notification, idled }}` | `notify_activity()`、`set_inhibited()`、`notification(id)` |
-| `XdgActivation` | `ActivationRequest { surface, token_valid, app_id, requesting_surface, serial }` | 给不给焦点由混成器决定 |
-| `PointerConstraints` | `PointerConstraintEvent::{New, Destroy, RegionChange}(SurfaceId)` | `constraint(surface)`：`kind()`、`region()`、`cursor_hint()`、`activate()`（只在指针焦点在该 surface 时生效）、`deactivate()`；`active_constraint()` |
-| `TextInputManager` | `TextInputEvent::{New, Enable, Disable, Commit, Destroy}(TextInputId)` | `focused()`、`text_input(id)`：`state()`、`surrounding_text()`、`send_preedit_string` / `send_commit_string` / `send_delete_surrounding_text` / `send_done` |
-| `DataDeviceManager`、`PrimarySelectionManager` | `next_selection_change() -> Option<Vec<String>>`（新所有者提供的 MIME 类型，空表示清空） | `selection_mime_types()`、`selection_receive(mime, OwnedFd)`（写进管道写端，dispatch 后读另一端） |
+| `IdleInhibitManager` | `IdleInhibit(IdleInhibitEvent)`：`IdleInhibitEvent::{NewInhibitor { inhibitor, surface }, InhibitorDestroy, Changed(bool)}` | `is_inhibited()`、`inhibitor_count()`、`set_visible(id, bool)`（只有可见的抑制器生效） |
+| `IdleNotifier` | `IdleNotifier(IdleNotifierEvent)`：`IdleNotifierEvent::{NewNotification, NotificationDestroy, StateChange { notification, idled }}` | `notify_activity()`、`set_inhibited()`、`notification(id)` |
+| `XdgActivation` | `Activation(ActivationEvent)`：`ActivationRequest { surface, token_valid, app_id, requesting_surface, serial }` | 给不给焦点由混成器决定 |
+| `PointerConstraints` | `PointerConstraint(…)`：`PointerConstraintEvent::{New, Destroy, RegionChange}(SurfaceId)` | `constraint(surface)`：`kind()`、`region()`、`cursor_hint()`、`activate()`（只在指针焦点在该 surface 时生效）、`deactivate()`；`active_constraint()` |
+| `TextInputManager` | `TextInput(…)`：`TextInputEvent::{New, Enable, Disable, Commit, Destroy}(TextInputId)` | `focused()`、`text_input(id)`：`state()`、`surrounding_text()`、`send_preedit_string` / `send_commit_string` / `send_delete_surrounding_text` / `send_done` |
+| `DataDeviceManager`、`PrimarySelectionManager` | `Selection(SelectionChange { primary, mime_types })`（新所有者提供的 MIME 类型，空表示清空） | `selection_mime_types()`、`selection_receive(mime, OwnedFd)`（写进管道写端，dispatch 后读另一端） |
+
+### `CoreGlobals`
+每个可用混成器都要的那一组，一次建好（C++ `CoreGlobals` 的对应物）：wl_shm、wl_compositor、wl_subcompositor、
+xdg-shell、wl_seat、剪贴板与 primary selection、single-pixel-buffer、presentation-time、viewporter、fractional-scale、
+cursor-shape、xdg-decoration。两个选区管理器借的 seat 归它自己，所以它是一个可以移动、可以放进结构体的值：
+```rust
+let globals = CoreGlobals::new(&display)?;          // 或 with_seat_name(&display, "seat1")
+let (shell, seat) = (globals.shell(), globals.seat());
+globals.fractional_scale().set_scale(surface, 1.5); // 精确值 + 向上取整的整数提示
+```
+`forward_window_requests()` 同 `XdgShell` 的。linux-dmabuf（要渲染器）与其余协议照下面单独建。
+
+### `OutputGlobal`
+`OutputGlobal::for_output(&display, &output, &layout, name)` 建一个跟随输出与布局的 wl_output：mode 变化重发 mode、
+scale、transform，布局变化重发位置，输出销毁后停止跟随；空名字取 `luminaria-<n>`。`OutputGlobal::new(&display, w, h, name)`
+加 setter 留给不来自后端的输出。查询：`logical_position()`、`logical_size()`、`size()`、`scale()`、`transform()`、
+`refresh_mhz()`、`name()`。
 
 ### 协议扩展管理器
 所有管理器均采用统一构建规范，内部 RAII 管理协议生命周期：
@@ -437,22 +496,22 @@ let _text_input      = TextInputManager::new(&display, &seat)?;
 
 ### `VulkanRenderer`
 - `VulkanRenderer::new(&VulkanOptions::default())`：初始化 Vulkan 1.3 上下文（要求 Dynamic Rendering、Timeline Semaphore 与 dmabuf 扩展支持）。裸机上传 `VulkanOptions { drm_device: DrmDeviceId::from_fd(&drm) }`，让渲染器就是显示所在的那块 GPU。
-- `vulkan.scanout_modifiers(drm_format)`：读取显卡支持的内存布局 modifier。
+- `vulkan.scanout_modifiers(DrmFourcc::Xrgb8888)`：读取显卡支持的内存布局 modifier（`util::DrmFourcc`，来自 `drm-fourcc` crate）。
 
-### `SceneRenderer` 与 `SceneOutput`
-全自动具备 GPU 混合及 CPU 降级能力的场景呈现引擎：
+### `SceneRenderer`
+全自动具备 GPU 混合及 CPU 降级能力的场景呈现引擎。每块输出的渲染状态由它自己按输出保存，输出销毁时丢掉：
 ```rust
-use luminaria::gpu::{SceneRenderer, SceneOutput, VulkanOptions, SceneOutcome};
+use luminaria::gpu::{SceneRenderer, VulkanOptions, SceneOutcome};
 use luminaria::util::Color;
 
 let renderer = SceneRenderer::new(&VulkanOptions::default())?;
-let mut state = SceneOutput::new(); // 第一次 reset/present 后借用 renderer
 
-// 在输出模式变更或初始化时重置缓冲区绑定
-renderer.reset(&mut state, &mut output, 0x34325241 /* DRM_FORMAT_ARGB8888 */)?;
+// 每块输出一次（默认 XRGB8888；reset_with_format(&mut output, DrmFourcc::Argb8888) 换格式），
+// 之后的 mode 变化它自己重新分配
+renderer.reset(&mut output)?;
 
-// 提交场景列表进行呈现
-let outcome = renderer.present(&mut state, &mut output, &scene_items, Color::rgb(0.0, 0.0, 0.0))?;
+// 在 OutputEvent::Frame 上提交场景：present 用输出坐标，present_in 用布局坐标
+let outcome = renderer.present_in(&layout, &mut output, &scene_items, Color::rgb(0.0, 0.0, 0.0))?;
 match outcome {
     SceneOutcome::Composited => { /* GPU 成功合成 */ }
     SceneOutcome::Scanout => { /* 客户端全屏零拷贝直出 */ }
@@ -460,6 +519,7 @@ match outcome {
     SceneOutcome::Cpu => { /* 降级至 CPU 软件混合 */ }
 }
 ```
+`gpu_output(&output)` 说这块输出现在走不走 GPU，`read_back(&output)` 读回上一帧。
 
 ### `Cursor`
 指针及其图像：主题、cursor-shape、客户端精灵、KMS 光标平面。`Cursor::new(&renderer, &layout, &seat)?`
@@ -471,6 +531,7 @@ match outcome {
 - `Frame::new(&mut output, &vulkan)?`
 - `frame.begin(viewport)`
 - `frame.place_rect(rect, color)`
+- `frame.reset(DrmFourcc::Xrgb8888)`
 - `frame.submit(background)`
 - `frame.send_frame_done(time_ms)`
 
@@ -495,7 +556,7 @@ match outcome {
   let ws = wm.create_workspace(group, "Workspace 1");
   wm.activate_workspace(ws);
   ```
-- **`SessionLockManager`**：`ext-session-lock` 锁屏协议。`next_event()` 返回 `SessionLockEvent`：`NewLock(LockId)`、
+- **`SessionLockManager`**：`ext-session-lock` 锁屏协议。事件 `Event::SessionLock(SessionLockEvent)`：`NewLock(LockId)`、
   `NewSurface { lock, surface }`、`SurfaceMap`、`SurfaceDestroy`、`LockDestroy { lock, unlocked }`。盖住所有输出后
   `locks.lock(id).send_locked()`，拒绝用 `send_finished()`；`lock_surface(surface)` 的句柄 `is_on(&output_global)`、
   `configure(w, h)`。它**失败即锁定**：锁屏客户端没解锁就死了，`unlocked` 为 false，`is_locked()` 仍为 true，
@@ -503,7 +564,7 @@ match outcome {
 - **`OutputManager`**：为 `kanshi`、`wlr-randr` 等外部多屏配置工具提供查询与动态布局修改接口。
 - **`DataControlManager`**：为 `wl-clipboard` 等无窗口剪贴板工具提供特权读取与写入接口。
 - **`InputMethodManager`**：为 Fcitx / IBus 等输入法引擎提供候选词窗口绑定与键盘抢占支持；与 `TextInputManager`
-  之间的桥接它自己完成。`next_event()` 返回 `InputMethodEvent`：`New`、`GrabChange { input_method, grabbed }`、`Destroy`、
+  之间的桥接它自己完成。事件 `Event::InputMethod(InputMethodEvent)`：`New`、`GrabChange { input_method, grabbed }`、`Destroy`、
   `NewPopupSurface { input_method, surface }`、`PopupSurfaceDestroy`。抢占键盘期间按键经 `input_method(id).grab_send_key(...)`
   送给输入法，候选窗口放在 `popup_text_input_rectangle(surface)` 旁边。
 
@@ -552,10 +613,15 @@ if hit.hit {
 ```
 
 ### `PopupTree`
-已映射的 popup 及其位置：`popups.add(&shell, popup)`（layer surface 的 popup 用 `add_with_parent(&shell, popup, layer_surface)`）、
-`set_mapped`、`append_to(&mut scene)`（每个 popup 接在父 surface 之上、按偏移摆放、带父窗口的 tag，子菜单嵌套）、
+`PopupTree::new(&shell)` 从此自己跟随 shell 的每个 popup（创建、映射、取消映射、重定位、销毁），混成器只画它；
+layer surface 的 popup 用 `set_parent(&shell, popup, layer_surface)` 指定父亲。`append_to(&mut scene)`（每个 popup 接在父 surface 之上、按偏移摆放、带父窗口的 tag，子菜单嵌套）、
 `contains`、`active_grab`、`dismiss_grabs_outside(seat.pointer_focus())`（点在所有 popup 外面就关掉抢占的那些，返回 true
-时这次点击不该交给客户端）。popup 销毁时它自己放手，不借用 `XdgShell`。
+时这次点击不该交给客户端）。不借用 `XdgShell`：shell 先死，它的连接自动失效。
+
+### `scene_route_pointer` 与 `scene_surface_origin`
+`scene_route_pointer(&seat, &items, x, y)` 是指针路由：按住按钮（隐式 grab）期间每次运动都按 grab 表面自己的坐标
+发过去，否则把焦点给命中的表面、或在空白处清掉焦点；返回命中结果。`scene_surface_origin(&items, surface)` 是它用的
+那一半：某个表面（子表面也算）的原点画在哪。`SceneItem::kind` 是 `SceneKind::{Surface, Rect, Border, Image}`。
 
 ### `LayerManager`
 按输出管理 layer surface：`add(&layers, surface, output_id)`（`output_id` 由混成器自定）、`set_mapped`、
@@ -576,7 +642,7 @@ if hit.hit {
 use std::time::Duration;
 use luminaria::core::Display;
 use luminaria::backend::HeadlessBackend;
-use luminaria::protocol::{Compositor, XdgShell, Seat, OutputGlobal};
+use luminaria::protocol::{CoreGlobals, OutputGlobal};
 use luminaria::shell::{CpuCompositor, OutputLayout, SceneItem};
 use luminaria::util::{Color, Rect};
 
@@ -592,19 +658,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = backend.add_output(1024, 768)?;
     backend.start()?;
 
-    // 3. 注册协议接口
-    let _compositor = Compositor::new(&display)?;
-    let xdg_shell = XdgShell::new(&display)?;
-    xdg_shell.set_bounds(1024, 768);
-    let seat = Seat::new(&display, "seat0")?;
-    seat.set_capabilities(true, true, false);
+    // 3. 注册每个混成器都要的协议接口
+    let globals = CoreGlobals::new(&display)?;
+    globals.shell().set_bounds(1024, 768);
+    globals.seat().set_capabilities(true, true, false);
 
     // 4. 多屏坐标排版
     let layout = OutputLayout::new()?;
     layout.add(&mut output, 0, 0);
 
-    // 5. 向客户端发布输出全局描述符
-    let _out_global = OutputGlobal::new(&display, 1024, 768, "HEADLESS-1")?;
+    // 5. 向客户端发布跟随这块输出的 wl_output
+    let _out_global = OutputGlobal::for_output(&display, &output, &layout, "HEADLESS-1")?;
 
     // 6. 构造场景并完成一帧合成
     let mut cpu_comp = CpuCompositor::new()?;
@@ -620,9 +684,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pixels = cpu_comp.finish(1024, 768, Color::rgb(0.0, 0.0, 0.0));
     output.commit_frame(&pixels, 1024, 768)?;
 
-    // 7. 单步驱动事件循环
-    display.dispatch(Some(Duration::ZERO))?;
-    display.flush_clients();
+    // 7. 单步驱动事件循环，处理这一轮的事件
+    for event in display.dispatch(Some(Duration::ZERO))? {
+        println!("{event:?}");
+    }
 
     println!("Custom compositor loop tick completed successfully.");
     Ok(())
@@ -690,22 +755,22 @@ let renderer = SceneRenderer::new(&options)?;
 ### 9.3 裸机输入、显示器热插拔、VT 切换
 
 绑定原先拿不到 `LibinputBackend` 的输入，也拿不到 `DrmBackend` 找到的显示器，所以 Rust 写不了裸机混成器。
-补法与嵌套后端一样：shim 把信号排进队列，Rust 在 `dispatch()` 返回后取。
+补法与嵌套后端一样：shim 把信号推进事件队列，`dispatch()` 返回时交给 Rust（§4「事件」）。
 
 - **`LibinputBackend` 是一个 `InputSource`**（见 §3「输入」）：按键、修饰键、相对移动、按钮、滚轮
   （平滑量 + 刻度 + 停止标记）、触摸（down/motion/up/frame/cancel，坐标归一化到触摸屏）、设备能力变化。
   另有 `set_keymap()`，以及对应 `create_path()` 的 `LibinputBackend::new_path()`。
-- **`DrmBackend::next_event() -> Option<BackendEvent>`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`
-  （原名 `DrmEvent`；`AutoBackend::next_event()` 给的也是它，于是改了名）。
+- **`Event::Backend(BackendEvent)`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`，DRM 与 `AutoBackend` 都是它。
   `start()` 时已有的显示器也以 `OutputAdded` 到来。显示器被拔掉后，手里的 `Output` 仍可安全调用，只是一切都成了
   空操作（`Output::is_alive()` 为 false），收到 `OutputRemoved` 时丢掉即可。`Output::id()` 是比较身份用的。
 - **`OutputLayout::add_auto()` / `bounds()`**：从左到右排；所有输出的外框，相对指针就夹在里面。
   **`Cursor::position()`** 读回 `move_by()` 夹过之后指针在哪，不必在 Rust 里再算一遍。
-- **`OutputLayout` 在显示器销毁时自动把它移除。** 这不是策略：C++ 的混成器在 `Output::destroy` 回调里同步移除，
-  Rust 只能等到 `dispatch()` 返回才知道，而在那之前 `Cursor` 可能已经在用这个 layout。shim 自己挂 destroy
-  信号，避免留下悬垂指针。`SceneOutput` 本来就会自行解绑。
-- **`Output::take_mode_changed()`**：`set_mode()` 生效后为真一次，此时要 `reset()` 渲染状态、重新排版。
-- **`Session::next_activity() -> Option<bool>`**：VT 切走 / 切回。切走时该把发给客户端的按下状态全部放开。
+- **`OutputLayout` 在显示器销毁时自动把它移除**，换 mode 时保留位置、换上新尺寸——现在 C++ 的 `OutputLayout`
+  自己就这么做，渲染器的每输出状态同样自行解绑。
+- **`OutputEvent::ModeChanged`**：`set_mode()` 生效。渲染器、布局与跟随的 `OutputGlobal` 已经跟上，剩下的只有
+  混成器自己按旧尺寸摆的东西（窗口大小）。
+- **`Event::SessionActive(bool)`**：VT 切走 / 切回。切走时 `seat.release_keys()`；`session.switch_vt_for(keysym)` 是
+  Ctrl+Alt+Fn 那个绑定。
 
 ### 9.4 Vulkan 原始句柄（cargo feature `raw-vulkan`）
 
@@ -738,7 +803,14 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 告诉客户端位置、模式、缩放与朝向。C++ 版没有 layer shell 与锁屏，所以 Rust 版也没有（两者保持同步）；
 它们的用法见 `tests/test_layer_shell.rs`、`tests/test_session_lock.rs`。
 
-与 C++ 版曾有的差别现已全部补齐，两个示例在行为上已经一致：
+与 C++ 版曾有的差别现已全部补齐，两个示例在行为上已经一致，并且建在同一组库机制上：`CoreGlobals`、
+跟随输出与布局的 `OutputGlobal`、跟随 shell 的 `PopupTree`、`scene_route_pointer`、`KeyRouter::route` +
+`Session::switch_vt_for` + `Seat::release_keys`、`Seat::follow`、用布局坐标的 `present`。两者剩下的差别只在
+语言本身：C++ 在信号回调里处理，Rust 在 `dispatch()` 返回的事件上 match；popup 约束 C++ 同步回答、Rust 事先告知；
+Rust 版一个带 lifetime 的结构体都没写。行数：C++ 639 → 500，Rust 677 → 420。
+
+- **窗口状态请求**：两边都不回答 maximize / fullscreen / minimize，由库按兜底批准（Rust 不调
+  `forward_window_requests()`）。
 
 - **后端由库来挑**：两边都只读环境变量、填一个 `BackendOptions`，交给 `AutoBackend`。之前两边各自写了约 50 行
   挑后端的代码，每个基于本库的混成器都会照抄一遍；Rust 版还为此带着一个本地 `enum Backend` 和一个 `'pick:`
@@ -752,11 +824,11 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 
 - **首选缓冲缩放与分数缩放**：窗口 map 时把输出的整数缩放与分数缩放发给客户端——`SurfaceId::set_preferred_buffer_scale(scale)`、
   `SurfaceId::set_preferred_buffer_transform(transform)` 对应 `wl_surface.preferred_buffer_scale` /
-  `preferred_buffer_transform`（`wl_surface` v6 起），`FractionalScaleManager::set_scale(surface, scale_120ths)`
-  对应 `wp_fractional_scale_v1.preferred_scale`（120 分之一；另有 `set_scale_f64(1.5)`）。输出缩放变化后要重新发。
+  `preferred_buffer_transform`（`wl_surface` v6 起），`FractionalScaleManager::set_scale(surface, 1.5)` 同时发
+  `wp_fractional_scale_v1.preferred_scale` 与向上取整的整数提示，两个示例都只调它。输出缩放变化后要重新发。
 - **子表面树**：`SurfaceId::surface_tree() -> Vec<SurfaceAt>` 按后到前的顺序给出这棵树（含子表面），
-  每一项的 `x`/`y` 是它相对根表面的偏移。按住按钮、抓取落在子表面上时，用它算出该子表面在屏幕上的原点
-  （场景项的位置 + 偏移），指针坐标才不会按整个窗口的原点算。
+  每一项的 `x`/`y` 是它相对根表面的偏移。按住按钮、抓取落在子表面上时，`scene_route_pointer` 用它算出该子表面
+  在屏幕上的原点（场景项的位置 + 偏移），指针坐标才不会按整个窗口的原点算。
 
 另有两条与「对象活得比输出久」相关的约定，热插拔时靠它们兜底：`Frame`（借用 `VulkanRenderer` 的那个）
 在输出销毁时被 shim 直接丢弃，之后 `reset` / `submit` 返回错误、其余方法是空操作；`DirectScanout`
@@ -768,27 +840,27 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 - **`LinuxDmabuf` 与 GPU 共享**：可通过 `LinuxDmabuf::from_scene_renderer(&display, &renderer)`（或 `renderer.create_linux_dmabuf(&display)`）直接从 `SceneRenderer` 创建；`examples/minimal.rs` 已接驳该协议，GPU 客户端可直接走零拷贝 dmabuf。
 - **光标形状协议 (`cursor-shape`)**：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接入光标引擎，自动呈现客户端请求的命名光标形状，已在 `examples/minimal.rs` 中完整启用。
 - **图像数据输入 (`SceneItem::image`)**：`SceneRenderer::set_image(serial, width, height, rgba: &[u8])` 接受紧凑排布的原始 RGBA `&[u8]` 字节切片（`image` crate 的图像缓冲区可直接传入），与场景中的 `SceneItem::image(rect, serial)` 对应；GPU 路径按 serial 自动去重缓存与动态上传，CPU 路径自动回退合成。
-- **显示器配置 (`OutputGlobal`)**：支持完整的 `position()`、`logical_position()`、`size()`、`logical_size()`、`scale()`、`transform()`、`refresh_mhz()`、`name()` 查询与设置，并提供 `with_properties()` 构造器。
+- **显示器配置 (`OutputGlobal`)**：`for_output()` 跟随输出与布局；`logical_position()`、`size()`、`logical_size()`、`scale()`、`transform()`、`refresh_mhz()`、`name()` 读的都是 C++ global 当前描述的值。
 - **分类错误类型 (`core::ErrorKind`)**：`core::Error` 现包含可模式匹配的 `ErrorKind`（`err.kind()`），涵盖 `Init`、`EventLoop`、`Backend`、`Gpu`、`Protocol`、`Shell`、`InvalidArgument`、`Other`；保留 `Display` 与 `std::error::Error` 实现，可无缝配合 `?` 操作符、`anyhow` 与 `thiserror`。
 - **几何类型转换 (`mint` / `glam` 特性)**：提供可选 cargo 特性 `mint` 与 `glam`，为 `Rect`、`Color`、`Point` 提供 `From`/`Into` 实现，避免调用者受孤儿规则限制而编写 newtype 包装。
 - **事件循环集成 (`calloop` 与 `tokio`)**：
-  - **`calloop`**：`Display` 实现了 `AsFd`，可将其文件描述符通过 `calloop::generic::Generic` 注册至 calloop 事件循环（详见 `examples/calloop.rs`）。就绪时调用 `display.dispatch(Some(Duration::ZERO))` 排干底层事件与定时器，随后调用各协议包装对象的 `next_event()` 排干事件队列。
+  - **`calloop`**：`Display` 实现了 `AsFd`，可将其文件描述符通过 `calloop::generic::Generic` 注册至 calloop 事件循环（详见 `examples/calloop.rs`）。就绪时调用 `display.dispatch(Some(Duration::ZERO))`，处理它返回的事件；自己派发事件循环的调用者用 `display.events()`。
   - **`tokio`**：注意 luminaria 所有类型均为 `!Send`（所有 Wayland 对象、后端句柄与 C++ 状态均绑定至创建 `wl_display` 的单线程主循环）。因此在 tokio 中必须使用单线程运行时（`tokio::runtime::Builder::new_current_thread()`）或在 `tokio::task::LocalSet` 内运行；使用 `tokio::io::unix::AsyncFd::new(display.as_fd())` 监听可读就绪事件，随后执行非阻塞 `display.dispatch(Some(Duration::ZERO))` 并清空就绪标记（`guard.clear_ready()`）。
 
-整个绑定现已完整转发全部信号（C++ 产生信号时将 `EventRaw` 入队，Rust 侧通过对应包装类型的 `next_event()` 取出）：
+整个绑定现已完整转发全部信号（C++ 产生信号时按触发顺序推进同一条队列，`dispatch()` 返回时成为 `Event`）：
 
 - **`Compositor`**：`CompositorEvent::NewSurface`，以及每个 surface 的 `Commit`、`Destroy`、`Rendered` 与全局的 `Invalidated`。
-- **`Output`**：`OutputEvent::Present(PresentEvent)`（亦可通过 `output.next_present()` 获取，包含硬件时钟与单调时间戳、刷新周期与垂直同步标志）。
-- **`WaylandBackend`**：作为 `InputSource` 转发 `Key`（带 keysym）、`MotionAbsolute`（带输出）、`PointerLeave`、`Button`、`Modifiers`、`Axis`（平滑滚动量、离散步进刻度与停止标记）、`KeymapChange` 与 `Capabilities`；关窗请求经 `take_close_request()`。
+- **`Output`**：`Event::Output(id, OutputEvent::{Frame, Present(PresentEvent), ModeChanged})`（`PresentEvent` 含硬件时钟与单调时间戳、刷新周期与垂直同步标志）。
+- **`WaylandBackend`**：作为 `InputSource` 转发 `Key`（带 keysym）、`MotionAbsolute`（带输出）、`PointerLeave`、`Button`、`Modifiers`、`Axis`（平滑滚动量、离散步进刻度与停止标记）、`KeymapChange` 与 `Capabilities`；关窗请求是 `Event::HostCloseRequest`。
 - **需同步回答的信号**（遵照 C++ 绝不调用 Rust 的规矩，策略预先配在 shim 上）：
-  - xdg-activation 的 `ActivationTokenRequest`：默认批准（可通过 `set_grant_tokens(bool)` 预设策略），同时入队到 `next_event()`。
-  - cursor-shape 的 `CursorShapeRequest`：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接进 `Cursor`，在 C++ 信号发射期间直接由光标引擎同步呈现所请求的光标；`CursorShapeManager::next_event()` 亦可获取该请求。
+  - xdg-activation 的 `ActivationTokenRequest`：默认批准（可通过 `set_grant_tokens(bool)` 预设策略），同时作为 `Event::Activation` 到来。
+  - cursor-shape 的 `CursorShapeRequest`：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接进 `Cursor`，在 C++ 信号发射期间直接由光标引擎同步呈现所请求的光标；该请求同时作为 `Event::CursorShape` 到来。
 - **桌面协议请求**：
-  - `XdgDecorationManager`：`next_event() -> Option<DecorationRequest>`（携带表面、客户端偏好与最终决议），可由 `set_default_mode` 预先配置默认模式。
-  - `ForeignToplevelManager`：`next_event() -> Option<ForeignToplevelRequest>`（最大化、最小化、全屏、激活、关闭等请求）。
-  - `WorkspaceManager`：`next_event() -> Option<WorkspaceRequest>`（激活、反激活、创建、移除等工作区请求）。
-  - `OutputManager`：`next_event() -> Option<OutputConfigRequest>`（测试与应用请求，可通过 `set_auto_verdict` 设置默认裁决）。
-  - `XdgToplevelIconManager`：`next_event() -> Option<ToplevelIconChange>`，并提供 `icon_name(surface)` 查询客户端设定的图标名。
+  - `XdgDecorationManager`：`Event::Decoration(DecorationRequest)`（携带表面、客户端偏好与最终决议），可由 `set_default_mode` 预先配置默认模式。
+  - `ForeignToplevelManager`：`Event::ForeignToplevel(ForeignToplevelRequest)`（最大化、最小化、全屏、激活、关闭等请求）。
+  - `WorkspaceManager`：`Event::Workspace(WorkspaceRequest)`（激活、反激活、创建、移除等工作区请求）。
+  - `OutputManager`：`Event::OutputConfig(OutputConfigRequest)`（测试与应用请求，可通过 `set_auto_verdict` 设置默认裁决）。
+  - `XdgToplevelIconManager`：`Event::ToplevelIcon(ToplevelIconChange)`，并提供 `icon_name(surface)` 查询客户端设定的图标名。
 
 DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 上的运行还没有验证过。
 

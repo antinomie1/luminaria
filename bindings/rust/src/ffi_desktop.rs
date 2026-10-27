@@ -5,9 +5,8 @@
 //! output configuration — which ADR 0003 keeps out of the core module because
 //! each of them lets one client enumerate or drive another client's objects.
 //!
-//! `DesktopGlobals` is here rather than in the core bridge because it wires up
-//! every one of those globals, and it takes a `VulkanRenderer`, so the feature
-//! depends on `gpu`.
+//! It needs nothing of `luminaria.gpu`: a nested or headless desktop shell
+//! pays for no Vulkan.
 
 #[cxx::bridge(namespace = "lum")]
 pub(crate) mod ffi {
@@ -37,12 +36,10 @@ pub(crate) mod ffi {
         type DataDeviceManagerShim = crate::ffi::DataDeviceManagerShim;
         type OutputGlobalShim = crate::ffi::OutputGlobalShim;
         type OutputLayoutShim = crate::ffi::OutputLayoutShim;
-        type VulkanRendererShim = crate::ffi_gpu::VulkanRendererShim;
 
         type ForeignToplevelManagerShim;
         fn foreign_toplevel_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ForeignToplevelManagerShim>;
         fn foreign_toplevel_track(ftm: Pin<&mut ForeignToplevelManagerShim>, shell: &XdgShellShim);
-        fn next_event(self: &ForeignToplevelManagerShim, out: &mut EventRaw) -> bool;
 
         type WorkspaceManagerShim;
         fn workspace_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<WorkspaceManagerShim>;
@@ -50,11 +47,9 @@ pub(crate) mod ffi {
         fn create_workspace(self: &WorkspaceManagerShim, group: u32, name: &str) -> u32;
         fn remove_workspace(self: &WorkspaceManagerShim, workspace: u32);
         fn activate_workspace(self: &WorkspaceManagerShim, workspace: u32);
-        fn next_event(self: &WorkspaceManagerShim, out: &mut EventRaw) -> bool;
 
         type SessionLockManagerShim;
         fn session_lock_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SessionLockManagerShim>;
-        fn next_event(self: &SessionLockManagerShim, out: &mut EventRaw) -> bool;
         fn locked(self: &SessionLockManagerShim) -> bool;
         fn current(self: &SessionLockManagerShim) -> u64;
         fn lock_locked(self: &SessionLockManagerShim, lock: u64) -> bool;
@@ -69,14 +64,12 @@ pub(crate) mod ffi {
         fn output_manager_new(display: &DisplayShim, layout: &OutputLayoutShim, error: &mut String) -> UniquePtr<OutputManagerShim>;
         fn update(self: Pin<&mut OutputManagerShim>);
         fn set_auto_verdict(self: &OutputManagerShim, succeed: bool);
-        fn next_event(self: &OutputManagerShim, out: &mut EventRaw) -> bool;
 
         type DataControlManagerShim;
         fn data_control_manager_new(display: &DisplayShim, ddm: &DataDeviceManagerShim, error: &mut String) -> UniquePtr<DataControlManagerShim>;
 
         type InputMethodManagerShim;
         fn input_method_manager_new(display: &DisplayShim, seat: &SeatShim, tim: &TextInputManagerShim, error: &mut String) -> UniquePtr<InputMethodManagerShim>;
-        fn next_event(self: &InputMethodManagerShim, out: &mut EventRaw) -> bool;
         fn current(self: &InputMethodManagerShim) -> u64;
         fn active(self: &InputMethodManagerShim, input_method: u64) -> bool;
         fn has_keyboard_grab(self: &InputMethodManagerShim, input_method: u64) -> bool;
@@ -86,8 +79,5 @@ pub(crate) mod ffi {
         fn popup_surfaces(self: &InputMethodManagerShim, input_method: u64) -> Vec<u64>;
         fn popup_text_input_rectangle(self: &InputMethodManagerShim, surface_id: u64) -> Rect;
 
-        type DesktopGlobalsShim;
-        fn desktop_globals_new(display: &DisplayShim, renderer: &VulkanRendererShim, seat_name: &str, error: &mut String) -> UniquePtr<DesktopGlobalsShim>;
-        fn desktop_globals_new_headless(display: &DisplayShim, seat_name: &str, error: &mut String) -> UniquePtr<DesktopGlobalsShim>;
     }
 }

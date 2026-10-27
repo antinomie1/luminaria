@@ -52,8 +52,8 @@ fn libinput_path_context_starts_empty() {
     assert_eq!(input.capabilities(), InputCapabilities::default());
     assert!(!input.keymap().is_empty(), "the console layout compiles");
     assert!(input.add_device("/nonexistent/event0").is_err());
-    display.dispatch(Some(std::time::Duration::ZERO)).unwrap();
-    assert_eq!(input.next_input_event(), None);
+    let events = display.dispatch(Some(std::time::Duration::ZERO)).unwrap();
+    assert!(events.filter(|e| matches!(e, luminaria::Event::Input(_))).count() == 0);
 
     let keymap = input.keymap();
     assert!(input.set_keymap(&keymap));
@@ -69,7 +69,6 @@ fn output_identity_and_liveness() {
     let mut b = backend.add_output(640, 480).unwrap();
     assert_ne!(a.id(), b.id());
     assert!(a.is_alive() && b.is_alive());
-    assert!(!a.take_mode_changed());
 
     let layout = OutputLayout::new().unwrap();
     layout.add_auto(&mut a);
@@ -120,7 +119,7 @@ fn output_dependants_survive_their_output() {
     };
     let mut frame = renderer.as_ref().map(|renderer| {
         let mut frame = Frame::new(&mut output, renderer).expect("frame");
-        assert!(frame.reset(0x34325258).is_ok(), "headless has a render target");
+        assert!(frame.reset(luminaria::util::DrmFourcc::Xrgb8888).is_ok(), "headless has a render target");
         assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_ok());
         frame
     });
@@ -139,14 +138,13 @@ fn output_dependants_survive_their_output() {
     assert_eq!(direct.cached(), 0);
 
     if let Some(frame) = frame.as_mut() {
-        assert!(frame.reset(0x34325258).is_err(), "reset after hotplug fails");
+        assert!(frame.reset(luminaria::util::DrmFourcc::Xrgb8888).is_err(), "reset after hotplug fails");
         assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_err());
         frame.begin(Rect::new(0, 0, 640, 480));
         frame.place_rect(Rect::new(0, 0, 10, 10), Color::rgb(1.0, 0.0, 0.0));
         frame.send_frame_done(0);
     }
-    let mut state = luminaria::gpu::SceneOutput::new();
-    assert!(scene.reset(&mut state, &mut output, 0x34325258).is_err());
+    assert!(scene.reset(&mut output).is_err());
 }
 
 #[cfg(feature = "raw-vulkan")]

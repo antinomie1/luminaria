@@ -9,7 +9,7 @@ use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi_gpu as ffi;
 use crate::protocol::{Presentation, Seat, SurfaceId};
 use crate::shell::{OutputLayout, SceneItem};
-use crate::util::{Color, Rect};
+use crate::util::{Color, DrmFourcc, Rect};
 
 pub use crate::ffi_gpu::DrmDeviceId;
 
@@ -102,8 +102,8 @@ impl VulkanRenderer {
         }
     }
 
-    pub fn scanout_modifiers(&self, drm_format: u32) -> Vec<u64> {
-        self.raw.scanout_modifiers(drm_format)
+    pub fn scanout_modifiers(&self, format: DrmFourcc) -> Vec<u64> {
+        self.raw.scanout_modifiers(format as u32)
     }
 
     /// The instance, device and queue this renderer runs on, for ash.
@@ -190,35 +190,6 @@ impl<'d> ScreencopyManager<'d> {
     }
 }
 
-/// Per-output scene rendering state (GPU ledger or CPU scratch).
-///
-/// The first [`SceneRenderer::reset`] or [`SceneRenderer::present`] binds it to
-/// that renderer, whose textures and render targets it then caches, so `'r` is
-/// the renderer's borrow: the renderer cannot drop while this does not.
-pub struct SceneOutput<'r> {
-    pub(crate) raw: cxx::UniquePtr<ffi::SceneOutputShim>,
-    _renderer: Holds<'r>,
-}
-
-impl SceneOutput<'_> {
-    pub fn new() -> Self {
-        Self {
-            raw: ffi::scene_output_new(),
-            _renderer: Holds::new(),
-        }
-    }
-
-    pub fn gpu_output(&self) -> bool {
-        self.raw.gpu_output()
-    }
-}
-
-impl Default for SceneOutput<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Outcome of presenting a scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneOutcome {
@@ -229,21 +200,23 @@ pub enum SceneOutcome {
 }
 
 impl SceneOutcome {
-    fn from_raw(code: i32) -> Self {
+    fn from_result(code: i32, error: String) -> Result<Self, Error> {
         match code {
-            0 => Self::Composited,
-            1 => Self::Scanout,
-            2 => Self::Unchanged,
-            _ => Self::Cpu,
+            0 => Ok(Self::Composited),
+            1 => Ok(Self::Scanout),
+            2 => Ok(Self::Unchanged),
+            3 => Ok(Self::Cpu),
+            _ => Err(Error::new(ErrorKind::Gpu, error)),
         }
     }
 }
 
 /// Unified scene presenter over Vulkan GPU and CPU fallback.
 ///
-/// [`Cursor`] and every [`SceneOutput`] keep it borrowed while they live, so
-/// its methods take `&self`. It borrows nothing itself, which is what lets it
-/// be declared before the [`Display`] and so be the last thing to go.
+/// It keeps every output's render state itself, by output, and drops it when
+/// the output is destroyed, so there is nothing per output for the compositor
+/// to hold. [`Cursor`] and [`LinuxDmabuf`] keep it borrowed while they live,
+/// so its methods take `&self`. It borrows nothing itself.
 pub struct SceneRenderer {
     pub(crate) raw: cxx::UniquePtr<ffi::SceneRendererShim>,
 }
@@ -268,53 +241,53 @@ impl SceneRenderer {
         self.raw.gpu_error()
     }
 
-    /// Bind `state` to `output` and to this renderer, and size its render
-    /// targets for the output's current mode.
-    pub fn reset<'r>(
-        &'r self,
-        state: &mut SceneOutput<'r>,
-        output: &mut Output,
-        drm_format: u32,
-    ) -> Result<(), Error> {
+    /// Size this output's render targets for its current mode, in XRGB8888.
+    /// Once per output: a later mode change reallocates by itself. A failure
+    /// is not fatal — the output is drawn on the CPU instead — but is worth
+    /// reporting.
+    pub fn reset(&self, output: &mut Output) -> Result<(), Error> {
+        self.reset_with_format(output, DrmFourcc::Xrgb8888)
+    }
+
+    /// [`reset`](Self::reset) in a format of the caller's choosing.
+    pub fn reset_with_format(&self, output: &mut Output, format: DrmFourcc) -> Result<(), Error> {
         let mut err = String::new();
-        let mut s_pin = state.raw.pin_mut();
-        let mut o_pin = output.raw.pin_mut();
-        if self
-            .raw
-            .reset(s_pin.as_mut(), o_pin.as_mut(), drm_format, &mut err)
-        {
+        if self.raw.reset(output.raw.pin_mut(), format as u32, &mut err) {
             Ok(())
         } else {
             Err(Error::new(ErrorKind::Gpu, err))
         }
     }
 
-    pub fn present<'r>(
-        &'r self,
-        state: &mut SceneOutput<'r>,
+    /// Draw `items`, in `output`'s own logical coordinates, and present them.
+    /// Call it on [`OutputEvent::Frame`](crate::backend::OutputEvent::Frame).
+    pub fn present(&self, output: &mut Output, items: &[SceneItem], background: Color) -> Result<SceneOutcome, Error> {
+        let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+        let mut err = String::new();
+        let (r, g, b, a) = (background.r, background.g, background.b, background.a);
+        let res = self.raw.present(output.raw.pin_mut(), &raw_items, r, g, b, a, &mut err);
+        SceneOutcome::from_result(res, err)
+    }
+
+    /// The same from a scene in `layout`'s coordinates: one list for every
+    /// output, each showing the part `layout` puts it on.
+    pub fn present_in(
+        &self,
+        layout: &OutputLayout,
         output: &mut Output,
         items: &[SceneItem],
         background: Color,
     ) -> Result<SceneOutcome, Error> {
         let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
         let mut err = String::new();
-        let mut s_pin = state.raw.pin_mut();
-        let mut o_pin = output.raw.pin_mut();
-        let res = self.raw.present(
-            s_pin.as_mut(),
-            o_pin.as_mut(),
-            &raw_items,
-            background.r,
-            background.g,
-            background.b,
-            background.a,
-            &mut err,
-        );
-        if res < 0 {
-            Err(Error::new(ErrorKind::Gpu, err))
-        } else {
-            Ok(SceneOutcome::from_raw(res))
-        }
+        let (r, g, b, a) = (background.r, background.g, background.b, background.a);
+        let res = self.raw.present_in(&layout.raw, output.raw.pin_mut(), &raw_items, r, g, b, a, &mut err);
+        SceneOutcome::from_result(res, err)
+    }
+
+    /// Whether `output` is currently drawn on the GPU.
+    pub fn gpu_output(&self, output: &Output) -> bool {
+        self.raw.gpu_output(&output.raw)
     }
 
     /// Where presentation feedback goes. The renderer usually outlives the
@@ -341,10 +314,10 @@ impl SceneRenderer {
         self.raw.vulkan_handles(&mut h).then(|| h.into())
     }
 
-    pub fn read_back(&self, state: &mut SceneOutput<'_>) -> Result<Vec<u8>, Error> {
+    /// The last frame presented on `output`, as RGBA8.
+    pub fn read_back(&self, output: &Output) -> Result<Vec<u8>, Error> {
         let mut err = String::new();
-        let mut s_pin = state.raw.pin_mut();
-        let vec = self.raw.read_back(s_pin.as_mut(), &mut err);
+        let vec = self.raw.read_back(&output.raw, &mut err);
         if vec.is_empty() && !err.is_empty() {
             Err(Error::new(ErrorKind::Gpu, err))
         } else {
@@ -545,9 +518,9 @@ impl<'r> Frame<'r> {
         self.raw.pin_mut()
     }
 
-    pub fn reset(&mut self, drm_format: u32) -> Result<(), Error> {
+    pub fn reset(&mut self, format: DrmFourcc) -> Result<(), Error> {
         let mut err = String::new();
-        if self.pin().reset(drm_format, &mut err) {
+        if self.pin().reset(format as u32, &mut err) {
             Ok(())
         } else {
             Err(Error::new(ErrorKind::Gpu, err))

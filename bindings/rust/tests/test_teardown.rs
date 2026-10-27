@@ -9,7 +9,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, shm_buffer, ClientSide, Peer};
+use common::{shm_buffer, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::desktop::{
     ForeignToplevelManager, InputMethodManager, OutputManager, SessionLockManager, WorkspaceManager,
@@ -248,7 +248,8 @@ fn client(conn: Connection, step: ClientSide) {
 #[test]
 fn globals_and_display_drop_under_a_connected_client() {
     // Before the Display: alive while the Display's drop destroys the client.
-    let mut popups = PopupTree::new().expect("popup tree");
+    // The tree is made from the shell below, but declared here.
+    let mut popups;
     let mut layer_manager = LayerManager::new().expect("layer manager");
     let display = Display::new().expect("display");
     display.init_shm().expect("wl_shm");
@@ -257,6 +258,7 @@ fn globals_and_display_drop_under_a_connected_client() {
     let seat = Seat::new(&display, "seat0").expect("wl_seat");
     seat.set_capabilities(true, true, false);
     let shell = XdgShell::new(&display).expect("xdg-shell");
+    popups = PopupTree::new(&shell).expect("popup tree");
     let layers = LayerShell::new(&display).expect("layer-shell");
     let locks = SessionLockManager::new(&display).expect("session-lock");
     let inhibits = IdleInhibitManager::new(&display).expect("idle-inhibit");
@@ -281,15 +283,15 @@ fn globals_and_display_drop_under_a_connected_client() {
     peer.wait(&display, "holding");
 
     let mut window = None;
-    for event in drain(|| shell.next_event()) {
+    for event in take::<XdgEvent>() {
         match event {
             XdgEvent::Toplevel(s, _) => window = Some(s),
-            XdgEvent::Popup(p, PopupEvent::Created { .. }) => assert!(popups.add(&shell, p)),
+            XdgEvent::Popup(_, PopupEvent::Created { .. }) => {} // the tree follows the shell
             _ => {}
         }
     }
     let window = window.expect("no toplevel");
-    for (s, event) in drain(|| layers.next_event()) {
+    for (s, event) in take::<(luminaria::protocol::SurfaceId, LayerSurfaceEvent)>() {
         if event == LayerSurfaceEvent::Created {
             assert!(layer_manager.add(&layers, s, 1));
         }
@@ -303,7 +305,7 @@ fn globals_and_display_drop_under_a_connected_client() {
     assert_eq!(inhibits.inhibitor_count(), 1);
     assert_eq!(notifier.notification_count(), 1);
     assert!(constraints.constraint(window).is_some());
-    assert!(matches!(drain(|| text_inputs.next_event())[..], [TextInputEvent::New(_), ..]));
+    assert!(matches!(take::<TextInputEvent>()[..], [TextInputEvent::New(_), ..]));
     assert!(input_methods.current().is_some());
     assert_eq!(clipboard.selection_mime_types(), ["text/plain"]);
 

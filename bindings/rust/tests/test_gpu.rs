@@ -3,7 +3,7 @@ use luminaria::core::Display;
 use luminaria::gpu::*;
 use luminaria::protocol::{Presentation, Seat};
 use luminaria::shell::{OutputLayout, SceneItem};
-use luminaria::util::{Color, Rect};
+use luminaria::util::{Color, DrmFourcc, Rect};
 
 #[test]
 fn test_scene_renderer_and_output() {
@@ -17,22 +17,21 @@ fn test_scene_renderer_and_output() {
     let mut output = backend.add_output(800, 600).expect("add_output failed");
 
     let renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
-    let mut state = SceneOutput::new();
 
     // Reset output target
-    renderer.reset(&mut state, &mut output, 0x34325241).expect("reset failed");
+    renderer.reset_with_format(&mut output, DrmFourcc::Argb8888).expect("reset failed");
 
     // Present a scene
     let scene = vec![
         SceneItem::rect(Rect::new(0, 0, 800, 600), Color::rgb(0.2, 0.2, 0.2)),
         SceneItem::border(Rect::new(100, 100, 200, 200), 4, Color::rgb(1.0, 1.0, 0.0)),
     ];
-    let outcome = renderer.present(&mut state, &mut output, &scene, Color::rgb(0.0, 0.0, 0.0))
+    let outcome = renderer.present(&mut output, &scene, Color::rgb(0.0, 0.0, 0.0))
         .expect("present failed");
     println!("Scene outcome: {:?}", outcome);
 
     // Read back frame
-    let pixels = renderer.read_back(&mut state).expect("read_back failed");
+    let pixels = renderer.read_back(&output).expect("read_back failed");
     assert_eq!(pixels.len(), 800 * 600 * 4);
 
     // Test cursor integration
@@ -67,12 +66,12 @@ fn test_vulkan_and_frame_skipped_by_default() {
     let mut output = backend.add_output(640, 480).expect("add_output failed");
 
     if let Ok(vk) = VulkanRenderer::new(&VulkanOptions::default()) {
-        let _ = vk.scanout_modifiers(0x34325241);
+        let _ = vk.scanout_modifiers(DrmFourcc::Argb8888);
         let _dmabuf = LinuxDmabuf::new(&display, Some(&vk));
         let _syncobj = DrmSyncobjManager::new(&display);
 
         if let Ok(mut frame) = Frame::new(&mut output, &vk) {
-            let _ = frame.reset(0x34325241);
+            let _ = frame.reset(DrmFourcc::Argb8888);
             frame.begin(Rect::new(0, 0, 640, 480));
             frame.place_rect(Rect::new(10, 10, 50, 50), Color::rgb(1.0, 0.0, 0.0));
             let _ = frame.submit(Color::rgb(0.0, 0.0, 0.0));
@@ -99,7 +98,7 @@ fn frame_outlives_its_output() {
     // no lifetime can prevent. The frame goes with it and is inert after.
     drop(backend);
     assert!(!output.is_alive());
-    assert!(frame.reset(0x34325258).is_err());
+    assert!(frame.reset(DrmFourcc::Xrgb8888).is_err());
     frame.begin(Rect::new(0, 0, 64, 64));
     frame.place_rect(Rect::new(0, 0, 8, 8), Color::rgb(1.0, 0.0, 0.0));
     assert!(frame.submit(Color::rgb(0.0, 0.0, 0.0)).is_err());
@@ -160,14 +159,13 @@ fn test_scene_renderer_images_and_dmabuf() {
 
     let mut backend = HeadlessBackend::new(&display, 16).expect("HeadlessBackend failed");
     let mut output = backend.add_output(320, 240).expect("add_output failed");
-    let mut state = SceneOutput::new();
-    renderer.reset(&mut state, &mut output, 0x34325258).expect("reset failed");
+    renderer.reset(&mut output).expect("reset failed");
 
     let scene = vec![
         SceneItem::rect(Rect::new(0, 0, 320, 240), Color::rgb(0.1, 0.1, 0.1)),
         SceneItem::image(Rect::new(10, 10, 16, 16), 42),
     ];
-    let outcome = renderer.present(&mut state, &mut output, &scene, Color::rgb(0.0, 0.0, 0.0));
+    let outcome = renderer.present(&mut output, &scene, Color::rgb(0.0, 0.0, 0.0));
     assert!(outcome.is_ok(), "present with image item should succeed: {outcome:?}");
 
     renderer.remove_image(42);

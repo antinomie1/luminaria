@@ -5,7 +5,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, pump, ClientSide, Peer};
+use common::{pump, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, IdleInhibitEvent, IdleInhibitManager, IdleNotifier, IdleNotifierEvent, Seat};
 use wayland_client::globals::registry_queue_init;
@@ -72,7 +72,7 @@ fn inhibitors_count_while_visible() {
 
     let mut peer = Peer::spawn(&display, inhibit_client);
     peer.wait(&display, "inhibiting");
-    let events = drain(|| inhibits.next_event());
+    let events = take::<IdleInhibitEvent>();
     let [IdleInhibitEvent::NewInhibitor { inhibitor, surface }, IdleInhibitEvent::Changed(true)] = events[..] else {
         panic!("{events:?}");
     };
@@ -83,14 +83,16 @@ fn inhibitors_count_while_visible() {
 
     // Off screen: it no longer keeps anything awake.
     inhibits.set_visible(inhibitor, false);
-    assert_eq!(drain(|| inhibits.next_event()), [IdleInhibitEvent::Changed(false)]);
+    common::collect(&display);
+    assert_eq!(take::<IdleInhibitEvent>(), [IdleInhibitEvent::Changed(false)]);
     assert!(!inhibits.is_inhibited());
     inhibits.set_visible(inhibitor, true);
-    assert_eq!(drain(|| inhibits.next_event()), [IdleInhibitEvent::Changed(true)]);
+    common::collect(&display);
+    assert_eq!(take::<IdleInhibitEvent>(), [IdleInhibitEvent::Changed(true)]);
     peer.go();
 
     peer.wait(&display, "released");
-    let events = drain(|| inhibits.next_event());
+    let events = take::<IdleInhibitEvent>();
     assert!(events.contains(&IdleInhibitEvent::InhibitorDestroy(inhibitor)), "{events:?}");
     assert_eq!(events.last(), Some(&IdleInhibitEvent::Changed(false)));
     assert!(!inhibits.is_inhibited());
@@ -129,7 +131,7 @@ fn notifications_idle_and_resume() {
 
     let mut peer = Peer::spawn(&display, notify_client);
     peer.wait(&display, "watching");
-    let events = drain(|| notifier.next_event());
+    let events = take::<IdleNotifierEvent>();
     let [IdleNotifierEvent::NewNotification(n)] = events[..] else {
         panic!("{events:?}");
     };
@@ -141,7 +143,7 @@ fn notifications_idle_and_resume() {
     // Its timer runs on the display's loop.
     let mut seen = Vec::new();
     pump(&display, "the notification to idle", || {
-        seen.extend(drain(|| notifier.next_event()));
+        seen.extend(take::<IdleNotifierEvent>());
         !seen.is_empty()
     });
     assert_eq!(seen, [IdleNotifierEvent::StateChange { notification: n, idled: true }]);
@@ -151,8 +153,9 @@ fn notifications_idle_and_resume() {
 
     peer.wait(&display, "idled");
     notifier.notify_activity();
+    common::collect(&display);
     assert_eq!(
-        drain(|| notifier.next_event()),
+        take::<IdleNotifierEvent>(),
         [IdleNotifierEvent::StateChange { notification: n, idled: false }]
     );
     assert_eq!(notifier.idled_count(), 0);
@@ -161,7 +164,7 @@ fn notifications_idle_and_resume() {
     peer.go();
 
     peer.wait(&display, "done");
-    assert_eq!(drain(|| notifier.next_event()), [IdleNotifierEvent::NotificationDestroy(n)]);
+    assert_eq!(take::<IdleNotifierEvent>(), [IdleNotifierEvent::NotificationDestroy(n)]);
     assert_eq!(notifier.notification(n), None);
     assert_eq!(notifier.notification_count(), 0);
     peer.finish(&display);

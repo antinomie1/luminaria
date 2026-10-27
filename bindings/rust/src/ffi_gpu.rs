@@ -55,9 +55,9 @@ pub(crate) mod ffi {
         type SessionShim;
         fn session_new(display: &DisplayShim, error: &mut String) -> UniquePtr<SessionShim>;
         fn switch_to(self: &SessionShim, vt: i32, error: &mut String) -> bool;
+        fn switch_vt_for(self: &SessionShim, keysym: u32) -> bool;
         fn active(self: &SessionShim) -> bool;
         fn seat_name(self: &SessionShim) -> String;
-        fn next_activity(self: &SessionShim) -> u32;
 
         type DrmBackendShim;
         fn drm_backend_new(display: &DisplayShim, device: &str, session: &SessionShim, error: &mut String) -> UniquePtr<DrmBackendShim>;
@@ -65,7 +65,6 @@ pub(crate) mod ffi {
         fn start(self: Pin<&mut DrmBackendShim>, error: &mut String) -> bool;
         fn fd(self: &DrmBackendShim) -> i32;
         fn scan_connectors(self: Pin<&mut DrmBackendShim>);
-        fn next_event(self: Pin<&mut DrmBackendShim>, kind: &mut u32, removed: &mut u64) -> UniquePtr<OutputShim>;
 
         type LibinputBackendShim;
         fn libinput_backend_new(display: &DisplayShim, session: &SessionShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
@@ -74,8 +73,8 @@ pub(crate) mod ffi {
         fn libinput_backend_new_path_standalone(display: &DisplayShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
         fn start(self: Pin<&mut LibinputBackendShim>, error: &mut String) -> bool;
         fn add_device(self: Pin<&mut LibinputBackendShim>, path: &str, error: &mut String) -> bool;
-        fn next_input_event(self: Pin<&mut LibinputBackendShim>, out: &mut InputEventRaw) -> bool;
         fn keymap(self: &LibinputBackendShim) -> String;
+        fn follow_seat(self: &LibinputBackendShim, seat: &SeatShim, touch: bool);
         fn set_keymap(self: Pin<&mut LibinputBackendShim>, xkb_text: &str) -> bool;
         fn capabilities(self: &LibinputBackendShim) -> u32;
 
@@ -84,11 +83,9 @@ pub(crate) mod ffi {
         fn auto_backend_new(display: &DisplayShim, kind: u32, drm_device: &str, width: i32, height: i32, title: &str, error: &mut String) -> UniquePtr<AutoBackendShim>;
         fn kind(self: &AutoBackendShim) -> u32;
         fn start(self: Pin<&mut AutoBackendShim>, error: &mut String) -> bool;
-        fn next_event(self: Pin<&mut AutoBackendShim>, kind: &mut u32, removed: &mut u64) -> UniquePtr<OutputShim>;
-        fn next_input_event(self: Pin<&mut AutoBackendShim>, out: &mut InputEventRaw) -> bool;
         fn keymap(self: &AutoBackendShim) -> String;
         fn capabilities(self: &AutoBackendShim) -> u32;
-        fn take_close_request(self: Pin<&mut AutoBackendShim>) -> bool;
+        fn follow_seat(self: &AutoBackendShim, seat: &SeatShim, touch: bool);
         fn has_session(self: &AutoBackendShim) -> bool;
         fn session(self: &AutoBackendShim) -> &SessionShim;
         fn session_error(self: &AutoBackendShim) -> String;
@@ -116,20 +113,29 @@ pub(crate) mod ffi {
         fn linux_dmabuf_new_headless(display: &DisplayShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
         fn linux_dmabuf_new_from_scene_renderer(display: &DisplayShim, renderer: &SceneRendererShim, error: &mut String) -> UniquePtr<LinuxDmabufShim>;
 
-        type SceneOutputShim;
-        fn scene_output_new() -> UniquePtr<SceneOutputShim>;
-        fn gpu_output(self: &SceneOutputShim) -> bool;
 
         type SceneRendererShim;
         fn scene_renderer_new(has_drm_device: bool, drm_device: &DrmDeviceId, error: &mut String) -> UniquePtr<SceneRendererShim>;
         fn gpu_enabled(self: &SceneRendererShim) -> bool;
         fn gpu_error(self: &SceneRendererShim) -> String;
-        fn reset(self: &SceneRendererShim, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
-        fn present(self: &SceneRendererShim, state: Pin<&mut SceneOutputShim>, output: Pin<&mut OutputShim>, items: &[SceneItemRaw], bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
+        fn reset(self: &SceneRendererShim, output: Pin<&mut OutputShim>, drm_format: u32, error: &mut String) -> bool;
+        fn present(self: &SceneRendererShim, output: Pin<&mut OutputShim>, items: &[SceneItemRaw], bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32, error: &mut String) -> i32;
+        fn present_in(
+            self: &SceneRendererShim,
+            layout: &OutputLayoutShim,
+            output: Pin<&mut OutputShim>,
+            items: &[SceneItemRaw],
+            bg_r: f32,
+            bg_g: f32,
+            bg_b: f32,
+            bg_a: f32,
+            error: &mut String,
+        ) -> i32;
+        fn gpu_output(self: &SceneRendererShim, output: &OutputShim) -> bool;
         fn set_presentation(self: &SceneRendererShim, presentation: &PresentationShim);
         fn clear_presentation(self: &SceneRendererShim);
         fn update_cursor(self: &SceneRendererShim);
-        fn read_back(self: &SceneRendererShim, state: Pin<&mut SceneOutputShim>, error: &mut String) -> Vec<u8>;
+        fn read_back(self: &SceneRendererShim, output: &OutputShim, error: &mut String) -> Vec<u8>;
         // Only `raw-vulkan` reads these.
         #[allow(dead_code)]
         fn vulkan_handles(self: &SceneRendererShim, out: &mut VulkanHandlesRaw) -> bool;

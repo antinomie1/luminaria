@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use luminaria::backend::{AutoBackend, BackendEvent, BackendKind, BackendOptions, Session};
+use luminaria::Event;
 use luminaria::core::Display;
 
 /// One output arrives at start(), the size asked for, and nothing else is there.
@@ -14,17 +15,17 @@ fn check_headless(display: &Display, backend: &mut AutoBackend<'_>, width: i32, 
     assert!(backend.input().is_none());
     assert!(backend.session().is_none());
     assert!(backend.session_error().is_none());
-    assert!(!backend.take_close_request());
     assert!(backend.vulkan_options().drm_device.is_none());
 
-    assert!(backend.next_event().is_none(), "nothing before start()");
+    assert_eq!(display.events().count(), 0, "nothing before start()");
     backend.start().expect("start");
-    display.dispatch(Some(Duration::ZERO)).expect("dispatch");
     let mut outputs = Vec::new();
-    while let Some(event) = backend.next_event() {
+    for event in display.dispatch(Some(Duration::ZERO)).expect("dispatch") {
         match event {
-            BackendEvent::OutputAdded(output) => outputs.push(output),
-            BackendEvent::OutputRemoved(_) => panic!("headless lost an output"),
+            Event::Backend(BackendEvent::OutputAdded(output)) => outputs.push(output),
+            Event::Backend(BackendEvent::OutputRemoved(_)) => panic!("headless lost an output"),
+            Event::HostCloseRequest => panic!("headless has no host"),
+            _ => {}
         }
     }
     assert_eq!(outputs.len(), 1);

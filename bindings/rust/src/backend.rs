@@ -4,7 +4,7 @@ use std::pin::Pin;
 
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
-use crate::util::{Color, Mode, Transform};
+use crate::util::{Color, DrmFourcc, Keysym, Mode, Transform};
 
 /// An active output surface (display or virtual window).
 pub struct Output {
@@ -103,8 +103,8 @@ impl Output {
         }
     }
 
-    pub fn scanout_modifiers(&self, drm_format: u32) -> Vec<u64> {
-        self.raw.scanout_modifiers(drm_format)
+    pub fn scanout_modifiers(&self, format: DrmFourcc) -> Vec<u64> {
+        self.raw.scanout_modifiers(format as u32)
     }
 
     pub fn has_cursor_plane(&self) -> bool {
@@ -126,45 +126,6 @@ impl Output {
             Ok(())
         } else {
             Err(Error::new(ErrorKind::Backend, err))
-        }
-    }
-
-    /// Check if this output asked for a frame redraw, and reset the request flag.
-    pub fn take_frame(&mut self) -> bool {
-        self.pin().take_frame()
-    }
-
-    /// True once after a `set_mode()` has landed. Everything sized for the old
-    /// mode has to be rebuilt then: `SceneRenderer::reset()`, the layout box,
-    /// the `OutputGlobal`.
-    pub fn take_mode_changed(&mut self) -> bool {
-        self.pin().take_mode_changed()
-    }
-
-    /// Pull the next output event (e.g. presentation feedback).
-    pub fn next_event(&self) -> Option<OutputEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                ffi::EventKind::OutputPresent => {
-                    return Some(OutputEvent::Present(PresentEvent {
-                        tv_sec: raw.other,
-                        tv_nsec: raw.serial,
-                        refresh_ns: raw.value,
-                        seq: raw.id,
-                        vsync: raw.flag,
-                        hw_clock: raw.flag2,
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Pull the next presentation feedback event, if any.
-    pub fn next_present(&self) -> Option<PresentEvent> {
-        match self.next_event()? {
-            OutputEvent::Present(p) => Some(p),
         }
     }
 
@@ -198,15 +159,51 @@ impl PresentEvent {
     }
 }
 
-/// An event on an [`Output`].
+impl std::fmt::Debug for Output {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Output")
+            .field("id", &self.id())
+            .field("alive", &self.is_alive())
+            .field("size", &(self.width(), self.height()))
+            .finish()
+    }
+}
+
+/// Something that happened on one [`Output`]: [`crate::Event::Output`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputEvent {
+    /// The output wants a frame, which `schedule_frame()` asked for: present
+    /// one now. An idle output asks for none.
+    Frame,
+    /// A frame reached the screen.
     Present(PresentEvent),
+    /// A `set_mode()` landed. The renderer, the layout and a following
+    /// `OutputGlobal` have already caught up; only what the compositor sized
+    /// for the old mode itself is left to it.
+    ModeChanged,
 }
 
 /// Identifies an [`Output`], including after it was destroyed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OutputId(pub u64);
+
+impl std::fmt::Display for OutputId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "output {}", self.0)
+    }
+}
+
+/// What a backend reports about outputs: [`crate::Event::Backend`].
+#[derive(Debug)]
+pub enum BackendEvent {
+    /// An output was lit up: at `start()` for every one there is (nested and
+    /// headless have theirs from the start), later on DRM hotplug.
+    OutputAdded(Output),
+    /// A monitor went away. The [`Output`] with this id is now inert; drop it,
+    /// along with whatever was built for it. The layout and the renderer have
+    /// already let go of it.
+    OutputRemoved(OutputId),
+}
 
 pub use crate::util::Mode as OutputMode;
 
@@ -294,31 +291,21 @@ impl<'d> WaylandBackend<'d> {
         InputCapabilities::from_bits(self.raw.capabilities())
     }
 
-    /// Input from the host window, oldest first: absolute motion in an
-    /// output's coordinates, `PointerLeave` when the pointer leaves our
-    /// windows. Drain it after every `Display::dispatch()`.
-    pub fn next_input_event(&mut self) -> Option<InputEvent> {
-        let mut raw = InputEvent::empty_raw();
-        self.raw.pin_mut().next_input_event(&mut raw).then(|| InputEvent::from_raw(raw))
-    }
-
-    /// Whether the parent asked our window to close since the last call — its
-    /// titlebar button, its window menu, or the user's binding. Advisory:
-    /// whether that ends the session is the compositor's decision.
-    pub fn take_close_request(&mut self) -> bool {
-        self.raw.pin_mut().take_close_request()
-    }
 }
 
+/// Input from the host window arrives as [`crate::Event::Input`]: absolute
+/// motion in an output's coordinates, `PointerLeave` when the pointer leaves
+/// our windows. The parent asking our window to close is
+/// [`crate::Event::HostCloseRequest`].
 impl InputSource for WaylandBackend<'_> {
-    fn next_input_event(&mut self) -> Option<InputEvent> {
-        WaylandBackend::next_input_event(self)
-    }
     fn keymap(&self) -> String {
         WaylandBackend::keymap(self)
     }
     fn capabilities(&self) -> InputCapabilities {
         WaylandBackend::capabilities(self)
+    }
+    fn follow(&self, seat: &crate::protocol::Seat<'_>, touch: bool) {
+        self.raw.follow_seat(&seat.raw, touch);
     }
 }
 
@@ -379,15 +366,13 @@ mod bare_metal {
             self.shim().seat_name()
         }
 
-        /// The next VT switch, oldest first: `Some(false)` when the session was
-        /// taken away, `Some(true)` when it came back. On the way out, release every
-        /// key and button a client was told is down; on the way back, repaint.
-        pub fn next_activity(&self) -> Option<bool> {
-            match self.shim().next_activity() {
-                1 => Some(false),
-                2 => Some(true),
-                _ => None,
-            }
+        /// The Ctrl+Alt+Fn binding: if `keysym` is one of XF86Switch_VT_1..12
+        /// (what the keymap turns Ctrl+Alt+Fn into), switch to that VT and
+        /// answer true. Release the seat's keys alongside — their releases
+        /// arrive on the other VT. VT switches themselves arrive as
+        /// [`crate::Event::SessionActive`].
+        pub fn switch_vt_for(&self, keysym: crate::util::Keysym) -> bool {
+            self.shim().switch_vt_for(keysym.raw())
         }
     }
 
@@ -435,14 +420,6 @@ mod bare_metal {
             self.raw.pin_mut().scan_connectors();
         }
 
-        /// The next monitor that appeared or went away, oldest first. Drain it
-        /// after every `Display::dispatch()`.
-        pub fn next_event(&mut self) -> Option<BackendEvent> {
-            let mut kind = 0;
-            let mut removed = 0;
-            let output = self.raw.pin_mut().next_event(&mut kind, &mut removed);
-            BackendEvent::from_raw(kind, output, removed)
-        }
     }
 
     /// The card's fd, borrowed for the life of the backend. Query it (the `drm`
@@ -460,26 +437,6 @@ mod bare_metal {
     impl AsRawFd for DrmBackend<'_> {
         fn as_raw_fd(&self) -> RawFd {
             self.raw.fd()
-        }
-    }
-
-    /// What a [`DrmBackend`] or an [`AutoBackend`] reports about outputs.
-    pub enum BackendEvent {
-        /// An output was lit up: at `start()` for every one there is (nested
-        /// and headless have theirs from the start), later on DRM hotplug.
-        OutputAdded(Output),
-        /// A monitor went away. The [`Output`] with this id is now inert; drop it,
-        /// along with whatever was built for it.
-        OutputRemoved(OutputId),
-    }
-
-    impl BackendEvent {
-        fn from_raw(kind: u32, output: cxx::UniquePtr<ffi::OutputShim>, removed: u64) -> Option<Self> {
-            match kind {
-                1 => Some(BackendEvent::OutputAdded(Output::from_raw(output))),
-                2 => Some(BackendEvent::OutputRemoved(OutputId(removed))),
-                _ => None,
-            }
         }
     }
 
@@ -556,24 +513,19 @@ mod bare_metal {
             InputCapabilities::from_bits(self.raw.capabilities())
         }
 
-        /// The next input event, oldest first: relative motion, touch, and
-        /// `Capabilities` as devices come and go. Drain it after every
-        /// `Display::dispatch()`.
-        pub fn next_input_event(&mut self) -> Option<InputEvent> {
-            let mut raw = InputEvent::empty_raw();
-            self.raw.pin_mut().next_input_event(&mut raw).then(|| InputEvent::from_raw(raw))
-        }
     }
 
+    /// Relative motion, touch, and `Capabilities` as devices come and go, all
+    /// as [`crate::Event::Input`].
     impl InputSource for LibinputBackend<'_> {
-        fn next_input_event(&mut self) -> Option<InputEvent> {
-            LibinputBackend::next_input_event(self)
-        }
         fn keymap(&self) -> String {
             LibinputBackend::keymap(self)
         }
         fn capabilities(&self) -> InputCapabilities {
             LibinputBackend::capabilities(self)
+        }
+        fn follow(&self, seat: &crate::protocol::Seat<'_>, touch: bool) {
+            self.raw.follow_seat(&seat.raw, touch);
         }
     }
 
@@ -710,18 +662,9 @@ mod bare_metal {
             }
         }
 
-        /// The next output that appeared or went away, oldest first. Drain it
-        /// after every `Display::dispatch()`.
-        pub fn next_event(&mut self) -> Option<BackendEvent> {
-            let mut kind = 0;
-            let mut removed = 0;
-            let output = self.raw.pin_mut().next_event(&mut kind, &mut removed);
-            BackendEvent::from_raw(kind, output, removed)
-        }
-
         /// Where input comes from: the host window nested, libinput on DRM;
-        /// `None` headless.
-        pub fn input(&mut self) -> Option<&mut dyn InputSource> {
+        /// `None` headless. Its events arrive as [`crate::Event::Input`].
+        pub fn input(&self) -> Option<&dyn InputSource> {
             if self.kind() == BackendKind::Headless {
                 None
             } else {
@@ -729,13 +672,7 @@ mod bare_metal {
             }
         }
 
-        /// Whether the parent asked our window to close since the last call;
-        /// never on anything but nested.
-        pub fn take_close_request(&mut self) -> bool {
-            self.raw.pin_mut().take_close_request()
-        }
-
-        /// The libseat session, lent out: VT switching and `next_activity()`.
+        /// The libseat session, lent out: VT switching. Only ever on DRM.
         /// Only ever on DRM.
         pub fn session(&self) -> Option<Session<'_>> {
             self.raw.has_session().then(|| Session {
@@ -761,9 +698,8 @@ mod bare_metal {
     }
 
     impl InputSource for AutoBackend<'_> {
-        fn next_input_event(&mut self) -> Option<InputEvent> {
-            let mut raw = InputEvent::empty_raw();
-            self.raw.pin_mut().next_input_event(&mut raw).then(|| InputEvent::from_raw(raw))
+        fn follow(&self, seat: &crate::protocol::Seat<'_>, touch: bool) {
+            self.raw.follow_seat(&seat.raw, touch);
         }
         fn keymap(&self) -> String {
             self.raw.keymap()
@@ -785,6 +721,23 @@ pub struct Modifiers {
     pub latched: u32,
     pub locked: u32,
     pub group: u32,
+}
+
+impl Modifiers {
+    /// xkb's core modifier bits, for matching bindings against [`Modifiers::held`].
+    pub const SHIFT: u32 = 1 << 0;
+    pub const CTRL: u32 = 1 << 2;
+    pub const ALT: u32 = 1 << 3;
+    pub const LOGO: u32 = 1 << 6;
+    /// The four a binding is made of. Caps and Num Lock are left out on
+    /// purpose: a binding must not stop working because a lock is on.
+    pub const BINDABLE: u32 = Self::SHIFT | Self::CTRL | Self::ALT | Self::LOGO;
+
+    /// What is held down for a binding: pressed or latched, Shift, Ctrl, Alt
+    /// and Logo only.
+    pub const fn held(&self) -> u32 {
+        (self.depressed | self.latched) & Self::BINDABLE
+    }
 }
 
 /// What kinds of input device are open. Hand it to `Seat::set_capabilities()`.
@@ -828,7 +781,7 @@ pub enum InputEvent {
     Key {
         key: u32,
         pressed: bool,
-        keysym: u32,
+        keysym: Keysym,
         modifiers: Modifiers,
     },
     /// The masks changed. Forward to `Seat::notify_modifiers()`.
@@ -857,7 +810,7 @@ pub enum InputEvent {
 }
 
 impl InputEvent {
-    fn empty_raw() -> ffi::InputEventRaw {
+    pub(crate) fn empty_raw() -> ffi::InputEventRaw {
         ffi::InputEventRaw {
             kind: ffi::InputEventKind::Key,
             code: 0,
@@ -878,7 +831,7 @@ impl InputEvent {
         }
     }
 
-    fn from_raw(raw: ffi::InputEventRaw) -> Self {
+    pub(crate) fn from_raw(raw: ffi::InputEventRaw) -> Self {
         use ffi::InputEventKind as K;
         let modifiers = Modifiers {
             depressed: raw.depressed,
@@ -890,7 +843,7 @@ impl InputEvent {
             K::Key => InputEvent::Key {
                 key: raw.code,
                 pressed: raw.pressed,
-                keysym: raw.keysym,
+                keysym: Keysym::new(raw.keysym),
                 modifiers,
             },
             K::Modifiers => InputEvent::Modifiers(modifiers),
@@ -934,16 +887,27 @@ impl InputEvent {
 
 /// Where input comes from: [`LibinputBackend`] on bare metal,
 /// [`WaylandBackend`] nested. What differs between them is which
-/// [`InputEvent`]s arrive, not how, so a compositor drains whichever it has
-/// through one loop.
-pub trait InputSource {
-    /// The next input event, oldest first. Drain after every
-    /// `Display::dispatch()`.
-    fn next_input_event(&mut self) -> Option<InputEvent>;
+/// [`InputEvent`]s arrive as [`crate::Event::Input`], not how, so a compositor
+/// handles whichever it has in one match. Hand it to `Seat::follow()` and the
+/// seat describes its devices to clients by itself.
+///
+/// Sealed: only luminaria's backends are input sources.
+pub trait InputSource: sealed::Sealed {
     /// The keymap `InputEvent::Key` is read against; empty while there is
     /// none yet. Later changes arrive as `InputEvent::KeymapChange`.
     fn keymap(&self) -> String;
     /// What the devices can do now. Later changes arrive as
     /// `InputEvent::Capabilities`.
     fn capabilities(&self) -> InputCapabilities;
+    #[doc(hidden)]
+    fn follow(&self, seat: &crate::protocol::Seat<'_>, touch: bool);
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::WaylandBackend<'_> {}
+    #[cfg(feature = "gpu")]
+    impl Sealed for super::LibinputBackend<'_> {}
+    #[cfg(feature = "gpu")]
+    impl Sealed for super::AutoBackend<'_> {}
 }

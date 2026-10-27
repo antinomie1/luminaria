@@ -117,8 +117,7 @@ inline InputEventRaw input_event_raw(const lm::InputEvent& event) {
     return r;
 }
 
-// An event for Rust to drain; `kind` says which of the other fields mean
-// something. Every shim that forwards signals keeps one queue of these.
+// An event for Rust; `kind` says which of the other fields mean something.
 inline EventRaw event(EventKind kind, std::uint64_t id = 0, std::uint64_t other = 0) {
     EventRaw e{};
     e.kind = kind;
@@ -129,16 +128,32 @@ inline EventRaw event(EventKind kind, std::uint64_t id = 0, std::uint64_t other 
     return e;
 }
 
-struct Events {
-    std::deque<EventRaw> queue;
+// Everything any shim forwards, in the order the signals fired, until
+// `DisplayShim::next_event` hands it to Rust as one stream. C++ never calls
+// Rust, so a signal can only leave something behind to be collected; keeping
+// one queue rather than one per shim is what keeps the order and makes a queue
+// nobody drains impossible. Per thread, because a Display and everything on it
+// live on the thread that made them: no Rust wrapper is Send.
+struct HubRecord {
+    enum class Type : std::uint32_t { none = 0, raw = 1, input = 2, output_added = 3 };
+    Type type = Type::none;
+    EventRaw event{};
+    InputEventRaw input{};
+    std::unique_ptr<OutputShim> output; // output_added: its id is event.id
+};
+std::deque<HubRecord>& hub();
 
-    void push(EventRaw e) { queue.push_back(std::move(e)); }
-    bool pop(EventRaw& out) {
-        if (queue.empty()) return false;
-        out = std::move(queue.front());
-        queue.pop_front();
-        return true;
-    }
+inline void hub_push(EventRaw e) {
+    hub().push_back(HubRecord{HubRecord::Type::raw, std::move(e), {}, nullptr});
+}
+inline void hub_push_input(InputEventRaw e) {
+    hub().push_back(HubRecord{HubRecord::Type::input, {}, std::move(e), nullptr});
+}
+void hub_push_output(std::unique_ptr<OutputShim> output);
+
+// What a shim keeps to forward its signals.
+struct Events {
+    void push(EventRaw e) { hub_push(std::move(e)); }
 };
 
 struct StoredImage {

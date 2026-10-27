@@ -5,7 +5,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, shm_buffer, ClientSide, Peer};
+use common::{shm_buffer, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::desktop::{SessionLockEvent, SessionLockManager};
 use luminaria::protocol::{Compositor, OutputGlobal};
@@ -122,7 +122,7 @@ fn lock_surface_and_orderly_unlock() {
 
     let mut peer = Peer::spawn(&display, orderly_client);
     peer.wait(&display, "locking");
-    let events = drain(|| locks.next_event());
+    let events = take::<SessionLockEvent>();
     let [SessionLockEvent::NewLock(l), SessionLockEvent::NewSurface { lock, surface: s }] = events[..] else {
         panic!("{events:?}");
     };
@@ -139,7 +139,7 @@ fn lock_surface_and_orderly_unlock() {
     peer.go();
 
     peer.wait(&display, "mapped");
-    assert_eq!(drain(|| locks.next_event()), [SessionLockEvent::SurfaceMap(s)]);
+    assert_eq!(take::<SessionLockEvent>(), [SessionLockEvent::SurfaceMap(s)]);
     assert!(ls.is_mapped());
     // Every output is covered: now the client may be told.
     locks.lock(l).send_locked();
@@ -149,7 +149,7 @@ fn lock_surface_and_orderly_unlock() {
 
     peer.wait(&display, "unlocked");
     assert_eq!(
-        drain(|| locks.next_event()),
+        take::<SessionLockEvent>(),
         [
             SessionLockEvent::SurfaceDestroy(s),
             SessionLockEvent::LockDestroy { lock: l, unlocked: true }
@@ -182,7 +182,7 @@ fn a_lock_client_that_dies_leaves_the_session_locked() {
 
     let mut peer = Peer::spawn(&display, dying_client);
     peer.wait(&display, "locking");
-    let events = drain(|| locks.next_event());
+    let events = take::<SessionLockEvent>();
     let [SessionLockEvent::NewLock(l)] = events[..] else {
         panic!("{events:?}");
     };
@@ -190,7 +190,7 @@ fn a_lock_client_that_dies_leaves_the_session_locked() {
     peer.finish(&display);
 
     assert_eq!(
-        drain(|| locks.next_event()),
+        take::<SessionLockEvent>(),
         [SessionLockEvent::LockDestroy { lock: l, unlocked: false }]
     );
     assert!(locks.is_locked(), "fails closed");

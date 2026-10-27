@@ -5,11 +5,11 @@
 #[macro_use]
 mod common;
 
-use common::{drain, shm_buffer, ClientSide, Peer};
+use common::{shm_buffer, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{
     Compositor, KeyboardInteractivity, Layer, LayerShell, LayerSurfaceEvent, Margins, OutputGlobal, PopupEvent,
-    XdgEvent, XdgShell,
+    SurfaceId, XdgEvent, XdgShell,
 };
 use luminaria::shell::{LayerManager, PopupTree, SceneItem};
 use luminaria::util::{edge, Rect};
@@ -152,12 +152,12 @@ fn layer_surfaces_through_the_layer_manager() {
     let layers = LayerShell::new(&display).expect("layer-shell");
     let output = OutputGlobal::new(&display, 1000, 800, "test-1").expect("wl_output");
     let mut manager = LayerManager::new().expect("layer manager");
-    let mut popups = PopupTree::new().expect("popup tree");
+    let popups = PopupTree::new(&shell).expect("popup tree");
     let full = Rect::new(0, 0, 1000, 800);
 
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "committed");
-    let events = drain(|| layers.next_event());
+    let events = take::<(SurfaceId, LayerSurfaceEvent)>();
     let (panel, wall) = match events[..] {
         [(p, LayerSurfaceEvent::Created), _, (w, LayerSurfaceEvent::Created), _] => (p, w),
         _ => panic!("{events:?}"),
@@ -198,7 +198,7 @@ fn layer_surfaces_through_the_layer_manager() {
     peer.go();
 
     peer.wait(&display, "mapped");
-    assert_eq!(drain(|| layers.next_event()), [(panel, LayerSurfaceEvent::Map)]);
+    assert_eq!(take::<(SurfaceId, LayerSurfaceEvent)>(), [(panel, LayerSurfaceEvent::Map)]);
     assert!(ls.is_mapped());
     manager.set_mapped(panel, true);
     let usable = manager.arrange(OUTPUT, full, full);
@@ -219,25 +219,26 @@ fn layer_surfaces_through_the_layer_manager() {
     peer.go();
 
     peer.wait(&display, "popup");
-    let events = drain(|| layers.next_event());
+    let events = take::<(SurfaceId, LayerSurfaceEvent)>();
     let [(_, LayerSurfaceEvent::NewPopup(popup))] = events[..] else {
         panic!("{events:?}");
     };
     assert_eq!(events, [(panel, LayerSurfaceEvent::NewPopup(popup))]);
     assert_eq!(
-        drain(|| shell.next_event()),
+        take::<XdgEvent>(),
         [XdgEvent::Popup(popup, PopupEvent::Created { parent: None })]
     );
     assert_eq!(shell.popup(popup).expect("popup").parent(), None);
     // Positioned against where the panel was put.
-    assert!(popups.add_with_parent(&shell, popup, panel));
+    assert!(popups.set_parent(&shell, popup, panel));
 
     ls.close();
-    assert_eq!(drain(|| layers.next_event()), [(panel, LayerSurfaceEvent::Unmap)]);
+    common::collect(&display);
+    assert_eq!(take::<(SurfaceId, LayerSurfaceEvent)>(), [(panel, LayerSurfaceEvent::Unmap)]);
     peer.go();
 
     peer.wait(&display, "destroyed");
-    let events = drain(|| layers.next_event());
+    let events = take::<(SurfaceId, LayerSurfaceEvent)>();
     assert!(events.contains(&(panel, LayerSurfaceEvent::Destroy)), "{events:?}");
     // The manager let go of it by itself.
     assert_eq!(manager.keyboard_target(panel), None);
@@ -247,5 +248,5 @@ fn layer_surfaces_through_the_layer_manager() {
     assert!(layers.layer_surface(panel).is_none());
     assert_eq!(ls.scope(), "");
     peer.finish(&display);
-    assert!(drain(|| layers.next_event()).contains(&(wall, LayerSurfaceEvent::Destroy)));
+    assert!(take::<(SurfaceId, LayerSurfaceEvent)>().contains(&(wall, LayerSurfaceEvent::Destroy)));
 }

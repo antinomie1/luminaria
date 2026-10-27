@@ -5,7 +5,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, ClientSide, Peer};
+use common::{ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, PointerConstraintEvent, PointerConstraintKind, PointerConstraints, Seat};
 use luminaria::util::Rect;
@@ -100,7 +100,7 @@ fn constraints_follow_pointer_focus() {
 
     let mut peer = Peer::spawn(&display, client);
     peer.wait(&display, "requested");
-    let events = drain(|| constraints.next_event());
+    let events = take::<PointerConstraintEvent>();
     let [PointerConstraintEvent::New(game), PointerConstraintEvent::New(editor)] = events[..] else {
         panic!("{events:?}");
     };
@@ -130,14 +130,14 @@ fn constraints_follow_pointer_focus() {
     peer.go();
 
     peer.wait(&display, "updated");
-    assert_eq!(drain(|| constraints.next_event()), [PointerConstraintEvent::RegionChange(editor)]);
+    assert_eq!(take::<PointerConstraintEvent>(), [PointerConstraintEvent::RegionChange(editor)]);
     assert_eq!(confine.region(), Some(vec![Rect::new(0, 0, 20, 20)]));
     assert_eq!(lock.cursor_hint(), Some((5.0, 6.0)));
     peer.go();
 
     peer.wait(&display, "destroyed");
     assert_eq!(
-        drain(|| constraints.next_event()),
+        take::<PointerConstraintEvent>(),
         [PointerConstraintEvent::Destroy(game), PointerConstraintEvent::Destroy(editor)]
     );
     assert!(constraints.constraint(game).is_none());

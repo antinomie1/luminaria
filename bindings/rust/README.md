@@ -15,13 +15,13 @@ cargo 特性决定编译哪些、链接哪些。关掉的模块不进编译、�
 |---|---|---|---|---|
 | *（始终有）* | — | `luminaria` | 协议、`Display`、headless / 嵌套后端、`CpuCompositor`、`SceneItem` | wayland-server、wayland-client、xkbcommon |
 | `gpu` | ✅ | `luminaria.gpu` | `gpu` 模块（`VulkanRenderer`/`SceneRenderer`/`Frame`/`Cursor`/`DirectScanout`/`LinuxDmabuf`/`Screencopy`），`backend::DrmBackend`/`LibinputBackend`/`Session` | vulkan、libdrm、libinput、libudev、gbm、libseat |
-| `desktop` | ✅ | `luminaria.desktop` | `desktop` 模块（任务栏、工作区、锁屏、输出管理、剪贴板、输入法） | —（依赖 `gpu`） |
+| `desktop` | ✅ | `luminaria.desktop` | `desktop` 模块（任务栏、工作区、锁屏、输出管理、剪贴板、输入法） | — |
 | `text` | ❌ | `luminaria.text` | `text` 模块（`Font`：字形栅格化与度量） | fcft、fontconfig、pixman |
 | `raw-vulkan` | ❌ | —（隐含 `gpu`） | `VulkanRenderer::raw_handles()` / `SceneRenderer::raw_vulkan_handles()` | — |
 | `mint` / `glam` | ❌ | — | 几何类型的 `From`/`Into` 转换 | — |
 
-`desktop` 依赖 `gpu`：`DesktopGlobals` 要在构造时拿到 `VulkanRenderer`，所以打开 `desktop`
-会自动带上 `gpu`。只写无头合成器（不需要 Vulkan、不需要 DRM/libinput/libseat）时：
+两个扩展互不依赖：只开 `desktop` 就是一个不链接 Vulkan 的桌面外壳。只写无头合成器（不需要
+Vulkan、不需要 DRM/libinput/libseat）时：
 
 ```sh
 cargo build --no-default-features            # 只有核心：link line 里没有 vulkan/gbm/libseat
@@ -36,14 +36,15 @@ cargo build                                  # 默认：gpu + desktop，与之�
 
 Crate 按库的职责分层组织为以下模块：
 
-- **`core`**：`Display`（拥有 `wl_display` 和事件循环）、`EventLoop`、`KeyRouter`、`Error`（可模式匹配的 `ErrorKind` 分类）。
-- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Point`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`（可选 `mint` 与 `glam` 特性支持零样板几何转换）。
+- **`core`**：`Display`（拥有 `wl_display` 和事件循环；`dispatch()` 返回这一轮的全部 `Event`）、`EventLoop`、`KeyRouter`（快捷键与客户端之间分键盘）、`Error`（可模式匹配的 `ErrorKind` 分类）。
+- **`event`**：`Event`——库报告的一切都走这一条流，按信号触发的顺序；各载荷类型都能用 `TryFrom<Event>` 取回。
+- **`util`**：基础几何与格式工具：`Rect`、`Color`、`Point`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`Keysym`（每个 `XKB_KEY_*` 一个关联常量，由系统的 xkbcommon 生成）、`DrmFourcc`（来自 `drm-fourcc` crate）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`（可选 `mint` 与 `glam` 特性支持零样板几何转换）。
 - **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）；`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）只在特性 `gpu` 下存在。
-- **`protocol`**：Wayland 核心协议全局对象：`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
-- **`gpu`**（对应 `luminaria.gpu`，特性 `gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退）、`SceneOutput`、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
-- **`desktop`**（对应 `luminaria.desktop`，特性 `desktop`）：桌面特权协议管理器：`ForeignToplevelManager`（任务栏窗口列表）、`WorkspaceManager`（ext-workspace 工作区）、`SessionLockManager`（ext-session-lock 锁屏）、`OutputManager`（wlr-output-management 显示器配置）、`DataControlManager`（剪贴板访问）、`InputMethodManager`（输入法协议）、`DesktopGlobals`（标准桌面全局对象套件）。
+- **`protocol`**：Wayland 核心协议全局对象：`CoreGlobals`（一次创建每个混成器都要的那一组）、`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
+- **`gpu`**（对应 `luminaria.gpu`，特性 `gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退，自己按输出保存渲染状态）、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
+- **`desktop`**（对应 `luminaria.desktop`，特性 `desktop`）：桌面特权协议管理器：`ForeignToplevelManager`（任务栏窗口列表）、`WorkspaceManager`（ext-workspace 工作区）、`SessionLockManager`（ext-session-lock 锁屏）、`OutputManager`（wlr-output-management 显示器配置）、`DataControlManager`（剪贴板访问）、`InputMethodManager`（输入法协议）。
 - **`text`**（对应 `luminaria.text`，特性 `text`）：`Font`（fcft 字形栅格化与度量）、`decode_utf8`。不画文字的混成器不必链接 fontconfig。
-- **`shell`**：即时模式场景与排版：`OutputLayout`（全局逻辑多屏布局）、`SceneItem`（场景绘制项）、`SceneHit` 与 `scene_hit_test`（命中测试）、`CpuCompositor`（纯 CPU 软件合成器）、`PopupTree`（popup 层次树与 grab 关闭）、`Pointer`。
+- **`shell`**：即时模式场景与排版：`OutputLayout`（全局逻辑多屏布局）、`SceneItem`（场景绘制项）、`SceneHit` 与 `scene_hit_test`（命中测试）、`scene_route_pointer`（指针路由，含隐式 grab）、`CpuCompositor`（纯 CPU 软件合成器）、`PopupTree`（自己跟随 `XdgShell` 的 popup 树与 grab 关闭）、`Pointer`。
 
 ---
 
@@ -87,9 +88,12 @@ comp.composite_rect(Rect::new(50, 50, 400, 300), Color::rgb(0.2, 0.4, 0.8));
 let pixels = comp.finish(1280, 720, Color::rgb(0.1, 0.1, 0.1));
 output.commit_frame(&pixels, 1280, 720)?;
 
-// 6. 驱动事件循环
-display.dispatch(Some(Duration::ZERO))?;
-display.flush_clients();
+// 6. 驱动事件循环：这一轮发生的一切都在返回的事件里
+for event in display.dispatch(Some(Duration::ZERO))? {
+    if let luminaria::Event::Xdg(e) = event {
+        println!("{e:?}");
+    }
+}
 ```
 
 完整可用的混成器见 `examples/minimal.rs`：它与根目录的 `examples/minimal.cpp` 是一对，窗口策略与快捷键相同（每个窗口最大化、新的在最上面、点击置顶；Logo+Return 开终端、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出），后端选择也相同（嵌套 / DRM / headless）。
@@ -109,17 +113,17 @@ cargo run --example calloop                                        # calloop 事
 ## 线程、生命周期与安全约束
 
 1. **单线程约束（Single-Threaded）**：
-   底层 `libwayland-server` 是单线程事件循环架构，所有涉及 Wayland 对象、后端输出与渲染器的操作必须在同一个线程中运行。所有 FFI 包装类型均未实现 `Send` 与 `Sync`。
+   底层 `libwayland-server` 是单线程事件循环架构，所有涉及 Wayland 对象、后端输出与渲染器的操作必须在同一个线程中运行。所有 FFI 包装类型均未实现 `Send` 与 `Sync`。事件队列是每线程一条，所以**一个线程只放一个 `Display`**；两个混成器（比如测试里的宿主与嵌套端）各占一个线程。
 2. **析构顺序由借用检查器保证**：
-   - C++ 对象之间的引用都写进了 Rust 类型的生命周期参数：协议 global、后端和 `Session` 借用 `Display`（`Seat<'d>`、`HeadlessBackend<'d>`……），`Cursor<'a>` 借用 renderer、layout 和 seat，`SceneOutput<'r>` 借用渲染它的 `SceneRenderer`，等等。被借的一方先 drop 就**编译不过**，不再是运行时的 use-after-free。完整清单见 [API 文档](docs/api.md) 的"借用关系"一节。
+   - C++ 对象之间的引用都写进了 Rust 类型的生命周期参数：协议 global、后端和 `Session` 借用 `Display`（`Seat<'d>`、`HeadlessBackend<'d>`……），`Cursor<'a>` 借用 renderer、layout 和 seat，等等。被借的一方先 drop 就**编译不过**，不再是运行时的 use-after-free。完整清单见 [API 文档](docs/api.md) 的"借用关系"一节。
    - 会被别的对象借住的类型（`Seat`、`XdgShell`、`OutputLayout`、`SceneRenderer`、`Session`）的方法都取 `&self`，所以借出之后照样能用。
-   - 局部变量按声明的逆序析构，被借的先声明即可。**Renderer 比 Display 活得久**这条仍然写得出来：`SceneRenderer` 不借任何东西，放在最前面声明：
+   - 局部变量按声明的逆序析构，被借的先声明即可。`SceneRenderer` 不借任何东西，每块输出的渲染状态由它自己保存，所以放在哪里都行，只要在借它的 `Cursor` / `LinuxDmabuf` 之前：
      ```rust
-     let renderer = SceneRenderer::new(&opts)?;     // 先声明，最后析构
      let display = Display::new()?;
-     let seat = Seat::new(&display, "seat0")?;       // 借 display
+     let globals = CoreGlobals::new(&display)?;          // 借 display
      let layout = OutputLayout::new()?;
-     let cursor = Cursor::new(&renderer, &layout, &seat)?; // 借三者，最先析构
+     let renderer = SceneRenderer::new(&opts)?;
+     let cursor = Cursor::new(&renderer, &layout, globals.seat())?; // 借三者，最先析构
      ```
    - 结构体不能同时持有被借者和借用者（那是自引用）。把被借的对象放在外层（`main` 的局部变量，或一个只装它们的结构体），再让持有 `Cursor<'a>` 之类的结构体借用它们。
 3. **世代标识符（Generational SurfaceId）**：

@@ -7,7 +7,10 @@ use std::marker::PhantomData;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
 
+use crate::backend::InputEvent;
+use crate::event::Events;
 use crate::ffi;
+use crate::protocol::Seat;
 
 /// Category of error originating from luminaria operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,18 +175,23 @@ impl Display {
         self.raw.terminate();
     }
 
-    /// Wait up to `timeout` for events on the event loop and dispatch them.
-    pub fn dispatch(&self, timeout: Option<Duration>) -> Result<i32, Error> {
+    /// One turn of the compositor: send the clients what the last turn
+    /// produced, wait up to `timeout` (`None`: until something happens) for
+    /// the event loop, dispatch it, and hand back every [`Event`] that left.
+    ///
+    /// Everything any wrapper on this display forwards comes back here, oldest
+    /// first, so there is no queue of its own to forget to drain.
+    pub fn dispatch(&self, timeout: Option<Duration>) -> Result<Events, Error> {
         let ms = timeout.map_or(-1, |t| t.as_millis().min(i32::MAX as u128) as i32);
         let ret = self.raw.dispatch(ms);
         if ret < 0 {
             Err(Error::new(ErrorKind::EventLoop, format!("event loop dispatch error: {ret}")))
         } else {
-            Ok(ret)
+            Ok(self.events())
         }
     }
 
-    /// Flush pending requests/events to all connected clients.
+    /// Send the clients what is pending now, instead of at the next dispatch.
     pub fn flush_clients(&self) {
         self.raw.flush_clients();
     }
@@ -263,10 +271,12 @@ impl AsFd for EventLoop<'_> {
     }
 }
 
-/// Tracks swallowed keypresses to ensure matching releases are also swallowed.
-#[derive(Default)]
+/// Splits the keyboard between the compositor's bindings and the focused
+/// client, keeping each key whole: a key whose press a binding took has its
+/// release taken too, so the client never sees half of it.
+#[derive(Debug, Default)]
 pub struct KeyRouter {
-    consumed: HashSet<u32>,
+    kept: HashSet<u32>,
 }
 
 impl KeyRouter {
@@ -274,15 +284,26 @@ impl KeyRouter {
         Self::default()
     }
 
-    pub fn consume(&mut self, keycode: u32) {
-        self.consumed.insert(keycode);
-    }
-
-    pub fn unconsume(&mut self, keycode: u32) -> bool {
-        self.consumed.remove(&keycode)
-    }
-
-    pub fn is_consumed(&self, keycode: u32) -> bool {
-        self.consumed.contains(&keycode)
+    /// Route one [`InputEvent::Key`]; anything else is ignored. A press is
+    /// offered to `binding` first, which answers whether the compositor keeps
+    /// it; everything else goes to `seat`.
+    ///
+    /// A press of a key a binding is thought to still hold means its release
+    /// was lost — what happens to the key that switched the VT away — and is
+    /// treated as a fresh press.
+    pub fn route(&mut self, seat: &Seat<'_>, event: &InputEvent, binding: impl FnOnce(&InputEvent) -> bool) {
+        let &InputEvent::Key { key, pressed, .. } = event else { return };
+        if !pressed {
+            if !self.kept.remove(&key) {
+                seat.notify_key(key, false);
+            }
+            return;
+        }
+        self.kept.remove(&key);
+        if binding(event) {
+            self.kept.insert(key);
+        } else {
+            seat.notify_key(key, true);
+        }
     }
 }

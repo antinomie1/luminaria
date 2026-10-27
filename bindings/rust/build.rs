@@ -40,15 +40,14 @@ fn main() {
     );
 
     // Which C++ modules the enabled cargo features ask for. The core module is
-    // always there; `desktop` needs `gpu` (DesktopGlobals takes a VulkanRenderer)
-    // and Cargo's `desktop = ["gpu"]` has already turned that on.
+    // always there; the extensions are independent of each other.
     let gpu = env::var_os("CARGO_FEATURE_GPU").is_some();
     let desktop = env::var_os("CARGO_FEATURE_DESKTOP").is_some();
     let text = env::var_os("CARGO_FEATURE_TEXT").is_some();
-    assert!(
-        !desktop || gpu,
-        "the `desktop` feature must also enable `gpu` (see Cargo.toml)"
-    );
+
+    // ------------------------------------------------------------- 0. keysyms
+    // Every XKB_KEY_* the system's xkbcommon defines, as `Keysym` constants.
+    keysyms(&out);
 
     // ---------------------------------------------------------------- 1. glue
     let mut bridges = vec!["src/ffi.rs"];
@@ -207,4 +206,40 @@ fn find_archive_dir(dir: &Path, name: &str) -> Option<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .find_map(|e| find_archive_dir(&e.path(), name))
+}
+
+/// `util::Keysym::Return`, `Keysym::a`, `Keysym::XF86Switch_VT_1`: one
+/// associated constant per `#define XKB_KEY_<name> 0x…` in the system's
+/// xkbcommon-keysyms.h, so the table is the one the C++ side compiles against.
+fn keysyms(out: &Path) {
+    let include = pkg_config::get_variable("xkbcommon", "includedir").unwrap_or_else(|_| "/usr/include".into());
+    let header = Path::new(&include).join("xkbcommon/xkbcommon-keysyms.h");
+    let text = std::fs::read_to_string(&header)
+        .unwrap_or_else(|e| panic!("{}: {e}", header.display()));
+    println!("cargo:rerun-if-changed={}", header.display());
+    let keywords = [
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if",
+        "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
+        "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "async",
+        "await", "dyn", "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof",
+        "unsized", "virtual", "yield", "try", "gen",
+    ];
+    let mut rust = String::from("impl Keysym {\n");
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("#define XKB_KEY_") else { continue };
+        let mut parts = rest.split_whitespace();
+        let (Some(name), Some(value)) = (parts.next(), parts.next()) else { continue };
+        let Some(hex) = value.strip_prefix("0x") else { continue };
+        let Ok(value) = u32::from_str_radix(hex, 16) else { continue };
+        let ident = if name.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("_{name}")
+        } else if keywords.contains(&name) {
+            format!("r#{name}")
+        } else {
+            name.to_owned()
+        };
+        rust.push_str(&format!("    pub const {ident}: Keysym = Keysym({value:#x});\n"));
+    }
+    rust.push_str("}\n");
+    std::fs::write(out.join("keysyms.rs"), rust).expect("write keysyms.rs");
 }

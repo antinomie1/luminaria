@@ -58,40 +58,29 @@ impl<'d> XdgActivation<'d> {
     }
 }
 
-impl XdgActivation<'_> {
-    pub fn next_event(&self) -> Option<ActivationEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                EventKind::ActivationRequest => {
-                    return Some(ActivationEvent::Request(ActivationRequest {
-                        surface: SurfaceId(raw.id),
-                        token_valid: raw.flag,
-                        app_id: raw.text,
-                        requesting_surface: SurfaceId::from_raw(raw.other),
-                        serial: raw.serial,
-                    }));
-                }
-                EventKind::ActivationTokenRequest => {
-                    return Some(ActivationEvent::TokenRequest(ActivationTokenRequest {
-                        surface: SurfaceId::from_raw(raw.id),
-                        serial: raw.serial,
-                        app_id: raw.text,
-                        granted: raw.flag,
-                    }));
-                }
-                _ => {}
+impl ActivationEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<ActivationEvent> {
+        match raw.kind {
+            EventKind::ActivationRequest => {
+                return Some(ActivationEvent::Request(ActivationRequest {
+                    surface: SurfaceId(raw.id),
+                    token_valid: raw.flag,
+                    app_id: raw.text,
+                    requesting_surface: SurfaceId::from_raw(raw.other),
+                    serial: raw.serial,
+                }));
             }
-        }
-    }
-
-    /// Pull the next activation request, skipping any token requests.
-    pub fn next_request(&self) -> Option<ActivationRequest> {
-        loop {
-            match self.next_event()? {
-                ActivationEvent::Request(req) => return Some(req),
-                _ => {}
+            EventKind::ActivationTokenRequest => {
+                return Some(ActivationEvent::TokenRequest(ActivationTokenRequest {
+                    surface: SurfaceId::from_raw(raw.id),
+                    serial: raw.serial,
+                    app_id: raw.text,
+                    granted: raw.flag,
+                }));
             }
+            _ => {}
         }
+        None
     }
 }

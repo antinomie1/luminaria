@@ -21,17 +21,10 @@ fn test_core_protocols_instantiation() {
     assert!(!seat.keymap().is_empty());
 
     let _layer_shell = LayerShell::new(&display).expect("LayerShell failed");
-    let output_global = OutputGlobal::with_properties(
-        &display,
-        1920,
-        1080,
-        "test-output",
-        (100, 200),
-        144000,
-        2,
-        luminaria::util::Transform::Normal,
-    ).expect("OutputGlobal with_properties failed");
-    assert_eq!(output_global.position(), (100, 200));
+    let output_global = OutputGlobal::new(&display, 1920, 1080, "test-output").expect("OutputGlobal failed");
+    output_global.set_logical_position(100, 200);
+    output_global.set_mode(1920, 1080, 144000);
+    output_global.set_scale(2);
     assert_eq!(output_global.logical_position(), (100, 200));
     assert_eq!(output_global.scale(), 2);
     assert_eq!(output_global.refresh_mhz(), 144000);
@@ -44,8 +37,8 @@ fn test_core_protocols_instantiation() {
     assert_eq!(output_global.logical_width(), 960);
     assert_eq!(output_global.logical_height(), 540);
 
-    output_global.set_position(300, 400);
-    assert_eq!(output_global.position(), (300, 400));
+    output_global.set_logical_position(300, 400);
+    assert_eq!(output_global.logical_position(), (300, 400));
     output_global.set_scale(1);
     assert_eq!(output_global.scale(), 1);
     assert_eq!(output_global.logical_size(), (1920, 1080));
@@ -75,4 +68,34 @@ fn test_core_protocols_instantiation() {
     let _relative_ptr = RelativePointerManager::new(&display, &seat).expect("RelativePointer failed");
     let _ptr_constraints = PointerConstraints::new(&display, &seat).expect("PointerConstraints failed");
     let _text_input = TextInputManager::new(&display, &seat).expect("TextInput failed");
+}
+
+/// A wl_output made from a backend output follows the layout it is placed by.
+#[test]
+fn output_global_follows_the_layout() {
+    let display = Display::new().expect("display");
+    let mut backend = luminaria::backend::HeadlessBackend::new(&display, 16).expect("headless");
+    let mut output = backend.add_output(800, 600).expect("output");
+    let layout = luminaria::shell::OutputLayout::new().expect("layout");
+    layout.add(&mut output, 0, 0);
+    let global = OutputGlobal::for_output(&display, &output, &layout, "").expect("for_output");
+    assert!(global.name().starts_with("luminaria-"));
+    assert_eq!(global.size(), (800, 600));
+    assert_eq!(global.logical_position(), (0, 0));
+    layout.add(&mut output, 300, 40);
+    assert_eq!(global.logical_position(), (300, 40));
+}
+
+/// The globals every compositor advertises, as one value.
+#[test]
+fn core_globals() {
+    let display = Display::new().expect("display");
+    let globals = CoreGlobals::new(&display).expect("CoreGlobals");
+    globals.seat().set_capabilities(true, true, false);
+    assert!(!globals.seat().keymap().is_empty());
+    globals.shell().set_bounds(800, 600);
+    // Moving it keeps every global where the seat-borrowing ones look for it.
+    let moved = globals;
+    assert!(moved.data_device().selection_mime_types().is_empty());
+    assert!(moved.primary_selection().selection_mime_types().is_empty());
 }

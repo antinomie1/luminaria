@@ -1,5 +1,6 @@
 //! Utility types: geometry, colors, transforms, regions, keymaps, and pixel layouts.
 
+use std::fmt;
 use std::pin::Pin;
 
 use crate::ffi;
@@ -332,6 +333,105 @@ impl Transform {
             Self::Flipped90 => (height - y, width - x),
             Self::Flipped180 => (x, height - y),
             Self::Flipped270 => (y, x),
+        }
+    }
+}
+
+/// `0..=7` is a transform, anything else is not.
+impl TryFrom<u32> for Transform {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, u32> {
+        if value <= 7 { Ok(Self::from_u32(value)) } else { Err(value) }
+    }
+}
+
+impl From<Transform> for u32 {
+    fn from(transform: Transform) -> u32 {
+        transform.as_u32()
+    }
+}
+
+/// DRM pixel formats, from the `drm-fourcc` crate: what
+/// `SceneRenderer::reset_with_format()` and the scanout queries take.
+pub use drm_fourcc::DrmFourcc;
+
+/// An xkb keysym: what a key means in the current layout, as
+/// `InputEvent::Key` reports it and as a key binding matches it.
+///
+/// Every `XKB_KEY_<name>` is an associated constant — `Keysym::Return`,
+/// `Keysym::a`, `Keysym::XF86Switch_VT_1` — generated from the xkbcommon the
+/// library is built against. Names that start with a digit get a leading `_`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct Keysym(u32);
+
+#[allow(non_upper_case_globals)]
+mod keysym_table {
+    use super::Keysym;
+    include!(concat!(env!("OUT_DIR"), "/keysyms.rs"));
+}
+
+unsafe extern "C" {
+    fn xkb_keysym_to_lower(keysym: u32) -> u32;
+    fn xkb_keysym_get_name(keysym: u32, buffer: *mut std::ffi::c_char, size: usize) -> i32;
+}
+
+impl Keysym {
+    /// No symbol: a key nothing in the layout maps.
+    pub const NONE: Keysym = Keysym(0);
+
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// The lower-case form, for matching a binding regardless of Shift or
+    /// Caps Lock: `Keysym::Q.to_lower() == Keysym::q`.
+    pub fn to_lower(self) -> Self {
+        // SAFETY: a pure function of its argument.
+        Self(unsafe { xkb_keysym_to_lower(self.0) })
+    }
+
+    /// The name xkb gives it ("Return", "q"), or `None` for one it has none for.
+    pub fn name(self) -> Option<String> {
+        let mut buffer = [0 as std::ffi::c_char; 64];
+        // SAFETY: the buffer and its size are what xkb is told.
+        let len = unsafe { xkb_keysym_get_name(self.0, buffer.as_mut_ptr(), buffer.len()) };
+        let len = usize::try_from(len).ok().filter(|&n| n > 0 && n < buffer.len())?;
+        let bytes: Vec<u8> = buffer[..len].iter().map(|&c| c as u8).collect();
+        String::from_utf8(bytes).ok()
+    }
+}
+
+impl From<u32> for Keysym {
+    fn from(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<Keysym> for u32 {
+    fn from(keysym: Keysym) -> u32 {
+        keysym.0
+    }
+}
+
+impl fmt::Debug for Keysym {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => write!(f, "Keysym::{name}"),
+            None => write!(f, "Keysym({:#x})", self.0),
+        }
+    }
+}
+
+impl fmt::Display for Keysym {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(&name),
+            None => write!(f, "{:#x}", self.0),
         }
     }
 }

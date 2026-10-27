@@ -47,15 +47,3 @@ fn test_desktop_protocols() {
     // Input method manager
     let _imm = InputMethodManager::new(&display, &seat, &tim).expect("InputMethodManager failed");
 }
-
-#[test]
-fn test_desktop_globals_suite() {
-    let temp_dir = std::env::temp_dir().join("luminaria_test_desktop_runtime");
-    let _ = std::fs::create_dir_all(&temp_dir);
-    unsafe {
-        std::env::set_var("XDG_RUNTIME_DIR", &temp_dir);
-    }
-
-    let display = Display::new().expect("failed to create display");
-    let _globals = DesktopGlobals::new(&display, None, "seat0").expect("DesktopGlobals failed");
-}

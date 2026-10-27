@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use luminaria::backend::{InputCapabilities, InputEvent, InputSource, Modifiers, PointerAxis, WaylandBackend};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, Seat, XdgEvent, XdgShell};
-use luminaria::util::KeymapState;
+use luminaria::Event;
+use luminaria::util::{KeymapState, Keysym};
 
 const KEY_A: u32 = 30;
-const XKB_KEY_CAPITAL_A: u32 = 0x41;
-const SHIFT: u32 = 1 << 0;
+const SHIFT: u32 = Modifiers::SHIFT;
 
 #[test]
 fn nested_wayland_backend_events() {
@@ -63,21 +63,22 @@ fn nested_wayland_backend_events() {
         ready_tx.send(child_output.id()).unwrap();
 
         while !stop_thread.load(Ordering::Relaxed) {
-            child_display.dispatch(Some(Duration::from_millis(5))).ok();
-            while let Some(ev) = InputSource::next_input_event(&mut backend) {
-                event_tx.send(ev).unwrap();
-            }
-            if backend.take_close_request() {
-                closed_thread.store(true, Ordering::Relaxed);
+            for event in child_display.dispatch(Some(Duration::from_millis(5))).into_iter().flatten() {
+                match event {
+                    Event::Input(ev) => event_tx.send(ev).unwrap(),
+                    Event::HostCloseRequest => closed_thread.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
             }
         }
     });
 
-    let pump_host = |display: &Display, for_duration: Duration| {
+    // What the host saw, for the toplevel the child creates.
+    let mut host_events: Vec<Event> = Vec::new();
+    let pump_host = |display: &Display, for_duration: Duration, seen: &mut Vec<Event>| {
         let deadline = Instant::now() + for_duration;
         while Instant::now() < deadline {
-            display.dispatch(Some(Duration::from_millis(5))).ok();
-            display.flush_clients();
+            seen.extend(display.dispatch(Some(Duration::from_millis(5))).into_iter().flatten());
         }
     };
 
@@ -86,15 +87,14 @@ fn nested_wayland_backend_events() {
         if let Ok(id) = ready_rx.try_recv() {
             break id;
         }
-        host_display.dispatch(Some(Duration::from_millis(5))).ok();
-        host_display.flush_clients();
+        host_events.extend(host_display.dispatch(Some(Duration::from_millis(5))).into_iter().flatten());
     };
 
-    pump_host(&host_display, Duration::from_millis(50));
+    pump_host(&host_display, Duration::from_millis(50), &mut host_events);
 
     // Find the child's toplevel
     let mut toplevel_id = None;
-    while let Some(ev) = host_shell.next_event() {
+    for ev in host_events.drain(..).filter_map(|e| XdgEvent::try_from(e).ok()) {
         if let XdgEvent::Toplevel(id, _) = ev {
             toplevel_id = Some(id);
             if let Some(tl) = host_shell.toplevel(id) {
@@ -117,13 +117,13 @@ fn nested_wayland_backend_events() {
     host_seat.pointer_axis_stop(true, false);
     host_seat.pointer_clear_focus();
 
-    pump_host(&host_display, Duration::from_millis(50));
+    pump_host(&host_display, Duration::from_millis(50), &mut host_events);
 
     // Send close
     if let Some(tl) = host_shell.toplevel(toplevel_id) {
         tl.close();
     }
-    pump_host(&host_display, Duration::from_millis(50));
+    pump_host(&host_display, Duration::from_millis(50), &mut host_events);
 
     // Stop child thread
     stop.store(true, Ordering::Relaxed);
@@ -148,7 +148,7 @@ fn nested_wayland_backend_events() {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            InputEvent::Key { key: KEY_A, pressed: true, keysym: XKB_KEY_CAPITAL_A, modifiers }
+            InputEvent::Key { key: KEY_A, pressed: true, keysym: Keysym::A, modifiers }
                 if modifiers.depressed == SHIFT
         )),
         "expected a Shift+a press read as `A`, got: {events:?}"

@@ -38,20 +38,6 @@ impl<'d> IdleInhibitManager<'d> {
 }
 
 impl IdleInhibitManager<'_> {
-    pub fn next_event(&self) -> Option<IdleInhibitEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            return Some(match raw.kind {
-                EventKind::NewIdleInhibitor => IdleInhibitEvent::NewInhibitor {
-                    inhibitor: IdleInhibitorId(raw.id),
-                    surface: SurfaceId(raw.other),
-                },
-                EventKind::IdleInhibitorDestroy => IdleInhibitEvent::InhibitorDestroy(IdleInhibitorId(raw.id)),
-                EventKind::IdleInhibitChange => IdleInhibitEvent::Changed(raw.flag),
-                _ => continue,
-            });
-        }
-    }
 
     pub fn is_inhibited(&self) -> bool {
         self.raw.inhibited()
@@ -117,18 +103,6 @@ impl<'d> IdleNotifier<'d> {
 }
 
 impl IdleNotifier<'_> {
-    pub fn next_event(&self) -> Option<IdleNotifierEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let notification = IdleNotificationId(raw.id);
-            return Some(match raw.kind {
-                EventKind::NewIdleNotification => IdleNotifierEvent::NewNotification(notification),
-                EventKind::IdleNotificationDestroy => IdleNotifierEvent::NotificationDestroy(notification),
-                EventKind::IdleStateChange => IdleNotifierEvent::StateChange { notification, idled: raw.flag },
-                _ => continue,
-            });
-        }
-    }
 
     /// The user did something: every notification resumes and restarts.
     pub fn notify_activity(&self) {
@@ -160,5 +134,35 @@ impl IdleNotifier<'_> {
             idled: info.idled,
             input_only: info.input_only,
         })
+    }
+}
+
+impl IdleInhibitEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<IdleInhibitEvent> {
+        return Some(match raw.kind {
+            EventKind::NewIdleInhibitor => IdleInhibitEvent::NewInhibitor {
+                inhibitor: IdleInhibitorId(raw.id),
+                surface: SurfaceId(raw.other),
+            },
+            EventKind::IdleInhibitorDestroy => IdleInhibitEvent::InhibitorDestroy(IdleInhibitorId(raw.id)),
+            EventKind::IdleInhibitChange => IdleInhibitEvent::Changed(raw.flag),
+            _ => return None,
+        });
+        None
+    }
+}
+
+impl IdleNotifierEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<IdleNotifierEvent> {
+        let notification = IdleNotificationId(raw.id);
+        return Some(match raw.kind {
+            EventKind::NewIdleNotification => IdleNotifierEvent::NewNotification(notification),
+            EventKind::IdleNotificationDestroy => IdleNotifierEvent::NotificationDestroy(notification),
+            EventKind::IdleStateChange => IdleNotifierEvent::StateChange { notification, idled: raw.flag },
+            _ => return None,
+        });
+        None
     }
 }

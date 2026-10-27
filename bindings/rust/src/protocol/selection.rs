@@ -29,13 +29,6 @@ macro_rules! selection_manager {
         }
 
         impl $name<'_> {
-            /// The next change of selection owner, with what the new one
-            /// offers (empty: the selection was cleared).
-            pub fn next_selection_change(&self) -> Option<Vec<String>> {
-                let mut mime_types = Vec::new();
-                self.raw.next_selection_change(&mut mime_types).then_some(mime_types)
-            }
-
             /// What the current selection offers; empty when there is none.
             pub fn selection_mime_types(&self) -> Vec<String> {
                 self.raw.selection_mime_types()
@@ -51,9 +44,31 @@ macro_rules! selection_manager {
     };
 }
 
+/// The selection changed owner: [`crate::Event::Selection`]. `mime_types` is
+/// what the new owner offers; empty when the selection was cleared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionChange {
+    /// The middle-click selection rather than the clipboard.
+    pub primary: bool,
+    pub mime_types: Vec<String>,
+}
+
+impl SelectionChange {
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<Self> {
+        let primary = match raw.kind {
+            crate::ffi::EventKind::SelectionChange => false,
+            crate::ffi::EventKind::PrimarySelectionChange => true,
+            _ => return None,
+        };
+        let mime_types = if raw.text.is_empty() { Vec::new() } else { raw.text.lines().map(str::to_owned).collect() };
+        Some(Self { primary, mime_types })
+    }
+}
+
 selection_manager!(
     /// The `wl_data_device_manager` (clipboard and drag-and-drop) global. It
     /// routes through the [`Seat`] it was created for, which it keeps borrowed.
+    /// Changes of owner arrive as [`crate::Event::Selection`].
     DataDeviceManager,
     DataDeviceManagerShim,
     data_device_manager_new

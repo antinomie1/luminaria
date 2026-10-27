@@ -54,7 +54,9 @@ fn test_cpu_compositor() {
 
 #[test]
 fn test_popup_tree() {
-    let mut tree = PopupTree::new().expect("PopupTree failed");
+    let display = luminaria::core::Display::new().expect("display");
+    let shell = luminaria::protocol::XdgShell::new(&display).expect("xdg-shell");
+    let mut tree = PopupTree::new(&shell).expect("PopupTree failed");
     assert!(!tree.contains(SurfaceId(123)));
     assert!(!tree.dismiss_grabs_outside(Some(SurfaceId(123))));
 }

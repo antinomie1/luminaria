@@ -87,22 +87,6 @@ impl<'d> LayerShell<'d> {
 }
 
 impl LayerShell<'_> {
-    /// The next layer-surface event, oldest first, with the surface it is about.
-    pub fn next_event(&self) -> Option<(SurfaceId, LayerSurfaceEvent)> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let event = match raw.kind {
-                EventKind::NewLayerSurface => LayerSurfaceEvent::Created,
-                EventKind::LayerSurfaceMap => LayerSurfaceEvent::Map,
-                EventKind::LayerSurfaceUnmap => LayerSurfaceEvent::Unmap,
-                EventKind::LayerSurfaceDestroy => LayerSurfaceEvent::Destroy,
-                EventKind::LayerSurfaceStateChange => LayerSurfaceEvent::StateChange,
-                EventKind::LayerSurfacePopup => LayerSurfaceEvent::NewPopup(SurfaceId(raw.other)),
-                _ => continue,
-            };
-            return Some((SurfaceId(raw.id), event));
-        }
-    }
 
     /// Every layer surface alive now, in no particular order.
     pub fn layer_surfaces(&self) -> Vec<SurfaceId> {
@@ -226,5 +210,22 @@ impl LayerSurface<'_> {
     /// does this for every surface of an output, in the right order.
     pub fn arrange(&self, full: Rect, usable: &mut Rect) -> Rect {
         self.shell.arrange(self.surface.0, full, usable)
+    }
+}
+
+impl LayerSurfaceEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<(SurfaceId, LayerSurfaceEvent)> {
+        let event = match raw.kind {
+            EventKind::NewLayerSurface => LayerSurfaceEvent::Created,
+            EventKind::LayerSurfaceMap => LayerSurfaceEvent::Map,
+            EventKind::LayerSurfaceUnmap => LayerSurfaceEvent::Unmap,
+            EventKind::LayerSurfaceDestroy => LayerSurfaceEvent::Destroy,
+            EventKind::LayerSurfaceStateChange => LayerSurfaceEvent::StateChange,
+            EventKind::LayerSurfacePopup => LayerSurfaceEvent::NewPopup(SurfaceId(raw.other)),
+            _ => return None,
+        };
+        return Some((SurfaceId(raw.id), event));
+        None
     }
 }

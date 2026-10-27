@@ -3,7 +3,7 @@ use std::time::Duration;
 use luminaria::backend::HeadlessBackend;
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, Seat, XdgShell};
-use luminaria::shell::{CpuCompositor, OutputLayout, SceneItem};
+use luminaria::shell::{CpuCompositor, OutputLayout, SceneItem, SceneKind};
 use luminaria::util::{Color, Rect};
 
 #[test]
@@ -49,9 +49,7 @@ fn test_custom_compositor_headless_pipeline() {
     ];
 
     for item in &items {
-        if item.kind == 1 {
-            cpu_comp.composite_rect(item.rect, item.color);
-        } else if item.kind == 2 {
+        if matches!(item.kind, SceneKind::Rect | SceneKind::Border) {
             cpu_comp.composite_rect(item.rect, item.color);
         }
     }

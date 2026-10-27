@@ -5,7 +5,7 @@
 #[macro_use]
 mod common;
 
-use common::{drain, ClientSide, Peer};
+use common::{ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::desktop::{
     ForeignToplevelManager, ForeignToplevelRequestKind, OutputManager, WorkspaceManager,
@@ -193,13 +193,13 @@ fn test_decoration_and_icon_events() {
     let display = Display::new().expect("display");
     let _comp = Compositor::new(&display).expect("compositor");
     let _shell = XdgShell::new(&display).expect("shell");
-    let deco_mgr = XdgDecorationManager::new(&display).expect("decoration");
+    let _deco_mgr = XdgDecorationManager::new(&display).expect("decoration");
     let icon_mgr = XdgToplevelIconManager::new(&display).expect("icon");
 
     let mut peer = Peer::spawn(&display, client_decoration_and_icon);
 
     peer.wait(&display, "deco_requested");
-    let events = drain(|| deco_mgr.next_event());
+    let events = take::<luminaria::protocol::DecorationRequest>();
     assert!(!events.is_empty(), "expected DecorationRequest: {events:?}");
     let req = events
         .iter()
@@ -209,7 +209,7 @@ fn test_decoration_and_icon_events() {
     peer.go();
 
     peer.wait(&display, "icon_set");
-    let events = drain(|| icon_mgr.next_event());
+    let events = take::<luminaria::protocol::ToplevelIconChange>();
     assert!(!events.is_empty(), "expected ToplevelIconChange: {events:?}");
     let ev = &events[0];
     assert_eq!(ev.name, "my-test-app");
@@ -270,7 +270,7 @@ fn test_cursor_shape_events() {
 
     peer.wait(&display, "ready");
     let mut surface = None;
-    while let Some(ev) = shell.next_event() {
+    for ev in take::<luminaria::protocol::XdgEvent>() {
         if let luminaria::protocol::XdgEvent::Toplevel(id, _) = ev {
             surface = Some(id);
             if let Some(tl) = shell.toplevel(id) {
@@ -284,7 +284,7 @@ fn test_cursor_shape_events() {
     peer.go();
 
     peer.wait(&display, "shape_set");
-    let requests = drain(|| shape_mgr.next_event());
+    let requests = take::<luminaria::protocol::CursorShapeRequest>();
     assert!(!requests.is_empty(), "expected CursorShapeRequest: {requests:?}");
     let req = &requests[0];
     assert_eq!(req.name, "pointer");
@@ -318,12 +318,12 @@ fn client_activation_token(conn: Connection, step: ClientSide) {
 fn test_activation_token_events() {
     let display = Display::new().expect("display");
     let _comp = Compositor::new(&display).expect("compositor");
-    let activation = XdgActivation::new(&display).expect("activation");
+    let _activation = XdgActivation::new(&display).expect("activation");
 
     let mut peer = Peer::spawn(&display, client_activation_token);
 
     peer.wait(&display, "token_committed");
-    let events = drain(|| activation.next_event());
+    let events = take::<luminaria::protocol::ActivationEvent>();
     assert!(!events.is_empty(), "expected TokenRequest: {events:?}");
     let token_req = events
         .iter()
@@ -394,7 +394,7 @@ fn test_workspace_and_foreign_toplevel_events() {
     let mut peer = Peer::spawn(&display, client_workspace_and_foreign);
 
     peer.wait(&display, "workspace_requested");
-    let ws_events = drain(|| ws_mgr.next_event());
+    let ws_events = take::<luminaria::desktop::WorkspaceRequest>();
     assert!(!ws_events.is_empty(), "expected WorkspaceRequest: {ws_events:?}");
     let ws_req = &ws_events[0];
     assert_eq!(ws_req.kind, WorkspaceRequestKind::Create);
@@ -403,7 +403,7 @@ fn test_workspace_and_foreign_toplevel_events() {
 
     peer.wait(&display, "toplevel_created");
     // Configure toplevel so it finishes mapping
-    while let Some(ev) = shell.next_event() {
+    for ev in take::<luminaria::protocol::XdgEvent>() {
         if let luminaria::protocol::XdgEvent::Toplevel(id, _) = ev {
             if let Some(tl) = shell.toplevel(id) {
                 tl.configure(320, 240);
@@ -413,7 +413,7 @@ fn test_workspace_and_foreign_toplevel_events() {
     peer.go();
 
     peer.wait(&display, "foreign_maximized");
-    let ft_events = drain(|| ft_mgr.next_event());
+    let ft_events = take::<luminaria::desktop::ForeignToplevelRequest>();
     assert!(!ft_events.is_empty(), "expected ForeignToplevelRequest: {ft_events:?}");
     let ft_req = &ft_events[0];
     assert_eq!(ft_req.kind, ForeignToplevelRequestKind::Maximize);
@@ -444,12 +444,12 @@ fn client_output_management(conn: Connection, step: ClientSide) {
 fn test_output_management_events() {
     let display = Display::new().expect("display");
     let layout = OutputLayout::new().expect("layout");
-    let out_mgr = OutputManager::new(&display, &layout).expect("output manager");
+    let _out_mgr = OutputManager::new(&display, &layout).expect("output manager");
 
     let mut peer = Peer::spawn(&display, client_output_management);
 
     peer.wait(&display, "config_applied");
-    let requests = drain(|| out_mgr.next_event());
+    let requests = take::<luminaria::desktop::OutputConfigRequest>();
     assert!(!requests.is_empty(), "expected OutputConfigRequest: {requests:?}");
     let req = &requests[0];
     assert!(!req.test); // applied, not test

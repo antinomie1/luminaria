@@ -3,7 +3,6 @@
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::EventKind;
 use crate::ffi_desktop as ffi;
-use crate::gpu::VulkanRenderer;
 use crate::protocol::{DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell};
 use crate::util::Rect;
 use crate::shell::OutputLayout;
@@ -67,21 +66,6 @@ impl<'d> ForeignToplevelManager<'d> {
     /// the manager's lifetime could shrink to this call.)
     pub fn track(&mut self, shell: &'d XdgShell<'_>) {
         ffi::foreign_toplevel_track(self.raw.pin_mut(), &shell.raw);
-    }
-
-    pub fn next_event(&self) -> Option<ForeignToplevelRequest> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                EventKind::ForeignToplevelRequest => {
-                    let surface = SurfaceId(raw.id);
-                    if let Some(kind) = ForeignToplevelRequestKind::from_u32(raw.value) {
-                        return Some(ForeignToplevelRequest { surface, kind });
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 }
 
@@ -149,25 +133,6 @@ impl<'d> WorkspaceManager<'d> {
     pub fn activate_workspace(&mut self, workspace: u32) {
         self.raw.activate_workspace(workspace);
     }
-
-    pub fn next_event(&self) -> Option<WorkspaceRequest> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                EventKind::WorkspaceRequest => {
-                    if let Some(kind) = WorkspaceRequestKind::from_u32(raw.value) {
-                        return Some(WorkspaceRequest {
-                            kind,
-                            workspace: raw.id as u32,
-                            group: raw.other as u32,
-                            name: raw.text,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 /// A lock client's claim on the session, named by the binding.
@@ -212,25 +177,6 @@ impl<'d> SessionLockManager<'d> {
 }
 
 impl SessionLockManager<'_> {
-    pub fn next_event(&self) -> Option<SessionLockEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            return Some(match raw.kind {
-                EventKind::NewSessionLock => SessionLockEvent::NewLock(LockId(raw.id)),
-                EventKind::NewLockSurface => SessionLockEvent::NewSurface {
-                    lock: LockId(raw.id),
-                    surface: SurfaceId(raw.other),
-                },
-                EventKind::LockSurfaceMap => SessionLockEvent::SurfaceMap(SurfaceId(raw.id)),
-                EventKind::LockSurfaceDestroy => SessionLockEvent::SurfaceDestroy(SurfaceId(raw.id)),
-                EventKind::SessionLockDestroy => SessionLockEvent::LockDestroy {
-                    lock: LockId(raw.id),
-                    unlocked: raw.flag,
-                },
-                _ => continue,
-            });
-        }
-    }
 
     /// True from the first `send_locked` until a client's orderly unlock.
     pub fn is_locked(&self) -> bool {
@@ -366,18 +312,6 @@ impl<'a> OutputManager<'a> {
     pub fn set_auto_verdict(&self, succeed: bool) {
         self.raw.set_auto_verdict(succeed);
     }
-
-    pub fn next_event(&self) -> Option<OutputConfigRequest> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                EventKind::OutputConfigRequest => {
-                    return Some(OutputConfigRequest { test: raw.flag });
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 /// Clipboard manager protocol (`zwlr_data_control_manager_v1` for
@@ -440,26 +374,6 @@ impl<'a> InputMethodManager<'a> {
 }
 
 impl InputMethodManager<'_> {
-    pub fn next_event(&self) -> Option<InputMethodEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let input_method = InputMethodId(raw.id);
-            return Some(match raw.kind {
-                EventKind::NewInputMethod => InputMethodEvent::New(input_method),
-                EventKind::InputMethodGrabChange => InputMethodEvent::GrabChange {
-                    input_method,
-                    grabbed: raw.flag,
-                },
-                EventKind::InputMethodDestroy => InputMethodEvent::Destroy(input_method),
-                EventKind::NewInputPopupSurface => InputMethodEvent::NewPopupSurface {
-                    input_method,
-                    surface: SurfaceId(raw.other),
-                },
-                EventKind::InputPopupSurfaceDestroy => InputMethodEvent::PopupSurfaceDestroy(SurfaceId(raw.id)),
-                _ => continue,
-            });
-        }
-    }
 
     /// The input method bound to the seat.
     pub fn current(&self) -> Option<InputMethod<'_>> {
@@ -519,30 +433,94 @@ impl InputMethod<'_> {
     }
 }
 
-/// Convenience manager creating the complete set of standard Wayland desktop
-/// globals. Borrows the [`Display`], and the renderer its linux-dmabuf uses.
-pub struct DesktopGlobals<'a> {
-    #[allow(dead_code)]
-    pub(crate) raw: cxx::UniquePtr<ffi::DesktopGlobalsShim>,
-    _borrows: Holds<'a>,
+impl ForeignToplevelRequest {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<ForeignToplevelRequest> {
+        match raw.kind {
+            EventKind::ForeignToplevelRequest => {
+                let surface = SurfaceId(raw.id);
+                if let Some(kind) = ForeignToplevelRequestKind::from_u32(raw.value) {
+                    return Some(ForeignToplevelRequest { surface, kind });
+                }
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
-impl<'a> DesktopGlobals<'a> {
-    pub fn new(
-        display: &'a Display,
-        renderer: Option<&'a VulkanRenderer>,
-        seat_name: &str,
-    ) -> Result<Self, Error> {
-        let mut err = String::new();
-        let raw = if let Some(r) = renderer {
-            ffi::desktop_globals_new(&display.raw, &r.raw, seat_name, &mut err)
-        } else {
-            ffi::desktop_globals_new_headless(&display.raw, seat_name, &mut err)
-        };
-        if raw.is_null() {
-            Err(Error::new(ErrorKind::Protocol, err))
-        } else {
-            Ok(Self { raw, _borrows: Holds::new() })
+impl WorkspaceRequest {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<WorkspaceRequest> {
+        match raw.kind {
+            EventKind::WorkspaceRequest => {
+                if let Some(kind) = WorkspaceRequestKind::from_u32(raw.value) {
+                    return Some(WorkspaceRequest {
+                        kind,
+                        workspace: raw.id as u32,
+                        group: raw.other as u32,
+                        name: raw.text,
+                    });
+                }
+            }
+            _ => {}
         }
+        None
+    }
+}
+
+impl SessionLockEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<SessionLockEvent> {
+        return Some(match raw.kind {
+            EventKind::NewSessionLock => SessionLockEvent::NewLock(LockId(raw.id)),
+            EventKind::NewLockSurface => SessionLockEvent::NewSurface {
+                lock: LockId(raw.id),
+                surface: SurfaceId(raw.other),
+            },
+            EventKind::LockSurfaceMap => SessionLockEvent::SurfaceMap(SurfaceId(raw.id)),
+            EventKind::LockSurfaceDestroy => SessionLockEvent::SurfaceDestroy(SurfaceId(raw.id)),
+            EventKind::SessionLockDestroy => SessionLockEvent::LockDestroy {
+                lock: LockId(raw.id),
+                unlocked: raw.flag,
+            },
+            _ => return None,
+        });
+        None
+    }
+}
+
+impl OutputConfigRequest {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<OutputConfigRequest> {
+        match raw.kind {
+            EventKind::OutputConfigRequest => {
+                return Some(OutputConfigRequest { test: raw.flag });
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+impl InputMethodEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<InputMethodEvent> {
+        let input_method = InputMethodId(raw.id);
+        return Some(match raw.kind {
+            EventKind::NewInputMethod => InputMethodEvent::New(input_method),
+            EventKind::InputMethodGrabChange => InputMethodEvent::GrabChange {
+                input_method,
+                grabbed: raw.flag,
+            },
+            EventKind::InputMethodDestroy => InputMethodEvent::Destroy(input_method),
+            EventKind::NewInputPopupSurface => InputMethodEvent::NewPopupSurface {
+                input_method,
+                surface: SurfaceId(raw.other),
+            },
+            EventKind::InputPopupSurfaceDestroy => InputMethodEvent::PopupSurfaceDestroy(SurfaceId(raw.id)),
+            _ => return None,
+        });
+        None
     }
 }

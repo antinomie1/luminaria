@@ -27,10 +27,9 @@ public:
     SessionShim& operator=(const SessionShim&) = delete;
 
     bool switch_to(int vt, rust::String& error) const;
+    bool switch_vt_for(std::uint32_t keysym) const;
     bool active() const;
     rust::String seat_name() const;
-    // 0 = nothing queued, 1 = became inactive, 2 = became active.
-    std::uint32_t next_activity() const;
 
     struct Impl;
     Impl& impl() const;
@@ -50,8 +49,6 @@ public:
     bool start(rust::String& error);
     int fd() const;
     void scan_connectors();
-    // kind: 0 = nothing queued, 1 = output added (returned), 2 = removed (`removed` set).
-    std::unique_ptr<OutputShim> next_event(std::uint32_t& kind, std::uint64_t& removed);
 
     struct Impl;
     Impl& impl() const;
@@ -71,9 +68,9 @@ public:
 
     bool start(rust::String& error);
     bool add_device(rust::Str path, rust::String& error);
-    bool next_input_event(InputEventRaw& out);
     rust::String keymap() const;
     bool set_keymap(rust::Str xkb_text);
+    void follow_seat(const SeatShim& seat, bool touch) const;
     // keyboard, pointer, touch as bits 0, 1, 2.
     std::uint32_t capabilities() const;
 
@@ -100,12 +97,10 @@ public:
     // 1 = nested, 2 = drm, 3 = headless.
     std::uint32_t kind() const;
     bool start(rust::String& error);
-    // As DrmBackendShim::next_event; nested and headless report theirs at start.
-    std::unique_ptr<OutputShim> next_event(std::uint32_t& kind, std::uint64_t& removed);
-    bool next_input_event(InputEventRaw& out);
     rust::String keymap() const;
     std::uint32_t capabilities() const;
-    bool take_close_request();
+    // lm::Seat::follow on the picked backend's input; nothing headless.
+    void follow_seat(const SeatShim& seat, bool touch) const;
     bool has_session() const;
     // Only when has_session(); borrowed from the backend, which owns it.
     const SessionShim& session() const;
@@ -193,23 +188,6 @@ std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new(const DisplayShim& display, co
 std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new_headless(const DisplayShim& display, rust::String& error);
 std::unique_ptr<LinuxDmabufShim> linux_dmabuf_new_from_scene_renderer(const DisplayShim& display, const SceneRendererShim& renderer, rust::String& error);
 
-class SceneOutputShim {
-public:
-    ~SceneOutputShim();
-    SceneOutputShim(const SceneOutputShim&) = delete;
-    SceneOutputShim& operator=(const SceneOutputShim&) = delete;
-
-    bool gpu_output() const;
-
-    struct Impl;
-    Impl& impl() const;
-    explicit SceneOutputShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<SceneOutputShim> scene_output_new();
-
 class SceneRendererShim {
 public:
     ~SceneRendererShim();
@@ -218,13 +196,19 @@ public:
 
     bool gpu_enabled() const;
     rust::String gpu_error() const;
-    bool reset(SceneOutputShim& state, OutputShim& output, std::uint32_t drm_format, rust::String& error) const;
-    int present(SceneOutputShim& state, OutputShim& output, rust::Slice<const SceneItemRaw> items,
+    // Each output's lm::SceneOutput is kept here, by output id, and dropped
+    // when the output is destroyed: Rust never holds one.
+    bool reset(OutputShim& output, std::uint32_t drm_format, rust::String& error) const;
+    int present(OutputShim& output, rust::Slice<const SceneItemRaw> items,
                 float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const;
+    // The same, from a scene in `layout`'s coordinates.
+    int present_in(const OutputLayoutShim& layout, OutputShim& output, rust::Slice<const SceneItemRaw> items,
+                   float bg_r, float bg_g, float bg_b, float bg_a, rust::String& error) const;
+    bool gpu_output(const OutputShim& output) const;
     void set_presentation(const PresentationShim& presentation) const;
     void clear_presentation() const;
     void update_cursor() const;
-    rust::Vec<std::uint8_t> read_back(SceneOutputShim& state, rust::String& error) const;
+    rust::Vec<std::uint8_t> read_back(const OutputShim& output, rust::String& error) const;
     bool vulkan_handles(VulkanHandlesRaw& out) const;
     bool set_image(std::uint64_t serial, std::int32_t width, std::int32_t height, rust::Slice<const std::uint8_t> rgba, rust::String& error) const;
     void remove_image(std::uint64_t serial) const;

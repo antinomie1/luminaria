@@ -1,7 +1,10 @@
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
+use luminaria::backend::InputEvent;
 use luminaria::core::{Display, Error, ErrorKind, KeyRouter};
+use luminaria::protocol::Seat;
+use luminaria::util::Keysym;
 
 #[test]
 fn test_display_creation_and_sockets() {
@@ -31,15 +34,30 @@ fn test_display_creation_and_sockets() {
 
 #[test]
 fn test_key_router() {
+    let display = Display::new().expect("display");
+    let seat = Seat::new(&display, "seat0").expect("seat");
+    let key = |key, pressed| InputEvent::Key { key, pressed, keysym: Keysym::q, modifiers: Default::default() };
     let mut router = KeyRouter::new();
-    assert!(!router.is_consumed(1));
-
-    router.consume(1);
-    assert!(router.is_consumed(1));
-
-    assert!(router.unconsume(1));
-    assert!(!router.is_consumed(1));
-    assert!(!router.unconsume(1));
+    let mut asked = Vec::new();
+    // Only presses are offered, and the binding decides per key.
+    for event in [key(1, true), key(1, false), key(2, true), key(2, false)] {
+        router.route(&seat, &event, |e| {
+            let &InputEvent::Key { key, .. } = e else { unreachable!() };
+            asked.push(key);
+            key == 1
+        });
+    }
+    assert_eq!(asked, [1, 2]);
+    // A press whose release was lost (the VT switched away) is a fresh press.
+    router.route(&seat, &key(3, true), |_| true);
+    let mut offered = false;
+    router.route(&seat, &key(3, true), |_| {
+        offered = true;
+        false
+    });
+    assert!(offered);
+    // Anything that is not a key is ignored.
+    router.route(&seat, &InputEvent::PointerLeave, |_| panic!("not a key"));
 }
 
 #[test]

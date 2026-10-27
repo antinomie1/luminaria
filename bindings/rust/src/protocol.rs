@@ -1,11 +1,13 @@
 //! Wayland protocol globals and managers: Compositor, XdgShell, Seat, LayerShell, etc.
 //!
-//! A global whose C++ type emits signals queues them, and its `next_event()`
-//! hands them over one at a time: call it until it returns `None` after every
-//! [`Display::dispatch`]. A queue nobody drains keeps growing. Objects clients
-//! create (a toplevel, a layer surface, a text input) are named by their
-//! surface's [`SurfaceId`] or by an id the binding assigns, never by a
-//! reference; each lookup happens on the call, and a stale name finds nothing.
+//! What a global reports arrives through [`Display::dispatch`] as a
+//! [`crate::Event`]. Objects clients create (a toplevel, a layer surface, a
+//! text input) are named by their surface's [`SurfaceId`] or by an id the
+//! binding assigns, never by a reference; each lookup happens on the call, and
+//! a stale name finds nothing.
+
+mod core_globals;
+pub use core_globals::CoreGlobals;
 
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
@@ -150,21 +152,6 @@ impl<'d> Compositor<'d> {
             Ok(Self { raw, _display: Holds::new() })
         }
     }
-
-    pub fn next_event(&self) -> Option<CompositorEvent> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            let surface = SurfaceId(raw.id);
-            match raw.kind {
-                ffi::EventKind::NewSurface => return Some(CompositorEvent::NewSurface(surface)),
-                ffi::EventKind::SurfaceCommit => return Some(CompositorEvent::Commit(surface)),
-                ffi::EventKind::SurfaceDestroy => return Some(CompositorEvent::Destroy(surface)),
-                ffi::EventKind::SurfaceRendered => return Some(CompositorEvent::Rendered(surface)),
-                ffi::EventKind::SurfaceInvalidated => return Some(CompositorEvent::Invalidated(surface)),
-                _ => {}
-            }
-        }
-    }
 }
 
 /// The `wl_subcompositor` global.
@@ -214,33 +201,30 @@ impl<'d> OutputGlobal<'d> {
         }
     }
 
-    pub fn with_properties(
+    /// Advertise `output` as `layout` places it, and keep following both:
+    /// a mode change re-sends the mode, scale and transform, a layout change
+    /// the position. An empty `name` picks `luminaria-<n>`. This is the one a
+    /// compositor wants; [`OutputGlobal::new`] is for an output that is not a
+    /// backend's.
+    pub fn for_output(
         display: &'d Display,
-        width: i32,
-        height: i32,
+        output: &crate::backend::Output,
+        layout: &crate::shell::OutputLayout,
         name: &str,
-        position: (i32, i32),
-        refresh_mhz: i32,
-        scale: i32,
-        transform: Transform,
     ) -> Result<Self, Error> {
-        let global = Self::new(display, width, height, name)?;
-        global.set_logical_position(position.0, position.1);
-        global.set_mode(width, height, refresh_mhz);
-        global.set_scale(scale);
-        global.set_transform(transform);
-        Ok(global)
+        let mut err = String::new();
+        let raw = ffi::output_global_for(&display.raw, &output.raw, &layout.raw, name, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Protocol, err))
+        } else {
+            Ok(Self { raw, _display: Holds::new() })
+        }
     }
 }
 
 impl OutputGlobal<'_> {
     /// Where this output sits in the layout, as xdg-output reports it.
     pub fn set_logical_position(&self, x: i32, y: i32) {
-        self.raw.set_logical_position(x, y);
-    }
-
-    /// Alias for [`Self::set_logical_position`].
-    pub fn set_position(&self, x: i32, y: i32) {
         self.raw.set_logical_position(x, y);
     }
 
@@ -260,11 +244,6 @@ impl OutputGlobal<'_> {
     /// Current logical position in global layout coordinates.
     pub fn logical_position(&self) -> (i32, i32) {
         (self.raw.logical_x(), self.raw.logical_y())
-    }
-
-    /// Alias for [`Self::logical_position`].
-    pub fn position(&self) -> (i32, i32) {
-        self.logical_position()
     }
 
     /// Size in layout coordinates.
@@ -395,16 +374,12 @@ impl<'d> FractionalScaleManager<'d> {
         }
     }
 
-    /// `scale_120ths` is the scale in 120ths (180 = 1.5x), which is what the
-    /// protocol carries. Surfaces that never created a `wp_fractional_scale_v1`
-    /// object are skipped by the library.
-    pub fn set_scale(&self, surface: SurfaceId, scale_120ths: i32) {
-        self.raw.set_scale(surface.0, scale_120ths);
-    }
-
-    /// The same from a floating-point scale, e.g. 1.5.
-    pub fn set_scale_f64(&self, surface: SurfaceId, scale: f64) {
-        self.set_scale(surface, (scale * 120.0 + 0.5) as i32);
+    /// Tell `surface` the scale of the output it is on, e.g. 1.5, in both
+    /// currencies: the exact value to a client that bound
+    /// `wp_fractional_scale_v1`, and the integer preferred-buffer-scale hint
+    /// rounded up to every other one.
+    pub fn set_scale(&self, surface: SurfaceId, scale: f64) {
+        self.raw.set_scale(surface.0, scale);
     }
 }
 
@@ -458,22 +433,6 @@ impl<'d> XdgDecorationManager<'d> {
     pub fn default_mode(&self) -> DecorationMode {
         DecorationMode::from_u32(self.raw.default_mode()).unwrap_or(DecorationMode::ClientSide)
     }
-
-    pub fn next_event(&self) -> Option<DecorationRequest> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                ffi::EventKind::DecorationRequest => {
-                    return Some(DecorationRequest {
-                        surface: SurfaceId::from_raw(raw.id),
-                        preferred: DecorationMode::from_u32(raw.serial),
-                        mode: DecorationMode::from_u32(raw.value).unwrap_or(DecorationMode::ClientSide),
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 /// A request for a named cursor shape (`wp_cursor_shape_device_v1.set_shape`).
@@ -486,6 +445,8 @@ pub struct CursorShapeRequest {
 
 /// The `wp_cursor_shape_manager_v1` global.
 pub struct CursorShapeManager<'d> {
+    // Read by `gpu::Cursor`; its requests arrive as `Event::CursorShape`.
+    #[allow(dead_code)]
     pub(crate) raw: cxx::UniquePtr<ffi::CursorShapeManagerShim>,
     _display: Holds<'d>,
 }
@@ -498,22 +459,6 @@ impl<'d> CursorShapeManager<'d> {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {
             Ok(Self { raw, _display: Holds::new() })
-        }
-    }
-
-    pub fn next_event(&self) -> Option<CursorShapeRequest> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                ffi::EventKind::CursorShapeRequest => {
-                    return Some(CursorShapeRequest {
-                        serial: raw.serial,
-                        shape: raw.value,
-                        name: raw.text,
-                    });
-                }
-                _ => {}
-            }
         }
     }
 }
@@ -545,21 +490,6 @@ impl<'d> XdgToplevelIconManager<'d> {
     pub fn icon_name(&self, surface: SurfaceId) -> String {
         self.raw.icon_name(surface.0)
     }
-
-    pub fn next_event(&self) -> Option<ToplevelIconChange> {
-        loop {
-            let raw = crate::next_raw_event(|out| self.raw.next_event(out))?;
-            match raw.kind {
-                ffi::EventKind::ToplevelIconChange => {
-                    return Some(ToplevelIconChange {
-                        surface: SurfaceId(raw.id),
-                        name: raw.text,
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 /// The `zwp_relative_pointer_manager_v1` global. It routes through the [`Seat`] it was created for,
@@ -579,5 +509,71 @@ impl<'a> RelativePointerManager<'a> {
         } else {
             Ok(Self { raw, _borrows: Holds::new() })
         }
+    }
+}
+
+impl CompositorEvent {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<CompositorEvent> {
+        let surface = SurfaceId(raw.id);
+        match raw.kind {
+            ffi::EventKind::NewSurface => return Some(CompositorEvent::NewSurface(surface)),
+            ffi::EventKind::SurfaceCommit => return Some(CompositorEvent::Commit(surface)),
+            ffi::EventKind::SurfaceDestroy => return Some(CompositorEvent::Destroy(surface)),
+            ffi::EventKind::SurfaceRendered => return Some(CompositorEvent::Rendered(surface)),
+            ffi::EventKind::SurfaceInvalidated => return Some(CompositorEvent::Invalidated(surface)),
+            _ => {}
+        }
+        None
+    }
+}
+
+impl DecorationRequest {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<DecorationRequest> {
+        match raw.kind {
+            ffi::EventKind::DecorationRequest => {
+                return Some(DecorationRequest {
+                    surface: SurfaceId::from_raw(raw.id),
+                    preferred: DecorationMode::from_u32(raw.serial),
+                    mode: DecorationMode::from_u32(raw.value).unwrap_or(DecorationMode::ClientSide),
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+impl CursorShapeRequest {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<CursorShapeRequest> {
+        match raw.kind {
+            ffi::EventKind::CursorShapeRequest => {
+                return Some(CursorShapeRequest {
+                    serial: raw.serial,
+                    shape: raw.value,
+                    name: raw.text,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+impl ToplevelIconChange {
+    #[allow(unreachable_code, clippy::needless_return)]
+    pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<ToplevelIconChange> {
+        match raw.kind {
+            ffi::EventKind::ToplevelIconChange => {
+                return Some(ToplevelIconChange {
+                    surface: SurfaceId(raw.id),
+                    name: raw.text,
+                });
+            }
+            _ => {}
+        }
+        None
     }
 }

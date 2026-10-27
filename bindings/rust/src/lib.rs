@@ -16,7 +16,7 @@
 //! |---|---|---|---|
 //! | *(always)* | `luminaria` | protocols, Display, headless + nested backends | wayland-server, wayland-client, xkbcommon |
 //! | `gpu` | `luminaria.gpu` | [`gpu`], DRM/libinput/session backends | vulkan, libdrm, libinput, libudev, gbm, libseat |
-//! | `desktop` | `luminaria.desktop` | [`desktop`], implied by nothing | — (implies `gpu`) |
+//! | `desktop` | `luminaria.desktop` | [`desktop`] | — |
 //! | `text` | `luminaria.text` | `text` | fcft, fontconfig, pixman |
 //!
 //! A compositor is assembled from the submodules; the policy (where windows go,
@@ -27,17 +27,19 @@
 //! - [`protocol`]: Compositor, Subcompositor, XdgShell, Seat, LayerShell, and core protocol managers.
 //! - [`gpu`]: VulkanRenderer, SceneRenderer, Frame, Cursor, DirectScanout, LinuxDmabuf, Screencopy.
 //! - [`desktop`]: ForeignToplevelManager, WorkspaceManager, SessionLockManager, OutputManager, DataControlManager, InputMethodManager.
+//! - [`event`]: Event, the one stream everything above reports through.
 //! - [`shell`]: OutputLayout, SceneItem, SceneHit, scene_hit_test, CpuCompositor, PopupTree, LayerManager.
 //!
-//! The library is driven by its signals, and C++ never calls Rust: each global
-//! queues what it emitted, and its `next_event()` hands it over after
-//! [`Display::dispatch`](core::Display::dispatch) returns. The [`protocol`]
-//! module documentation says how the objects those events are about are named.
+//! The library is driven by its signals, and C++ never calls Rust: every
+//! signal is queued in the order it fired, and [`Display::dispatch`](core::Display::dispatch)
+//! hands them all back as one stream of [`Event`]s. The [`event`] module says
+//! how the objects those events are about are named.
 //!
 //! `examples/minimal.rs` is a complete compositor built this way.
 
 pub mod backend;
 pub mod core;
+pub mod event;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 #[cfg(feature = "gpu")]
@@ -47,6 +49,8 @@ pub mod shell;
 #[cfg(feature = "text")]
 pub mod text;
 pub mod util;
+
+pub use event::{Event, Events};
 
 // One bridge per C++ module. Each file holds a `#[cxx::bridge] mod ffi`; the
 // crate root re-exports them as `crate::ffi`, `crate::ffi_gpu`, ... so the
@@ -74,7 +78,7 @@ mod text_bridge;
 pub(crate) use text_bridge::ffi as ffi_text;
 
 impl ffi::EventRaw {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             kind: ffi::EventKind::None,
             id: 0,
@@ -89,10 +93,3 @@ impl ffi::EventRaw {
         }
     }
 }
-
-/// Pops the shim's next queued event, if any.
-pub(crate) fn next_raw_event(next: impl FnOnce(&mut ffi::EventRaw) -> bool) -> Option<ffi::EventRaw> {
-    let mut raw = ffi::EventRaw::empty();
-    next(&mut raw).then_some(raw)
-}
-

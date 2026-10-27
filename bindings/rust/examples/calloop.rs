@@ -25,12 +25,11 @@
 //!     handle.insert_source(
 //!         Generic::new(FdWrapper::new(display.as_raw_fd()), Interest::READ, Mode::Level),
 //!         |_readiness, _fd, _shared| {
-//!             // 1. Dispatch Wayland requests & internal timers non-blockingly:
-//!             display.dispatch(Some(Duration::ZERO)).unwrap();
-//!             // 2. Drain protocol signals (Compositor, XdgShell, Output, etc.):
-//!             //    while let Some(ev) = compositor.next_event() { ... }
-//!             // 3. Re-render/present active outputs when frames are due:
-//!             //    renderer.present(...);
+//!             // Dispatch Wayland requests and internal timers without
+//!             // blocking, then handle everything they produced:
+//!             for event in display.dispatch(Some(Duration::ZERO)).unwrap() {
+//!                 // Event::Output(id, OutputEvent::Frame) => renderer.present(...)
+//!             }
 //!             Ok(PostAction::Continue)
 //!         },
 //!     ).unwrap();
@@ -58,10 +57,9 @@
 //! let async_fd = AsyncFd::new(display.as_fd())?;
 //! loop {
 //!     let mut guard = async_fd.readable().await?;
-//!     // Dispatch pending requests without blocking the async executor:
-//!     display.dispatch(Some(Duration::ZERO))?;
-//!     // Drain protocol events here:
-//!     // while let Some(ev) = compositor.next_event() { ... }
+//!     // Dispatch pending requests without blocking the async executor, and
+//!     // handle what they produced:
+//!     for event in display.dispatch(Some(Duration::ZERO))? { /* ... */ }
 //!     guard.clear_ready();
 //! }
 //! # }
@@ -74,71 +72,51 @@ use calloop::generic::{FdWrapper, Generic};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, Mode, PostAction};
 
-use luminaria::backend::{HeadlessBackend, Output};
+use luminaria::Event;
+use luminaria::backend::{HeadlessBackend, Output, OutputEvent};
 use luminaria::core::{Display, Error};
-use luminaria::gpu::{SceneOutput, SceneRenderer, VulkanOptions};
-use luminaria::protocol::{Compositor, OutputGlobal, XdgShell};
+use luminaria::gpu::{SceneRenderer, VulkanOptions};
+use luminaria::protocol::{CompositorEvent, CoreGlobals, OutputGlobal};
 use luminaria::shell::{OutputLayout, SceneItem};
-use luminaria::util::{Color, Rect, Transform};
+use luminaria::util::{Color, Rect};
 
 const WIDTH: i32 = 1280;
 const HEIGHT: i32 = 800;
 
-struct Screen<'a> {
-    output: Output,
-    state: SceneOutput<'a>,
-    _global: OutputGlobal<'a>,
-}
-
 struct AppState<'a> {
     display: &'a Display,
     renderer: &'a SceneRenderer,
-    compositor: &'a Compositor<'a>,
-    shell: &'a XdgShell<'a>,
-    screens: Vec<Screen<'a>>,
+    output: Output,
     frames_rendered: u64,
 }
 
-impl<'a> AppState<'a> {
-    fn drain_events(&mut self) {
-        while let Some(ev) = self.compositor.next_event() {
-            match ev {
-                luminaria::protocol::CompositorEvent::NewSurface(id) => {
-                    println!("calloop: new client surface {id:?}");
-                }
-                luminaria::protocol::CompositorEvent::Commit(id) => {
-                    println!("calloop: surface {id:?} committed");
-                }
-                luminaria::protocol::CompositorEvent::Destroy(id) => {
-                    println!("calloop: surface {id:?} destroyed");
-                }
+impl AppState<'_> {
+    /// Everything the dispatch produced: client surfaces are logged, a frame
+    /// the output asks for is drawn.
+    fn handle(&mut self, events: luminaria::Events) -> Result<(), Error> {
+        for event in events {
+            match event {
+                Event::Compositor(CompositorEvent::NewSurface(id)) => println!("calloop: new client surface {id:?}"),
+                Event::Compositor(CompositorEvent::Commit(id)) => println!("calloop: surface {id:?} committed"),
+                Event::Compositor(CompositorEvent::Destroy(id)) => println!("calloop: surface {id:?} destroyed"),
+                Event::Output(_, OutputEvent::Frame) => self.render_frame()?,
                 _ => {}
             }
         }
-        while let Some(_ev) = self.shell.next_event() {}
+        Ok(())
     }
 
-    fn render_frames(&mut self) -> Result<(), Error> {
+    fn render_frame(&mut self) -> Result<(), Error> {
         let view = Rect::new(0, 0, WIDTH, HEIGHT);
-        let items = vec![
+        let items = [
             SceneItem::rect(view, Color::rgb(0.12, 0.14, 0.18)),
             // Compositor-owned image bar at the top (serial 1)
             SceneItem::image(Rect::new(20, 20, 200, 40), 1),
         ];
-
-        let bg = Color::rgb(0.1, 0.1, 0.15);
-        for screen in &mut self.screens {
-            let outcome = self.renderer.present(
-                &mut screen.state,
-                &mut screen.output,
-                &items,
-                bg,
-            )?;
-
-            self.frames_rendered += 1;
-            if self.frames_rendered <= 3 {
-                println!("calloop: frame #{} presented ({outcome:?})", self.frames_rendered);
-            }
+        let outcome = self.renderer.present(&mut self.output, &items, Color::rgb(0.1, 0.1, 0.15))?;
+        self.frames_rendered += 1;
+        if self.frames_rendered <= 3 {
+            println!("calloop: frame #{} presented ({outcome:?})", self.frames_rendered);
         }
         Ok(())
     }
@@ -151,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(300);
 
     let display = Display::new()?;
-    display.init_shm()?;
+    let _globals = CoreGlobals::new(&display)?;
     let socket = display.add_socket_auto()?;
 
     let mut headless = HeadlessBackend::new(&display, 16)?;
@@ -160,58 +138,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let layout = OutputLayout::new()?;
     layout.add(&mut output, 0, 0);
-
-    let global = OutputGlobal::with_properties(
-        &display,
-        WIDTH,
-        HEIGHT,
-        "HEADLESS-1",
-        (0, 0),
-        60000,
-        1,
-        Transform::Normal,
-    )?;
+    let _global = OutputGlobal::for_output(&display, &output, &layout, "HEADLESS-1")?;
 
     let renderer = SceneRenderer::new(&VulkanOptions::default())?;
-    let mut scene_output = SceneOutput::new();
-    renderer.reset(&mut scene_output, &mut output, 0x34325258)?; // DRM_FORMAT_XRGB8888
+    renderer.reset(&mut output)?;
 
     // Hand the renderer a 200x40 compositor-owned test bar image (serial 1)
-    let mut bar_pixels = vec![0u8; (200 * 40 * 4) as usize];
-    for y in 0..40 {
-        for x in 0..200 {
-            let idx = ((y * 200 + x) * 4) as usize;
-            bar_pixels[idx] = 40;       // R
-            bar_pixels[idx + 1] = 160;   // G
-            bar_pixels[idx + 2] = 220;   // B
-            bar_pixels[idx + 3] = 255;   // A
-        }
-    }
+    let bar_pixels: Vec<u8> = std::iter::repeat_n([40u8, 160, 220, 255], 200 * 40).flatten().collect();
     renderer.set_image(1, 200, 40, &bar_pixels)?;
-
-    let compositor = Compositor::new(&display)?;
-    let shell = XdgShell::new(&display)?;
 
     println!("calloop: compositor initialized (WAYLAND_DISPLAY={socket})");
     println!("calloop: renderer = {}", if renderer.gpu_enabled() { "GPU" } else { "CPU" });
 
-    let screens = vec![Screen {
-        output,
-        state: scene_output,
-        _global: global,
-    }];
-
-    let mut state = AppState {
-        display: &display,
-        renderer: &renderer,
-        compositor: &compositor,
-        shell: &shell,
-        screens,
-        frames_rendered: 0,
-    };
+    let mut state = AppState { display: &display, renderer: &renderer, output, frames_rendered: 0 };
 
     // Initial frame render
-    state.render_frames()?;
+    state.render_frame()?;
 
     // Set up Calloop event loop
     let mut event_loop = EventLoop::<AppState<'_>>::try_new()?;
@@ -227,27 +169,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     handle.insert_source(
         display_source,
         |_readiness, _fd, state| {
-            // Non-blocking dispatch of Wayland events & timers
-            state.display.dispatch(Some(Duration::ZERO)).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-            })?;
-
-            // Drain protocol events
-            state.drain_events();
-
-            // Re-render when any output requests a frame
-            let need_redraw = state.screens.iter_mut().any(|s| s.output.take_frame());
-            if need_redraw {
-                state.render_frames().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?;
-            }
-
+            // Non-blocking dispatch of Wayland events & timers, then what it produced.
+            let events = state.display.dispatch(Some(Duration::ZERO)).map_err(std::io::Error::other)?;
+            state.handle(events).map_err(std::io::Error::other)?;
             state.display.flush_clients();
             Ok(PostAction::Continue)
         },
     ).map_err(|e| format!("failed to insert display source: {e}"))?;
-
     // Auto-exit timer for tests / smoke runs
     if exit_ms > 0 {
         let timer_signal = signal.clone();

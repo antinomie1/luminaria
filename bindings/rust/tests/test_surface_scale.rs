@@ -6,7 +6,7 @@
 #[macro_use]
 mod common;
 
-use common::{dispatch, drain, ClientSide, Peer};
+use common::{dispatch, ClientSide, Peer, take};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, CompositorEvent, FractionalScaleManager, Subcompositor, SurfaceId};
 use luminaria::util::Transform;
@@ -69,9 +69,9 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for State {
 
 /// The first surface a client creates, as the server names it. The events are
 /// queued by the time the peer reaches its first step; drain them there.
-fn first_surface(compositor: &Compositor<'_>, display: &Display) -> SurfaceId {
+fn first_surface(_compositor: &Compositor<'_>, display: &Display) -> SurfaceId {
     for _ in 0..8 {
-        for event in drain(|| compositor.next_event()) {
+        for event in take::<CompositorEvent>() {
             if let CompositorEvent::NewSurface(surface) = event {
                 return surface;
             }
@@ -106,9 +106,9 @@ fn client_scales(conn: Connection, step: ClientSide) {
     assert_eq!(state.fractional_scale, Some(180), "fractional scale in 120ths");
     step.step("scaled");
 
-    // The floating-point spelling of the same thing: 2.0 * 120.
+    // 2.0 is 240 in 120ths.
     queue.roundtrip(&mut state).unwrap();
-    assert_eq!(state.fractional_scale, Some(240), "set_scale_f64(2.0)");
+    assert_eq!(state.fractional_scale, Some(240), "set_scale(2.0)");
     step.step("rescaled");
 }
 
@@ -124,11 +124,11 @@ fn preferred_scale_and_fractional_scale_reach_the_client() {
 
     surface.set_preferred_buffer_scale(2);
     surface.set_preferred_buffer_transform(Transform::Rotate90);
-    fractions.set_scale(surface, 180);
+    fractions.set_scale(surface, 1.5); // and the integer hint, rounded up: 2
     peer.go();
 
     peer.wait(&display, "scaled");
-    fractions.set_scale_f64(surface, 2.0);
+    fractions.set_scale(surface, 2.0);
     peer.go();
 
     peer.wait(&display, "rescaled");

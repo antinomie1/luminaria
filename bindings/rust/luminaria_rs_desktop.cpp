@@ -12,20 +12,15 @@
 #include <vector>
 
 #include "luminaria/luminaria_rs.h"
-#include "luminaria/luminaria_rs_gpu.h"
 #include "luminaria/luminaria_rs_desktop.h"
 #include "luminaria/src/ffi.rs.h"
-#include "luminaria/src/ffi_gpu.rs.h"
 #include "luminaria/src/ffi_desktop.rs.h"
 
-import luminaria.gpu;
 import luminaria.desktop;
 
 #include "luminaria_rs_internal.h"
 
 namespace lum {
-
-lm::VulkanRenderer* raw_ptr(const VulkanRendererShim& s);
 
 // ============================================================================
 // Desktop Protocols
@@ -63,9 +58,6 @@ void ForeignToplevelManagerShim::track(const XdgShellShim& shell) {
     if (impl_->mgr && sh) {
         impl_->mgr->track(*sh);
     }
-}
-bool ForeignToplevelManagerShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
 }
 
 void foreign_toplevel_track(ForeignToplevelManagerShim& ftm, const XdgShellShim& shell) {
@@ -111,9 +103,6 @@ void WorkspaceManagerShim::remove_workspace(std::uint32_t workspace) const {
 }
 void WorkspaceManagerShim::activate_workspace(std::uint32_t workspace) const {
     if (impl_->mgr) impl_->mgr->activate(workspace);
-}
-bool WorkspaceManagerShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
 }
 
 struct SessionLockManagerShim::Impl {
@@ -192,7 +181,6 @@ std::unique_ptr<SessionLockManagerShim> session_lock_manager_new(const DisplaySh
         return std::make_unique<SessionLockManagerShim>(std::move(impl));
     } catch (const std::exception& e) { error = e.what(); return nullptr; }
 }
-bool SessionLockManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 bool SessionLockManagerShim::locked() const { return impl_->mgr && impl_->mgr->session_locked(); }
 std::uint64_t SessionLockManagerShim::current() const {
     if (!impl_->mgr) return 0;
@@ -271,9 +259,6 @@ std::unique_ptr<OutputManagerShim> output_manager_new(const DisplayShim& display
 }
 void OutputManagerShim::update() {
     if (impl_->mgr) impl_->mgr->update();
-}
-bool OutputManagerShim::next_event(EventRaw& out) const {
-    return impl_->events.pop(out);
 }
 void OutputManagerShim::set_auto_verdict(bool succeed) const {
     impl_->auto_verdict = succeed ? lm::OutputConfigVerdict::succeeded : lm::OutputConfigVerdict::failed;
@@ -382,7 +367,6 @@ std::unique_ptr<InputMethodManagerShim> input_method_manager_new(const DisplaySh
         return nullptr;
     }
 }
-bool InputMethodManagerShim::next_event(EventRaw& out) const { return impl_->events.pop(out); }
 std::uint64_t InputMethodManagerShim::current() const {
     if (!impl_->mgr) return 0;
     const lm::InputMethod* current = impl_->mgr->current();
@@ -425,43 +409,6 @@ rust::Vec<std::uint64_t> InputMethodManagerShim::popup_surfaces(std::uint64_t in
 Rect InputMethodManagerShim::popup_text_input_rectangle(std::uint64_t surface_id) const {
     const auto it = impl_->popups.find(surface_id);
     return it == impl_->popups.end() ? Rect{0, 0, 0, 0} : to_rect(it->second->popup->text_input_rectangle());
-}
-
-struct DesktopGlobalsShim::Impl {
-    std::optional<lm::DesktopGlobals> globals;
-};
-DesktopGlobalsShim::~DesktopGlobalsShim() = default;
-DesktopGlobalsShim::DesktopGlobalsShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-DesktopGlobalsShim::Impl& DesktopGlobalsShim::impl() const { return *impl_; }
-
-std::unique_ptr<DesktopGlobalsShim> desktop_globals_new(const DisplayShim& display, const VulkanRendererShim& renderer, rust::Str seat_name, rust::String& error) {
-    try {
-        lm::Display* disp = raw_ptr(display);
-        if (!disp) { error = "display not initialized"; return nullptr; }
-        auto r = lm::DesktopGlobals::create(*disp, raw_ptr(renderer), std::string(seat_name));
-        if (!r) { error = to_rust(r.error().message); return nullptr; }
-        auto impl = std::make_unique<DesktopGlobalsShim::Impl>();
-        impl->globals.emplace(std::move(*r));
-        return std::make_unique<DesktopGlobalsShim>(std::move(impl));
-    } catch (const std::exception& e) {
-        error = e.what();
-        return nullptr;
-    }
-}
-
-std::unique_ptr<DesktopGlobalsShim> desktop_globals_new_headless(const DisplayShim& display, rust::Str seat_name, rust::String& error) {
-    try {
-        lm::Display* disp = raw_ptr(display);
-        if (!disp) { error = "display not initialized"; return nullptr; }
-        auto r = lm::DesktopGlobals::create(*disp, nullptr, std::string(seat_name));
-        if (!r) { error = to_rust(r.error().message); return nullptr; }
-        auto impl = std::make_unique<DesktopGlobalsShim::Impl>();
-        impl->globals.emplace(std::move(*r));
-        return std::make_unique<DesktopGlobalsShim>(std::move(impl));
-    } catch (const std::exception& e) {
-        error = e.what();
-        return nullptr;
-    }
 }
 
 } // namespace lum
