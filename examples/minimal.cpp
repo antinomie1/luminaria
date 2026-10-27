@@ -14,11 +14,12 @@
 //
 // What is left here is what a compositor decides: where windows go, which one
 // has the keyboard, what a key does. The pointer's picture (theme, cursor
-// shapes, client sprites, the KMS cursor plane) is `Cursor`'s, and answering
-// the display — frame callbacks, presentation feedback, the frame that turned
-// out unchanged — is `SceneRenderer`'s.
+// shapes, client sprites, the KMS cursor plane) is `Cursor`'s; answering the
+// display — frame callbacks, presentation feedback, the frame that turned out
+// unchanged, reallocating on a mode change — is `SceneRenderer`'s; where each
+// output sits and what wl_output says about it is `OutputLayout`'s and
+// `OutputGlobal`'s; popups are `PopupTree`'s.
 #include <xkbcommon/xkbcommon.h>
-#include <drm_fourcc.h>
 #include <spawn.h>
 
 #include <csignal>
@@ -87,19 +88,11 @@ struct Window {
     Conn<lm::ToplevelDestroy> on_destroy;
 };
 
-struct PopupEntry {
-    Conn<lm::PopupMap> on_map;
-    Conn<lm::PopupUnmap> on_unmap;
-    Conn<lm::PopupReposition> on_reposition;
-    Conn<lm::PopupDestroy> on_destroy;
-};
-
 struct Screen {
     lm::Output* output = nullptr;
     lm::SceneOutput state;
     std::optional<lm::OutputGlobal> global;
     Conn<lm::FrameEvent> on_frame;
-    Conn<lm::OutputModeChange> on_mode;
     Conn<lm::OutputDestroy> on_destroy;
 };
 
@@ -127,37 +120,22 @@ int main(int argc, char** argv) {
         backend_options.drm_device = device;
     }
 
-    // Declaration order is destruction order, reversed. The renderer first, so
-    // it dies last: every output state caches textures it owns. It is created
-    // once the card is open, so it can be the GPU that card belongs to.
-    std::optional<lm::SceneRenderer> renderer;
+    // Declaration order is destruction order, reversed: the globals die after
+    // everything that uses them and before the display, and the backends —
+    // whose outputs' last `present` still finds the presentation global — die
+    // before the globals.
     auto display = must(lm::Display::create(), "display");
-    must(display.init_shm(), "wl_shm");
-
-    auto compositor = must(lm::Compositor::create(display), "wl_compositor");
-    auto subcompositor = must(lm::Subcompositor::create(display), "wl_subcompositor");
-    auto shell = must(lm::XdgShell::create(display), "xdg-shell");
-    auto seat = must(lm::Seat::create(display), "wl_seat");
-    auto data_device = must(lm::DataDeviceManager::create(display, seat), "data-device");
-    auto single_pixel = must(lm::SinglePixelBufferManager::create(display), "single-pixel-buffer");
-    auto presentation = must(lm::Presentation::create(display), "presentation-time");
-    auto viewporter = must(lm::Viewporter::create(display), "wp_viewporter");
-    auto fractional = must(lm::FractionalScaleManager::create(display), "fractional-scale");
-    auto cursor_shape = must(lm::CursorShapeManager::create(display), "cursor-shape");
-    // We draw no title bars, so clients draw their own.
-    auto decoration = must(lm::XdgDecorationManager::create(display), "xdg-decoration");
+    auto globals = must(lm::CoreGlobals::create(display), "globals");
+    lm::XdgShell& shell = globals.shell();
+    lm::Seat& seat = globals.seat();
     lm::OutputLayout layout;
-    lm::PopupTree popups;
+    lm::PopupTree popups(shell);
 
-    // Backends after the globals: an output's last `present` must still find
-    // the presentation global there.
     // Nested, else DRM when a libseat session can be had, else headless; or
     // the one LUMINARIA_BACKEND names. It owns the session, which outlives the
     // card and libinput opened through it.
     auto picked = must(lm::AutoBackend::create(display.event_loop(), backend_options), "backend");
     const bool on_drm = picked.kind() == lm::BackendKind::drm;
-    lm::WaylandBackend* nested = picked.nested();
-    lm::InputSource* source = picked.input(); // none headless
     lm::Session* session = picked.session();
     if (session != nullptr) {
         std::printf("minimal: session = libseat (VT switching enabled)\n");
@@ -170,37 +148,37 @@ int main(int argc, char** argv) {
                 static_cast<int>(lm::backend_kind_name(picked.kind()).size()),
                 lm::backend_kind_name(picked.kind()).data());
 
-    renderer.emplace(picked.vulkan_options());
-    if (renderer->gpu_enabled()) {
+    // The GPU behind the card the backend opened. Everything that caches its
+    // textures — the dmabuf global, the cursor, every output's state — is
+    // declared after it.
+    lm::SceneRenderer renderer(picked.vulkan_options());
+    if (renderer.gpu_enabled()) {
         std::printf("minimal: renderer = %.*s\n",
-                    static_cast<int>(renderer->gpu()->device_name().size()),
-                    renderer->gpu()->device_name().data());
+                    static_cast<int>(renderer.gpu()->device_name().size()),
+                    renderer.gpu()->device_name().data());
     } else {
         std::printf("minimal: renderer = CPU (%.*s)\n",
-                    static_cast<int>(renderer->gpu_error().size()), renderer->gpu_error().data());
+                    static_cast<int>(renderer.gpu_error().size()), renderer.gpu_error().data());
     }
-    renderer->set_presentation(&presentation);
+    renderer.set_presentation(&globals.presentation());
     // GPU clients hand over dmabufs, imported with no copy.
     std::optional<lm::LinuxDmabuf> dmabuf;
-    if (renderer->gpu_enabled()) {
-        if (auto d = lm::LinuxDmabuf::create(display, renderer->gpu()); d) {
+    if (renderer.gpu_enabled()) {
+        if (auto d = lm::LinuxDmabuf::create(display, renderer.gpu()); d) {
             dmabuf.emplace(std::move(*d));
         }
     }
-    lm::Cursor cursor(*renderer, layout, seat, &cursor_shape);
+    lm::Cursor cursor(renderer, layout, seat, &globals.cursor_shape());
 
     // --- windows -------------------------------------------------------------
 
     std::list<Window> windows;
-    std::list<PopupEntry> popup_entries;
     std::vector<Window*> stack; // mapped, back to front
     std::list<Screen> screens;
     lm::Box usable{0, 0, 1280, 800}; // the first output: where windows go
     lm::Toplevel* activated = nullptr;
 
-    std::vector<lm::SceneItem> scene; // global coordinates, rebuilt whenever asked
-    std::vector<lm::SceneItem> local; // `scene` in one output's coordinates
-    std::vector<lm::SurfaceAt> tree;
+    std::vector<lm::SceneItem> scene; // layout coordinates, rebuilt whenever asked
     auto build_scene = [&] {
         scene.clear();
         for (Window* w : stack) {
@@ -218,55 +196,21 @@ int main(int argc, char** argv) {
         }
         popups.append_to(scene);
     };
-    // Where `id` is drawn, subsurfaces included, for input that belongs to a
-    // surface wherever the pointer is (a held button).
-    auto origin_of = [&](lm::SurfaceId id, double& x, double& y) {
-        for (const lm::SceneItem& item : scene) {
-            lm::Surface* root = lm::surface_from_id(item.surface);
-            if (root == nullptr) {
-                continue;
-            }
-            tree.clear();
-            root->surface_tree(tree);
-            for (const lm::SurfaceAt& at : tree) {
-                if (at.surface->id() == id) {
-                    x = item.x + at.x;
-                    y = item.y + at.y;
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
 
-    // Tell the client under the pointer. With a button held, every event goes
-    // to the surface that took the press, in its own coordinates.
+    // Tell the client under the pointer; with a button held, the one that
+    // took the press.
     auto pointer_focus = [&] {
-        const lm::Pointer& p = cursor.pointer();
-        if (!p.present()) {
-            return;
-        }
-        build_scene();
-        if (const lm::SurfaceId grab = seat.pointer_grab(); grab.valid() && !seat.dragging()) {
-            double ox = 0, oy = 0;
-            if (origin_of(grab, ox, oy)) {
-                seat.pointer_motion(p.x() - ox, p.y() - oy);
-            }
-            return;
-        }
-        const lm::SceneHit hit = lm::scene_hit_test(scene, p.x(), p.y());
-        if (hit.surface != nullptr) {
-            seat.pointer_enter(*hit.surface, hit.sx, hit.sy);
-        } else if (seat.pointer_focus().valid()) {
-            seat.pointer_clear_focus();
+        if (const lm::Pointer& p = cursor.pointer(); p.present()) {
+            build_scene();
+            (void)lm::scene_route_pointer(seat, scene, p.x(), p.y());
         }
     };
 
     // Something no client reports changed: ask every output for a frame and
     // let the frame's diff work out what moved.
     auto schedule_all = [&] {
-        for (Screen& s : screens) {
-            s.output->schedule_frame();
+        for (const lm::OutputBox& on : layout.outputs()) {
+            on.output->schedule_frame();
         }
     };
 
@@ -300,13 +244,11 @@ int main(int argc, char** argv) {
         e.toplevel.set_maximized(true);
         (void)e.toplevel.configure(usable.width, usable.height);
         w.on_map = e.toplevel.map.connect([&](lm::ToplevelMap&) {
-            if (!screens.empty()) {
-                // Render at the output's density, both the integer hint and
-                // the exact scale for clients that speak fractional-scale.
-                lm::Surface& surface = w.toplevel->surface();
-                const int scale = screens.front().output->scale();
-                surface.set_preferred_buffer_scale(scale);
-                fractional.set_scale(surface, scale * 120);
+            // Render at the output's density: the integer hint and, for
+            // clients that speak fractional-scale, the exact scale.
+            if (!layout.empty()) {
+                globals.fractional_scale().set_scale(w.toplevel->surface(),
+                                                     layout.outputs().front().output->scale());
             }
             std::printf("minimal: window mapped — \"%s\"\n", w.toplevel->title().c_str());
             raise(&w);
@@ -327,27 +269,9 @@ int main(int argc, char** argv) {
         });
     });
 
-    // Menus, tooltips and combo boxes: drawn above their parents, dismissed by
-    // a click outside them.
-    auto new_popup = shell.new_popup().connect([&](lm::NewPopup& e) {
-        lm::Popup& popup = e.popup;
-        popups.add(popup);
-        PopupEntry& p = popup_entries.emplace_back();
-        p.on_map = popup.map.connect([&](lm::PopupMap&) {
-            popups.set_mapped(popup, true);
-            schedule_all();
-        });
-        p.on_unmap = popup.unmap.connect([&](lm::PopupUnmap&) {
-            popups.set_mapped(popup, false);
-            schedule_all();
-        });
-        p.on_reposition = popup.reposition.connect([&](lm::PopupReposition&) { schedule_all(); });
-        p.on_destroy = popup.destroy.connect([&](lm::PopupDestroy&) {
-            popups.remove(popup);
-            popup_entries.remove_if([&p](const PopupEntry& x) { return &x == &p; });
-            schedule_all();
-        });
-    });
+    // Menus, tooltips and combo boxes: the tree follows the shell, drawn above
+    // their parents and dismissed by a click outside them.
+    auto popups_changed = popups.changed.connect([&](lm::PopupTreeChange&) { schedule_all(); });
     // Where a popup's parent is and what screen it is on, so a menu near the
     // bottom edge flips up instead of hanging off it.
     shell.set_popup_constraint_query([&](lm::Surface& parent, lm::Box& parent_box,
@@ -367,57 +291,44 @@ int main(int argc, char** argv) {
     // --- outputs -------------------------------------------------------------
 
     FrameCount frames, reported;
-    // Windows fill the first output; everything else about the layout is the
-    // OutputLayout's.
-    auto relayout = [&] {
-        if (screens.empty()) {
+    // Windows fill the first output. The layout keeps every output's box —
+    // arrivals, departures and mode changes alike — and tells us here.
+    auto relayout = layout.changed.connect([&](lm::OutputLayoutChange&) {
+        if (layout.empty()) {
             return;
         }
-        usable = layout.box_of(*screens.front().output);
+        usable = layout.outputs().front().box;
         shell.set_bounds(usable.width, usable.height);
         for (Window& w : windows) {
             (void)w.toplevel->configure(usable.width, usable.height);
         }
-        cursor.refresh();
         schedule_all();
-    };
+    });
     auto new_output = picked.backend().new_output.connect([&](lm::NewOutput& e) {
         lm::Output& output = e.output;
         Screen& screen = screens.emplace_back();
         screen.output = &output;
-        layout.add_auto(output);
-        if (auto s = renderer->reset(screen.state, output, DRM_FORMAT_XRGB8888); !s) {
+        // Mode changes from here on are the renderer's, the layout's and the
+        // wl_output's own business.
+        if (auto s = renderer.reset(screen.state, output); !s) {
             std::fprintf(stderr, "minimal: render target: %s; compositing on the CPU\n",
                          s.error().message.c_str());
         }
-        const lm::Box box = layout.box_of(output);
-        if (auto g = lm::OutputGlobal::create(display, output.width(), output.height(),
+        layout.add_auto(output);
+        if (auto g = lm::OutputGlobal::create(display, output, layout,
                                               "minimal-" + std::to_string(screens.size()));
             g) {
             screen.global.emplace(std::move(*g));
-            screen.global->set_logical_position(box.x, box.y);
-            screen.global->set_mode(output.width(), output.height(),
-                                    output.current_mode().refresh_mhz);
-            screen.global->set_scale(output.scale());
-            screen.global->set_transform(output.transform());
         }
+        const lm::Box box = layout.box_of(output);
         std::printf("minimal: output %dx%d@%.3gHz at (%d,%d), scale %d, cursor plane %s\n",
                     output.width(), output.height(), output.current_mode().refresh_mhz / 1000.0,
                     box.x, box.y, output.scale(), output.has_cursor_plane() ? "yes" : "no");
 
         screen.on_frame = output.frame.connect([&](lm::FrameEvent&) {
             build_scene();
-            const lm::Box view = layout.box_of(*screen.output);
-            local.clear();
-            for (lm::SceneItem item : scene) {
-                item.box.x -= view.x;
-                item.box.y -= view.y;
-                item.x -= view.x;
-                item.y -= view.y;
-                local.push_back(item);
-            }
-            auto outcome = renderer->present(screen.state, *screen.output, local,
-                                             lm::Color{0.12f, 0.13f, 0.16f, 1.0f});
+            auto outcome = renderer.present(screen.state, *screen.output, scene,
+                                            lm::Color{0.12f, 0.13f, 0.16f, 1.0f}, layout);
             if (!outcome) {
                 std::fprintf(stderr, "minimal: present: %s\n", outcome.error().message.c_str());
                 return;
@@ -429,41 +340,20 @@ int main(int argc, char** argv) {
             case lm::SceneOutcome::cpu: ++frames.cpu; break;
             }
         });
-        // Everything sized for the old mode is rebuilt.
-        screen.on_mode = output.mode_changed.connect([&](lm::OutputModeChange&) {
-            (void)renderer->reset(screen.state, *screen.output, DRM_FORMAT_XRGB8888);
-            const lm::Box old = layout.box_of(*screen.output);
-            layout.add(*screen.output, old.x, old.y);
-            if (screen.global.has_value()) {
-                screen.global->set_mode(screen.output->width(), screen.output->height(),
-                                        screen.output->current_mode().refresh_mhz);
-            }
-            relayout();
-        });
+        // The layout has already let go of it.
         screen.on_destroy = output.destroy.connect([&](lm::OutputDestroy&) {
             std::printf("minimal: output removed\n");
-            layout.remove(*screen.output);
             screens.remove_if([&screen](const Screen& x) { return &x == &screen; });
-            relayout();
         });
         // libinput only reports deltas: the pointer starts mid-screen.
         if (on_drm && !cursor.pointer().present()) {
             cursor.move_to(box.x + box.width / 2.0, box.y + box.height / 2.0);
         }
-        relayout();
     });
 
     // --- input ---------------------------------------------------------------
 
     lm::KeyRouter keys;
-    std::vector<std::uint32_t> held; // keys a client was told are down
-    auto release_held = [&] {
-        for (const std::uint32_t k : held) {
-            seat.notify_key(k, false);
-        }
-        held.clear();
-        seat.notify_modifiers(0, 0, 0, 0);
-    };
     auto act = [&](Action action) {
         switch (action) {
         case Action::spawn: {
@@ -489,36 +379,20 @@ int main(int argc, char** argv) {
         case Action::quit: display.terminate(); break;
         }
     };
-    auto key = [&](const lm::KeyEvent& e) {
-        if (!e.pressed) {
-            if (keys.unconsume(e.keycode)) { // the release of a key we kept stays ours
-                return;
-            }
-            std::erase(held, e.keycode);
-            seat.notify_key(e.keycode, false);
-            return;
-        }
-        // A press of a key we think we still hold: its release was lost, which
-        // is what happens to the key that switched VTs away.
-        (void)keys.unconsume(e.keycode);
-        // Ctrl+Alt+Fn, which the keymap itself turns into XF86Switch_VT_n.
-        if (session != nullptr && e.keysym >= XKB_KEY_XF86Switch_VT_1 &&
-            e.keysym <= XKB_KEY_XF86Switch_VT_12) {
-            keys.consume(e.keycode);
-            release_held();
-            (void)session->switch_to(static_cast<int>(e.keysym - XKB_KEY_XF86Switch_VT_1) + 1);
-            return;
+    // A press the compositor keeps; everything else is the client's.
+    auto binding = [&](const lm::KeyEvent& e) {
+        if (session != nullptr && session->switch_vt_for(e.keysym)) {
+            seat.release_keys(); // their releases arrive on the other VT
+            return true;
         }
         const std::uint32_t mods = (e.modifiers.depressed | e.modifiers.latched) & kBindableMods;
         for (const Binding& b : kBindings) {
             if (b.mods == mods && b.keysym == xkb_keysym_to_lower(e.keysym)) {
-                keys.consume(e.keycode);
                 act(b.action);
-                return;
+                return true;
             }
         }
-        held.push_back(e.keycode);
-        seat.notify_key(e.keycode, true);
+        return false;
     };
     auto button = [&](std::uint32_t code, bool pressed) {
         if (pressed) {
@@ -539,16 +413,16 @@ int main(int argc, char** argv) {
 
     // One handler for either backend: they differ in which events arrive
     // (relative motion and touch from libinput, absolute motion and leave from
-    // the nested window), not in how.
+    // the nested window), not in how. The keymap and the capabilities are the
+    // seat's to follow; no touch, since nothing here routes it.
     Conn<lm::InputEvent> on_input;
-    if (source != nullptr) {
+    if (lm::InputSource* source = picked.input(); source != nullptr) {
+        seat.follow(*source);
         on_input = source->input().connect([&](lm::InputEvent& event) {
             std::visit(
                 Overloaded{
-                    [&](const lm::KeyEvent& e) { key(e); },
+                    [&](const lm::KeyEvent& e) { keys.route(seat, e, binding); },
                     [&](const lm::ModifiersEvent& e) { seat.notify_modifiers(e); },
-                    // Clients get the layout the backend reads keys against.
-                    [&](const lm::KeymapChange& e) { (void)seat.set_keymap(std::string(e.text)); },
                     [&](const lm::PointerMotionEvent& e) {
                         if (cursor.move_by(e.dx, e.dy)) {
                             pointer_focus();
@@ -556,8 +430,8 @@ int main(int argc, char** argv) {
                     },
                     [&](const lm::PointerMotionAbsEvent& e) {
                         const lm::Output* on = e.output != nullptr ? e.output
-                                               : screens.empty()   ? nullptr
-                                                                   : screens.front().output;
+                                               : layout.empty()    ? nullptr
+                                                                   : layout.outputs().front().output;
                         const lm::Box origin = on != nullptr ? layout.box_of(*on) : lm::Box{};
                         cursor.move_to(origin.x + e.x, origin.y + e.y);
                         pointer_focus();
@@ -568,20 +442,17 @@ int main(int argc, char** argv) {
                     },
                     [&](const lm::PointerButtonEvent& e) { button(e.button, e.pressed); },
                     [&](const lm::PointerAxisEvent& e) { seat.pointer_axis(e); },
-                    // A client that binds a wl_pointer no device can drive
-                    // waits forever. No touch: nothing here routes it.
                     [&](const lm::InputCapabilities& caps) {
-                        seat.set_capabilities(caps.keyboard, caps.pointer, false);
                         std::printf("minimal: input devices: keyboard=%s pointer=%s\n",
                                     caps.keyboard ? "yes" : "no", caps.pointer ? "yes" : "no");
                     },
-                    [](const auto&) {}, // touch: no policy here
+                    [](const auto&) {}, // the keymap is the seat's; touch: no policy here
                 },
                 event);
         });
     }
     Conn<lm::HostCloseRequest> on_close;
-    if (nested != nullptr) {
+    if (lm::WaylandBackend* nested = picked.nested(); nested != nullptr) {
         on_close = nested->close_requested.connect([&](lm::HostCloseRequest&) { display.terminate(); });
     }
     Conn<lm::SessionActive> on_session;
@@ -590,7 +461,7 @@ int main(int argc, char** argv) {
             std::printf("minimal: session %s\n",
                         e.active ? "active — VT switched in" : "inactive — VT switched away");
             if (!e.active) {
-                release_held();
+                seat.release_keys();
             } else {
                 schedule_all(); // repaint what the other VT drew over
             }
@@ -602,19 +473,9 @@ int main(int argc, char** argv) {
     const std::string socket = must(display.add_socket_auto(), "socket");
     setenv("WAYLAND_DISPLAY", socket.c_str(), 1); // for what Logo+Return spawns
     must(picked.start(), "backend");
-    // What arrived before anything was listening: the nested keymap and seat
-    // come with the connection, libinput's devices with start().
-    if (source != nullptr) {
-        if (!source->keymap().empty()) {
-            (void)seat.set_keymap(source->keymap());
-        }
-        const lm::InputCapabilities caps = source->capabilities();
-        seat.set_capabilities(caps.keyboard, caps.pointer, false);
-    }
     std::printf("minimal: WAYLAND_DISPLAY=%s — Logo+Return opens a terminal, Logo+Escape "
                 "quits\n",
                 socket.c_str());
-
     lm::EventSource stats;
     if (on_drm) {
         stats = display.event_loop().add_timer([&] {
