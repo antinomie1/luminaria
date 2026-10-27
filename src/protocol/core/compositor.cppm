@@ -25,6 +25,7 @@ import std;
 
 import :box;
 import :client_buffer;
+import :color_description;
 import :display;
 import :dmabuf;
 import :expected;
@@ -255,6 +256,35 @@ public:
     /// Called by the wp_content_type_v1 glue; applied on the next commit.
     void set_pending_content_type(std::uint32_t type) noexcept { pending_.content_type = type; }
 
+    // --- colour (wp_color_management_v1, wp_color_representation_v1) ---
+    //
+    // What the client says its pixels mean. Sticky double-buffered state, like
+    // the scale and the transform. The renderers do not act on any of it: a
+    // surface whose description is not `is_srgb()` is composited as if it were.
+    // A compositor that cannot honour more than sRGB should say so when it
+    // creates the `ColorManager`, so no client sends it anything else.
+
+    /// The colour space the client declared, or null when it declared none
+    /// (read that as sRGB).
+    [[nodiscard]] const ImageDescription* image_description() const noexcept {
+        return image_description_.get();
+    }
+    [[nodiscard]] RenderIntent render_intent() const noexcept { return render_intent_; }
+    /// Alpha mode, YUV matrix and range, chroma siting, as far as the client said.
+    [[nodiscard]] const ColorRepresentation& color_representation() const noexcept {
+        return color_representation_;
+    }
+    /// Called by the colour-management glue; null unsets. Applied on the next commit.
+    void set_pending_image_description(std::shared_ptr<const ImageDescription> description,
+                                       RenderIntent intent) noexcept {
+        pending_.image_description = std::move(description);
+        pending_.render_intent = intent;
+    }
+    /// Called by the colour-representation glue. Applied on the next commit.
+    void set_pending_color_representation(const ColorRepresentation& representation) noexcept {
+        pending_.color_representation = representation;
+    }
+
     /// Called by ext-background-effect glue; copied now because wl_region may
     /// be destroyed immediately. Applied on the next wl_surface.commit.
     void set_pending_blur_region(const Region* region) {
@@ -450,6 +480,9 @@ private:
         Region blur;
         bool has_input = false;
         Viewport viewport;
+        std::shared_ptr<const ImageDescription> image_description; // sticky
+        RenderIntent render_intent = RenderIntent::perceptual;       // sticky
+        ColorRepresentation color_representation;                    // sticky
         int offset_x = 0, offset_y = 0; // accumulated since the last commit
     };
 
@@ -482,6 +515,9 @@ private:
     bool has_input_region_ = false;
     bool input_transparent_ = false; // cursor / drag-icon role
     Viewport viewport_;
+    std::shared_ptr<const ImageDescription> image_description_;
+    RenderIntent render_intent_ = RenderIntent::perceptual;
+    ColorRepresentation color_representation_;
     // Buffers someone is scanning out, and the releases that are waiting on
     // them. Both are tiny — a client's swapchain is two or three buffers.
     std::vector<wl_resource*> held_buffers_;
@@ -1109,6 +1145,9 @@ void Surface::merge_state(State& into, State&& from) {
     into.blur = std::move(from.blur);
     into.has_input = from.has_input;
     into.viewport = from.viewport;
+    into.image_description = std::move(from.image_description);
+    into.render_intent = from.render_intent;
+    into.color_representation = from.color_representation;
     into.offset_x += from.offset_x;
     into.offset_y += from.offset_y;
 }
@@ -1128,6 +1167,9 @@ void Surface::reset_pending(const State& applied) {
     pending_.blur = applied.blur;
     pending_.has_input = applied.has_input;
     pending_.viewport = applied.viewport;
+    pending_.image_description = applied.image_description;
+    pending_.render_intent = applied.render_intent;
+    pending_.color_representation = applied.color_representation;
 }
 
 void Surface::apply_commit() {
@@ -1226,6 +1268,9 @@ void Surface::commit_state(State state) {
     blur_ = state.blur;
     has_input_region_ = state.has_input;
     viewport_ = state.viewport;
+    image_description_ = std::move(state.image_description);
+    render_intent_ = state.render_intent;
+    color_representation_ = state.color_representation;
     offset_x_ += state.offset_x;
     offset_y_ += state.offset_y;
 

@@ -37,6 +37,8 @@
 #include "ext-idle-notify-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
+#include "color-management-v1-client-protocol.h"
+#include "color-representation-v1-client-protocol.h"
 #include "ext-foreign-toplevel-list-v1-client-protocol.h"
 #include "ext-session-lock-v1-client-protocol.h"
 #include "ext-workspace-v1-client-protocol.h"
@@ -349,6 +351,26 @@ void run_client(int fd) {
     }
   }
 
+  // Colour: an output, a surface and a feedback object, a description, and a
+  // creator that is never finished. All of them point back at the manager.
+  if (auto *colors =
+          bind<wp_color_manager_v1>(st, wp_color_manager_v1_interface)) {
+    wp_color_manager_v1_get_output(colors, output);
+    wp_color_manager_v1_get_surface(colors, st.surface);
+    wp_color_manager_v1_get_surface_feedback(colors, st.surface);
+    auto *done = wp_color_manager_v1_create_parametric_creator(colors);
+    wp_image_description_creator_params_v1_set_tf_named(
+        done, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_COMPOUND_POWER_2_4);
+    wp_image_description_creator_params_v1_set_primaries_named(
+        done, WP_COLOR_MANAGER_V1_PRIMARIES_SRGB);
+    wp_image_description_creator_params_v1_create(done);
+    wp_color_manager_v1_create_parametric_creator(colors); // abandoned
+  }
+  if (auto *rep = bind<wp_color_representation_manager_v1>(
+          st, wp_color_representation_manager_v1_interface)) {
+    wp_color_representation_manager_v1_get_surface(rep, st.surface);
+  }
+
   // A tablet seat: the tablet, a tool and a pad (with its group, ring and
   // strip) all point back at the manager, and a tool is in range of this window.
   if (auto *tablet_mgr = bind<zwp_tablet_manager_v2>(
@@ -469,6 +491,9 @@ int main() {
     auto ctm = must(luminaria::CtmControlManager::create(*display));
     auto vk_mgr = must(luminaria::VirtualKeyboardManager::create(*display));
     auto vp_mgr = must(luminaria::VirtualPointerManager::create(*display));
+    auto colors = must(luminaria::ColorManager::create(*display));
+    auto representations =
+        must(luminaria::ColorRepresentationManager::create(*display));
     auto tablets = must(luminaria::TabletManager::create(*display));
     (void)tablets.add_tablet({.name = "Teardown Tablet", .path = "/dev/input/event0"});
     (void)tablets.add_tool({});

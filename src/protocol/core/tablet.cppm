@@ -344,6 +344,26 @@ struct TabChild {
 
 TabChild* child_of(wl_resource* r) { return static_cast<TabChild*>(wl_resource_get_user_data(r)); }
 
+/// A resource the client may still hold but that must never reach the binding
+/// again (it is gone from the binding's maps, or the binding is).
+void cut(wl_resource* r) {
+    if (r != nullptr) {
+        child_of(r)->binding = nullptr;
+    }
+}
+void cut_pad(TabImpl::PadRes& pad) {
+    cut(pad.pad);
+    for (wl_resource* r : pad.groups) {
+        cut(r);
+    }
+    for (wl_resource* r : pad.rings) {
+        cut(r);
+    }
+    for (wl_resource* r : pad.strips) {
+        cut(r);
+    }
+}
+
 void child_destroyed(wl_resource* resource) {
     TabChild* c = child_of(resource);
     if (c->binding != nullptr) {
@@ -355,7 +375,12 @@ void child_destroyed(wl_resource* resource) {
             c->binding->tools.erase(c->id);
             break;
         case TabKind::pad:
-            c->binding->pads.erase(c->id);
+            // Its groups, rings and strips outlive it (the client destroys them
+            // in its own time) and must stop pointing at the binding.
+            if (auto it = c->binding->pads.find(c->id); it != c->binding->pads.end()) {
+                cut_pad(it->second);
+                c->binding->pads.erase(it);
+            }
             break;
         case TabKind::ring:
         case TabKind::strip:
@@ -442,11 +467,6 @@ constexpr struct zwp_tablet_seat_v2_interface seat_impl = {.destroy = seat_destr
 /// Sever every child of a binding. They stay valid objects the client may still
 /// destroy; they just never hear anything again.
 void sever(TabBinding& b) {
-    const auto cut = [](wl_resource* r) {
-        if (r != nullptr) {
-            child_of(r)->binding = nullptr;
-        }
-    };
     for (auto& [id, r] : b.tablets) {
         cut(r);
     }
@@ -454,16 +474,7 @@ void sever(TabBinding& b) {
         cut(r);
     }
     for (auto& [id, pad] : b.pads) {
-        cut(pad.pad);
-        for (wl_resource* r : pad.groups) {
-            cut(r);
-        }
-        for (wl_resource* r : pad.rings) {
-            cut(r);
-        }
-        for (wl_resource* r : pad.strips) {
-            cut(r);
-        }
+        cut_pad(pad);
     }
     b.tablets.clear();
     b.tools.clear();
@@ -732,6 +743,7 @@ void TabletManager::remove_tablet(TabletId tablet) {
     for (auto& b : impl_->bindings) {
         if (auto it = b->tablets.find(tablet); it != b->tablets.end()) {
             zwp_tablet_v2_send_removed(it->second);
+            cut(it->second); // inert from here on; the client destroys it when it likes
             b->tablets.erase(it);
         }
     }
@@ -756,6 +768,7 @@ void TabletManager::remove_tool(TabletToolId tool) {
     for (auto& b : impl_->bindings) {
         if (auto it = b->tools.find(tool); it != b->tools.end()) {
             zwp_tablet_tool_v2_send_removed(it->second);
+            cut(it->second);
             b->tools.erase(it);
         }
     }
@@ -780,6 +793,7 @@ void TabletManager::remove_pad(TabletPadId pad) {
     for (auto& b : impl_->bindings) {
         if (auto it = b->pads.find(pad); it != b->pads.end()) {
             zwp_tablet_pad_v2_send_removed(it->second.pad);
+            cut_pad(it->second);
             b->pads.erase(it);
         }
     }

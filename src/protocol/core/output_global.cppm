@@ -77,6 +77,15 @@ public:
   using BindFunc = std::function<void(wl_resource *)>;
   void on_bind(BindFunc fn);
 
+  /// An opaque name for this output that survives moving the wrapper, and that
+  /// `identity_of()` recovers from a client's wl_output resource. For protocols
+  /// that take a wl_output and need to know which of the compositor's outputs
+  /// it is (wp-color-management).
+  [[nodiscard]] const void *identity() const noexcept;
+  /// The `identity()` of the output a wl_output resource belongs to; null for
+  /// anything else, or for an output that is gone.
+  [[nodiscard]] static const void *identity_of(wl_resource *wl_output) noexcept;
+
   /// This output's wl_output resource for `client`, or null if that client
   /// never bound it. Protocols that reference an output in an event
   /// (ext-workspace, presentation-time) can only name a client's own object.
@@ -357,6 +366,16 @@ Result<OutputGlobal> OutputGlobal::create(Display &display, int width,
   }
   impl->xdg_output_global = std::move(*xdg_global);
   return OutputGlobal{std::move(impl)};
+}
+
+const void *OutputGlobal::identity() const noexcept { return impl_.get(); }
+
+const void *OutputGlobal::identity_of(wl_resource *wl_output) noexcept {
+  if (wl_output == nullptr ||
+      !wl_resource_instance_of(wl_output, &wl_output_interface, &output_impl)) {
+    return nullptr;
+  }
+  return wl_resource_get_user_data(wl_output);
 }
 
 wl_resource *OutputGlobal::resource_for(wl_client *client) const {
