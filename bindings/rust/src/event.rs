@@ -6,11 +6,11 @@
 //! as [`Events`] once it returns:
 //!
 //! ```no_run
-//! # use luminaria::{core::Display, Event, protocol::XdgEvent};
+//! # use luminaria::{core::Display, Event};
 //! # fn run(display: &Display) -> Result<(), luminaria::core::Error> {
 //! for event in display.dispatch(None)? {
 //!     match event {
-//!         Event::Xdg(XdgEvent::Toplevel(surface, e)) => { /* ... */ }
+//!         Event::Toplevel(surface, e) => { /* ... */ }
 //!         Event::Output(output, e) => { /* frames, presentation, mode changes */ }
 //!         _ => {}
 //!     }
@@ -27,8 +27,11 @@
 //! binding hands out and never reuses. Look the object up again when the event
 //! is handled; one destroyed since answers with nothing.
 //!
-//! Each payload converts back out of an [`Event`] with `TryFrom`, which gives
-//! back the event untouched when it is something else:
+//! Events about outputs and xdg windows are flat variants, so one `match` arm
+//! names the whole thing. Each family also converts back out of an [`Event`]
+//! with `TryFrom` ([`BackendEvent`] and [`XdgEvent`] collect the variants of
+//! their family), which gives back the event untouched when it is something
+//! else:
 //!
 //! ```no_run
 //! # use luminaria::{Event, protocol::XdgEvent};
@@ -50,15 +53,20 @@ use crate::protocol::{
     ActivationEvent, CompositorEvent, CursorShapeRequest, DecorationRequest, IdleInhibitEvent,
     IdleNotifierEvent, LayerSurfaceEvent, PointerConstraintEvent, SeatEvent, SelectionChange, SurfaceId,
     TextInputEvent,
-    ToplevelIconChange, XdgEvent,
+    ToplevelIconChange, ToplevelEvent, PopupEvent, XdgEvent,
 };
 
 /// Something luminaria reports, from whichever wrapper forwarded it.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event {
-    /// An output was lit up or went away.
-    Backend(BackendEvent),
+    /// An output was lit up: at `start()` for every one there is (nested and
+    /// headless have theirs from the start), later on DRM hotplug.
+    OutputAdded(Output),
+    /// A monitor went away. The [`Output`] with this id is now inert; drop it,
+    /// along with whatever was built for it. The layout and the renderer have
+    /// already let go of it.
+    OutputRemoved(OutputId),
     /// Something happened on one output: it wants a frame, a frame reached the
     /// screen, or its mode changed.
     Output(OutputId, OutputEvent),
@@ -71,7 +79,10 @@ pub enum Event {
     /// `Seat::release_keys()`; on the way back, repaint.
     SessionActive(bool),
     Compositor(CompositorEvent),
-    Xdg(XdgEvent),
+    /// Something a toplevel did or asked for, named by its surface.
+    Toplevel(SurfaceId, ToplevelEvent),
+    /// Something a popup did, named by its surface.
+    Popup(SurfaceId, PopupEvent),
     Seat(SeatEvent),
     Layer(SurfaceId, LayerSurfaceEvent),
     Decoration(DecorationRequest),
@@ -99,7 +110,7 @@ pub enum Event {
 impl Event {
     fn from_raw(raw: ffi::EventRaw) -> Option<Self> {
         Some(match raw.kind {
-            K::OutputRemoved => Event::Backend(BackendEvent::OutputRemoved(OutputId(raw.id))),
+            K::OutputRemoved => Event::OutputRemoved(OutputId(raw.id)),
             K::OutputFrame => Event::Output(OutputId(raw.id), OutputEvent::Frame),
             K::OutputModeChanged => Event::Output(OutputId(raw.id), OutputEvent::ModeChanged),
             K::OutputPresent => Event::Output(
@@ -163,7 +174,10 @@ impl Event {
             | K::InputMethodDestroy
             | K::NewInputPopupSurface
             | K::InputPopupSurfaceDestroy => Event::InputMethod(InputMethodEvent::from_raw(raw)?),
-            _ => Event::Xdg(XdgEvent::from_raw(&raw)?),
+            _ => match XdgEvent::from_raw(&raw)? {
+                XdgEvent::Toplevel(surface, event) => Event::Toplevel(surface, event),
+                XdgEvent::Popup(surface, event) => Event::Popup(surface, event),
+            },
         })
     }
 }
@@ -208,7 +222,7 @@ impl Display {
                 3 => {
                     let output = self.raw.take_output();
                     if !output.is_null() {
-                        out.push(Event::Backend(BackendEvent::OutputAdded(Output::from_raw(output))));
+                        out.push(Event::OutputAdded(Output::from_raw(output)));
                     }
                 }
                 _ => out.extend(Event::from_raw(raw)),
@@ -240,10 +254,8 @@ macro_rules! payload {
 }
 
 payload! {
-    Backend(BackendEvent),
     Input(InputEvent),
     Compositor(CompositorEvent),
-    Xdg(XdgEvent),
     Seat(SeatEvent),
     Decoration(DecorationRequest),
     CursorShape(CursorShapeRequest),
@@ -263,6 +275,46 @@ payload! {
     SessionLock(SessionLockEvent),
     OutputConfig(OutputConfigRequest),
     InputMethod(InputMethodEvent),
+}
+
+impl TryFrom<Event> for BackendEvent {
+    type Error = Event;
+    fn try_from(event: Event) -> Result<Self, Event> {
+        match event {
+            Event::OutputAdded(output) => Ok(BackendEvent::OutputAdded(output)),
+            Event::OutputRemoved(id) => Ok(BackendEvent::OutputRemoved(id)),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<BackendEvent> for Event {
+    fn from(event: BackendEvent) -> Self {
+        match event {
+            BackendEvent::OutputAdded(output) => Event::OutputAdded(output),
+            BackendEvent::OutputRemoved(id) => Event::OutputRemoved(id),
+        }
+    }
+}
+
+impl TryFrom<Event> for XdgEvent {
+    type Error = Event;
+    fn try_from(event: Event) -> Result<Self, Event> {
+        match event {
+            Event::Toplevel(surface, e) => Ok(XdgEvent::Toplevel(surface, e)),
+            Event::Popup(surface, e) => Ok(XdgEvent::Popup(surface, e)),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<XdgEvent> for Event {
+    fn from(event: XdgEvent) -> Self {
+        match event {
+            XdgEvent::Toplevel(surface, e) => Event::Toplevel(surface, e),
+            XdgEvent::Popup(surface, e) => Event::Popup(surface, e),
+        }
+    }
 }
 
 impl TryFrom<Event> for (OutputId, OutputEvent) {

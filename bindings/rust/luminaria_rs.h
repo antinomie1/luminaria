@@ -266,6 +266,7 @@ public:
     XdgShellShim& operator=(const XdgShellShim&) = delete;
 
     void set_bounds(std::int32_t width, std::int32_t height) const;
+    void focus(const SeatShim& seat, std::uint64_t surface_id) const;
     // From now on, maximize/fullscreen/minimize requests of toplevels created
     // later are Rust's to answer; until then the library grants them itself.
     void forward_window_requests() const;
@@ -626,6 +627,7 @@ public:
     void remove(OutputShim& output) const;
     Rect bounds() const;
     Rect output_box(const OutputShim& output) const;
+    Rect primary_box() const;
 
     struct Impl;
     Impl& impl() const;

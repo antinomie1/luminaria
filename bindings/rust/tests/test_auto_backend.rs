@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use luminaria::backend::{AutoBackend, BackendEvent, BackendKind, BackendOptions, Session};
+use luminaria::backend::{AutoBackend, BackendKind, BackendOptions, Session};
 use luminaria::Event;
 use luminaria::core::Display;
 
@@ -22,8 +22,8 @@ fn check_headless(display: &Display, backend: &mut AutoBackend<'_>, width: i32, 
     let mut outputs = Vec::new();
     for event in display.dispatch(Some(Duration::ZERO)).expect("dispatch") {
         match event {
-            Event::Backend(BackendEvent::OutputAdded(output)) => outputs.push(output),
-            Event::Backend(BackendEvent::OutputRemoved(_)) => panic!("headless lost an output"),
+            Event::OutputAdded(output) => outputs.push(output),
+            Event::OutputRemoved(_) => panic!("headless lost an output"),
             Event::HostCloseRequest => panic!("headless has no host"),
             _ => {}
         }

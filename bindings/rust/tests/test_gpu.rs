@@ -38,7 +38,7 @@ fn test_scene_renderer_and_output() {
     let layout = OutputLayout::new().expect("OutputLayout failed");
     let seat = Seat::new(&display, "seat0").expect("Seat failed");
     let mut cursor = Cursor::new(&renderer, &layout, &seat).expect("Cursor failed");
-    assert!(cursor.move_to(400.0, 300.0, Rect::new(0, 0, 800, 600)));
+    assert!(cursor.move_to_within(400.0, 300.0, Rect::new(0, 0, 800, 600)));
     cursor.leave();
 }
 
@@ -171,4 +171,28 @@ fn test_scene_renderer_images_and_dmabuf() {
     renderer.remove_image(42);
     assert!(!renderer.has_image(42));
     renderer.clear_images();
+}
+
+#[test]
+fn cursor_starts_in_the_middle_of_the_first_output() {
+    let display = Display::new().expect("Display failed");
+    let mut backend = HeadlessBackend::new(&display, 16).expect("HeadlessBackend failed");
+    let mut output = backend.add_output(640, 480).expect("add_output failed");
+    let renderer = SceneRenderer::new(&VulkanOptions::default()).expect("SceneRenderer failed");
+    let layout = OutputLayout::new().expect("OutputLayout failed");
+    let seat = Seat::new(&display, "seat0").expect("Seat failed");
+    let mut cursor = Cursor::new(&renderer, &layout, &seat).expect("Cursor failed");
+
+    assert_eq!(cursor.position(), None);
+    assert!(layout.primary_box().is_empty());
+    layout.add_auto(&mut output);
+    assert_eq!(layout.primary_box(), Rect::new(0, 0, 640, 480));
+    assert_eq!(output.refresh_hz(), f64::from(output.current_mode().refresh_mhz) / 1000.0);
+
+    // Nothing has said otherwise yet, so the first output found it in the middle.
+    assert_eq!(cursor.position(), Some((320.0, 240.0)));
+    assert!(cursor.move_to(10.0, 12.0));
+    assert_eq!(cursor.position(), Some((10.0, 12.0)));
+    assert!(cursor.move_by(5.0, 5.0));
+    assert_eq!(cursor.position(), Some((15.0, 17.0)));
 }

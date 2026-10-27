@@ -68,6 +68,12 @@ impl Output {
         self.raw.current_mode()
     }
 
+    /// The refresh rate of [`Output::current_mode`] in hertz; 0 when the backend
+    /// has no notion of one.
+    pub fn refresh_hz(&self) -> f64 {
+        f64::from(self.current_mode().refresh_mhz) / 1000.0
+    }
+
     pub fn set_mode(&mut self, width: i32, height: i32, refresh_mhz: i32) -> Result<(), Error> {
         let mut err = String::new();
         if self.pin().set_mode(width, height, refresh_mhz, &mut err) {
@@ -193,7 +199,7 @@ impl std::fmt::Display for OutputId {
     }
 }
 
-/// What a backend reports about outputs: [`crate::Event::Backend`].
+/// What a backend reports about outputs: [`crate::Event::OutputAdded`] and [`crate::Event::OutputRemoved`] together.
 #[derive(Debug)]
 pub enum BackendEvent {
     /// An output was lit up: at `start()` for every one there is (nested and

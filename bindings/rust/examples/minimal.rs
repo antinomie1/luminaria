@@ -14,20 +14,16 @@
 //! Logo+Escape quits.
 //!
 //! What is left here is what a compositor decides: where windows go, which one
-//! has the keyboard, what a key does. The pointer's picture is `Cursor`'s;
-//! answering the display — frame callbacks, the frame that turned out
-//! unchanged, reallocating on a mode change — is `SceneRenderer`'s; where each
-//! output sits and what wl_output says about it is `OutputLayout`'s and
-//! `OutputGlobal`'s; popups are `PopupTree`'s.
+//! has the keyboard, what a key does.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use luminaria::Event;
-use luminaria::backend::{AutoBackend, BackendEvent, BackendKind, BackendOptions, InputEvent, Modifiers, Output, OutputEvent};
+use luminaria::backend::{AutoBackend, BackendOptions, InputEvent, Modifiers, Output, OutputEvent};
 use luminaria::core::{Display, KeyRouter};
-use luminaria::gpu::{Cursor, LinuxDmabuf, SceneOutcome, SceneRenderer};
-use luminaria::protocol::{CoreGlobals, OutputGlobal, PopupArea, SurfaceId, ToplevelEvent, XdgEvent, XdgShell};
+use luminaria::gpu::{Cursor, LinuxDmabuf, SceneRenderer};
+use luminaria::protocol::{CoreGlobals, OutputGlobal, PopupArea, SurfaceId, ToplevelEvent, XdgShell};
 use luminaria::shell::{OutputLayout, PopupTree, SceneItem, scene_hit_test, scene_route_pointer};
 use luminaria::util::{Color, Keysym, Rect};
 
@@ -47,17 +43,6 @@ const BINDINGS: [(u32, Keysym, Action); 4] = [
     (Modifiers::LOGO, Keysym::q, Action::Close),
     (Modifiers::LOGO, Keysym::Escape, Action::Quit),
 ];
-
-/// What the frames did, once a second on DRM and only when it changed: the
-/// line scripts/tty-check.sh reads from the C++ twin. An idle screen asks for
-/// no frames at all, and then this line stops appearing — which is the point.
-#[derive(Default, Clone, Copy, PartialEq)]
-struct FrameCount {
-    composited: u32,
-    scanout: u32,
-    unchanged: u32,
-    cpu: u32,
-}
 
 /// Every window sits at the usable area's origin, newest on top, with its
 /// popups above it. Tagged with its own surface, so a hit on one of its
@@ -110,10 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Declaration order is destruction order, reversed, and the borrow
-    // checker holds every one of these to it: the globals outlive what uses
-    // them, the backend — whose outputs' last `present` still finds the
-    // presentation global — goes before them, and the renderer outlives the
-    // cursor and the dmabuf global that cache its textures.
+    // checker holds every one of these to it.
     let display = Display::new()?;
     let globals = CoreGlobals::new(&display)?;
     let (shell, seat) = (globals.shell(), globals.seat());
@@ -121,25 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut popups = PopupTree::new(shell)?;
 
     // Nested, else DRM when a libseat session can be had, else headless; or
-    // the one LUMINARIA_BACKEND names. It owns the session, which outlives the
-    // card and libinput opened through it. Its outputs, nested and headless
-    // included, arrive as `BackendEvent`s once it starts.
+    // the one LUMINARIA_BACKEND names. Its outputs arrive as events once it
+    // starts.
     let mut backend = AutoBackend::new(&display, &backend_options)?;
-    let on_drm = backend.kind() == BackendKind::Drm;
-    if backend.session().is_some() {
-        println!("minimal: session = libseat (VT switching enabled)");
-    } else if let Some(e) = backend.session_error().filter(|_| on_drm) {
-        println!("minimal: session = none ({e}); VT switching disabled");
-    }
-    println!("minimal: backend = {}", backend.kind());
-
-    // The GPU behind the card the backend opened.
     let renderer = SceneRenderer::new(&backend.vulkan_options())?;
-    if renderer.gpu_enabled() {
-        println!("minimal: renderer = GPU");
-    } else {
-        println!("minimal: renderer = CPU ({})", renderer.gpu_error());
-    }
     renderer.set_presentation(Some(globals.presentation()));
     // GPU clients hand over dmabufs, imported with no copy.
     let _dmabuf = renderer.gpu_enabled().then(|| LinuxDmabuf::from_scene_renderer(&display, &renderer).ok()).flatten();
@@ -149,19 +116,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut outputs: Vec<(Output, Option<OutputGlobal>)> = Vec::new();
 
     let socket = display.add_socket_auto()?;
-    // The keymap and the capabilities are the seat's to follow; no touch,
-    // since nothing here routes it.
     if let Some(source) = backend.input() {
         seat.follow(source, false);
     }
     backend.start()?;
     println!("minimal: WAYLAND_DISPLAY={socket} — Logo+Return opens a terminal, Logo+Escape quits");
 
-    let mut stack: Vec<SurfaceId> = Vec::new(); // bottom to top
+    let mut stack: Vec<SurfaceId> = Vec::new(); // mapped windows, bottom to top
     let mut keys = KeyRouter::new();
     let mut usable = Rect::new(0, 0, backend_options.width, backend_options.height); // the first output
-    let (mut frames, mut reported) = (FrameCount::default(), FrameCount::default());
-    let mut next_report = Instant::now() + Duration::from_secs(1);
 
     let deadline = std::env::var("LUMINARIA_EXIT_MS")
         .ok()
@@ -182,37 +145,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for event in events {
             match event {
                 // --- outputs -------------------------------------------------
-                Event::Backend(BackendEvent::OutputAdded(mut output)) => {
-                    // Mode changes from here on are the renderer's, the
-                    // layout's and the wl_output's own business.
+                Event::OutputAdded(mut output) => {
                     if let Err(e) = renderer.reset(&mut output) {
                         eprintln!("minimal: render target: {e}; compositing on the CPU");
                     }
                     layout.add_auto(&mut output);
                     let name = format!("minimal-{}", outputs.len() + 1);
                     let wl_output = OutputGlobal::for_output(&display, &output, &layout, &name).ok();
-                    let b = layout.output_box(&output);
-                    println!(
-                        "minimal: output {}x{}@{:.3}Hz at ({},{}), scale {}, cursor plane {}",
-                        output.width(),
-                        output.height(),
-                        output.current_mode().refresh_mhz as f64 / 1000.0,
-                        b.x,
-                        b.y,
-                        output.scale(),
-                        if output.has_cursor_plane() { "yes" } else { "no" }
-                    );
-                    // libinput only reports deltas: the pointer starts mid-screen.
-                    if on_drm && cursor.position().is_none() {
-                        let (x, y) = (b.x as f64 + b.width as f64 / 2.0, b.y as f64 + b.height as f64 / 2.0);
-                        cursor.move_to(x, y, layout.bounds());
-                    }
                     outputs.push((output, wl_output));
                     relayout = true;
                 }
-                // The layout and the renderer have already let go of it.
-                Event::Backend(BackendEvent::OutputRemoved(id)) => {
-                    println!("minimal: output removed");
+                Event::OutputRemoved(id) => {
                     outputs.retain(|(o, _)| o.id() != id);
                     relayout = true;
                 }
@@ -220,40 +163,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Output(_, OutputEvent::ModeChanged) => relayout = true,
 
                 // --- windows -------------------------------------------------
-                Event::Xdg(XdgEvent::Toplevel(surface, event)) => {
-                    let Some(t) = shell.toplevel(surface) else {
-                        // Destroyed since: only its leaving matters.
-                        stack.retain(|&s| s != surface);
-                        restacked = true;
-                        continue;
-                    };
-                    match event {
-                        ToplevelEvent::Created => {
-                            // Sized before its first frame, so it never shows at its own size.
-                            t.set_maximized(true);
-                            t.configure(usable.width, usable.height);
-                        }
-                        ToplevelEvent::Map => {
-                            // Render at the output's density: the integer
-                            // hint and, for clients that speak
-                            // fractional-scale, the exact scale.
-                            if let Some((first, _)) = outputs.first() {
-                                globals.fractional_scale().set_scale(surface, first.scale() as f64);
-                            }
-                            println!("minimal: window mapped — \"{}\"", t.title());
-                            raise(&mut stack, surface);
-                            restacked = true;
-                        }
-                        ToplevelEvent::Unmap | ToplevelEvent::Destroy => {
-                            stack.retain(|&s| s != surface);
-                            restacked = true;
-                        }
-                        _ => {}
+                Event::Toplevel(surface, ToplevelEvent::Created) => {
+                    if let Some(t) = shell.toplevel(surface) {
+                        // Sized before its first frame, so it never shows at its own size.
+                        t.set_maximized(true);
+                        t.configure(usable.size());
                     }
+                }
+                Event::Toplevel(surface, ToplevelEvent::Map) => {
+                    // Render at the output's density: the integer hint and, for
+                    // clients that speak fractional-scale, the exact scale.
+                    if let Some((first, _)) = outputs.first() {
+                        globals.fractional_scale().set_scale(surface, first.scale() as f64);
+                    }
+                    raise(&mut stack, surface);
+                    restacked = true;
+                }
+                Event::Toplevel(surface, ToplevelEvent::Unmap | ToplevelEvent::Destroy) => {
+                    stack.retain(|&s| s != surface);
+                    restacked = true;
                 }
                 // Menus, tooltips and combo boxes: the tree follows the shell,
                 // drawn above their parents and dismissed by a click outside.
-                Event::Xdg(XdgEvent::Popup(..)) => redraw = true,
+                Event::Popup(..) => redraw = true,
 
                 // --- input ---------------------------------------------------
                 // One arm for either backend: they differ in which events
@@ -270,18 +202,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         actions.extend(binding.map(|&(_, _, action)| action));
                         binding.is_some()
                     }),
-                    InputEvent::Modifiers(m) => seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group),
+                    InputEvent::Modifiers(m) => seat.notify_modifiers(m),
                     InputEvent::Motion { dx, dy } => {
-                        if cursor.move_by(dx, dy, layout.bounds())
+                        if cursor.move_by(dx, dy)
                             && let Some((x, y)) = cursor.position()
                         {
                             scene_route_pointer(seat, &scene(shell, &popups, &stack, usable), x, y);
                         }
                     }
                     InputEvent::MotionAbsolute { x, y, output } => {
-                        let on = output.and_then(|id| outputs.iter().find(|(o, _)| o.id() == id)).or(outputs.first());
-                        let origin = on.map_or(usable, |(o, _)| layout.output_box(o));
-                        cursor.move_to(origin.x as f64 + x, origin.y as f64 + y, layout.bounds());
+                        let on = output.and_then(|id| outputs.iter().find(|(o, _)| o.id() == id));
+                        let origin = on.map_or(layout.primary_box(), |(o, _)| layout.output_box(o));
+                        cursor.move_to(f64::from(origin.x) + x, f64::from(origin.y) + y);
                         if let Some((x, y)) = cursor.position() {
                             scene_route_pointer(seat, &scene(shell, &popups, &stack, usable), x, y);
                         }
@@ -293,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     InputEvent::Button { button, pressed } => {
                         let at = cursor.position();
                         if pressed {
-                            popups.dismiss_grabs_outside(seat.pointer_focus()); // menu semantics
+                            popups.dismiss_grabs_outside(seat.pointer_focus()); // a click outside a menu closes it
                             if let Some((x, y)) = at {
                                 let hit = scene_hit_test(&scene(shell, &popups, &stack, usable), x, y);
                                 if hit.tag != 0 && stack.last() != Some(&SurfaceId(hit.tag)) {
@@ -311,21 +243,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     InputEvent::Axis(axis) => seat.pointer_axis_event(axis),
-                    InputEvent::Capabilities(caps) => println!(
-                        "minimal: input devices: keyboard={} pointer={}",
-                        if caps.keyboard { "yes" } else { "no" },
-                        if caps.pointer { "yes" } else { "no" }
-                    ),
-                    // The keymap is the seat's; touch: no policy here.
-                    _ => {}
+                    _ => {} // the keymap is the seat's; touch: no policy here
                 },
                 Event::HostCloseRequest => break 'run,
                 Event::SessionActive(active) => {
                     if active {
-                        println!("minimal: session active — VT switched in");
                         redraw = true; // repaint what the other VT drew over
                     } else {
-                        println!("minimal: session inactive — VT switched away");
                         seat.release_keys();
                     }
                 }
@@ -358,23 +282,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Windows fill the first output; everything else about the layout is
         // the OutputLayout's.
-        if relayout && let Some((first, _)) = outputs.first() {
-            usable = layout.output_box(first);
-            shell.set_bounds(usable.width, usable.height);
+        if relayout && !outputs.is_empty() {
+            usable = layout.primary_box();
+            shell.set_bounds(usable.size());
             for t in stack.iter().filter_map(|&s| shell.toplevel(s)) {
-                t.configure(usable.width, usable.height);
+                t.configure(usable.size());
             }
             redraw = true;
         }
         // The top window has the keyboard and the activated look, and the
         // pointer may be over something else now.
         if restacked {
-            for (i, t) in stack.iter().map(|&s| shell.toplevel(s)).enumerate() {
-                if let Some(t) = t {
-                    t.set_activated(i + 1 == stack.len());
-                }
-            }
-            seat.set_keyboard_focus(stack.last().copied());
+            shell.focus(seat, stack.last().copied());
             if let Some((x, y)) = cursor.position() {
                 scene_route_pointer(seat, &scene(shell, &popups, &stack, usable), x, y);
             }
@@ -393,25 +312,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let screens: Vec<Rect> = outputs.iter().map(|(o, _)| layout.output_box(o)).collect();
         shell.set_popup_constraint_areas(&popup_areas(&items, &screens, layout.bounds()));
         for (o, _) in outputs.iter_mut().filter(|(o, _)| due.contains(&o.id())) {
-            match renderer.present_in(&layout, o, &items, BACKGROUND) {
-                Ok(SceneOutcome::Composited) => frames.composited += 1,
-                Ok(SceneOutcome::Scanout) => frames.scanout += 1,
-                Ok(SceneOutcome::Unchanged) => frames.unchanged += 1,
-                Ok(SceneOutcome::Cpu) => frames.cpu += 1,
-                Err(e) => eprintln!("minimal: present: {e}"),
-            }
-        }
-        if on_drm && Instant::now() >= next_report {
-            next_report += Duration::from_secs(1);
-            if frames != reported {
-                println!(
-                    "minimal: frames/s composited={} scanout={} unchanged={} cpu={}",
-                    frames.composited - reported.composited,
-                    frames.scanout - reported.scanout,
-                    frames.unchanged - reported.unchanged,
-                    frames.cpu - reported.cpu
-                );
-                reported = frames;
+            if let Err(e) = renderer.present_in(&layout, o, &items, BACKGROUND) {
+                eprintln!("minimal: present: {e}");
             }
         }
     }

@@ -755,10 +755,16 @@ std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& rend
     }
 }
 
-bool CursorShim::move_to(double x, double y, Rect bounds) {
+bool CursorShim::move_to(double x, double y) {
+    return impl_->cursor ? impl_->cursor->move_to(x, y) : false;
+}
+bool CursorShim::move_by(double dx, double dy) {
+    return impl_->cursor ? impl_->cursor->move_by(dx, dy) : false;
+}
+bool CursorShim::move_to_within(double x, double y, Rect bounds) {
     return impl_->cursor ? impl_->cursor->move_to(x, y, lm::Box{bounds.x, bounds.y, bounds.width, bounds.height}) : false;
 }
-bool CursorShim::move_by(double dx, double dy, Rect bounds) {
+bool CursorShim::move_by_within(double dx, double dy, Rect bounds) {
     return impl_->cursor ? impl_->cursor->move_by(dx, dy, lm::Box{bounds.x, bounds.y, bounds.width, bounds.height}) : false;
 }
 void CursorShim::leave() {

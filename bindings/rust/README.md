@@ -73,7 +73,7 @@ backend.start()?;
 // 3. 注册协议全局对象
 let _compositor = Compositor::new(&display)?;
 let xdg_shell = XdgShell::new(&display)?;
-xdg_shell.set_bounds(1280, 720);
+xdg_shell.set_bounds((1280, 720));
 let seat = Seat::new(&display, "seat0")?;
 seat.set_capabilities(true, true, false);
 
@@ -90,8 +90,8 @@ output.commit_frame(&pixels, 1280, 720)?;
 
 // 6. 驱动事件循环：这一轮发生的一切都在返回的事件里
 for event in display.dispatch(Some(Duration::ZERO))? {
-    if let luminaria::Event::Xdg(e) = event {
-        println!("{e:?}");
+    if let luminaria::Event::Toplevel(surface, e) = event {
+        println!("{surface:?} {e:?}");
     }
 }
 ```

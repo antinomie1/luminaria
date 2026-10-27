@@ -147,8 +147,10 @@ pub(crate) mod ffi {
         type CursorShim;
         fn cursor_new(renderer: &SceneRendererShim, layout: &OutputLayoutShim, seat: &SeatShim, error: &mut String) -> UniquePtr<CursorShim>;
         fn cursor_new_with_shapes(renderer: &SceneRendererShim, layout: &OutputLayoutShim, seat: &SeatShim, shapes: &CursorShapeManagerShim, error: &mut String) -> UniquePtr<CursorShim>;
-        fn move_to(self: Pin<&mut CursorShim>, x: f64, y: f64, bounds: Rect) -> bool;
-        fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64, bounds: Rect) -> bool;
+        fn move_to(self: Pin<&mut CursorShim>, x: f64, y: f64) -> bool;
+        fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64) -> bool;
+        fn move_to_within(self: Pin<&mut CursorShim>, x: f64, y: f64, bounds: Rect) -> bool;
+        fn move_by_within(self: Pin<&mut CursorShim>, dx: f64, dy: f64, bounds: Rect) -> bool;
         fn leave(self: Pin<&mut CursorShim>);
         fn refresh(self: Pin<&mut CursorShim>);
         fn position(self: &CursorShim, x: &mut f64, y: &mut f64) -> bool;

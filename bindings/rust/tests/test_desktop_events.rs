@@ -274,7 +274,7 @@ fn test_cursor_shape_events() {
         if let luminaria::protocol::XdgEvent::Toplevel(id, _) = ev {
             surface = Some(id);
             if let Some(tl) = shell.toplevel(id) {
-                tl.configure(320, 240);
+                tl.configure((320, 240));
             }
         }
     }
@@ -406,7 +406,7 @@ fn test_workspace_and_foreign_toplevel_events() {
     for ev in take::<luminaria::protocol::XdgEvent>() {
         if let luminaria::protocol::XdgEvent::Toplevel(id, _) = ev {
             if let Some(tl) = shell.toplevel(id) {
-                tl.configure(320, 240);
+                tl.configure((320, 240));
             }
         }
     }

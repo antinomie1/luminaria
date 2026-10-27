@@ -425,6 +425,7 @@ pub(crate) mod ffi {
         type XdgShellShim;
         fn xdg_shell_new(display: &DisplayShim, error: &mut String) -> UniquePtr<XdgShellShim>;
         fn set_bounds(self: &XdgShellShim, width: i32, height: i32);
+        fn focus(self: &XdgShellShim, seat: &SeatShim, surface_id: u64);
         fn forward_window_requests(self: &XdgShellShim);
         fn toplevels(self: &XdgShellShim) -> Vec<u64>;
         fn toplevel_info(self: &XdgShellShim, surface_id: u64, out: &mut ToplevelInfoRaw) -> bool;
@@ -615,6 +616,7 @@ pub(crate) mod ffi {
         fn bounds(self: &OutputLayoutShim) -> Rect;
         fn remove(self: &OutputLayoutShim, output: Pin<&mut OutputShim>);
         fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
+        fn primary_box(self: &OutputLayoutShim) -> Rect;
 
         fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
         fn raw_scene_route_pointer(seat: &SeatShim, items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;

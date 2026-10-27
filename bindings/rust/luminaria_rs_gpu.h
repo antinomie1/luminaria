@@ -230,8 +230,10 @@ public:
     CursorShim(const CursorShim&) = delete;
     CursorShim& operator=(const CursorShim&) = delete;
 
-    bool move_to(double x, double y, Rect bounds);
-    bool move_by(double dx, double dy, Rect bounds);
+    bool move_to(double x, double y);
+    bool move_by(double dx, double dy);
+    bool move_to_within(double x, double y, Rect bounds);
+    bool move_by_within(double dx, double dy, Rect bounds);
     void leave();
     void refresh();
     bool position(double& x, double& y) const;

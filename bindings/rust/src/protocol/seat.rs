@@ -1,6 +1,6 @@
 //! wl_seat: keyboard, pointer and touch routing, and what focus did.
 
-use crate::backend::PointerAxis;
+use crate::backend::{Modifiers, PointerAxis};
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 
@@ -70,9 +70,9 @@ impl<'d> Seat<'d> {
         self.raw.notify_key(key, pressed);
     }
 
-    pub fn notify_modifiers(&self, depressed: u32, latched: u32, locked: u32, group: u32) {
-        self.raw
-            .notify_modifiers(depressed, latched, locked, group);
+    pub fn notify_modifiers(&self, modifiers: Modifiers) {
+        let Modifiers { depressed, latched, locked, group } = modifiers;
+        self.raw.notify_modifiers(depressed, latched, locked, group);
     }
 
     /// Release every key a client was told is down, and clear the modifiers:

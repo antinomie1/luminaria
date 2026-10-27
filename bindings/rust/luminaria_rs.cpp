@@ -882,6 +882,11 @@ void XdgShellShim::set_bounds(std::int32_t width, std::int32_t height) const {
     if (impl_->shell) impl_->shell->set_bounds(width, height);
 }
 
+void XdgShellShim::focus(const SeatShim& seat, std::uint64_t surface_id) const {
+    lm::Seat* s = raw_ptr(seat);
+    if (impl_->shell && s) impl_->shell->focus(*s, surface_id != 0 ? impl_->toplevel(surface_id) : nullptr);
+}
+
 void XdgShellShim::forward_window_requests() const { impl_->forward_requests = true; }
 
 
@@ -1939,6 +1944,10 @@ void OutputLayoutShim::remove(OutputShim& output) const {
     lm::Output* out = output.impl().output;
     if (!out) return;
     impl_->layout.remove(*out);
+}
+Rect OutputLayoutShim::primary_box() const {
+    const auto b = impl_->layout.primary_box();
+    return Rect{b.x, b.y, b.width, b.height};
 }
 Rect OutputLayoutShim::output_box(const OutputShim& output) const {
     if (!output.impl().output) return Rect{0, 0, 0, 0};

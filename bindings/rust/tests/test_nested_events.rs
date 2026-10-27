@@ -98,19 +98,19 @@ fn nested_wayland_backend_events() {
         if let XdgEvent::Toplevel(id, _) = ev {
             toplevel_id = Some(id);
             if let Some(tl) = host_shell.toplevel(id) {
-                tl.configure(320, 240);
+                tl.configure((320, 240));
             }
         }
     }
     let toplevel_id = toplevel_id.expect("expected child to create toplevel on host");
 
     host_seat.set_keyboard_focus(Some(toplevel_id));
-    host_seat.notify_modifiers(1, 2, 4, 0);
+    host_seat.notify_modifiers(Modifiers { depressed: 1, latched: 2, locked: 4, group: 0 });
     // Shift held, then `a`: the child reads it against the parent's keymap.
-    host_seat.notify_modifiers(SHIFT, 0, 0, 0);
+    host_seat.notify_modifiers(Modifiers { depressed: SHIFT, ..Modifiers::default() });
     host_seat.notify_key(KEY_A, true);
     host_seat.notify_key(KEY_A, false);
-    host_seat.notify_modifiers(0, 0, 0, 0);
+    host_seat.notify_modifiers(Modifiers::default());
     host_seat.pointer_enter(toplevel_id, 10.0, 12.0);
     host_seat.pointer_axis(5.0, 10.0);
     host_seat.pointer_axis_discrete(0, 15);

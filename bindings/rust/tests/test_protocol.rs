@@ -14,7 +14,7 @@ fn test_core_protocols_instantiation() {
     let _compositor = Compositor::new(&display).expect("Compositor failed");
     let _subcompositor = Subcompositor::new(&display).expect("Subcompositor failed");
     let xdg_shell = XdgShell::new(&display).expect("XdgShell failed");
-    xdg_shell.set_bounds(1920, 1080);
+    xdg_shell.set_bounds((1920, 1080));
 
     let seat = Seat::new(&display, "seat0").expect("Seat failed");
     seat.set_capabilities(true, true, true);
@@ -93,7 +93,7 @@ fn core_globals() {
     let globals = CoreGlobals::new(&display).expect("CoreGlobals");
     globals.seat().set_capabilities(true, true, false);
     assert!(!globals.seat().keymap().is_empty());
-    globals.shell().set_bounds(800, 600);
+    globals.shell().set_bounds((800, 600));
     // Moving it keeps every global where the seat-borrowing ones look for it.
     let moved = globals;
     assert!(moved.data_device().selection_mime_types().is_empty());

@@ -161,7 +161,7 @@ fn toplevel_events_requests_and_state() {
     let _compositor = Compositor::new(&display).expect("wl_compositor");
     // Answering maximize/fullscreen/minimize ourselves, so they arrive as events.
     let shell = XdgShell::new(&display).expect("xdg-shell").forward_window_requests();
-    let _seat = Seat::new(&display, "seat0").expect("wl_seat");
+    let seat = Seat::new(&display, "seat0").expect("wl_seat");
 
     let mut peer = Peer::spawn(&display, toplevel_client);
     peer.wait(&display, "mapped");
@@ -215,9 +215,10 @@ fn toplevel_events_requests_and_state() {
     assert_eq!(t.states(), ToplevelStates::default());
 
     t.set_maximized(true);
-    t.set_activated(true);
-    t.set_activated(true); // no change, no event
-    assert_ne!(t.configure(300, 200), 0);
+    shell.focus(&seat, Some(a)); // activated, and the keyboard follows
+    shell.focus(&seat, Some(a)); // no change, no event
+    assert_eq!(seat.keyboard_focus(), Some(a));
+    assert_ne!(t.configure((300, 200)), 0);
     common::collect(&display);
     assert_eq!(
         take::<XdgEvent>(),

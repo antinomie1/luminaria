@@ -46,6 +46,12 @@ impl OutputLayout {
         self.raw.output_box(&output.raw)
     }
 
+    /// The first output placed, where a window with no better idea goes; empty
+    /// when there are none.
+    pub fn primary_box(&self) -> Rect {
+        self.raw.primary_box()
+    }
+
     /// The box around every output, empty when there are none: the bounds a
     /// relative pointer is kept in.
     pub fn bounds(&self) -> Rect {

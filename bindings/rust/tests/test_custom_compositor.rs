@@ -30,7 +30,7 @@ fn test_custom_compositor_headless_pipeline() {
     // 3. Register Core Protocols
     let _compositor = Compositor::new(&display).expect("compositor failed");
     let xdg_shell = XdgShell::new(&display).expect("xdg_shell failed");
-    xdg_shell.set_bounds(1024, 768);
+    xdg_shell.set_bounds((1024, 768));
     let seat = Seat::new(&display, "seat0").expect("seat failed");
     seat.set_capabilities(true, true, false);
 

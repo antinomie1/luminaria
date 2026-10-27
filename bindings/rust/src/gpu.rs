@@ -443,12 +443,27 @@ impl<'a> Cursor<'a> {
         self.raw.pin_mut()
     }
 
-    pub fn move_to(&mut self, x: f64, y: f64, bounds: Rect) -> bool {
-        self.pin().move_to(x, y, bounds)
+    /// Put the pointer at (`x`, `y`), kept inside the layout. Returns whether
+    /// it moved. Until something moves it, it sits in the middle of the first
+    /// output to arrive.
+    pub fn move_to(&mut self, x: f64, y: f64) -> bool {
+        self.pin().move_to(x, y)
     }
 
-    pub fn move_by(&mut self, dx: f64, dy: f64, bounds: Rect) -> bool {
-        self.pin().move_by(dx, dy, bounds)
+    /// Move it by a relative delta (libinput), kept inside the layout.
+    pub fn move_by(&mut self, dx: f64, dy: f64) -> bool {
+        self.pin().move_by(dx, dy)
+    }
+
+    /// [`Cursor::move_to`] kept inside `bounds` instead of the layout: what a
+    /// pointer constraint asks for.
+    pub fn move_to_within(&mut self, x: f64, y: f64, bounds: Rect) -> bool {
+        self.pin().move_to_within(x, y, bounds)
+    }
+
+    /// [`Cursor::move_by`] kept inside `bounds`.
+    pub fn move_by_within(&mut self, dx: f64, dy: f64, bounds: Rect) -> bool {
+        self.pin().move_by_within(dx, dy, bounds)
     }
 
     pub fn leave(&mut self) {

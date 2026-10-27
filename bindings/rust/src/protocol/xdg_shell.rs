@@ -2,7 +2,7 @@
 
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
-use crate::util::Rect;
+use crate::util::{Point, Rect};
 
 use super::SurfaceId;
 
@@ -49,7 +49,7 @@ pub enum PopupEvent {
     Grab { serial: u32 },
 }
 
-/// An xdg-shell event ([`crate::Event::Xdg`]), named by the surface it is about.
+/// An xdg-shell event ([`crate::Event::Toplevel`] or [`crate::Event::Popup`]), named by the surface it is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XdgEvent {
     Toplevel(SurfaceId, ToplevelEvent),
@@ -169,8 +169,17 @@ impl XdgShell<'_> {
     }
 
     /// The area a maximized window may take (xdg_toplevel.configure_bounds).
-    pub fn set_bounds(&self, width: i32, height: i32) {
-        self.raw.set_bounds(width, height);
+    pub fn set_bounds(&self, size: impl Into<Point<i32>>) {
+        let Point { x, y } = size.into();
+        self.raw.set_bounds(x, y);
+    }
+
+    /// Make `surface`'s toplevel the focused window (`None`: none): it alone is
+    /// activated, and `seat`'s keyboard goes to it. The window that had focus is
+    /// deactivated, and one that is destroyed while focused is forgotten, so the
+    /// compositor keeps no "which one is active" of its own.
+    pub fn focus(&self, seat: &super::Seat<'_>, surface: Option<SurfaceId>) {
+        self.raw.focus(&seat.raw, surface.map_or(0, |s| s.0));
     }
 
     /// Every toplevel alive now, mapped or not, in no particular order.
@@ -278,7 +287,8 @@ impl Toplevel<'_> {
 
     /// Ask the client to take this size (0 = its choice) with the current
     /// states. Returns the configure serial.
-    pub fn configure(&self, width: i32, height: i32) -> u32 {
+    pub fn configure(&self, size: impl Into<Point<i32>>) -> u32 {
+        let Point { x: width, y: height } = size.into();
         self.shell.toplevel_configure(self.surface.0, width, height)
     }
 
