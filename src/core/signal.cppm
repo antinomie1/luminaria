@@ -7,7 +7,10 @@
 //   - Connection destroyed first -> the slot is unregistered.
 //   - Signal destroyed first     -> the Connection becomes an inert no-op.
 // The friendly API is: `auto c = sig.connect([](Event& e){ ... });` and you keep
-// `c` alive exactly as long as you want the callback.
+// `c` alive exactly as long as you want the callback. A callback that does not
+// look at the event is `sig.connect([]{ ... })`. Many connections that live as
+// long as the program, or as long as the object they listen to, go into one
+// `Connections` instead of a member each.
 //
 // Pure C++: it does NOT touch libwayland's wl_signal, so callbacks are typed
 // (no void* trampolines). Interop wrappers for raw C wl_signal live elsewhere.
@@ -106,9 +109,18 @@ public:
     Signal& operator=(Signal&&) noexcept = default;
 
     /// Register a slot. Keep the returned Connection alive to stay subscribed.
-    [[nodiscard]] Connection connect(std::function<void(Event&)> slot) {
+    /// `slot` takes the event, or nothing when it has no use for it.
+    template <class F>
+        requires std::invocable<F&, Event&> || std::invocable<F&>
+    [[nodiscard]] Connection connect(F&& slot) {
         const std::uint64_t id = impl_->next_id++;
-        impl_->entries.push_back(Entry{id, std::move(slot), true});
+        if constexpr (std::invocable<F&, Event&>) {
+            impl_->entries.push_back(
+                Entry{id, std::function<void(Event&)>(std::forward<F>(slot)), true});
+        } else {
+            impl_->entries.push_back(Entry{
+                id, [fn = std::forward<F>(slot)](Event&) mutable { fn(); }, true});
+        }
         return Connection{impl_, id};
     }
 
@@ -139,6 +151,49 @@ public:
         }
         return n;
     }
+};
+
+/// A bag of connections to signals of any type, for the ones nobody wants a
+/// named member for. A connection whose signal has died is inert, so the bag
+/// forgets those as it grows: a window that opens and closes a million times
+/// leaves a million small objects nowhere.
+///
+/// The bag disconnects everything when it dies, so declare it after whatever
+/// its callbacks capture. That also keeps them from running during `Display`
+/// teardown, when a client's objects are destroyed and the locals are gone.
+class Connections {
+    struct Held {
+        virtual ~Held() = default;
+        [[nodiscard]] virtual bool connected() const noexcept = 0;
+    };
+    template <class C>
+    struct Typed final : Held {
+        C connection;
+        explicit Typed(C&& c) : connection(std::move(c)) {}
+        [[nodiscard]] bool connected() const noexcept override { return connection.connected(); }
+    };
+
+    std::vector<std::unique_ptr<Held>> held_;
+    std::size_t prune_at_ = 32;
+
+public:
+    template <class C>
+        requires(!std::is_lvalue_reference_v<C>)
+    void add(C&& connection) {
+        if (held_.size() >= prune_at_) {
+            std::erase_if(held_, [](const auto& h) { return !h->connected(); });
+            prune_at_ = std::max<std::size_t>(32, held_.size() * 2);
+        }
+        held_.push_back(std::make_unique<Typed<std::remove_cvref_t<C>>>(std::move(connection)));
+    }
+    template <class C>
+        requires(!std::is_lvalue_reference_v<C>)
+    Connections& operator+=(C&& connection) {
+        add(std::move(connection));
+        return *this;
+    }
+    void clear() noexcept { held_.clear(); }
+    [[nodiscard]] std::size_t size() const noexcept { return held_.size(); }
 };
 
 } // namespace luminaria

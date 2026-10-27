@@ -28,6 +28,17 @@ using Status = Result<void>;
     return std::unexpected<Error>(Error{std::move(message), code});
 }
 
+/// "Fine if it can't be built": the value if there is one, nothing otherwise.
+/// An optional global is `if (auto d = to_optional(X::create(...))) ...` instead
+/// of an `if (auto r = ...; r)` with the value moved out by hand.
+template <class T>
+[[nodiscard]] std::optional<T> to_optional(Result<T> result) {
+    if (!result) {
+        return std::nullopt;
+    }
+    return std::move(*result);
+}
+
 /// Success sentinel for Status-returning functions: `return ok();`
 [[nodiscard]] inline Status ok() {
     return Status{};

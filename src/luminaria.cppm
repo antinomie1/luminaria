@@ -44,6 +44,7 @@ export import :idle_notify;
 export import :input_event;
 export import :input_router;
 export import :keymap;
+export import :match;
 export import :layer;
 export import :layer_shell;
 export import :output;

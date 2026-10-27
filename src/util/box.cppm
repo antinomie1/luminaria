@@ -11,6 +11,26 @@ export module luminaria:box;
 import std;
 export namespace luminaria {
 
+/// A width and a height, for what has an extent and no position.
+struct Size {
+    int width = 0;
+    int height = 0;
+
+    [[nodiscard]] constexpr bool empty() const noexcept {
+        return width <= 0 || height <= 0;
+    }
+    [[nodiscard]] constexpr bool operator==(const Size&) const noexcept = default;
+};
+
+/// A position in layout coordinates, which are fractional wherever a pointer is
+/// involved.
+struct Point {
+    double x = 0.0;
+    double y = 0.0;
+
+    [[nodiscard]] constexpr bool operator==(const Point&) const noexcept = default;
+};
+
 /// An axis-aligned rectangle in integer coordinates. Empty iff width/height <= 0.
 struct Box {
     int x = 0;
@@ -20,6 +40,14 @@ struct Box {
 
     [[nodiscard]] constexpr bool empty() const noexcept {
         return width <= 0 || height <= 0;
+    }
+
+    [[nodiscard]] constexpr Size size() const noexcept {
+        return Size{width, height};
+    }
+
+    [[nodiscard]] constexpr Point center() const noexcept {
+        return Point{x + width / 2.0, y + height / 2.0};
     }
 
     [[nodiscard]] constexpr bool contains(int px, int py) const noexcept {

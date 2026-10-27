@@ -12,6 +12,9 @@ static_assert(Box{0, 0, 4, 4}.contains(3, 3));
 static_assert(!Box{0, 0, 4, 4}.contains(4, 0));
 static_assert(Box{0, 0, 4, 4}.intersection(Box{2, 2, 4, 4}) == Box{2, 2, 2, 2});
 static_assert(Box{0, 0, 2, 2}.intersection(Box{5, 5, 1, 1}).empty());
+static_assert(Box{10, 20, 30, 40}.size() == luminaria::Size{30, 40});
+static_assert(Box{10, 20, 31, 41}.center() == luminaria::Point{25.5, 40.5});
+static_assert(luminaria::Size{}.empty() && !luminaria::Size{1, 1}.empty());
 
 int main() {
     Box a{1, 1, 10, 10};
