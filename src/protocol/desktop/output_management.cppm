@@ -58,7 +58,7 @@ struct OutputHeadConfig {
     std::optional<OutputPosition> position; ///< layout coordinates
     std::optional<Transform> transform;
     std::optional<double> scale; ///< as sent; may be fractional and `Output::scale` is not
-    std::optional<bool> adaptive_sync;
+    std::optional<bool> adaptive_sync; ///< variable refresh; apply with `Output::set_vrr()`
 };
 
 /// What the client is told. Anything but `succeeded` means nothing changed:
@@ -146,6 +146,7 @@ struct OmHeadState {
     int y = 0;
     Transform transform = Transform::normal;
     int scale = 1;
+    bool adaptive_sync = false;
 };
 
 struct OmHead {
@@ -237,7 +238,9 @@ constexpr unsigned kOmCurrent = 1u << 1;
 constexpr unsigned kOmPosition = 1u << 2;
 constexpr unsigned kOmTransform = 1u << 3;
 constexpr unsigned kOmScale = 1u << 4;
-constexpr unsigned kOmAll = kOmEnabled | kOmCurrent | kOmPosition | kOmTransform | kOmScale;
+constexpr unsigned kOmAdaptive = 1u << 5;
+constexpr unsigned kOmAll =
+    kOmEnabled | kOmCurrent | kOmPosition | kOmTransform | kOmScale | kOmAdaptive;
 
 // --- zwlr_output_mode_v1 / zwlr_output_head_v1 --------------------------------
 
@@ -644,6 +647,7 @@ OmHeadState OutputManager::Impl::read(const Output& output) const {
     }
     s.transform = output.transform();
     s.scale = output.scale();
+    s.adaptive_sync = output.vrr_enabled();
     return s;
 }
 
@@ -728,11 +732,11 @@ void OutputManager::Impl::send_state(OmHeadRes& r, const OmHeadState& s, unsigne
     if ((what & kOmScale) != 0) {
         zwlr_output_head_v1_send_scale(r.resource, wl_fixed_from_int(s.scale));
     }
-    if ((what & kOmEnabled) != 0 &&
+    if ((what & (kOmEnabled | kOmAdaptive)) != 0 &&
         wl_resource_get_version(r.resource) >= ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_SINCE_VERSION) {
-        // No backend here drives VRR, so it is never on.
-        zwlr_output_head_v1_send_adaptive_sync(r.resource,
-                                               ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_DISABLED);
+        zwlr_output_head_v1_send_adaptive_sync(
+            r.resource, s.adaptive_sync ? ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_ENABLED
+                                        : ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_DISABLED);
     }
 }
 
@@ -847,6 +851,9 @@ void OutputManager::update() {
         }
         if (now.scale != h.sent.scale) {
             what |= kOmScale;
+        }
+        if (now.adaptive_sync != h.sent.adaptive_sync) {
+            what |= kOmAdaptive;
         }
         if (!modes_changed && what == 0) {
             continue;

@@ -39,9 +39,10 @@ public:
         connections_ += backend.backend().new_output.connect([this, &layout](lm::NewOutput& e) {
             lm::Output& output = e.output;
             const lm::Box box = layout.box_of(output);
-            std::println("minimal: output {}x{}@{:.3g}Hz at ({},{}), scale {}, cursor plane {}",
+            std::println("minimal: output {}x{}@{:.3g}Hz at ({},{}), scale {}, cursor plane {}, vrr {}",
                          output.width(), output.height(), output.refresh_hz(), box.x, box.y,
-                         output.scale(), output.has_cursor_plane() ? "yes" : "no");
+                         output.scale(), output.has_cursor_plane() ? "yes" : "no",
+                         output.vrr_enabled() ? "on" : output.vrr_capable() ? "off" : "n/a");
             connections_ += output.destroy.connect([] { std::println("minimal: output removed"); });
         });
         if (lm::InputSource* source = backend.input(); source != nullptr) {

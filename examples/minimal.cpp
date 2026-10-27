@@ -228,6 +228,12 @@ int main(int argc, char** argv) {
                          s.error().message);
         }
         layout.add_auto(output);
+        // Variable refresh on a monitor that has it: the panel follows the
+        // frames, so an idle desktop idles it and a game runs as fast as it renders.
+        if (const char* vrr = std::getenv("LUMINARIA_VRR");
+            vrr != nullptr && *vrr != '\0' && *vrr != '0' && output.vrr_capable()) {
+            (void)output.set_vrr(true);
+        }
         screen.global = lm::to_optional(lm::OutputGlobal::create(
             display, output, layout, std::format("minimal-{}", screens.size())));
         connections += output.frame.connect([&] {

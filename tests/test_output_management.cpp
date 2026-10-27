@@ -69,7 +69,20 @@ public:
     }
     lm::Status commit(lm::Color) override { return lm::ok(); }
 
+    // A FreeSync-capable monitor when `vrr_capable_` is set.
+    [[nodiscard]] bool vrr_capable() const noexcept override { return vrr_capable_; }
+    [[nodiscard]] bool vrr_enabled() const noexcept override { return vrr_on_; }
+    lm::Status set_vrr(bool enabled) override {
+        if (enabled && !vrr_capable_) {
+            return Output::set_vrr(enabled);
+        }
+        vrr_on_ = enabled;
+        return lm::ok();
+    }
+    bool vrr_capable_ = false;
+
 private:
+    bool vrr_on_ = false;
     std::vector<lm::OutputMode> modes_;
 };
 
@@ -295,6 +308,33 @@ void run_client(int fd) {
         assert(virt.x == 1280);
     }
 
+    // Variable refresh: the capable monitor takes it and the client is told;
+    // asking the other one for it is refused, and nothing is left half done.
+    {
+        auto* config = zwlr_output_manager_v1_create_configuration(st.manager, st.serial);
+        auto* h = zwlr_output_configuration_v1_enable_head(config, dp.proxy);
+        zwlr_output_configuration_head_v1_set_adaptive_sync(
+            h, ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_ENABLED);
+        zwlr_output_configuration_head_v1_destroy(
+            zwlr_output_configuration_v1_enable_head(config, virt.proxy));
+        assert(submit(display, config, false) == Answer::succeeded);
+        zwlr_output_configuration_head_v1_destroy(h);
+        wl_display_roundtrip(display);
+        assert(dp.adaptive_sync == ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_ENABLED);
+        assert(virt.adaptive_sync == ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_DISABLED);
+
+        config = zwlr_output_manager_v1_create_configuration(st.manager, st.serial);
+        zwlr_output_configuration_head_v1_destroy(
+            zwlr_output_configuration_v1_enable_head(config, dp.proxy));
+        auto* v = zwlr_output_configuration_v1_enable_head(config, virt.proxy);
+        zwlr_output_configuration_head_v1_set_adaptive_sync(
+            v, ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_ENABLED);
+        assert(submit(display, config, false) == Answer::failed);
+        zwlr_output_configuration_head_v1_destroy(v);
+        wl_display_roundtrip(display);
+        assert(virt.adaptive_sync == ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_STATE_DISABLED);
+    }
+
     // The compositor's verdict, not ours: it refuses to switch anything off.
     {
         auto* config = zwlr_output_manager_v1_create_configuration(st.manager, st.serial);
@@ -371,6 +411,7 @@ int main() {
         1920, 1080,
         std::vector<lm::OutputMode>{{1920, 1080, 60000, true}, {1280, 720, 60000, false}});
     auto virt = std::make_unique<FakeOutput>(800, 600, std::vector<lm::OutputMode>{});
+    dp->vrr_capable_ = true; // only the real monitor can do variable refresh
     layout.add_auto(*dp);
     layout.add_auto(*virt);
     manager->add_head(*dp, {.name = "DP-1", .description = "Fake monitor"});
@@ -413,6 +454,9 @@ int main() {
             if (h.scale) {
                 h.output->set_scale(static_cast<int>(*h.scale));
             }
+            if (h.adaptive_sync && !h.output->set_vrr(*h.adaptive_sync)) {
+                return; // a monitor that cannot do it: `failed` is the default
+            }
             if (h.transform) {
                 h.output->set_transform(*h.transform);
             }
@@ -439,7 +483,9 @@ int main() {
     client_thread.join();
 
     assert(seen.tests == 2);
-    assert(seen.applies == 2); // the stale one never arrived; the error one never got that far
+    // The mode switch, the two variable-refresh applies (one taken, one refused) and
+    // the refused switch-off; the stale one never arrived, the error one never got that far.
+    assert(seen.applies == 4);
     assert(virt == nullptr);
     return 0;
 }

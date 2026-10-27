@@ -174,6 +174,7 @@ uint32_t find_prop(int fd, uint32_t obj_id, uint32_t obj_type, const char *name,
 struct CrtcProps {
   uint32_t mode_id = 0;
   uint32_t active = 0;
+  uint32_t vrr_enabled = 0;   // optional: variable refresh (FreeSync, Adaptive-Sync)
   uint32_t out_fence_ptr = 0; // optional: a fence for "this frame is on screen"
 };
 
@@ -289,6 +290,9 @@ public:
   uint32_t plane_id;
   uint32_t connector_crtc_id_prop;
   CrtcProps crtc_props;
+  bool vrr_capable_ = false; // the connector's `vrr_capable` property
+  bool vrr_want = false;     // what set_vrr() asked for
+  bool vrr_applied = false;  // what the last successful commit carried
   PlaneProps plane_props;
   drmModeModeInfo mode;
   // Everything the connector reported, copied: the drmModeConnector it came
@@ -455,6 +459,24 @@ public:
 
   void set_tearing(bool async) override { tearing = async; }
 
+  [[nodiscard]] bool vrr_capable() const noexcept override {
+    return vrr_capable_ && crtc_props.vrr_enabled != 0;
+  }
+  [[nodiscard]] bool vrr_enabled() const noexcept override { return vrr_want; }
+  Status set_vrr(bool enabled) override {
+    if (enabled && !vrr_capable()) {
+      return fail("drm: this connector/CRTC cannot do variable refresh");
+    }
+    if (enabled == vrr_want) {
+      return ok();
+    }
+    vrr_want = enabled;
+    // It rides on the next atomic commit. Ask for a frame so a compositor that
+    // would otherwise sit idle has a reason to make one.
+    schedule_frame();
+    return ok();
+  }
+
   DrmOutput(EventLoop loop, int fd, uint32_t crtc, uint32_t connector,
             uint32_t plane, const drmModeModeInfo &mode)
       : Output(mode.hdisplay, mode.vdisplay), fd(fd), crtc_id(crtc),
@@ -605,6 +627,13 @@ public:
     add(plane_id, plane_props.crtc_w, static_cast<uint64_t>(width_));
     add(plane_id, plane_props.crtc_h, static_cast<uint64_t>(height_));
 
+    // Variable refresh is a CRTC property. A modeset always states it (the
+    // kernel resets it to 0 across one); a plain flip only when it changed.
+    // It is added last, behind a saved cursor, so a driver that rejects it can
+    // be retried without it instead of failing every frame.
+    const bool vrr_prop = crtc_props.vrr_enabled != 0 && (modeset || vrr_want != vrr_applied);
+    int req_before_vrr = 0;
+
     // Cursor updates are folded into the next primary-plane flip. A
     // blocking cursor-only atomic commit waits for vblank on some drivers;
     // doing one for every libinput motion event therefore builds an input
@@ -648,7 +677,20 @@ public:
         flags |= DRM_MODE_PAGE_FLIP_ASYNC;
       }
     }
-    const int rc = drmModeAtomicCommit(fd, req.get(), flags, this);
+    if (vrr_prop) {
+      req_before_vrr = drmModeAtomicGetCursor(req.get());
+      add(crtc_id, crtc_props.vrr_enabled, vrr_want ? 1 : 0);
+    }
+    int rc = drmModeAtomicCommit(fd, req.get(), flags, this);
+    if (rc != 0 && vrr_prop && vrr_want && errno != EBUSY) {
+      // The driver took everything but variable refresh. Give up on VRR, not
+      // on the frame: drop the property, try again, and stop offering it.
+      drmModeAtomicSetCursor(req.get(), req_before_vrr);
+      vrr_want = false;
+      vrr_capable_ = false;
+      add(crtc_id, crtc_props.vrr_enabled, 0);
+      rc = drmModeAtomicCommit(fd, req.get(), flags, this);
+    }
     // KMS took its own reference to the in-fence; ours dies with this scope.
     // The out-fence is only an fd once the ioctl has written the slot.
     UniqueFd out_fence{out_fence_slot};
@@ -663,6 +705,9 @@ public:
     pending_fb = fb_id;
     flip_pending = true;
     cursor_dirty = false;
+    if (vrr_prop) {
+      vrr_applied = vrr_want;
+    }
     return ok();
   }
 
@@ -946,6 +991,17 @@ bool resolve_props(int fd, DrmOutput &out) {
       find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
   out.crtc_props.active =
       find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+  // Optional: absent on drivers without variable refresh. The connector says
+  // whether THIS monitor supports it; the CRTC property is the switch.
+  out.crtc_props.vrr_enabled =
+      find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "VRR_ENABLED");
+  {
+    uint64_t capable = 0;
+    if (find_prop(fd, out.connector_id, DRM_MODE_OBJECT_CONNECTOR, "vrr_capable",
+                  &capable) != 0) {
+      out.vrr_capable_ = capable != 0;
+    }
+  }
   // Optional on old drivers; without them the pipeline still works, it just
   // has to keep the GPU and the display in step by blocking.
   out.crtc_props.out_fence_ptr =

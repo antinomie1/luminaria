@@ -207,6 +207,40 @@ public:
   /// (wp_tearing_control_v1). Backends that can't tear ignore it.
   virtual void set_tearing(bool async) { (void)async; }
 
+  // --- variable refresh rate ---
+  //
+  // FreeSync / G-Sync Compatible / VESA Adaptive-Sync: instead of the display
+  // scanning out at a fixed rate and the frame waiting for the next tick, the
+  // display waits for the frame. A game rendering 97 fps is shown at 97 Hz with
+  // no tearing and no judder from a missed 144 Hz deadline; a still desktop
+  // lets the panel idle down to the bottom of its range (typically 48 Hz, or
+  // 10-30 Hz with low-framerate compensation) instead of redrawing the same
+  // image 144 times a second.
+  //
+  // The mechanism is already here: frames are asked for (`schedule_frame()`),
+  // never free-running, so an idle output commits nothing and a busy one
+  // commits exactly when it has something. All VRR adds is telling the display
+  // that it may wait. Whether to — always, only for a fullscreen game
+  // (`Surface::content_type()`), never — is the compositor's policy.
+
+  /// Whether this display (and the connector it is on) can do variable refresh.
+  /// False for headless and nested outputs, and for a monitor that does not
+  /// advertise it (or has it switched off in its own menu).
+  [[nodiscard]] virtual bool vrr_capable() const noexcept { return false; }
+  /// Whether it is asked to. A request that has been made but not yet reached
+  /// the hardware (it rides on the next commit) already reads as enabled.
+  [[nodiscard]] virtual bool vrr_enabled() const noexcept { return false; }
+  /// Turn variable refresh on or off. Takes effect with the next commit — on a
+  /// compositor that only commits when something changed, that is the next
+  /// frame with damage, which is exactly when it matters. Turning it off, or on
+  /// an output that was already so, always succeeds; turning it on where
+  /// `vrr_capable()` is false is an error. If the kernel refuses it later, VRR
+  /// falls back to off and `vrr_capable()` to false, rather than failing
+  /// every commit.
+  virtual Status set_vrr(bool enabled) {
+    return enabled ? fail("this output cannot do variable refresh") : ok();
+  }
+
   /// Present a solid color (convenience / bring-up path).
   virtual Status commit(Color color) = 0;
 
