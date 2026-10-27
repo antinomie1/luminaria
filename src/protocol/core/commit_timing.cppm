@@ -203,23 +203,25 @@ void CommitTimingManager::Impl::tick() {
     // create or destroy timers.
     const std::vector<CommitTimer*> snapshot = timers;
     for (CommitTimer* timer : snapshot) {
-        if (timer->deadline == 0) {
-            continue;
-        }
         Surface* surface = surface_from_id(timer->surface);
         if (surface == nullptr) {
             timer->deadline = 0;
             continue;
         }
-        if (timer->deadline <= now) {
-            // Due. The stamp is per-commit, so it is spent either way: the
-            // surface either had a commit parked on it or never made one.
+        // The stamp staged for the next commit is spent once it is due, whether
+        // or not a commit ever parked on it.
+        if (timer->deadline != 0 && timer->deadline <= now) {
             timer->deadline = 0;
-            surface->release_deferred_commit(now);
-            continue;
         }
-        if (next == 0 || timer->deadline < next) {
-            next = timer->deadline;
+        // Parked commits queue in order and each carries its own stamp, so the
+        // stamp to wake for is the OLDEST one's, re-read after every release.
+        surface->release_deferred_commit(now);
+        std::uint64_t want = timer->deadline;
+        if (const std::uint64_t head = surface->deferred_commit_time(); head > now) {
+            want = want == 0 ? head : std::min(want, head);
+        }
+        if (want != 0 && (next == 0 || want < next)) {
+            next = want;
         }
     }
     if (next == 0) {

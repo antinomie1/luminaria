@@ -286,16 +286,28 @@ public:
         return pending_.commit_time_ns;
     }
 
-    /// True while a commit is parked waiting for one of the two conditions.
-    [[nodiscard]] bool has_deferred_commit() const noexcept { return has_deferred_; }
-    /// The stamp the parked commit is waiting for, or 0 if it only waits on the
-    /// FIFO barrier. Meaningless when nothing is parked.
+    /// True while at least one commit is parked waiting for one of the two
+    /// conditions.
+    [[nodiscard]] bool has_deferred_commit() const noexcept { return !deferred_.empty(); }
+    /// How many commits are parked. The queue is per-commit, in the order the
+    /// client made them: each one is its own frame, not a merge of its
+    /// neighbours, so a client that raced three FIFO frames ahead gets three
+    /// presentations out of them, one per barrier.
+    [[nodiscard]] std::size_t deferred_commit_count() const noexcept { return deferred_.size(); }
+    /// The stamp the OLDEST parked commit is waiting for, or 0 if it only waits
+    /// on the FIFO barrier. Meaningless when nothing is parked. Only the head
+    /// matters: commits apply in order, so a later commit with an earlier stamp
+    /// still waits behind it (wp_commit_timing_v1 says exactly that).
     [[nodiscard]] std::uint64_t deferred_commit_time() const noexcept {
-        return deferred_.commit_time_ns;
+        return deferred_.empty() ? 0 : deferred_.front().commit_time_ns;
     }
-    /// Apply the parked commit if both conditions are now met at `now_ns`.
-    /// Returns true if one was applied. Cheap and idempotent when nothing is
-    /// parked, so a per-frame sweep is fine.
+    /// A client that never waits cannot make this grow without bound: past
+    /// this many parked commits the newest one is folded into its predecessor
+    /// (the old, collapsing behaviour) instead of queuing.
+    static constexpr std::size_t max_deferred_commits = 64;
+    /// Apply parked commits, oldest first, for as long as the head's conditions
+    /// are met at `now_ns`. Returns true if at least one was applied. Cheap and
+    /// idempotent when nothing is parked, so a per-frame sweep is fine.
     bool release_deferred_commit(std::uint64_t now_ns);
 
     /// The content committed under a FIFO barrier has been shown (or never will
@@ -483,8 +495,8 @@ private:
     State pending_;         // accumulated since the last commit request
     State cached_;          // sync-mode state waiting for the parent's commit
     bool has_cached_ = false;
-    State deferred_;        // fifo / commit-timing state waiting for its gate
-    bool has_deferred_ = false;
+    std::deque<State> deferred_; // fifo / commit-timing commits waiting for their gate, oldest first
+    bool releasing_deferred_ = false; // release_deferred_commit() is on the stack
     // One entry per client buffer we still reference, so we hear about its
     // destruction before we touch a freed wl_resource.
     std::vector<std::unique_ptr<BufferWatch>> buffer_watches_;
@@ -718,7 +730,9 @@ void Surface::add_frame_callback(wl_resource* callback) {
 void Surface::forget_frame_callback(wl_resource* callback) noexcept {
     std::erase(pending_.frame_callbacks, callback);
     std::erase(cached_.frame_callbacks, callback);
-    std::erase(deferred_.frame_callbacks, callback);
+    for (State& parked : deferred_) {
+        std::erase(parked.frame_callbacks, callback);
+    }
     std::erase(queued_frame_callbacks_, callback);
 }
 
@@ -771,7 +785,10 @@ void Surface::watch_buffer(wl_resource* buffer) {
 void Surface::prune_buffer_watches() {
     std::erase_if(buffer_watches_, [this](const std::unique_ptr<BufferWatch>& watch) {
         return watch->buffer != current_buffer_ && watch->buffer != pending_.buffer &&
-               watch->buffer != cached_.buffer && watch->buffer != deferred_.buffer &&
+               watch->buffer != cached_.buffer &&
+               std::ranges::none_of(deferred_, [&](const State& s) {
+                   return s.buffer == watch->buffer;
+               }) &&
                std::find(held_buffers_.begin(), held_buffers_.end(), watch->buffer) ==
                    held_buffers_.end();
     });
@@ -792,8 +809,10 @@ void Surface::forget_buffer(wl_resource* buffer) noexcept {
     }
     // ...including one parked behind a fifo barrier or a commit timestamp: a
     // client may well drop its swapchain while a frame of it is still waiting.
-    if (deferred_.buffer == buffer) {
-        deferred_.buffer = nullptr;
+    for (State& parked : deferred_) {
+        if (parked.buffer == buffer) {
+            parked.buffer = nullptr;
+        }
     }
     if (current_buffer_ == buffer) {
         current_buffer_ = nullptr;
@@ -1020,6 +1039,11 @@ Surface::~Surface() {
                      cached_.frame_callbacks.end());
     callbacks.insert(callbacks.end(), queued_frame_callbacks_.begin(),
                      queued_frame_callbacks_.end());
+    for (State& parked : deferred_) {
+        callbacks.insert(callbacks.end(), parked.frame_callbacks.begin(),
+                         parked.frame_callbacks.end());
+        parked.frame_callbacks.clear();
+    }
     pending_.frame_callbacks.clear();
     cached_.frame_callbacks.clear();
     queued_frame_callbacks_.clear();
@@ -1120,16 +1144,16 @@ void Surface::apply_commit() {
     // The fifo / commit-timing gate. A commit parked here is not visible to
     // anything downstream — no `commit` signal, no damage, no frame callbacks —
     // until it is let through, which is exactly what the two protocols promise.
-    if (gate_blocks(state, monotonic_ns())) {
-        merge_state(deferred_, std::move(state));
-        has_deferred_ = true;
-        prune_buffer_watches();
-        return;
-    }
-    if (has_deferred_) {
-        // Never reorder a client's own commits: an ungated one that arrives
-        // while an earlier commit is parked joins it and waits its turn.
-        merge_state(deferred_, std::move(state));
+    //
+    // Commits queue one by one, in order. Never reorder a client's own commits:
+    // an ungated one that arrives while an earlier commit is parked waits its
+    // turn behind it, as a frame of its own.
+    if (!deferred_.empty() || gate_blocks(state, monotonic_ns())) {
+        if (deferred_.size() >= max_deferred_commits) {
+            merge_state(deferred_.back(), std::move(state));
+        } else {
+            deferred_.push_back(std::move(state));
+        }
         prune_buffer_watches();
         return;
     }
@@ -1144,14 +1168,22 @@ bool Surface::gate_blocks(const State& state, std::uint64_t now_ns) const noexce
 }
 
 bool Surface::release_deferred_commit(std::uint64_t now_ns) {
-    if (!has_deferred_ || gate_blocks(deferred_, now_ns)) {
+    // Applying a commit emits `commit`, and a handler may well present the
+    // surface (send_frame_done -> clear_fifo_barrier -> back here). The outer
+    // loop re-reads the gate after every commit, so it picks that up itself.
+    if (releasing_deferred_) {
         return false;
     }
-    State state = std::move(deferred_);
-    deferred_ = State{};
-    has_deferred_ = false;
-    commit_state(std::move(state));
-    return true;
+    releasing_deferred_ = true;
+    bool applied = false;
+    while (!deferred_.empty() && !gate_blocks(deferred_.front(), now_ns)) {
+        State state = std::move(deferred_.front());
+        deferred_.pop_front();
+        commit_state(std::move(state));
+        applied = true;
+    }
+    releasing_deferred_ = false;
+    return applied;
 }
 
 void Surface::clear_fifo_barrier() {

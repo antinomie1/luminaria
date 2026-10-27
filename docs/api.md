@@ -403,7 +403,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `void notify_presented(Surface& surface, const PresentationFeedback& feedback)`
   - `void notify_discarded(Surface& surface)`
 - **`TearingControlManager`** (`luminaria:tearing_control`): 允许游戏等低延迟客户端申请异步撕裂翻页。
-- **`FifoManager` & `CommitTimingManager`** (`luminaria:fifo`, `luminaria:commit_timing`): 提交节拍栅栏与定时提交控制。
+- **`FifoManager` & `CommitTimingManager`** (`luminaria:fifo`, `luminaria:commit_timing`): 提交节拍栅栏与定时提交控制。被扣住的提交在 `Surface` 上按序排队（`deferred_commit_count()`、`deferred_commit_time()` 看队头），每次放行条件满足就依次应用，不再塌缩。
 
 ### 7.5 Viewporter & FractionalScale & ContentType & XdgDecoration
 - **`Viewporter`** (`luminaria:viewporter`): 客户端源裁剪与目标拉伸支持。

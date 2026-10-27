@@ -210,10 +210,6 @@ fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize
 
 ## 已知的天花板（不是 bug，是没做完的地方）
 
-- **闸门里只停一次提交** —— `wp-fifo-v1` / `wp-commit-timing-v1` 的规范说排队的提交按序
-  排成一列；这里第二次提交合并进已经停着的那一次（gate 取两者的并集，时间戳取较晚的），
-  也就是塌缩成一帧。动画客户端每帧一次提交，落不到这个差异上；真要排队得让 `Surface`
-  持有一条 `State` 队列。
 - **不可见表面的 FIFO 放行归混成器** —— barrier 只在 `send_frame_done()` 时清除，所以最小化
   或被完全遮挡、混成器不再 present 的客户端会一直停在闸门里。`FifoManager::unblock_hidden()`
   是那把钥匙，但什么算"不可见"只有混成器知道，示例里还没接。

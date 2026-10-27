@@ -71,8 +71,18 @@ void run_client(int fd) {
     wl_surface_commit(surface);
     wl_display_roundtrip(display);
 
+    // A second stamped commit, due 250ms after the first: it queues behind it
+    // as a frame of its own and must wake the compositor by itself too.
+    ns += 250'000'000ULL;
+    sec = static_cast<std::uint64_t>(ts.tv_sec) + ns / 1'000'000'000ULL;
+    wp_commit_timer_v1_set_timestamp(timer, static_cast<uint32_t>(sec >> 32),
+                                     static_cast<uint32_t>(sec & 0xFFFFFFFFU),
+                                     static_cast<uint32_t>(ns % 1'000'000'000ULL));
+    wl_surface_commit(surface);
+    wl_display_roundtrip(display);
+
     // Say nothing more: the release must come from the compositor's own timer.
-    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
 
     wp_commit_timer_v1_destroy(timer);
     wl_surface_destroy(surface);
@@ -119,9 +129,18 @@ int main() {
     });
     early.arm(120);
 
+    // Between the two stamps: the first applied, the second still queued.
+    int commits_mid = -1;
+    std::size_t queued_mid = 0;
+    auto mid = display->event_loop().add_timer([&] {
+        commits_mid = commits;
+        queued_mid = the_surface != nullptr ? the_surface->deferred_commit_count() : 0;
+    });
+    mid.arm(400);
+
     int commits_late = -1;
     auto late = display->event_loop().add_timer([&] { commits_late = commits; });
-    late.arm(450);
+    late.arm(700);
 
     wl_client* client = wl_client_create(display->c_ptr(), fds[0]);
     assert(client != nullptr);
@@ -139,6 +158,8 @@ int main() {
     assert(timing->timer_count() == 0); // the client destroyed its timer
     assert(commits_early == 0);         // not applied before its stamp
     assert(parked);
-    assert(commits_late == 1);          // applied by the manager's own wakeup
+    assert(commits_mid == 1);           // applied by the manager's own wakeup...
+    assert(queued_mid == 1);            // ...and the second still waits for its own stamp
+    assert(commits_late == 2);          // which the manager woke for as well
     return 0;
 }

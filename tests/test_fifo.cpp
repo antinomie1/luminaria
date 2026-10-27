@@ -67,11 +67,14 @@ void run_client(int fd) {
     wl_surface_commit(surface);
     wl_display_roundtrip(display);
 
-    // Frame 2: waits for frame 1 to be shown. Must NOT apply yet.
-    wp_fifo_v1_set_barrier(fifo);
-    wp_fifo_v1_wait_barrier(fifo);
-    wl_surface_commit(surface);
-    wl_display_roundtrip(display);
+    // Frames 2 and 3: each waits for the one before it to be shown. Neither may
+    // apply yet, and they must queue as TWO frames rather than collapse to one.
+    for (int i = 0; i < 2; ++i) {
+        wp_fifo_v1_set_barrier(fifo);
+        wp_fifo_v1_wait_barrier(fifo);
+        wl_surface_commit(surface);
+        wl_display_roundtrip(display);
+    }
 
     // Hold the connection open long enough for the server's timers below.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -127,15 +130,28 @@ int main() {
 
     // Presenting the surface pays the debt, which must let frame 2 through.
     int commits_after = -1;
+    int commits_after_second = -1;
+    std::size_t queued_before = 0, queued_after = 0, queued_end = 0;
     bool deferred_before_release = false;
     auto release = display->event_loop().add_timer([&] {
         deferred_before_release = the_surface != nullptr && the_surface->has_deferred_commit();
+        queued_before = the_surface != nullptr ? the_surface->deferred_commit_count() : 0;
         if (the_surface != nullptr) {
             the_surface->send_frame_done(0);
         }
         commits_after = commits;
+        queued_after = the_surface != nullptr ? the_surface->deferred_commit_count() : 0;
     });
     release.arm(300);
+    // The second presentation pays for frame 2 and lets frame 3 through.
+    auto release_again = display->event_loop().add_timer([&] {
+        if (the_surface != nullptr) {
+            the_surface->send_frame_done(0);
+        }
+        commits_after_second = commits;
+        queued_end = the_surface != nullptr ? the_surface->deferred_commit_count() : 0;
+    });
+    release_again.arm(350);
 
     wl_client* client = wl_client_create(display->c_ptr(), fds[0]);
     assert(client != nullptr);
@@ -154,8 +170,12 @@ int main() {
     assert(commits_before == 1);       // frame 2 is parked, not applied
     assert(barrier_held);              // frame 1 still owes a presentation
     assert(deferred_before_release);
-    assert(commits_after == 2);        // presenting frame 1 released frame 2
-    assert(commits == 2);
-    // Frame 2 took a barrier of its own, and nothing has presented it.
+    assert(queued_before == 2);       // frames 2 and 3 are queued, not merged
+    assert(commits_after == 2);       // presenting frame 1 released frame 2 ONLY...
+    assert(queued_after == 1);        // ...because frame 2 took a barrier of its own
+    assert(commits_after_second == 3);
+    assert(queued_end == 0);
+    assert(commits == 3);
+    // Frame 3 took a barrier of its own, and nothing has presented it.
     return 0;
 }
