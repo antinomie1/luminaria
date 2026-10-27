@@ -17,6 +17,7 @@
 
 module;
 
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 // libseat.h has no extern "C" guard of its own, so C++ would mangle every
 // symbol in it. This is the same treatment the other C headers get implicitly.
@@ -67,6 +68,13 @@ public:
 
     /// Ask to switch to another VT (1-based), as a compositor key binding would.
     Status switch_to(int vt);
+
+    /// The VT-switch binding every bare-metal compositor has: if `keysym` is
+    /// one of XF86Switch_VT_1..12 — what the keymap itself turns Ctrl+Alt+Fn
+    /// into — switch to that VT and answer true; otherwise do nothing and
+    /// answer false. Release the seat's keys alongside (`Seat::release_keys`):
+    /// their releases arrive on the other VT.
+    bool switch_vt_for(std::uint32_t keysym);
 
     struct Impl;
 
@@ -172,6 +180,14 @@ void Session::close_device(int device_id) {
 bool Session::active() const noexcept { return impl_->active; }
 
 Signal<SessionActive>& Session::activity() noexcept { return impl_->activity; }
+
+bool Session::switch_vt_for(std::uint32_t keysym) {
+    if (keysym < XKB_KEY_XF86Switch_VT_1 || keysym > XKB_KEY_XF86Switch_VT_12) {
+        return false;
+    }
+    (void)switch_to(static_cast<int>(keysym - XKB_KEY_XF86Switch_VT_1) + 1);
+    return true;
+}
 
 Status Session::switch_to(int vt) {
     if (libseat_switch_session(impl_->seat, vt) != 0) {

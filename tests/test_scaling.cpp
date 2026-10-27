@@ -182,7 +182,7 @@ int main() {
             // 1.5x: no integer scale can say this, which is the whole point of
             // wp_fractional_scale_v1. Sent on commit, not on surface creation —
             // the client hasn't asked for a scale object yet at that point.
-            fractional->set_scale(s, 180);
+            fractional->set_scale(s, 1.5);
             // The buffer is 100x50; the viewport says the surface is 300x200.
             assert(s.buffer_width() == 100 && s.buffer_height() == 50);
             assert(s.surface_width() == 300 && s.surface_height() == 200);

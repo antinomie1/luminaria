@@ -1,49 +1,39 @@
-// luminaria/core/input_router.cppm — key event routing and modifier synchronization helpers.
+// luminaria/core/input_router.cppm — the compositor's key bindings in front of the seat.
 export module luminaria:input_router;
 
 import std;
 
 import :input_event;
-import :keymap;
 import :seat;
 
 export namespace luminaria {
 
-/// Tracks swallowed keypresses to ensure matching key releases are also swallowed,
-/// and provides helpers for synchronizing modifiers with Seat and releasing modifiers on VT switches.
+/// Splits the keyboard between the compositor's bindings and the focused
+/// client, keeping each key whole: a key whose press a binding took has its
+/// release taken too, so the client never sees half of it.
 class KeyRouter {
 public:
-    KeyRouter() = default;
-
-    /// Record a keycode as swallowed by a binding/action.
-    void consume(std::uint32_t keycode) {
-        consumed_.insert(keycode);
-    }
-
-    /// Check if a release event should be swallowed because its press was swallowed.
-    /// Erases the recorded keycode and returns true if it was swallowed.
-    bool unconsume(std::uint32_t keycode) noexcept {
-        return consumed_.erase(keycode) > 0;
-    }
-
-    [[nodiscard]] bool is_consumed(std::uint32_t keycode) const noexcept {
-        return consumed_.contains(keycode);
-    }
-
-    /// Synchronize modifier state from backend input event into both keymap and seat.
-    static void sync_modifiers(KeymapState& keymap, Seat& seat, const ModifiersEvent& e) {
-        keymap.update_modifiers(e);
-        seat.notify_modifiers(e.depressed, e.latched, e.locked, e.group);
-    }
-
-    /// Release held modifier keys to prevent clients from getting stuck keys across VT switches.
-    static void release_held_modifiers(KeymapState& keymap, Seat& seat,
-                                       const std::set<std::uint32_t>& held_modifiers) {
-        for (const std::uint32_t modifier : held_modifiers) {
-            keymap.update_key(modifier, false);
-            seat.notify_key(modifier, false);
+    /// Route one backend key event. A press is offered to `binding` first
+    /// (`bool(const KeyEvent&)`); answering true keeps the key from the client.
+    /// Everything else goes to `seat`.
+    ///
+    /// A press of a key the router thinks a binding still holds means its
+    /// release was lost — what happens to the key that switched the VT away —
+    /// and is treated as a fresh press.
+    template <class Binding>
+    void route(Seat& seat, const KeyEvent& event, Binding&& binding) {
+        if (!event.pressed) {
+            if (consumed_.erase(event.keycode) == 0) {
+                seat.notify_key(event.keycode, false);
+            }
+            return;
         }
-        seat.notify_modifiers(0, 0, 0, 0);
+        consumed_.erase(event.keycode);
+        if (std::invoke(binding, event)) {
+            consumed_.insert(event.keycode);
+            return;
+        }
+        seat.notify_key(event.keycode, true);
     }
 
 private:

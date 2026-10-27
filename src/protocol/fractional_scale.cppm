@@ -39,17 +39,14 @@ public:
     FractionalScaleManager(const FractionalScaleManager&) = delete;
     FractionalScaleManager& operator=(const FractionalScaleManager&) = delete;
 
-    /// Tell a surface the scale of the output it is showing on. `scale_120ths`
-    /// is the protocol's unit (120 = 1x, 180 = 1.5x, 240 = 2x); values below 1
-    /// are ignored. Call it when a surface lands on an output, and again when
-    /// that output's scale changes. Surfaces with no wp_fractional_scale_v1
-    /// object are silently skipped.
-    void set_scale(Surface& surface, int scale_120ths);
-
-    /// The same thing from a floating-point scale, e.g. 1.5.
-    void set_scale(Surface& surface, double scale) {
-        set_scale(surface, static_cast<int>(scale * 120.0 + 0.5));
-    }
+    /// Tell a surface the scale of the output it is showing on, e.g. 1.5, in
+    /// both currencies at once: the exact value to a client that bound
+    /// wp_fractional_scale_v1, and the integer hint rounded up
+    /// (`Surface::set_preferred_buffer_scale`) to every other one — a 1.5x
+    /// output wants a 2x buffer scaled down, not a 1x one scaled up. Call it
+    /// when a surface lands on an output, and again when that output's scale
+    /// changes. Values below 1/120 are ignored.
+    void set_scale(Surface& surface, double scale);
 
     struct Impl;
 
@@ -161,10 +158,12 @@ Result<FractionalScaleManager> FractionalScaleManager::create(Display& display) 
     return FractionalScaleManager{std::move(impl)};
 }
 
-void FractionalScaleManager::set_scale(Surface& surface, int scale_120ths) {
+void FractionalScaleManager::set_scale(Surface& surface, double scale) {
+    const int scale_120ths = static_cast<int>(scale * 120.0 + 0.5);
     if (scale_120ths < 1) {
         return;
     }
+    surface.set_preferred_buffer_scale(static_cast<int>(std::ceil(scale_120ths / 120.0)));
     for (ScaleObject* object : impl_->objects) {
         if (object->surface != &surface || object->last_sent == scale_120ths) {
             continue;

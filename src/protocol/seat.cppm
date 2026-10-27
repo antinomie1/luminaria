@@ -101,12 +101,28 @@ public:
     [[nodiscard]] bool set_keymap(const std::string& xkb_text);
     [[nodiscard]] const std::string& keymap() const noexcept;
 
+    /// Describe the devices behind `source` from now on: its keymap and
+    /// capabilities are adopted at once — what the nested connection and
+    /// libinput's start() produced before anything was listening — and every
+    /// later `KeymapChange` and `InputCapabilities` follows. Touch is
+    /// advertised only with `touch`, for a compositor that routes it: a client
+    /// that binds a wl_touch nothing drives waits forever. Events are not
+    /// routed; keys and the pointer stay the compositor's to deliver. A second
+    /// call replaces the first. `source` must outlive the seat or be followed
+    /// by nothing else afterwards; the connection is dropped with either.
+    void follow(InputSource& source, bool touch = false);
+
     // --- keyboard ---
     /// Give keyboard focus to `surface` (nullptr clears focus). Sends leave/enter.
     void set_keyboard_focus(Surface* surface);
     [[nodiscard]] SurfaceId keyboard_focus() const noexcept;
     /// Send a key event to the keyboard-focused client. `pressed` = down.
     void notify_key(uint32_t key, bool pressed);
+    /// Release every key a client was told is down, and clear the modifiers.
+    /// For the moment the keyboard stops reaching this seat — a VT switch, a
+    /// lost session — when the releases themselves will never arrive and the
+    /// client would otherwise repeat the last key for ever.
+    void release_keys();
     /// Send the current modifier state (Shift/Ctrl/…) to the keyboard-focused client.
     void notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
     void notify_modifiers(const ModifiersEvent& modifiers);
@@ -211,6 +227,9 @@ struct Seat::Impl {
 
     SurfaceId kb_focus;
     SurfaceId ptr_focus;
+    /// Keys a client was sent a press for and no release since.
+    std::vector<uint32_t> keys_down;
+    Signal<InputEvent>::Connection followed;
     /// Which surface each touch point went down on, by slot.
     struct TouchPoint {
         int32_t id;
@@ -512,8 +531,12 @@ Result<Seat> Seat::create(Display& display, std::string name) {
     return Seat{std::move(impl)};
 }
 
-bool Seat::set_keymap(const std::string& xkb_text) {
-    if (xkb_text.empty() || xkb_text == impl_->keymap) {
+namespace {
+
+// On the Impl rather than the Seat: `follow()` calls them from a slot, which
+// must survive the Seat wrapper being moved.
+bool adopt_keymap(Seat::Impl& impl, const std::string& xkb_text) {
+    if (xkb_text.empty() || xkb_text == impl.keymap) {
         return !xkb_text.empty();
     }
     // Compile it before believing it: a keymap we can't parse would leave every
@@ -533,37 +556,59 @@ bool Seat::set_keymap(const std::string& xkb_text) {
     if (!valid) {
         return false;
     }
-    impl_->keymap = xkb_text;
-    for (wl_resource* kb : impl_->keyboards) {
-        send_keymap(impl_.get(), kb);
+    impl.keymap = xkb_text;
+    for (wl_resource* kb : impl.keyboards) {
+        send_keymap(&impl, kb);
     }
     return true;
 }
 
-const std::string& Seat::keymap() const noexcept { return impl_->keymap; }
-
-void Seat::set_capabilities(InputCapabilities caps) {
-    set_capabilities(caps.keyboard, caps.pointer, caps.touch);
-}
-
-void Seat::set_capabilities(bool keyboard, bool pointer, bool touch) {
+void advertise(Seat::Impl& impl, InputCapabilities wanted) {
     uint32_t caps = 0;
-    if (keyboard) {
+    if (wanted.keyboard) {
         caps |= WL_SEAT_CAPABILITY_KEYBOARD;
     }
-    if (pointer) {
+    if (wanted.pointer) {
         caps |= WL_SEAT_CAPABILITY_POINTER;
     }
-    if (touch) {
+    if (wanted.touch) {
         caps |= WL_SEAT_CAPABILITY_TOUCH;
     }
-    if (caps == impl_->capabilities) {
+    if (caps == impl.capabilities) {
         return;
     }
-    impl_->capabilities = caps;
-    for (wl_resource* seat : impl_->seats) {
+    impl.capabilities = caps;
+    for (wl_resource* seat : impl.seats) {
         wl_seat_send_capabilities(seat, caps);
     }
+}
+
+} // namespace
+
+bool Seat::set_keymap(const std::string& xkb_text) { return adopt_keymap(*impl_, xkb_text); }
+
+const std::string& Seat::keymap() const noexcept { return impl_->keymap; }
+
+void Seat::follow(InputSource& source, bool touch) {
+    adopt_keymap(*impl_, source.keymap());
+    InputCapabilities caps = source.capabilities();
+    caps.touch = caps.touch && touch;
+    advertise(*impl_, caps);
+    impl_->followed = source.input().connect([impl = impl_.get(), touch](InputEvent& event) {
+        if (const auto* keymap = std::get_if<KeymapChange>(&event)) {
+            (void)adopt_keymap(*impl, std::string(keymap->text));
+        } else if (const auto* now = std::get_if<InputCapabilities>(&event)) {
+            InputCapabilities masked = *now;
+            masked.touch = masked.touch && touch;
+            advertise(*impl, masked);
+        }
+    });
+}
+
+void Seat::set_capabilities(InputCapabilities caps) { advertise(*impl_, caps); }
+
+void Seat::set_capabilities(bool keyboard, bool pointer, bool touch) {
+    advertise(*impl_, {.keyboard = keyboard, .pointer = pointer, .touch = touch});
 }
 
 // --- keyboard ---
@@ -615,6 +660,13 @@ void Seat::notify_key(uint32_t key, bool pressed) {
     if (focus == nullptr) {
         return;
     }
+    if (pressed) {
+        if (std::ranges::find(impl_->keys_down, key) == impl_->keys_down.end()) {
+            impl_->keys_down.push_back(key);
+        }
+    } else {
+        std::erase(impl_->keys_down, key);
+    }
     wl_client* client = client_of(*focus);
     const uint32_t serial = impl_->next_serial();
     const uint32_t state =
@@ -624,6 +676,16 @@ void Seat::notify_key(uint32_t key, bool pressed) {
             wl_keyboard_send_key(kb, serial, now_ms(), key, state);
         }
     }
+}
+
+void Seat::release_keys() {
+    // Copied first: each release erases its key from the list.
+    const std::vector<uint32_t> down = std::move(impl_->keys_down);
+    impl_->keys_down.clear();
+    for (const uint32_t key : down) {
+        notify_key(key, false);
+    }
+    notify_modifiers(0, 0, 0, 0);
 }
 
 void Seat::notify_modifiers(const ModifiersEvent& m) {
