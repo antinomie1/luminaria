@@ -6,6 +6,7 @@ export import luminaria;
 export import :ctm_control;
 export import :data_control;
 export import :foreign_toplevel;
+export import :foreign_toplevel_list;
 export import :gamma_control;
 export import :input_method;
 export import :output_management;

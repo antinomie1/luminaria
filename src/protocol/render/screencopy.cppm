@@ -28,6 +28,7 @@ export module luminaria.render:screencopy;
 import std;
 
 import luminaria;
+import :cpu_compositor;
 import :linux_dmabuf;
 import :vulkan;
 
@@ -58,6 +59,19 @@ struct CursorCapture {
 /// immediately that they have stopped.
 using ScreencopyCursorFunc = std::function<bool(wl_resource* output, CursorCapture& out)>;
 
+/// Which window a `ext_foreign_toplevel_handle_v1` resource names, or null when
+/// it names none (not one of ours, or the window has gone). The desktop module's
+/// `ForeignToplevelList::toplevel_for` is exactly this.
+using ToplevelResolveFunc = std::function<Toplevel*(wl_resource* handle)>;
+
+/// A window's pixels, for a compositor that wants to draw them itself (a GPU
+/// readback of a tiled dmabuf, say). Fill `rgba` with tightly-packed
+/// premultiplied RGBA8, `width * height * 4` bytes, and return true. The
+/// default — used when none is set — composites the window's surface tree on
+/// the CPU, which reads shm, single-pixel and LINEAR dmabuf buffers.
+using ToplevelCaptureFunc =
+    std::function<bool(Toplevel& toplevel, int& width, int& height, std::vector<std::uint8_t>& rgba)>;
+
 /// The wlr_screencopy_manager_v1 + ext_image_copy_capture_manager_v1 globals.
 ///
 /// Usage:
@@ -87,6 +101,31 @@ public:
 
     /// Where the pointer cursor comes from, for cursor capture sessions.
     void set_cursor_source(ScreencopyCursorFunc fn);
+
+    /// Publish `ext_foreign_toplevel_image_capture_source_manager_v1`: a client
+    /// that holds an ext-foreign-toplevel-list handle can capture THAT WINDOW —
+    /// not the screen — through the same ext-image-copy-capture sessions an
+    /// output capture uses. This is single-window screen sharing (Zoom, Teams,
+    /// Discord, browsers via xdg-desktop-portal).
+    ///
+    /// The window is rendered from its own surface tree, so what the recipient
+    /// sees does not depend on what covers it, whether it is minimised, or
+    /// where it sits on the layout: capturing a window behind another one
+    /// yields the window. Frames are paced by the window's own commits — a
+    /// `capture` on a session whose window has not changed since the last frame
+    /// is held back until it does, which is what ext-image-copy-capture asks of
+    /// a compositor and what keeps an idle shared window at zero wakeups. The
+    /// session is `stopped` when the window is destroyed, and re-advertises its
+    /// buffer size when the window is resized.
+    ///
+    /// `resolve` maps a handle to a window; with the desktop module that is
+    ///   `[](wl_resource* h) { return ForeignToplevelList::toplevel_for(h); }`
+    /// It is a function rather than a type because `luminaria.render` does not
+    /// (and, by ADR 0008, may not) depend on `luminaria.desktop`.
+    [[nodiscard]] Status enable_toplevel_capture(Display& display, ToplevelResolveFunc resolve);
+
+    /// Replace the CPU rendering of window captures (see ToplevelCaptureFunc).
+    void set_toplevel_capture(ToplevelCaptureFunc fn);
 
     /// The cursor moved, changed shape, or left the screen. Re-reads the
     /// source and updates every live cursor session: enter/leave, position and
@@ -158,6 +197,10 @@ struct ScreencopyManager::Impl {
     VulkanRenderer* renderer = nullptr; // set → dmabuf targets advertised/writable
     dev_t render_dev = 0;               // DRM render node dev_t (for ext dmabuf_device)
     bool has_dev = false;
+    EventLoop loop;                     // for pacing window captures; set by enable_toplevel_capture
+    ToplevelResolveFunc toplevel_resolver;
+    ToplevelCaptureFunc toplevel_capture; // unset → composite the surface tree on the CPU
+    CpuCompositor cpu;                    // scratch for the default window render
     ScreencopyCursorFunc cursor_source;             // unset → cursor capture unavailable
     std::vector<ExtCursorSession*> cursor_sessions; // live, weak; each unregisters itself
 
@@ -168,6 +211,7 @@ struct ScreencopyManager::Impl {
     WlGlobal ext_copy_capture_global;
     // ext-image-capture-source globals
     WlGlobal ext_source_output_manager_global;
+    WlGlobal ext_source_toplevel_manager_global;
 
     std::vector<OutputEntry> outputs;
 
@@ -572,12 +616,60 @@ bool ext_cursor_read(ExtCursorSession& cs, CursorCapture& out) {
     return cs.mgr->cursor_source(cs.output->output, out) && out.width > 0 && out.height > 0;
 }
 
+// ---- window capture state ----
+//
+// A window source is shared three ways at once — the source object, every
+// session made from it, and every frame of those — and any of them can outlive
+// the others, the window included. So the window lives behind shared_ptrs:
+// `ToplevelTarget` follows the Toplevel (and nulls it when it dies), and
+// `ToplevelSessionState` is one session's bookkeeping, which its frames share.
+struct ExtFrame;
+struct ToplevelSessionState;
+
+struct ToplevelTarget : std::enable_shared_from_this<ToplevelTarget> {
+    ScreencopyManager::Impl* mgr = nullptr;
+    Toplevel* toplevel = nullptr; // null once the window is destroyed
+    Signal<ToplevelDestroy>::Connection destroy_conn;
+    // One commit connection per surface of the tree, so the frame pacing hears
+    // about a video subsurface committing on its own. Rebuilt when the tree's
+    // membership changes (only ever from a request handler, never mid-emit).
+    std::vector<Signal<SurfaceCommit>::Connection> watch;
+    std::vector<SurfaceId> watched;
+    std::uint64_t serial = 0; // bumped by every commit anywhere in the tree
+    bool wake_pending = false;
+    std::vector<ExtFrame*> waiting;           // captures held back until `serial` moves
+    std::vector<ToplevelSessionState*> sessions; // live; each unregisters itself
+
+    void follow(Toplevel& tl);
+    void refresh_watch();
+    void on_commit();
+    void on_destroy();
+    void flush();
+};
+
+struct ToplevelSessionState {
+    std::shared_ptr<ToplevelTarget> target;
+    wl_resource* session = nullptr; // the ext_image_copy_capture_session_v1; null once destroyed
+    int width = 0, height = 0;      // what the client was last told
+    std::uint64_t last_serial = 0;  // target->serial at the last delivered frame
+    bool first = true;              // nothing delivered yet: the first frame is immediate
+    bool stopped = false;
+
+    ~ToplevelSessionState() {
+        if (target != nullptr) {
+            std::erase(target->sessions, this);
+        }
+    }
+};
+
 // ---- ext_image_copy_capture_frame_v1 ----
 struct ExtFrame {
     ScreencopyManager::Impl* mgr = nullptr;
     wl_resource* resource = nullptr;
     OutputEntry* output = nullptr;
     ExtCursorSession* cursor = nullptr; // set → this frame captures the pointer, not the screen
+    std::shared_ptr<ToplevelSessionState> window; // set → this frame captures a window
+    bool waiting = false;                         // parked in window->target->waiting
     wl_resource* attached_buffer = nullptr;
     bool captured = false;
     // attach_buffer and capture are separate requests, so the buffer is held
@@ -588,6 +680,9 @@ struct ExtFrame {
     ~ExtFrame() {
         if (buffer_destroy.link.prev != nullptr) {
             wl_list_remove(&buffer_destroy.link);
+        }
+        if (waiting && window != nullptr && window->target != nullptr) {
+            std::erase(window->target->waiting, this);
         }
     }
 };
@@ -631,52 +726,20 @@ void ext_frame_damage_buffer(wl_client*, wl_resource* resource,
     // We ignore damage for now and always capture the full region.
 }
 
-void ext_frame_capture(wl_client*, wl_resource* resource) {
-    auto* f = static_cast<ExtFrame*>(wl_resource_get_user_data(resource));
-    if (f->captured) {
-        wl_resource_post_error(f->resource,
-                               EXT_IMAGE_COPY_CAPTURE_FRAME_V1_ERROR_ALREADY_CAPTURED,
-                               "frame already captured");
-        return;
-    }
-    if (!f->attached_buffer) {
-        wl_resource_post_error(f->resource, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_ERROR_NO_BUFFER,
-                               "no buffer attached");
-        return;
-    }
-    f->captured = true;
-
-    // Capture pixels — of the screen, or of the pointer when this frame belongs
-    // to a cursor session. The cursor's size is its own, not the output's.
-    std::vector<uint8_t> rgba;
-    int cap_w = 0, cap_h = 0;
-    if (f->cursor != nullptr) {
-        CursorCapture cc;
-        if (!ext_cursor_read(*f->cursor, cc)) {
-            // No cursor on this output right now. Not an error the client can
-            // fix by reallocating — it should wait for the next `enter`.
-            ext_image_copy_capture_frame_v1_send_failed(f->resource,
-                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
-            return;
-        }
-        cap_w = cc.width;
-        cap_h = cc.height;
-        rgba = std::move(cc.rgba);
-    } else {
-        cap_w = f->output->width;
-        cap_h = f->output->height;
-        if (!f->output->capture(0, 0, cap_w, cap_h, rgba)) {
-            ext_image_copy_capture_frame_v1_send_failed(f->resource,
-                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
-            return;
-        }
-    }
-
+/// Write a captured image into the buffer the client attached and answer
+/// `ready` — or `failed` if what it attached cannot hold it.
+void ext_frame_deliver(ExtFrame* f, const std::vector<uint8_t>& rgba, int cap_w, int cap_h) {
     // attach_buffer accepts any wl_buffer without inspecting it, and the size
     // captured here (the output's, or the cursor's) is not one the client
     // chose — so nothing so far has established that what it attached can hold
     // this frame. A 1x1 buffer against a full-screen capture would be a
     // screen-sized write into someone else's pool. Check before writing.
+    if (f->attached_buffer == nullptr) {
+        // Destroyed while the capture was held back.
+        ext_image_copy_capture_frame_v1_send_failed(f->resource,
+            EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+        return;
+    }
     wl_shm_buffer* shm = wl_shm_buffer_get(f->attached_buffer);
     bool wrote = false;
     if (shm) {
@@ -705,87 +768,13 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
     ext_image_copy_capture_frame_v1_send_ready(f->resource);
 }
 
-constexpr struct ext_image_copy_capture_frame_v1_interface ext_frame_impl = {
-    .destroy = resource_destroy_request,
-    .attach_buffer = ext_frame_attach_buffer,
-    .damage_buffer = ext_frame_damage_buffer,
-    .capture = ext_frame_capture,
-};
-
-void ext_frame_resource_destroy(wl_resource* resource) {
-    delete static_cast<ExtFrame*>(wl_resource_get_user_data(resource));
-}
-
-// ---- ext_image_copy_capture_session_v1 ----
-struct ExtSession {
-    ScreencopyManager::Impl* mgr = nullptr;
-    wl_resource* resource = nullptr;
-    OutputEntry* output = nullptr;
-    ExtCursorSession* cursor = nullptr;
-    bool stopped = false;
-};
-
-void ext_session_create_frame(wl_client* client, wl_resource* session_resource, uint32_t id) {
-    auto* s = static_cast<ExtSession*>(wl_resource_get_user_data(session_resource));
-    if (s->stopped) return;
-
-    uint32_t version = wl_resource_get_version(session_resource);
-    wl_resource* frame_res = wl_resource_create(client,
-                                                  &ext_image_copy_capture_frame_v1_interface,
-                                                  static_cast<int>(version), id);
-    if (!frame_res) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    auto* frame = new ExtFrame{};
-    frame->mgr = s->mgr;
-    frame->resource = frame_res;
-    frame->output = s->output;
-    frame->cursor = s->cursor;
-    wl_resource_set_implementation(frame_res, &ext_frame_impl, frame, ext_frame_resource_destroy);
-}
-
-constexpr struct ext_image_copy_capture_session_v1_interface ext_session_impl = {
-    .create_frame = ext_session_create_frame,
-    .destroy = resource_destroy_request,
-};
-
-void ext_session_resource_destroy(wl_resource* resource) {
-    delete static_cast<ExtSession*>(wl_resource_get_user_data(resource));
-}
-
-// ---- ext_image_copy_capture_manager_v1 ----
-ScreencopyManager::Impl* ext_manager_of(wl_resource* r) {
-    return static_cast<ScreencopyManager::Impl*>(wl_resource_get_user_data(r));
-}
-
-void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, uint32_t id,
-                                 wl_resource* source, uint32_t options) {
-    (void)options; // paint_cursors flag; not implemented yet
-    auto* mgr = ext_manager_of(mgr_resource);
-    // Find which output this source belongs to. We store the source -> output
-    // mapping in source user_data.
-    auto* out = static_cast<OutputEntry*>(wl_resource_get_user_data(source));
-    if (!out) {
-        wl_resource_post_error(mgr_resource, 0, "invalid source");
-        return;
-    }
-
-    wl_resource* session_res = wl_resource_create(client,
-                                                    &ext_image_copy_capture_session_v1_interface,
-                                                    1, id);
-    if (!session_res) {
-        wl_client_post_no_memory(client);
-        return;
-    }
-    auto* session = new ExtSession{mgr, session_res, out, nullptr, false};
-    wl_resource_set_implementation(session_res, &ext_session_impl, session,
-                                     ext_session_resource_destroy);
-
-    // Send buffer constraints: full output size, ARGB8888 shm, plus dmabuf
-    // (device + per-format modifiers) when a renderer is enabled.
+/// Advertise what a buffer for this session must look like: size, ARGB8888 shm,
+/// plus dmabuf (device + per-format modifiers) when a renderer is enabled —
+/// and `done`, which makes the batch atomic.
+void ext_send_constraints(ScreencopyManager::Impl* mgr, wl_resource* session_res, int width,
+                          int height) {
     ext_image_copy_capture_session_v1_send_buffer_size(session_res,
-        static_cast<uint32_t>(out->width), static_cast<uint32_t>(out->height));
+        static_cast<uint32_t>(width), static_cast<uint32_t>(height));
     ext_image_copy_capture_session_v1_send_shm_format(session_res, WL_SHM_FORMAT_ARGB8888);
     if (mgr->renderer && mgr->has_dev) {
         struct wl_array dev;
@@ -809,6 +798,374 @@ void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, ui
         }
     }
     ext_image_copy_capture_session_v1_send_done(session_res);
+}
+
+// ---- window capture ----
+
+/// Render a window's surface tree into `rgba`. A custom function wins; the
+/// default composites on the CPU with the window's geometry at the origin.
+bool toplevel_render(ToplevelTarget& target, int& width, int& height, std::vector<uint8_t>& rgba) {
+    Toplevel* tl = target.toplevel;
+    if (tl == nullptr) {
+        return false;
+    }
+    if (target.mgr->toplevel_capture) {
+        return target.mgr->toplevel_capture(*tl, width, height, rgba) && width > 0 && height > 0;
+    }
+    Surface& surface = tl->surface();
+    XdgGeometry g = tl->geometry();
+    if (g.width <= 0 || g.height <= 0) {
+        g = XdgGeometry{0, 0, surface.surface_width(), surface.surface_height()};
+    }
+    if (g.width <= 0 || g.height <= 0) {
+        return false; // nothing committed yet
+    }
+    width = g.width;
+    height = g.height;
+    const CpuItem view = CpuView{surface.id(), -g.x, -g.y};
+    target.mgr->cpu.composite(width, height, Color{0, 0, 0, 0}, std::span{&view, 1});
+    const std::span<const Pixel> pixels = target.mgr->cpu.pixels();
+    rgba.resize(pixels.size() * 4);
+    std::memcpy(rgba.data(), pixels.data(), rgba.size());
+    return true;
+}
+
+/// How big the window's capture is right now, without rendering it. 0x0 when it
+/// has nothing to show.
+Size toplevel_size(const ToplevelTarget& target) {
+    Toplevel* tl = target.toplevel;
+    if (tl == nullptr) {
+        return {};
+    }
+    if (target.mgr->toplevel_capture) {
+        return {};
+    }
+    XdgGeometry g = tl->geometry();
+    if (g.width <= 0 || g.height <= 0) {
+        g = XdgGeometry{0, 0, tl->surface().surface_width(), tl->surface().surface_height()};
+    }
+    return {std::max(g.width, 0), std::max(g.height, 0)};
+}
+
+void toplevel_fail(ExtFrame& f, uint32_t reason) {
+    ext_image_copy_capture_frame_v1_send_failed(f.resource, reason);
+}
+
+/// Render the window into the frame's buffer. The caller has decided this frame
+/// is due.
+void toplevel_produce(ExtFrame& f) {
+    ToplevelSessionState& st = *f.window;
+    ToplevelTarget& target = *st.target;
+    if (st.stopped || target.toplevel == nullptr) {
+        toplevel_fail(f, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
+        return;
+    }
+    if (f.attached_buffer == nullptr) {
+        toplevel_fail(f, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+        return;
+    }
+    int w = 0, h = 0;
+    std::vector<uint8_t> rgba;
+    if (!toplevel_render(target, w, h, rgba)) {
+        toplevel_fail(f, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+        return;
+    }
+    if (w != st.width || h != st.height) {
+        // The window was resized since the client allocated its buffer. Say what
+        // the new constraints are and fail this frame against the old ones; the
+        // client reallocates and asks again.
+        st.width = w;
+        st.height = h;
+        if (st.session != nullptr) {
+            ext_send_constraints(target.mgr, st.session, w, h);
+        }
+        toplevel_fail(f, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
+        return;
+    }
+    st.first = false;
+    st.last_serial = target.serial;
+    ext_frame_deliver(&f, rgba, w, h);
+}
+
+/// A capture request on a window session: deliver now if the window has changed
+/// since the last frame, otherwise hold it until it does.
+void toplevel_capture_frame(ExtFrame& f) {
+    ToplevelSessionState& st = *f.window;
+    ToplevelTarget& target = *st.target;
+    if (st.stopped || target.toplevel == nullptr) {
+        toplevel_fail(f, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
+        return;
+    }
+    target.refresh_watch();
+    // A size change is news even without a commit having been heard (the tree
+    // may have been reshaped by a commit that landed before we watched it).
+    const Size now = toplevel_size(target);
+    const bool resized = now.width > 0 && (now.width != st.width || now.height != st.height);
+    if (!st.first && !resized && st.last_serial == target.serial) {
+        f.waiting = true;
+        target.waiting.push_back(&f);
+        return;
+    }
+    toplevel_produce(f);
+}
+
+} // namespace
+
+void ToplevelTarget::follow(Toplevel& tl) {
+    toplevel = &tl;
+    destroy_conn = tl.destroy.connect([this](ToplevelDestroy&) { on_destroy(); });
+    refresh_watch();
+}
+
+void ToplevelTarget::refresh_watch() {
+    if (toplevel == nullptr) {
+        return;
+    }
+    const std::vector<SurfaceAt> tree = toplevel->surface().surface_tree();
+    std::vector<SurfaceId> ids;
+    ids.reserve(tree.size());
+    for (const SurfaceAt& at : tree) {
+        ids.push_back(at.surface->id());
+    }
+    if (ids == watched) {
+        return;
+    }
+    watch.clear();
+    watched = std::move(ids);
+    for (const SurfaceAt& at : tree) {
+        watch.push_back(at.surface->commit.connect([this](SurfaceCommit&) { on_commit(); }));
+    }
+}
+
+void ToplevelTarget::on_commit() {
+    ++serial;
+    if (waiting.empty() || wake_pending || mgr == nullptr || !mgr->loop.valid()) {
+        return;
+    }
+    // Not here: a commit lands in the middle of its own surface's bookkeeping
+    // (an xdg geometry may still be about to change), and a video surface plus
+    // its parent commit back to back. One idle turn later sees both, once.
+    wake_pending = true;
+    mgr->loop.once([weak = weak_from_this()] {
+        if (auto self = weak.lock(); self != nullptr) {
+            self->flush();
+        }
+    });
+}
+
+void ToplevelTarget::flush() {
+    wake_pending = false;
+    std::vector<ExtFrame*> frames = std::move(waiting);
+    waiting.clear();
+    for (ExtFrame* f : frames) {
+        f->waiting = false;
+    }
+    for (ExtFrame* f : frames) {
+        toplevel_produce(*f);
+    }
+}
+
+void ToplevelTarget::on_destroy() {
+    toplevel = nullptr;
+    watch.clear();
+    watched.clear();
+    std::vector<ExtFrame*> frames = std::move(waiting);
+    waiting.clear();
+    for (ExtFrame* f : frames) {
+        f->waiting = false;
+        toplevel_fail(*f, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
+    }
+    const std::vector<ToplevelSessionState*> live = sessions;
+    for (ToplevelSessionState* st : live) {
+        if (!st->stopped) {
+            st->stopped = true;
+            if (st->session != nullptr) {
+                ext_image_copy_capture_session_v1_send_stopped(st->session);
+            }
+        }
+    }
+}
+
+namespace {
+
+void ext_frame_capture(wl_client*, wl_resource* resource) {
+    auto* f = static_cast<ExtFrame*>(wl_resource_get_user_data(resource));
+    if (f->captured) {
+        wl_resource_post_error(f->resource,
+                               EXT_IMAGE_COPY_CAPTURE_FRAME_V1_ERROR_ALREADY_CAPTURED,
+                               "frame already captured");
+        return;
+    }
+    if (!f->attached_buffer) {
+        wl_resource_post_error(f->resource, EXT_IMAGE_COPY_CAPTURE_FRAME_V1_ERROR_NO_BUFFER,
+                               "no buffer attached");
+        return;
+    }
+    f->captured = true;
+
+    if (f->window != nullptr) {
+        toplevel_capture_frame(*f);
+        return;
+    }
+
+    // Capture pixels — of the screen, or of the pointer when this frame belongs
+    // to a cursor session. The cursor's size is its own, not the output's.
+    std::vector<uint8_t> rgba;
+    int cap_w = 0, cap_h = 0;
+    if (f->cursor != nullptr) {
+        CursorCapture cc;
+        if (!ext_cursor_read(*f->cursor, cc)) {
+            // No cursor on this output right now. Not an error the client can
+            // fix by reallocating — it should wait for the next `enter`.
+            ext_image_copy_capture_frame_v1_send_failed(f->resource,
+                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+            return;
+        }
+        cap_w = cc.width;
+        cap_h = cc.height;
+        rgba = std::move(cc.rgba);
+    } else {
+        cap_w = f->output->width;
+        cap_h = f->output->height;
+        if (!f->output->capture(0, 0, cap_w, cap_h, rgba)) {
+            ext_image_copy_capture_frame_v1_send_failed(f->resource,
+                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+            return;
+        }
+    }
+
+    ext_frame_deliver(f, rgba, cap_w, cap_h);
+}
+
+constexpr struct ext_image_copy_capture_frame_v1_interface ext_frame_impl = {
+    .destroy = resource_destroy_request,
+    .attach_buffer = ext_frame_attach_buffer,
+    .damage_buffer = ext_frame_damage_buffer,
+    .capture = ext_frame_capture,
+};
+
+void ext_frame_resource_destroy(wl_resource* resource) {
+    delete static_cast<ExtFrame*>(wl_resource_get_user_data(resource));
+}
+
+// ---- ext_image_copy_capture_session_v1 ----
+struct ExtSession {
+    ScreencopyManager::Impl* mgr = nullptr;
+    wl_resource* resource = nullptr;
+    OutputEntry* output = nullptr;
+    ExtCursorSession* cursor = nullptr;
+    std::shared_ptr<ToplevelSessionState> window; // set → a window capture session
+    bool stopped = false;
+};
+
+void ext_session_create_frame(wl_client* client, wl_resource* session_resource, uint32_t id) {
+    auto* s = static_cast<ExtSession*>(wl_resource_get_user_data(session_resource));
+    if (s->stopped) return;
+
+    uint32_t version = wl_resource_get_version(session_resource);
+    wl_resource* frame_res = wl_resource_create(client,
+                                                  &ext_image_copy_capture_frame_v1_interface,
+                                                  static_cast<int>(version), id);
+    if (!frame_res) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    auto* frame = new ExtFrame{};
+    frame->mgr = s->mgr;
+    frame->resource = frame_res;
+    frame->output = s->output;
+    frame->cursor = s->cursor;
+    frame->window = s->window;
+    wl_resource_set_implementation(frame_res, &ext_frame_impl, frame, ext_frame_resource_destroy);
+}
+
+constexpr struct ext_image_copy_capture_session_v1_interface ext_session_impl = {
+    .create_frame = ext_session_create_frame,
+    .destroy = resource_destroy_request,
+};
+
+void ext_session_resource_destroy(wl_resource* resource) {
+    auto* s = static_cast<ExtSession*>(wl_resource_get_user_data(resource));
+    if (s->window != nullptr) {
+        s->window->session = nullptr; // frames may outlive the session object
+    }
+    delete s;
+}
+
+/// What a capture source stands for. The resource's user data, so the copy
+/// manager can tell an output from a window when a session is made from it.
+struct ExtSource {
+    OutputEntry* output = nullptr;                // set → an output source
+    std::shared_ptr<ToplevelTarget> window;       // set → a window source
+};
+
+void ext_source_resource_destroy(wl_resource* resource) {
+    delete static_cast<ExtSource*>(wl_resource_get_user_data(resource));
+}
+
+// ---- ext_image_copy_capture_manager_v1 ----
+ScreencopyManager::Impl* ext_manager_of(wl_resource* r) {
+    return static_cast<ScreencopyManager::Impl*>(wl_resource_get_user_data(r));
+}
+
+void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, uint32_t id,
+                                 wl_resource* source, uint32_t options) {
+    (void)options; // paint_cursors flag; not implemented yet
+    auto* mgr = ext_manager_of(mgr_resource);
+    // Find which output this source belongs to. We store the source -> output
+    // mapping in source user_data.
+    auto* src = static_cast<ExtSource*>(wl_resource_get_user_data(source));
+    if (src == nullptr || (src->output == nullptr && src->window == nullptr)) {
+        wl_resource_post_error(mgr_resource, 0, "invalid source");
+        return;
+    }
+    OutputEntry* out = src->output;
+
+    wl_resource* session_res = wl_resource_create(client,
+                                                    &ext_image_copy_capture_session_v1_interface,
+                                                    1, id);
+    if (!session_res) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    auto* session = new ExtSession{mgr, session_res, out, nullptr, nullptr, false};
+    wl_resource_set_implementation(session_res, &ext_session_impl, session,
+                                     ext_session_resource_destroy);
+
+    if (src->window != nullptr) {
+        // A window. If it is already gone, or has nothing on screen to size a
+        // buffer by, there is nothing this session could ever produce.
+        auto state = std::make_shared<ToplevelSessionState>();
+        state->target = src->window;
+        state->session = session_res;
+        session->window = state;
+        src->window->sessions.push_back(state.get());
+        const Size size = toplevel_size(*src->window);
+        if (src->window->toplevel == nullptr || (size.width <= 0 && !mgr->toplevel_capture)) {
+            state->stopped = true;
+            session->stopped = true;
+            ext_image_copy_capture_session_v1_send_stopped(session_res);
+            return;
+        }
+        // A custom renderer decides the size only when it draws: ask it once.
+        int w = size.width, h = size.height;
+        if (mgr->toplevel_capture) {
+            std::vector<uint8_t> probe;
+            if (!toplevel_render(*src->window, w, h, probe)) {
+                state->stopped = true;
+                session->stopped = true;
+                ext_image_copy_capture_session_v1_send_stopped(session_res);
+                return;
+            }
+        }
+        state->width = w;
+        state->height = h;
+        src->window->refresh_watch();
+        ext_send_constraints(mgr, session_res, w, h);
+        return;
+    }
+
+    ext_send_constraints(mgr, session_res, out->width, out->height);
 }
 
 /// Re-read the cursor and tell the session what changed. Sends the geometry
@@ -867,7 +1224,7 @@ void ext_cursor_session_get_capture_session(wl_client* client, wl_resource* reso
         wl_client_post_no_memory(client);
         return;
     }
-    auto* session = new ExtSession{cs->mgr, session_res, cs->output, cs, false};
+    auto* session = new ExtSession{cs->mgr, session_res, cs->output, cs, nullptr, false};
     wl_resource_set_implementation(session_res, &ext_session_impl, session,
                                    ext_session_resource_destroy);
     cs->inner = session_res;
@@ -911,11 +1268,15 @@ void ext_manager_create_pointer_cursor_session(wl_client* client, wl_resource* m
     // The wl_pointer is accepted and ignored: this library has a single seat,
     // so "which pointer" and "which client" are the same question.
     auto* mgr = ext_manager_of(mgr_resource);
-    auto* out = static_cast<OutputEntry*>(wl_resource_get_user_data(source));
-    if (!out) {
+    auto* src = static_cast<ExtSource*>(wl_resource_get_user_data(source));
+    if (src == nullptr || (src->output == nullptr && src->window == nullptr)) {
         wl_resource_post_error(mgr_resource, 0, "invalid source");
         return;
     }
+    // A window has no pointer of its own to show; the session is made all the
+    // same (the client's id must be bound) and, with no output, reads as "no
+    // cursor here" — the same state an unregistered cursor source gives.
+    OutputEntry* out = src->output;
     const uint32_t version = wl_resource_get_version(mgr_resource);
     wl_resource* resource =
         wl_resource_create(client, &ext_image_copy_capture_cursor_session_v1_interface,
@@ -959,6 +1320,10 @@ ScreencopyManager::Impl* ext_source_manager_of(wl_resource* r) {
     return static_cast<ScreencopyManager::Impl*>(wl_resource_get_user_data(r));
 }
 
+constexpr struct ext_image_capture_source_v1_interface ext_source_impl = {
+    .destroy = resource_destroy_request,
+};
+
 void ext_source_manager_create_source(wl_client* client, wl_resource* mgr_resource, uint32_t id,
                                        wl_resource* output) {
     auto* mgr = ext_source_manager_of(mgr_resource);
@@ -974,18 +1339,57 @@ void ext_source_manager_create_source(wl_client* client, wl_resource* mgr_resour
         wl_client_post_no_memory(client);
         return;
     }
-    // Store the OutputEntry pointer as user_data so the copy-capture manager
-    // can resolve it later. Provide a minimal implementation so destroy works.
-    static constexpr struct ext_image_capture_source_v1_interface source_impl = {
-        .destroy = resource_destroy_request,
-    };
-    wl_resource_set_implementation(source_res, &source_impl, out, nullptr);
+    // The copy-capture manager resolves what the source stands for from its
+    // user data later.
+    wl_resource_set_implementation(source_res, &ext_source_impl, new ExtSource{out, nullptr},
+                                   ext_source_resource_destroy);
 }
 
 constexpr struct ext_output_image_capture_source_manager_v1_interface ext_source_manager_impl = {
     .create_source = ext_source_manager_create_source,
     .destroy = resource_destroy_request,
 };
+
+// ---- ext_foreign_toplevel_image_capture_source_manager_v1 ----
+void ext_toplevel_source_create(wl_client* client, wl_resource* mgr_resource, uint32_t id,
+                                wl_resource* handle) {
+    auto* mgr = ext_source_manager_of(mgr_resource);
+    wl_resource* source_res =
+        wl_resource_create(client, &ext_image_capture_source_v1_interface, 1, id);
+    if (!source_res) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    // A handle whose window is already gone still yields a source — the id must
+    // be bound — but its sessions are stopped on creation.
+    auto target = std::make_shared<ToplevelTarget>();
+    target->mgr = mgr;
+    if (mgr != nullptr && mgr->toplevel_resolver) {
+        if (Toplevel* tl = mgr->toplevel_resolver(handle); tl != nullptr) {
+            target->follow(*tl);
+        }
+    }
+    wl_resource_set_implementation(source_res, &ext_source_impl, new ExtSource{nullptr, target},
+                                   ext_source_resource_destroy);
+}
+
+constexpr struct ext_foreign_toplevel_image_capture_source_manager_v1_interface
+    ext_toplevel_source_manager_impl = {
+        .create_source = ext_toplevel_source_create,
+        .destroy = resource_destroy_request,
+};
+
+void ext_toplevel_source_manager_bind(wl_client* client, void* data, uint32_t version,
+                                      uint32_t id) {
+    wl_resource* resource = wl_resource_create(
+        client, &ext_foreign_toplevel_image_capture_source_manager_v1_interface,
+        static_cast<int>(version), id);
+    if (!resource) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource, &ext_toplevel_source_manager_impl, data, nullptr);
+}
 
 void ext_source_manager_bind(wl_client* client, void* data, uint32_t version, uint32_t id) {
     wl_resource* resource = wl_resource_create(client,
@@ -1058,6 +1462,25 @@ void ScreencopyManager::notify_cursor_changed() {
     for (ExtCursorSession* cs : live) {
         ext_cursor_refresh(*cs);
     }
+}
+
+Status ScreencopyManager::enable_toplevel_capture(Display& display, ToplevelResolveFunc resolve) {
+    impl_->toplevel_resolver = std::move(resolve);
+    impl_->loop = display.event_loop();
+    if (impl_->ext_source_toplevel_manager_global.get() != nullptr) {
+        return ok(); // already published; only the resolver changed
+    }
+    auto global = create_wl_global<&ext_foreign_toplevel_image_capture_source_manager_v1_interface,
+                                   ext_toplevel_source_manager_bind>(display, 1, impl_.get());
+    if (!global) {
+        return fail(std::move(global.error().message));
+    }
+    impl_->ext_source_toplevel_manager_global = std::move(*global);
+    return ok();
+}
+
+void ScreencopyManager::set_toplevel_capture(ToplevelCaptureFunc fn) {
+    impl_->toplevel_capture = std::move(fn);
 }
 
 void ScreencopyManager::set_renderer(VulkanRenderer* renderer) {

@@ -300,7 +300,7 @@ target("luminaria")
             {"tearing-control-v1",            "staging/tearing-control/tearing-control-v1.xml",             "scl"},
             {"cursor-shape-v1",               "staging/cursor-shape/cursor-shape-v1.xml",                   "scl"},
             -- cursor-shape references tablet-v2 interfaces; the generated code needs them.
-            {"tablet-v2",                     "stable/tablet/tablet-v2.xml",                                "sc"},
+            {"tablet-v2",                     "stable/tablet/tablet-v2.xml",                                "scl"},
             {"ext-workspace-v1",              "staging/ext-workspace/ext-workspace-v1.xml",                 "scl"},
             {"linux-drm-syncobj-v1",          "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml",         "scl"},
             {"xdg-activation-v1",             "staging/xdg-activation/xdg-activation-v1.xml",               "scl"},
@@ -316,12 +316,16 @@ target("luminaria")
             {"content-type-v1",               "staging/content-type/content-type-v1.xml",                   "scl"},
             {"ext-background-effect-v1",      "staging/ext-background-effect/ext-background-effect-v1.xml", "scl"},
             {"ext-session-lock-v1",           "staging/ext-session-lock/ext-session-lock-v1.xml",           "scl"},
+            {"ext-foreign-toplevel-list-v1",  "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml", "scl"},
+            -- The vendored copy predates the foreign-toplevel source manager.
+            {"ext-image-capture-source-v1",   "staging/ext-image-capture-source/ext-image-capture-source-v1.xml", "scl"},
+            {"color-management-v1",           "staging/color-management/color-management-v1.xml",          "scl"},
+            {"color-representation-v1",       "staging/color-representation/color-representation-v1.xml",  "scl"},
         }
         -- Protocols upstream does not ship; the XML lives in protocol/.
         local local_protocols = {
             {"wlr-screencopy-unstable-v1",   "scl"},
             {"ext-image-copy-capture-v1",    "scl"},
-            {"ext-image-capture-source-v1",  "scl"},
             {"wlr-layer-shell-unstable-v1",  "scl"},
             {"wlr-foreign-toplevel-management-unstable-v1", "scl"},
             {"wlr-data-control-unstable-v1", "scl"},
@@ -531,6 +535,10 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
         elseif desktop_tests[name] then
             -- desktop protocols need the core module and nothing else.
             add_deps("luminaria-desktop")
+        elseif name == "test_toplevel_capture" then
+            -- Names a window through the desktop module's list and captures it
+            -- through the render module's screencopy: the two meet only here.
+            add_deps("luminaria-desktop", "luminaria-render")
         elseif name == "test_teardown_order" then
             -- Holds one of every client-side object, including the privileged
             -- protocols and the shell's, so it links both.

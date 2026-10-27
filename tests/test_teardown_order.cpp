@@ -37,6 +37,7 @@
 #include "ext-idle-notify-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
+#include "ext-foreign-toplevel-list-v1-client-protocol.h"
 #include "ext-session-lock-v1-client-protocol.h"
 #include "ext-workspace-v1-client-protocol.h"
 #include "fifo-v1-client-protocol.h"
@@ -163,6 +164,19 @@ void xdg_surface_configure(void *data, xdg_surface *xsurf,
   }
 }
 const xdg_surface_listener kXdgSurfaceListener{xdg_surface_configure};
+
+// The window list hands out handles unprompted; keep the first so a capture
+// source can be made from it.
+ext_foreign_toplevel_handle_v1 *g_list_handle = nullptr;
+void list_toplevel(void *, ext_foreign_toplevel_list_v1 *,
+                   ext_foreign_toplevel_handle_v1 *handle) {
+  if (g_list_handle == nullptr) {
+    g_list_handle = handle;
+  }
+}
+void list_finished(void *, ext_foreign_toplevel_list_v1 *) {}
+const ext_foreign_toplevel_list_v1_listener kListListener{list_toplevel,
+                                                          list_finished};
 
 void run_client(int fd) {
   wl_display *display = wl_display_connect_to_fd(fd);
@@ -309,6 +323,31 @@ void run_client(int fd) {
           st, ext_image_copy_capture_manager_v1_interface),
       capture_source, pointer);
 
+  // A window capture session with a frame held back: the source, the session
+  // and the frame all point at the window, and the window (and the global that
+  // serves them) go before the client does.
+  auto *window_list = bind<ext_foreign_toplevel_list_v1>(
+      st, ext_foreign_toplevel_list_v1_interface);
+  if (window_list) {
+    ext_foreign_toplevel_list_v1_add_listener(window_list, &kListListener,
+                                              nullptr);
+    wl_display_roundtrip(display);
+    if (g_list_handle != nullptr) {
+      ext_image_capture_source_v1 *window_source =
+          ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
+              bind<ext_foreign_toplevel_image_capture_source_manager_v1>(
+                  st,
+                  ext_foreign_toplevel_image_capture_source_manager_v1_interface),
+              g_list_handle);
+      ext_image_copy_capture_session_v1 *window_session =
+          ext_image_copy_capture_manager_v1_create_session(
+              bind<ext_image_copy_capture_manager_v1>(
+                  st, ext_image_copy_capture_manager_v1_interface),
+              window_source, 0);
+      ext_image_copy_capture_session_v1_create_frame(window_session);
+    }
+  }
+
   // Gestures, gamma, CTM, virtual keyboard, and virtual pointer.
   auto *pg =
       bind<zwp_pointer_gestures_v1>(st, zwp_pointer_gestures_v1_interface);
@@ -421,7 +460,18 @@ int main() {
     auto ctm = must(luminaria::CtmControlManager::create(*display));
     auto vk_mgr = must(luminaria::VirtualKeyboardManager::create(*display));
     auto vp_mgr = must(luminaria::VirtualPointerManager::create(*display));
+    auto window_list = must(luminaria::ForeignToplevelList::create(*display));
+    window_list.track(shell);
     auto screencopy = must(luminaria::ScreencopyManager::create(*display));
+    if (auto enabled = screencopy.enable_toplevel_capture(
+            *display,
+            [](wl_resource *handle) {
+              return luminaria::ForeignToplevelList::toplevel_for(handle);
+            });
+        !enabled) {
+      std::fprintf(stderr, "enable_toplevel_capture failed\n");
+      return 1;
+    }
     screencopy.set_cursor_source(
         [](wl_resource *, luminaria::CursorCapture &out) {
           out.width = 1;
