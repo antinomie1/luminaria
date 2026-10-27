@@ -40,7 +40,8 @@ public:
     /// nothing.
     ///
     /// It follows `layout` by itself: an output that arrives, leaves, moves or
-    /// changes mode gets the pointer pushed to it again.
+    /// changes mode gets the pointer pushed to it again, and the first output
+    /// to arrive finds it in its middle until a device says otherwise.
     Cursor(SceneRenderer& renderer, OutputLayout& layout, Seat& seat,
            CursorShapeManager* shapes = nullptr, ScreencopyManager* capture = nullptr);
     ~Cursor();
@@ -62,6 +63,11 @@ public:
     /// `bounds` the first time. Returns whether it moved.
     bool move_by(double dx, double dy);
     bool move_by(double dx, double dy, const Box& bounds);
+    /// The same from the backend's event. Absolute motion is in the coordinates
+    /// of the output the event names, or of the layout's primary output when it
+    /// names none.
+    bool move_to(const PointerMotionAbsEvent& event);
+    bool move_by(const PointerMotionEvent& event) { return move_by(event.dx, event.dy); }
     /// The pointer left every output (the nested window, say). Draws nothing
     /// until the next move.
     void leave();
@@ -99,6 +105,9 @@ struct Cursor::Impl {
     ScreencopyManager* capture = nullptr;
     CursorManager images;
     Pointer pointer;
+    // Whether anything has put the pointer somewhere yet, so a pointer that
+    // left the window is not pulled back to the middle by a mode change.
+    bool placed = false;
 
     // The client sprite whose commits are being watched: on a cursor plane no
     // frame draws it, so nothing else would notice a new animation frame.
@@ -174,7 +183,14 @@ Cursor::Cursor(SceneRenderer& renderer, OutputLayout& layout, Seat& seat,
                CursorShapeManager* shapes, ScreencopyManager* capture)
     : impl_(std::make_unique<Impl>()) {
     Impl& self = *impl_;
-    self.on_layout = layout.changed.connect([&self](OutputLayoutChange&) { self.update(); });
+    self.on_layout = layout.changed.connect([&self] {
+        if (!self.placed && !self.layout->empty()) {
+            self.placed = true;
+            const Point middle = self.layout->primary_box().center();
+            self.pointer.move_to(middle.x, middle.y, self.layout->bounds());
+        }
+        self.update();
+    });
     self.renderer = &renderer;
     self.layout = &layout;
     self.seat = &seat;
@@ -218,6 +234,7 @@ const CursorTheme* Cursor::theme() const noexcept {
 bool Cursor::move_to(double x, double y) { return move_to(x, y, impl_->layout->bounds()); }
 
 bool Cursor::move_to(double x, double y, const Box& bounds) {
+    impl_->placed = true;
     if (!impl_->pointer.move_to(x, y, bounds)) {
         return false;
     }
@@ -225,9 +242,16 @@ bool Cursor::move_to(double x, double y, const Box& bounds) {
     return true;
 }
 
+bool Cursor::move_to(const PointerMotionAbsEvent& event) {
+    const Output* on = event.output != nullptr ? event.output : impl_->layout->primary();
+    const Box origin = on != nullptr ? impl_->layout->box_of(*on) : Box{};
+    return move_to(origin.x + event.x, origin.y + event.y);
+}
+
 bool Cursor::move_by(double dx, double dy) { return move_by(dx, dy, impl_->layout->bounds()); }
 
 bool Cursor::move_by(double dx, double dy, const Box& bounds) {
+    impl_->placed = true;
     if (!impl_->pointer.move_by(dx, dy, bounds)) {
         return false;
     }
@@ -236,6 +260,7 @@ bool Cursor::move_by(double dx, double dy, const Box& bounds) {
 }
 
 void Cursor::leave() {
+    impl_->placed = true;
     if (impl_->pointer.leave()) {
         impl_->update();
     }

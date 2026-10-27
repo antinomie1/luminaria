@@ -47,6 +47,14 @@ enum class SceneOutcome {
     cpu,
 };
 
+/// How many frames ended each way since the renderer was made, for a
+/// compositor that wants to see whether an idle screen really goes quiet.
+struct SceneStats {
+    std::uint64_t composited = 0, scanout = 0, unchanged = 0, cpu = 0;
+
+    [[nodiscard]] bool operator==(const SceneStats&) const noexcept = default;
+};
+
 /// The pointer as `output` should show it, in that output's logical
 /// coordinates; an empty `SceneCursor` for none. `Cursor` installs one.
 using SceneCursorSource = std::function<SceneCursor(const Output& output)>;
@@ -158,9 +166,15 @@ public:
     /// `CpuCompositor::pixels()`.
     [[nodiscard]] Result<std::span<const Pixel>> read_back(SceneOutput& state);
 
+    /// Frames `present()` has finished so far, by outcome.
+    [[nodiscard]] SceneStats stats() const noexcept;
+
     struct Impl;
 
 private:
+    Result<SceneOutcome> draw(SceneOutput& state, Output& output, std::span<const SceneItem> scene,
+                              Color background);
+
     std::unique_ptr<Impl> impl_;
 };
 
@@ -285,6 +299,7 @@ struct SceneOutput::Impl {
 };
 
 struct SceneRenderer::Impl {
+    SceneStats stats;
     std::unique_ptr<VulkanRenderer> gpu;
     std::string gpu_error;
     // The themed cursor, in both currencies. Two keys and not one: an output
@@ -751,8 +766,25 @@ void SceneRenderer::update_cursor() {
     }
 }
 
+SceneStats SceneRenderer::stats() const noexcept { return impl_->stats; }
+
 Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
                                             std::span<const SceneItem> scene, Color background) {
+    Result<SceneOutcome> outcome = draw(state, output, scene, background);
+    if (outcome) {
+        SceneStats& stats = impl_->stats;
+        switch (*outcome) {
+        case SceneOutcome::composited: ++stats.composited; break;
+        case SceneOutcome::scanout: ++stats.scanout; break;
+        case SceneOutcome::unchanged: ++stats.unchanged; break;
+        case SceneOutcome::cpu: ++stats.cpu; break;
+        }
+    }
+    return outcome;
+}
+
+Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
+                                         std::span<const SceneItem> scene, Color background) {
     SceneOutput::Impl& self = *state.impl_;
     // A compositor with no GPU has nothing to reset(), but its frames still
     // have to be answered.

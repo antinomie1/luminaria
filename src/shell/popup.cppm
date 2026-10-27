@@ -40,7 +40,7 @@ public:
     [[nodiscard]] Popup* active_grab() const noexcept;
     /// Dismiss active grabs when `surface` is outside every popup in the tree.
     /// Returns true if a grab was dismissed (meaning the caller should swallow the click).
-    [[nodiscard]] bool dismiss_grabs_outside(SurfaceId surface);
+    bool dismiss_grabs_outside(SurfaceId surface);
 
     Signal<PopupTreeChange> changed;
 

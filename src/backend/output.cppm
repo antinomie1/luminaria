@@ -179,6 +179,10 @@ public:
         return OutputMode{width_, height_, 0, true};
     }
 
+    /// The refresh rate of `current_mode()` in hertz; 0 when the backend has no
+    /// notion of one.
+    [[nodiscard]] double refresh_hz() const { return current_mode().refresh_mhz / 1000.0; }
+
     /// Drive this output at a different mode, matched against `modes()`. Pass
     /// `refresh_mhz = 0` to take the highest refresh rate at that size.
     ///

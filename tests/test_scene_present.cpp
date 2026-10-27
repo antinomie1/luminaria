@@ -442,6 +442,38 @@ void cursor_follows_the_pointer(luminaria::SceneRenderer& renderer) {
     std::fprintf(stderr, "cursor: placed, localized, captured\n");
 }
 
+// Nothing a device said yet: the first output to arrive finds the pointer in its
+// middle, absolute motion lands on the output the event names (the primary one
+// when it names none), and a pointer that left the window stays gone.
+void cursor_places_itself(luminaria::SceneRenderer& renderer) {
+    auto display = luminaria::Display::create();
+    assert(display.has_value());
+    auto seat = luminaria::Seat::create(*display);
+    assert(seat.has_value());
+    luminaria::HeadlessOutput left(display->event_loop(), kOutW, kOutH, 1);
+    luminaria::HeadlessOutput right(display->event_loop(), kOutW, kOutH, 1);
+    luminaria::OutputLayout layout;
+    luminaria::Cursor cursor(renderer, layout, *seat);
+    assert(!cursor.pointer().present());
+
+    layout.add(left, 0, 0);
+    assert(cursor.pointer().present());
+    assert(cursor.pointer().x() == kOutW / 2.0 && cursor.pointer().y() == kOutH / 2.0);
+
+    layout.add(right, kOutW, 0);
+    assert(cursor.pointer().x() == kOutW / 2.0); // the second arrival does not move it
+
+    cursor.move_to(luminaria::PointerMotionAbsEvent{10, 12, nullptr});
+    assert(cursor.pointer().x() == 10 && cursor.pointer().y() == 12);
+    cursor.move_to(luminaria::PointerMotionAbsEvent{5, 6, &right});
+    assert(cursor.pointer().x() == kOutW + 5 && cursor.pointer().y() == 6);
+
+    cursor.leave();
+    layout.add(right, kOutW, 0);
+    assert(!cursor.pointer().present());
+    std::fprintf(stderr, "cursor: centered, absolute motion mapped\n");
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +482,7 @@ int main() {
         (void)run_session(renderer);
         run_idle_session(renderer);
         cursor_follows_the_pointer(renderer);
+        cursor_places_itself(renderer);
     }
     // The same on the CPU path, wherever this runs: a loader with no driver
     // to load cannot create an instance, which is exactly a GPU-less machine.
@@ -460,5 +493,6 @@ int main() {
     assert(!run_session(cpu));
     run_idle_session(cpu);
     cursor_follows_the_pointer(cpu);
+    cursor_places_itself(cpu);
     return 0;
 }

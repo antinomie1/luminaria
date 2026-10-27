@@ -30,6 +30,7 @@ import :compositor;
 import :display;
 import :expected;
 import :protocol_helper;
+import :seat;
 import :signal;
 
 export namespace luminaria {
@@ -148,6 +149,7 @@ public:
     /// Ask the client to take this size (0,0 = "you choose"). Sends the current
     /// state set along with it. Returns the configure serial.
     virtual std::uint32_t configure(int width, int height) = 0;
+    std::uint32_t configure(Size size) { return configure(size.width, size.height); }
     /// Change a state and immediately re-configure the client at its last size.
     virtual void set_maximized(bool maximized) = 0;
     virtual void set_fullscreen(bool fullscreen) = 0;
@@ -261,6 +263,13 @@ public:
     /// Largest window size the compositor recommends (usually the usable output
     /// area). Sent to clients as xdg_toplevel.configure_bounds. 0 disables it.
     void set_bounds(int width, int height) noexcept;
+    void set_bounds(Size size) noexcept { set_bounds(size.width, size.height); }
+
+    /// Make `toplevel` the focused window (null: none): it alone gets the
+    /// activated state, and the seat's keyboard goes to it. The window that had
+    /// focus is deactivated, and one that is destroyed while focused is
+    /// forgotten — the caller keeps no "which one is active" of its own.
+    void focus(Seat& seat, Toplevel* toplevel);
 
     /// Where a popup's parent sits, so xdg_positioner's constraint_adjustment
     /// (flip / slide / resize) can actually be applied: fill `parent` with the
@@ -303,6 +312,8 @@ struct XdgShell::Impl {
     int bounds_width = 0;
     int bounds_height = 0;
     XdgShell::PopupConstraintQuery constraint_query;
+    Toplevel* focused = nullptr;
+    Signal<ToplevelDestroy>::Connection on_focused_destroy;
 };
 
 namespace {
@@ -543,6 +554,7 @@ public:
     [[nodiscard]] int max_height() const noexcept override { return max_h_; }
     [[nodiscard]] XdgGeometry geometry() const noexcept override;
 
+    using Toplevel::configure;
     uint32_t configure(int width, int height) override;
     // Each of these re-configures the client at its last known size, but only
     // when the state actually changed — a no-op set_activated(true) on an
@@ -1244,6 +1256,27 @@ Signal<NewPopup>& XdgShell::new_popup() noexcept {
 void XdgShell::set_bounds(int width, int height) noexcept {
     impl_->bounds_width = width;
     impl_->bounds_height = height;
+}
+
+void XdgShell::focus(Seat& seat, Toplevel* toplevel) {
+    Impl& self = *impl_;
+    if (self.focused != toplevel) {
+        if (self.focused != nullptr) {
+            self.focused->set_activated(false);
+        }
+        if (toplevel != nullptr) {
+            toplevel->set_activated(true);
+        }
+        self.focused = toplevel;
+        self.on_focused_destroy = {};
+        if (toplevel != nullptr) {
+            self.on_focused_destroy = toplevel->destroy.connect([&self] {
+                self.focused = nullptr;
+                self.on_focused_destroy = {};
+            });
+        }
+    }
+    seat.set_keyboard_focus(toplevel != nullptr ? &toplevel->surface() : nullptr);
 }
 
 void XdgShell::set_popup_constraint_query(PopupConstraintQuery query) {

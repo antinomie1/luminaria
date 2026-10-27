@@ -92,5 +92,12 @@ int main() {
     layout.remove(right);
     assert(layout.outputs().size() == 1);
     assert((layout.box_of(right) == luminaria::Box{}));
+
+    // The first one placed is the primary, and an empty layout has none.
+    assert(layout.primary() == &left);
+    assert((layout.primary_box() == layout.box_of(left)));
+    layout.remove(left);
+    assert(layout.primary() == nullptr);
+    assert(layout.primary_box().empty());
     return 0;
 }

@@ -60,6 +60,16 @@ public:
     /// Subtract `box_of(output)`'s origin to get output-local coordinates.
     [[nodiscard]] std::vector<OutputBox> intersecting(const Box& box) const;
 
+    /// The first output placed, the one a window with no better idea goes to;
+    /// null when there are none.
+    [[nodiscard]] Output* primary() const noexcept {
+        return outputs_.empty() ? nullptr : outputs_.front().output;
+    }
+    /// Its rectangle; empty when there are none.
+    [[nodiscard]] Box primary_box() const noexcept {
+        return outputs_.empty() ? Box{} : outputs_.front().box;
+    }
+
     [[nodiscard]] const std::vector<OutputBox>& outputs() const noexcept { return outputs_; }
     [[nodiscard]] bool empty() const noexcept { return outputs_.empty(); }
 

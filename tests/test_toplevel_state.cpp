@@ -188,8 +188,11 @@ int main() {
     assert(compositor.has_value());
     auto shell = luminaria::XdgShell::create(*display);
     assert(shell.has_value());
-    shell->set_bounds(kBoundsW, kBoundsH);
+    shell->set_bounds(luminaria::Size{kBoundsW, kBoundsH});
+    auto seat = luminaria::Seat::create(*display);
+    assert(seat.has_value());
 
+    bool focus_took = false;
     std::string seen_title, seen_app_id;
     int seen_min_w = -1, seen_min_h = -1, seen_max_w = -1, seen_max_h = -1;
     luminaria::XdgGeometry seen_geometry{};
@@ -210,7 +213,8 @@ int main() {
             seen_max_w = tl->max_width();
             seen_max_h = tl->max_height();
             seen_geometry = tl->geometry();
-            tl->set_activated(true);
+            shell->focus(*seat, tl); // activated, and the keyboard follows
+            focus_took = seat->keyboard_focus() == tl->surface().id();
             tl->close();
         }));
         max_conns.push_back(
@@ -218,7 +222,7 @@ int main() {
                 saw_maximize_request = ev.maximized;
                 // Grant it and give the client the size we want it to take.
                 tl->set_maximized(ev.maximized);
-                (void)tl->configure(kBoundsW, kBoundsH);
+                tl->configure(luminaria::Size{kBoundsW, kBoundsH});
                 server_thinks_maximized = tl->is_maximized();
             }));
         min_conns.push_back(tl->request_minimize.connect(
@@ -240,6 +244,12 @@ int main() {
 
     display->run();
     client_thread.join();
+
+    // The focused window is gone with its client; focusing nothing must not
+    // reach back into it.
+    shell->focus(*seat, nullptr);
+    assert(focus_took);
+    assert(!seat->keyboard_focus().valid());
 
     assert(seen_title == "Luminaria Test");
     assert(seen_app_id == "org.luminaria.test");
