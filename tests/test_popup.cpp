@@ -256,6 +256,17 @@ int main() {
             return true;
         });
 
+    // The tree follows the shell by itself: no add/map/remove calls below.
+    // Created before the test's own popup handlers, so its slots run first.
+    luminaria::PopupTree tree(*shell);
+    int tree_changes = 0;
+    bool tree_drew_popup = false;
+    auto tree_changed = tree.changed.connect([&](luminaria::PopupTreeChange&) { ++tree_changes; });
+    auto window_scene = [&] {
+        return std::vector<luminaria::SceneItem>{
+            {.box = {0, 0, kOutputSize, kOutputSize}, .surface = toplevel_surface->id(), .tag = 7}};
+    };
+
     int popups_seen = 0;
     int flipped_x = -1, flipped_y = -1;
     auto np = shell->new_popup().connect([&](luminaria::NewPopup& e) {
@@ -273,7 +284,14 @@ int main() {
         popup_h = popup->height();
         popup_parent_is_toplevel_surface = popup->parent_surface() == toplevel_surface;
         popup_conns.push_back(
-            e.popup.map.connect([&](luminaria::PopupMap&) { saw_popup_map = true; }));
+            e.popup.map.connect([&, popup](luminaria::PopupMap&) {
+                saw_popup_map = true;
+                std::vector<luminaria::SceneItem> scene = window_scene();
+                tree.append_to(scene);
+                // Above its parent, at its position, carrying the parent's tag.
+                tree_drew_popup = scene.size() == 2 && scene[1].surface == popup->surface().id() &&
+                                  scene[1].tag == 7 && scene[1].box.x == popup->x();
+            }));
         repos_conns.push_back(
             e.popup.reposition.connect([&, popup](luminaria::PopupReposition&) {
                 repositioned_x = popup->x();
@@ -313,5 +331,12 @@ int main() {
     assert(g_client.cfg_x == kRepositionedX && g_client.cfg_y == kRepositionedY);
     assert(g_client.cfg_w == kPopupW && g_client.cfg_h == kPopupH);
     assert(g_client.got_repositioned);
+
+    assert(tree_drew_popup);
+    assert(tree_changes >= 2); // mapped, repositioned, ...
+    // The client is gone, and so is every popup it had: nothing left to draw.
+    std::vector<luminaria::SceneItem> after{{.box = {0, 0, kOutputSize, kOutputSize}}};
+    tree.append_to(after);
+    assert(after.size() == 1 && tree.active_grab() == nullptr);
     return 0;
 }

@@ -29,6 +29,7 @@ import :color;
 import :compositor;
 import :cursor_theme;
 import :pixel;
+import :seat;
 
 export namespace luminaria {
 
@@ -188,6 +189,26 @@ struct SceneHit {
 /// drawn.
 [[nodiscard]] SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y);
 
+/// A point in the scene's coordinates.
+struct ScenePoint {
+    double x = 0.0, y = 0.0;
+};
+
+/// Where `surface`'s own origin is drawn in `scene`: a root's item origin, or
+/// that plus a subsurface's offset in its tree. Empty when it is not drawn.
+[[nodiscard]] std::optional<ScenePoint> scene_surface_origin(std::span<const SceneItem> scene,
+                                                             SurfaceId surface);
+
+/// Tell the seat the pointer is at (`x`, `y`) in `scene`.
+///
+/// With a button held (an implicit grab, `Seat::pointer_grab()`) every motion
+/// goes to the surface that took the press, in its own coordinates, wherever
+/// the pointer is; otherwise the surface under the point gets focus, or focus
+/// is cleared over nothing. During a drag the seat routes to the drag instead.
+/// Answers the hit under the point either way, for a compositor that also
+/// wants to know which window that was.
+SceneHit scene_route_pointer(Seat& seat, std::span<const SceneItem> scene, double x, double y);
+
 } // namespace luminaria
 
 // --------------------------------------------------------------- implementation
@@ -219,6 +240,48 @@ SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y) {
         }
     }
     return {};
+}
+
+std::optional<ScenePoint> scene_surface_origin(std::span<const SceneItem> scene,
+                                               SurfaceId surface) {
+    if (!surface.valid()) {
+        return std::nullopt;
+    }
+    for (const SceneItem& item : scene) {
+        if (item.kind == SceneItem::Kind::surface && item.surface == surface) {
+            return ScenePoint{static_cast<double>(item.x), static_cast<double>(item.y)};
+        }
+    }
+    for (const SceneItem& item : scene) {
+        Surface* root = item.kind == SceneItem::Kind::surface ? surface_from_id(item.surface)
+                                                              : nullptr;
+        if (root == nullptr) {
+            continue;
+        }
+        for (const SurfaceAt& at : root->surface_tree()) {
+            if (at.surface->id() == surface) {
+                return ScenePoint{static_cast<double>(item.x + at.x),
+                                  static_cast<double>(item.y + at.y)};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+SceneHit scene_route_pointer(Seat& seat, std::span<const SceneItem> scene, double x, double y) {
+    const SceneHit hit = scene_hit_test(scene, x, y);
+    if (const SurfaceId grab = seat.pointer_grab(); grab.valid() && !seat.dragging()) {
+        if (const std::optional<ScenePoint> origin = scene_surface_origin(scene, grab)) {
+            seat.pointer_motion(x - origin->x, y - origin->y);
+        }
+        return hit;
+    }
+    if (hit.surface != nullptr) {
+        seat.pointer_enter(*hit.surface, hit.sx, hit.sy);
+    } else if (seat.pointer_focus().valid()) {
+        seat.pointer_clear_focus();
+    }
+    return hit;
 }
 
 } // namespace luminaria

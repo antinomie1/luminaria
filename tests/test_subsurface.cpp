@@ -121,6 +121,8 @@ int main() {
     int child_commits = 0;
     int child_commits_when_parent_committed = -1;
     std::vector<luminaria::SurfaceAt> tree_at_child_commit;
+    // Where the scene list says the child is drawn, with the window at (100, 50).
+    std::optional<luminaria::ScenePoint> child_origin, parent_origin, nowhere;
     std::vector<luminaria::Signal<luminaria::SurfaceCommit>::Connection> conns;
 
     auto ns = compositor->new_surface().connect([&](luminaria::NewSurface& e) {
@@ -139,6 +141,11 @@ int main() {
                 ++child_commits;
                 if (parent != nullptr) {
                     tree_at_child_commit = parent->surface_tree();
+                    const luminaria::SceneItem window{
+                        .box = {100, 50, 64, 64}, .surface = parent->id(), .x = 100, .y = 50};
+                    child_origin = luminaria::scene_surface_origin({&window, 1}, surface->id());
+                    parent_origin = luminaria::scene_surface_origin({&window, 1}, parent->id());
+                    nowhere = luminaria::scene_surface_origin({&window, 1}, luminaria::SurfaceId{});
                 }
             }
         }));
@@ -173,5 +180,10 @@ int main() {
     assert(tree_at_child_commit[0].x == 0 && tree_at_child_commit[0].y == 0);
     assert(tree_at_child_commit[1].surface == child);
     assert(tree_at_child_commit[1].x == 10 && tree_at_child_commit[1].y == 20);
+    // A pointer grab on the child is delivered in the child's coordinates:
+    // the window's origin plus the subsurface offset.
+    assert(child_origin.has_value() && child_origin->x == 110 && child_origin->y == 70);
+    assert(parent_origin.has_value() && parent_origin->x == 100 && parent_origin->y == 50);
+    assert(!nowhere.has_value());
     return 0;
 }

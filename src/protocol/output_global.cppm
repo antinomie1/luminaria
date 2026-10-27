@@ -25,10 +25,13 @@ export module luminaria:output_global;
 
 import std;
 
+import :box;
 import :display;
 import :expected;
 import :output;
+import :output_layout;
 import :protocol_helper;
+import :signal;
 import :transform;
 
 export namespace luminaria {
@@ -43,6 +46,17 @@ public:
     /// `name` (what `grim -o` and other tools address it by).
     [[nodiscard]] static Result<OutputGlobal> create(Display& display, int width, int height,
                                                      std::string name = "luminaria-1");
+
+    /// Advertise `output` as `layout` places it, and keep following both: a
+    /// mode change re-sends the mode, scale and transform, and a layout change
+    /// re-sends the position. When the output is destroyed it stops following
+    /// and keeps describing the last state until it is dropped. An empty `name`
+    /// picks `luminaria-<n>`, unique within the process.
+    ///
+    /// The setters below still work on a following global, but the next change
+    /// to the output or the layout overwrites what they set.
+    [[nodiscard]] static Result<OutputGlobal> create(Display& display, Output& output,
+                                                     OutputLayout& layout, std::string name = {});
 
     ~OutputGlobal();
     OutputGlobal(OutputGlobal&&) noexcept;
@@ -118,6 +132,13 @@ struct OutputGlobal::Impl {
     int scale = 1;
     Transform transform = Transform::normal;
     std::string name;
+    // What a following global mirrors; both null for a fixed one, and after
+    // the output is destroyed.
+    Output* output = nullptr;
+    OutputLayout* layout = nullptr;
+    Signal<OutputModeChange>::Connection on_mode;
+    Signal<OutputDestroy>::Connection on_destroy;
+    Signal<OutputLayoutChange>::Connection on_layout;
     std::vector<BindFunc> bind_callbacks;
     std::vector<wl_resource*> resources;     // all bound wl_output resources (weak refs)
     std::vector<wl_resource*> xdg_resources; // …and their zxdg_output_v1 companions
@@ -330,7 +351,68 @@ void broadcast(OutputGlobal::Impl& impl) {
     }
 }
 
+// Copy everything a following global mirrors. No broadcast: the caller sends
+// one for the lot, and at creation nobody is bound yet.
+void follow(OutputGlobal::Impl& impl) {
+    if (impl.output == nullptr) {
+        return;
+    }
+    const Output& output = *impl.output;
+    impl.width = output.width();
+    impl.height = output.height();
+    if (const int refresh = output.current_mode().refresh_mhz; refresh > 0) {
+        impl.refresh_mhz = refresh;
+    }
+    impl.modes = output.modes();
+    impl.scale = std::max(1, output.scale());
+    impl.transform = output.transform();
+    if (const Box box = impl.layout->box_of(output); !box.empty()) {
+        impl.logical_x = box.x;
+        impl.logical_y = box.y;
+    }
+}
+
 } // namespace
+
+Result<OutputGlobal> OutputGlobal::create(Display& display, Output& output, OutputLayout& layout,
+                                          std::string name) {
+    if (name.empty()) {
+        static std::atomic<unsigned> next{1};
+        name = "luminaria-" + std::to_string(next.fetch_add(1));
+    }
+    Result<OutputGlobal> created = create(display, output.width(), output.height(), std::move(name));
+    if (!created) {
+        return created;
+    }
+    Impl& impl = *created->impl_;
+    impl.output = &output;
+    impl.layout = &layout;
+    follow(impl);
+    impl.on_mode = output.mode_changed.connect([&impl](OutputModeChange&) {
+        follow(impl);
+        broadcast(impl);
+    });
+    impl.on_layout = layout.changed.connect([&impl](OutputLayoutChange&) {
+        if (impl.output == nullptr) {
+            return;
+        }
+        const Box box = impl.layout->box_of(*impl.output);
+        if (box.empty() || (box.x == impl.logical_x && box.y == impl.logical_y)) {
+            return;
+        }
+        impl.logical_x = box.x;
+        impl.logical_y = box.y;
+        broadcast(impl);
+    });
+    impl.on_destroy = output.destroy.connect([&impl](OutputDestroy&) {
+        impl.output = nullptr;
+        impl.layout = nullptr;
+        impl.on_mode.disconnect();
+        impl.on_layout.disconnect();
+        impl.on_destroy.disconnect();
+    });
+    return created;
+}
 
 void OutputGlobal::set_logical_position(int x, int y) {
     impl_->logical_x = x;

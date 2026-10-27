@@ -38,7 +38,10 @@ public:
     /// (screencopy, told whenever the pointer changes) may be null. No theme
     /// installed is not an error: the pointer is then whatever clients set, or
     /// nothing.
-    Cursor(SceneRenderer& renderer, const OutputLayout& layout, Seat& seat,
+    ///
+    /// It follows `layout` by itself: an output that arrives, leaves, moves or
+    /// changes mode gets the pointer pushed to it again.
+    Cursor(SceneRenderer& renderer, OutputLayout& layout, Seat& seat,
            CursorShapeManager* shapes = nullptr, ScreencopyManager* capture = nullptr);
     ~Cursor();
     Cursor(Cursor&&) noexcept;
@@ -63,8 +66,8 @@ public:
     /// until the next move.
     void leave();
 
-    /// Push the pointer to every output again: for a change the cursor cannot
-    /// see, an output that moved in the layout above all.
+    /// Push the pointer to every output again, for a change the cursor cannot
+    /// see. Layout changes it sees by itself.
     void refresh();
 
     /// The sprite as `output` shows it, in that output's logical coordinates;
@@ -104,6 +107,7 @@ struct Cursor::Impl {
     Signal<CursorShapeRequest>::Connection on_shape;
     Signal<SeatCursorChange>::Connection on_cursor;
     Signal<SeatPointerFocus>::Connection on_focus;
+    Signal<OutputLayoutChange>::Connection on_layout;
 
     Impl() = default;
     Impl(const Impl&) = delete;
@@ -166,10 +170,11 @@ struct Cursor::Impl {
     }
 };
 
-Cursor::Cursor(SceneRenderer& renderer, const OutputLayout& layout, Seat& seat,
+Cursor::Cursor(SceneRenderer& renderer, OutputLayout& layout, Seat& seat,
                CursorShapeManager* shapes, ScreencopyManager* capture)
     : impl_(std::make_unique<Impl>()) {
     Impl& self = *impl_;
+    self.on_layout = layout.changed.connect([&self](OutputLayoutChange&) { self.update(); });
     self.renderer = &renderer;
     self.layout = &layout;
     self.seat = &seat;

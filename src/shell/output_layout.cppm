@@ -6,8 +6,11 @@
 // mapping lives here and nowhere else, so rendering, hit-testing and
 // xdg-output all quote the same numbers.
 //
-// Pure geometry — no protocol, no rendering. Non-owning: an Output must be
-// removed before it dies.
+// Pure geometry — no protocol, no rendering. Non-owning, but it follows what it
+// holds: an output that is destroyed leaves the layout by itself, and one whose
+// mode changes keeps its position and takes its new size. Both used to be two
+// handlers every compositor wrote, and forgetting the first left a dangling
+// `Output*` in the one table every hit-test reads.
 
 module;
 
@@ -19,6 +22,7 @@ import std;
 
 import :box;
 import :output;
+import :signal;
 
 export namespace luminaria {
 
@@ -28,8 +32,16 @@ struct OutputBox {
     Box box;
 };
 
+/// Some output moved, arrived, left or changed size in the layout.
+struct OutputLayoutChange {};
+
+/// Not movable: each output it holds is watched on its behalf.
 class OutputLayout {
 public:
+    OutputLayout() = default;
+    OutputLayout(const OutputLayout&) = delete;
+    OutputLayout& operator=(const OutputLayout&) = delete;
+
     /// Place `output` with its top-left at (x, y). Re-adding moves it.
     void add(Output& output, int x, int y);
     /// Place `output` immediately right of everything placed so far, tops aligned.
@@ -51,8 +63,18 @@ public:
     [[nodiscard]] const std::vector<OutputBox>& outputs() const noexcept { return outputs_; }
     [[nodiscard]] bool empty() const noexcept { return outputs_.empty(); }
 
+    /// Fires after every change to any output's box, including the ones the
+    /// layout makes by itself (destroy, mode change).
+    Signal<OutputLayoutChange> changed;
+
 private:
+    struct Watch {
+        Output* output;
+        Signal<OutputDestroy>::Connection on_destroy;
+        Signal<OutputModeChange>::Connection on_mode;
+    };
     std::vector<OutputBox> outputs_;
+    std::vector<Watch> watches_;
 };
 
 } // namespace luminaria
@@ -64,13 +86,20 @@ void OutputLayout::add(Output& output, int x, int y) {
     // Logical size, not the mode: a rotated or HiDPI output occupies a different
     // rectangle in the layout than its framebuffer suggests.
     const Box box{x, y, output.logical_width(), output.logical_height()};
-    for (OutputBox& entry : outputs_) {
-        if (entry.output == &output) {
-            entry.box = box;
-            return;
-        }
+    const auto known = std::ranges::find(outputs_, &output, &OutputBox::output);
+    if (known != outputs_.end()) {
+        known->box = box;
+    } else {
+        outputs_.push_back(OutputBox{&output, box});
+        Watch& watch = watches_.emplace_back(Watch{&output, {}, {}});
+        watch.on_destroy = output.destroy.connect([this](OutputDestroy& e) { remove(e.output); });
+        watch.on_mode = output.mode_changed.connect([this](OutputModeChange& e) {
+            const Box old = box_of(e.output);
+            add(e.output, old.x, old.y);
+        });
     }
-    outputs_.push_back(OutputBox{&output, box});
+    OutputLayoutChange change;
+    changed.emit(change);
 }
 
 void OutputLayout::add_auto(Output& output) {
@@ -86,7 +115,15 @@ void OutputLayout::add_auto(Output& output) {
 }
 
 void OutputLayout::remove(const Output& output) {
-    std::erase_if(outputs_, [&](const OutputBox& entry) { return entry.output == &output; });
+    if (std::erase_if(outputs_, [&](const OutputBox& entry) { return entry.output == &output; }) ==
+        0) {
+        return;
+    }
+    // Erasing the watch inside its own destroy slot is safe: a Signal never
+    // frees the slot that is running.
+    std::erase_if(watches_, [&](const Watch& watch) { return watch.output == &output; });
+    OutputLayoutChange change;
+    changed.emit(change);
 }
 
 Box OutputLayout::box_of(const Output& output) const {

@@ -110,14 +110,17 @@ public:
     /// the globals-before-backends order already does.
     void set_presentation(Presentation* presentation) noexcept;
 
-    /// Allocate everything sized for `output`'s CURRENT mode, and bind `state`
-    /// to it. Call it once per output and again from `Output::mode_changed`.
+    /// Allocate everything sized for `output`'s CURRENT mode in `drm_format`
+    /// (XRGB8888 unless told otherwise), and bind `state` to it. Call it once
+    /// per output: from then on a `mode_changed` on that output reallocates by
+    /// itself, before any handler of the compositor's own runs a frame.
     ///
     /// A failure is not fatal and is not an error the caller has to handle
     /// beyond reporting it: this output falls back to the CPU path, which needs
     /// no setup. There is nothing to allocate when there is no GPU at all, and
     /// that answers `ok()` — the binding happens either way.
-    Status reset(SceneOutput& state, Output& output, std::uint32_t drm_format);
+    Status reset(SceneOutput& state, Output& output,
+                 std::uint32_t drm_format = 0x34325258 /* DRM_FORMAT_XRGB8888 */);
 
     /// Draw `scene` and present it on `output`, with the pointer from the
     /// cursor source composited on top unless the cursor plane carries it.
@@ -129,6 +132,13 @@ public:
     /// what every software output currently is.
     [[nodiscard]] Result<SceneOutcome> present(SceneOutput& state, Output& output,
                                                std::span<const SceneItem> scene, Color background);
+
+    /// The same, from a scene in `layout`'s coordinates — one list for every
+    /// output, each showing the part `layout` puts it on. An output that is not
+    /// in the layout shows the scene from the origin.
+    [[nodiscard]] Result<SceneOutcome> present(SceneOutput& state, Output& output,
+                                               std::span<const SceneItem> scene, Color background,
+                                               const OutputLayout& layout);
 
     /// What the pointer looks like on each output. Without one no cursor is
     /// drawn. `Cursor` installs itself here; an empty function uninstalls.
@@ -255,6 +265,13 @@ struct SceneOutput::Impl {
     Output* output = nullptr;
     Signal<PresentEvent>::Connection on_present;
     Signal<OutputDestroy>::Connection on_destroy;
+    Signal<OutputModeChange>::Connection on_mode;
+    // The format the last reset() allocated in; empty until there was one, so a
+    // state only ever presented on the CPU is not given GPU targets by a mode
+    // change it never asked to follow.
+    std::optional<std::uint32_t> format;
+    // `present(..., layout)`'s scene moved into this output's coordinates.
+    std::vector<SceneItem> local;
 
     Impl() = default;
     Impl(const Impl&) = delete;
@@ -555,6 +572,11 @@ void append_tree(SceneOutput::Impl& state, const Output& output, Surface& root, 
 
 } // namespace
 
+namespace {
+Status reallocate(SceneRenderer::Impl& renderer, SceneOutput::Impl& self, Output& output,
+                  std::uint32_t drm_format);
+} // namespace
+
 void SceneOutput::Impl::bind(SceneRenderer::Impl& renderer, Output& out) {
     if (owner == &renderer && output == &out) {
         return;
@@ -566,6 +588,13 @@ void SceneOutput::Impl::bind(SceneRenderer::Impl& renderer, Output& out) {
     on_present = out.present.connect([this](PresentEvent& event) { presented(event); });
     // Everything here that holds the output goes while it still exists.
     on_destroy = out.destroy.connect([this](OutputDestroy&) { unbind(); });
+    // Everything sized for the old mode is stale. Connected before anything
+    // the compositor hooks up on this output, so it runs first.
+    on_mode = out.mode_changed.connect([this](OutputModeChange&) {
+        if (owner != nullptr && output != nullptr && format.has_value()) {
+            (void)reallocate(*owner, *this, *output, *format);
+        }
+    });
 }
 
 void SceneOutput::Impl::unbind() noexcept {
@@ -580,6 +609,8 @@ void SceneOutput::Impl::unbind() noexcept {
     output = nullptr;
     on_present.disconnect();
     on_destroy.disconnect();
+    on_mode.disconnect();
+    format.reset();
 }
 
 void SceneOutput::Impl::send_frame_done(std::uint32_t time_ms) {
@@ -657,23 +688,55 @@ void SceneRenderer::set_cursor_source(SceneCursorSource source) {
     impl_->cursor = std::move(source);
 }
 
-Status SceneRenderer::reset(SceneOutput& state, Output& output, std::uint32_t drm_format) {
-    SceneOutput::Impl& self = *state.impl_;
-    self.bind(*impl_, output);
+namespace {
+Status reallocate(SceneRenderer::Impl& renderer, SceneOutput::Impl& self, Output& output,
+                  std::uint32_t drm_format) {
+    self.format = drm_format;
     // Dropped first: every texture it cached describes the old mode, and so do
     // the scanout buffers it would otherwise keep alive while allocating more.
     self.frame.reset();
     self.images.clear();
     self.cpu_valid = false; // the new mode's buffer is blank
-    if (impl_->gpu == nullptr) {
+    if (renderer.gpu == nullptr) {
         return ok();
     }
-    self.frame.emplace(output, *impl_->gpu);
+    self.frame.emplace(output, *renderer.gpu);
     if (Status ready = self.frame->reset(drm_format); !ready) {
         self.frame.reset();
         return ready;
     }
     return ok();
+}
+} // namespace
+
+Status SceneRenderer::reset(SceneOutput& state, Output& output, std::uint32_t drm_format) {
+    SceneOutput::Impl& self = *state.impl_;
+    self.bind(*impl_, output);
+    return reallocate(*impl_, self, output, drm_format);
+}
+
+Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
+                                            std::span<const SceneItem> scene, Color background,
+                                            const OutputLayout& layout) {
+    const Box view = layout.box_of(output);
+    if (view.x == 0 && view.y == 0) {
+        return present(state, output, scene, background);
+    }
+    // Into the state's own scratch: cleared, never freed, so a steady frame
+    // still allocates nothing.
+    std::vector<SceneItem>& local = state.impl_->local;
+    local.assign(scene.begin(), scene.end());
+    for (SceneItem& item : local) {
+        item.box.x -= view.x;
+        item.box.y -= view.y;
+        item.x -= view.x;
+        item.y -= view.y;
+        if (!item.shadow_box.empty()) {
+            item.shadow_box.x -= view.x;
+            item.shadow_box.y -= view.y;
+        }
+    }
+    return present(state, output, local, background);
 }
 
 void SceneRenderer::update_cursor() {
