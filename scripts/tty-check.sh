@@ -164,6 +164,7 @@ fi
 : >"$RUN_LOG"
 (
     export LUMINARIA_BACKEND=drm
+    export LUMINARIA_TRACE=1 # minimal's log lines are the evidence; see examples/trace.cppm
     if [[ -n "$DEVICE" ]]; then "$BIN" "$DEVICE"; else "$BIN"; fi
     echo $? >"$OUT/exit-code"
 ) 2>&1 | while IFS= read -r line; do

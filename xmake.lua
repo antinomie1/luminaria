@@ -458,7 +458,7 @@ if standalone then
 target("minimal")
     set_kind("binary")
     luminaria_defaults()
-    add_files("examples/minimal.cpp")
+    add_files("examples/minimal.cpp", "examples/trace.cppm")
     add_deps("luminaria-gpu")
 
 -- One test binary per file, same as before. Several skip themselves with exit 77
