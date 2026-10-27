@@ -21,6 +21,7 @@
    - [4.2 输入：InputSource](#42-输入inputsource-luminariainput_event)
    - [4.3 Headless & Wayland 嵌套后端](#43-headless--wayland-嵌套后端)
    - [4.4 DrmBackend & Session & Libinput (Bare-metal)](#44-drmbackend--session--libinput-bare-metal-luminariagpu)
+   - [4.5 AutoBackend：自动挑后端](#45-autobackend自动挑后端-luminariagpuauto_backend)
 5. [渲染器与合成引擎 (`luminaria` / `luminaria.gpu`)](#5-渲染器与合成引擎-luminaria--luminariagpu)
    - [5.1 CpuCompositor (CPU 立即模式合成)](#51-cpucompositor-cpu-立即模式合成)
    - [5.2 VulkanRenderer (GPU 零拷贝渲染)](#52-vulkanrenderer-gpu-零拷贝渲染)
@@ -220,6 +221,27 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `static Result<LibinputBackend> create(EventLoop loop, Session& session)`
   - 是一个 `InputSource`：相对移动、按钮、滚轮、按键、修饰键（仅在变化时）、触摸、设备增删引起的能力变化，全经 `input()`。`set_keymap()` 成功时也发 `KeymapChange`。
   - `const KeymapState& keymap_state() const`: 获取底座共享的 XKB 状态。
+
+### 4.5 AutoBackend：自动挑后端 (`luminaria.gpu:auto_backend`)
+每个混成器开头都是同一段：有父混成器就嵌套，有 seat 就上裸机，否则无头；开显卡、加入 seat、让 libinput 走同一个会话、
+让渲染器选中屏幕背后那块 GPU。`AutoBackend` 就是这一段。
+- **`BackendKind`** = `automatic | nested | drm | headless`；`Result<BackendKind> parse_backend_kind(std::string_view)`
+  解析 `"auto" | "nested" | "drm" | "headless"`（示例里 `LUMINARIA_BACKEND` 的取值），`backend_kind_name()` 反过来。
+  读环境变量仍是调用者的事。
+- **`BackendOptions`**：`kind`（默认 `automatic`）、`drm_device`（空 = 第一块接了显示器的卡）、`width`/`height`
+  （嵌套与无头自带的那一块输出，默认 1280×800）、`title`（嵌套窗口标题）。
+- **`static Result<AutoBackend> create(EventLoop loop, const BackendOptions& = {})`**：
+  - `automatic` 依次试：`WaylandBackend` + 一个窗口；**能拿到 libseat `Session` 时**的 `DrmBackend`（ssh、CI 因此不会误上 VT），
+    DRM 失败就放掉会话；最后 `HeadlessBackend` + 一块输出。
+  - 按名字要某一种时，失败就是错误而不回退；要 `drm` 时没有会话也照跑（切 VT 不安全，原因见 `session_error()`）。
+  - DRM 上同时建好同一会话上的 `LibinputBackend`，并设 `VulkanOptions::drm_device = drm_device_id(drm.fd())`。
+- 取用：`kind()`（不会是 `automatic`）、`Backend& backend()`（订阅 `new_output`）、`InputSource* input()`（嵌套后端或
+  libinput，无头为空）、`WaylandBackend* nested()`（`close_requested` 由调用者回答）、`DrmBackend* drm()`、
+  `LibinputBackend* libinput()`、`Session* session()`（VT 切换与 `activity()`，只在 DRM 上）、`session_error()`、
+  `const VulkanOptions& vulkan_options()`（交给 `SceneRenderer` / `VulkanRenderer`）。
+- **`Status start()`**：先 libinput，后后端。
+- 会话、显卡后端、libinput 都归它所有，按"会话最后析构"的顺序声明；它是 pimpl，所以移动它不会让 `Session*` 失效。
+  和别的后端一样，要声明在各 global 之后（输出最后一次 `present` 还要找得到 presentation global）。
 
 ---
 

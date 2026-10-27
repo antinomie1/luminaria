@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "luminaria/luminaria_rs.h"
@@ -28,7 +30,9 @@ namespace lum {
 // ============================================================================
 
 struct SessionShim::Impl {
-    std::unique_ptr<lm::Session> session;
+    // `session` is `owned`, or one an AutoBackendShim lends out.
+    std::unique_ptr<lm::Session> owned;
+    lm::Session* session = nullptr;
     std::deque<bool> activity;
     Conn<lm::SessionActive> on_activity;
 };
@@ -44,7 +48,8 @@ std::unique_ptr<SessionShim> session_new(const DisplayShim& display, rust::Strin
         auto r = lm::Session::create(disp->event_loop());
         if (!r) { error = to_rust(r.error().message); return nullptr; }
         auto impl = std::make_unique<SessionShim::Impl>();
-        impl->session = std::make_unique<lm::Session>(std::move(*r));
+        impl->owned = std::make_unique<lm::Session>(std::move(*r));
+        impl->session = impl->owned.get();
         impl->on_activity = impl->session->activity().connect(
             [raw = impl.get()](lm::SessionActive& e) { raw->activity.push_back(e.active); });
         return std::make_unique<SessionShim>(std::move(impl));
@@ -76,29 +81,33 @@ std::uint32_t SessionShim::next_activity() const {
     return active ? 2 : 1;
 }
 
-struct DrmBackendShim::Impl {
+namespace {
+
+// A backend's outputs, arriving and leaving, queued for Rust.
+struct OutputQueue {
     struct Event {
         std::unique_ptr<OutputShim> added; // null: a removal
         std::uint64_t removed = 0;
     };
     // Hotplug watch on each output the backend reported, keyed by the shim's id.
     struct Watch {
+        const lm::Output* output;
         std::uint64_t id;
         Conn<lm::OutputDestroy> on_destroy;
     };
 
-    std::unique_ptr<lm::DrmBackend> backend;
     std::deque<Event> events;
     std::deque<Watch> watches;
     Conn<lm::NewOutput> on_new_output;
 
     // Every output, the ones start() finds included, reaches Rust as an event:
     // C++ never calls Rust, so a signal can only leave something to be drained.
-    void watch() {
-        on_new_output = backend->new_output.connect([this](lm::NewOutput& e) {
+    void watch(lm::Backend& backend) {
+        on_new_output = backend.new_output.connect([this](lm::NewOutput& e) {
             auto shim = make_output_shim(&e.output);
             const std::uint64_t id = shim->id();
             Watch& w = watches.emplace_back();
+            w.output = &e.output;
             w.id = id;
             w.on_destroy = e.output.destroy.connect([this, id](lm::OutputDestroy&) {
                 events.push_back(Event{nullptr, id});
@@ -109,6 +118,37 @@ struct DrmBackendShim::Impl {
             events.push_back(Event{std::move(shim), 0});
         });
     }
+
+    // The shim id `output` was reported under; 0 for one this queue never saw.
+    std::uint64_t id_of(const lm::Output* output) const {
+        for (const Watch& w : watches) {
+            if (w.output == output) return w.id;
+        }
+        return 0;
+    }
+
+    std::unique_ptr<OutputShim> next(std::uint32_t& kind, std::uint64_t& removed) {
+        kind = 0;
+        if (events.empty()) return nullptr;
+        Event e = std::move(events.front());
+        events.pop_front();
+        if (e.added) {
+            kind = 1;
+            return std::move(e.added);
+        }
+        kind = 2;
+        removed = e.removed;
+        return nullptr;
+    }
+};
+
+} // namespace
+
+struct DrmBackendShim::Impl {
+    std::unique_ptr<lm::DrmBackend> backend;
+    OutputQueue outputs;
+
+    void watch() { outputs.watch(*backend); }
 };
 
 DrmBackendShim::~DrmBackendShim() = default;
@@ -120,7 +160,7 @@ std::unique_ptr<DrmBackendShim> drm_backend_new(const DisplayShim& display, rust
         lm::Display* disp = raw_ptr(display);
         if (!disp) { error = "display not initialized"; return nullptr; }
         auto loop = disp->event_loop();
-        lm::Session* sess = session.impl().session.get();
+        lm::Session* sess = session.impl().session;
         lm::Result<lm::DrmBackend> r = device.empty()
             ? lm::DrmBackend::create(loop, sess)
             : lm::DrmBackend::create(loop, std::string(device), sess);
@@ -170,17 +210,7 @@ void DrmBackendShim::scan_connectors() {
 }
 
 std::unique_ptr<OutputShim> DrmBackendShim::next_event(std::uint32_t& kind, std::uint64_t& removed) {
-    kind = 0;
-    if (impl_->events.empty()) return nullptr;
-    Impl::Event e = std::move(impl_->events.front());
-    impl_->events.pop_front();
-    if (e.added) {
-        kind = 1;
-        return std::move(e.added);
-    }
-    kind = 2;
-    removed = e.removed;
-    return nullptr;
+    return impl_->outputs.next(kind, removed);
 }
 
 struct LibinputBackendShim::Impl {
@@ -226,7 +256,7 @@ std::unique_ptr<LibinputBackendShim> make_libinput(const DisplayShim& display, l
 } // namespace
 
 std::unique_ptr<LibinputBackendShim> libinput_backend_new(const DisplayShim& display, const SessionShim& session, rust::String& error) {
-    return make_libinput(display, session.impl().session.get(), false, error);
+    return make_libinput(display, session.impl().session, false, error);
 }
 
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_standalone(const DisplayShim& display, rust::String& error) {
@@ -234,7 +264,7 @@ std::unique_ptr<LibinputBackendShim> libinput_backend_new_standalone(const Displ
 }
 
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_path(const DisplayShim& display, const SessionShim& session, rust::String& error) {
-    return make_libinput(display, session.impl().session.get(), true, error);
+    return make_libinput(display, session.impl().session, true, error);
 }
 
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_path_standalone(const DisplayShim& display, rust::String& error) {
@@ -272,6 +302,121 @@ bool LibinputBackendShim::set_keymap(rust::Str xkb_text) {
 
 std::uint32_t LibinputBackendShim::capabilities() const {
     return impl_->backend ? caps_bits(impl_->backend->capabilities()) : 0;
+}
+
+struct AutoBackendShim::Impl {
+    std::optional<lm::AutoBackend> backend;
+    // Lends out the backend's session, so it goes first.
+    std::unique_ptr<SessionShim> session;
+    OutputQueue outputs;
+    std::deque<InputEventRaw> input_events;
+    bool close_requested = false;
+    Conn<lm::InputEvent> on_input;
+    Conn<lm::HostCloseRequest> on_close;
+};
+
+AutoBackendShim::~AutoBackendShim() = default;
+AutoBackendShim::AutoBackendShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+AutoBackendShim::Impl& AutoBackendShim::impl() const { return *impl_; }
+
+std::unique_ptr<AutoBackendShim> auto_backend_new(const DisplayShim& display, std::uint32_t kind, rust::Str drm_device,
+                                                  std::int32_t width, std::int32_t height, rust::Str title,
+                                                  rust::String& error) {
+    try {
+        lm::Display* disp = raw_ptr(display);
+        if (!disp) { error = "display not initialized"; return nullptr; }
+        constexpr lm::BackendKind kinds[] = {lm::BackendKind::automatic, lm::BackendKind::nested,
+                                             lm::BackendKind::drm, lm::BackendKind::headless};
+        if (kind >= std::size(kinds)) { error = "unknown backend kind"; return nullptr; }
+        lm::BackendOptions options{.kind = kinds[kind],
+                                   .drm_device = std::string(drm_device),
+                                   .width = width,
+                                   .height = height,
+                                   .title = std::string(title)};
+        auto r = lm::AutoBackend::create(disp->event_loop(), options);
+        if (!r) { error = to_rust(r.error().message); return nullptr; }
+        auto impl = std::make_unique<AutoBackendShim::Impl>();
+        impl->backend.emplace(std::move(*r));
+        lm::AutoBackend& backend = *impl->backend;
+        auto* raw = impl.get();
+        raw->outputs.watch(backend.backend());
+        if (lm::Session* s = backend.session()) {
+            auto session = std::make_unique<SessionShim::Impl>();
+            session->session = s;
+            session->on_activity = s->activity().connect(
+                [q = session.get()](lm::SessionActive& e) { q->activity.push_back(e.active); });
+            raw->session = std::make_unique<SessionShim>(std::move(session));
+        }
+        if (lm::InputSource* source = backend.input()) {
+            // Read as the event arrives, as LibinputBackendShim does; absolute
+            // motion names its output by the id Rust was handed.
+            raw->on_input = source->input().connect([raw](lm::InputEvent& e) {
+                InputEventRaw ev = input_event_raw(e);
+                if (const auto* motion = std::get_if<lm::PointerMotionAbsEvent>(&e)) {
+                    ev.output = raw->outputs.id_of(motion->output);
+                }
+                raw->input_events.push_back(std::move(ev));
+            });
+        }
+        if (lm::WaylandBackend* nested = backend.nested()) {
+            raw->on_close = nested->close_requested.connect(
+                [raw](lm::HostCloseRequest&) { raw->close_requested = true; });
+        }
+        return std::make_unique<AutoBackendShim>(std::move(impl));
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nullptr;
+    }
+}
+
+std::uint32_t AutoBackendShim::kind() const {
+    switch (impl_->backend->kind()) {
+    case lm::BackendKind::nested: return 1;
+    case lm::BackendKind::drm: return 2;
+    default: return 3;
+    }
+}
+
+bool AutoBackendShim::start(rust::String& error) {
+    auto st = impl_->backend->start();
+    if (!st) { error = to_rust(st.error().message); return false; }
+    return true;
+}
+
+std::unique_ptr<OutputShim> AutoBackendShim::next_event(std::uint32_t& kind, std::uint64_t& removed) {
+    return impl_->outputs.next(kind, removed);
+}
+
+bool AutoBackendShim::next_input_event(InputEventRaw& out) {
+    if (impl_->input_events.empty()) return false;
+    out = std::move(impl_->input_events.front());
+    impl_->input_events.pop_front();
+    return true;
+}
+
+rust::String AutoBackendShim::keymap() const {
+    const lm::InputSource* source = impl_->backend->input();
+    return source ? to_rust(source->keymap()) : rust::String{};
+}
+
+std::uint32_t AutoBackendShim::capabilities() const {
+    const lm::InputSource* source = impl_->backend->input();
+    return source ? caps_bits(source->capabilities()) : 0;
+}
+
+bool AutoBackendShim::take_close_request() { return std::exchange(impl_->close_requested, false); }
+
+bool AutoBackendShim::has_session() const { return impl_->session != nullptr; }
+
+const SessionShim& AutoBackendShim::session() const { return *impl_->session; }
+
+rust::String AutoBackendShim::session_error() const { return to_rust(std::string(impl_->backend->session_error())); }
+
+bool AutoBackendShim::drm_device(DrmDeviceId& out) const {
+    const auto& id = impl_->backend->vulkan_options().drm_device;
+    if (!id) return false;
+    out = DrmDeviceId{id->major, id->minor};
+    return true;
 }
 
 // ============================================================================

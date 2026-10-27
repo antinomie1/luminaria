@@ -175,7 +175,7 @@ impl Output {
     }
 
     /// This output's identity, which outlives it: what
-    /// [`DrmEvent::OutputRemoved`] names. Never reused within a process.
+    /// [`BackendEvent::OutputRemoved`] names. Never reused within a process.
     pub fn id(&self) -> OutputId {
         OutputId(self.raw.id())
     }
@@ -332,9 +332,16 @@ mod bare_metal {
 
     /// libseat session management for bare-metal KMS/DRM backends. The backends
     /// built on it keep it borrowed, which is why its methods take `&self`.
+    /// One made by [`Session::new`] is owned; [`AutoBackend::session`] lends
+    /// out the one the backend owns.
     pub struct Session<'d> {
-        pub(crate) raw: cxx::UniquePtr<crate::ffi_gpu::SessionShim>,
+        raw: SessionRaw<'d>,
         _display: Holds<'d>,
+    }
+
+    enum SessionRaw<'a> {
+        Owned(cxx::UniquePtr<crate::ffi_gpu::SessionShim>),
+        Lent(&'a crate::ffi_gpu::SessionShim),
     }
 
     impl<'d> Session<'d> {
@@ -344,13 +351,20 @@ mod bare_metal {
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
-                Ok(Self { raw, _display: Holds::new() })
+                Ok(Self { raw: SessionRaw::Owned(raw), _display: Holds::new() })
+            }
+        }
+
+        pub(crate) fn shim(&self) -> &crate::ffi_gpu::SessionShim {
+            match &self.raw {
+                SessionRaw::Owned(raw) => raw,
+                SessionRaw::Lent(raw) => raw,
             }
         }
 
         pub fn switch_to(&self, vt: i32) -> Result<(), Error> {
             let mut err = String::new();
-            if self.raw.switch_to(vt, &mut err) {
+            if self.shim().switch_to(vt, &mut err) {
                 Ok(())
             } else {
                 Err(Error::new(ErrorKind::Backend, err))
@@ -358,18 +372,18 @@ mod bare_metal {
         }
 
         pub fn is_active(&self) -> bool {
-            self.raw.active()
+            self.shim().active()
         }
 
         pub fn seat_name(&self) -> String {
-            self.raw.seat_name()
+            self.shim().seat_name()
         }
 
         /// The next VT switch, oldest first: `Some(false)` when the session was
         /// taken away, `Some(true)` when it came back. On the way out, release every
         /// key and button a client was told is down; on the way back, repaint.
         pub fn next_activity(&self) -> Option<bool> {
-            match self.raw.next_activity() {
+            match self.shim().next_activity() {
                 1 => Some(false),
                 2 => Some(true),
                 _ => None,
@@ -393,7 +407,7 @@ mod bare_metal {
         ) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_gpu::drm_backend_new(&display.raw, device.unwrap_or(""), &sess.raw, &mut err)
+                crate::ffi_gpu::drm_backend_new(&display.raw, device.unwrap_or(""), sess.shim(), &mut err)
             } else {
                 crate::ffi_gpu::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
             };
@@ -405,7 +419,7 @@ mod bare_metal {
         }
 
         /// Light up the connected monitors. Each arrives as a
-        /// [`DrmEvent::OutputAdded`] after this returns.
+        /// [`BackendEvent::OutputAdded`] after this returns.
         pub fn start(&mut self) -> Result<(), Error> {
             let mut err = String::new();
             if self.raw.pin_mut().start(&mut err) {
@@ -423,15 +437,11 @@ mod bare_metal {
 
         /// The next monitor that appeared or went away, oldest first. Drain it
         /// after every `Display::dispatch()`.
-        pub fn next_event(&mut self) -> Option<DrmEvent> {
+        pub fn next_event(&mut self) -> Option<BackendEvent> {
             let mut kind = 0;
             let mut removed = 0;
             let output = self.raw.pin_mut().next_event(&mut kind, &mut removed);
-            match kind {
-                1 => Some(DrmEvent::OutputAdded(Output::from_raw(output))),
-                2 => Some(DrmEvent::OutputRemoved(OutputId(removed))),
-                _ => None,
-            }
+            BackendEvent::from_raw(kind, output, removed)
         }
     }
 
@@ -453,14 +463,24 @@ mod bare_metal {
         }
     }
 
-    /// What a [`DrmBackend`] reports about monitors.
-    pub enum DrmEvent {
-        /// A monitor was lit up: at `start()` for every connected one, later on
-        /// hotplug.
+    /// What a [`DrmBackend`] or an [`AutoBackend`] reports about outputs.
+    pub enum BackendEvent {
+        /// An output was lit up: at `start()` for every one there is (nested
+        /// and headless have theirs from the start), later on DRM hotplug.
         OutputAdded(Output),
         /// A monitor went away. The [`Output`] with this id is now inert; drop it,
         /// along with whatever was built for it.
         OutputRemoved(OutputId),
+    }
+
+    impl BackendEvent {
+        fn from_raw(kind: u32, output: cxx::UniquePtr<ffi::OutputShim>, removed: u64) -> Option<Self> {
+            match kind {
+                1 => Some(BackendEvent::OutputAdded(Output::from_raw(output))),
+                2 => Some(BackendEvent::OutputRemoved(OutputId(removed))),
+                _ => None,
+            }
+        }
     }
 
     /// libinput input device manager for evdev keyboards, pointers, and
@@ -476,7 +496,7 @@ mod bare_metal {
         pub fn new(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_gpu::libinput_backend_new(&display.raw, &sess.raw, &mut err)
+                crate::ffi_gpu::libinput_backend_new(&display.raw, sess.shim(), &mut err)
             } else {
                 crate::ffi_gpu::libinput_backend_new_standalone(&display.raw, &mut err)
             };
@@ -491,7 +511,7 @@ mod bare_metal {
         pub fn new_path(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_gpu::libinput_backend_new_path(&display.raw, &sess.raw, &mut err)
+                crate::ffi_gpu::libinput_backend_new_path(&display.raw, sess.shim(), &mut err)
             } else {
                 crate::ffi_gpu::libinput_backend_new_path_standalone(&display.raw, &mut err)
             };
@@ -554,6 +574,202 @@ mod bare_metal {
         }
         fn capabilities(&self) -> InputCapabilities {
             LibinputBackend::capabilities(self)
+        }
+    }
+
+    /// Which backend [`AutoBackend`] is asked for, and which one it picked.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub enum BackendKind {
+        /// Nested, then DRM when a libseat session can be had, then headless.
+        /// Asked for, never picked.
+        #[default]
+        Auto,
+        Nested,
+        Drm,
+        Headless,
+    }
+
+    impl BackendKind {
+        /// "auto", "nested", "drm" or "headless": what `parse()` reads back.
+        pub fn name(self) -> &'static str {
+            match self {
+                BackendKind::Auto => "auto",
+                BackendKind::Nested => "nested",
+                BackendKind::Drm => "drm",
+                BackendKind::Headless => "headless",
+            }
+        }
+    }
+
+    impl std::fmt::Display for BackendKind {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.name())
+        }
+    }
+
+    /// `"auto" | "nested" | "drm" | "headless"`, what `LUMINARIA_BACKEND` holds
+    /// in the examples.
+    impl std::str::FromStr for BackendKind {
+        type Err = Error;
+
+        fn from_str(text: &str) -> Result<Self, Error> {
+            [BackendKind::Auto, BackendKind::Nested, BackendKind::Drm, BackendKind::Headless]
+                .into_iter()
+                .find(|k| k.name() == text)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidArgument,
+                        format!("backend \"{text}\": expected auto, nested, drm or headless"),
+                    )
+                })
+        }
+    }
+
+    /// What [`AutoBackend::new`] is asked for.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BackendOptions {
+        pub kind: BackendKind,
+        /// The DRM card, e.g. `/dev/dri/card1`; `None` takes the first one with
+        /// a monitor.
+        pub drm_device: Option<String>,
+        /// The one output nested and headless come with. DRM's are its monitors.
+        pub width: i32,
+        pub height: i32,
+        /// The nested window's title.
+        pub title: String,
+    }
+
+    impl Default for BackendOptions {
+        fn default() -> Self {
+            Self {
+                kind: BackendKind::Auto,
+                drm_device: None,
+                width: 1280,
+                height: 800,
+                title: "luminaria".into(),
+            }
+        }
+    }
+
+    /// The backend this machine can run, picked the way every compositor would
+    /// pick it (C++ `AutoBackend`): nested when there is a parent compositor,
+    /// DRM when a libseat session can be had, so ssh and CI never land on a VT,
+    /// else headless. A kind asked for by name fails instead of falling back,
+    /// and DRM then also runs without a session.
+    ///
+    /// It owns the session, the card and libinput, so nothing here borrows
+    /// anything but the [`Display`]. Outputs arrive as [`BackendEvent`]s once it
+    /// starts, input through [`AutoBackend::input`].
+    pub struct AutoBackend<'d> {
+        raw: cxx::UniquePtr<crate::ffi_gpu::AutoBackendShim>,
+        _display: Holds<'d>,
+    }
+
+    impl<'d> AutoBackend<'d> {
+        pub fn new(display: &'d Display, options: &BackendOptions) -> Result<Self, Error> {
+            let kind = match options.kind {
+                BackendKind::Auto => 0,
+                BackendKind::Nested => 1,
+                BackendKind::Drm => 2,
+                BackendKind::Headless => 3,
+            };
+            let mut err = String::new();
+            let raw = crate::ffi_gpu::auto_backend_new(
+                &display.raw,
+                kind,
+                options.drm_device.as_deref().unwrap_or(""),
+                options.width,
+                options.height,
+                &options.title,
+                &mut err,
+            );
+            if raw.is_null() {
+                Err(Error::new(ErrorKind::Backend, err))
+            } else {
+                Ok(Self { raw, _display: Holds::new() })
+            }
+        }
+
+        /// What was picked; never `Auto`.
+        pub fn kind(&self) -> BackendKind {
+            match self.raw.kind() {
+                1 => BackendKind::Nested,
+                2 => BackendKind::Drm,
+                _ => BackendKind::Headless,
+            }
+        }
+
+        /// libinput, then the backend. Every output then arrives as a
+        /// [`BackendEvent::OutputAdded`].
+        pub fn start(&mut self) -> Result<(), Error> {
+            let mut err = String::new();
+            if self.raw.pin_mut().start(&mut err) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Backend, err))
+            }
+        }
+
+        /// The next output that appeared or went away, oldest first. Drain it
+        /// after every `Display::dispatch()`.
+        pub fn next_event(&mut self) -> Option<BackendEvent> {
+            let mut kind = 0;
+            let mut removed = 0;
+            let output = self.raw.pin_mut().next_event(&mut kind, &mut removed);
+            BackendEvent::from_raw(kind, output, removed)
+        }
+
+        /// Where input comes from: the host window nested, libinput on DRM;
+        /// `None` headless.
+        pub fn input(&mut self) -> Option<&mut dyn InputSource> {
+            if self.kind() == BackendKind::Headless {
+                None
+            } else {
+                Some(self)
+            }
+        }
+
+        /// Whether the parent asked our window to close since the last call;
+        /// never on anything but nested.
+        pub fn take_close_request(&mut self) -> bool {
+            self.raw.pin_mut().take_close_request()
+        }
+
+        /// The libseat session, lent out: VT switching and `next_activity()`.
+        /// Only ever on DRM.
+        pub fn session(&self) -> Option<Session<'_>> {
+            self.raw.has_session().then(|| Session {
+                raw: SessionRaw::Lent(self.raw.session()),
+                _display: Holds::new(),
+            })
+        }
+
+        /// On DRM without a session (asked for by name, no seat to join): why.
+        pub fn session_error(&self) -> Option<String> {
+            let error = self.raw.session_error();
+            (!error.is_empty()).then_some(error)
+        }
+
+        /// For `SceneRenderer::new`: on DRM the card, so the GPU that renders
+        /// is the one behind the display.
+        pub fn vulkan_options(&self) -> crate::gpu::VulkanOptions {
+            let mut id = crate::gpu::DrmDeviceId { major: 0, minor: 0 };
+            crate::gpu::VulkanOptions {
+                drm_device: self.raw.drm_device(&mut id).then_some(id),
+            }
+        }
+    }
+
+    impl InputSource for AutoBackend<'_> {
+        fn next_input_event(&mut self) -> Option<InputEvent> {
+            let mut raw = InputEvent::empty_raw();
+            self.raw.pin_mut().next_input_event(&mut raw).then(|| InputEvent::from_raw(raw))
+        }
+        fn keymap(&self) -> String {
+            self.raw.keymap()
+        }
+        fn capabilities(&self) -> InputCapabilities {
+            InputCapabilities::from_bits(self.raw.capabilities())
         }
     }
 }

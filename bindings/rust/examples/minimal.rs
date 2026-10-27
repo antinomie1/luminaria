@@ -26,14 +26,9 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use luminaria::backend::{
-    DrmBackend, DrmEvent, HeadlessBackend, InputEvent, InputSource, LibinputBackend, Output, Session,
-    WaylandBackend,
-};
-use luminaria::core::{Display, Error, KeyRouter};
-use luminaria::gpu::{
-    Cursor, DrmDeviceId, LinuxDmabuf, SceneOutcome, SceneOutput, SceneRenderer, VulkanOptions,
-};
+use luminaria::backend::{AutoBackend, BackendEvent, BackendKind, BackendOptions, InputEvent, Output};
+use luminaria::core::{Display, KeyRouter};
+use luminaria::gpu::{Cursor, LinuxDmabuf, SceneOutcome, SceneOutput, SceneRenderer};
 use luminaria::protocol::{
     Compositor, CursorShapeManager, DataDeviceManager, FractionalScaleManager, OutputGlobal, PopupArea, PopupEvent,
     Presentation, Seat, SinglePixelBufferManager, Subcompositor, SurfaceId, ToplevelEvent,
@@ -72,38 +67,6 @@ const BINDINGS: [(u32, u32, Action); 4] = [
     (LOGO, 0x0071 /* q */, Action::Close),
     (LOGO, 0xff1b /* Escape */, Action::Quit),
 ];
-
-/// `'a` is the display, plus the libseat session on DRM.
-enum Backend<'a> {
-    Nested(WaylandBackend<'a>),
-    Drm {
-        drm: DrmBackend<'a>,
-        input: LibinputBackend<'a>,
-    },
-    Headless(HeadlessBackend<'a>),
-}
-
-impl Backend<'_> {
-    fn start(&mut self) -> Result<(), Error> {
-        match self {
-            Backend::Nested(b) => b.start(),
-            Backend::Drm { drm, input } => {
-                input.start()?;
-                drm.start()
-            }
-            Backend::Headless(b) => b.start(),
-        }
-    }
-
-    /// Where input comes from: the host window nested, libinput on DRM.
-    fn input(&mut self) -> Option<&mut dyn InputSource> {
-        match self {
-            Backend::Nested(b) => Some(b),
-            Backend::Drm { input, .. } => Some(input),
-            Backend::Headless(_) => None,
-        }
-    }
-}
 
 /// One output and what was built for it. Dropped when its monitor goes away.
 /// `'a` is the renderer `state` caches into and the display `_global` is on.
@@ -343,9 +306,16 @@ fn release_held(seat: &Seat, held: &mut Vec<u32>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("LUMINARIA_DRM_DEVICE").ok());
+    let mut backend_options = BackendOptions {
+        drm_device: std::env::args().nth(1).or_else(|| std::env::var("LUMINARIA_DRM_DEVICE").ok()),
+        width: WIDTH,
+        height: HEIGHT,
+        title: "minimal".into(),
+        ..BackendOptions::default()
+    };
+    if let Ok(want) = std::env::var("LUMINARIA_BACKEND") {
+        backend_options.kind = want.parse()?;
+    }
 
     // Declaration order is destruction order, reversed. The renderer first, so
     // it dies last: every output state caches textures it owns, which is why
@@ -354,8 +324,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let renderer;
     let display = Display::new()?;
     display.init_shm()?;
-    // Before the backend: DRM and libinput keep the session borrowed.
-    let mut session: Option<Session> = None;
 
     let _compositor = Compositor::new(&display)?;
     let _subcompositor = Subcompositor::new(&display)?;
@@ -375,66 +343,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Backends after the globals: an output's last `present` must still find
     // the presentation global there.
     //
-    // Picks the backend. Nested and headless come with their one output; DRM's
-    // arrive as `DrmEvent`s once it starts. Also answers which GPU the display
-    // belongs to, so the renderer can be that one. Inline rather than a
-    // function: a DRM backend that fails gives the session back, and only
-    // here can the borrow checker see that its borrow of the session ended.
-    let want = std::env::var("LUMINARIA_BACKEND").unwrap_or_else(|_| "auto".into());
-    let (mut backend, outputs, gpu_options) = 'pick: {
-        if want == "auto" || want == "nested" {
-            match WaylandBackend::new(&display) {
-                Ok(mut nested) => {
-                    let output = nested.add_output(WIDTH, HEIGHT)?;
-                    break 'pick (Backend::Nested(nested), vec![output], VulkanOptions::default());
-                }
-                Err(e) if want == "nested" => return Err(e.into()),
-                Err(_) => {}
-            }
-        }
-        if want == "auto" || want == "drm" {
-            // With a seat a VT switch is safe: DRM master is handed back and
-            // input suspended. Auto only tries DRM with one, so ssh and CI never
-            // land on a VT by accident; asked for explicitly, it also runs without.
-            match Session::new(&display) {
-                Ok(s) => {
-                    session = Some(s);
-                    println!("minimal: session = libseat (VT switching enabled)");
-                }
-                Err(e) if want == "drm" => {
-                    println!("minimal: session = none ({e}); VT switching disabled");
-                }
-                Err(_) => {}
-            }
-            if want == "drm" || session.is_some() {
-                match DrmBackend::new(&display, device.as_deref(), session.as_ref()) {
-                    Ok(drm) => {
-                        let options = VulkanOptions {
-                            drm_device: DrmDeviceId::from_fd(&drm),
-                        };
-                        let input = LibinputBackend::new(&display, session.as_ref())?;
-                        break 'pick (Backend::Drm { drm, input }, Vec::new(), options);
-                    }
-                    Err(e) if want == "drm" => return Err(e.into()),
-                    Err(_) => {}
-                }
-                session = None;
-            }
-        }
-        let mut headless = HeadlessBackend::new(&display, 16)?;
-        let output = headless.add_output(WIDTH, HEIGHT)?;
-        (Backend::Headless(headless), vec![output], VulkanOptions::default())
-    };
-    println!(
-        "minimal: backend = {}",
-        match backend {
-            Backend::Nested(_) => "nested",
-            Backend::Drm { .. } => "drm",
-            Backend::Headless(_) => "headless",
-        }
-    );
+    // Nested, else DRM when a libseat session can be had, else headless; or
+    // the one LUMINARIA_BACKEND names. It owns the session, which outlives the
+    // card and libinput opened through it. Its outputs, nested and headless
+    // included, arrive as `BackendEvent`s once it starts.
+    let mut backend = AutoBackend::new(&display, &backend_options)?;
+    let on_drm = backend.kind() == BackendKind::Drm;
+    let vt_switching = backend.session().is_some();
+    if vt_switching {
+        println!("minimal: session = libseat (VT switching enabled)");
+    } else if let Some(e) = backend.session_error().filter(|_| on_drm) {
+        println!("minimal: session = none ({e}); VT switching disabled");
+    }
+    println!("minimal: backend = {}", backend.kind());
 
-    renderer = SceneRenderer::new(&gpu_options)?;
+    renderer = SceneRenderer::new(&backend.vulkan_options())?;
     if renderer.gpu_enabled() {
         println!("minimal: renderer = GPU");
     } else {
@@ -449,9 +372,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new_with_shapes(&renderer, &layout, &seat, &cursor_shape)?;
 
     let mut screens: Vec<Screen> = Vec::new();
-    for output in outputs {
-        add_screen(&display, &renderer, &layout, &mut screens, output);
-    }
 
     let socket = display.add_socket_auto()?;
     backend.start()?;
@@ -466,8 +386,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let caps = source.capabilities();
         seat.set_capabilities(caps.keyboard, caps.pointer, false);
     }
-    let on_drm = matches!(backend, Backend::Drm { .. });
-    let vt_switching = session.is_some();
     println!("minimal: WAYLAND_DISPLAY={socket} — Logo+Return opens a terminal, Logo+Escape quits");
 
     let mut stack: Vec<SurfaceId> = Vec::new(); // bottom to top
@@ -492,26 +410,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // --- outputs ---------------------------------------------------------
 
-        if let Backend::Drm { drm, .. } = &mut backend {
-            while let Some(event) = drm.next_event() {
-                match event {
-                    DrmEvent::OutputAdded(output) => {
-                        add_screen(&display, &renderer, &layout, &mut screens, output);
-                        // libinput only reports deltas: the pointer starts mid-screen.
-                        if cursor.position().is_none() {
-                            let b = layout.bounds();
-                            let (x, y) = (b.x as f64 + b.width as f64 / 2.0, b.y as f64 + b.height as f64 / 2.0);
-                            cursor.move_to(x, y, b);
-                        }
-                    }
-                    DrmEvent::OutputRemoved(id) => {
-                        // The layout has already let go of it.
-                        println!("minimal: output removed");
-                        screens.retain(|s| s.output.id() != id);
+        while let Some(event) = backend.next_event() {
+            match event {
+                BackendEvent::OutputAdded(output) => {
+                    add_screen(&display, &renderer, &layout, &mut screens, output);
+                    // libinput only reports deltas: the pointer starts mid-screen.
+                    if on_drm && cursor.position().is_none() {
+                        let b = layout.bounds();
+                        let (x, y) = (b.x as f64 + b.width as f64 / 2.0, b.y as f64 + b.height as f64 / 2.0);
+                        cursor.move_to(x, y, b);
                     }
                 }
-                relayout = true;
+                BackendEvent::OutputRemoved(id) => {
+                    // The layout has already let go of it.
+                    println!("minimal: output removed");
+                    screens.retain(|s| s.output.id() != id);
+                }
             }
+            relayout = true;
         }
         // Everything sized for the old mode is rebuilt.
         for s in &mut screens {
@@ -665,16 +581,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        if let Backend::Nested(nested) = &mut backend
-            && nested.take_close_request()
-        {
+        if backend.take_close_request() {
             break 'run;
         }
         for command in commands {
             match command {
                 KeyCommand::SwitchVt(vt) => {
                     release_held(&seat, &mut held);
-                    if let Some(s) = &session {
+                    if let Some(s) = backend.session() {
                         let _ = s.switch_to(vt);
                     }
                 }
@@ -699,7 +613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if let Some(sess) = &session {
+        if let Some(sess) = backend.session() {
             while let Some(active) = sess.next_activity() {
                 if active {
                     println!("minimal: session active — VT switched in");

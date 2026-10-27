@@ -369,7 +369,7 @@ target("luminaria-gpu")
     set_kind("static")
     luminaria_defaults()
     add_deps("luminaria")
-    add_files("src/luminaria.gpu.cppm", "src/backend/drm.cppm",
+    add_files("src/luminaria.gpu.cppm", "src/backend/auto_backend.cppm", "src/backend/drm.cppm",
               "src/backend/libinput.cppm", "src/backend/session.cppm",
               "src/protocol/drm_syncobj.cppm", "src/protocol/linux_dmabuf.cppm",
               "src/protocol/screencopy.cppm", "src/render/vulkan.cppm",
@@ -465,6 +465,7 @@ target("minimal")
 -- when the machine has no GPU / no free VT / no seat, so that counts as a pass.
 
 local gpu_tests = {
+    test_auto_backend = true,
     test_client_texture = true, test_composite = true, test_cursor_capture = true,
     test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
     test_frame_animation = true,

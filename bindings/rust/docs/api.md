@@ -54,7 +54,8 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 
 | 类型 | 借用的对象 |
 |---|---|
-| 所有协议 global（`Compositor<'d>`、`Seat<'d>`、`XdgShell<'d>`、`Presentation<'d>`……）、`HeadlessBackend<'d>`、`WaylandBackend<'d>`、`Session<'d>`、`EventLoop<'d>` | `Display` |
+| 所有协议 global（`Compositor<'d>`、`Seat<'d>`、`XdgShell<'d>`、`Presentation<'d>`……）、`HeadlessBackend<'d>`、`WaylandBackend<'d>`、`AutoBackend<'d>`、`Session<'d>`、`EventLoop<'d>` | `Display` |
+| `AutoBackend::session()` 借出的 `Session<'_>` | 那个 `AutoBackend`（会话归它所有） |
 | `DrmBackend<'a>`、`LibinputBackend<'a>` | `Display`，以及传入的 `Session` |
 | `DataDeviceManager<'a>`、`PrimarySelectionManager<'a>`、`RelativePointerManager<'a>`、`PointerConstraints<'a>`、`TextInputManager<'a>` | `Display`、`Seat` |
 | `DataControlManager<'a>` | `Display`、`DataDeviceManager` |
@@ -81,7 +82,9 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
   所以和输出有关的都在运行时兜底：`Output` 自己变成空操作（`is_alive()` 为 false）；`OutputLayout` 与 `SceneOutput`
   自动解除绑定；`DirectScanout` 不再调用它；`Frame` 随输出一起销毁，之后 `reset` / `submit` 返回错误、其余方法为空操作。
 - **结构体不能同时装被借者和借用者**（自引用）。把被借的放在外层——`main` 的局部变量，或一个只装它们的结构体——
-  再让装 `Cursor<'a>`、`SceneOutput<'a>` 的结构体借用它们，如 `examples/minimal.rs` 的 `Screen<'a>`、`Backend<'a>`。
+  再让装 `Cursor<'a>`、`SceneOutput<'a>` 的结构体借用它们，如 `examples/minimal.rs` 的 `Screen<'a>`。
+  会话、显卡、libinput 这一组本来就是这种关系（后两者借前者），所以由 `AutoBackend` 在 C++ 一侧一起持有，
+  Rust 只借 `Display`。
 
 ---
 
@@ -223,6 +226,21 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   backend.start()?;
   ```
 - **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器经 `DrmBackend::next_event()` 到来与离开，输入见下一节，VT 切换经 `Session::next_activity()`；见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
+- **`AutoBackend`**（特性 `gpu`，C++ `AutoBackend`）：替调用者挑后端。auto 依次试嵌套、能拿到 libseat 会话时的
+  DRM（ssh、CI 因此不会误上 VT）、无头；按名字要某一种时失败就是错误而不回退，DRM 这时没有会话也照跑。
+  会话、显卡、libinput 都归它，Rust 只借 `Display`。读环境变量仍是调用者的事，`"auto".parse::<BackendKind>()`
+  负责解析那四个名字。
+  ```rust
+  let options = BackendOptions { kind: std::env::var("LUMINARIA_BACKEND")?.parse()?, ..Default::default() };
+  let mut backend = AutoBackend::new(&display, &options)?;      // 宽高、窗口标题、显卡路径都在 options 里
+  let renderer = SceneRenderer::new(&backend.vulkan_options())?; // DRM 上是屏幕背后那块 GPU
+  backend.start()?;                                             // 先 libinput，后后端
+  while let Some(event) = backend.next_event() { /* BackendEvent::OutputAdded / OutputRemoved */ }
+  if let Some(source) = backend.input() { /* 嵌套或 libinput；无头为 None */ }
+  if backend.take_close_request() { /* 只有嵌套会有 */ }
+  if let Some(session) = backend.session() { session.switch_to(2)?; } // 只在 DRM 上
+  ```
+  嵌套与无头那一块输出也以 `BackendEvent::OutputAdded` 到来（`start()` 时），所以三种后端只有一条输出路径。
 
 ### 输入：`InputSource`
 嵌套的 `WaylandBackend` 与裸机的 `LibinputBackend` 都实现 `InputSource` trait，给出同一个 `InputEvent`。
@@ -677,7 +695,8 @@ let renderer = SceneRenderer::new(&options)?;
 - **`LibinputBackend` 是一个 `InputSource`**（见 §3「输入」）：按键、修饰键、相对移动、按钮、滚轮
   （平滑量 + 刻度 + 停止标记）、触摸（down/motion/up/frame/cancel，坐标归一化到触摸屏）、设备能力变化。
   另有 `set_keymap()`，以及对应 `create_path()` 的 `LibinputBackend::new_path()`。
-- **`DrmBackend::next_event() -> Option<DrmEvent>`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`。
+- **`DrmBackend::next_event() -> Option<BackendEvent>`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`
+  （原名 `DrmEvent`；`AutoBackend::next_event()` 给的也是它，于是改了名）。
   `start()` 时已有的显示器也以 `OutputAdded` 到来。显示器被拔掉后，手里的 `Output` 仍可安全调用，只是一切都成了
   空操作（`Output::is_alive()` 为 false），收到 `OutputRemoved` 时丢掉即可。`Output::id()` 是比较身份用的。
 - **`OutputLayout::add_auto()` / `bounds()`**：从左到右排；所有输出的外框，相对指针就夹在里面。
@@ -711,7 +730,7 @@ ADR 0003 约束的是**核心模块**收什么协议；Vulkan 本来就在 `lumi
 
 ### 9.5 `examples/minimal.rs` 与 C++ 版的对齐情况
 
-有了 9.2 和 9.3，`minimal.rs` 加上了与 `minimal.cpp` 相同的后端选择：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
+`minimal.rs` 与 `minimal.cpp` 的后端选择相同：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
 auto 依次尝试嵌套、能拿到 libseat 会话时的 DRM、无头；显卡取第一个参数或 `LUMINARIA_DRM_DEVICE`；
 Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满第一块；显示器热插拔、模式变化、VT 切走时放开
 按键、DRM 上每秒一行帧统计，都与 C++ 版一致。有了 §4 的事件，弹出菜单也一致了：`PopupTree` 把 popup 放进场景，
@@ -720,6 +739,12 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 它们的用法见 `tests/test_layer_shell.rs`、`tests/test_session_lock.rs`。
 
 与 C++ 版曾有的差别现已全部补齐，两个示例在行为上已经一致：
+
+- **后端由库来挑**：两边都只读环境变量、填一个 `BackendOptions`，交给 `AutoBackend`。之前两边各自写了约 50 行
+  挑后端的代码，每个基于本库的混成器都会照抄一遍；Rust 版还为此带着一个本地 `enum Backend` 和一个 `'pick:`
+  标签块——DRM 失败时要把会话还回来，而只有写在 `main` 里借用检查器才看得出那次借用已经结束。现在会话归
+  `AutoBackend`，这些都不需要了；`backend.session()` 在用到时临时借出会话。两边启动时都打印
+  `minimal: backend = …`。
 
 - **输入只有一条路径**：两个示例都把嵌套和 libinput 当作同一个 `InputSource`，一个处理函数。之前各写两遍，
   Rust 的嵌套路径把滚轮的刻度和平滑量都发给客户端，每格滚两次；C++ 版与 DRM 路径只发刻度。现在这条规则在

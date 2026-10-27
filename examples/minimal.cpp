@@ -118,10 +118,14 @@ int main(int argc, char** argv) {
     // its tail exactly when it matters — a crash, or a VT taken away.
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::signal(SIGCHLD, SIG_IGN); // spawned terminals reap themselves
-    const std::string_view want = std::getenv("LUMINARIA_BACKEND") != nullptr
-                                      ? std::getenv("LUMINARIA_BACKEND")
-                                      : "auto";
-    const char* device = argc > 1 ? argv[1] : std::getenv("LUMINARIA_DRM_DEVICE");
+    lm::BackendOptions backend_options{.title = "minimal"};
+    if (const char* want = std::getenv("LUMINARIA_BACKEND"); want != nullptr) {
+        backend_options.kind = must(lm::parse_backend_kind(want), "LUMINARIA_BACKEND");
+    }
+    if (const char* device = argc > 1 ? argv[1] : std::getenv("LUMINARIA_DRM_DEVICE");
+        device != nullptr) {
+        backend_options.drm_device = device;
+    }
 
     // Declaration order is destruction order, reversed. The renderer first, so
     // it dies last: every output state caches textures it owns. It is created
@@ -129,7 +133,6 @@ int main(int argc, char** argv) {
     std::optional<lm::SceneRenderer> renderer;
     auto display = must(lm::Display::create(), "display");
     must(display.init_shm(), "wl_shm");
-    std::optional<lm::Session> session;
 
     auto compositor = must(lm::Compositor::create(display), "wl_compositor");
     auto subcompositor = must(lm::Subcompositor::create(display), "wl_subcompositor");
@@ -148,59 +151,26 @@ int main(int argc, char** argv) {
 
     // Backends after the globals: an output's last `present` must still find
     // the presentation global there.
-    std::unique_ptr<lm::Backend> backend;
-    lm::WaylandBackend* nested = nullptr;
-    std::optional<lm::LibinputBackend> input;
-    lm::InputSource* source = nullptr; // whichever of the two this backend has; none headless
-    lm::VulkanOptions gpu_options;
-    if (want == "auto" || want == "nested") {
-        if (auto wb = lm::WaylandBackend::create(display.event_loop()); wb) {
-            auto owned = std::make_unique<lm::WaylandBackend>(std::move(*wb));
-            nested = owned.get();
-            source = nested;
-            nested->add_output(1280, 800, "minimal");
-            backend = std::move(owned);
-        } else if (want == "nested") {
-            die("nested backend", wb.error());
-        }
+    // Nested, else DRM when a libseat session can be had, else headless; or
+    // the one LUMINARIA_BACKEND names. It owns the session, which outlives the
+    // card and libinput opened through it.
+    auto picked = must(lm::AutoBackend::create(display.event_loop(), backend_options), "backend");
+    const bool on_drm = picked.kind() == lm::BackendKind::drm;
+    lm::WaylandBackend* nested = picked.nested();
+    lm::InputSource* source = picked.input(); // none headless
+    lm::Session* session = picked.session();
+    if (session != nullptr) {
+        std::printf("minimal: session = libseat (VT switching enabled)\n");
+    } else if (on_drm) {
+        std::printf("minimal: session = none (%.*s); VT switching disabled\n",
+                    static_cast<int>(picked.session_error().size()),
+                    picked.session_error().data());
     }
-    if (backend == nullptr && (want == "auto" || want == "drm")) {
-        // With a seat a VT switch is safe: DRM master is handed back and input
-        // suspended. Auto only tries DRM with one, so ssh and CI never land on
-        // a VT by accident; asked for explicitly, it also runs without.
-        if (auto s = lm::Session::create(display.event_loop()); s) {
-            session.emplace(std::move(*s));
-            std::printf("minimal: session = libseat (VT switching enabled)\n");
-        } else if (want == "drm") {
-            std::printf("minimal: session = none (%s); VT switching disabled\n",
-                        s.error().message.c_str());
-        }
-        lm::Session* seat_session = session.has_value() ? &*session : nullptr;
-        if (want == "drm" || seat_session != nullptr) {
-            auto drm = device != nullptr
-                           ? lm::DrmBackend::create(display.event_loop(), device, seat_session)
-                           : lm::DrmBackend::create(display.event_loop(), seat_session);
-            if (!drm) {
-                if (want == "drm") {
-                    die("drm", drm.error());
-                }
-                session.reset();
-            } else {
-                gpu_options.drm_device = lm::drm_device_id(drm->fd());
-                backend = std::make_unique<lm::DrmBackend>(std::move(*drm));
-                input.emplace(
-                    must(lm::LibinputBackend::create(display.event_loop(), seat_session), "input"));
-                source = &*input;
-            }
-        }
-    }
-    if (backend == nullptr) {
-        auto owned = std::make_unique<lm::HeadlessBackend>(display.event_loop());
-        owned->add_output(1280, 800);
-        backend = std::move(owned);
-    }
+    std::printf("minimal: backend = %.*s\n",
+                static_cast<int>(lm::backend_kind_name(picked.kind()).size()),
+                lm::backend_kind_name(picked.kind()).data());
 
-    renderer.emplace(gpu_options);
+    renderer.emplace(picked.vulkan_options());
     if (renderer->gpu_enabled()) {
         std::printf("minimal: renderer = %.*s\n",
                     static_cast<int>(renderer->gpu()->device_name().size()),
@@ -411,7 +381,7 @@ int main(int argc, char** argv) {
         cursor.refresh();
         schedule_all();
     };
-    auto new_output = backend->new_output.connect([&](lm::NewOutput& e) {
+    auto new_output = picked.backend().new_output.connect([&](lm::NewOutput& e) {
         lm::Output& output = e.output;
         Screen& screen = screens.emplace_back();
         screen.output = &output;
@@ -477,7 +447,7 @@ int main(int argc, char** argv) {
             relayout();
         });
         // libinput only reports deltas: the pointer starts mid-screen.
-        if (input.has_value() && !cursor.pointer().present()) {
+        if (on_drm && !cursor.pointer().present()) {
             cursor.move_to(box.x + box.width / 2.0, box.y + box.height / 2.0);
         }
         relayout();
@@ -532,7 +502,7 @@ int main(int argc, char** argv) {
         // is what happens to the key that switched VTs away.
         (void)keys.unconsume(e.keycode);
         // Ctrl+Alt+Fn, which the keymap itself turns into XF86Switch_VT_n.
-        if (session.has_value() && e.keysym >= XKB_KEY_XF86Switch_VT_1 &&
+        if (session != nullptr && e.keysym >= XKB_KEY_XF86Switch_VT_1 &&
             e.keysym <= XKB_KEY_XF86Switch_VT_12) {
             keys.consume(e.keycode);
             release_held();
@@ -615,7 +585,7 @@ int main(int argc, char** argv) {
         on_close = nested->close_requested.connect([&](lm::HostCloseRequest&) { display.terminate(); });
     }
     Conn<lm::SessionActive> on_session;
-    if (session.has_value()) {
+    if (session != nullptr) {
         on_session = session->activity().connect([&](lm::SessionActive& e) {
             std::printf("minimal: session %s\n",
                         e.active ? "active — VT switched in" : "inactive — VT switched away");
@@ -631,10 +601,7 @@ int main(int argc, char** argv) {
 
     const std::string socket = must(display.add_socket_auto(), "socket");
     setenv("WAYLAND_DISPLAY", socket.c_str(), 1); // for what Logo+Return spawns
-    if (input.has_value()) {
-        must(input->start(), "libinput");
-    }
-    must(backend->start(), "backend");
+    must(picked.start(), "backend");
     // What arrived before anything was listening: the nested keymap and seat
     // come with the connection, libinput's devices with start().
     if (source != nullptr) {
@@ -649,7 +616,7 @@ int main(int argc, char** argv) {
                 socket.c_str());
 
     lm::EventSource stats;
-    if (input.has_value()) {
+    if (on_drm) {
         stats = display.event_loop().add_timer([&] {
             if (!(frames == reported)) {
                 std::printf("minimal: frames/s composited=%u scanout=%u unchanged=%u cpu=%u\n",

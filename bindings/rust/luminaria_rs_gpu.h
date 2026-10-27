@@ -89,6 +89,41 @@ std::unique_ptr<LibinputBackendShim> libinput_backend_new_standalone(const Displ
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_path(const DisplayShim& display, const SessionShim& session, rust::String& error);
 std::unique_ptr<LibinputBackendShim> libinput_backend_new_path_standalone(const DisplayShim& display, rust::String& error);
 
+// The backend luminaria picks (lm::AutoBackend), with its outputs, input and
+// close requests queued for Rust the way the single backends queue theirs.
+class AutoBackendShim {
+public:
+    ~AutoBackendShim();
+    AutoBackendShim(const AutoBackendShim&) = delete;
+    AutoBackendShim& operator=(const AutoBackendShim&) = delete;
+
+    // 1 = nested, 2 = drm, 3 = headless.
+    std::uint32_t kind() const;
+    bool start(rust::String& error);
+    // As DrmBackendShim::next_event; nested and headless report theirs at start.
+    std::unique_ptr<OutputShim> next_event(std::uint32_t& kind, std::uint64_t& removed);
+    bool next_input_event(InputEventRaw& out);
+    rust::String keymap() const;
+    std::uint32_t capabilities() const;
+    bool take_close_request();
+    bool has_session() const;
+    // Only when has_session(); borrowed from the backend, which owns it.
+    const SessionShim& session() const;
+    rust::String session_error() const;
+    bool drm_device(DrmDeviceId& out) const;
+
+    struct Impl;
+    Impl& impl() const;
+    explicit AutoBackendShim(std::unique_ptr<Impl> impl) noexcept;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+// kind: 0 = auto, 1 = nested, 2 = drm, 3 = headless. An empty device: the first card with a monitor.
+std::unique_ptr<AutoBackendShim> auto_backend_new(const DisplayShim& display, std::uint32_t kind, rust::Str drm_device,
+                                                  std::int32_t width, std::int32_t height, rust::Str title,
+                                                  rust::String& error);
+
 // ============================================================================
 // GPU Protocols & Rendering
 // ============================================================================

@@ -76,7 +76,7 @@ src/luminaria.desktop.cppm desktop primary interface — privileged shell protoc
 src/luminaria.text.cppm  text primary interface — fcft glyph rasterization
 src/core/                display event_loop expected handle signal
 src/util/                box color dmabuf keymap pixel pixel_layout rect_fill region transform
-src/backend/             backend output input_event session drm headless libinput wayland
+src/backend/             backend output input_event session drm headless libinput wayland auto_backend
 src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
 src/shell/               cpu_compositor cursor cursor_manager frame scene scene_renderer output_layout direct_scanout
 src/protocol/            the 25 Wayland globals, one file each
@@ -167,7 +167,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   monitor goes away and `Output::mode_changed` when a `set_mode()` lands — everything
   sized for the old mode (scanout targets, scanout imports, the layout box, the
   `OutputGlobal`) has to be rebuilt there. `Session` (libseat, `session.cppm`) owns the device fds and tells
-  both bare-metal backends when the VT is taken away.
+  both bare-metal backends when the VT is taken away. `AutoBackend` (`auto_backend.cppm`,
+  `luminaria.gpu`) is the pick every compositor would otherwise copy: nested, else DRM only
+  when a `Session` can be had (so ssh/CI never land on a VT), else headless — or the one kind
+  asked for, failing rather than falling back. It owns session, card and libinput (session
+  destroyed last), hands back the `InputSource*`, `WaylandBackend*`, `Session*` and the
+  `VulkanOptions` for the GPU behind the card, and `start()`s libinput before the backend.
   **`frame` is asked for, not free-running.** One `Output::schedule_frame()` buys one `frame`
   event; committing does NOT implicitly buy the next one. An idle screen therefore subscribes
   to no vblank and wakes nobody — DRM's frames come from page-flip completions (plus a 1ms

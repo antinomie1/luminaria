@@ -48,6 +48,10 @@ name = "test_backend"
 required-features = ["gpu"]
 
 [[test]]
+name = "test_auto_backend"
+required-features = ["gpu"]
+
+[[test]]
 name = "test_gpu"
 required-features = ["gpu"]
 

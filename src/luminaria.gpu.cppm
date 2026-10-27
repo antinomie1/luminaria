@@ -3,6 +3,7 @@
 export module luminaria.gpu;
 
 export import luminaria;
+export import :auto_backend;
 export import :cursor;
 export import :direct_scanout;
 export import :drm;

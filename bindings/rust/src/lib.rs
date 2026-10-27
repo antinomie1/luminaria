@@ -23,7 +23,7 @@
 //! who has the keyboard, what a key does) stays in the caller:
 //! - [`util`]: Rect, Color, Transform, Region, KeymapState, Pixel, resize edges.
 //! - [`core`]: Display, EventLoop, Error, KeyRouter.
-//! - [`backend`]: Output, HeadlessBackend, WaylandBackend, and (with `gpu`) DrmBackend, LibinputBackend, Session.
+//! - [`backend`]: Output, HeadlessBackend, WaylandBackend, and (with `gpu`) DrmBackend, LibinputBackend, Session, and AutoBackend, which picks among them.
 //! - [`protocol`]: Compositor, Subcompositor, XdgShell, Seat, LayerShell, and core protocol managers.
 //! - [`gpu`]: VulkanRenderer, SceneRenderer, Frame, Cursor, DirectScanout, LinuxDmabuf, Screencopy.
 //! - [`desktop`]: ForeignToplevelManager, WorkspaceManager, SessionLockManager, OutputManager, DataControlManager, InputMethodManager.

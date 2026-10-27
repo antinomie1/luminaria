@@ -79,6 +79,21 @@ pub(crate) mod ffi {
         fn set_keymap(self: Pin<&mut LibinputBackendShim>, xkb_text: &str) -> bool;
         fn capabilities(self: &LibinputBackendShim) -> u32;
 
+        // The backend luminaria picks (AutoBackend): kind 0 auto, 1 nested, 2 drm, 3 headless.
+        type AutoBackendShim;
+        fn auto_backend_new(display: &DisplayShim, kind: u32, drm_device: &str, width: i32, height: i32, title: &str, error: &mut String) -> UniquePtr<AutoBackendShim>;
+        fn kind(self: &AutoBackendShim) -> u32;
+        fn start(self: Pin<&mut AutoBackendShim>, error: &mut String) -> bool;
+        fn next_event(self: Pin<&mut AutoBackendShim>, kind: &mut u32, removed: &mut u64) -> UniquePtr<OutputShim>;
+        fn next_input_event(self: Pin<&mut AutoBackendShim>, out: &mut InputEventRaw) -> bool;
+        fn keymap(self: &AutoBackendShim) -> String;
+        fn capabilities(self: &AutoBackendShim) -> u32;
+        fn take_close_request(self: Pin<&mut AutoBackendShim>) -> bool;
+        fn has_session(self: &AutoBackendShim) -> bool;
+        fn session(self: &AutoBackendShim) -> &SessionShim;
+        fn session_error(self: &AutoBackendShim) -> String;
+        fn drm_device(self: &AutoBackendShim, out: &mut DrmDeviceId) -> bool;
+
         // GPU protocols.
         type DrmSyncobjManagerShim;
         fn drm_syncobj_manager_new(display: &DisplayShim, error: &mut String) -> UniquePtr<DrmSyncobjManagerShim>;
