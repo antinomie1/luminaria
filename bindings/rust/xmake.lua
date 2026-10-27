@@ -16,14 +16,14 @@ option("cxxbridge")
     set_description("cxx-build's $OUT_DIR/cxxbridge (holds rust/cxx.h and the bridge headers)")
 option_end()
 
--- Which C++ modules to build, comma separated: "core", "core,gpu",
--- "core,gpu,desktop", ... The shim target adds the matching luminaria targets
--- and shim .cpp files, so a core-only build never compiles or links the GPU or
--- desktop shims. build.rs derives it from the cargo features (ADR 0003).
+-- Which C++ modules to build, comma separated: "core", "core,shell",
+-- "core,shell,desktop", ... The shim target adds the matching luminaria targets
+-- and shim .cpp files, so a core-only build never compiles or links the compositor
+-- or desktop shims. build.rs derives it from the cargo features (ADR 0008).
 option("modules")
     set_default("core")
     set_showmenu(true)
-    set_description("C++ modules to build: core,gpu,desktop,text")
+    set_description("C++ modules to build: core,backend,render,shell,desktop,text")
 option_end()
 
 -- LUMINARIA_SANITIZE=address|undefined, passed down by build.rs. Root scope on
@@ -60,9 +60,17 @@ target("luminaria-rs")
 
     add_deps("luminaria")
     add_files(path.join(os.scriptdir(), "luminaria_rs.cpp"))
-    if enabled["gpu"] then
-        add_deps("luminaria-gpu")
-        add_files(path.join(os.scriptdir(), "luminaria_rs_gpu.cpp"))
+    if enabled["backend"] then
+        add_deps("luminaria-backend")
+        add_files(path.join(os.scriptdir(), "luminaria_rs_backend.cpp"))
+    end
+    if enabled["render"] then
+        add_deps("luminaria-render")
+        add_files(path.join(os.scriptdir(), "luminaria_rs_render.cpp"))
+    end
+    if enabled["shell"] or enabled["gpu"] then
+        add_deps("luminaria-shell")
+        add_files(path.join(os.scriptdir(), "luminaria_rs_shell.cpp"))
     end
     if enabled["desktop"] then
         add_deps("luminaria-desktop")

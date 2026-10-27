@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace {

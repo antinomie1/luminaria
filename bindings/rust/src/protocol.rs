@@ -298,15 +298,17 @@ impl OutputGlobal<'_> {
 }
 
 /// An Xcursor theme.
+#[cfg(feature = "shell")]
 pub struct CursorTheme {
     #[allow(dead_code)]
-    pub(crate) raw: cxx::UniquePtr<ffi::CursorThemeShim>,
+    pub(crate) raw: cxx::UniquePtr<crate::ffi_shell::CursorThemeShim>,
 }
 
+#[cfg(feature = "shell")]
 impl CursorTheme {
     pub fn load(name: &str, size: i32) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::cursor_theme_load(name, size, &mut err);
+        let raw = crate::ffi_shell::cursor_theme_load(name, size, &mut err);
         if raw.is_null() {
             Err(Error::new(ErrorKind::Protocol, err))
         } else {

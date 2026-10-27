@@ -28,7 +28,7 @@
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
 
-import luminaria.gpu;
+import luminaria.render;
 import std;
 
 namespace {

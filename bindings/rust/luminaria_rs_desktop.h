@@ -5,7 +5,6 @@
 #include <memory>
 
 #include "luminaria/luminaria_rs.h"
-#include "luminaria/luminaria_rs_gpu.h"
 
 namespace lum {
 

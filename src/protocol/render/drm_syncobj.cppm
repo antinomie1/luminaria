@@ -21,7 +21,7 @@ module;
 #include <xf86drm.h>
 #include "linux-drm-syncobj-v1-protocol.h"
 
-export module luminaria.gpu:drm_syncobj;
+export module luminaria.render:drm_syncobj;
 
 import std;
 

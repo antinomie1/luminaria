@@ -27,7 +27,7 @@ extern "C" {
 #include <libseat.h>
 }
 
-export module luminaria.gpu:session;
+export module luminaria.backend:session;
 
 import std;
 

@@ -23,7 +23,7 @@ module;
 #include "ext-image-copy-capture-v1-protocol.h"
 #include "ext-image-capture-source-v1-protocol.h"
 
-export module luminaria.gpu:screencopy;
+export module luminaria.render:screencopy;
 
 import std;
 

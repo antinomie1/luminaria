@@ -22,20 +22,11 @@ module;
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-export module luminaria:wayland;
+export module luminaria.backend:wayland;
 
 import std;
 
-import :backend;
-import :color;
-import :dmabuf;
-import :event_loop;
-import :expected;
-import :input_event;
-import :keymap;
-import :output;
-import :pixel;
-import :signal;
+import luminaria;
 
 export namespace luminaria {
 
@@ -170,7 +161,7 @@ wl_buffer* make_solid_buffer(wl_shm* shm, int w, int h, Color color) {
 // Lifted out of the anonymous namespace: the backend's Impl holds
 // `std::vector<std::unique_ptr<WaylandOutput>>`, and clang instantiates the
 // allocator comparisons at module scope — a TU-local element type in those is
-// ill-formed. Still unexported, so it stays private to module luminaria.gpu.
+// ill-formed. Still unexported, so it stays private to module luminaria.backend.
 class WaylandOutput final : public Output {
 public:
     /// Kick a frame from outside (the very first one, before the parent's

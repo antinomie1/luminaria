@@ -93,7 +93,7 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 
   两条路径合起来还有第三样东西：**场景表**。`SceneItem`（`luminaria:scene`，核心模块）是一张
   有序列表，四种图元——客户端表面树、纯色矩形、窗口边框、混成器自己的像素块——`SceneRenderer`
-  （`luminaria.gpu:scene_renderer`）拿它去喂 `Frame` 或 `CpuCompositor`，`scene_hit_test()`
+  （`luminaria.shell:scene_renderer`）拿它去喂 `Frame` 或 `CpuCompositor`，`scene_hit_test()`
   拿同一张表回答"这个点上是什么"。这是为了让上层只写一遍：在它之前，每个基于本库的混成器都得
   把每种图元实现两次（一次 `Placement`、一次 `CpuItem`），而且没有编译器会告诉你两边什么时候
   开始不一致。降级也全在运行时——没有 Vulkan 设备、某个输出配不出渲染目标、`submit()` 答
@@ -154,25 +154,29 @@ KMS 光标平面或合成）。示例只剩"窗口放哪、谁拿键盘、按键
 `src/` 按职责分目录，分区名则是扁平的（跟文件名走，不跟路径走），所以挪动文件不构成 API 变化。
 
 ```
-src/luminaria.cppm       基础接口单元（协议 + core + 嵌套/headless）
-src/luminaria.gpu.cppm   Vulkan / DRM / libinput / session / GPU 协议
-src/luminaria.desktop.cppm  workspace / foreign-toplevel / data-control / output-management …
-src/luminaria.text.cppm  fcft 字形栅格化与字体度量（默认不构建：另需 fcft + pixman）
-src/core/                display event_loop expected handle signal
-src/util/                box color dmabuf keymap pixel rect_fill region transform
-src/backend/             backend output input_event session drm headless libinput wayland
-src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
-src/shell/               cpu_compositor frame scene scene_renderer output_layout direct_scanout
-src/text/                text（luminaria.text 的唯一分区）
-src/protocol/            30 个 Wayland global，一个一文件
-src/detail/wayland_fwd.h 唯一剩下的头文件
+src/luminaria.cppm         基础接口单元（纯协议 + core 机制内核 + Backend/Output 抽象）
+src/luminaria.backend.cppm 后端接口单元（headless / 嵌套 / DRM / libinput / session）
+src/luminaria.render.cppm  渲染接口单元（Vulkan / CPU 合成器 / dmabuf / syncobj / screencopy）
+src/luminaria.shell.cppm   外壳接口单元（Frame / SceneRenderer / Cursor / DirectScanout / AutoBackend）
+src/luminaria.desktop.cppm 桌面特权协议（workspace / foreign-toplevel / data-control / output-management …）
+src/luminaria.text.cppm    字形栅格化与字体度量（fcft + pixman，按需链接）
+src/core/                  display event_loop expected handle signal input_router match protocol_helper
+src/util/                  blur box color dmabuf keymap pixel pixel_layout rect_fill region transform
+src/backend/base/          backend output input_event output_layout（属于 core 的抽象层）
+src/backend/               drm headless libinput session wayland
+src/render/                vulkan cpu_compositor + 着色器 SPIR-V
+src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
+src/protocol/core/         27 个纯 Wayland 协议
+src/protocol/render/       drm_syncobj linux_dmabuf screencopy
+src/protocol/desktop/      data_control foreign_toplevel input_method output_management session_lock workspace
+src/detail/wayland_fwd.h   唯一剩下的头文件
 ```
 
-公开 module 的边界见 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)：
-只用 `import luminaria;` 不会编译或链接 Vulkan、libdrm、libinput、libseat 或 GBM；
-桌面专用的三个高权限协议也不会进入基础接口。扩展 module 会 `export import luminaria`，
-所以需要 GPU 的下游只写 `import luminaria.gpu;` 即可。第四个 `luminaria.text`
-（`Font`/`decode_utf8`，依赖 fcft + pixman）同样只按需链接，Rust 绑定把它做成 `text` 特性。
+公开 module 的层级关系见 [ADR 0008](./adr/0008-module-layering.md)（取代原 [ADR 0003](./adr/0003-module-split-and-protocol-admission.md)）：
+依赖严格单向朝下流（`core` ← `{backend, render, desktop}` ← `shell`）。
+只用 `import luminaria;` 仅需 `wayland-server` + `xkbcommon`；后端驱动与渲染引擎解耦，
+编写普通混成器的下游直接写 `import luminaria.shell;`（内部自动 re-export 了 backend 与 render）。
+`luminaria.text`（`Font`/`decode_utf8`，依赖 fcft + pixman）同样按需链接，Rust 绑定把它做成 `text` 特性。
 
 每个 `.cppm` **接口与实现同文件**：先是 `export namespace luminaria { … }`，然后一条
 `// --- implementation` 分隔线，之后是 pimpl 的 `struct X::Impl`、匿名 namespace 里的

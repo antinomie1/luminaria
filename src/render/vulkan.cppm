@@ -24,7 +24,7 @@ module;
 #include "kawase_up_frag_spv.h"
 #include "solid_frag_spv.h"
 
-export module luminaria.gpu:vulkan;
+export module luminaria.render:vulkan;
 
 import std;
 
@@ -99,14 +99,17 @@ public:
 
     [[nodiscard]] ShaderDamage damage() const noexcept;
 
+    /// Identity of the program, for callers that cache per-shader state (the
+    /// frame ledger keys its placement diff on it). Distinct per compiled
+    /// shader and stable for its lifetime.
+    [[nodiscard]] std::uint64_t id() const noexcept;
+
     struct Impl;
 
 private:
     friend class VulkanRenderer;
-    friend class Frame;
     std::unique_ptr<Impl> impl_;
     explicit FragmentShader(std::unique_ptr<Impl> impl) noexcept;
-    [[nodiscard]] std::uint64_t id() const noexcept;
 };
 
 /// A GPU render target that is also a dmabuf, so KMS can scan it out directly:
@@ -559,6 +562,16 @@ public:
     [[nodiscard]] Status blur(BlurChain& chain, const GpuTexture& source,
                               const BlurParams& params = {});
 
+    /// `render_to()` with a fragment stage per texture fill: `shaders[i]`
+    /// post-processes fill `i`, and a null entry leaves that fill alone. The
+    /// caller must keep the shaders alive across the call. What the frame
+    /// ledger's `begin_group()` / `place(shader)` path composites through.
+    [[nodiscard]] Status render_to_with_shaders(
+        ScanoutTarget& target, Color background, std::span<const RectFill> rects,
+        std::span<const GpuTextureFill> textures,
+        std::span<const FragmentShader* const> shaders, std::span<const Box> damage,
+        const OutputMapping& mapping, const RenderSync& sync);
+
     /// Refresh an x-ray cache from static output-local layers. `textures` use
     /// normal output logical coordinates; this method scales them into the
     /// reduced target and owns the scratch list. On success call
@@ -621,7 +634,6 @@ private:
     friend class GpuTexture;
     friend class ScanoutTarget;
     friend class FragmentShader;
-    friend class Frame;
 
     /// The one render pass, written once for both destinations. A member and not
     /// a free function because it reaches into GpuTexture's innards, and the
@@ -638,12 +650,6 @@ private:
     [[nodiscard]] Status blur_pass(OffscreenTarget& target, const GpuTexture& source,
                                    const FragmentShader& shader, float offset, float noise,
                                    float saturation);
-
-    [[nodiscard]] Status render_to_with_shaders(
-        ScanoutTarget& target, Color background, std::span<const RectFill> rects,
-        std::span<const GpuTextureFill> textures,
-        std::span<const FragmentShader* const> shaders, std::span<const Box> damage,
-        const OutputMapping& mapping, const RenderSync& sync);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -53,9 +53,9 @@
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
-import luminaria;
+import luminaria.shell;
 import luminaria.desktop;
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace {

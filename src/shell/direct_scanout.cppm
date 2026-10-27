@@ -32,7 +32,7 @@ module;
 
 #include <wayland-server-core.h>
 
-export module luminaria.gpu:direct_scanout;
+export module luminaria.shell:direct_scanout;
 
 import std;
 

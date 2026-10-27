@@ -1,5 +1,9 @@
 # 切成三个 module，并给核心 module 定一条协议准入标准
 
+> **已被 [ADR 0008](./0008-module-layering.md) 取代。** 三刀是按“链接什么 C 库”切的，
+> 落成了 `luminaria.gpu` 这个大杂烩（libinput/libseat 与 Vulkan 绑在一个开关上）
+> 和不能自闭环的 core。下面是当初的决定，保留作为背景。
+
 `import luminaria;` 不再意味着链上 Vulkan + libdrm + libinput + libseat 全家桶。
 交付面切成：
 

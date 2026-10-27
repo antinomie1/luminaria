@@ -22,16 +22,11 @@ module;
 
 #include <cstdint>
 
-export module luminaria:cpu_compositor;
+export module luminaria.render:cpu_compositor;
 
 import std;
 
-import :box;
-import :color;
-import :compositor;
-import :pixel;
-import :rect_fill;
-import :transform;
+import luminaria;
 
 export namespace luminaria {
 

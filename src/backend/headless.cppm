@@ -7,16 +7,11 @@ module;
 
 
 
-export module luminaria:headless;
+export module luminaria.backend:headless;
 
 import std;
 
-import :backend;
-import :color;
-import :event_loop;
-import :expected;
-import :output;
-import :pixel;
+import luminaria;
 
 export namespace luminaria {
 

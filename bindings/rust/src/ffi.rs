@@ -26,44 +26,6 @@ pub(crate) mod ffi {
         preferred: bool,
     }
 
-    #[derive(Debug, Clone, Copy)]
-    struct SceneItemRaw {
-        kind: u32,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        surface_id: u64,
-        surface_x: i32,
-        surface_y: i32,
-        r: f32,
-        g: f32,
-        b: f32,
-        a: f32,
-        thickness: i32,
-        serial: u64,
-        tag: u64,
-        accepts_input: bool,
-        alpha: f32,
-        corner_radius: f32,
-        blur_enabled: bool,
-        blur_xray: bool,
-        shadow_r: f32,
-        shadow_g: f32,
-        shadow_b: f32,
-        shadow_a: f32,
-        shadow_feather: f32,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct SceneHitRaw {
-        hit: bool,
-        tag: u64,
-        surface_id: u64,
-        sx: f64,
-        sy: f64,
-    }
-
     /// One entry of [`SurfaceId::surface_tree`](crate::protocol::SurfaceId::surface_tree):
     /// a surface of the tree and where it sits relative to the root.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,19 +348,6 @@ pub(crate) mod ffi {
         fn alive(self: &OutputShim) -> bool;
         fn id(self: &OutputShim) -> u64;
 
-        type HeadlessBackendShim;
-        fn headless_backend_new(display: &DisplayShim, interval_ms: u32, error: &mut String) -> UniquePtr<HeadlessBackendShim>;
-        fn add_output(self: Pin<&mut HeadlessBackendShim>, width: i32, height: i32) -> UniquePtr<OutputShim>;
-        fn start(self: Pin<&mut HeadlessBackendShim>, error: &mut String) -> bool;
-
-        type WaylandBackendShim;
-        fn wayland_backend_new(display: &DisplayShim, error: &mut String) -> UniquePtr<WaylandBackendShim>;
-        fn add_output(self: Pin<&mut WaylandBackendShim>, width: i32, height: i32) -> UniquePtr<OutputShim>;
-        fn start(self: Pin<&mut WaylandBackendShim>, error: &mut String) -> bool;
-        fn keymap(self: &WaylandBackendShim) -> String;
-        fn capabilities(self: &WaylandBackendShim) -> u32;
-        fn follow_seat(self: &WaylandBackendShim, seat: &SeatShim, touch: bool);
-
         // Surface inspection
         fn surface_width(surface_id: u64) -> i32;
         fn surface_height(surface_id: u64) -> i32;
@@ -512,9 +461,6 @@ pub(crate) mod ffi {
         fn refresh_mhz(self: &OutputGlobalShim) -> i32;
         fn name(self: &OutputGlobalShim) -> String;
 
-        type CursorThemeShim;
-        fn cursor_theme_load(name: &str, size: i32, error: &mut String) -> UniquePtr<CursorThemeShim>;
-
         type ViewporterShim;
         fn viewporter_new(display: &DisplayShim, error: &mut String) -> UniquePtr<ViewporterShim>;
 
@@ -618,31 +564,5 @@ pub(crate) mod ffi {
         fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
         fn primary_box(self: &OutputLayoutShim) -> Rect;
 
-        fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
-        fn raw_scene_route_pointer(seat: &SeatShim, items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;
-        fn raw_scene_surface_origin(items: &[SceneItemRaw], surface_id: u64, x: &mut f64, y: &mut f64) -> bool;
-
-        type CpuCompositorShim;
-        fn cpu_compositor_new() -> UniquePtr<CpuCompositorShim>;
-        fn composite_rect(self: Pin<&mut CpuCompositorShim>, x: i32, y: i32, width: i32, height: i32, r: f32, g: f32, b: f32, a: f32);
-        fn finish(self: Pin<&mut CpuCompositorShim>, width: i32, height: i32, bg_r: f32, bg_g: f32, bg_b: f32, bg_a: f32) -> Vec<u8>;
-
-        type PopupTreeShim;
-        fn popup_tree_new(shell: &XdgShellShim) -> UniquePtr<PopupTreeShim>;
-        fn set_parent(self: &PopupTreeShim, shell: &XdgShellShim, popup: u64, parent: u64) -> bool;
-        fn append_to(self: &PopupTreeShim, scene: &[SceneItemRaw]) -> Vec<SceneItemRaw>;
-        fn contains(self: &PopupTreeShim, surface_id: u64) -> bool;
-        fn active_grab(self: &PopupTreeShim) -> u64;
-        fn dismiss_grabs_outside(self: Pin<&mut PopupTreeShim>, surface_id: u64) -> bool;
-
-        type LayerManagerShim;
-        fn layer_manager_new() -> UniquePtr<LayerManagerShim>;
-        fn add(self: Pin<&mut LayerManagerShim>, shell: &LayerShellShim, surface_id: u64, output_id: u32) -> bool;
-        fn remove(self: Pin<&mut LayerManagerShim>, surface_id: u64);
-        fn set_mapped(self: Pin<&mut LayerManagerShim>, surface_id: u64, mapped: bool);
-        fn arrange(self: Pin<&mut LayerManagerShim>, output_id: u32, full: Rect, usable: Rect) -> Rect;
-        fn append_to(self: &LayerManagerShim, output_id: u32, layer: u32) -> Vec<SceneItemRaw>;
-        fn keyboard_target(self: &LayerManagerShim, surface_id: u64) -> u64;
-        fn close_output(self: Pin<&mut LayerManagerShim>, output_id: u32);
     }
 }

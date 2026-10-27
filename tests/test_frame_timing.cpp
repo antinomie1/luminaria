@@ -20,7 +20,7 @@
 
 #include "presentation-time-client-protocol.h"
 
-import luminaria;
+import luminaria.backend;
 import std;
 
 namespace {

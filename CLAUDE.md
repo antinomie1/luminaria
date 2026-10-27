@@ -8,9 +8,11 @@ Luminaria: a minimal Wayland compositor **library** in modern C++23, built on to
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
 built with xmake. Roughly wlroots-shaped but far smaller (30 protocol types vs wlroots' 73).
 
-It ships as **C++23 named modules** with no public headers: `luminaria` is the
-dependency-light protocol/core interface, with opt-in `luminaria.gpu`, `luminaria.desktop`
-and `luminaria.text` (fcft + pixman glyph rasterization) extensions.
+It ships as **C++23 named modules** with no public headers, layered strictly
+downwards (ADR 0008): `luminaria` is the dependency-light protocol/core interface, with
+`luminaria.backend` (outputs + input devices), `luminaria.render` (Vulkan + CPU compositing),
+`luminaria.shell` (Frame, SceneRenderer, Cursor, AutoBackend), `luminaria.desktop`
+(privileged protocols) and `luminaria.text` (fcft + pixman glyph rasterization) extensions.
 All prose docs are in Chinese. `README.md` is the introduction only — no technical detail.
 `CONTEXT.md` is the glossary (what "混成器"/"合成"/"布局" mean here, and what they don't);
 `docs/architecture.md` is the layering, module structure and the rules that bite;
@@ -70,22 +72,27 @@ There is no `include/`. Nothing here is a header, so nothing is split
 interface-from-implementation; `src/` is grouped by responsibility instead:
 
 ```
-src/luminaria.cppm       core primary interface — protocol + nested/headless
-src/luminaria.gpu.cppm   GPU primary interface — Vulkan/DRM/input/session
+src/luminaria.cppm         core primary interface — mechanism kernel + protocols
+src/luminaria.backend.cppm backend primary interface — KMS/libinput/session/nested/headless
+src/luminaria.render.cppm  render primary interface — Vulkan/CPU/dmabuf/syncobj/screencopy
+src/luminaria.shell.cppm   shell primary interface — Frame/Cursor/SceneRenderer/AutoBackend
 src/luminaria.desktop.cppm desktop primary interface — privileged shell protocols
-src/luminaria.text.cppm  text primary interface — fcft glyph rasterization
-src/core/                display event_loop expected handle signal
-src/util/                box color dmabuf keymap pixel pixel_layout rect_fill region transform
-src/backend/             backend output input_event session drm headless libinput wayland auto_backend
-src/render/              vulkan cursor_theme + quad.{vert,frag} + solid.frag
-src/shell/               cpu_compositor cursor cursor_manager frame scene scene_renderer output_layout direct_scanout
-src/protocol/            the 25 Wayland globals, one file each
-src/detail/wayland_fwd.h the one remaining header
+src/luminaria.text.cppm    text primary interface — fcft glyph rasterization
+src/core/                  display event_loop expected handle signal
+src/util/                  blur box color dmabuf keymap pixel pixel_layout rect_fill region transform
+src/backend/base/          backend output input_event output_layout (abstract base in core)
+src/backend/               drm headless libinput session wayland
+src/render/                vulkan cpu_compositor + quad.{vert,frag} + solid.frag
+src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
+src/protocol/core/         27 Wayland globals in core
+src/protocol/render/       drm_syncobj linux_dmabuf screencopy
+src/protocol/desktop/      data_control foreign_toplevel input_method output_management session_lock workspace
+src/detail/wayland_fwd.h   the one remaining header
 ```
 
 - Most `src/**/<name>.cppm` files are one **partition** per concept, named after the *file*
-  and not its path: `util/box.cppm` is `luminaria:box`, while GPU and desktop concepts use
-  `luminaria.gpu:<name>` and `luminaria.desktop:<name>`. Directories organise the tree for humans;
+  and not its path: `util/box.cppm` is `luminaria:box`, while backend, render, shell and desktop concepts use
+  `luminaria.backend:<name>`, `luminaria.render:<name>`, `luminaria.shell:<name>` and `luminaria.desktop:<name>`. Directories organise the tree for humans;
   partition names are flat, so moving a file between folders is not an API change.
   Each file holds its interface *and* its implementation — the exported declarations in
   `export namespace luminaria { … }`, then a `// --- implementation` divider, then the pimpl
@@ -173,7 +180,7 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   new size, and an `OutputGlobal` made with `create(display, output, layout)` re-sends the
   mode. A destroyed output leaves the layout by itself. `Session` (libseat, `session.cppm`) owns the device fds and tells
   both bare-metal backends when the VT is taken away. `AutoBackend` (`auto_backend.cppm`,
-  `luminaria.gpu`) is the pick every compositor would otherwise copy: nested, else DRM only
+  `luminaria.shell`) is the pick every compositor would otherwise copy: nested, else DRM only
   when a `Session` can be had (so ssh/CI never land on a VT), else headless — or the one kind
   asked for, failing rather than falling back. It owns session, card and libinput (session
   destroyed last), hands back the `InputSource*`, `WaylandBackend*`, `Session*` and the
@@ -288,7 +295,7 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   **Above both paths is the scene list.** `SceneItem` (`shell/scene.cppm`, core module) is
   one ordered list of four primitives — client surface tree, solid rect, window border,
   compositor-owned image — that `SceneRenderer` (`shell/scene_renderer.cppm`,
-  `luminaria.gpu`) feeds to whichever of `Frame` / `CpuCompositor` this machine has, and
+  `luminaria.shell`) feeds to whichever of `Frame` / `CpuCompositor` this machine has, and
   that `scene_hit_test()` answers "what is under this point" from. It exists because the
   alternative is every compositor built on this library implementing each primitive twice,
   once as a `Placement` and once as a `CpuItem`, with nothing to catch the two drifting.
@@ -308,7 +315,7 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   further frame and answers `unchanged`. A mode change or a GPU frame invalidates the keys.
   `tests/test_scene_present.cpp` guards all three plus the idling, on a test output that — like DRM and
   unlike headless — presents only what was committed. **`Cursor`** (`shell/cursor.cppm`,
-  `luminaria.gpu`) is the pointer and its picture end to end: it loads the theme, follows
+  `luminaria.shell`) is the pointer and its picture end to end: it loads the theme, follows
   cursor-shape requests and the client sprite (re-uploading an animated one on each commit),
   forgets the shape when pointer focus moves, installs itself as the renderer's cursor
   source, and on every move puts the sprite on each output's KMS cursor plane or asks that

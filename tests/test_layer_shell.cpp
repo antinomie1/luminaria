@@ -16,7 +16,7 @@
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
-import luminaria;
+import luminaria.shell;
 import std;
 
 namespace {

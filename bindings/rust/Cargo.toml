@@ -8,12 +8,26 @@ links = "luminaria"
 build = "build.rs"
 
 [features]
-# The two C++ extension modules, on by default. Turning one off drops its
-# bridge, its C++ shim and its system libraries: with `--no-default-features`
-# nothing links Vulkan, libdrm, libinput, libudev, gbm or libseat. The two are
-# independent: `desktop` alone is a desktop shell with no Vulkan.
+# One feature per C++ module (ADR 0008), on by default. Turning one off drops
+# its bridge, its C++ shim and its system libraries: with `--no-default-features`
+# nothing links Vulkan, libdrm, libinput, libudev, gbm or libseat.
+#
+#   backend  luminaria.backend   headless, nested, DRM/KMS, libinput, session
+#   render   luminaria.render    Vulkan, the CPU compositor, dmabuf/syncobj/screencopy
+#   shell    luminaria.shell     Frame, SceneRenderer, Cursor, layer surfaces, direct
+#                                scanout, AutoBackend; implies backend + render
+#   gpu      the historical name for the whole stack; same build as `shell`
+#
+# `desktop` is independent of all three: the privileged protocols need no GPU.
+# The Rust bridges for the shell layer (Frame, Cursor, SceneRenderer, the scene
+# list, the CPU compositor, the headless/nested backends) are all carried by the
+# `shell` bridge today, so `backend` and `render` on their own build their C++
+# module but expose no extra Rust API yet; that split is the next step.
 default = ["gpu", "desktop"]
-gpu = []
+backend = []
+render = []
+shell = ["backend", "render"]
+gpu = ["shell"]
 desktop = []
 # fcft + fontconfig + pixman; see src/text.rs and luminaria.text.
 text = []
@@ -45,7 +59,7 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 # Tests and examples that only make sense with a module switched on.
 [[test]]
 name = "test_backend"
-required-features = ["gpu"]
+required-features = ["backend"]
 
 [[test]]
 name = "test_auto_backend"

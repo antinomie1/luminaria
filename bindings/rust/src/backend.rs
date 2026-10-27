@@ -2,8 +2,12 @@
 
 use std::pin::Pin;
 
-use crate::core::{Display, Error, ErrorKind, Holds};
+use crate::core::{Error, ErrorKind};
+#[cfg(feature = "backend")]
+use crate::core::{Display, Holds};
 use crate::ffi;
+#[cfg(feature = "backend")]
+use crate::ffi_backend;
 use crate::util::{Color, DrmFourcc, Keysym, Mode, Transform};
 
 /// An active output surface (display or virtual window).
@@ -215,15 +219,17 @@ pub use crate::util::Mode as OutputMode;
 
 /// Headless software backend for tests and offscreen rendering. Its timer is a
 /// source on the display's event loop, so it borrows the [`Display`].
+#[cfg(feature = "backend")]
 pub struct HeadlessBackend<'d> {
-    raw: cxx::UniquePtr<ffi::HeadlessBackendShim>,
+    raw: cxx::UniquePtr<ffi_backend::HeadlessBackendShim>,
     _display: Holds<'d>,
 }
 
+#[cfg(feature = "backend")]
 impl<'d> HeadlessBackend<'d> {
     pub fn new(display: &'d Display, interval_ms: u32) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::headless_backend_new(&display.raw, interval_ms, &mut err);
+        let raw = ffi_backend::headless_backend_new(&display.raw, interval_ms, &mut err);
         if raw.is_null() {
             Err(Error::new(ErrorKind::Backend, err))
         } else {
@@ -252,15 +258,17 @@ impl<'d> HeadlessBackend<'d> {
 
 /// Nested Wayland backend driving a host Wayland window. The host connection
 /// is a source on the display's event loop, so it borrows the [`Display`].
+#[cfg(feature = "backend")]
 pub struct WaylandBackend<'d> {
-    raw: cxx::UniquePtr<ffi::WaylandBackendShim>,
+    raw: cxx::UniquePtr<ffi_backend::WaylandBackendShim>,
     _display: Holds<'d>,
 }
 
+#[cfg(feature = "backend")]
 impl<'d> WaylandBackend<'d> {
     pub fn new(display: &'d Display) -> Result<Self, Error> {
         let mut err = String::new();
-        let raw = ffi::wayland_backend_new(&display.raw, &mut err);
+        let raw = ffi_backend::wayland_backend_new(&display.raw, &mut err);
         if raw.is_null() {
             Err(Error::new(ErrorKind::Backend, err))
         } else {
@@ -303,6 +311,7 @@ impl<'d> WaylandBackend<'d> {
 /// motion in an output's coordinates, `PointerLeave` when the pointer leaves
 /// our windows. The parent asking our window to close is
 /// [`crate::Event::HostCloseRequest`].
+#[cfg(feature = "shell")]
 impl InputSource for WaylandBackend<'_> {
     fn keymap(&self) -> String {
         WaylandBackend::keymap(self)
@@ -317,7 +326,7 @@ impl InputSource for WaylandBackend<'_> {
 
 // The bare-metal stack (libseat, KMS, libinput) lives in luminaria.gpu. The
 // value types below stay in core: the nested backend reports them too.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "backend")]
 mod bare_metal {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
@@ -333,14 +342,15 @@ mod bare_metal {
     }
 
     enum SessionRaw<'a> {
-        Owned(cxx::UniquePtr<crate::ffi_gpu::SessionShim>),
-        Lent(&'a crate::ffi_gpu::SessionShim),
+        Owned(cxx::UniquePtr<crate::ffi_backend::SessionShim>),
+        #[allow(dead_code)]
+        Lent(&'a crate::ffi_backend::SessionShim),
     }
 
     impl<'d> Session<'d> {
         pub fn new(display: &'d Display) -> Result<Self, Error> {
             let mut err = String::new();
-            let raw = crate::ffi_gpu::session_new(&display.raw, &mut err);
+            let raw = crate::ffi_backend::session_new(&display.raw, &mut err);
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
             } else {
@@ -348,7 +358,7 @@ mod bare_metal {
             }
         }
 
-        pub(crate) fn shim(&self) -> &crate::ffi_gpu::SessionShim {
+        pub(crate) fn shim(&self) -> &crate::ffi_backend::SessionShim {
             match &self.raw {
                 SessionRaw::Owned(raw) => raw,
                 SessionRaw::Lent(raw) => raw,
@@ -386,7 +396,7 @@ mod bare_metal {
     /// [`Display`] (its page flips and hotplug monitor are event-loop sources) and
     /// the [`Session`] it opened the card through.
     pub struct DrmBackend<'a> {
-        raw: cxx::UniquePtr<crate::ffi_gpu::DrmBackendShim>,
+        raw: cxx::UniquePtr<crate::ffi_backend::DrmBackendShim>,
         _borrows: Holds<'a>,
     }
 
@@ -398,9 +408,9 @@ mod bare_metal {
         ) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_gpu::drm_backend_new(&display.raw, device.unwrap_or(""), sess.shim(), &mut err)
+                crate::ffi_backend::drm_backend_new(&display.raw, device.unwrap_or(""), sess.shim(), &mut err)
             } else {
-                crate::ffi_gpu::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
+                crate::ffi_backend::drm_backend_new_standalone(&display.raw, device.unwrap_or(""), &mut err)
             };
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
@@ -450,7 +460,7 @@ mod bare_metal {
     /// touchscreens. Borrows the [`Display`] and the [`Session`] that opens its
     /// devices, like [`DrmBackend`].
     pub struct LibinputBackend<'a> {
-        raw: cxx::UniquePtr<crate::ffi_gpu::LibinputBackendShim>,
+        raw: cxx::UniquePtr<crate::ffi_backend::LibinputBackendShim>,
         _borrows: Holds<'a>,
     }
 
@@ -459,9 +469,9 @@ mod bare_metal {
         pub fn new(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_gpu::libinput_backend_new(&display.raw, sess.shim(), &mut err)
+                crate::ffi_backend::libinput_backend_new(&display.raw, sess.shim(), &mut err)
             } else {
-                crate::ffi_gpu::libinput_backend_new_standalone(&display.raw, &mut err)
+                crate::ffi_backend::libinput_backend_new_standalone(&display.raw, &mut err)
             };
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
@@ -474,9 +484,9 @@ mod bare_metal {
         pub fn new_path(display: &'a Display, session: Option<&'a Session<'_>>) -> Result<Self, Error> {
             let mut err = String::new();
             let raw = if let Some(sess) = session {
-                crate::ffi_gpu::libinput_backend_new_path(&display.raw, sess.shim(), &mut err)
+                crate::ffi_backend::libinput_backend_new_path(&display.raw, sess.shim(), &mut err)
             } else {
-                crate::ffi_gpu::libinput_backend_new_path_standalone(&display.raw, &mut err)
+                crate::ffi_backend::libinput_backend_new_path_standalone(&display.raw, &mut err)
             };
             if raw.is_null() {
                 Err(Error::new(ErrorKind::Backend, err))
@@ -618,11 +628,13 @@ mod bare_metal {
     /// It owns the session, the card and libinput, so nothing here borrows
     /// anything but the [`Display`]. Outputs arrive as [`BackendEvent`]s once it
     /// starts, input through [`AutoBackend::input`].
+    #[cfg(feature = "shell")]
     pub struct AutoBackend<'d> {
-        raw: cxx::UniquePtr<crate::ffi_gpu::AutoBackendShim>,
+        raw: cxx::UniquePtr<crate::ffi_shell::AutoBackendShim>,
         _display: Holds<'d>,
     }
 
+    #[cfg(feature = "shell")]
     impl<'d> AutoBackend<'d> {
         pub fn new(display: &'d Display, options: &BackendOptions) -> Result<Self, Error> {
             let kind = match options.kind {
@@ -632,7 +644,7 @@ mod bare_metal {
                 BackendKind::Headless => 3,
             };
             let mut err = String::new();
-            let raw = crate::ffi_gpu::auto_backend_new(
+            let raw = crate::ffi_shell::auto_backend_new(
                 &display.raw,
                 kind,
                 options.drm_device.as_deref().unwrap_or(""),
@@ -695,14 +707,16 @@ mod bare_metal {
 
         /// For `SceneRenderer::new`: on DRM the card, so the GPU that renders
         /// is the one behind the display.
-        pub fn vulkan_options(&self) -> crate::gpu::VulkanOptions {
-            let mut id = crate::gpu::DrmDeviceId { major: 0, minor: 0 };
-            crate::gpu::VulkanOptions {
+        #[cfg(feature = "render")]
+        pub fn vulkan_options(&self) -> crate::render::VulkanOptions {
+            let mut id = crate::render::DrmDeviceId { major: 0, minor: 0 };
+            crate::render::VulkanOptions {
                 drm_device: self.raw.drm_device(&mut id).then_some(id),
             }
         }
     }
 
+    #[cfg(feature = "shell")]
     impl InputSource for AutoBackend<'_> {
         fn follow(&self, seat: &crate::protocol::Seat<'_>, touch: bool) {
             self.raw.follow_seat(&seat.raw, touch);
@@ -716,7 +730,7 @@ mod bare_metal {
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "backend")]
 pub use bare_metal::*;
 
 /// xkb modifier masks plus the layout group, as `Seat::notify_modifiers()`
@@ -911,9 +925,10 @@ pub trait InputSource: sealed::Sealed {
 
 mod sealed {
     pub trait Sealed {}
+    #[cfg(feature = "backend")]
     impl Sealed for super::WaylandBackend<'_> {}
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "backend")]
     impl Sealed for super::LibinputBackend<'_> {}
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "shell")]
     impl Sealed for super::AutoBackend<'_> {}
 }

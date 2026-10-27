@@ -16,17 +16,17 @@
    - [3.3 Signal & Observer](#33-signal--observer)
    - [3.4 Geometry & Color & Math](#34-geometry--color--math)
    - [3.5 Keymap & Input Routing](#35-keymap--input-routing)
-4. [后端与硬件抽象 (`luminaria` / `luminaria.gpu`)](#4-后端与硬件抽象-luminaria--luminariagpu)
+4. [后端与硬件抽象 (`luminaria.backend`)](#4-后端与硬件抽象-luminariabackend)
    - [4.1 Backend & Output 抽象](#41-backend--output-抽象)
    - [4.2 输入：InputSource](#42-输入inputsource-luminariainput_event)
    - [4.3 Headless & Wayland 嵌套后端](#43-headless--wayland-嵌套后端)
-   - [4.4 DrmBackend & Session & Libinput (Bare-metal)](#44-drmbackend--session--libinput-bare-metal-luminariagpu)
-   - [4.5 AutoBackend：自动挑后端](#45-autobackend自动挑后端-luminariagpuauto_backend)
-5. [渲染器与合成引擎 (`luminaria` / `luminaria.gpu`)](#5-渲染器与合成引擎-luminaria--luminariagpu)
+   - [4.4 DrmBackend & Session & Libinput (Bare-metal)](#44-drmbackend--session--libinput-bare-metal-luminariabackend)
+   - [4.5 AutoBackend：自动挑后端](#45-autobackend自动挑后端-luminariashellauto_backend)
+5. [渲染器与合成引擎 (`luminaria.render`)](#5-渲染器与合成引擎-luminariarender)
    - [5.1 CpuCompositor (CPU 立即模式合成)](#51-cpucompositor-cpu-立即模式合成)
    - [5.2 VulkanRenderer (GPU 零拷贝渲染)](#52-vulkanrenderer-gpu-零拷贝渲染)
    - [5.3 CursorTheme & Text/Font](#53-cursortheme--textfont)
-6. [外壳层与即时模式帧账本 (`luminaria` / `luminaria.gpu`)](#6-外壳层与即时模式帧账本-luminaria--luminariagpu)
+6. [外壳层与即时模式帧账本 (`luminaria.shell`)](#6-外壳层与即时模式帧账本-luminariashell)
    - [6.1 Frame (GPU 帧账本与摆位差异追踪)](#61-frame-gpu-帧账本与摆位差异追踪)
    - [6.2 Scene & SceneRenderer (统一场景抽象)](#62-scene--scenerenderer-统一场景抽象)
    - [6.3 DirectScanout (直出决策)](#63-directscanout-直出决策)
@@ -40,7 +40,7 @@
    - [7.5 Viewporter & FractionalScale & ContentType & XdgDecoration](#75-viewporter--fractionalscale--contenttype--xdgdecoration)
    - [7.6 PointerConstraints & RelativePointer & CursorShape](#76-pointerconstraints--relativepointer--cursorshape)
    - [7.7 TextInput & IdleInhibit & IdleNotify & BackgroundEffect](#77-textinput--idleinhibit--idlenotify--backgroundeffect)
-8. [GPU 专属 Wayland 协议 (`luminaria.gpu`)](#8-gpu-专属-wayland-协议-luminariagpu)
+8. [渲染与缓冲协议 (`luminaria.render`)](#8-渲染与缓冲协议-luminariarender)
    - [8.1 LinuxDmabuf](#81-linuxdmabuf)
    - [8.2 DrmSyncobj (显式同步)](#82-drmsyncobj-显式同步)
    - [8.3 Screencopy (截图与捕获)](#83-screencopy-截图与捕获)
@@ -63,17 +63,19 @@ Luminaria 定位为**有主见的纯 Wayland 机制 C++23 库**：公共机制�
 +-------------------------------------------------------------------------+
 |                        Compositor Application                           |
 |  (Window Placement, Tiling, Workspace Policy, Keybindings, Workflows)   |
++-------------------------------------------------------------------------+
+|                         luminaria.shell                                 |
+|  (Frame Ledger, SceneRenderer, Cursor, DirectScanout, AutoBackend)      |
 +------------------------------------+------------------------------------+
-|       luminaria.desktop            |                                    |
-| (Workspace, ForeignToplevel, Lock) |                                    |
+|       luminaria.desktop            |         luminaria.render           |
+| (Workspace, ForeignToplevel, Lock) | (VulkanRenderer, CpuCompositor,    |
+|                                    |  linux-dmabuf, screencopy, syncobj)|
 +------------------------------------+------------------------------------+
-|                         luminaria.gpu                                   |
-|   (VulkanRenderer, Frame Ledger, DirectScanout, DRM, Libinput, Session) |
+|                         luminaria.backend                               |
+|       (KMS/DRM, Libinput, Session, Headless, Wayland-nested)            |
 +-------------------------------------------------------------------------+
 |                           luminaria (Core)                              |
-|   (Display, EventLoop, Surface, Compositor, Seat, CpuCompositor, Scene) |
-+-------------------------------------------------------------------------+
-|               libwayland-server, Linux KMS/DRM, Vulkan-Hpp              |
+|   (Display, EventLoop, Surface, Compositor, Seat, Math/Box/Region)      |
 +-------------------------------------------------------------------------+
 ```
 
@@ -91,13 +93,15 @@ Luminaria 定位为**有主见的纯 Wayland 机制 C++23 库**：公共机制�
 
 ## 2. C++23 模块划分与引入规范
 
-Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），完全基于 C++23 命名模块构建：
+Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），基于 C++23 命名模块构建，按 ADR 0008 单向按层分立：
 
 | 模块名称 | 职责边界与依赖要求 | 典型应用场景 |
 |---|---|---|
-| `import luminaria;` | 核心主接口。无 Vulkan/DRM/Libinput/Libseat 依赖。包含 Display/EventLoop、核心协议、CPU 合成、Scene 表、Nested/Headless 后端。 | 基础混成器、无头测试、软件渲染、CI 测试环境 |
-| `import luminaria.gpu;` | GPU 与裸机扩展。依赖 Vulkan-Hpp、libdrm、libinput、libseat。包含 `Frame` 帧账本、`VulkanRenderer`、`DirectScanout`、DRM/Libinput 后端与显式同步。 | 生产级裸机混成器、GPU 加速嵌套混成器 |
-| `import luminaria.desktop;` | 桌面特权协议扩展。包含工作区、任务栏控制、剪贴板管理、锁屏与输入法引擎协议。 | 完整桌面环境（Panel、Dock、Lockscreen） |
+| `import luminaria;` | 核心主接口。仅依赖 `wayland-server` 与 `xkbcommon`。包含 Display/EventLoop、核心协议、数学/几何值类型与 Backend/Output 抽象。 | 机制基底、纯协议测试、嵌入式无硬件环境 |
+| `import luminaria.backend;` | 设备与后端驱动扩展。依赖 libdrm、libinput、libseat。包含 DRM/KMS、Libinput、Session、Headless、Wayland 嵌套。不依赖 GPU。 | 裸机/虚拟输出与输入管理、CPU 软渲染嵌入式系统 |
+| `import luminaria.render;` | 渲染引擎扩展。依赖 Vulkan、GBM、libdrm。包含 Vulkan 1.3 渲染器、CPU 立即模式合成器与 dmabuf/syncobj/screencopy 缓冲协议。 | GPU 加速渲染、无头截图、离屏渲染 |
+| `import luminaria.shell;` | 混成器全功能外壳。re-export 了 `backend` 与 `render`。包含 Frame 帧账本、SceneRenderer 调度器、Cursor、DirectScanout、AutoBackend。 | 生产级混成器、常规混成器首选入口 |
+| `import luminaria.desktop;` | 桌面特权协议扩展。包含工作区、任务栏控制、剪贴板管理、锁屏与输入法引擎协议。只依赖 core。 | 完整桌面环境（Panel、Dock、Lockscreen） |
 
 ---
 
@@ -179,7 +183,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ---
 
-## 4. 后端与硬件抽象 (`luminaria` / `luminaria.gpu`)
+## 4. 后端与硬件抽象 (`luminaria.backend`)
 
 ### 4.1 Backend & Output 抽象
 - **`Backend`** (`luminaria:backend`):
@@ -216,20 +220,20 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - 是一个 `InputSource`：转发父级的输入，按键按父级 keymap 读出 keysym，`keymap()` 就是父级的 keymap。
   - `Signal<HostCloseRequest> close_requested`：父级要求关窗（不是输入，不经 `input()`）。
 
-### 4.4 DrmBackend & Session & Libinput (Bare-metal, `luminaria.gpu`)
-- **`Session`** (`luminaria.gpu:session`): 基于 libseat 的 VT 与设备权限仲裁。
+### 4.4 DrmBackend & Session & Libinput (Bare-metal, `luminaria.backend`)
+- **`Session`** (`luminaria.backend:session`): 基于 libseat 的 VT 与设备权限仲裁。
   - `static Result<Session> create(EventLoop loop, std::string_view seat_name = "")`
   - `int open_device(std::string_view path)` / `void close_device(int fd)`
   - `bool active() const`, `Signal<SessionActive>& active_changed()`
-- **`DrmBackend`** (`luminaria.gpu:drm`): KMS Atomic Modesetting 裸机显示驱动。
+- **`DrmBackend`** (`luminaria.backend:drm`): KMS Atomic Modesetting 裸机显示驱动。
   - `static Result<DrmBackend> create(EventLoop loop, Session& session, std::string_view card_path = "")`
   - 监听 udev connector 热插拔，为每个活跃显示器构建 `DrmOutput`；支持硬件光标平面（Hardware Cursor Plane）、Atomic 翻页与显式 Fence（`IN_FENCE_FD` / `OUT_FENCE_PTR`）。
-- **`LibinputBackend`** (`luminaria.gpu:libinput`): 裸机输入设备事件源。
+- **`LibinputBackend`** (`luminaria.backend:libinput`): 裸机输入设备事件源。
   - `static Result<LibinputBackend> create(EventLoop loop, Session& session)`
   - 是一个 `InputSource`：相对移动、按钮、滚轮、按键、修饰键（仅在变化时）、触摸、设备增删引起的能力变化，全经 `input()`。`set_keymap()` 成功时也发 `KeymapChange`。
   - `const KeymapState& keymap_state() const`: 获取底座共享的 XKB 状态。
 
-### 4.5 AutoBackend：自动挑后端 (`luminaria.gpu:auto_backend`)
+### 4.5 AutoBackend：自动挑后端 (`luminaria.shell:auto_backend`)
 每个混成器开头都是同一段：有父混成器就嵌套，有 seat 就上裸机，否则无头；开显卡、加入 seat、让 libinput 走同一个会话、
 让渲染器选中屏幕背后那块 GPU。`AutoBackend` 就是这一段。
 - **`BackendKind`** = `automatic | nested | drm | headless`；`Result<BackendKind> parse_backend_kind(std::string_view)`
@@ -252,9 +256,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ---
 
-## 5. 渲染器与合成引擎 (`luminaria` / `luminaria.gpu`)
+## 5. 渲染器与合成引擎 (`luminaria.render`)
 
-### 5.1 CpuCompositor (CPU 立即模式合成, `luminaria`)
+### 5.1 CpuCompositor (CPU 立即模式合成, `luminaria.render:cpu_compositor`)
 专为无头模式、嵌套回退、测试及截屏设计的软件合成器：
 - **`CpuView`**: `{ SurfaceId root; int x, y; Box clip; }`（`clip` 限制表面树绘制边界，平铺混成器无需手工擦除溢出）。
 - **`CpuImage`**: `{ Box box; std::span<const Pixel> pixels; }`。
@@ -264,7 +268,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `std::span<const Pixel> pixels() const`: 获取合成后的像素跨度。
 - **`void send_frame_done(std::span<const SurfaceId> ids, uint32_t time_ms)`**: 自由函数，为 CPU 路径批量应答帧回调。
 
-### 5.2 VulkanRenderer (GPU 零拷贝渲染, `luminaria.gpu`)
+### 5.2 VulkanRenderer (GPU 零拷贝渲染, `luminaria.render:vulkan`)
 基于 `VK_EXT_external_memory_dma_buf` 与 `VK_EXT_image_drm_format_modifier` 的 GPU 渲染器：
 - **`GpuTexture`**: 缓存客户端导入的 dmabuf 或上传的 shm 像素。
 - **`ScanoutTarget`**: 分配并导出为 dmabuf 的渲染目标（KMS 直接上屏）。
@@ -284,9 +288,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ---
 
-## 6. 外壳层与即时模式帧账本 (`luminaria` / `luminaria.gpu`)
+## 6. 外壳层与即时模式帧账本 (`luminaria.shell`)
 
-### 6.1 Frame (GPU 帧账本与摆位差异追踪, `luminaria.gpu`)
+### 6.1 Frame (GPU 帧账本与摆位差异追踪, `luminaria.shell:frame`)
 `Frame` 是外壳层的核心账本，每输出一份，按帧重构：
 - **核心构建流程**：
   - `void begin(Box logical_view)`: 开启新一帧记录。
@@ -319,14 +323,14 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y)`**: 全图元命中测试。
 - **`std::optional<ScenePoint> scene_surface_origin(scene, SurfaceId)`**：某表面（含子表面）的原点画在哪。
 - **`SceneHit scene_route_pointer(Seat&, scene, double x, double y)`**：指针路由——有隐式 grab 时按 grab 表面自己的坐标发运动，否则把焦点给命中的表面或清掉焦点。
-- **`SceneRenderer`** (`luminaria.gpu:scene_renderer`):
+- **`SceneRenderer`** (`luminaria.shell:scene_renderer`):
   - 将 `std::vector<SceneItem>` 自动分发至 `Frame` 或 `CpuCompositor`，透明处理运行时 GPU 降级。
   - `Status reset(SceneOutput&, Output&, uint32_t drm_format = XRGB8888)`：每块输出调一次，之后的 mode 变化自己重新分配。
   - `present(state, output, scene, background)`（输出坐标）与 `present(state, output, scene, background, const OutputLayout&)`（全局坐标）。
   - `SceneStats stats() const`：`present()` 到目前为止按结果（composited / scanout / unchanged / cpu）数过的帧，看空闲屏幕是不是真的安静下来。
 
-### 6.3 DirectScanout (直出决策, `luminaria.gpu`)
-- **`DirectScanout`** (`luminaria.gpu:direct_scanout`): 评估单全屏表面是否满足 KMS 硬件直出要求（无旋转、无裁剪、格式匹配），并管理导入缓存与 `Surface::hold_buffer()`。
+### 6.3 DirectScanout (直出决策, `luminaria.shell:direct_scanout`)
+- **`DirectScanout`** (`luminaria.shell:direct_scanout`): 评估单全屏表面是否满足 KMS 硬件直出要求（无旋转、无裁剪、格式匹配），并管理导入缓存与 `Surface::hold_buffer()`。
 
 ### 6.4 OutputLayout & Pointer & PopupTree & LayerManager
 - **`OutputLayout`** (`luminaria:output_layout`): 全局逻辑坐标系管理。不可移动：它盯着装进来的每块输出，销毁的自己离开、换 mode 的保留位置换上新尺寸。
@@ -412,19 +416,19 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ---
 
-## 8. GPU 专属 Wayland 协议 (`luminaria.gpu`)
+## 8. 渲染与缓冲协议 (`luminaria.render`)
 
 ### 8.1 LinuxDmabuf
-- **`LinuxDmabuf`** (`luminaria.gpu:linux_dmabuf`):
+- **`LinuxDmabuf`** (`luminaria.render:linux_dmabuf`):
   - `static Result<LinuxDmabuf> create(Display& display, dev_t main_device, std::span<const DmabufFormat> formats)`
   - 广播混成器支持的 DRM 格式与 Modifier 列表，零拷贝导入客户端 GPU 缓冲。
 
 ### 8.2 DrmSyncobj (显式同步)
-- **`DrmSyncobjManager`** (`luminaria.gpu:drm_syncobj`):
+- **`DrmSyncobjManager`** (`luminaria.render:drm_syncobj`):
   - `wp_linux_drm_syncobj_manager_v1` 协议支持，基于 Timeline Semaphore 实现无 CPU 阻塞的 GPU Acquire/Release Fence 编排。
 
 ### 8.3 Screencopy (截图与捕获)
-- **`ScreencopyManager`** (`luminaria.gpu:screencopy`):
+- **`ScreencopyManager`** (`luminaria.render:screencopy`):
   - 整合 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`。
   - `void set_cursor_source(std::function<CursorCapture(Output&)> source)`: 支持捕获独立硬件光标或合成光标层。
 

@@ -1,9 +1,9 @@
 // luminaria/shell/pointer.cppm — cursor coordinates and pointer state tracking.
-export module luminaria:pointer;
+export module luminaria.shell:pointer;
 
 import std;
 
-import :box;
+import luminaria;
 
 export namespace luminaria {
 

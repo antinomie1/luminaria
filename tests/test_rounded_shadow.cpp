@@ -14,7 +14,7 @@
 
 #include <drm_fourcc.h>
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace {

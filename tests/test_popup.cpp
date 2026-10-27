@@ -16,7 +16,7 @@
 
 #include "xdg-shell-client-protocol.h"
 
-import luminaria;
+import luminaria.shell;
 import std;
 
 namespace {

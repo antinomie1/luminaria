@@ -28,7 +28,7 @@ module;
 #include <wayland-server-protocol.h>
 #include "linux-dmabuf-unstable-v1-protocol.h"
 
-export module luminaria.gpu:linux_dmabuf;
+export module luminaria.render:linux_dmabuf;
 
 import std;
 

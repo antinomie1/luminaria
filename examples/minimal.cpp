@@ -22,7 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-import luminaria.gpu;
+import luminaria.shell;
 import minimal_trace;
 import std;
 

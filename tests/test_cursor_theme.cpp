@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-import luminaria;
+import luminaria.shell;
 import std;
 
 int main() {

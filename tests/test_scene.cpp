@@ -6,7 +6,7 @@
 // drawn but never hit) is reachable here.
 #include <cassert>
 
-import luminaria;
+import luminaria.shell;
 import std;
 
 using luminaria::SceneBlur;

@@ -23,7 +23,7 @@
 
 #include "linux-drm-syncobj-v1-client-protocol.h"
 
-import luminaria.gpu;
+import luminaria.render;
 import std;
 
 namespace {

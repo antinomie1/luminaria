@@ -21,7 +21,7 @@
 #include <wayland-client.h>
 #include <wayland-server-core.h>
 
-import luminaria;
+import luminaria.render;
 import std;
 
 namespace {

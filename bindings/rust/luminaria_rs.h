@@ -166,47 +166,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-class HeadlessBackendShim {
-public:
-    ~HeadlessBackendShim();
-    HeadlessBackendShim(const HeadlessBackendShim&) = delete;
-    HeadlessBackendShim& operator=(const HeadlessBackendShim&) = delete;
-
-    std::unique_ptr<OutputShim> add_output(std::int32_t width, std::int32_t height);
-    bool start(rust::String& error);
-
-    struct Impl;
-    Impl& impl() const;
-    explicit HeadlessBackendShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<HeadlessBackendShim> headless_backend_new(const DisplayShim& display, unsigned int interval_ms, rust::String& error);
-
-class WaylandBackendShim {
-public:
-    ~WaylandBackendShim();
-    WaylandBackendShim(const WaylandBackendShim&) = delete;
-    WaylandBackendShim& operator=(const WaylandBackendShim&) = delete;
-
-    std::unique_ptr<OutputShim> add_output(std::int32_t width, std::int32_t height);
-    bool start(rust::String& error);
-    rust::String keymap() const;
-    // keyboard, pointer, touch as bits 0, 1, 2.
-    std::uint32_t capabilities() const;
-    // lm::Seat::follow on this backend's input.
-    void follow_seat(const SeatShim& seat, bool touch) const;
-
-    struct Impl;
-    Impl& impl() const;
-    explicit WaylandBackendShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<WaylandBackendShim> wayland_backend_new(const DisplayShim& display, rust::String& error);
-
 // ============================================================================
 // Core Protocols
 // ============================================================================
@@ -369,6 +328,7 @@ private:
 
 std::unique_ptr<LayerShellShim> layer_shell_new(const DisplayShim& display, rust::String& error);
 
+
 class OutputGlobalShim {
 public:
     ~OutputGlobalShim();
@@ -404,21 +364,6 @@ std::unique_ptr<OutputGlobalShim> output_global_new(const DisplayShim& display, 
 std::unique_ptr<OutputGlobalShim> output_global_for(const DisplayShim& display, const OutputShim& output,
                                                    const OutputLayoutShim& layout, rust::Str name,
                                                    rust::String& error);
-
-class CursorThemeShim {
-public:
-    ~CursorThemeShim();
-    CursorThemeShim(const CursorThemeShim&) = delete;
-    CursorThemeShim& operator=(const CursorThemeShim&) = delete;
-
-    struct Impl;
-    Impl& impl() const;
-    explicit CursorThemeShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<CursorThemeShim> cursor_theme_load(rust::Str name, std::int32_t size, rust::String& error);
 
 // Protocol Managers
 #define DECLARE_GLOBAL_SHIM(Name, FuncName) \
@@ -637,70 +582,5 @@ private:
 };
 
 std::unique_ptr<OutputLayoutShim> output_layout_new();
-
-class CpuCompositorShim {
-public:
-    ~CpuCompositorShim();
-    CpuCompositorShim(const CpuCompositorShim&) = delete;
-    CpuCompositorShim& operator=(const CpuCompositorShim&) = delete;
-
-    void composite_rect(std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height,
-                        float r, float g, float b, float a);
-    rust::Vec<std::uint8_t> finish(std::int32_t width, std::int32_t height,
-                                  float bg_r, float bg_g, float bg_b, float bg_a);
-
-    struct Impl;
-    Impl& impl() const;
-    explicit CpuCompositorShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<CpuCompositorShim> cpu_compositor_new();
-
-SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, double y);
-SceneHitRaw raw_scene_route_pointer(const SeatShim& seat, rust::Slice<const SceneItemRaw> items, double x, double y);
-bool raw_scene_surface_origin(rust::Slice<const SceneItemRaw> items, std::uint64_t surface_id, double& x, double& y);
-
-class PopupTreeShim {
-public:
-    ~PopupTreeShim();
-    PopupTreeShim(const PopupTreeShim&) = delete;
-    PopupTreeShim& operator=(const PopupTreeShim&) = delete;
-
-    // For a popup whose parent is not an xdg surface (a layer surface's).
-    bool set_parent(const XdgShellShim& shell, std::uint64_t popup, std::uint64_t parent) const;
-    // Only the items appended to `scene`.
-    rust::Vec<SceneItemRaw> append_to(rust::Slice<const SceneItemRaw> scene) const;
-    bool contains(std::uint64_t surface_id) const;
-    std::uint64_t active_grab() const;
-    bool dismiss_grabs_outside(std::uint64_t surface_id);
-
-    struct Impl;
-    Impl& impl() const;
-    explicit PopupTreeShim(std::unique_ptr<Impl> impl) noexcept;
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<PopupTreeShim> popup_tree_new(const XdgShellShim& shell);
-
-class LayerManagerShim {
-public:
-    LUM_SHIM_BOILERPLATE(LayerManagerShim)
-    bool add(const LayerShellShim& shell, std::uint64_t surface_id, std::uint32_t output_id);
-    void remove(std::uint64_t surface_id);
-    void set_mapped(std::uint64_t surface_id, bool mapped);
-    Rect arrange(std::uint32_t output_id, Rect full, Rect usable);
-    rust::Vec<SceneItemRaw> append_to(std::uint32_t output_id, std::uint32_t layer) const;
-    std::uint64_t keyboard_target(std::uint64_t surface_id) const;
-    void close_output(std::uint32_t output_id);
-private:
-    std::unique_ptr<Impl> impl_;
-};
-
-std::unique_ptr<LayerManagerShim> layer_manager_new();
-
-#undef LUM_SHIM_BOILERPLATE
 
 } // namespace lum

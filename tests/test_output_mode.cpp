@@ -22,7 +22,7 @@
 #include <wayland-client-protocol.h>
 #include <wayland-server-core.h>
 
-import luminaria;
+import luminaria.backend;
 import std;
 
 namespace {

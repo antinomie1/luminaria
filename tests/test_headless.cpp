@@ -4,7 +4,7 @@
 // integration end to end — no GPU. Solid color stands in for a rendered buffer.
 #include <cassert>
 
-import luminaria;
+import luminaria.backend;
 import std;
 
 int main() {

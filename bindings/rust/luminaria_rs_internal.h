@@ -162,69 +162,10 @@ struct StoredImage {
     std::vector<lm::Pixel> pixels;
 };
 
-inline lm::SceneItem scene_item(const SceneItemRaw& raw, const std::unordered_map<std::uint64_t, StoredImage>* images = nullptr) {
-    lm::SceneItem it{};
-    it.kind = static_cast<lm::SceneItem::Kind>(raw.kind);
-    it.box = lm::Box{raw.x, raw.y, raw.width, raw.height};
-    it.surface = id_from_u64(raw.surface_id);
-    it.x = raw.surface_x;
-    it.y = raw.surface_y;
-    it.color = lm::Color{raw.r, raw.g, raw.b, raw.a};
-    it.thickness = raw.thickness;
-    it.serial = raw.serial;
-    it.tag = raw.tag;
-    it.accepts_input = raw.accepts_input;
-    it.alpha = raw.alpha;
-    it.corner_radius = raw.corner_radius;
-    it.blur.enabled = raw.blur_enabled;
-    it.blur.xray = raw.blur_xray;
-    it.shadow.color = lm::Color{raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a};
-    it.shadow.feather = raw.shadow_feather;
-    if (it.kind == lm::SceneItem::Kind::image && images != nullptr) {
-        auto it_img = images->find(it.serial);
-        if (it_img != images->end()) {
-            it.pixels = std::span<const lm::Pixel>{it_img->second.pixels.data(), it_img->second.pixels.size()};
-        }
-    }
-    return it;
-}
-
-inline std::vector<lm::SceneItem> scene_items(rust::Slice<const SceneItemRaw> items, const std::unordered_map<std::uint64_t, StoredImage>* images = nullptr) {
-    std::vector<lm::SceneItem> scene;
-    scene.reserve(items.size());
-    for (const auto& raw : items) scene.push_back(scene_item(raw, images));
-    return scene;
-}
-
-inline SceneItemRaw scene_item_raw(const lm::SceneItem& it) {
-    SceneItemRaw raw{};
-    raw.kind = static_cast<std::uint32_t>(it.kind);
-    raw.x = it.box.x;
-    raw.y = it.box.y;
-    raw.width = it.box.width;
-    raw.height = it.box.height;
-    raw.surface_id = u64_from_id(it.surface);
-    raw.surface_x = it.x;
-    raw.surface_y = it.y;
-    raw.r = it.color.r;
-    raw.g = it.color.g;
-    raw.b = it.color.b;
-    raw.a = it.color.a;
-    raw.thickness = it.thickness;
-    raw.serial = it.serial;
-    raw.tag = it.tag;
-    raw.accepts_input = it.accepts_input;
-    raw.alpha = it.alpha;
-    raw.corner_radius = it.corner_radius;
-    raw.blur_enabled = it.blur.enabled;
-    raw.blur_xray = it.blur.xray;
-    raw.shadow_r = it.shadow.color.r;
-    raw.shadow_g = it.shadow.color.g;
-    raw.shadow_b = it.shadow.color.b;
-    raw.shadow_a = it.shadow.color.a;
-    raw.shadow_feather = it.shadow.feather;
-    return raw;
-}
+// The popup behind a client's xdg_popup, and the layer surface behind an
+// ours; both `Impl`s are private to the core TU.
+lm::Popup* xdg_popup(const XdgShellShim& shell, std::uint64_t popup);
+lm::LayerSurface* layer_surface(const LayerShellShim& shell, std::uint64_t surface_id);
 
 // Identity for an object that has no surface of its own to be named by (a
 // lock, an idle notification, a text input). Never reused.

@@ -27,7 +27,7 @@ module;
 #include <libudev.h>
 #include <xkbcommon/xkbcommon.h>
 
-export module luminaria.gpu:libinput;
+export module luminaria.backend:libinput;
 
 import std;
 

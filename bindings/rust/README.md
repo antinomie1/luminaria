@@ -2,31 +2,33 @@
 
 用 [cxx](https://cxx.rs) 从 Rust 调用 luminaria。
 
-Crate 逐类型公开 `luminaria`、`luminaria.gpu`、`luminaria.desktop`、`luminaria.text` 四个 C++23 模块的类型与能力，由使用者自行组合成混成器；窗口放哪、谁拿键盘、按键做什么，这些策略始终留在 Rust 一侧。
+Crate 逐类型公开 `luminaria`、`luminaria.backend`、`luminaria.render`、`luminaria.shell`、`luminaria.desktop`、`luminaria.text` 等 C++23 模块的类型与能力，由使用者自行组合成混成器；窗口放哪、谁拿键盘、按键做什么，这些策略始终留在 Rust 一侧。
 
 - 详细 API 说明：参见 [API 文档](docs/api.md)
 
 ## 特性开关（cargo features）
 
-绑定跟着 C++ 的模块切（ADR 0003）：**每个模块一个 `#[cxx::bridge]`、一个 shim 翻译单元**，
+绑定跟着 C++ 的模块切（ADR 0008）：**每个模块一个 `#[cxx::bridge]`、一个 shim 翻译单元**，
 cargo 特性决定编译哪些、链接哪些。关掉的模块不进编译、不进链接，也不探测它的系统库。
 
 | 特性 | 默认 | 对应的 C++ 模块 | 打开后多出来的东西 | 额外链接的系统库 |
 |---|---|---|---|---|
-| *（始终有）* | — | `luminaria` | 协议、`Display`、headless / 嵌套后端、`CpuCompositor`、`SceneItem` | wayland-server、wayland-client、xkbcommon |
-| `gpu` | ✅ | `luminaria.gpu` | `gpu` 模块（`VulkanRenderer`/`SceneRenderer`/`Frame`/`Cursor`/`DirectScanout`/`LinuxDmabuf`/`Screencopy`），`backend::DrmBackend`/`LibinputBackend`/`Session` | vulkan、libdrm、libinput、libudev、gbm、libseat |
-| `desktop` | ✅ | `luminaria.desktop` | `desktop` 模块（任务栏、工作区、锁屏、输出管理、剪贴板、输入法） | — |
+| *（始终有）* | — | `luminaria` | 协议、`Display`、核心值类型、`Output` / `Backend` 抽象基类 | wayland-server、wayland-client、xkbcommon |
+| `backend` | — | `luminaria.backend` | `backend` 驱动：`HeadlessBackend`、`WaylandBackend`、`DrmBackend`、`LibinputBackend`、`Session` | libdrm、libinput、libudev、libseat |
+| `render` | — | `luminaria.render` | `render` 引擎：`VulkanRenderer`、`CpuCompositor`、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager` | vulkan、libdrm、gbm |
+| `shell` / `gpu` | ✅ | `luminaria.shell` | 混成器整栈：`Frame`、`SceneRenderer`、`Cursor`、`DirectScanout`、`AutoBackend`（隐含 `backend` 与 `render`） | backend + render 的全部库 |
+| `desktop` | ✅ | `luminaria.desktop` | `desktop` 模块（任务栏、工作区、锁屏、输出管理、剪贴板、输入法，只依赖 core） | — |
 | `text` | ❌ | `luminaria.text` | `text` 模块（`Font`：字形栅格化与度量） | fcft、fontconfig、pixman |
-| `raw-vulkan` | ❌ | —（隐含 `gpu`） | `VulkanRenderer::raw_handles()` / `SceneRenderer::raw_vulkan_handles()` | — |
+| `raw-vulkan` | ❌ | —（隐含 `render`） | `VulkanRenderer::raw_handles()` / `SceneRenderer::raw_vulkan_handles()` | — |
 | `mint` / `glam` | ❌ | — | 几何类型的 `From`/`Into` 转换 | — |
 
-两个扩展互不依赖：只开 `desktop` 就是一个不链接 Vulkan 的桌面外壳。只写无头合成器（不需要
-Vulkan、不需要 DRM/libinput/libseat）时：
+两个扩展互不依赖：只开 `desktop` 就是一个不链接 Vulkan 的桌面外壳；只开 `backend` 就是纯设备后端。只写基础合成器时：
 
 ```sh
-cargo build --no-default-features            # 只有核心：link line 里没有 vulkan/gbm/libseat
-cargo build --no-default-features --features gpu
-cargo build                                  # 默认：gpu + desktop，与之前完全一致
+cargo build --no-default-features            # 只有核心：link line 里没有 libdrm/vulkan/gbm/libseat
+cargo build --no-default-features --features backend
+cargo build --no-default-features --features render
+cargo build                                  # 默认：gpu + desktop，整套流水线
 ```
 
 只用 `--no-default-features` 构建出的二进制，`ldd` 只剩 wayland 与 xkbcommon；这是本绑定
@@ -39,12 +41,13 @@ Crate 按库的职责分层组织为以下模块：
 - **`core`**：`Display`（拥有 `wl_display` 和事件循环；`dispatch()` 返回这一轮的全部 `Event`）、`EventLoop`、`KeyRouter`（快捷键与客户端之间分键盘）、`Error`（可模式匹配的 `ErrorKind` 分类）。
 - **`event`**：`Event`——库报告的一切都走这一条流，按信号触发的顺序；各载荷类型都能用 `TryFrom<Event>` 取回。
 - **`util`**：基础几何与格式工具：`Rect`、`Color`、`Point`、`Transform`、`Region`（不相交矩形集）、`KeymapState`（xkb 状态封装）、`Pixel`（RGBA8，与 `read_back` / `commit_frame` 的字节顺序一致）、`Keysym`（每个 `XKB_KEY_*` 一个关联常量，由系统的 xkbcommon 生成）、`DrmFourcc`（来自 `drm-fourcc` crate）、`edge`（xdg_toplevel 缩放边缘位）、`layout_fits`（可选 `mint` 与 `glam` 特性支持零样板几何转换）。
-- **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`、`HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）；`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）只在特性 `gpu` 下存在。
-- **`protocol`**：Wayland 核心协议全局对象：`CoreGlobals`（一次创建每个混成器都要的那一组）、`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器（`Viewporter`、`FractionalScaleManager`、`XdgActivation`、`XdgDecorationManager`、`CursorShapeManager`、`DataDeviceManager`、`PrimarySelectionManager`、`IdleInhibitManager`、`IdleNotifier`、`RelativePointerManager`、`PointerConstraints`、`TextInputManager`、`SinglePixelBufferManager`、`TearingControlManager`、`ContentTypeManager`、`FifoManager`、`CommitTimingManager`、`Presentation`、`BackgroundEffectManager`、`XdgToplevelIconManager`）。
-- **`gpu`**（对应 `luminaria.gpu`，特性 `gpu`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`SceneRenderer`（GPU 混合与 CPU 自动回退，自己按输出保存渲染状态）、`Frame`（即时模式逐输出帧账本）、`Cursor`（硬件光标平面与主题精灵跟随）、`DirectScanout`（全屏零拷贝直出评估）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
+- **`backend`**：输出与硬件/虚拟后端：`Output`、`OutputMode`。在特性 `backend` 下提供 `HeadlessBackend`（无头软件帧泵）、`WaylandBackend`（宿主嵌套窗口）、`DrmBackend`（KMS bare-metal）、`LibinputBackend`（输入事件）、`Session`（libseat 会话管理）；在特性 `shell` 下提供 `AutoBackend`。
+- **`render`**（对应 `luminaria.render`，特性 `render`）：`VulkanRenderer`（Vulkan 1.3 动态渲染与 dmabuf 导入）、`CpuCompositor`（纯 CPU 软件合成器）、`LinuxDmabuf`、`DrmSyncobjManager`、`ScreencopyManager`。
+- **`shell`**：即时模式场景与排版：`OutputLayout`（全局逻辑多屏布局）、`SceneItem`（场景绘制项）、`SceneHit` 与 `scene_hit_test`（命中测试）、`scene_route_pointer`（指针路由，含隐式 grab）、`PopupTree`（自己跟随 `XdgShell` 的 popup 树与 grab 关闭）、`LayerManager`。
+- **`gpu`**（对应 `luminaria.shell` + `luminaria.render`，特性 `gpu` / `shell`）：混成器整栈门面（re-export 了 `render` 的全部类型，以及 `Frame`、`SceneRenderer`、`Cursor`、`DirectScanout`）。
+- **`protocol`**：Wayland 核心协议全局对象：`CoreGlobals`（一次创建每个混成器都要的那一组）、`Compositor`、`Subcompositor`、`SurfaceId`、`XdgShell`、`Seat`、`LayerShell`、`OutputGlobal`、`CursorTheme`，以及各类协议管理器。
 - **`desktop`**（对应 `luminaria.desktop`，特性 `desktop`）：桌面特权协议管理器：`ForeignToplevelManager`（任务栏窗口列表）、`WorkspaceManager`（ext-workspace 工作区）、`SessionLockManager`（ext-session-lock 锁屏）、`OutputManager`（wlr-output-management 显示器配置）、`DataControlManager`（剪贴板访问）、`InputMethodManager`（输入法协议）。
 - **`text`**（对应 `luminaria.text`，特性 `text`）：`Font`（fcft 字形栅格化与度量）、`decode_utf8`。不画文字的混成器不必链接 fontconfig。
-- **`shell`**：即时模式场景与排版：`OutputLayout`（全局逻辑多屏布局）、`SceneItem`（场景绘制项）、`SceneHit` 与 `scene_hit_test`（命中测试）、`scene_route_pointer`（指针路由，含隐式 grab）、`CpuCompositor`（纯 CPU 软件合成器）、`PopupTree`（自己跟随 `XdgShell` 的 popup 树与 grab 关闭）、`Pointer`。
 
 ---
 

@@ -15,7 +15,7 @@
 #include <wayland-client-protocol.h>
 #include <wayland-server-core.h>
 
-import luminaria.gpu;
+import luminaria.render;
 import std;
 
 namespace {

@@ -14,11 +14,11 @@ module;
 
 #include <sys/stat.h>
 
-export module luminaria:cursor_theme;
+export module luminaria.shell:cursor_theme;
 
 import std;
 
-import :expected;
+import luminaria;
 
 export namespace luminaria {
 

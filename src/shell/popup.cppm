@@ -1,13 +1,11 @@
 // luminaria/shell/popup.cppm — popup hierarchy, placement and menu-grab routing.
-export module luminaria:popup;
+export module luminaria.shell:popup;
 
 import std;
 
-import :box;
-import :handle;
+import luminaria;
+
 import :scene;
-import :signal;
-import :xdg_shell;
 
 export namespace luminaria {
 

@@ -44,7 +44,7 @@
 
 #include "presentation-time-client-protocol.h"
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace {

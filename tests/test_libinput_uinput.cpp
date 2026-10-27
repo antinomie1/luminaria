@@ -34,7 +34,7 @@
 #include <time.h>
 #include <unistd.h>
 
-import luminaria.gpu;
+import luminaria.backend;
 import std;
 
 namespace {

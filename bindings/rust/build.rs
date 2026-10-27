@@ -39,9 +39,13 @@ fn main() {
         "LUMINARIA_SANITIZE must be none, address or undefined"
     );
 
-    // Which C++ modules the enabled cargo features ask for. The core module is
-    // always there; the extensions are independent of each other.
-    let gpu = env::var_os("CARGO_FEATURE_GPU").is_some();
+    // Which C++ modules the enabled cargo features ask for (ADR 0008). The core
+    // module is always there. `shell` implies `backend` and `render` through the
+    // feature table, and `gpu` is the historical name for `shell`, so cargo sets
+    // all three for a default build.
+    let backend = env::var_os("CARGO_FEATURE_BACKEND").is_some();
+    let render = env::var_os("CARGO_FEATURE_RENDER").is_some();
+    let shell = env::var_os("CARGO_FEATURE_SHELL").is_some();
     let desktop = env::var_os("CARGO_FEATURE_DESKTOP").is_some();
     let text = env::var_os("CARGO_FEATURE_TEXT").is_some();
 
@@ -51,8 +55,14 @@ fn main() {
 
     // ---------------------------------------------------------------- 1. glue
     let mut bridges = vec!["src/ffi.rs"];
-    if gpu {
-        bridges.push("src/ffi_gpu.rs");
+    if backend {
+        bridges.push("src/ffi_backend.rs");
+    }
+    if render {
+        bridges.push("src/ffi_render.rs");
+    }
+    if shell {
+        bridges.push("src/ffi_shell.rs");
     }
     if desktop {
         bridges.push("src/ffi_desktop.rs");
@@ -83,8 +93,14 @@ fn main() {
         assert!(status.success(), "xmake {} failed", args.join(" "));
     };
     let mut modules = vec!["core"];
-    if gpu {
-        modules.push("gpu");
+    if backend {
+        modules.push("backend");
+    }
+    if render {
+        modules.push("render");
+    }
+    if shell {
+        modules.push("shell");
     }
     if desktop {
         modules.push("desktop");
@@ -120,12 +136,19 @@ fn main() {
         .expect("xmake built luminaria-rs but its archive is nowhere under the build dir");
     println!("cargo:rustc-link-search=native={}", libdir.display());
     // Dependents before dependencies, and only the modules that were built.
+    // Dependents before dependencies.
     let mut libs = vec!["luminaria-rs"];
+    if shell {
+        libs.push("luminaria-shell");
+    }
     if desktop {
         libs.push("luminaria-desktop");
     }
-    if gpu {
-        libs.push("luminaria-gpu");
+    if render {
+        libs.push("luminaria-render");
+    }
+    if backend {
+        libs.push("luminaria-backend");
     }
     libs.push("luminaria");
     if text {
@@ -139,8 +162,11 @@ fn main() {
     // xkbcommon; luminaria.gpu adds the whole bare-metal stack; luminaria.text
     // adds fcft and its dependencies.
     let mut pkgs = vec!["wayland-server", "wayland-client", "xkbcommon"];
-    if gpu {
-        pkgs.extend(["vulkan", "libdrm", "libinput", "libudev", "gbm", "libseat"]);
+    if backend {
+        pkgs.extend(["libdrm", "libinput", "libudev", "libseat"]);
+    }
+    if render {
+        pkgs.extend(["vulkan", "gbm", "libdrm"]);
     }
     if text {
         pkgs.extend(["fontconfig", "pixman-1"]);
@@ -163,8 +189,12 @@ fn main() {
     for path in [
         "luminaria_rs.h",
         "luminaria_rs.cpp",
-        "luminaria_rs_gpu.h",
-        "luminaria_rs_gpu.cpp",
+        "luminaria_rs_backend.h",
+        "luminaria_rs_backend.cpp",
+        "luminaria_rs_render.h",
+        "luminaria_rs_render.cpp",
+        "luminaria_rs_shell.h",
+        "luminaria_rs_shell.cpp",
         "luminaria_rs_desktop.h",
         "luminaria_rs_desktop.cpp",
         "luminaria_rs_text.h",
@@ -172,7 +202,9 @@ fn main() {
         "luminaria_rs_internal.h",
         "src/lib.rs",
         "src/ffi.rs",
-        "src/ffi_gpu.rs",
+        "src/ffi_backend.rs",
+        "src/ffi_render.rs",
+        "src/ffi_shell.rs",
         "src/ffi_desktop.rs",
         "src/ffi_text.rs",
         "xmake.lua",
@@ -191,7 +223,7 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
-    for feature in ["gpu", "desktop", "text"] {
+    for feature in ["backend", "render", "shell", "gpu", "desktop", "text"] {
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_{}", feature.to_uppercase());
     }
 }

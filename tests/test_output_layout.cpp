@@ -2,7 +2,7 @@
 // coordinate space, and what a window straddling two of them covers.
 #include <cassert>
 
-import luminaria;
+import luminaria.backend;
 import std;
 
 int main() {

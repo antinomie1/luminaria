@@ -3,7 +3,11 @@
 use crate::backend::Output;
 use crate::core::{Error, ErrorKind};
 use crate::ffi;
-use crate::protocol::{Layer, LayerShell, SurfaceId, XdgShell};
+#[cfg(feature = "shell")]
+use crate::ffi_shell;
+use crate::protocol::SurfaceId;
+#[cfg(feature = "shell")]
+use crate::protocol::{Layer, LayerShell, XdgShell};
 use crate::util::{Color, Rect};
 
 /// Manages arrangement of multiple outputs in global logical coordinates.
@@ -74,6 +78,7 @@ pub enum SceneKind {
 }
 
 impl SceneKind {
+    #[cfg(feature = "shell")]
     fn from_raw(raw: u32) -> Self {
         match raw {
             0 => Self::Surface,
@@ -173,7 +178,8 @@ impl SceneItem {
         self
     }
 
-    pub(crate) fn from_raw(raw: &ffi::SceneItemRaw) -> Self {
+    #[cfg(feature = "shell")]
+    pub(crate) fn from_raw(raw: &ffi_shell::SceneItemRaw) -> Self {
         Self {
             kind: SceneKind::from_raw(raw.kind),
             rect: Rect::new(raw.x, raw.y, raw.width, raw.height),
@@ -193,8 +199,9 @@ impl SceneItem {
         }
     }
 
-    pub(crate) fn to_raw(&self) -> ffi::SceneItemRaw {
-        ffi::SceneItemRaw {
+    #[cfg(feature = "shell")]
+    pub(crate) fn to_raw(&self) -> ffi_shell::SceneItemRaw {
+        ffi_shell::SceneItemRaw {
             kind: self.kind as u32,
             x: self.rect.x,
             y: self.rect.y,
@@ -235,13 +242,15 @@ pub struct SceneHit {
 }
 
 /// Hit-test against `items` (front-to-back, reverse of paint order) at global coordinates (`x`, `y`).
+#[cfg(feature = "shell")]
 pub fn scene_hit_test(items: &[SceneItem], x: f64, y: f64) -> SceneHit {
-    let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
-    SceneHit::from_raw(ffi::raw_scene_hit_test(&raw_items, x, y))
+    let raw_items: Vec<ffi_shell::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+    SceneHit::from_raw(ffi_shell::raw_scene_hit_test(&raw_items, x, y))
 }
 
 impl SceneHit {
-    fn from_raw(raw: ffi::SceneHitRaw) -> Self {
+    #[cfg(feature = "shell")]
+    fn from_raw(raw: ffi_shell::SceneHitRaw) -> Self {
         Self { hit: raw.hit, tag: raw.tag, surface: SurfaceId::from_raw(raw.surface_id), sx: raw.sx, sy: raw.sy }
     }
 }
@@ -251,58 +260,23 @@ impl SceneHit {
 /// its own coordinates, wherever the pointer is; otherwise the surface under
 /// the point gets focus, or focus is cleared over nothing. Answers the hit
 /// under the point either way.
+#[cfg(feature = "shell")]
 pub fn scene_route_pointer(seat: &crate::protocol::Seat<'_>, items: &[SceneItem], x: f64, y: f64) -> SceneHit {
-    let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
-    SceneHit::from_raw(ffi::raw_scene_route_pointer(&seat.raw, &raw_items, x, y))
+    let raw_items: Vec<ffi_shell::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+    SceneHit::from_raw(ffi_shell::raw_scene_route_pointer(&seat.raw, &raw_items, x, y))
 }
 
 /// Where `surface`'s own origin is drawn in `items`: a root's item origin, or
 /// that plus a subsurface's offset in its tree. `None` when it is not drawn.
+#[cfg(feature = "shell")]
 pub fn scene_surface_origin(items: &[SceneItem], surface: SurfaceId) -> Option<(f64, f64)> {
-    let raw_items: Vec<ffi::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+    let raw_items: Vec<ffi_shell::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
     let (mut x, mut y) = (0.0, 0.0);
-    ffi::raw_scene_surface_origin(&raw_items, surface.0, &mut x, &mut y).then_some((x, y))
+    ffi_shell::raw_scene_surface_origin(&raw_items, surface.0, &mut x, &mut y).then_some((x, y))
 }
 
-/// Software CPU compositor for nested and headless targets.
-pub struct CpuCompositor {
-    raw: cxx::UniquePtr<ffi::CpuCompositorShim>,
-}
-
-impl CpuCompositor {
-    pub fn new() -> Result<Self, Error> {
-        let raw = ffi::cpu_compositor_new();
-        if raw.is_null() {
-            Err(Error::new(ErrorKind::Shell, "failed to create cpu compositor"))
-        } else {
-            Ok(Self { raw })
-        }
-    }
-
-    pub fn composite_rect(&mut self, rect: Rect, color: Color) {
-        self.raw.pin_mut().composite_rect(
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            color.r,
-            color.g,
-            color.b,
-            color.a,
-        );
-    }
-
-    pub fn finish(&mut self, width: i32, height: i32, background: Color) -> Vec<u8> {
-        self.raw.pin_mut().finish(
-            width,
-            height,
-            background.r,
-            background.g,
-            background.b,
-            background.a,
-        )
-    }
-}
+#[cfg(feature = "render")]
+pub use crate::render::CpuCompositor;
 
 /// Every popup an [`XdgShell`] creates, from creation to destruction: drawn
 /// above its parent by [`append_to`](Self::append_to), dismissed by a click
@@ -312,13 +286,15 @@ impl CpuCompositor {
 /// It needs no borrow of the shell: the C++ tree it wraps lets go of each
 /// popup when the popup is destroyed, and of the shell's signal when either
 /// side goes first.
+#[cfg(feature = "shell")]
 pub struct PopupTree {
-    raw: cxx::UniquePtr<ffi::PopupTreeShim>,
+    raw: cxx::UniquePtr<ffi_shell::PopupTreeShim>,
 }
 
+#[cfg(feature = "shell")]
 impl PopupTree {
     pub fn new(shell: &XdgShell<'_>) -> Result<Self, Error> {
-        let raw = ffi::popup_tree_new(&shell.raw);
+        let raw = ffi_shell::popup_tree_new(&shell.raw);
         if raw.is_null() {
             Err(Error::new(ErrorKind::Shell, "failed to create popup tree"))
         } else {
@@ -337,7 +313,7 @@ impl PopupTree {
     /// item and at its offset from it, carrying the parent's tag. Popups whose
     /// parent is not in `scene` are left out. Submenus nest.
     pub fn append_to(&self, scene: &mut Vec<SceneItem>) {
-        let raw: Vec<ffi::SceneItemRaw> = scene.iter().map(SceneItem::to_raw).collect();
+        let raw: Vec<ffi_shell::SceneItemRaw> = scene.iter().map(SceneItem::to_raw).collect();
         scene.extend(self.raw.append_to(&raw).iter().map(SceneItem::from_raw));
     }
 
@@ -368,13 +344,15 @@ impl PopupTree {
 ///
 /// Like [`PopupTree`] it drops a destroyed layer surface by itself and needs
 /// no borrow of the [`LayerShell`].
+#[cfg(feature = "shell")]
 pub struct LayerManager {
-    raw: cxx::UniquePtr<ffi::LayerManagerShim>,
+    raw: cxx::UniquePtr<ffi_shell::LayerManagerShim>,
 }
 
+#[cfg(feature = "shell")]
 impl LayerManager {
     pub fn new() -> Result<Self, Error> {
-        let raw = ffi::layer_manager_new();
+        let raw = ffi_shell::layer_manager_new();
         if raw.is_null() {
             Err(Error::new(ErrorKind::Shell, "failed to create layer manager"))
         } else {

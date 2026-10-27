@@ -22,14 +22,15 @@
 // A compositor that wants the GPU path only can still drive `Frame` directly;
 // this is for the ones that must also come up on a machine with no GPU — which
 // includes every test suite that runs in CI.
-export module luminaria.gpu:scene_renderer;
+export module luminaria.shell:scene_renderer;
 
 import std;
 
 import luminaria;
+import luminaria.render;
 
 import :frame;
-import :vulkan;
+import :scene;
 
 export namespace luminaria {
 

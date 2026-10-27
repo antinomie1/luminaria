@@ -7,7 +7,7 @@
 
 #include "tint_frag_spv.h"
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace {

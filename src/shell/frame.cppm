@@ -37,13 +37,14 @@ module;
 
 #include <unistd.h> // dup, close — the fences handed between GPU and display
 
-export module luminaria.gpu:frame;
+export module luminaria.shell:frame;
 
 import std;
 
 import luminaria;
+import luminaria.render;
+
 import :direct_scanout;
-import :vulkan;
 
 export namespace luminaria {
 

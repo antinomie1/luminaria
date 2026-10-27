@@ -6,28 +6,29 @@ Rust 绑定与 C++ 库逐类型对应：像在 C++ 中一样，按需挑选与�
 
 ## 特性开关：按模块付费
 
-C++ 的模块边界（ADR 0003）在绑定里是一比一复制的：**每个模块一个 `#[cxx::bridge]`
-（`src/ffi.rs` / `src/ffi_gpu.rs` / `src/ffi_desktop.rs` / `src/ffi_text.rs`）、一个 shim 翻译单元
-（`luminaria_rs*.cpp`）**，cargo 特性决定编译哪些、链接哪些。关掉的模块不编译、不链接，
-也不探测它的系统库。
+C++ 的模块边界（ADR 0008）在绑定里是一比一复制的：**每个模块一个 `#[cxx::bridge]`、一个 shim 翻译单元**，
+cargo 特性决定编译哪些、链接哪些。关掉的模块不编译、不链接，也不探测它的系统库。
 
 | 特性 | 默认 | C++ 模块 | Rust 模块 / 类型 | 额外链接的系统库 |
 |---|---|---|---|---|
-| *（始终有）* | — | `luminaria` | `core`、`util`、`backend`（`Output`/`HeadlessBackend`/`WaylandBackend`）、`protocol`、`shell` | wayland-server、wayland-client、xkbcommon |
-| `gpu` | ✅ | `luminaria.gpu` | `gpu`，以及 `backend::{DrmBackend, LibinputBackend, Session}` | vulkan、libdrm、libinput、libudev、gbm、libseat |
-| `desktop` | ✅ | `luminaria.desktop` | `desktop` | — |
+| *（始终有）* | — | `luminaria` | `core`、`util`、`backend::Output`、`protocol`、`shell::OutputLayout` | wayland-server、wayland-client、xkbcommon |
+| `backend` | — | `luminaria.backend` | `backend`（`HeadlessBackend`/`WaylandBackend`/`DrmBackend`/`LibinputBackend`/`Session`） | libdrm、libinput、libudev、libseat |
+| `render` | — | `luminaria.render` | `render`（`VulkanRenderer`/`CpuCompositor`/`LinuxDmabuf`/`Screencopy`） | vulkan、libdrm、gbm |
+| `shell` / `gpu` | ✅ | `luminaria.shell` | 混成器整栈：`gpu` 门面（`Frame`/`SceneRenderer`/`Cursor`/`DirectScanout`）+ `AutoBackend` | 上述两行全部库 |
+| `desktop` | ✅ | `luminaria.desktop` | `desktop`（任务栏、工作区、锁屏、输出管理、剪贴板、输入法） | — |
 | `text` | ❌ | `luminaria.text` | `text` | fcft、fontconfig、pixman |
-| `raw-vulkan` | ❌ | —（隐含 `gpu`） | `VulkanRenderer::raw_handles()`、`SceneRenderer::raw_vulkan_handles()` | — |
+| `raw-vulkan` | ❌ | —（隐含 `render`） | `VulkanRenderer::raw_handles()`、`SceneRenderer::raw_vulkan_handles()` | — |
 | `mint` / `glam` | ❌ | — | `util` 里几何类型的 `From`/`Into` | — |
 
 ```sh
 cargo test --no-default-features                 # 只有核心：ldd 里没有 vulkan/gbm/libseat/libinput
-cargo test --no-default-features --features gpu  # 裸机/GPU，不要桌面特权协议
-cargo test                                       # 默认 = gpu + desktop，与 0.0.1 之前完全一致
+cargo test --no-default-features --features backend # 只有设备与后端
+cargo test --no-default-features --features render  # 只有渲染器
+cargo test                                       # 默认 = gpu + desktop，整套流水线
 cargo test --features text                       # 加上 Font
 ```
 
-`desktop` 与 `gpu` 互不依赖。`raw-vulkan` 依赖 `gpu`：没有渲染器就没有句柄。
+`desktop` 与底层渲染互不依赖。`raw-vulkan` 依赖 `render`：没有渲染器就没有句柄。
 
 ---
 
@@ -37,12 +38,13 @@ cargo test --features text                       # 加上 Font
 |---|---|---|
 | **[`core`](#1-core-模块)** | `luminaria:display`, `event_loop`, `expected`, `input_router` | Wayland 服务端根对象、事件循环驱动、文件描述符绑定、错误类型、`KeyRouter` |
 | **[`event`](#事件一条流)** | —（绑定自己的） | `Event`：库报告的一切，按信号触发顺序 |
-| **[`util`](#2-util-模块)** | `luminaria:box`, `color`, `transform`, `region`, `keymap` | 纯几何矩形运算、颜色与色彩空间、朝向变换、不相交区域、XKB 键表与像素布局 |
-| **[`backend`](#3-backend-模块)** | `luminaria:output`, `headless`, `wayland`（`drm`/`libinput` 属 `luminaria.gpu`） | 虚拟无头输出、嵌套窗口后端；特性 `gpu` 下还有裸机 DRM/KMS 输出、libinput 设备驱动 |
-| **[`protocol`](#4-protocol-模块)** | `luminaria:compositor`, `xdg_shell`, `seat`, `layer_shell` 等 | Wayland 核心协议对象（Compositor, SurfaceId, Seat 等）及 16 个核心扩展管理器 |
-| **[`gpu`](#5-gpu-模块)** | `luminaria.gpu:*` | Vulkan 1.3 渲染器、即时帧账本 `Frame`、硬件光标、直出评估 `DirectScanout`、截屏协议 |
+| **[`util`](#2-util-模块)** | `luminaria:box`, `color`, `transform`, `region`, `keymap`, `blur` | 纯几何矩形运算、颜色与色彩空间、朝向变换、不相交区域、XKB 键表与模糊参数 |
+| **[`backend`](#3-backend-模块)** | `luminaria.backend:*`（基础 Output 在 `luminaria`） | 虚拟无头输出、嵌套窗口后端；特性 `backend` 下还有裸机 DRM/KMS 输出、libinput 设备驱动、libseat 会话；特性 `shell` 下有 `AutoBackend` |
+| **[`protocol`](#4-protocol-模块)** | `luminaria:compositor`, `xdg_shell`, `seat`, `layer_shell` 等 | Wayland 核心协议对象（Compositor, SurfaceId, Seat, LayerShell 等）及核心扩展管理器 |
+| **[`render`](#5-render-模块特性-render)** | `luminaria.render:*` | Vulkan 1.3 渲染器、纯 CPU 软件合成器 `CpuCompositor`、`LinuxDmabuf`、显式同步 `DrmSyncobj`、截屏协议 |
+| **[`shell`](#7-shell-模块)** | `luminaria.shell:*` | 即时模式场景项定义、反向命中测试、多显示器坐标排版、PopupTree、LayerManager |
+| **[`gpu`](#5-gpu-模块)** | `luminaria.shell` + `luminaria.render` | 混成器整栈门面（re-export 了 `render` 全部图元，以及即时帧账本 `Frame`、硬件光标 `Cursor`、`SceneRenderer`、直出评估 `DirectScanout`） |
 | **[`desktop`](#6-desktop-模块)** | `luminaria.desktop:*` | 任务栏同步、ext-workspace 工作区、ext-session-lock 锁屏、wlr-output-management 显示管理 |
-| **[`shell`](#7-shell-模块)** | `luminaria:output_layout`, `scene`, `cpu_compositor` | 即时模式场景项定义、反向命中测试、多显示器坐标排版、纯 CPU 软件合成器 |
 | **[`text`](#10-text-模块特性-text)** | `luminaria.text` | fcft 字形栅格化与字体度量 |
 
 ---

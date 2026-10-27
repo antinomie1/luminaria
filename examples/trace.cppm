@@ -6,7 +6,7 @@
 // the `frames/s` line stops appearing — which is the point of printing it.
 export module minimal_trace;
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 export namespace trace {

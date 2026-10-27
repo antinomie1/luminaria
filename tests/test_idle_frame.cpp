@@ -11,7 +11,7 @@
 // callbacks, so both stop on their own once the commits stop.
 #include <cassert>
 
-import luminaria;
+import luminaria.backend;
 import std;
 
 int main() {

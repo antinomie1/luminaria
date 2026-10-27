@@ -37,7 +37,7 @@ module;
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-export module luminaria.gpu:drm;
+export module luminaria.backend:drm;
 
 import std;
 

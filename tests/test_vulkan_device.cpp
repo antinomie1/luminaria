@@ -10,7 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-import luminaria.gpu;
+import luminaria.render;
 import std;
 
 int main() {

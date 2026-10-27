@@ -9,7 +9,7 @@
 #include <cassert>
 #include <cstdio>
 
-import luminaria.gpu;
+import luminaria.backend;
 import std;
 
 int main() {

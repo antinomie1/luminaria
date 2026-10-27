@@ -21,7 +21,6 @@ pub(crate) mod ffi {
 
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
-        include!("luminaria/luminaria_rs_gpu.h");
         include!("luminaria/luminaria_rs_desktop.h");
         // Shared structs (EventRaw, Rect) are defined by the core bridge.
         include!("luminaria/src/ffi.rs.h");

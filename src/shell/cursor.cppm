@@ -19,14 +19,18 @@
 // It draws through `SceneRenderer`: it installs itself as the renderer's cursor
 // source, so `SceneRenderer::present()` composites it wherever the plane does
 // not carry it, and calls `update_cursor()` whenever it moved or changed.
-export module luminaria.gpu:cursor;
+export module luminaria.shell:cursor;
 
 import std;
 
 import luminaria;
+import luminaria.render;
 
+import :cursor_manager;
+import :cursor_theme;
+import :pointer;
+import :scene;
 import :scene_renderer;
-import :screencopy;
 
 export namespace luminaria {
 

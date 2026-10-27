@@ -21,8 +21,8 @@ luminaria 管**机制**，不管**策略**：
 
 | 路径 | 入口 | 用在哪 |
 |---|---|---|
-| GPU | `Frame`（`luminaria.gpu`）| 有 Vulkan 的混成器。零拷贝、damage 记账、fence 编排、直出判断全包 |
-| CPU | `CpuCompositor`（`luminaria`）| 没有 GPU 的地方：headless、嵌套、测试、screencopy 前置。纯 CPU 混合，无 Vulkan 依赖 |
+| GPU | `Frame`（`luminaria.shell`）| 有 Vulkan 的混成器。零拷贝、damage 记账、fence 编排、直出判断全包 |
+| CPU | `CpuCompositor`（`luminaria.render`）| 没有 GPU 的地方：headless、嵌套、测试、screencopy 前置。纯 CPU 混合，无 Vulkan 依赖 |
 
 两者吃**同一种 z 序列表**——混成器每帧现搭一串"画什么、画在哪"，按列表顺序
 从后往前画。列表由两种图元组成：

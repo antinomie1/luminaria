@@ -1,11 +1,10 @@
 // luminaria/shell/layer.cppm — multi-layer placement and exclusive-zone arrangement.
-export module luminaria:layer;
+export module luminaria.shell:layer;
 
 import std;
 
-import :box;
-import :handle;
-import :layer_shell;
+import luminaria;
+
 import :scene;
 
 export namespace luminaria {

@@ -37,9 +37,6 @@ import :xdg_shell;
 
 export namespace luminaria {
 
-class Display;
-class Popup;
-class Surface;
 class LayerSurface;
 
 /// z-depth bands, bottom-most first. Application windows live between `bottom`

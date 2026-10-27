@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 using namespace luminaria;

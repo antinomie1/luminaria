@@ -1,18 +1,13 @@
 // luminaria/shell/cursor_manager.cppm — cursor image resolution, shape and constraint pipeline.
-export module luminaria:cursor_manager;
+export module luminaria.shell:cursor_manager;
 
 import std;
 
-import :box;
-import :cursor_shape;
+import luminaria;
+
 import :cursor_theme;
-import :expected;
-import :handle;
 import :pointer;
-import :pointer_constraints;
-import :relative_pointer;
 import :scene;
-import :seat;
 
 export namespace luminaria {
 

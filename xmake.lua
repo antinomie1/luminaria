@@ -1,7 +1,14 @@
 -- Luminaria — a minimal Wayland compositor library.
 --
--- Built as three C++23 named modules: the dependency-light `luminaria` core and
--- opt-in `luminaria.gpu` and `luminaria.desktop` extensions.
+-- Built as C++23 named modules, one per layer (ADR 0008):
+--
+--   luminaria          protocols, mechanism kernel, Backend/Output abstraction
+--   luminaria.backend  headless, nested, DRM/KMS, libinput, libseat session
+--   luminaria.render   Vulkan, the CPU compositor, dmabuf/syncobj/screencopy
+--   luminaria.shell    Frame, SceneRenderer, Cursor, direct scanout, AutoBackend
+--   luminaria.desktop  privileged desktop protocols
+--   luminaria.text     fcft + pixman glyph rasterization
+--
 -- Every partition lives in src/**/*.cppm — one file per concept, holding both
 -- interface and implementation. There is no public include/ tree.
 --
@@ -224,7 +231,20 @@ for _, name in ipairs(pkgs) do
     add_requires("pkgconfig::" .. name, {alias = (name:gsub("-", "_"))})
 end
 local base_packages = {"wayland_server", "wayland_client", "xkbcommon"}
-local gpu_packages = {"vulkan", "libdrm", "libinput", "libudev", "gbm", "libseat"}
+-- What the concrete backends need and the renderer does not: devices and the
+-- session that grants access to them.
+local backend_packages = {"libdrm", "libinput", "libudev", "libseat"}
+-- What the renderer needs and the backends do not: the GPU stack.
+local render_packages = {"vulkan", "libdrm", "gbm"}
+-- Shaders compiled to SPIR-V arrays at build time by glslangValidator.
+local shaders = {{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
+                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
+                 {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
+                 {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
+                 {"kawase_down.frag", "kKawaseDownFragSpv", "kawase_down_frag_spv.h"},
+                 {"kawase_up.frag", "kKawaseUpFragSpv", "kawase_up_frag_spv.h"},
+                 {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
+                 {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}
 add_requires("fcft", "pixman", {system = true})
 
 -- ---------------------------------------------------------------- code generation
@@ -239,31 +259,11 @@ add_requires("fcft", "pixman", {system = true})
 target("luminaria")
     set_kind("static")
     luminaria_defaults()
-    add_files("src/luminaria.cppm", "src/core/**.cppm", "src/util/**.cppm", {public = true})
-    add_files("src/backend/backend.cppm", "src/backend/headless.cppm",
-              "src/backend/input_event.cppm", "src/backend/output.cppm",
-              "src/backend/wayland.cppm", {public = true})
-    add_files("src/protocol/client_buffer.cppm", "src/protocol/commit_timing.cppm",
-              "src/protocol/compositor.cppm", "src/protocol/content_type.cppm",
-              "src/protocol/core_globals.cppm",
-              "src/protocol/background_effect.cppm",
-              "src/protocol/cursor_shape.cppm", "src/protocol/data_device.cppm",
-              "src/protocol/fifo.cppm",
-              "src/protocol/fractional_scale.cppm", "src/protocol/idle_inhibit.cppm",
-              "src/protocol/idle_notify.cppm", "src/protocol/layer_shell.cppm",
-              "src/protocol/output_global.cppm", "src/protocol/pointer_constraints.cppm",
-              "src/protocol/presentation_time.cppm", "src/protocol/relative_pointer.cppm",
-              "src/protocol/seat.cppm", "src/protocol/single_pixel_buffer.cppm",
-              "src/protocol/subcompositor.cppm", "src/protocol/tearing_control.cppm",
-              "src/protocol/text_input.cppm", "src/protocol/viewporter.cppm",
-              "src/protocol/xdg_activation.cppm", "src/protocol/xdg_decoration.cppm",
-              "src/protocol/xdg_shell.cppm", "src/protocol/xdg_toplevel_icon.cppm",
-              {public = true})
-    add_files("src/render/cursor_theme.cppm", "src/shell/cpu_compositor.cppm",
-              "src/shell/cursor_manager.cppm", "src/shell/layer.cppm",
-              "src/shell/pointer.cppm", "src/shell/popup.cppm",
-              "src/shell/output_layout.cppm", "src/shell/scene.cppm", {public = true})
-
+    -- The mechanism kernel, the value types, the Backend/Output/InputEvent
+    -- abstraction (backend/base/) and every protocol whose semantics are plain
+    -- Wayland rather than a shell decision or a display-hardware one.
+    add_files("src/luminaria.cppm", "src/core/**.cppm", "src/util/**.cppm",
+              "src/backend/base/**.cppm", "src/protocol/core/**.cppm", {public = true})
 
     -- for detail/wayland_fwd.h, included in the units' GMF
     add_includedirs("src", {public = true})
@@ -366,31 +366,38 @@ target("luminaria")
         target:add("includedirs", gendir, {public = true})
     end)
 
-target("luminaria-gpu")
+target("luminaria-backend")
     set_kind("static")
     luminaria_defaults()
     add_deps("luminaria")
-    add_files("src/luminaria.gpu.cppm", "src/backend/auto_backend.cppm", "src/backend/drm.cppm",
-              "src/backend/libinput.cppm", "src/backend/session.cppm",
-              "src/protocol/drm_syncobj.cppm", "src/protocol/linux_dmabuf.cppm",
-              "src/protocol/screencopy.cppm", "src/render/vulkan.cppm",
-              "src/shell/cursor.cppm", "src/shell/direct_scanout.cppm",
-              "src/shell/frame.cppm", "src/shell/scene_renderer.cppm", {public = true})
+    add_files("src/luminaria.backend.cppm", "src/backend/headless.cppm",
+              "src/backend/wayland.cppm", "src/backend/drm.cppm",
+              "src/backend/libinput.cppm", "src/backend/session.cppm", {public = true})
     add_includedirs("src", "build/generated", {public = true})
-    add_packages(gpu_packages, {public = true})
+    add_packages(base_packages, {public = true})
+    add_packages(backend_packages, {public = true})
+
+-- Pixels, by GPU or by CPU, plus the three protocols that exist to move buffers
+-- around. No Vulkan-free variant exists by now: the dmabuf importer is the
+-- renderer's.
+target("luminaria-render")
+    set_kind("static")
+    luminaria_defaults()
+    add_deps("luminaria")
+    add_files("src/luminaria.render.cppm", "src/render/vulkan.cppm",
+              "src/render/cpu_compositor.cppm",
+              "src/protocol/render/linux_dmabuf.cppm",
+              "src/protocol/render/drm_syncobj.cppm",
+              "src/protocol/render/screencopy.cppm", {public = true})
+    add_includedirs("src", "build/generated", {public = true})
+    add_packages(base_packages, {public = true})
+    add_packages(render_packages, {public = true})
     on_load(function (target)
         local function stale(src, dst)
             return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
         end
         -- os.scriptdir() for the same reason as the protocol scanner above.
-        for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
-                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
-                                 {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
-                                 {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
-                                 {"kawase_down.frag", "kKawaseDownFragSpv", "kawase_down_frag_spv.h"},
-                                 {"kawase_up.frag", "kKawaseUpFragSpv", "kawase_up_frag_spv.h"},
-                                 {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
-                                 {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
+        for _, shader in ipairs(shaders) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
             local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
             if stale(src, dst) then
@@ -407,14 +414,7 @@ target("luminaria-gpu")
         local function stale(src, dst)
             return not os.isfile(dst) or os.mtime(src) > os.mtime(dst)
         end
-        for _, shader in ipairs({{"quad.vert", "kQuadVertSpv", "quad_vert_spv.h"},
-                                 {"quad.frag", "kQuadFragSpv", "quad_frag_spv.h"},
-                                 {"solid.frag", "kSolidFragSpv", "solid_frag_spv.h"},
-                                 {"rounded.frag", "kRoundedFragSpv", "rounded_frag_spv.h"},
-                                 {"kawase_down.frag", "kKawaseDownFragSpv", "kawase_down_frag_spv.h"},
-                                 {"kawase_up.frag", "kKawaseUpFragSpv", "kawase_up_frag_spv.h"},
-                                 {"shadow.frag", "kShadowFragSpv", "shadow_frag_spv.h"},
-                                 {"tint.frag", "kTintFragSpv", "tint_frag_spv.h"}}) do
+        for _, shader in ipairs(shaders) do
             local src = path.join(os.scriptdir(), "src", "render", shader[1])
             local dst = path.join(os.scriptdir(), "build", "generated", shader[3])
             if stale(src, dst) then
@@ -424,16 +424,24 @@ target("luminaria-gpu")
         end
     end)
 
+-- The immediate-mode shell: Frame, SceneItem/SceneRenderer, Cursor, layer
+-- surfaces, popups, direct scanout and AutoBackend. It is the one target that
+-- needs both halves, so it depends on both and re-exports both.
+target("luminaria-shell")
+    set_kind("static")
+    luminaria_defaults()
+    add_deps("luminaria-backend", "luminaria-render")
+    add_files("src/luminaria.shell.cppm", "src/shell/**.cppm", {public = true})
+    add_includedirs("src", "build/generated", {public = true})
+    add_packages(base_packages, {public = true})
+
 target("luminaria-desktop")
     set_kind("static")
     luminaria_defaults()
     add_deps("luminaria")
-    add_files("src/luminaria.desktop.cppm", "src/protocol/data_control.cppm",
-              "src/protocol/foreign_toplevel.cppm", "src/protocol/input_method.cppm",
-              "src/protocol/output_management.cppm",
-              "src/protocol/session_lock.cppm", "src/protocol/workspace.cppm",
-              {public = true})
-
+    add_files("src/luminaria.desktop.cppm", "src/protocol/desktop/**.cppm", {public = true})
+    add_includedirs("src", "build/generated", {public = true})
+    add_packages(base_packages, {public = true})
 
 target("luminaria-text")
     set_kind("static")
@@ -459,35 +467,43 @@ target("minimal")
     set_kind("binary")
     luminaria_defaults()
     add_files("examples/minimal.cpp", "examples/trace.cppm")
-    add_deps("luminaria-gpu")
+    add_deps("luminaria-shell")
 
 -- One test binary per file, same as before. Several skip themselves with exit 77
 -- when the machine has no GPU / no free VT / no seat, so that counts as a pass.
+--
+-- Which library a test links follows from the module it imports, and the tables
+-- below are only the ones that need more than the core module: a test of the
+-- KMS backend has no business linking Vulkan, and vice versa.
 
-local gpu_tests = {
-    test_auto_backend = true,
-    test_client_texture = true, test_composite = true, test_cursor_capture = true,
-    test_direct_scanout = true, test_dmabuf = true, test_drm = true, test_frame = true,
-    test_frame_animation = true,
-    test_fragment_shader = true,
-    test_frame_xray_blur = true,
-    test_blur_chain = true,
-    test_backdrop_blur = true,
-    test_rounded_shadow = true,
-    test_scene_effects = true,
-    test_xray_blur = true,
-    test_frame_damage = true, test_offscreen = true,
-    test_gpu_scanout = true, test_idle_wake = true, test_libinput = true,
-    test_libinput_uinput = true, test_render_alloc = true, test_render_output = true,
-    test_scene_present = true, test_screencopy_bounds = true, test_session = true, test_syncobj = true,
+-- Devices: KMS, libinput, the seat, plus the headless/nested backends.
+local backend_tests = {
+    test_drm = true, test_libinput = true, test_libinput_uinput = true,
+    test_session = true, test_headless = true, test_frame_timing = true,
+    test_idle_frame = true, test_output_layout = true, test_output_mode = true,
+}
+-- Pixels: Vulkan, the CPU compositor, the buffer protocols.
+local render_tests = {
+    test_client_texture = true, test_composite = true, test_dmabuf = true,
+    test_render_alloc = true, test_render_inflight = true,
     test_texture = true, test_texture_cache = true, test_vulkan = true,
-    test_vulkan_device = true, test_render_inflight = true,
-    test_wayland_nested = true,
+    test_vulkan_device = true, test_cpu_compositor = true,
+}
+-- The shell pipeline: Frame, SceneRenderer, Cursor, direct scanout, auto backend.
+local shell_tests = {
+    test_auto_backend = true, test_backdrop_blur = true, test_blur_chain = true,
+    test_direct_scanout = true, test_fragment_shader = true, test_frame = true,
+    test_frame_animation = true, test_frame_damage = true, test_frame_xray_blur = true,
+    test_gpu_scanout = true, test_idle_wake = true, test_offscreen = true,
+    test_rounded_shadow = true, test_scene_effects = true, test_scene_present = true,
+    test_wayland_nested = true, test_xray_blur = true,
+    test_layer_shell = true, test_popup = true, test_scene = true, test_subsurface = true,
+    test_cursor_theme = true, test_cursor_capture = true, test_screencopy_bounds = true,
+    test_syncobj = true, test_render_output = true,
 }
 local desktop_tests = {
     test_data_control = true, test_foreign_toplevel = true, test_input_method = true,
-    test_output_management = true, test_session_lock = true, test_teardown_order = true,
-    test_workspace = true,
+    test_output_management = true, test_session_lock = true, test_workspace = true,
 }
 local text_tests = {
     test_text = true,
@@ -500,15 +516,19 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
         luminaria_defaults()
         set_default(false)
         add_files(file)
-        if gpu_tests[name] then
-            add_deps("luminaria-gpu")
+        if shell_tests[name] then
+            add_deps("luminaria-shell")
+        elseif render_tests[name] then
+            add_deps("luminaria-render")
+        elseif backend_tests[name] then
+            add_deps("luminaria-backend")
         elseif desktop_tests[name] then
-            -- desktop does not need gpu; a test that holds one of everything
-            -- imports both.
+            -- desktop protocols need the core module and nothing else.
             add_deps("luminaria-desktop")
-            if name == "test_teardown_order" then
-                add_deps("luminaria-gpu")
-            end
+        elseif name == "test_teardown_order" then
+            -- Holds one of every client-side object, including the privileged
+            -- protocols and the shell's, so it links both.
+            add_deps("luminaria-desktop", "luminaria-shell")
         elseif text_tests[name] then
             add_deps("luminaria-text")
         else

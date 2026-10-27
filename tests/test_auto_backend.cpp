@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace lm = luminaria;

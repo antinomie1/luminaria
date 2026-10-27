@@ -22,15 +22,13 @@
 
 module;
 
-export module luminaria.gpu:auto_backend;
+export module luminaria.shell:auto_backend;
 
 import std;
 
 import luminaria;
-import :drm;
-import :libinput;
-import :session;
-import :vulkan;
+import luminaria.backend;
+import luminaria.render;
 
 export namespace luminaria {
 

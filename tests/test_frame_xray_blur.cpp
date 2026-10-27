@@ -18,7 +18,7 @@
 
 #include "ext-background-effect-v1-client-protocol.h"
 
-import luminaria.gpu;
+import luminaria.shell;
 import std;
 
 namespace {
