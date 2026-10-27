@@ -28,6 +28,7 @@ import std;
 import :compositor;
 import :display;
 import :expected;
+import :input_event;
 import :protocol_helper;
 import :signal;
 
@@ -85,6 +86,9 @@ public:
     /// Re-advertise capabilities to every bound client. Defaults to keyboard +
     /// pointer; enable touch once a touch device actually exists.
     void set_capabilities(bool keyboard, bool pointer, bool touch);
+    /// The same, straight from `InputSource::capabilities()` or an
+    /// `InputCapabilities` event.
+    void set_capabilities(InputCapabilities caps);
 
     /// Replace the keyboard layout with an xkb keymap in text form, and re-send
     /// it to every bound wl_keyboard. Returns false if it doesn't compile, in
@@ -93,7 +97,7 @@ public:
     /// This is what keeps a NESTED compositor's keys honest: the parent reports
     /// modifier masks computed against ITS keymap, and interpreting those
     /// against a locally-guessed one only works by luck on a US layout. Adopt
-    /// `WaylandBackend::keymap()` and the two agree by construction.
+    /// `InputSource::keymap()` and the two agree by construction.
     [[nodiscard]] bool set_keymap(const std::string& xkb_text);
     [[nodiscard]] const std::string& keymap() const noexcept;
 
@@ -105,6 +109,7 @@ public:
     void notify_key(uint32_t key, bool pressed);
     /// Send the current modifier state (Shift/Ctrl/…) to the keyboard-focused client.
     void notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group);
+    void notify_modifiers(const ModifiersEvent& modifiers);
     [[nodiscard]] Signal<SeatKeyboardFocus>& keyboard_focus_changed() noexcept;
 
     // --- pointer ---
@@ -141,6 +146,11 @@ public:
     void pointer_axis_discrete(int32_t dx_steps, int32_t dy_steps);
     /// Scrolling finished (fingers lifted). Ends a smooth-scroll sequence.
     void pointer_axis_stop(bool horizontal, bool vertical);
+    /// One backend scroll frame, as the three calls above. A wheel reports its
+    /// notches AND their smooth value; the notches win, because
+    /// `pointer_axis_discrete` already sends the value that goes with them and
+    /// sending the smooth one as well scrolls every notch twice.
+    void pointer_axis(const PointerAxisEvent& event);
 
     /// Fires when the focused client sets (or hides) its cursor image.
     [[nodiscard]] Signal<SeatCursorChange>& cursor_changed() noexcept;
@@ -532,6 +542,10 @@ bool Seat::set_keymap(const std::string& xkb_text) {
 
 const std::string& Seat::keymap() const noexcept { return impl_->keymap; }
 
+void Seat::set_capabilities(InputCapabilities caps) {
+    set_capabilities(caps.keyboard, caps.pointer, caps.touch);
+}
+
 void Seat::set_capabilities(bool keyboard, bool pointer, bool touch) {
     uint32_t caps = 0;
     if (keyboard) {
@@ -610,6 +624,10 @@ void Seat::notify_key(uint32_t key, bool pressed) {
             wl_keyboard_send_key(kb, serial, now_ms(), key, state);
         }
     }
+}
+
+void Seat::notify_modifiers(const ModifiersEvent& m) {
+    notify_modifiers(m.depressed, m.latched, m.locked, m.group);
 }
 
 void Seat::notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
@@ -839,6 +857,15 @@ void Seat::pointer_axis_discrete(int32_t dx_steps, int32_t dy_steps) {
         }
         pointer_frame_if_supported(p);
     }
+}
+
+void Seat::pointer_axis(const PointerAxisEvent& e) {
+    if (e.dx_steps != 0 || e.dy_steps != 0) {
+        pointer_axis_discrete(e.dx_steps, e.dy_steps);
+    } else {
+        pointer_axis(e.dx, e.dy);
+    }
+    pointer_axis_stop(e.stop_horizontal, e.stop_vertical);
 }
 
 void Seat::pointer_axis_stop(bool horizontal, bool vertical) {

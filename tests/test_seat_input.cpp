@@ -33,7 +33,7 @@ struct ClientState {
     bool got_axis_source = false;
     bool got_axis_discrete = false;
     bool got_axis_stop = false;
-    double axis_value = 0.0;
+    std::vector<double> axis_values; // every vertical wl_pointer.axis, in order
     int32_t axis_discrete = 0;
     bool got_button_press = false;
     bool got_button_release = false;
@@ -68,7 +68,7 @@ void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value
     auto* st = static_cast<ClientState*>(data);
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
         st->got_axis = true;
-        st->axis_value = wl_fixed_to_double(value);
+        st->axis_values.push_back(wl_fixed_to_double(value));
     }
 }
 void ptr_frame(void*, wl_pointer*) {}
@@ -230,6 +230,9 @@ int main() {
             seat->pointer_axis_discrete(0, 1);       // one wheel notch down
             seat->pointer_axis(0.0, 12.0);           // smooth scroll
             seat->pointer_axis_stop(false, true);    // fingers lifted
+            // A backend's wheel frame: one notch AND its smooth value. The
+            // notch wins; both would scroll it twice.
+            seat->pointer_axis(luminaria::PointerAxisEvent{.dy = 15.0, .dy_steps = 1});
             seat->pointer_button(0x110, true);       // click a client-side decoration
             seat->pointer_button(0x110, false);
             seat->touch_down(*surface, 0, 11.0, 22.0);
@@ -267,7 +270,9 @@ int main() {
     assert((g_client.capabilities & WL_SEAT_CAPABILITY_TOUCH) != 0);
     assert(g_client.got_axis_source);
     assert(g_client.got_axis_discrete && g_client.axis_discrete == 1);
-    assert(g_client.got_axis && g_client.axis_value == 12.0);
+    // A notch is 10 surface units, the smooth scroll its own 12, and the wheel
+    // frame one notch more — never its smooth 15 on top.
+    assert(g_client.got_axis && (g_client.axis_values == std::vector<double>{10.0, 12.0, 10.0}));
     assert(g_client.got_axis_stop);
     assert(g_client.got_button_press && g_client.got_button_release);
 

@@ -20,24 +20,6 @@ pub(crate) mod ffi {
         minor: u32,
     }
 
-    #[derive(Debug, Clone, Copy)]
-    struct LibinputEventRaw {
-        kind: u32,
-        code: u32,
-        keysym: u32,
-        pressed: bool,
-        x: f64,
-        y: f64,
-        steps_x: i32,
-        steps_y: i32,
-        id: i32,
-        flags: u32,
-        depressed: u32,
-        latched: u32,
-        locked: u32,
-        group: u32,
-    }
-
     // Only `raw-vulkan` reads these.
     #[allow(dead_code)]
     #[derive(Debug, Clone, Default)]
@@ -54,7 +36,7 @@ pub(crate) mod ffi {
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
         include!("luminaria/luminaria_rs_gpu.h");
-        // The shared structs (Rect, SceneItemRaw) are declared by the core
+        // The shared structs (Rect, SceneItemRaw, InputEventRaw) are declared by the core
         // bridge; the C++ side needs its definitions, not just the alias.
         include!("luminaria/src/ffi.rs.h");
 
@@ -67,6 +49,7 @@ pub(crate) mod ffi {
         type PresentationShim = crate::ffi::PresentationShim;
         type Rect = crate::ffi::Rect;
         type SceneItemRaw = crate::ffi::SceneItemRaw;
+        type InputEventRaw = crate::ffi::InputEventRaw;
 
         // Bare-metal backends: libseat, KMS/DRM, libinput.
         type SessionShim;
@@ -91,7 +74,7 @@ pub(crate) mod ffi {
         fn libinput_backend_new_path_standalone(display: &DisplayShim, error: &mut String) -> UniquePtr<LibinputBackendShim>;
         fn start(self: Pin<&mut LibinputBackendShim>, error: &mut String) -> bool;
         fn add_device(self: Pin<&mut LibinputBackendShim>, path: &str, error: &mut String) -> bool;
-        fn next_input_event(self: Pin<&mut LibinputBackendShim>, out: &mut LibinputEventRaw) -> bool;
+        fn next_input_event(self: Pin<&mut LibinputBackendShim>, out: &mut InputEventRaw) -> bool;
         fn keymap(self: &LibinputBackendShim) -> String;
         fn set_keymap(self: Pin<&mut LibinputBackendShim>, xkb_text: &str) -> bool;
         fn capabilities(self: &LibinputBackendShim) -> u32;

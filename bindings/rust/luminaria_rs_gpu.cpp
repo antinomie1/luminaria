@@ -183,98 +183,18 @@ std::unique_ptr<OutputShim> DrmBackendShim::next_event(std::uint32_t& kind, std:
     return nullptr;
 }
 
-// Event kinds, matched by src/backend.rs.
-enum : std::uint32_t {
-    kLiKey, kLiModifiers, kLiMotion, kLiButton, kLiAxis,
-    kLiTouchDown, kLiTouchMotion, kLiTouchUp, kLiTouchFrame, kLiTouchCancel,
-    kLiCapabilities,
-};
-
 struct LibinputBackendShim::Impl {
     std::unique_ptr<lm::LibinputBackend> backend;
-    std::deque<LibinputEventRaw> events;
-    Conn<lm::KeyEvent> on_key;
-    Conn<lm::ModifiersEvent> on_modifiers;
-    Conn<lm::PointerMotionEvent> on_motion;
-    Conn<lm::PointerButtonEvent> on_button;
-    Conn<lm::PointerAxisEvent> on_axis;
-    Conn<lm::TouchDownEvent> on_touch_down;
-    Conn<lm::TouchMotionEvent> on_touch_motion;
-    Conn<lm::TouchUpEvent> on_touch_up;
-    Conn<lm::TouchFrameEvent> on_touch_frame;
-    Conn<lm::TouchCancelEvent> on_touch_cancel;
-    Conn<lm::InputCapabilities> on_caps;
+    std::deque<InputEventRaw> events;
+    Conn<lm::InputEvent> on_input;
 
-    void push(std::uint32_t kind, auto&& fill) {
-        LibinputEventRaw ev{};
-        ev.kind = kind;
-        fill(ev);
-        events.push_back(ev);
-    }
-
+    // A key's keysym and masks are the backend's reading as the key arrived,
+    // carried on the event itself — Rust reads the queue only after dispatch()
+    // returns, by which time later keys of the same batch have moved the
+    // backend's state on.
     void watch() {
-        lm::LibinputBackend& b = *backend;
-        // The key signal fires before the backend's xkb state takes the key in,
-        // and Rust reads the queue only after dispatch() returns, by which time
-        // later keys of the same batch have moved the state on. So the keysym
-        // and masks a binding is matched against are taken here, as C++ would
-        // read them in its handler.
-        on_key = b.key().connect([this](lm::KeyEvent& e) {
-            push(kLiKey, [&](LibinputEventRaw& ev) {
-                const lm::KeymapState& ks = backend->keymap_state();
-                const lm::ModifiersEvent m = ks.modifiers();
-                ev.code = e.keycode;
-                ev.pressed = e.pressed;
-                ev.keysym = ks.keysym(e.keycode);
-                ev.depressed = m.depressed;
-                ev.latched = m.latched;
-                ev.locked = m.locked;
-                ev.group = m.group;
-            });
-        });
-        on_modifiers = b.modifiers().connect([this](lm::ModifiersEvent& e) {
-            push(kLiModifiers, [&](LibinputEventRaw& ev) {
-                ev.depressed = e.depressed;
-                ev.latched = e.latched;
-                ev.locked = e.locked;
-                ev.group = e.group;
-            });
-        });
-        on_motion = b.pointer_motion().connect([this](lm::PointerMotionEvent& e) {
-            push(kLiMotion, [&](LibinputEventRaw& ev) { ev.x = e.dx; ev.y = e.dy; });
-        });
-        on_button = b.pointer_button().connect([this](lm::PointerButtonEvent& e) {
-            push(kLiButton, [&](LibinputEventRaw& ev) { ev.code = e.button; ev.pressed = e.pressed; });
-        });
-        on_axis = b.pointer_axis().connect([this](lm::PointerAxisEvent& e) {
-            push(kLiAxis, [&](LibinputEventRaw& ev) {
-                ev.x = e.dx;
-                ev.y = e.dy;
-                ev.steps_x = e.dx_steps;
-                ev.steps_y = e.dy_steps;
-                ev.flags = (e.stop_horizontal ? 1u : 0u) | (e.stop_vertical ? 2u : 0u);
-            });
-        });
-        on_touch_down = b.touch_down().connect([this](lm::TouchDownEvent& e) {
-            push(kLiTouchDown, [&](LibinputEventRaw& ev) { ev.id = e.id; ev.x = e.x; ev.y = e.y; });
-        });
-        on_touch_motion = b.touch_motion().connect([this](lm::TouchMotionEvent& e) {
-            push(kLiTouchMotion, [&](LibinputEventRaw& ev) { ev.id = e.id; ev.x = e.x; ev.y = e.y; });
-        });
-        on_touch_up = b.touch_up().connect([this](lm::TouchUpEvent& e) {
-            push(kLiTouchUp, [&](LibinputEventRaw& ev) { ev.id = e.id; });
-        });
-        on_touch_frame = b.touch_frame().connect([this](lm::TouchFrameEvent&) {
-            push(kLiTouchFrame, [](LibinputEventRaw&) {});
-        });
-        on_touch_cancel = b.touch_cancel().connect([this](lm::TouchCancelEvent& e) {
-            push(kLiTouchCancel, [&](LibinputEventRaw& ev) { ev.id = e.id; });
-        });
-        on_caps = b.capabilities_changed().connect([this](lm::InputCapabilities& c) {
-            push(kLiCapabilities, [&](LibinputEventRaw& ev) {
-                ev.flags = (c.keyboard ? 1u : 0u) | (c.pointer ? 2u : 0u) | (c.touch ? 4u : 0u);
-            });
-        });
+        on_input = backend->input().connect(
+            [this](lm::InputEvent& e) { events.push_back(input_event_raw(e)); });
     }
 };
 
@@ -335,9 +255,9 @@ bool LibinputBackendShim::add_device(rust::Str path, rust::String& error) {
     return true;
 }
 
-bool LibinputBackendShim::next_input_event(LibinputEventRaw& out) {
+bool LibinputBackendShim::next_input_event(InputEventRaw& out) {
     if (impl_->events.empty()) return false;
-    out = impl_->events.front();
+    out = std::move(impl_->events.front());
     impl_->events.pop_front();
     return true;
 }
@@ -351,9 +271,7 @@ bool LibinputBackendShim::set_keymap(rust::Str xkb_text) {
 }
 
 std::uint32_t LibinputBackendShim::capabilities() const {
-    if (!impl_->backend) return 0;
-    const lm::InputCapabilities c = impl_->backend->capabilities();
-    return (c.keyboard ? 1u : 0u) | (c.pointer ? 2u : 0u) | (c.touch ? 4u : 0u);
+    return impl_->backend ? caps_bits(impl_->backend->capabilities()) : 0;
 }
 
 // ============================================================================

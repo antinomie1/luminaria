@@ -32,21 +32,12 @@ import :dmabuf;
 import :event_loop;
 import :expected;
 import :input_event;
+import :keymap;
 import :output;
 import :pixel;
 import :signal;
 
 export namespace luminaria {
-
-/// Who draws the frame around OUR nested window, as negotiated with the parent
-/// compositor via xdg-decoration-unstable-v1. The mirror image of
-/// luminaria::DecorationMode in luminaria/xdg_decoration.cppm, which is the
-/// same question asked by our own clients.
-/// "The parent compositor's keyboard layout is this." `text` is an xkb keymap
-/// in text form, borrowed for the duration of the emit.
-struct KeymapChange {
-    const std::string& text;
-};
 
 /// The parent compositor asked our window to close — its titlebar button, its
 /// window menu, or the user's window-manager binding. Advisory: nothing here
@@ -54,13 +45,17 @@ struct KeymapChange {
 /// decision and not the backend's.
 struct HostCloseRequest {};
 
+/// Who draws the frame around OUR nested window, as negotiated with the parent
+/// compositor via xdg-decoration-unstable-v1. The mirror image of
+/// luminaria::DecorationMode in luminaria/xdg_decoration.cppm, which is the
+/// same question asked by our own clients.
 enum class HostDecorationMode {
     None,       ///< the parent has no xdg-decoration global: no frame at all
     ClientSide, ///< the parent insists WE draw it (GTK-style CSD); we don't
     ServerSide, ///< the parent draws a native titlebar around us — what we ask for
 };
 
-class WaylandBackend final : public Backend {
+class WaylandBackend final : public Backend, public InputSource {
 public:
     /// Connect to the parent compositor and bind its globals. Fails if there is
     /// no parent (WAYLAND_DISPLAY) or it lacks wl_compositor/xdg_wm_base/wl_shm.
@@ -85,23 +80,13 @@ public:
     /// is bare; `ClientSide` means it refused to decorate us.
     [[nodiscard]] HostDecorationMode decoration_mode() const noexcept;
 
-    // Input forwarded from the parent compositor (cursor is over our window).
-    // Coordinates are output-local; the compositor hit-tests and routes to a
-    // client surface. Pointer leave clears focus (motion x/y set to -1,-1).
-    Signal<KeyEvent> key;
-    Signal<ModifiersEvent> modifiers;
-    /// The parent compositor told us its keyboard layout. Hand `text` to
-    /// `Seat::set_keymap()` so our clients see the same layout the user is
-    /// actually typing on — otherwise the modifier masks forwarded above are
-    /// interpreted against a different keymap and non-US layouts misbehave.
-    Signal<KeymapChange> keymap_changed;
-
-    /// The parent's xkb keymap in text form; empty until it sends one.
-    [[nodiscard]] const std::string& keymap() const noexcept;
-    Signal<PointerMotionAbsEvent> pointer_motion;
-    Signal<PointerButtonEvent> pointer_button;
-    /// One scroll frame, accumulated across the parent's axis events.
-    Signal<PointerAxisEvent> pointer_axis;
+    // Input forwarded from the parent compositor while the cursor is over one
+    // of our windows: absolute motion in that output's coordinates, and a
+    // `PointerLeaveEvent` when it leaves them. Keys carry keysyms read against
+    // the parent's own keymap, which is also what `keymap()` returns.
+    [[nodiscard]] Signal<InputEvent>& input() noexcept override;
+    [[nodiscard]] const std::string& keymap() const noexcept override;
+    [[nodiscard]] InputCapabilities capabilities() const noexcept override;
 
     /// The parent compositor asked our window to close — its titlebar button, its
     /// window menu, or the user's window-manager binding. Advisory: nothing here
@@ -398,8 +383,16 @@ struct WaylandBackend::Impl {
     wl_pointer* pointer = nullptr;
     wl_keyboard* keyboard = nullptr;
     zxdg_decoration_manager_v1* decoration_manager = nullptr; // null if the parent lacks it
-    WaylandBackend* owner = nullptr; // set in start(), after all moves; emits input signals
+    WaylandBackend* owner = nullptr; // set in start(), after all moves; emits close_requested
+    Signal<InputEvent> input;
     std::string keymap;              // the parent's xkb keymap, verbatim
+    // The parent's keymap compiled, so keys can carry keysyms. It follows the
+    // parent's modifier events rather than our key events: the parent's masks
+    // are the truth, and feeding both would count every modifier twice.
+    std::optional<KeymapState> xkb;
+    ModifiersEvent mods{};
+    InputCapabilities caps;
+    Output* pointer_output = nullptr; // the window the parent's pointer is over
     PointerAxisEvent axis;           // accumulated until wl_pointer.frame
     bool axis_pending = false;
     EventSource fd_source;
@@ -447,31 +440,36 @@ void wm_base_ping(void*, xdg_wm_base* wm, uint32_t serial) {
 }
 const xdg_wm_base_listener kWmBaseListener{wm_base_ping};
 
-// ---- parent input: forward pointer/keyboard into the backend's signals ----
-// data is Impl*; owner is set by the time these fire (start() ran first).
-void emit_motion(WaylandBackend::Impl* impl, double x, double y) {
-    if (impl->owner != nullptr) {
-        PointerMotionAbsEvent e{x, y};
-        impl->owner->pointer_motion.emit(e);
-    }
+// ---- parent input: forward pointer/keyboard into the backend's input signal ----
+// data is Impl*.
+void emit(WaylandBackend::Impl* impl, InputEvent event) { impl->input.emit(event); }
+
+void emit_motion(WaylandBackend::Impl* impl, wl_fixed_t sx, wl_fixed_t sy) {
+    emit(impl, PointerMotionAbsEvent{wl_fixed_to_double(sx), wl_fixed_to_double(sy),
+                                     impl->pointer_output});
 }
-void ptr_enter(void* data, wl_pointer*, uint32_t, wl_surface*, wl_fixed_t sx, wl_fixed_t sy) {
-    emit_motion(static_cast<WaylandBackend::Impl*>(data), wl_fixed_to_double(sx),
-                wl_fixed_to_double(sy));
+void ptr_enter(void* data, wl_pointer*, uint32_t, wl_surface* surface, wl_fixed_t sx,
+               wl_fixed_t sy) {
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    impl->pointer_output = nullptr;
+    for (const auto& out : impl->outputs) {
+        if (out->surface == surface) {
+            impl->pointer_output = out.get();
+        }
+    }
+    emit_motion(impl, sx, sy);
 }
 void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface*) {
-    emit_motion(static_cast<WaylandBackend::Impl*>(data), -1.0, -1.0); // clear focus
+    auto* impl = static_cast<WaylandBackend::Impl*>(data);
+    impl->pointer_output = nullptr;
+    emit(impl, PointerLeaveEvent{});
 }
 void ptr_motion(void* data, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
-    emit_motion(static_cast<WaylandBackend::Impl*>(data), wl_fixed_to_double(sx),
-                wl_fixed_to_double(sy));
+    emit_motion(static_cast<WaylandBackend::Impl*>(data), sx, sy);
 }
 void ptr_button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state) {
-    auto* impl = static_cast<WaylandBackend::Impl*>(data);
-    if (impl->owner != nullptr) {
-        PointerButtonEvent e{button, state == WL_POINTER_BUTTON_STATE_PRESSED};
-        impl->owner->pointer_button.emit(e);
-    }
+    emit(static_cast<WaylandBackend::Impl*>(data),
+         PointerButtonEvent{button, state == WL_POINTER_BUTTON_STATE_PRESSED});
 }
 // Scroll arrives as several events terminated by wl_pointer.frame; accumulate
 // and emit one PointerAxisEvent per frame so the compositor scrolls once.
@@ -512,9 +510,7 @@ void ptr_frame(void* data, wl_pointer*) {
     PointerAxisEvent e = impl->axis;
     impl->axis = PointerAxisEvent{};
     impl->axis_pending = false;
-    if (impl->owner != nullptr) {
-        impl->owner->pointer_axis.emit(e);
-    }
+    emit(impl, e);
 }
 const wl_pointer_listener kPointerListener{ptr_enter,       ptr_leave,     ptr_motion,
                                            ptr_button,      ptr_axis,      ptr_frame,
@@ -533,10 +529,11 @@ void kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd, uint32_t s
             const auto len = text.find('\0');
             impl->keymap.assign(text.data(), len == std::string_view::npos ? size : len);
             munmap(p, size);
-            if (impl->owner != nullptr) {
-                KeymapChange e{impl->keymap};
-                impl->owner->keymap_changed.emit(e);
+            if (auto compiled = KeymapState::from_text(impl->keymap); compiled) {
+                impl->xkb.emplace(std::move(*compiled));
+                impl->xkb->update_modifiers(impl->mods);
             }
+            emit(impl, KeymapChange{impl->keymap});
         }
     }
     close(fd);
@@ -545,18 +542,17 @@ void kb_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
 void kb_leave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
 void kb_key(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state) {
     auto* impl = static_cast<WaylandBackend::Impl*>(data);
-    if (impl->owner != nullptr) {
-        KeyEvent e{key, state == WL_KEYBOARD_KEY_STATE_PRESSED};
-        impl->owner->key.emit(e);
-    }
+    const uint32_t keysym = impl->xkb.has_value() ? impl->xkb->keysym(key) : 0;
+    emit(impl, KeyEvent{key, state == WL_KEYBOARD_KEY_STATE_PRESSED, keysym, impl->mods});
 }
 void kb_mods(void* data, wl_keyboard*, uint32_t, uint32_t dep, uint32_t lat, uint32_t lock,
              uint32_t grp) {
     auto* impl = static_cast<WaylandBackend::Impl*>(data);
-    if (impl->owner != nullptr) {
-        ModifiersEvent e{dep, lat, lock, grp};
-        impl->owner->modifiers.emit(e);
+    impl->mods = ModifiersEvent{dep, lat, lock, grp};
+    if (impl->xkb.has_value()) {
+        impl->xkb->update_modifiers(impl->mods);
     }
+    emit(impl, impl->mods);
 }
 void kb_repeat(void*, wl_keyboard*, int32_t, int32_t) {}
 const wl_keyboard_listener kKeyboardListener{kb_keymap, kb_enter, kb_leave,
@@ -571,6 +567,12 @@ void seat_caps(void* data, wl_seat* seat, uint32_t caps) {
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0 && impl->keyboard == nullptr) {
         impl->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(impl->keyboard, &kKeyboardListener, impl);
+    }
+    const InputCapabilities now{(caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0,
+                                (caps & WL_SEAT_CAPABILITY_POINTER) != 0, false};
+    if (now != impl->caps) {
+        impl->caps = now;
+        emit(impl, now);
     }
 }
 void seat_name(void*, wl_seat*, const char*) {}
@@ -719,7 +721,7 @@ Output& WaylandBackend::add_output(int width, int height, std::string title) {
 }
 
 Status WaylandBackend::start() {
-    impl_->owner = this; // this object is now at its final address; input can emit
+    impl_->owner = this; // this object is now at its final address; close_requested can emit
     // Drive the parent connection from our event loop.
     impl_->fd_source = impl_->loop.add_fd(wl_display_get_fd(impl_->parent), [this] {
         if (wl_display_dispatch(impl_->parent) < 0) {
@@ -754,7 +756,9 @@ Status WaylandBackend::start() {
     return ok();
 }
 
+Signal<InputEvent>& WaylandBackend::input() noexcept { return impl_->input; }
 const std::string& WaylandBackend::keymap() const noexcept { return impl_->keymap; }
+InputCapabilities WaylandBackend::capabilities() const noexcept { return impl_->caps; }
 
 HostDecorationMode WaylandBackend::decoration_mode() const noexcept {
     if (impl_->outputs.empty()) {

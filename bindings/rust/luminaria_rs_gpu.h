@@ -10,7 +10,7 @@
 namespace lum {
 
 // Shared structs from gpu.rs.h
-struct LibinputEventRaw;
+struct InputEventRaw;
 struct DrmDeviceId;
 struct VulkanHandlesRaw;
 
@@ -71,7 +71,7 @@ public:
 
     bool start(rust::String& error);
     bool add_device(rust::Str path, rust::String& error);
-    bool next_input_event(LibinputEventRaw& out);
+    bool next_input_event(InputEventRaw& out);
     rust::String keymap() const;
     bool set_keymap(rust::Str xkb_text);
     // keyboard, pointer, touch as bits 0, 1, 2.

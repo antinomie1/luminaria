@@ -1,21 +1,41 @@
 // luminaria/input_event.cppm — backend-neutral input events. Both the libinput
-// (bare-metal) and nested-Wayland backends emit these; the compositor routes
-// them into a Seat. Keycodes/buttons are raw evdev (what wl_keyboard/wl_pointer
-// expect), so they pass straight through.
+// (bare-metal) and nested-Wayland backends are an `InputSource`: one signal
+// carrying one `InputEvent`, so a compositor routes input into its Seat once,
+// whichever backend it got. Keycodes/buttons are raw evdev (what
+// wl_keyboard/wl_pointer expect), so they pass straight through.
 
 module;
 
 #include <cstdint>
 
 export module luminaria:input_event;
+
+import std;
+
+import :output;
+import :signal;
+
 export namespace luminaria {
 
+struct ModifiersEvent {
+    uint32_t depressed, latched, locked, group; // xkb modifier masks + layout group
+};
+// `keysym` and `modifiers` are the backend's own reading of the key, against
+// the keymap `InputSource::keymap()` returns and in the state from BEFORE this
+// key: Logo then Return arrives as Return with Logo in `modifiers`, and Shift
+// itself arrives without Shift. That is what a binding matches against, so a
+// compositor needs no xkb state of its own to have shortcuts.
 struct KeyEvent {
     uint32_t keycode; // evdev code (KEY_ESC == 1)
     bool pressed;
+    uint32_t keysym = 0; // xkb keysym, 0 when nothing maps
+    ModifiersEvent modifiers{};
 };
-struct ModifiersEvent {
-    uint32_t depressed, latched, locked, group; // xkb modifier masks + layout group
+// The layout the backend now reads keys against. Hand `text` to
+// `Seat::set_keymap()`: the masks in `ModifiersEvent` are computed against it,
+// and clients should see the layout the user types on. Borrowed for the emit.
+struct KeymapChange {
+    std::string_view text;
 };
 struct PointerMotionEvent {
     double dx, dy; // relative (libinput)
@@ -24,11 +44,14 @@ struct PointerButtonEvent {
     uint32_t button; // evdev code (BTN_LEFT == 272)
     bool pressed;
 };
-// Absolute pointer position in output-local coordinates (nested backend: the
-// parent reports where the cursor is over our window).
+// Absolute pointer position in `output`'s own coordinates (nested backend: the
+// parent reports where the cursor is over that output's window).
 struct PointerMotionAbsEvent {
     double x, y;
+    Output* output = nullptr;
 };
+// The pointer left every output (nested backend: it left our windows).
+struct PointerLeaveEvent {};
 // One scroll frame. `dx/dy` are smooth (touchpad / hi-res wheel) deltas in
 // surface units, positive = right/down. `dx_steps/dy_steps` count wheel notches
 // and are 0 for touchpads. `stop_*` marks the end of a smooth scroll sequence.
@@ -73,6 +96,33 @@ struct InputCapabilities {
     bool keyboard = false, pointer = false, touch = false;
 
     bool operator==(const InputCapabilities&) const noexcept = default;
+};
+
+using InputEvent = std::variant<KeyEvent, ModifiersEvent, KeymapChange, PointerMotionEvent,
+                                PointerMotionAbsEvent, PointerLeaveEvent, PointerButtonEvent,
+                                PointerAxisEvent, TouchDownEvent, TouchMotionEvent, TouchUpEvent,
+                                TouchFrameEvent, TouchCancelEvent, InputCapabilities>;
+
+/// Where input comes from: `LibinputBackend` on bare metal, `WaylandBackend`
+/// nested. What differs between them — relative or absolute motion, touch or
+/// none — is which alternatives of `InputEvent` arrive, not how they arrive.
+class InputSource {
+public:
+    InputSource() = default;
+    virtual ~InputSource() = default;
+    InputSource(InputSource&&) = default;
+    InputSource& operator=(InputSource&&) = default;
+    InputSource(const InputSource&) = delete;
+    InputSource& operator=(const InputSource&) = delete;
+
+    /// Every input event, in the order the devices produced them.
+    [[nodiscard]] virtual Signal<InputEvent>& input() noexcept = 0;
+    /// The keymap `KeyEvent` and `ModifiersEvent` are read against, in text
+    /// form; empty while there is none yet. Later changes arrive as
+    /// `KeymapChange`.
+    [[nodiscard]] virtual const std::string& keymap() const noexcept = 0;
+    /// What the devices can do now. Later changes arrive as `InputCapabilities`.
+    [[nodiscard]] virtual InputCapabilities capabilities() const noexcept = 0;
 };
 
 } // namespace luminaria

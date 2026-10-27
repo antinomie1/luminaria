@@ -222,7 +222,36 @@ let (depressed, latched, locked, group) = keymap.modifiers();
   let mut output = backend.add_output(1280, 800)?;
   backend.start()?;
   ```
-- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器经 `DrmBackend::next_event()` 到来与离开，输入经 `LibinputBackend::next_input_event()` 取出，VT 切换经 `Session::next_activity()`；见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
+- **`DrmBackend`** / **`LibinputBackend`** / **`Session`**：裸机驱动栈（须在独立空闲 VT 环境下运行）。显示器经 `DrmBackend::next_event()` 到来与离开，输入见下一节，VT 切换经 `Session::next_activity()`；见[第 9 节](#9-逃生口和别的-rust-crate-共用底层对象)。
+
+### 输入：`InputSource`
+嵌套的 `WaylandBackend` 与裸机的 `LibinputBackend` 都实现 `InputSource` trait，给出同一个 `InputEvent`。
+两者的差别在于到来的是哪些分支（相对移动 `Motion` 与触摸来自 libinput，绝对移动 `MotionAbsolute` 与 `PointerLeave`
+来自嵌套窗口），而不在于怎么到来，所以混成器只写一个循环：
+
+```rust
+if let Some(source) = backend.input() { // -> Option<&mut dyn InputSource>
+    while let Some(event) = source.next_input_event() {
+        match event {
+            InputEvent::Key { key, pressed, keysym, modifiers } => { /* 快捷键，否则 seat.notify_key */ }
+            InputEvent::Modifiers(m) => seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group),
+            InputEvent::KeymapChange(text) => { seat.set_keymap(&text); }
+            InputEvent::Axis(axis) => seat.pointer_axis_event(axis),
+            // Motion / MotionAbsolute / PointerLeave / Button / Capabilities / Touch*
+            _ => {}
+        }
+    }
+}
+```
+
+- `InputEvent::Key` 的 `keysym` 与 `modifiers` 是后端按 `keymap()` 读出、取**这个键之前**的状态：先按 Logo
+  再按 Return，到来的是带着 Logo 的 Return。快捷键直接对着它匹配，不需要自己的 `KeymapState`。读数在 C++ 信号里
+  就拍下，所以同一批后面的按键改掉 xkb 状态也不影响它。
+- `MotionAbsolute { output }` 是 `OutputId`，指明坐标属于哪块输出。
+- `Seat::pointer_axis_event(PointerAxis)`：滚轮同时报刻度和平滑量，刻度优先；分别调 `pointer_axis` 与
+  `pointer_axis_discrete` 会让每格滚两次。
+- `keymap()` / `capabilities()` 给出启动时已有的状态，之后的变化以 `KeymapChange` / `Capabilities` 到来。
+- 父级要求关窗不是输入：`WaylandBackend::take_close_request()`。
 
 ---
 
@@ -643,13 +672,11 @@ let renderer = SceneRenderer::new(&options)?;
 ### 9.3 裸机输入、显示器热插拔、VT 切换
 
 绑定原先拿不到 `LibinputBackend` 的输入，也拿不到 `DrmBackend` 找到的显示器，所以 Rust 写不了裸机混成器。
-补法与 `WaylandBackend::next_input_event` 一样：shim 把信号排进队列，Rust 在 `dispatch()` 返回后取。
+补法与嵌套后端一样：shim 把信号排进队列，Rust 在 `dispatch()` 返回后取。
 
-- **`LibinputBackend::next_input_event() -> Option<LibinputEvent>`**：按键、修饰键、相对移动、按钮、滚轮
+- **`LibinputBackend` 是一个 `InputSource`**（见 §3「输入」）：按键、修饰键、相对移动、按钮、滚轮
   （平滑量 + 刻度 + 停止标记）、触摸（down/motion/up/frame/cancel，坐标归一化到触摸屏）、设备能力变化。
-  **按键事件带着当时的 keysym 和修饰键快照。** 队列要到 `dispatch()` 返回后才被读，那时 xkb 状态可能已被同一批里
-  后面的按键改掉；快照在信号里拍，才和 C++ 里在回调中读 `keymap_state()` 的结果一致。
-  另有 `keymap()` / `set_keymap()` / `capabilities()`，以及对应 `create_path()` 的 `LibinputBackend::new_path()`。
+  另有 `set_keymap()`，以及对应 `create_path()` 的 `LibinputBackend::new_path()`。
 - **`DrmBackend::next_event() -> Option<DrmEvent>`**：`OutputAdded(Output)` 与 `OutputRemoved(OutputId)`。
   `start()` 时已有的显示器也以 `OutputAdded` 到来。显示器被拔掉后，手里的 `Output` 仍可安全调用，只是一切都成了
   空操作（`Output::is_alive()` 为 false），收到 `OutputRemoved` 时丢掉即可。`Output::id()` 是比较身份用的。
@@ -694,6 +721,10 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 
 与 C++ 版曾有的差别现已全部补齐，两个示例在行为上已经一致：
 
+- **输入只有一条路径**：两个示例都把嵌套和 libinput 当作同一个 `InputSource`，一个处理函数。之前各写两遍，
+  Rust 的嵌套路径把滚轮的刻度和平滑量都发给客户端，每格滚两次；C++ 版与 DRM 路径只发刻度。现在这条规则在
+  `Seat::pointer_axis_event` 里，两边都调它。按键的 keysym 也由后端给出，嵌套路径不再自己维护一份 `KeymapState`。
+
 - **首选缓冲缩放与分数缩放**：窗口 map 时把输出的整数缩放与分数缩放发给客户端——`SurfaceId::set_preferred_buffer_scale(scale)`、
   `SurfaceId::set_preferred_buffer_transform(transform)` 对应 `wl_surface.preferred_buffer_scale` /
   `preferred_buffer_transform`（`wl_surface` v6 起），`FractionalScaleManager::set_scale(surface, scale_120ths)`
@@ -723,7 +754,7 @@ Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满�
 
 - **`Compositor`**：`CompositorEvent::NewSurface`，以及每个 surface 的 `Commit`、`Destroy`、`Rendered` 与全局的 `Invalidated`。
 - **`Output`**：`OutputEvent::Present(PresentEvent)`（亦可通过 `output.next_present()` 获取，包含硬件时钟与单调时间戳、刷新周期与垂直同步标志）。
-- **`WaylandBackend`**：`BackendInputEvent` 现完整转发 `Key`、`Motion`、`Button`、`Modifiers`、`Axis`（平滑滚动量、离散步进刻度与停止标记）、`KeymapChange`（携带新 keymap 字符串）以及 `HostCloseRequest`。
+- **`WaylandBackend`**：作为 `InputSource` 转发 `Key`（带 keysym）、`MotionAbsolute`（带输出）、`PointerLeave`、`Button`、`Modifiers`、`Axis`（平滑滚动量、离散步进刻度与停止标记）、`KeymapChange` 与 `Capabilities`；关窗请求经 `take_close_request()`。
 - **需同步回答的信号**（遵照 C++ 绝不调用 Rust 的规矩，策略预先配在 shim 上）：
   - xdg-activation 的 `ActivationTokenRequest`：默认批准（可通过 `set_grant_tokens(bool)` 预设策略），同时入队到 `next_event()`。
   - cursor-shape 的 `CursorShapeRequest`：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接进 `Cursor`，在 C++ 信号发射期间直接由光标引擎同步呈现所请求的光标；`CursorShapeManager::next_event()` 亦可获取该请求。

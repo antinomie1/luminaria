@@ -27,8 +27,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use luminaria::backend::{
-    BackendInputEvent, DrmBackend, DrmEvent, HeadlessBackend, LibinputBackend, LibinputEvent,
-    Output, Session, WaylandBackend,
+    DrmBackend, DrmEvent, HeadlessBackend, InputEvent, InputSource, LibinputBackend, Output, Session,
+    WaylandBackend,
 };
 use luminaria::core::{Display, Error, KeyRouter};
 use luminaria::gpu::{
@@ -40,7 +40,7 @@ use luminaria::protocol::{
     Viewporter, XdgDecorationManager, XdgEvent, XdgShell,
 };
 use luminaria::shell::{scene_hit_test, OutputLayout, PopupTree, SceneItem};
-use luminaria::util::{Color, KeymapState, Rect};
+use luminaria::util::{Color, Rect};
 
 const WIDTH: i32 = 1280;
 const HEIGHT: i32 = 800;
@@ -87,8 +87,20 @@ impl Backend<'_> {
     fn start(&mut self) -> Result<(), Error> {
         match self {
             Backend::Nested(b) => b.start(),
-            Backend::Drm { drm, .. } => drm.start(),
+            Backend::Drm { drm, input } => {
+                input.start()?;
+                drm.start()
+            }
             Backend::Headless(b) => b.start(),
+        }
+    }
+
+    /// Where input comes from: the host window nested, libinput on DRM.
+    fn input(&mut self) -> Option<&mut dyn InputSource> {
+        match self {
+            Backend::Nested(b) => Some(b),
+            Backend::Drm { input, .. } => Some(input),
+            Backend::Headless(_) => None,
         }
     }
 }
@@ -283,15 +295,17 @@ enum KeyCommand {
     SwitchVt(i32),
 }
 
-/// A key: a binding, a VT switch, or the focused client's. `state` is the
-/// keysym and modifier mask it is matched against, when there is a keymap.
+/// A key: a binding, a VT switch, or the focused client's. `keysym` and `mods`
+/// are the backend's reading of it, which is what a binding matches against.
+#[allow(clippy::too_many_arguments)]
 fn key(
     seat: &Seat,
     keys: &mut KeyRouter,
     held: &mut Vec<u32>,
     code: u32,
     pressed: bool,
-    state: Option<(u32, u32)>,
+    keysym: u32,
+    mods: u32,
     vt_switching: bool,
 ) -> Option<KeyCommand> {
     if !pressed {
@@ -305,16 +319,14 @@ fn key(
     // A press of a key we think we still hold: its release was lost, which is
     // what happens to the key that switched VTs away.
     keys.unconsume(code);
-    if let Some((sym, mods)) = state {
-        if vt_switching && (SWITCH_VT_1..=SWITCH_VT_12).contains(&sym) {
-            keys.consume(code);
-            return Some(KeyCommand::SwitchVt((sym - SWITCH_VT_1 + 1) as i32));
-        }
-        let mods = mods & BINDABLE_MODS;
-        if let Some(&(_, _, action)) = BINDINGS.iter().find(|&&(m, s, _)| m == mods && s == sym) {
-            keys.consume(code);
-            return Some(KeyCommand::Run(action));
-        }
+    if vt_switching && (SWITCH_VT_1..=SWITCH_VT_12).contains(&keysym) {
+        keys.consume(code);
+        return Some(KeyCommand::SwitchVt((keysym - SWITCH_VT_1 + 1) as i32));
+    }
+    let mods = mods & BINDABLE_MODS;
+    if let Some(&(_, _, action)) = BINDINGS.iter().find(|&&(m, s, _)| m == mods && s == keysym) {
+        keys.consume(code);
+        return Some(KeyCommand::Run(action));
     }
     held.push(code);
     seat.notify_key(code, true);
@@ -441,29 +453,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         add_screen(&display, &renderer, &layout, &mut screens, output);
     }
 
-    // Nested: the host's layout, matched against here and sent to clients.
-    // DRM: libinput's, which its modifier masks are computed against.
-    let mut keymap: Option<KeymapState> = None;
     let socket = display.add_socket_auto()?;
-    match &mut backend {
-        Backend::Drm { input, .. } => {
-            seat.set_keymap(&input.keymap());
-            input.start()?;
-            let caps = input.capabilities();
-            seat.set_capabilities(caps.keyboard, caps.pointer, false);
-        }
-        _ => seat.set_capabilities(true, true, false),
-    }
     backend.start()?;
-    if let Backend::Nested(nested) = &backend {
-        let text = nested.keymap();
-        if let Ok(k) = KeymapState::from_text(&text) {
-            if seat.set_keymap(&text) {
-                keymap = Some(k);
-            }
+    // What arrived before anything was listening: the nested keymap and seat
+    // come with the connection, libinput's devices with start(). Clients get
+    // the layout the backend reads keys against.
+    if let Some(source) = backend.input() {
+        let keymap = source.keymap();
+        if !keymap.is_empty() {
+            seat.set_keymap(&keymap);
         }
+        let caps = source.capabilities();
+        seat.set_capabilities(caps.keyboard, caps.pointer, false);
     }
     let on_drm = matches!(backend, Backend::Drm { .. });
+    let vt_switching = session.is_some();
     println!("minimal: WAYLAND_DISPLAY={socket} — Logo+Return opens a terminal, Logo+Escape quits");
 
     let mut stack: Vec<SurfaceId> = Vec::new(); // bottom to top
@@ -604,130 +608,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // --- input -----------------------------------------------------------
 
+        // One loop for either backend: they differ in which events arrive
+        // (relative motion and touch from libinput, absolute motion and leave
+        // from the host window), not in how.
         let mut commands: Vec<KeyCommand> = Vec::new();
-        match &mut backend {
-            Backend::Nested(nested) => {
-                while let Some(event) = nested.next_input_event() {
-                    match event {
-                        BackendInputEvent::Motion { x, .. } if x < 0.0 => {
-                            // Left the host window.
-                            cursor.leave();
-                            seat.pointer_clear_focus();
-                        }
-                        BackendInputEvent::Motion { x, y } => {
-                            cursor.move_to(usable.x as f64 + x, usable.y as f64 + y, layout.bounds());
-                            if let Some(at) = cursor.position() {
-                                pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
-                            }
-                        }
-                        BackendInputEvent::Button { button: code, pressed } => {
-                            let at = cursor.position();
-                            let desk = Desk { shell: &shell, popups: &mut popups, stack: &mut stack, usable };
-                            restacked |= button(&seat, desk, at, code, pressed);
-                        }
-                        BackendInputEvent::Key { key: code, pressed } => {
-                            // The host sends no modifier events through the
-                            // binding, so the masks come from our own copy of its
-                            // keymap.
-                            let state = keymap.as_mut().map(|k| {
-                                k.update_key(code, pressed);
-                                let (depressed, latched, locked, group) = k.modifiers();
-                                seat.notify_modifiers(depressed, latched, locked, group);
-                                (k.keysym(code), depressed | latched)
-                            });
-                            commands.extend(key(&seat, &mut keys, &mut held, code, pressed, state, false));
-                        }
-                        BackendInputEvent::Modifiers(mods) => {
-                            seat.notify_modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
-                        }
-                        BackendInputEvent::Axis {
-                            dx,
-                            dy,
-                            dx_steps,
-                            dy_steps,
-                            stop_horizontal,
-                            stop_vertical,
-                        } => {
-                            if dx != 0.0 || dy != 0.0 {
-                                seat.pointer_axis(dx, dy);
-                            }
-                            if dx_steps != 0 || dy_steps != 0 {
-                                seat.pointer_axis_discrete(dx_steps, dy_steps);
-                            }
-                            if stop_horizontal || stop_vertical {
-                                seat.pointer_axis_stop(stop_horizontal, stop_vertical);
-                            }
-                        }
-                        BackendInputEvent::KeymapChange(text) => {
-                            seat.set_keymap(&text);
-                            keymap = KeymapState::from_text(&text).ok();
-                        }
-                        BackendInputEvent::HostCloseRequest => {
-                            break 'run;
+        if let Some(source) = backend.input() {
+            while let Some(event) = source.next_input_event() {
+                match event {
+                    InputEvent::Key { key: code, pressed, keysym, modifiers } => {
+                        let mods = modifiers.depressed | modifiers.latched;
+                        commands.extend(key(&seat, &mut keys, &mut held, code, pressed, keysym, mods, vt_switching));
+                    }
+                    InputEvent::Modifiers(m) => seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group),
+                    InputEvent::KeymapChange(text) => {
+                        seat.set_keymap(&text);
+                    }
+                    InputEvent::Motion { dx, dy } => {
+                        if cursor.move_by(dx, dy, layout.bounds())
+                            && let Some(at) = cursor.position()
+                        {
+                            pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
                         }
                     }
-                }
-            }
-            Backend::Drm { input, .. } => {
-                while let Some(event) = input.next_input_event() {
-                    match event {
-                        LibinputEvent::Motion { dx, dy } => {
-                            if cursor.move_by(dx, dy, layout.bounds()) {
-                                if let Some(at) = cursor.position() {
-                                    pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
-                                }
-                            }
+                    InputEvent::MotionAbsolute { x, y, output } => {
+                        let on = output
+                            .and_then(|id| screens.iter().find(|s| s.output.id() == id))
+                            .or(screens.first());
+                        let origin = on.map_or(usable, |s| layout.output_box(&s.output));
+                        cursor.move_to(origin.x as f64 + x, origin.y as f64 + y, layout.bounds());
+                        if let Some(at) = cursor.position() {
+                            pointer_focus(&seat, &scene(&shell, &popups, &stack, usable), usable, at);
                         }
-                        LibinputEvent::Button { button: code, pressed } => {
-                            let at = cursor.position();
-                            let desk = Desk { shell: &shell, popups: &mut popups, stack: &mut stack, usable };
-                            restacked |= button(&seat, desk, at, code, pressed);
-                        }
-                        LibinputEvent::Axis {
-                            dx,
-                            dy,
-                            dx_steps,
-                            dy_steps,
-                            stop_horizontal,
-                            stop_vertical,
-                        } => {
-                            if dx_steps != 0 || dy_steps != 0 {
-                                seat.pointer_axis_discrete(dx_steps, dy_steps);
-                            } else if dx != 0.0 || dy != 0.0 {
-                                seat.pointer_axis(dx, dy);
-                            }
-                            if stop_horizontal || stop_vertical {
-                                seat.pointer_axis_stop(stop_horizontal, stop_vertical);
-                            }
-                        }
-                        LibinputEvent::Key {
-                            key: code,
-                            pressed,
-                            keysym,
-                            modifiers,
-                        } => {
-                            let state = Some((keysym, modifiers.depressed | modifiers.latched));
-                            let vt = session.is_some();
-                            commands.extend(key(&seat, &mut keys, &mut held, code, pressed, state, vt));
-                        }
-                        LibinputEvent::Modifiers(m) => {
-                            seat.notify_modifiers(m.depressed, m.latched, m.locked, m.group);
-                        }
-                        // A client that binds a wl_pointer no device can drive waits forever.
-                        LibinputEvent::Capabilities(caps) => {
-                            seat.set_capabilities(caps.keyboard, caps.pointer, false);
-                            println!(
-                                "minimal: input devices: keyboard={} pointer={}",
-                                if caps.keyboard { "yes" } else { "no" },
-                                if caps.pointer { "yes" } else { "no" }
-                            );
-                        }
-                        // No touch policy here, as in the twin.
-                        _ => {}
                     }
+                    InputEvent::PointerLeave => {
+                        cursor.leave();
+                        seat.pointer_clear_focus();
+                    }
+                    InputEvent::Button { button: code, pressed } => {
+                        let at = cursor.position();
+                        let desk = Desk { shell: &shell, popups: &mut popups, stack: &mut stack, usable };
+                        restacked |= button(&seat, desk, at, code, pressed);
+                    }
+                    InputEvent::Axis(axis) => seat.pointer_axis_event(axis),
+                    // A client that binds a wl_pointer no device can drive
+                    // waits forever. No touch: nothing here routes it.
+                    InputEvent::Capabilities(caps) => {
+                        seat.set_capabilities(caps.keyboard, caps.pointer, false);
+                        println!(
+                            "minimal: input devices: keyboard={} pointer={}",
+                            if caps.keyboard { "yes" } else { "no" },
+                            if caps.pointer { "yes" } else { "no" }
+                        );
+                    }
+                    // No touch policy here, as in the twin.
+                    _ => {}
                 }
             }
-            Backend::Headless(_) => {}
+        }
+        if let Backend::Nested(nested) = &mut backend
+            && nested.take_close_request()
+        {
+            break 'run;
         }
         for command in commands {
             match command {

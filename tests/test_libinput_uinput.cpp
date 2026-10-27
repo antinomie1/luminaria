@@ -247,15 +247,36 @@ int main() {
     std::vector<luminaria::PointerMotionEvent> motions;
     std::vector<luminaria::PointerAxisEvent> axes;
     std::vector<luminaria::InputCapabilities> caps;
-    auto on_key = backend->key().connect([&](luminaria::KeyEvent& e) { keys.push_back(e); });
-    auto on_mods =
-        backend->modifiers().connect([&](luminaria::ModifiersEvent& e) { mods.push_back(e); });
-    auto on_motion = backend->pointer_motion().connect(
-        [&](luminaria::PointerMotionEvent& e) { motions.push_back(e); });
-    auto on_axis =
-        backend->pointer_axis().connect([&](luminaria::PointerAxisEvent& e) { axes.push_back(e); });
-    auto on_caps = backend->capabilities_changed().connect(
-        [&](luminaria::InputCapabilities& e) { caps.push_back(e); });
+    // One record per touch event, in order, so the frames between them are checked.
+    struct Touch {
+        char kind; // d(own) m(otion) u(p) f(rame) c(ancel)
+        int32_t id;
+        double x, y;
+    };
+    std::vector<Touch> touches;
+    auto on_input = backend->input().connect([&](luminaria::InputEvent& event) {
+        if (auto* e = std::get_if<luminaria::KeyEvent>(&event)) {
+            keys.push_back(*e);
+        } else if (auto* e = std::get_if<luminaria::ModifiersEvent>(&event)) {
+            mods.push_back(*e);
+        } else if (auto* e = std::get_if<luminaria::PointerMotionEvent>(&event)) {
+            motions.push_back(*e);
+        } else if (auto* e = std::get_if<luminaria::PointerAxisEvent>(&event)) {
+            axes.push_back(*e);
+        } else if (auto* e = std::get_if<luminaria::InputCapabilities>(&event)) {
+            caps.push_back(*e);
+        } else if (auto* e = std::get_if<luminaria::TouchDownEvent>(&event)) {
+            touches.push_back({'d', e->id, e->x, e->y});
+        } else if (auto* e = std::get_if<luminaria::TouchMotionEvent>(&event)) {
+            touches.push_back({'m', e->id, e->x, e->y});
+        } else if (auto* e = std::get_if<luminaria::TouchUpEvent>(&event)) {
+            touches.push_back({'u', e->id, 0, 0});
+        } else if (std::holds_alternative<luminaria::TouchFrameEvent>(event)) {
+            touches.push_back({'f', -1, 0, 0});
+        } else if (auto* e = std::get_if<luminaria::TouchCancelEvent>(&event)) {
+            touches.push_back({'c', e->id, 0, 0});
+        }
+    });
 
     if (auto added = backend->add_device(keyboard.node); !added) {
         std::fprintf(stderr, "skip: %s\n", added.error().message.c_str());
@@ -283,6 +304,11 @@ int main() {
     assert(keys.size() == 2);
     assert(keys[0].keycode == KEY_LEFTSHIFT && keys[0].pressed);
     assert(keys[1].keycode == KEY_LEFTSHIFT && !keys[1].pressed);
+    // Read against the backend's keymap, in the state from before the key:
+    // Shift's own press carries no Shift, its release does.
+    constexpr uint32_t kShiftL = 0xffe1; // XKB_KEY_Shift_L
+    assert(keys[0].keysym == kShiftL && keys[0].modifiers.depressed == 0);
+    assert(keys[1].keysym == kShiftL && keys[1].modifiers.depressed != 0);
 
     // Exactly two: pressing Shift changes the mask, releasing it changes it
     // back, and nothing else in between is worth telling clients about.
@@ -330,23 +356,6 @@ int main() {
                      std::strerror(errno));
         return 77;
     }
-    // One record per event, in order, so the frames between them are checked.
-    struct Touch {
-        char kind; // d(own) m(otion) u(p) f(rame) c(ancel)
-        int32_t id;
-        double x, y;
-    };
-    std::vector<Touch> touches;
-    auto on_down = backend->touch_down().connect(
-        [&](luminaria::TouchDownEvent& e) { touches.push_back({'d', e.id, e.x, e.y}); });
-    auto on_tmotion = backend->touch_motion().connect(
-        [&](luminaria::TouchMotionEvent& e) { touches.push_back({'m', e.id, e.x, e.y}); });
-    auto on_up = backend->touch_up().connect(
-        [&](luminaria::TouchUpEvent& e) { touches.push_back({'u', e.id, 0, 0}); });
-    auto on_tframe = backend->touch_frame().connect(
-        [&](luminaria::TouchFrameEvent&) { touches.push_back({'f', -1, 0, 0}); });
-    auto on_cancel = backend->touch_cancel().connect(
-        [&](luminaria::TouchCancelEvent& e) { touches.push_back({'c', e.id, 0, 0}); });
     assert(backend->add_device(screen.node));
     pump(*display, 60);
     assert(backend->capabilities().touch);

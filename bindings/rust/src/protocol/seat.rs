@@ -1,5 +1,6 @@
 //! wl_seat: keyboard, pointer and touch routing, and what focus did.
 
+use crate::backend::PointerAxis;
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::{self, EventKind};
 
@@ -114,6 +115,21 @@ impl<'d> Seat<'d> {
 
     pub fn pointer_axis_stop(&self, horizontal: bool, vertical: bool) {
         self.raw.pointer_axis_stop(horizontal, vertical);
+    }
+
+    /// One backend scroll frame, as the three calls above. A wheel reports its
+    /// notches AND their smooth value; the notches win, because
+    /// `pointer_axis_discrete` already sends the value that goes with them and
+    /// sending the smooth one as well scrolls every notch twice.
+    pub fn pointer_axis_event(&self, axis: PointerAxis) {
+        self.raw.pointer_axis_event(
+            axis.dx,
+            axis.dy,
+            axis.dx_steps,
+            axis.dy_steps,
+            axis.stop_horizontal,
+            axis.stop_vertical,
+        );
     }
 
     pub fn cursor_surface(&self) -> Option<SurfaceId> {

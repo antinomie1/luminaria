@@ -262,23 +262,48 @@ pub(crate) mod ffi {
         serial: u32,
     }
 
+    /// Which `lm::InputEvent` alternative an [`InputEventRaw`] carries. Both
+    /// input sources (nested here, libinput in the GPU bridge) fill the same one.
+    #[derive(Debug)]
+    #[repr(u32)]
+    enum InputEventKind {
+        Key,
+        Modifiers,
+        KeymapChange,
+        Motion,
+        MotionAbsolute,
+        PointerLeave,
+        Button,
+        Axis,
+        TouchDown,
+        TouchMotion,
+        TouchUp,
+        TouchFrame,
+        TouchCancel,
+        Capabilities,
+    }
+
+    /// `kind` says which of the other fields mean something. `x`/`y` are the
+    /// motion, axis or touch position; `steps_*` the wheel notches; `flags`
+    /// the axis stops (bits 0, 1) or the capabilities (keyboard, pointer,
+    /// touch as bits 0, 1, 2); `output` the `OutputId` of absolute motion.
     #[derive(Debug, Clone)]
-    struct BackendInputEventRaw {
-        kind: u32,
+    struct InputEventRaw {
+        kind: InputEventKind,
         code: u32,
+        keysym: u32,
         pressed: bool,
         x: f64,
         y: f64,
-        dx: f64,
-        dy: f64,
-        dx_steps: i32,
-        dy_steps: i32,
-        stop_horizontal: bool,
-        stop_vertical: bool,
+        steps_x: i32,
+        steps_y: i32,
+        id: i32,
+        flags: u32,
         depressed: u32,
         latched: u32,
         locked: u32,
         group: u32,
+        output: u64,
         text: String,
     }
 
@@ -361,7 +386,9 @@ pub(crate) mod ffi {
         fn add_output(self: Pin<&mut WaylandBackendShim>, width: i32, height: i32) -> UniquePtr<OutputShim>;
         fn start(self: Pin<&mut WaylandBackendShim>, error: &mut String) -> bool;
         fn keymap(self: &WaylandBackendShim) -> String;
-        fn next_input_event(self: Pin<&mut WaylandBackendShim>, out: &mut BackendInputEventRaw) -> bool;
+        fn next_input_event(self: Pin<&mut WaylandBackendShim>, out: &mut InputEventRaw) -> bool;
+        fn capabilities(self: &WaylandBackendShim) -> u32;
+        fn take_close_request(self: Pin<&mut WaylandBackendShim>) -> bool;
 
         // Surface inspection
         fn surface_width(surface_id: u64) -> i32;
@@ -420,6 +447,16 @@ pub(crate) mod ffi {
         fn pointer_axis(self: &SeatShim, dx: f64, dy: f64);
         fn pointer_axis_discrete(self: &SeatShim, dx_steps: i32, dy_steps: i32);
         fn pointer_axis_stop(self: &SeatShim, horizontal: bool, vertical: bool);
+        #[allow(clippy::too_many_arguments)]
+        fn pointer_axis_event(
+            self: &SeatShim,
+            dx: f64,
+            dy: f64,
+            dx_steps: i32,
+            dy_steps: i32,
+            stop_horizontal: bool,
+            stop_vertical: bool,
+        );
         fn cursor_surface(self: &SeatShim) -> u64;
         fn cursor_hidden(self: &SeatShim) -> bool;
         fn cursor_hotspot_x(self: &SeatShim) -> i32;

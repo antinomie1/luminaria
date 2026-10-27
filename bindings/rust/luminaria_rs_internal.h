@@ -38,6 +38,85 @@ inline std::uint64_t u64_from_id(lm::SurfaceId id) {
 
 inline std::uint64_t surface_u64(lm::Surface* s) { return s != nullptr ? u64_from_id(s->id()) : 0; }
 
+inline std::uint32_t caps_bits(lm::InputCapabilities c) {
+    return (c.keyboard ? 1u : 0u) | (c.pointer ? 2u : 0u) | (c.touch ? 4u : 0u);
+}
+
+// One `lm::InputEvent` for Rust, whichever source emitted it. Absolute motion
+// leaves `output` 0: only the source knows which `OutputShim` id its output got.
+inline InputEventRaw input_event_raw(const lm::InputEvent& event) {
+    InputEventRaw r{};
+    r.pressed = false;
+    std::visit(
+        [&r](const auto& e) {
+            using E = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<E, lm::KeyEvent>) {
+                r.kind = InputEventKind::Key;
+                r.code = e.keycode;
+                r.pressed = e.pressed;
+                r.keysym = e.keysym;
+                r.depressed = e.modifiers.depressed;
+                r.latched = e.modifiers.latched;
+                r.locked = e.modifiers.locked;
+                r.group = e.modifiers.group;
+            } else if constexpr (std::is_same_v<E, lm::ModifiersEvent>) {
+                r.kind = InputEventKind::Modifiers;
+                r.depressed = e.depressed;
+                r.latched = e.latched;
+                r.locked = e.locked;
+                r.group = e.group;
+            } else if constexpr (std::is_same_v<E, lm::KeymapChange>) {
+                r.kind = InputEventKind::KeymapChange;
+                r.text = rust::String::lossy(e.text.data(), e.text.size());
+            } else if constexpr (std::is_same_v<E, lm::PointerMotionEvent>) {
+                r.kind = InputEventKind::Motion;
+                r.x = e.dx;
+                r.y = e.dy;
+            } else if constexpr (std::is_same_v<E, lm::PointerMotionAbsEvent>) {
+                r.kind = InputEventKind::MotionAbsolute;
+                r.x = e.x;
+                r.y = e.y;
+            } else if constexpr (std::is_same_v<E, lm::PointerLeaveEvent>) {
+                r.kind = InputEventKind::PointerLeave;
+            } else if constexpr (std::is_same_v<E, lm::PointerButtonEvent>) {
+                r.kind = InputEventKind::Button;
+                r.code = e.button;
+                r.pressed = e.pressed;
+            } else if constexpr (std::is_same_v<E, lm::PointerAxisEvent>) {
+                r.kind = InputEventKind::Axis;
+                r.x = e.dx;
+                r.y = e.dy;
+                r.steps_x = e.dx_steps;
+                r.steps_y = e.dy_steps;
+                r.flags = (e.stop_horizontal ? 1u : 0u) | (e.stop_vertical ? 2u : 0u);
+            } else if constexpr (std::is_same_v<E, lm::TouchDownEvent>) {
+                r.kind = InputEventKind::TouchDown;
+                r.id = e.id;
+                r.x = e.x;
+                r.y = e.y;
+            } else if constexpr (std::is_same_v<E, lm::TouchMotionEvent>) {
+                r.kind = InputEventKind::TouchMotion;
+                r.id = e.id;
+                r.x = e.x;
+                r.y = e.y;
+            } else if constexpr (std::is_same_v<E, lm::TouchUpEvent>) {
+                r.kind = InputEventKind::TouchUp;
+                r.id = e.id;
+            } else if constexpr (std::is_same_v<E, lm::TouchFrameEvent>) {
+                r.kind = InputEventKind::TouchFrame;
+            } else if constexpr (std::is_same_v<E, lm::TouchCancelEvent>) {
+                r.kind = InputEventKind::TouchCancel;
+                r.id = e.id;
+            } else {
+                static_assert(std::is_same_v<E, lm::InputCapabilities>);
+                r.kind = InputEventKind::Capabilities;
+                r.flags = caps_bits(e);
+            }
+        },
+        event);
+    return r;
+}
+
 // An event for Rust to drain; `kind` says which of the other fields mean
 // something. Every shim that forwards signals keeps one queue of these.
 inline EventRaw event(EventKind kind, std::uint64_t id = 0, std::uint64_t other = 0) {

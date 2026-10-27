@@ -36,7 +36,7 @@ import :session;
 
 export namespace luminaria {
 
-class LibinputBackend {
+class LibinputBackend final : public InputSource {
 public:
     /// Build the libinput/udev context. Does NOT open any input device yet.
     ///
@@ -76,10 +76,11 @@ public:
     /// Returns false if the text doesn't compile, in which case the old layout
     /// stays. Pass the SAME text to `Seat::set_keymap()`: masks mean nothing
     /// without the keymap they were computed against.
+    /// A layout that does compile is also announced as a `KeymapChange`.
     [[nodiscard]] bool set_keymap(const std::string& xkb_text);
     /// The layout in text form — by default the one XKB_DEFAULT_LAYOUT and
     /// friends select, which is what the user configured for the console.
-    [[nodiscard]] const std::string& keymap() const noexcept;
+    [[nodiscard]] const std::string& keymap() const noexcept override;
 
     /// The backend's live keyboard state — kept up to date by every key event,
     /// so read keysyms and modifier masks off it rather than re-feeding the key
@@ -89,29 +90,14 @@ public:
 
     /// What the currently open devices can do. Empty until `start()`, then kept
     /// up to date as devices come and go.
-    [[nodiscard]] InputCapabilities capabilities() const noexcept;
+    [[nodiscard]] InputCapabilities capabilities() const noexcept override;
 
-    [[nodiscard]] Signal<KeyEvent>& key() noexcept;
-    /// Modifier state after each key, emitted only when it actually changed.
-    /// Feed to `Seat::notify_modifiers()`; without it clients see every key as
-    /// unshifted and Ctrl-anything never reaches them as a shortcut.
-    [[nodiscard]] Signal<ModifiersEvent>& modifiers() noexcept;
-    [[nodiscard]] Signal<PointerMotionEvent>& pointer_motion() noexcept;
-    [[nodiscard]] Signal<PointerButtonEvent>& pointer_button() noexcept;
-    /// One scroll frame per libinput event: wheel notches in `d*_steps`, smooth
-    /// touchpad deltas in `dx/dy`, end-of-gesture in `stop_*`.
-    [[nodiscard]] Signal<PointerAxisEvent>& pointer_axis() noexcept;
-    /// Touchscreen points, normalised to the panel — see `TouchDownEvent`.
-    /// Mapping them onto an output and hit-testing them is the compositor's;
-    /// close each burst with `Seat::touch_frame()` on `touch_frame`.
-    [[nodiscard]] Signal<TouchDownEvent>& touch_down() noexcept;
-    [[nodiscard]] Signal<TouchMotionEvent>& touch_motion() noexcept;
-    [[nodiscard]] Signal<TouchUpEvent>& touch_up() noexcept;
-    [[nodiscard]] Signal<TouchFrameEvent>& touch_frame() noexcept;
-    [[nodiscard]] Signal<TouchCancelEvent>& touch_cancel() noexcept;
-    /// A device was added or removed and the aggregate capabilities changed.
-    /// Re-advertise them on the seat here.
-    [[nodiscard]] Signal<InputCapabilities>& capabilities_changed() noexcept;
+    /// Relative motion, buttons, one `PointerAxisEvent` per libinput scroll
+    /// event (wheel notches in `d*_steps` alongside their smooth value), keys,
+    /// `ModifiersEvent` only when the masks actually changed, touchscreen
+    /// points normalised to the panel (see `TouchDownEvent`), and
+    /// `InputCapabilities` as devices come and go.
+    [[nodiscard]] Signal<InputEvent>& input() noexcept override;
 
     struct Impl;
 
@@ -153,17 +139,9 @@ struct LibinputBackend::Impl {
     std::map<libinput_device*, InputCapabilities> devices;
     InputCapabilities caps;
 
-    Signal<KeyEvent> key;
-    Signal<ModifiersEvent> modifiers;
-    Signal<PointerMotionEvent> pointer_motion;
-    Signal<PointerButtonEvent> pointer_button;
-    Signal<PointerAxisEvent> pointer_axis;
-    Signal<TouchDownEvent> touch_down;
-    Signal<TouchMotionEvent> touch_motion;
-    Signal<TouchUpEvent> touch_up;
-    Signal<TouchFrameEvent> touch_frame;
-    Signal<TouchCancelEvent> touch_cancel;
-    Signal<InputCapabilities> capabilities_changed;
+    Signal<InputEvent> input;
+
+    void emit(InputEvent event) { input.emit(event); }
 
     ~Impl() {
         fd_source = EventSource{};
@@ -188,7 +166,7 @@ struct LibinputBackend::Impl {
             return;
         }
         last_mods = now;
-        modifiers.emit(now);
+        emit(now);
     }
 
     void device_added(libinput_device* device) {
@@ -216,7 +194,7 @@ struct LibinputBackend::Impl {
             return;
         }
         caps = now;
-        capabilities_changed.emit(now);
+        emit(now);
     }
 
     void handle_key(libinput_event* event) {
@@ -224,10 +202,10 @@ struct LibinputBackend::Impl {
         const uint32_t code = libinput_event_keyboard_get_key(k);
         const bool pressed =
             libinput_event_keyboard_get_key_state(k) == LIBINPUT_KEY_STATE_PRESSED;
-        KeyEvent e{code, pressed};
-        key.emit(e);
-        // After the key, the way wl_keyboard is specified: the mask applies to
-        // what the user types NEXT, not to the modifier key itself.
+        // Read before the key goes in, the way wl_keyboard is specified: the
+        // mask applies to what the user types NEXT, not to the modifier key
+        // itself.
+        emit(KeyEvent{code, pressed, keymap.keysym(code), keymap.modifiers()});
         keymap.update_key(code, pressed);
         update_modifiers();
     }
@@ -264,7 +242,7 @@ struct LibinputBackend::Impl {
             any = true;
         }
         if (any) {
-            pointer_axis.emit(e);
+            emit(e);
         }
     }
 
@@ -280,28 +258,28 @@ struct LibinputBackend::Impl {
         case LIBINPUT_EVENT_TOUCH_DOWN: {
             TouchDownEvent e{id, libinput_event_touch_get_x_transformed(t, 1),
                              libinput_event_touch_get_y_transformed(t, 1)};
-            touch_down.emit(e);
+            emit(e);
             break;
         }
         case LIBINPUT_EVENT_TOUCH_MOTION: {
             TouchMotionEvent e{id, libinput_event_touch_get_x_transformed(t, 1),
                                libinput_event_touch_get_y_transformed(t, 1)};
-            touch_motion.emit(e);
+            emit(e);
             break;
         }
         case LIBINPUT_EVENT_TOUCH_UP: {
             TouchUpEvent e{id};
-            touch_up.emit(e);
+            emit(e);
             break;
         }
         case LIBINPUT_EVENT_TOUCH_CANCEL: {
             TouchCancelEvent e{id};
-            touch_cancel.emit(e);
+            emit(e);
             break;
         }
         case LIBINPUT_EVENT_TOUCH_FRAME: {
             TouchFrameEvent e{};
-            touch_frame.emit(e);
+            emit(e);
             break;
         }
         default:
@@ -326,17 +304,15 @@ struct LibinputBackend::Impl {
                 break;
             case LIBINPUT_EVENT_POINTER_MOTION: {
                 auto* p = libinput_event_get_pointer_event(event);
-                PointerMotionEvent e{libinput_event_pointer_get_dx(p),
-                                     libinput_event_pointer_get_dy(p)};
-                pointer_motion.emit(e);
+                emit(PointerMotionEvent{libinput_event_pointer_get_dx(p),
+                                        libinput_event_pointer_get_dy(p)});
                 break;
             }
             case LIBINPUT_EVENT_POINTER_BUTTON: {
                 auto* p = libinput_event_get_pointer_event(event);
-                PointerButtonEvent e{libinput_event_pointer_get_button(p),
-                                     libinput_event_pointer_get_button_state(p) ==
-                                         LIBINPUT_BUTTON_STATE_PRESSED};
-                pointer_button.emit(e);
+                emit(PointerButtonEvent{libinput_event_pointer_get_button(p),
+                                        libinput_event_pointer_get_button_state(p) ==
+                                            LIBINPUT_BUTTON_STATE_PRESSED});
                 break;
             }
             case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
@@ -487,6 +463,7 @@ bool LibinputBackend::set_keymap(const std::string& xkb_text) {
     // old layout mean nothing under the new one, and clients get told the truth
     // on the next key.
     impl_->keymap = std::move(*fresh);
+    impl_->emit(KeymapChange{impl_->keymap.text()});
     return true;
 }
 
@@ -496,22 +473,6 @@ const KeymapState& LibinputBackend::keymap_state() const noexcept { return impl_
 
 InputCapabilities LibinputBackend::capabilities() const noexcept { return impl_->caps; }
 
-Signal<KeyEvent>& LibinputBackend::key() noexcept { return impl_->key; }
-Signal<ModifiersEvent>& LibinputBackend::modifiers() noexcept { return impl_->modifiers; }
-Signal<PointerMotionEvent>& LibinputBackend::pointer_motion() noexcept {
-    return impl_->pointer_motion;
-}
-Signal<PointerButtonEvent>& LibinputBackend::pointer_button() noexcept {
-    return impl_->pointer_button;
-}
-Signal<PointerAxisEvent>& LibinputBackend::pointer_axis() noexcept { return impl_->pointer_axis; }
-Signal<TouchDownEvent>& LibinputBackend::touch_down() noexcept { return impl_->touch_down; }
-Signal<TouchMotionEvent>& LibinputBackend::touch_motion() noexcept { return impl_->touch_motion; }
-Signal<TouchUpEvent>& LibinputBackend::touch_up() noexcept { return impl_->touch_up; }
-Signal<TouchFrameEvent>& LibinputBackend::touch_frame() noexcept { return impl_->touch_frame; }
-Signal<TouchCancelEvent>& LibinputBackend::touch_cancel() noexcept { return impl_->touch_cancel; }
-Signal<InputCapabilities>& LibinputBackend::capabilities_changed() noexcept {
-    return impl_->capabilities_changed;
-}
+Signal<InputEvent>& LibinputBackend::input() noexcept { return impl_->input; }
 
 } // namespace luminaria

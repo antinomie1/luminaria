@@ -283,67 +283,42 @@ impl<'d> WaylandBackend<'d> {
         }
     }
 
+    /// The parent's keymap, which `InputEvent::Key` keysyms are read against;
+    /// empty until it sends one. Hand it to `Seat::set_keymap()`.
     pub fn keymap(&self) -> String {
         self.raw.keymap()
     }
 
-    /// Pull the next input event received from the host Wayland window.
-    pub fn next_input_event(&mut self) -> Option<BackendInputEvent> {
-        let mut raw = ffi::BackendInputEventRaw {
-            kind: 0,
-            code: 0,
-            pressed: false,
-            x: 0.0,
-            y: 0.0,
-            dx: 0.0,
-            dy: 0.0,
-            dx_steps: 0,
-            dy_steps: 0,
-            stop_horizontal: false,
-            stop_vertical: false,
-            depressed: 0,
-            latched: 0,
-            locked: 0,
-            group: 0,
-            text: String::new(),
-        };
-        if self.raw.pin_mut().next_input_event(&mut raw) {
-            Some(match raw.kind {
-                0 => BackendInputEvent::Key {
-                    key: raw.code,
-                    pressed: raw.pressed,
-                },
-                1 => BackendInputEvent::Motion { x: raw.x, y: raw.y },
-                2 => BackendInputEvent::Button {
-                    button: raw.code,
-                    pressed: raw.pressed,
-                },
-                3 => BackendInputEvent::Modifiers(Modifiers {
-                    depressed: raw.depressed,
-                    latched: raw.latched,
-                    locked: raw.locked,
-                    group: raw.group,
-                }),
-                4 => BackendInputEvent::Axis {
-                    dx: raw.dx,
-                    dy: raw.dy,
-                    dx_steps: raw.dx_steps,
-                    dy_steps: raw.dy_steps,
-                    stop_horizontal: raw.stop_horizontal,
-                    stop_vertical: raw.stop_vertical,
-                },
-                5 => BackendInputEvent::KeymapChange(raw.text),
-                6 => BackendInputEvent::HostCloseRequest,
-                _ => return None,
-            })
-        } else {
-            None
-        }
+    /// What the parent's seat can do.
+    pub fn capabilities(&self) -> InputCapabilities {
+        InputCapabilities::from_bits(self.raw.capabilities())
     }
 
-    /// An alias for [`next_input_event`](Self::next_input_event).
-    pub fn next_event(&mut self) -> Option<BackendInputEvent> {
-        self.next_input_event()
+    /// Input from the host window, oldest first: absolute motion in an
+    /// output's coordinates, `PointerLeave` when the pointer leaves our
+    /// windows. Drain it after every `Display::dispatch()`.
+    pub fn next_input_event(&mut self) -> Option<InputEvent> {
+        let mut raw = InputEvent::empty_raw();
+        self.raw.pin_mut().next_input_event(&mut raw).then(|| InputEvent::from_raw(raw))
+    }
+
+    /// Whether the parent asked our window to close since the last call — its
+    /// titlebar button, its window menu, or the user's binding. Advisory:
+    /// whether that ends the session is the compositor's decision.
+    pub fn take_close_request(&mut self) -> bool {
+        self.raw.pin_mut().take_close_request()
+    }
+}
+
+impl InputSource for WaylandBackend<'_> {
+    fn next_input_event(&mut self) -> Option<InputEvent> {
+        WaylandBackend::next_input_event(self)
+    }
+    fn keymap(&self) -> String {
+        WaylandBackend::keymap(self)
+    }
+    fn capabilities(&self) -> InputCapabilities {
+        WaylandBackend::capabilities(self)
     }
 }
 
@@ -561,70 +536,24 @@ mod bare_metal {
             InputCapabilities::from_bits(self.raw.capabilities())
         }
 
-        /// The next input event, oldest first. Drain it after every
+        /// The next input event, oldest first: relative motion, touch, and
+        /// `Capabilities` as devices come and go. Drain it after every
         /// `Display::dispatch()`.
-        pub fn next_input_event(&mut self) -> Option<LibinputEvent> {
-            let mut raw = crate::ffi_gpu::LibinputEventRaw {
-                kind: 0,
-                code: 0,
-                keysym: 0,
-                pressed: false,
-                x: 0.0,
-                y: 0.0,
-                steps_x: 0,
-                steps_y: 0,
-                id: 0,
-                flags: 0,
-                depressed: 0,
-                latched: 0,
-                locked: 0,
-                group: 0,
-            };
-            if !self.raw.pin_mut().next_input_event(&mut raw) {
-                return None;
-            }
-            let modifiers = Modifiers {
-                depressed: raw.depressed,
-                latched: raw.latched,
-                locked: raw.locked,
-                group: raw.group,
-            };
-            Some(match raw.kind {
-                0 => LibinputEvent::Key {
-                    key: raw.code,
-                    pressed: raw.pressed,
-                    keysym: raw.keysym,
-                    modifiers,
-                },
-                1 => LibinputEvent::Modifiers(modifiers),
-                2 => LibinputEvent::Motion { dx: raw.x, dy: raw.y },
-                3 => LibinputEvent::Button {
-                    button: raw.code,
-                    pressed: raw.pressed,
-                },
-                4 => LibinputEvent::Axis {
-                    dx: raw.x,
-                    dy: raw.y,
-                    dx_steps: raw.steps_x,
-                    dy_steps: raw.steps_y,
-                    stop_horizontal: raw.flags & 1 != 0,
-                    stop_vertical: raw.flags & 2 != 0,
-                },
-                5 => LibinputEvent::TouchDown {
-                    id: raw.id,
-                    x: raw.x,
-                    y: raw.y,
-                },
-                6 => LibinputEvent::TouchMotion {
-                    id: raw.id,
-                    x: raw.x,
-                    y: raw.y,
-                },
-                7 => LibinputEvent::TouchUp { id: raw.id },
-                8 => LibinputEvent::TouchFrame,
-                9 => LibinputEvent::TouchCancel { id: raw.id },
-                _ => LibinputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
-            })
+        pub fn next_input_event(&mut self) -> Option<InputEvent> {
+            let mut raw = InputEvent::empty_raw();
+            self.raw.pin_mut().next_input_event(&mut raw).then(|| InputEvent::from_raw(raw))
+        }
+    }
+
+    impl InputSource for LibinputBackend<'_> {
+        fn next_input_event(&mut self) -> Option<InputEvent> {
+            LibinputBackend::next_input_event(self)
+        }
+        fn keymap(&self) -> String {
+            LibinputBackend::keymap(self)
+        }
+        fn capabilities(&self) -> InputCapabilities {
+            LibinputBackend::capabilities(self)
         }
     }
 }
@@ -650,7 +579,6 @@ pub struct InputCapabilities {
     pub touch: bool,
 }
 
-#[cfg(feature = "gpu")]
 impl InputCapabilities {
     fn from_bits(bits: u32) -> Self {
         Self {
@@ -661,35 +589,45 @@ impl InputCapabilities {
     }
 }
 
-/// An input event from [`LibinputBackend`]. Codes are evdev's, which is what
-/// `Seat` forwards to clients.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LibinputEvent {
-    /// `keysym` and `modifiers` are the keyboard state as this key arrived,
-    /// before it was applied: match bindings against them rather than a state
-    /// read later, which later keys of the same batch have moved on.
+/// One scroll frame: smooth deltas in surface units (positive is right/down),
+/// wheel notches (0 on touchpads), and the end of a smooth sequence. Hand it
+/// to `Seat::pointer_axis_event()`, which knows that a wheel reports both.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PointerAxis {
+    pub dx: f64,
+    pub dy: f64,
+    pub dx_steps: i32,
+    pub dy_steps: i32,
+    pub stop_horizontal: bool,
+    pub stop_vertical: bool,
+}
+
+/// An input event from an [`InputSource`], either backend. Codes are evdev's,
+/// which is what `Seat` forwards to clients.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputEvent {
+    /// `keysym` and `modifiers` are the backend's reading of the key, against
+    /// `InputSource::keymap()` and in the state from before the key: match
+    /// bindings against them. Logo then Return is Return with Logo held.
     Key {
         key: u32,
         pressed: bool,
         keysym: u32,
         modifiers: Modifiers,
     },
-    /// The masks after a key, only when they changed. Forward to
-    /// `Seat::notify_modifiers()`.
+    /// The masks changed. Forward to `Seat::notify_modifiers()`.
     Modifiers(Modifiers),
-    /// Relative: the compositor owns where the pointer is.
+    /// The layout keys are now read against. Forward to `Seat::set_keymap()`.
+    KeymapChange(String),
+    /// Relative (libinput): the compositor owns where the pointer is.
     Motion { dx: f64, dy: f64 },
+    /// Absolute (nested), in `output`'s coordinates; `None` if the window it
+    /// is over was not one this backend handed out.
+    MotionAbsolute { x: f64, y: f64, output: Option<OutputId> },
+    /// The pointer left every output (nested: it left our windows).
+    PointerLeave,
     Button { button: u32, pressed: bool },
-    /// One scroll frame: smooth deltas, wheel notches (0 on touchpads), and
-    /// the end of a smooth sequence.
-    Axis {
-        dx: f64,
-        dy: f64,
-        dx_steps: i32,
-        dy_steps: i32,
-        stop_horizontal: bool,
-        stop_vertical: bool,
-    },
+    Axis(PointerAxis),
     /// Normalised to the touchscreen, (0,0) to (1,1); mapping onto an output
     /// is the compositor's.
     TouchDown { id: i32, x: f64, y: f64 },
@@ -698,78 +636,98 @@ pub enum LibinputEvent {
     /// Close the burst with `Seat::touch_frame()`.
     TouchFrame,
     TouchCancel { id: i32 },
-    /// A device came or went and what the seat can do changed.
+    /// What the devices can do changed. Forward to `Seat::set_capabilities()`.
     Capabilities(InputCapabilities),
 }
 
-/// An input event from a nested backend.
-#[derive(Debug, Clone, PartialEq)]
-pub enum BackendInputEvent {
-    Key { key: u32, pressed: bool },
-    Motion { x: f64, y: f64 },
-    Button { button: u32, pressed: bool },
-    Modifiers(Modifiers),
-    Axis {
-        dx: f64,
-        dy: f64,
-        dx_steps: i32,
-        dy_steps: i32,
-        stop_horizontal: bool,
-        stop_vertical: bool,
-    },
-    KeymapChange(String),
-    HostCloseRequest,
+impl InputEvent {
+    fn empty_raw() -> ffi::InputEventRaw {
+        ffi::InputEventRaw {
+            kind: ffi::InputEventKind::Key,
+            code: 0,
+            keysym: 0,
+            pressed: false,
+            x: 0.0,
+            y: 0.0,
+            steps_x: 0,
+            steps_y: 0,
+            id: 0,
+            flags: 0,
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+            output: 0,
+            text: String::new(),
+        }
+    }
+
+    fn from_raw(raw: ffi::InputEventRaw) -> Self {
+        use ffi::InputEventKind as K;
+        let modifiers = Modifiers {
+            depressed: raw.depressed,
+            latched: raw.latched,
+            locked: raw.locked,
+            group: raw.group,
+        };
+        match raw.kind {
+            K::Key => InputEvent::Key {
+                key: raw.code,
+                pressed: raw.pressed,
+                keysym: raw.keysym,
+                modifiers,
+            },
+            K::Modifiers => InputEvent::Modifiers(modifiers),
+            K::KeymapChange => InputEvent::KeymapChange(raw.text),
+            K::Motion => InputEvent::Motion { dx: raw.x, dy: raw.y },
+            K::MotionAbsolute => InputEvent::MotionAbsolute {
+                x: raw.x,
+                y: raw.y,
+                output: (raw.output != 0).then_some(OutputId(raw.output)),
+            },
+            K::PointerLeave => InputEvent::PointerLeave,
+            K::Button => InputEvent::Button {
+                button: raw.code,
+                pressed: raw.pressed,
+            },
+            K::Axis => InputEvent::Axis(PointerAxis {
+                dx: raw.x,
+                dy: raw.y,
+                dx_steps: raw.steps_x,
+                dy_steps: raw.steps_y,
+                stop_horizontal: raw.flags & 1 != 0,
+                stop_vertical: raw.flags & 2 != 0,
+            }),
+            K::TouchDown => InputEvent::TouchDown {
+                id: raw.id,
+                x: raw.x,
+                y: raw.y,
+            },
+            K::TouchMotion => InputEvent::TouchMotion {
+                id: raw.id,
+                x: raw.x,
+                y: raw.y,
+            },
+            K::TouchUp => InputEvent::TouchUp { id: raw.id },
+            K::TouchFrame => InputEvent::TouchFrame,
+            K::TouchCancel => InputEvent::TouchCancel { id: raw.id },
+            _ => InputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
+        }
+    }
 }
 
-/// Raw input event types.
-pub mod input_event {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct KeyEvent {
-        pub time_ms: u32,
-        pub key: u32,
-        pub pressed: bool,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct PointerMotionEvent {
-        pub time_ms: u32,
-        pub dx: f64,
-        pub dy: f64,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct PointerButtonEvent {
-        pub time_ms: u32,
-        pub button: u32,
-        pub pressed: bool,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct PointerAxisEvent {
-        pub time_ms: u32,
-        pub dx: f64,
-        pub dy: f64,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct TouchDownEvent {
-        pub time_ms: u32,
-        pub id: i32,
-        pub x: f64,
-        pub y: f64,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct TouchMotionEvent {
-        pub time_ms: u32,
-        pub id: i32,
-        pub x: f64,
-        pub y: f64,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TouchUpEvent {
-        pub time_ms: u32,
-        pub id: i32,
-    }
+/// Where input comes from: [`LibinputBackend`] on bare metal,
+/// [`WaylandBackend`] nested. What differs between them is which
+/// [`InputEvent`]s arrive, not how, so a compositor drains whichever it has
+/// through one loop.
+pub trait InputSource {
+    /// The next input event, oldest first. Drain after every
+    /// `Display::dispatch()`.
+    fn next_input_event(&mut self) -> Option<InputEvent>;
+    /// The keymap `InputEvent::Key` is read against; empty while there is
+    /// none yet. Later changes arrive as `InputEvent::KeymapChange`.
+    fn keymap(&self) -> String;
+    /// What the devices can do now. Later changes arrive as
+    /// `InputEvent::Capabilities`.
+    fn capabilities(&self) -> InputCapabilities;
 }

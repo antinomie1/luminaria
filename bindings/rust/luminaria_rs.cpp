@@ -474,13 +474,11 @@ bool HeadlessBackendShim::start(rust::String& error) {
 
 struct WaylandBackendShim::Impl {
     std::unique_ptr<lm::WaylandBackend> backend;
-    std::deque<BackendInputEventRaw> input_events;
-    Conn<lm::KeyEvent> on_key;
-    Conn<lm::PointerMotionAbsEvent> on_motion;
-    Conn<lm::PointerButtonEvent> on_button;
-    Conn<lm::ModifiersEvent> on_modifiers;
-    Conn<lm::PointerAxisEvent> on_axis;
-    Conn<lm::KeymapChange> on_keymap;
+    std::deque<InputEventRaw> input_events;
+    // Which `OutputShim` id each window got, so absolute motion can name it.
+    std::vector<std::pair<const lm::Output*, std::uint64_t>> output_ids;
+    bool close_requested = false;
+    Conn<lm::InputEvent> on_input;
     Conn<lm::HostCloseRequest> on_close;
 };
 
@@ -496,57 +494,17 @@ std::unique_ptr<WaylandBackendShim> wayland_backend_new(const DisplayShim& displ
         auto impl = std::make_unique<WaylandBackendShim::Impl>();
         impl->backend = std::make_unique<lm::WaylandBackend>(std::move(*r));
         auto* raw_impl = impl.get();
-        raw_impl->on_key = raw_impl->backend->key.connect([raw_impl](lm::KeyEvent& e) {
-            BackendInputEventRaw raw{};
-            raw.kind = 0;
-            raw.code = e.keycode;
-            raw.pressed = e.pressed;
-            raw_impl->input_events.push_back(std::move(raw));
-        });
-        raw_impl->on_motion = raw_impl->backend->pointer_motion.connect([raw_impl](lm::PointerMotionAbsEvent& e) {
-            BackendInputEventRaw raw{};
-            raw.kind = 1;
-            raw.x = e.x;
-            raw.y = e.y;
-            raw_impl->input_events.push_back(std::move(raw));
-        });
-        raw_impl->on_button = raw_impl->backend->pointer_button.connect([raw_impl](lm::PointerButtonEvent& e) {
-            BackendInputEventRaw raw{};
-            raw.kind = 2;
-            raw.code = e.button;
-            raw.pressed = e.pressed;
-            raw_impl->input_events.push_back(std::move(raw));
-        });
-        raw_impl->on_modifiers = raw_impl->backend->modifiers.connect([raw_impl](lm::ModifiersEvent& e) {
-            BackendInputEventRaw raw{};
-            raw.kind = 3;
-            raw.depressed = e.depressed;
-            raw.latched = e.latched;
-            raw.locked = e.locked;
-            raw.group = e.group;
-            raw_impl->input_events.push_back(std::move(raw));
-        });
-        raw_impl->on_axis = raw_impl->backend->pointer_axis.connect([raw_impl](lm::PointerAxisEvent& e) {
-            BackendInputEventRaw raw{};
-            raw.kind = 4;
-            raw.dx = e.dx;
-            raw.dy = e.dy;
-            raw.dx_steps = e.dx_steps;
-            raw.dy_steps = e.dy_steps;
-            raw.stop_horizontal = e.stop_horizontal;
-            raw.stop_vertical = e.stop_vertical;
-            raw_impl->input_events.push_back(std::move(raw));
-        });
-        raw_impl->on_keymap = raw_impl->backend->keymap_changed.connect([raw_impl](lm::KeymapChange& e) {
-            BackendInputEventRaw raw{};
-            raw.kind = 5;
-            raw.text = to_rust(e.text);
+        raw_impl->on_input = raw_impl->backend->input().connect([raw_impl](lm::InputEvent& e) {
+            InputEventRaw raw = input_event_raw(e);
+            if (const auto* motion = std::get_if<lm::PointerMotionAbsEvent>(&e)) {
+                for (const auto& [output, id] : raw_impl->output_ids) {
+                    if (output == motion->output) raw.output = id;
+                }
+            }
             raw_impl->input_events.push_back(std::move(raw));
         });
         raw_impl->on_close = raw_impl->backend->close_requested.connect([raw_impl](lm::HostCloseRequest&) {
-            BackendInputEventRaw raw{};
-            raw.kind = 6;
-            raw_impl->input_events.push_back(std::move(raw));
+            raw_impl->close_requested = true;
         });
         return std::make_unique<WaylandBackendShim>(std::move(impl));
     } catch (const std::exception& e) {
@@ -558,7 +516,9 @@ std::unique_ptr<WaylandBackendShim> wayland_backend_new(const DisplayShim& displ
 std::unique_ptr<OutputShim> WaylandBackendShim::add_output(std::int32_t width, std::int32_t height) {
     if (!impl_->backend) return nullptr;
     lm::Output& out = impl_->backend->add_output(width, height);
-    return make_output_shim(&out);
+    auto shim = make_output_shim(&out);
+    impl_->output_ids.emplace_back(&out, shim->id());
+    return shim;
 }
 
 bool WaylandBackendShim::start(rust::String& error) {
@@ -573,7 +533,13 @@ rust::String WaylandBackendShim::keymap() const {
     return to_rust(impl_->backend->keymap());
 }
 
-bool WaylandBackendShim::next_input_event(BackendInputEventRaw& out) {
+std::uint32_t WaylandBackendShim::capabilities() const {
+    return impl_->backend ? caps_bits(impl_->backend->capabilities()) : 0;
+}
+
+bool WaylandBackendShim::take_close_request() { return std::exchange(impl_->close_requested, false); }
+
+bool WaylandBackendShim::next_input_event(InputEventRaw& out) {
     if (impl_->input_events.empty()) return false;
     out = std::move(impl_->input_events.front());
     impl_->input_events.pop_front();
@@ -1084,6 +1050,13 @@ void SeatShim::pointer_axis_discrete(std::int32_t dx_steps, std::int32_t dy_step
 }
 void SeatShim::pointer_axis_stop(bool horizontal, bool vertical) const {
     if (impl_->seat) impl_->seat->pointer_axis_stop(horizontal, vertical);
+}
+void SeatShim::pointer_axis_event(double dx, double dy, std::int32_t dx_steps, std::int32_t dy_steps,
+                                  bool stop_horizontal, bool stop_vertical) const {
+    if (impl_->seat) {
+        impl_->seat->pointer_axis(
+            lm::PointerAxisEvent{dx, dy, dx_steps, dy_steps, stop_horizontal, stop_vertical});
+    }
 }
 std::uint64_t SeatShim::cursor_surface() const {
     if (!impl_->seat) return 0;

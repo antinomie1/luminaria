@@ -39,6 +39,11 @@ namespace lm = luminaria;
 template <class E>
 using Conn = typename lm::Signal<E>::Connection;
 
+template <class... F>
+struct Overloaded : F... {
+    using F::operator()...;
+};
+
 [[noreturn]] void die(const char* what, const lm::Error& error) {
     std::fprintf(stderr, "minimal: %s: %s\n", what, error.message.c_str());
     std::exit(1);
@@ -146,11 +151,13 @@ int main(int argc, char** argv) {
     std::unique_ptr<lm::Backend> backend;
     lm::WaylandBackend* nested = nullptr;
     std::optional<lm::LibinputBackend> input;
+    lm::InputSource* source = nullptr; // whichever of the two this backend has; none headless
     lm::VulkanOptions gpu_options;
     if (want == "auto" || want == "nested") {
         if (auto wb = lm::WaylandBackend::create(display.event_loop()); wb) {
             auto owned = std::make_unique<lm::WaylandBackend>(std::move(*wb));
             nested = owned.get();
+            source = nested;
             nested->add_output(1280, 800, "minimal");
             backend = std::move(owned);
         } else if (want == "nested") {
@@ -183,6 +190,7 @@ int main(int argc, char** argv) {
                 backend = std::make_unique<lm::DrmBackend>(std::move(*drm));
                 input.emplace(
                     must(lm::LibinputBackend::create(display.event_loop(), seat_session), "input"));
+                source = &*input;
             }
         }
     }
@@ -477,18 +485,8 @@ int main(int argc, char** argv) {
 
     // --- input ---------------------------------------------------------------
 
-    std::optional<lm::KeymapState> keymap; // nested and headless; libinput keeps its own
     lm::KeyRouter keys;
     std::vector<std::uint32_t> held; // keys a client was told are down
-    auto key_state = [&]() -> const lm::KeymapState* {
-        return input.has_value() ? &input->keymap_state()
-                                 : (keymap.has_value() ? &*keymap : nullptr);
-    };
-    auto use_keymap = [&](const std::string& text) {
-        if (auto k = lm::KeymapState::from_text(text); k && seat.set_keymap(text)) {
-            keymap.emplace(std::move(*k));
-        }
-    };
     auto release_held = [&] {
         for (const std::uint32_t k : held) {
             seat.notify_key(k, false);
@@ -521,40 +519,36 @@ int main(int argc, char** argv) {
         case Action::quit: display.terminate(); break;
         }
     };
-    auto key = [&](std::uint32_t code, bool pressed) {
-        if (!pressed) {
-            if (keys.unconsume(code)) { // the release of a key we kept stays ours
+    auto key = [&](const lm::KeyEvent& e) {
+        if (!e.pressed) {
+            if (keys.unconsume(e.keycode)) { // the release of a key we kept stays ours
                 return;
             }
-            std::erase(held, code);
-            seat.notify_key(code, false);
+            std::erase(held, e.keycode);
+            seat.notify_key(e.keycode, false);
             return;
         }
         // A press of a key we think we still hold: its release was lost, which
         // is what happens to the key that switched VTs away.
-        (void)keys.unconsume(code);
-        if (const lm::KeymapState* ks = key_state(); ks != nullptr) {
-            const xkb_keysym_t sym = ks->keysym(code);
-            // Ctrl+Alt+Fn, which the keymap itself turns into XF86Switch_VT_n.
-            if (session.has_value() && sym >= XKB_KEY_XF86Switch_VT_1 &&
-                sym <= XKB_KEY_XF86Switch_VT_12) {
-                keys.consume(code);
-                release_held();
-                (void)session->switch_to(static_cast<int>(sym - XKB_KEY_XF86Switch_VT_1) + 1);
+        (void)keys.unconsume(e.keycode);
+        // Ctrl+Alt+Fn, which the keymap itself turns into XF86Switch_VT_n.
+        if (session.has_value() && e.keysym >= XKB_KEY_XF86Switch_VT_1 &&
+            e.keysym <= XKB_KEY_XF86Switch_VT_12) {
+            keys.consume(e.keycode);
+            release_held();
+            (void)session->switch_to(static_cast<int>(e.keysym - XKB_KEY_XF86Switch_VT_1) + 1);
+            return;
+        }
+        const std::uint32_t mods = (e.modifiers.depressed | e.modifiers.latched) & kBindableMods;
+        for (const Binding& b : kBindings) {
+            if (b.mods == mods && b.keysym == xkb_keysym_to_lower(e.keysym)) {
+                keys.consume(e.keycode);
+                act(b.action);
                 return;
             }
-            const lm::ModifiersEvent m = ks->modifiers();
-            const std::uint32_t mods = (m.depressed | m.latched) & kBindableMods;
-            for (const Binding& b : kBindings) {
-                if (b.mods == mods && b.keysym == xkb_keysym_to_lower(sym)) {
-                    keys.consume(code);
-                    act(b.action);
-                    return;
-                }
-            }
         }
-        held.push_back(code);
-        seat.notify_key(code, true);
+        held.push_back(e.keycode);
+        seat.notify_key(e.keycode, true);
     };
     auto button = [&](std::uint32_t code, bool pressed) {
         if (pressed) {
@@ -572,77 +566,55 @@ int main(int argc, char** argv) {
             pointer_focus(); // an implicit grab may have ended; re-pick
         }
     };
-    auto axis = [&](const lm::PointerAxisEvent& e) {
-        if (e.dx_steps != 0 || e.dy_steps != 0) {
-            seat.pointer_axis_discrete(e.dx_steps, e.dy_steps);
-        } else if (e.dx != 0.0 || e.dy != 0.0) {
-            seat.pointer_axis(e.dx, e.dy);
-        }
-        if (e.stop_horizontal || e.stop_vertical) {
-            seat.pointer_axis_stop(e.stop_horizontal, e.stop_vertical);
-        }
-    };
 
-    // Whichever of these this backend has.
-    Conn<lm::PointerMotionAbsEvent> on_host_motion;
-    Conn<lm::PointerMotionEvent> on_motion;
-    Conn<lm::PointerButtonEvent> on_button;
-    Conn<lm::PointerAxisEvent> on_axis;
-    Conn<lm::KeyEvent> on_key;
-    Conn<lm::ModifiersEvent> on_mods;
-    Conn<lm::KeymapChange> on_keymap;
+    // One handler for either backend: they differ in which events arrive
+    // (relative motion and touch from libinput, absolute motion and leave from
+    // the nested window), not in how.
+    Conn<lm::InputEvent> on_input;
+    if (source != nullptr) {
+        on_input = source->input().connect([&](lm::InputEvent& event) {
+            std::visit(
+                Overloaded{
+                    [&](const lm::KeyEvent& e) { key(e); },
+                    [&](const lm::ModifiersEvent& e) { seat.notify_modifiers(e); },
+                    // Clients get the layout the backend reads keys against.
+                    [&](const lm::KeymapChange& e) { (void)seat.set_keymap(std::string(e.text)); },
+                    [&](const lm::PointerMotionEvent& e) {
+                        if (cursor.move_by(e.dx, e.dy)) {
+                            pointer_focus();
+                        }
+                    },
+                    [&](const lm::PointerMotionAbsEvent& e) {
+                        const lm::Output* on = e.output != nullptr ? e.output
+                                               : screens.empty()   ? nullptr
+                                                                   : screens.front().output;
+                        const lm::Box origin = on != nullptr ? layout.box_of(*on) : lm::Box{};
+                        cursor.move_to(origin.x + e.x, origin.y + e.y);
+                        pointer_focus();
+                    },
+                    [&](const lm::PointerLeaveEvent&) {
+                        cursor.leave();
+                        seat.pointer_clear_focus();
+                    },
+                    [&](const lm::PointerButtonEvent& e) { button(e.button, e.pressed); },
+                    [&](const lm::PointerAxisEvent& e) { seat.pointer_axis(e); },
+                    // A client that binds a wl_pointer no device can drive
+                    // waits forever. No touch: nothing here routes it.
+                    [&](const lm::InputCapabilities& caps) {
+                        seat.set_capabilities(caps.keyboard, caps.pointer, false);
+                        std::printf("minimal: input devices: keyboard=%s pointer=%s\n",
+                                    caps.keyboard ? "yes" : "no", caps.pointer ? "yes" : "no");
+                    },
+                    [](const auto&) {}, // touch: no policy here
+                },
+                event);
+        });
+    }
     Conn<lm::HostCloseRequest> on_close;
-    Conn<lm::InputCapabilities> on_caps;
-    Conn<lm::SessionActive> on_session;
     if (nested != nullptr) {
-        on_host_motion = nested->pointer_motion.connect([&](lm::PointerMotionAbsEvent& e) {
-            if (e.x < 0) { // left the host window
-                cursor.leave();
-                seat.pointer_clear_focus();
-                return;
-            }
-            const lm::Box origin =
-                screens.empty() ? lm::Box{} : layout.box_of(*screens.front().output);
-            cursor.move_to(origin.x + e.x, origin.y + e.y);
-            pointer_focus();
-        });
-        on_button = nested->pointer_button.connect(
-            [&](lm::PointerButtonEvent& e) { button(e.button, e.pressed); });
-        on_axis = nested->pointer_axis.connect([&](lm::PointerAxisEvent& e) { axis(e); });
-        on_key = nested->key.connect([&](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
-        on_mods = nested->modifiers.connect([&](lm::ModifiersEvent& e) {
-            if (keymap.has_value()) {
-                keymap->update_modifiers(e);
-            }
-            seat.notify_modifiers(e.depressed, e.latched, e.locked, e.group);
-        });
-        // The host's layout: the modifier masks above are computed against it,
-        // and clients should see the layout the user types on.
-        on_keymap = nested->keymap_changed.connect([&](lm::KeymapChange& e) { use_keymap(e.text); });
         on_close = nested->close_requested.connect([&](lm::HostCloseRequest&) { display.terminate(); });
     }
-    if (input.has_value()) {
-        on_motion = input->pointer_motion().connect([&](lm::PointerMotionEvent& e) {
-            if (cursor.move_by(e.dx, e.dy)) {
-                pointer_focus();
-            }
-        });
-        on_button = input->pointer_button().connect(
-            [&](lm::PointerButtonEvent& e) { button(e.button, e.pressed); });
-        on_axis = input->pointer_axis().connect([&](lm::PointerAxisEvent& e) { axis(e); });
-        on_key = input->key().connect([&](lm::KeyEvent& e) { key(e.keycode, e.pressed); });
-        on_mods = input->modifiers().connect([&](lm::ModifiersEvent& e) {
-            seat.notify_modifiers(e.depressed, e.latched, e.locked, e.group);
-        });
-        // A client that binds a wl_pointer no device can drive waits forever.
-        on_caps = input->capabilities_changed().connect([&](lm::InputCapabilities& caps) {
-            seat.set_capabilities(caps.keyboard, caps.pointer, false);
-            std::printf("minimal: input devices: keyboard=%s pointer=%s\n",
-                        caps.keyboard ? "yes" : "no", caps.pointer ? "yes" : "no");
-        });
-        // libinput computes modifier masks against ITS keymap, so clients get it.
-        (void)seat.set_keymap(input->keymap());
-    }
+    Conn<lm::SessionActive> on_session;
     if (session.has_value()) {
         on_session = session->activity().connect([&](lm::SessionActive& e) {
             std::printf("minimal: session %s\n",
@@ -661,16 +633,16 @@ int main(int argc, char** argv) {
     setenv("WAYLAND_DISPLAY", socket.c_str(), 1); // for what Logo+Return spawns
     if (input.has_value()) {
         must(input->start(), "libinput");
-        const lm::InputCapabilities caps = input->capabilities();
-        seat.set_capabilities(caps.keyboard, caps.pointer, false);
     }
     must(backend->start(), "backend");
-    if (nested != nullptr && !nested->keymap().empty()) {
-        use_keymap(nested->keymap()); // already arrived during start()
-    } else if (!input.has_value()) {
-        if (auto k = lm::KeymapState::from_layout(); k) {
-            keymap.emplace(std::move(*k));
+    // What arrived before anything was listening: the nested keymap and seat
+    // come with the connection, libinput's devices with start().
+    if (source != nullptr) {
+        if (!source->keymap().empty()) {
+            (void)seat.set_keymap(source->keymap());
         }
+        const lm::InputCapabilities caps = source->capabilities();
+        seat.set_capabilities(caps.keyboard, caps.pointer, false);
     }
     std::printf("minimal: WAYLAND_DISPLAY=%s — Logo+Return opens a terminal, Logo+Escape "
                 "quits\n",

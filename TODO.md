@@ -184,7 +184,7 @@ placement 都拒绝 direct scanout，shader identity 也进 placement diff。pip
 - **`LibinputBackend` 只发相对指针运动** —— 绝对定位设备（触摸屏、数位板，以及虚拟机给客户机
   的那块 tablet）的 `LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE` 不处理，于是虚拟机里指针根本
   不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
-- **没有混成器接触摸** —— `LibinputBackend` 已经发 `touch_*` 信号（坐标归一化到
+- **没有混成器接触摸** —— `LibinputBackend` 的 `input()` 已经发 `Touch*Event`（坐标归一化到
   触摸面板），但映射到哪块输出、`scene_hit_test`、按 slot 路由这一层没有任何示例在做：C++ 的
   `minimal` 为了保持最小没接，`set_capabilities()` 传 touch=false；Rust 绑定的
   `LibinputBackend::next_input_event()` 已经带出 `Touch*` 事件，Rust 的 `minimal` 同样没接。

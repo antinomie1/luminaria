@@ -19,7 +19,7 @@ struct Rect;
 struct SceneItemRaw;
 struct SceneHitRaw;
 struct SurfaceAtRaw;
-struct BackendInputEventRaw;
+struct InputEventRaw;
 struct EventRaw;
 struct ToplevelInfoRaw;
 struct PopupInfoRaw;
@@ -188,7 +188,10 @@ public:
     std::unique_ptr<OutputShim> add_output(std::int32_t width, std::int32_t height);
     bool start(rust::String& error);
     rust::String keymap() const;
-    bool next_input_event(BackendInputEventRaw& out);
+    bool next_input_event(InputEventRaw& out);
+    // keyboard, pointer, touch as bits 0, 1, 2.
+    std::uint32_t capabilities() const;
+    bool take_close_request();
 
     struct Impl;
     Impl& impl() const;
@@ -310,6 +313,8 @@ public:
     void pointer_axis(double dx, double dy) const;
     void pointer_axis_discrete(std::int32_t dx_steps, std::int32_t dy_steps) const;
     void pointer_axis_stop(bool horizontal, bool vertical) const;
+    void pointer_axis_event(double dx, double dy, std::int32_t dx_steps, std::int32_t dy_steps,
+                            bool stop_horizontal, bool stop_vertical) const;
 
     std::uint64_t cursor_surface() const;
     bool cursor_hidden() const;

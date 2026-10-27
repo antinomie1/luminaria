@@ -1,15 +1,20 @@
-//! Tests for nested WaylandBackend signals: KeymapChange, ModifiersEvent,
-//! PointerAxisEvent, HostCloseRequest.
+//! The nested WaylandBackend as an `InputSource`: keymap, modifiers, keys
+//! read against the parent's keymap, absolute motion naming its output, leave,
+//! scroll, capabilities, and the close request that is not input.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use luminaria::backend::{BackendInputEvent, Modifiers, WaylandBackend};
+use luminaria::backend::{InputCapabilities, InputEvent, InputSource, Modifiers, PointerAxis, WaylandBackend};
 use luminaria::core::Display;
 use luminaria::protocol::{Compositor, Seat, XdgEvent, XdgShell};
 use luminaria::util::KeymapState;
+
+const KEY_A: u32 = 30;
+const XKB_KEY_CAPITAL_A: u32 = 0x41;
+const SHIFT: u32 = 1 << 0;
 
 #[test]
 fn nested_wayland_backend_events() {
@@ -29,7 +34,9 @@ fn nested_wayland_backend_events() {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
+    let closed = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
+    let closed_thread = Arc::clone(&closed);
     let socket_clone = socket.clone();
 
     let child_thread = std::thread::spawn(move || {
@@ -40,7 +47,7 @@ fn nested_wayland_backend_events() {
 
         let child_display = Display::new().expect("child display");
         let mut backend = WaylandBackend::new(&child_display).expect("backend");
-        let _child_output = backend.add_output(320, 240).expect("output");
+        let child_output = backend.add_output(320, 240).expect("output");
         backend.start().expect("backend start");
 
         if let Some(p) = prev_display {
@@ -49,12 +56,19 @@ fn nested_wayland_backend_events() {
             unsafe { std::env::remove_var("WAYLAND_DISPLAY"); }
         }
 
-        ready_tx.send(()).unwrap();
+        // The parent's seat, as the backend saw it while connecting.
+        let caps = InputSource::capabilities(&backend);
+        assert_eq!(caps, InputCapabilities { keyboard: true, pointer: true, touch: false });
+
+        ready_tx.send(child_output.id()).unwrap();
 
         while !stop_thread.load(Ordering::Relaxed) {
             child_display.dispatch(Some(Duration::from_millis(5))).ok();
-            while let Some(ev) = backend.next_input_event() {
+            while let Some(ev) = InputSource::next_input_event(&mut backend) {
                 event_tx.send(ev).unwrap();
+            }
+            if backend.take_close_request() {
+                closed_thread.store(true, Ordering::Relaxed);
             }
         }
     });
@@ -68,10 +82,13 @@ fn nested_wayland_backend_events() {
     };
 
     // Wait until child thread connects and starts
-    while ready_rx.try_recv().is_err() {
+    let output_id = loop {
+        if let Ok(id) = ready_rx.try_recv() {
+            break id;
+        }
         host_display.dispatch(Some(Duration::from_millis(5))).ok();
         host_display.flush_clients();
-    }
+    };
 
     pump_host(&host_display, Duration::from_millis(50));
 
@@ -87,13 +104,18 @@ fn nested_wayland_backend_events() {
     }
     let toplevel_id = toplevel_id.expect("expected child to create toplevel on host");
 
-    // Send modifiers & pointer axis
     host_seat.set_keyboard_focus(Some(toplevel_id));
     host_seat.notify_modifiers(1, 2, 4, 0);
-    host_seat.pointer_enter(toplevel_id, 10.0, 10.0);
+    // Shift held, then `a`: the child reads it against the parent's keymap.
+    host_seat.notify_modifiers(SHIFT, 0, 0, 0);
+    host_seat.notify_key(KEY_A, true);
+    host_seat.notify_key(KEY_A, false);
+    host_seat.notify_modifiers(0, 0, 0, 0);
+    host_seat.pointer_enter(toplevel_id, 10.0, 12.0);
     host_seat.pointer_axis(5.0, 10.0);
     host_seat.pointer_axis_discrete(0, 15);
     host_seat.pointer_axis_stop(true, false);
+    host_seat.pointer_clear_focus();
 
     pump_host(&host_display, Duration::from_millis(50));
 
@@ -113,64 +135,43 @@ fn nested_wayland_backend_events() {
         events.push(ev);
     }
 
-    // Verify KeymapChange
     assert!(
-        events.iter().any(|e| matches!(e, BackendInputEvent::KeymapChange(text) if !text.is_empty())),
+        events.iter().any(|e| matches!(e, InputEvent::KeymapChange(text) if !text.is_empty())),
         "expected KeymapChange, got: {events:?}"
     );
 
-    // Verify Modifiers
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            BackendInputEvent::Modifiers(Modifiers {
-                depressed: 1,
-                latched: 2,
-                locked: 4,
-                group: 0,
-            })
-        )),
+        events.contains(&InputEvent::Modifiers(Modifiers { depressed: 1, latched: 2, locked: 4, group: 0 })),
         "expected Modifiers event, got: {events:?}"
     );
 
-    // Verify Axis
     assert!(
         events.iter().any(|e| matches!(
             e,
-            BackendInputEvent::Axis {
-                dx,
-                dy,
-                ..
-            } if *dx == 5.0 && *dy == 10.0
+            InputEvent::Key { key: KEY_A, pressed: true, keysym: XKB_KEY_CAPITAL_A, modifiers }
+                if modifiers.depressed == SHIFT
         )),
+        "expected a Shift+a press read as `A`, got: {events:?}"
+    );
+
+    assert!(
+        events.contains(&InputEvent::MotionAbsolute { x: 10.0, y: 12.0, output: Some(output_id) }),
+        "expected absolute motion naming the child's output, got: {events:?}"
+    );
+    assert!(events.contains(&InputEvent::PointerLeave), "expected PointerLeave, got: {events:?}");
+
+    assert!(
+        events.contains(&InputEvent::Axis(PointerAxis { dx: 5.0, dy: 10.0, ..Default::default() })),
         "expected smooth Axis event, got: {events:?}"
     );
-
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            BackendInputEvent::Axis {
-                dy_steps: 15,
-                ..
-            }
-        )),
+        events.iter().any(|e| matches!(e, InputEvent::Axis(PointerAxis { dy_steps: 15, .. }))),
         "expected discrete Axis event, got: {events:?}"
     );
-
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            BackendInputEvent::Axis {
-                stop_horizontal: true,
-                ..
-            }
-        )),
+        events.iter().any(|e| matches!(e, InputEvent::Axis(PointerAxis { stop_horizontal: true, .. }))),
         "expected stop Axis event, got: {events:?}"
     );
 
-    // Verify HostCloseRequest
-    assert!(
-        events.iter().any(|e| matches!(e, BackendInputEvent::HostCloseRequest)),
-        "expected HostCloseRequest, got: {events:?}"
-    );
+    assert!(closed.load(Ordering::Relaxed), "expected the close request");
 }

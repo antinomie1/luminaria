@@ -18,8 +18,9 @@
    - [3.5 Keymap & Input Routing](#35-keymap--input-routing)
 4. [后端与硬件抽象 (`luminaria` / `luminaria.gpu`)](#4-后端与硬件抽象-luminaria--luminariagpu)
    - [4.1 Backend & Output 抽象](#41-backend--output-抽象)
-   - [4.2 Headless & Wayland 嵌套后端](#42-headless--wayland-嵌套后端)
-   - [4.3 DrmBackend & Session & Libinput (Bare-metal)](#43-drmbackend--session--libinput-bare-metal)
+   - [4.2 输入：InputSource](#42-输入inputsource-luminariainput_event)
+   - [4.3 Headless & Wayland 嵌套后端](#43-headless--wayland-嵌套后端)
+   - [4.4 DrmBackend & Session & Libinput (Bare-metal)](#44-drmbackend--session--libinput-bare-metal-luminariagpu)
 5. [渲染器与合成引擎 (`luminaria` / `luminaria.gpu`)](#5-渲染器与合成引擎-luminaria--luminariagpu)
    - [5.1 CpuCompositor (CPU 立即模式合成)](#51-cpucompositor-cpu-立即模式合成)
    - [5.2 VulkanRenderer (GPU 零拷贝渲染)](#52-vulkanrenderer-gpu-零拷贝渲染)
@@ -187,15 +188,27 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
     - `Signal<OutputModeChange>& mode_changed()`: 模式/分辨率变更信号。
   - 虚接口（由硬件后端重写）：`scanout_modifiers()`, `import_scanout()`, `commit_scanout()`, `set_mode()`, `modes()`.
 
-### 4.2 Headless & Wayland 嵌套后端
+### 4.2 输入：`InputSource` (`luminaria:input_event`)
+- **`InputSource`**：输入从哪来的统一接口，嵌套的 `WaylandBackend` 与裸机的 `LibinputBackend` 都是它。两者的差别在于到来的是 `InputEvent` 的哪些分支（相对移动与触摸来自 libinput，绝对移动与离开来自嵌套窗口），而不在于怎么到来，所以混成器只写一个处理函数。
+  - `Signal<InputEvent>& input()`：全部输入事件，按设备产生的顺序。
+  - `const std::string& keymap() const`：按键所依据的 keymap 文本；之后的变化以 `KeymapChange` 到来。交给 `Seat::set_keymap()`。
+  - `InputCapabilities capabilities() const`：设备当前能做什么；之后的变化以 `InputCapabilities` 到来。
+- **`InputEvent`** = `std::variant<KeyEvent, ModifiersEvent, KeymapChange, PointerMotionEvent, PointerMotionAbsEvent, PointerLeaveEvent, PointerButtonEvent, PointerAxisEvent, Touch{Down,Motion,Up,Frame,Cancel}Event, InputCapabilities>`。
+  - `KeyEvent` 带 `keysym` 与 `modifiers`：后端按自己的 keymap 读出，取**这个键之前**的状态（先按 Logo 再按 Return，到来的是带着 Logo 的 Return）。快捷键直接对着它匹配，混成器不需要自己的 xkb 状态。
+  - `PointerMotionAbsEvent::output` 指明坐标属于哪个输出。
+  - `PointerAxisEvent` 交给 `Seat::pointer_axis(const PointerAxisEvent&)`：滚轮同时报刻度和平滑量，刻度优先，否则每格滚两次。
+
+### 4.3 Headless & Wayland 嵌套后端
 - **`HeadlessBackend`** (`luminaria:headless`):
   - `static Result<HeadlessBackend> create(EventLoop loop, int width = 800, int height = 600)`
   - `Output& create_output(int width, int height)`: 动态创建虚拟无头输出。
 - **`WaylandBackend`** (`luminaria:wayland`):
   - `static Result<WaylandBackend> create(EventLoop loop, Display& display, int width, int height, std::string_view title)`
-  - 嵌套在宿主 Wayland 混成器内运行，自动转发输入事件与父级 keymap，支持父级 dmabuf 直出。
+  - 嵌套在宿主 Wayland 混成器内运行，支持父级 dmabuf 直出。
+  - 是一个 `InputSource`：转发父级的输入，按键按父级 keymap 读出 keysym，`keymap()` 就是父级的 keymap。
+  - `Signal<HostCloseRequest> close_requested`：父级要求关窗（不是输入，不经 `input()`）。
 
-### 4.3 DrmBackend & Session & Libinput (Bare-metal, `luminaria.gpu`)
+### 4.4 DrmBackend & Session & Libinput (Bare-metal, `luminaria.gpu`)
 - **`Session`** (`luminaria.gpu:session`): 基于 libseat 的 VT 与设备权限仲裁。
   - `static Result<Session> create(EventLoop loop, std::string_view seat_name = "")`
   - `int open_device(std::string_view path)` / `void close_device(int fd)`
@@ -205,7 +218,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - 监听 udev connector 热插拔，为每个活跃显示器构建 `DrmOutput`；支持硬件光标平面（Hardware Cursor Plane）、Atomic 翻页与显式 Fence（`IN_FENCE_FD` / `OUT_FENCE_PTR`）。
 - **`LibinputBackend`** (`luminaria.gpu:libinput`): 裸机输入设备事件源。
   - `static Result<LibinputBackend> create(EventLoop loop, Session& session)`
-  - 暴露输入信号：`key()`, `pointer_motion()`, `pointer_button()`, `pointer_axis()`, `touch_down()`, `touch_up()`, `touch_motion()`.
+  - 是一个 `InputSource`：相对移动、按钮、滚轮、按键、修饰键（仅在变化时）、触摸、设备增删引起的能力变化，全经 `input()`。`set_keymap()` 成功时也发 `KeymapChange`。
   - `const KeymapState& keymap_state() const`: 获取底座共享的 XKB 状态。
 
 ---
@@ -324,9 +337,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 ### 7.3 Seat & DataDevice & PrimarySelection
 - **`Seat`** (`luminaria:seat`):
   - `static Result<Seat> create(Display& display, std::string_view name)`
-  - 权限声明：`void set_capabilities(bool pointer, bool keyboard, bool touch)`
-  - 键盘输入：`void set_keymap(std::string_view text)`, `void notify_key(uint32_t code, bool pressed)`, `void notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)`
-  - 指针输入：`void notify_pointer_motion(double sx, double sy)`, `void notify_pointer_button(uint32_t button, bool pressed)`, `void notify_pointer_axis(...)`
+  - 权限声明：`void set_capabilities(bool keyboard, bool pointer, bool touch)`，或直接 `set_capabilities(InputCapabilities)`
+  - 键盘输入：`void set_keymap(std::string_view text)`, `void notify_key(uint32_t code, bool pressed)`, `void notify_modifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)` / `notify_modifiers(const ModifiersEvent&)`
+  - 指针输入：`void pointer_motion(double sx, double sy)`, `void pointer_button(uint32_t button, bool pressed)`, `void pointer_axis(double dx, double dy)`, `pointer_axis_discrete(...)`, `pointer_axis_stop(...)`，以及把后端的一帧滚动按「刻度优先」转成以上三者的 `pointer_axis(const PointerAxisEvent&)`
   - 焦点控制：`void set_keyboard_focus(Surface* surface)`, `void set_pointer_focus(Surface* surface, double sx, double sy)`
   - 信号：`cursor_change()`, `pointer_focus_changed()`, `keyboard_focus_changed()`
 - **`DataDeviceManager` & `PrimarySelectionManager`** (`luminaria:data_device`): 剪贴板、主选区与拖放（DnD）支持。
