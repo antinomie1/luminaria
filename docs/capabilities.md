@@ -110,9 +110,10 @@ km->modifiers();                                   // 掩码，直接进 wl_keyb
 
 ## 协议覆盖
 
-30 个 Wayland global 全部实现（`xdg-shell`、`layer-shell`、`seat`、`data-device`、
+35 个 Wayland global 全部实现（`xdg-shell`、`layer-shell`、`seat`、`data-device`、
 `presentation-time`、`linux-dmabuf`、`screencopy`、`session-lock`、`input-method`、
-`text-input`、`workspace`、`foreign-toplevel`……），矩阵见 [features.md](./features.md)。
+`text-input`、`workspace`、`foreign-toplevel`、`tablet-v2`、`color-management`、
+`ext-foreign-toplevel-list`（单窗口捕获）……），矩阵见 [features.md](./features.md)。
 
 ## 先别抽象的东西
 

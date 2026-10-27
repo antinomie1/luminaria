@@ -15,7 +15,7 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 - **内存安全靠构造，不靠小心** — 每个 C 句柄 RAII 包装，每个信号监听析构自动摘链，
   没有一处手写 `wl_list_remove`。目标是让悬空指针那一族错误**写不出来**，而不是靠代码评审
   逮住。
-- **API 简洁明了** — 30 个协议对象（wlroots 是 73 个），三个按能力付费的 module，
+- **API 简洁明了** — 35 个协议对象（wlroots 是 73 个），三个按能力付费的 module，
   一层 `Result<T>`，异常不跨 C 边界。
 - **完整到能日常用** — 而不是停在“能跑个 demo”。
 
@@ -168,7 +168,7 @@ src/render/                vulkan cpu_compositor + 着色器 SPIR-V
 src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
 src/protocol/core/         27 个纯 Wayland 协议
 src/protocol/render/       drm_syncobj linux_dmabuf screencopy
-src/protocol/desktop/      data_control foreign_toplevel input_method output_management session_lock workspace
+src/protocol/desktop/      data_control foreign_toplevel foreign_toplevel_list input_method output_management session_lock workspace
 src/detail/wayland_fwd.h   唯一剩下的头文件
 ```
 

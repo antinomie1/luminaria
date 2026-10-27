@@ -193,9 +193,6 @@ fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize
 
 - **摆放策略**（平铺 / 浮动 / 工作区切换逻辑）—— 每个混成器自己实现，见 `CONTEXT.md`。
 - **窗口装饰绘制** —— 库不画标题栏，所以 `xdg-decoration` 默认答 client-side。
-- **tablet-v2** —— 完整桌面要，
-  但混成器可以自己实现，且都不影响那三个数。
-- **VRR / 动态刷新率**（低功耗第三级）—— 收益大，但依赖真机数据，等第 0 步之后再判断。
 
 ---
 
@@ -210,6 +207,22 @@ fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize
 
 ## 已知的天花板（不是 bug，是没做完的地方）
 
+- **HDR 渲染 / 色彩转换没有** —— `wp-color-management-v1` 的协商做完了（参数化描述、输出描述、表面偏好、
+  `Surface::image_description()`），但两个渲染器都按客户端给的编码直接合成，不在色彩空间之间换算。所以
+  `ColorSupport` 默认只声明 sRGB；`ColorSupport::full()` 只该给自己有色彩管线的混成器用。真正的 HDR 要在
+  `quad.frag` 里做 线性化 → 原色矩阵 → 色调映射 → 编码，并让 10-bit/FP16 的 scanout target 与 DRM 的
+  `Colorspace` / `HDR_OUTPUT_METADATA` 属性接上——这是下一个独立的大块，不属于协议层。ICC 不支持。
+  `wp-color-representation` 同理：渲染器读不了 YUV，默认只收 RGB。
+- **单窗口捕获的 tiled dmabuf** —— 默认的窗口渲染是 CPU（`CpuCompositor`），读 shm、单像素、LINEAR dmabuf；
+  Chrome / Firefox 的 GPU 进程给的 tiled dmabuf 读不了，那一层会被跳过。`set_toplevel_capture()` 留了口子给
+  GPU 读回（`Frame::begin_group()` 的离屏合成本来就能整窗渲出来），还没接。窗口按逻辑尺寸捕获，HiDPI
+  窗口不会拿到 buffer 的真实分辨率。
+- **数位板、VRR 都没在真机上验证** —— `TabletManager` 的协议一侧由 `test_tablet`（真 tablet-v2 客户端）守着，
+  libinput 的 tablet 事件翻译只编译通过：这台机器没有 `/dev/input` 的读权限，uinput 测试跳过。VRR 同理，
+  `VRR_ENABLED` 的提交路径没有真正的 FreeSync 显示器跑过；第 0 步的真机验证应当把这两项加进去。
+  另外数位板没有接进 `minimal`（映射到哪块输出、命中哪个表面是混成器的决定）。
+- **commit-timing 与 FIFO 同挂一个表面时的唤醒** —— 队头被 FIFO 放行后，下一条的时间戳要等下一次
+  `set_timestamp` 或定时器 tick 才会被注意到（放行不经过 commit-timing 的定时器）。单独用任何一个协议都不受影响。
 - **不可见表面的 FIFO 放行归混成器** —— barrier 只在 `send_frame_done()` 时清除，所以最小化
   或被完全遮挡、混成器不再 present 的客户端会一直停在闸门里。`FifoManager::unblock_hidden()`
   是那把钥匙，但什么算"不可见"只有混成器知道，示例里还没接。

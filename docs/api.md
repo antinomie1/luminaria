@@ -202,14 +202,16 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
     - `Signal<PresentEvent>& present()`: 帧上屏呈现完成信号。
     - `Signal<OutputDestroy>& destroy()`: 输出断开信号。
     - `Signal<OutputModeChange>& mode_changed()`: 模式/分辨率变更信号。
-  - 虚接口（由硬件后端重写）：`scanout_modifiers()`, `import_scanout()`, `commit_scanout()`, `set_mode()`, `modes()`.
+  - 虚接口（由硬件后端重写）：`scanout_modifiers()`, `import_scanout()`, `commit_scanout()`, `set_mode()`, `modes()`, `vrr_capable()`, `vrr_enabled()`, `set_vrr()`.
+  - **可变刷新率**：`vrr_capable()`（显示器 + 连接器都支持；headless / 嵌套恒为假）、`vrr_enabled()`（已请求，即使还没随提交落到硬件）、`Status set_vrr(bool)`（随下一次提交生效；在不支持的输出上开启是错误，关闭永远成功；内核事后拒绝则退回关闭并把 `vrr_capable()` 置假）。何时开是混成器的策略。
 
 ### 4.2 输入：`InputSource` (`luminaria:input_event`)
 - **`InputSource`**：输入从哪来的统一接口，嵌套的 `WaylandBackend` 与裸机的 `LibinputBackend` 都是它。两者的差别在于到来的是 `InputEvent` 的哪些分支（相对移动与触摸来自 libinput，绝对移动与离开来自嵌套窗口），而不在于怎么到来，所以混成器只写一个处理函数。
   - `Signal<InputEvent>& input()`：全部输入事件，按设备产生的顺序。
   - `const std::string& keymap() const`：按键所依据的 keymap 文本；之后的变化以 `KeymapChange` 到来。交给 `Seat::set_keymap()`。
   - `InputCapabilities capabilities() const`：设备当前能做什么；之后的变化以 `InputCapabilities` 到来。
-- **`InputEvent`** = `std::variant<KeyEvent, ModifiersEvent, KeymapChange, PointerMotionEvent, PointerMotionAbsEvent, PointerLeaveEvent, PointerButtonEvent, PointerAxisEvent, Touch{Down,Motion,Up,Frame,Cancel}Event, InputCapabilities>`。
+- **`InputEvent`** = `std::variant<KeyEvent, ModifiersEvent, KeymapChange, PointerMotionEvent, PointerMotionAbsEvent, PointerLeaveEvent, PointerButtonEvent, PointerAxisEvent, Touch{Down,Motion,Up,Frame,Cancel}Event, InputCapabilities, TabletDeviceAdded, TabletDeviceRemoved, TabletTool{Proximity,Axis,Tip,Button}Event, TabletPad{Button,Ring,Strip}Event>`。
+  - 数位板事件：`device` 是板子（或 pad）、`tool` 是笔，都是后端自己的 id；位置按板子的有效区域归一化到 [0,1]（与触摸同理，映射到哪块输出是混成器的事，交给 `TabletManager::feed()`）。`TabletAxes::changed` 位掩码说明更新里哪些轴有意义，proximity-in 带全部。
   - `KeyEvent` 带 `keysym` 与 `modifiers`：后端按自己的 keymap 读出，取**这个键之前**的状态（先按 Logo 再按 Return，到来的是带着 Logo 的 Return）。快捷键直接对着它匹配，混成器不需要自己的 xkb 状态。
   - `PointerMotionAbsEvent::output` 指明坐标属于哪个输出。
   - `PointerAxisEvent` 交给 `Seat::pointer_axis(const PointerAxisEvent&)`：滚轮同时报刻度和平滑量，刻度优先，否则每格滚两次。
@@ -424,6 +426,23 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`IdleNotifier`** (`luminaria:idle_notify`): 空闲状态超时监控。
 - **`BackgroundEffectManager`** (`luminaria:background_effect`): 亚克力模糊区域协商。
 
+### 7.8 Tablet (`luminaria:tablet`)
+- **`TabletManager`**: `zwp_tablet_manager_v2` (v2)。
+  - 设备：`add_tablet(TabletInfo)` / `add_tool(TabletToolInfo)` / `add_pad(TabletPadInfo)`（返回不复用的 id）与对应的 `remove_*`；后绑定的客户端也能拿到已有设备。
+  - 笔：`tool_proximity_in(tool, tablet, Surface&)` / `tool_proximity_out` / `tool_down` / `tool_up` / `tool_motion(x, y)`（表面坐标）/ `tool_pressure` / `tool_distance` / `tool_tilt` / `tool_rotation` / `tool_slider` / `tool_wheel` / `tool_button` / `tool_frame(time_ms)`。事件只发给笔下表面所属的客户端；`tool_proximity_out` 自己带 `frame`。
+  - pad：`pad_enter` / `pad_leave` / `pad_button` / `pad_ring` / `pad_strip` / `pad_mode_switch`。
+  - `void feed(const InputEvent&, const Box& area, const TabletLocator& locate)`：一步到位。`area` 是板子 [0,1] 方块对应的布局盒子，`locate(x, y)` 回答「这一点下面是哪个表面、表面坐标多少」（典型是 `scene_hit_test`）；设备和笔自己建、自己撤，笔跨窗口自己换焦点，pad 跟笔。非数位板事件被忽略，所以可以把每个 `InputEvent` 都递进去。
+  - `Signal<TabletToolCursorRequest>& cursor_request()`；静态 `tool_id_of(wl_resource*)` 把 `wp_cursor_shape` 请求里的 `tablet_tool` 解析成笔 id。
+  - 没有接进 `minimal`：和触摸一样，映射到哪块输出、命中哪个表面是混成器的决定。
+
+### 7.9 Color (`luminaria:color_management`)
+- **`ColorManager`**: `wp_color_manager_v1` (v3)。`create(display, ColorSupport = ColorSupport::srgb_only())`。
+  - `ColorSupport` 说明混成器兑现得了什么：命名原色 / 传递函数 / 渲染意图列表，加 `set_primaries`、`set_tf_power`、`set_luminances`、`set_mastering_display_primaries`、`extended_target_volume` 开关。`srgb_only()`（默认）只发 sRGB，多要就是协议错误；`full()` 全开，给自己有色彩管线的混成器。ICC、`windows_scrgb`、`windows_bt2100` 不支持。
+  - `set_output_description(OutputGlobal&, ImageDescription)` / `output_description()`：输出是什么（默认 sRGB）；变化时已问过的客户端收到 `image_description_changed`。`set_default_preferred()` / `set_preferred(Surface&, ImageDescription)`：表面最好用什么色彩空间渲染；变化时收到 `preferred_changed2`。
+  - 相等的色彩空间共享一个 identity（只要有人还拿着）。
+- **`ColorRepresentationManager`**: `wp_color_representation_manager_v1`。`create(display, ColorRepresentationSupport)`，默认只收 RGB（premultiplied electrical、identity、full range）；渲染器读不了 YUV，就别声明。
+- 读客户端声明：`Surface::image_description()`（空 = 没声明，当 sRGB）、`render_intent()`、`color_representation()`；都是粘性双缓冲状态。`ImageDescription::is_srgb()` 是「不需要转换」的判断，`is_hdr()`。**两个渲染器都不在色彩空间之间换算**。
+
 ---
 
 ## 8. 渲染与缓冲协议 (`luminaria.render`)
@@ -441,6 +460,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`ScreencopyManager`** (`luminaria.render:screencopy`):
   - 整合 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`。
   - `void set_cursor_source(std::function<CursorCapture(Output&)> source)`: 支持捕获独立硬件光标或合成光标层。
+  - **单窗口捕获**：`Status enable_toplevel_capture(Display&, ToplevelResolveFunc)` 发布 `ext_foreign_toplevel_image_capture_source_manager_v1`，客户端手里的 `ext_foreign_toplevel_handle_v1` 于是能当 ext-image-copy-capture 的源。`ToplevelResolveFunc` 是 `Toplevel*(wl_resource* handle)`——用桌面模块的 `ForeignToplevelList::toplevel_for`（`luminaria.render` 按 ADR 0008 不依赖 `luminaria.desktop`，所以是函数而不是类型）。窗口从自己的表面树合成，与遮挡、最小化、布局无关；按窗口自己的 commit 出帧，没变化就把 `capture` 扣住；缩放时回 `buffer_constraints` 并重发尺寸；销毁时 `stopped`。`set_toplevel_capture(ToplevelCaptureFunc)` 换掉默认的 CPU 渲染（默认读 shm / 单像素 / LINEAR dmabuf，tiled dmabuf 要自己读回）。
 
 ---
 
@@ -453,6 +473,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 ### 9.2 ForeignToplevel (顶层窗口监控)
 - **`ForeignToplevelManager`** (`luminaria.desktop:foreign_toplevel`): `zwlr_foreign_toplevel_management_v1`
   - 供任务栏（Dock/Panel）列出、聚焦、最小化、最大化与关闭其他应用的顶层窗口。
+
+- **`ForeignToplevelList`** (`luminaria.desktop:foreign_toplevel_list`): `ext_foreign_toplevel_list_v1`
+  - 只读窗口列表（标题、app id、不透明标识符），不能激活或关闭。`track(XdgShell&)` / `add(Toplevel&)`；`identifier(toplevel)`；静态 `toplevel_for(wl_resource* handle)` 把句柄解析回窗口，是 `ScreencopyManager::enable_toplevel_capture()` 的接口；`toplevel_count()`。
 
 ### 9.3 DataControl (剪贴板管理器)
 - **`DataControlManager`** (`luminaria.desktop:data_control`): `zwlr_data_control_v1`

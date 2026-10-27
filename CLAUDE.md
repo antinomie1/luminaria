@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Luminaria: a minimal Wayland compositor **library** in modern C++23, built on top of
 `libwayland-server` (the wire protocol is never reimplemented), rendering with Vulkan-Hpp,
-built with xmake. Roughly wlroots-shaped but far smaller (30 protocol types vs wlroots' 73).
+built with xmake. Roughly wlroots-shaped but far smaller (35 protocol types vs wlroots' 73).
 
 It ships as **C++23 named modules** with no public headers, layered strictly
 downwards (ADR 0008): `luminaria` is the dependency-light protocol/core interface, with
@@ -79,14 +79,14 @@ src/luminaria.shell.cppm   shell primary interface — Frame/Cursor/SceneRendere
 src/luminaria.desktop.cppm desktop primary interface — privileged shell protocols
 src/luminaria.text.cppm    text primary interface — fcft glyph rasterization
 src/core/                  display event_loop expected handle signal
-src/util/                  blur box color dmabuf keymap pixel pixel_layout rect_fill region transform
+src/util/                  blur box color color_description dmabuf keymap pixel pixel_layout rect_fill region transform
 src/backend/base/          backend output input_event output_layout (abstract base in core)
 src/backend/               drm headless libinput session wayland
 src/render/                vulkan cpu_compositor + quad.{vert,frag} + solid.frag
 src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
-src/protocol/core/         28 Wayland globals in core
+src/protocol/core/         31 protocol files in core (incl. tablet, color_management)
 src/protocol/render/       drm_syncobj linux_dmabuf screencopy
-src/protocol/desktop/      ctm_control data_control foreign_toplevel gamma_control input_method output_management session_lock virtual_keyboard virtual_pointer workspace
+src/protocol/desktop/      ctm_control data_control foreign_toplevel foreign_toplevel_list gamma_control input_method output_management session_lock virtual_keyboard virtual_pointer workspace
 src/detail/wayland_fwd.h   the one remaining header
 ```
 
@@ -206,6 +206,12 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `track()`), `xdg_activation`, `relative_pointer`, `pointer_constraints`,
   `text_input` (text-input-v3), `idle_inhibit`, `data_control`
   (wlr-data-control, bridged into `data_device` through `SelectionSource`),
+  `tablet` (zwp-tablet-v2: tablets, tools and pads, with `feed()` taking the backend's `Tablet*`
+  events straight to focus-following delivery), `color_management` (wp-color-management-v1 +
+  wp-color-representation-v1: negotiation only — no renderer converts colour spaces, so
+  `ColorSupport` defaults to sRGB-only), `foreign_toplevel_list` (desktop; read-only window
+  list, and the handle `ScreencopyManager::enable_toplevel_capture()` turns into a
+  single-window capture source),
   `session_lock` (ext-session-lock, which fails CLOSED: a lock client that dies leaves
   the session locked), `input_method` (input-method-v2, bridged to `text_input`),
   `output_management` (wlr-output-management: heads described from `Output` +
@@ -370,6 +376,21 @@ into a frame the display hardware is still scanning out. `Frame::submit()` uses 
 `Surface::surface_width()/surface_height()`; only code that touches pixels wants
 `buffer_width()`. Hit-testing goes through `Surface::accepts_input()` so the client's input
 region decides, not the buffer rectangle.
+
+**Deferred commits queue.** `wp_fifo_v1` / `wp_commit_timing_v1` park a commit as one `Surface::State`
+in an ordered deque (`deferred_commit_count()`), not a single merged slot: each parked commit is a
+frame of its own, released oldest-first as its gate opens, capped at `max_deferred_commits` (past
+which the newest folds into its predecessor). Nothing downstream sees a parked commit.
+
+**Variable refresh is a request on the next commit.** `Output::set_vrr()` rides the next atomic
+commit (`VRR_ENABLED`, restated across every modeset); a driver that refuses it costs VRR, not the
+frame. Policy — always / fullscreen game / never — is the compositor's.
+
+**Module-local names can collide at link time.** Two partitions each defining
+`manager_get_surface` (or any same-named function in an anonymous namespace) with a lambda inside
+ended up with one table dispatching into the other's function — a `wp_linux_drm_syncobj_manager_v1`
+request landing in colour management's handler. Give the handlers/vtables of a new protocol a prefix
+of its own (`cm_`, `cr_`, `ftl`…) rather than the bare `manager_*` names.
 
 **The renderer must outlive what caches its textures.** Each `Frame` (inside a
 `SceneOutput`), the `Cursor` and `LinuxDmabuf` hold `GpuTexture`s or pointers owned by the
