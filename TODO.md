@@ -213,10 +213,6 @@ fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize
   `quad.frag` 里做 线性化 → 原色矩阵 → 色调映射 → 编码，并让 10-bit/FP16 的 scanout target 与 DRM 的
   `Colorspace` / `HDR_OUTPUT_METADATA` 属性接上——这是下一个独立的大块，不属于协议层。ICC 不支持。
   `wp-color-representation` 同理：渲染器读不了 YUV，默认只收 RGB。
-- **单窗口捕获的 tiled dmabuf** —— 默认的窗口渲染是 CPU（`CpuCompositor`），读 shm、单像素、LINEAR dmabuf；
-  Chrome / Firefox 的 GPU 进程给的 tiled dmabuf 读不了，那一层会被跳过。`set_toplevel_capture()` 留了口子给
-  GPU 读回（`Frame::begin_group()` 的离屏合成本来就能整窗渲出来），还没接。窗口按逻辑尺寸捕获，HiDPI
-  窗口不会拿到 buffer 的真实分辨率。
 - **数位板、VRR 都没在真机上验证** —— `TabletManager` 的协议一侧由 `test_tablet`（真 tablet-v2 客户端）守着，
   libinput 的 tablet 事件翻译只编译通过：这台机器没有 `/dev/input` 的读权限，uinput 测试跳过。VRR 同理，
   `VRR_ENABLED` 的提交路径没有真正的 FreeSync 显示器跑过；第 0 步的真机验证应当把这两项加进去。

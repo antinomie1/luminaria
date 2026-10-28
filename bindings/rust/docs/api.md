@@ -900,7 +900,19 @@ DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 
   ```
   窗口从它自己的表面树合成，与被谁盖住、是否最小化无关；按窗口自己的 commit 出帧（没变就不答，零唤醒）；缩放时重发尺寸；
   销毁时会话停止。C++ 侧的 `ToplevelResolveFunc` 在这里是 `ForeignToplevelList` 的静态解析函数（`luminaria.render` 不依赖
-  `luminaria.desktop`，所以两边用函数地址接起来）。默认 CPU 渲染，读 shm / 单像素 / LINEAR dmabuf。
+  `luminaria.desktop`，所以两边用函数地址接起来）。
+  捕获的尺寸是**窗口自己的像素密度**，不是逻辑尺寸：会话广告的 `buffer_size` 是 geometry × `Surface::buffer_scale()`，
+  声明了 `set_buffer_scale(2)` 的 HiDPI 客户端拿到的是它真实 buffer 的分辨率。
+  ```rust
+  let renderer = VulkanRenderer::new(&VulkanOptions::default())?;
+  let mut screencopy = ScreencopyManager::new(&display)?;
+  screencopy.enable_toplevel_capture(&display, &list)?;
+  screencopy.set_renderer(&renderer);   // 窗口捕获改走 GPU
+  ```
+  `set_renderer()` 让整窗在 GPU 上离屏合成再读回 —— **tiled dmabuf 只有这条路看得见**（Chrome / Firefox 的 GPU 进程给的
+  就是它，CPU 没有 host mapping，会整层跳过并留下一个透明的洞）。没有 renderer 时退回 CPU（shm / 单像素 / LINEAR dmabuf），
+  两条路产出同一个尺寸。renderer 借用 `'d`，必须比 manager 活得久（和 `LinuxDmabuf` / `Frame` 一样的声明顺序规矩）；
+  没有 dmabuf 支持的 renderer 会被忽略，捕获留在 CPU 路径。
 - **数位板**（`protocol::TabletManager`，`zwp_tablet_manager_v2`）：板子、笔具、pad 三种对象分开管。后端把数位板事件作为
   `Event::Input(InputEvent::Tablet(TabletInput))` 送来（`DeviceAdded` / `Proximity` / `Axis` / `Tip` / `Button` /
   `PadButton` / `PadRing` / `PadStrip`，位置按板子归一化）；混成器映射到布局、找笔下表面，再调 `add_tablet` / `add_tool` /

@@ -271,7 +271,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ### 5.1 CpuCompositor (CPU 立即模式合成, `luminaria.render:cpu_compositor`)
 专为无头模式、嵌套回退、测试及截屏设计的软件合成器：
-- **`CpuView`**: `{ SurfaceId root; int x, y; Box clip; }`（`clip` 限制表面树绘制边界，平铺混成器无需手工擦除溢出）。
+- **`CpuView`**: `{ SurfaceId root; int x, y; Box clip; float alpha; int scale; }`（`clip` 限制表面树绘制边界，平铺混成器无需手工擦除溢出；`scale` 是每表面坐标对应的帧缓冲像素数，把整树连同子表面偏移一起放大绘制——HiDPI 捕获靠它拿到 buffer 的真实分辨率，`1` 就是原样）。
 - **`CpuImage`**: `{ Box box; std::span<const Pixel> pixels; }`。
 - **`using CpuItem = std::variant<RectFill, CpuView, CpuImage>;`**
 - **`CpuCompositor`**:
@@ -288,6 +288,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `static Result<VulkanRenderer> create(...)`: 初始化 Vulkan 实例与物理设备。
   - `Status render_to(ScanoutTarget& target, Color background, std::span<const GpuTextureFill> fills, const Region& repaint, const OutputMapping& mapping, RenderSync sync)`: 执行多边形合并渲染，支持不透明遮挡剔除、独立 Damage Scissor、Fence 异步编排。
   - `Status read_scanout(ScanoutTarget& target, std::vector<Pixel>& out)`: 回读渲染结果至 CPU（32 位整字快速回读，消除逐字节标量循环与二次拷贝）。
+  - `Status read_offscreen(OffscreenTarget& target, std::vector<std::uint8_t>& out)`: 把离屏目标读回成紧密排列的 RGBA8（alpha 保留），读完把图像放回可采样的布局，所以同一个 target 可以「渲染 → 读回 → 再渲染」。单窗口捕获用它——`Frame` 把合成好的窗口放回屏幕上，从不需要读回，所以这个入口只服务捕获。
 
 ### 5.3 CursorTheme & Text/Font
 - **`CursorTheme`** (`luminaria:cursor_theme`):
@@ -460,7 +461,14 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`ScreencopyManager`** (`luminaria.render:screencopy`):
   - 整合 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`。
   - `void set_cursor_source(std::function<CursorCapture(Output&)> source)`: 支持捕获独立硬件光标或合成光标层。
-  - **单窗口捕获**：`Status enable_toplevel_capture(Display&, ToplevelResolveFunc)` 发布 `ext_foreign_toplevel_image_capture_source_manager_v1`，客户端手里的 `ext_foreign_toplevel_handle_v1` 于是能当 ext-image-copy-capture 的源。`ToplevelResolveFunc` 是 `Toplevel*(wl_resource* handle)`——用桌面模块的 `ForeignToplevelList::toplevel_for`（`luminaria.render` 按 ADR 0008 不依赖 `luminaria.desktop`，所以是函数而不是类型）。窗口从自己的表面树合成，与遮挡、最小化、布局无关；按窗口自己的 commit 出帧，没变化就把 `capture` 扣住；缩放时回 `buffer_constraints` 并重发尺寸；销毁时 `stopped`。`set_toplevel_capture(ToplevelCaptureFunc)` 换掉默认的 CPU 渲染（默认读 shm / 单像素 / LINEAR dmabuf，tiled dmabuf 要自己读回）。
+  - **单窗口捕获**：`Status enable_toplevel_capture(Display&, ToplevelResolveFunc)` 发布 `ext_foreign_toplevel_image_capture_source_manager_v1`，客户端手里的 `ext_foreign_toplevel_handle_v1` 于是能当 ext-image-copy-capture 的源。`ToplevelResolveFunc` 是 `Toplevel*(wl_resource* handle)`——用桌面模块的 `ForeignToplevelList::toplevel_for`（`luminaria.render` 按 ADR 0008 不依赖 `luminaria.desktop`，所以是函数而不是类型）。窗口从自己的表面树合成，与遮挡、最小化、布局无关；按窗口自己的 commit 出帧，没变化就把 `capture` 扣住；缩放时回 `buffer_constraints` 并重发尺寸；销毁时 `stopped`。
+  - **捕获的分辨率是窗口自己的像素密度**：会话广告的 `buffer_size` 是 xdg geometry × `Surface::buffer_scale()`，所以声明了 `set_buffer_scale(2)` 的 HiDPI 客户端拿到的是它真实 buffer 的 128×96，而不是逻辑的 64×48——否则录屏软件得到的是"缩小再放大"两遍重采样的画面。
+  - **两条渲染路径**，都产出同一个尺寸：
+    - 给了 `set_renderer(VulkanRenderer*)` 时走 GPU：整窗表面树经 `VulkanRenderer::import_texture()` 变成纹理，`render_offscreen()` 合成到 `OffscreenTarget`（透明背景，alpha 保留），`read_offscreen()` 读回。**这是唯一能看见 tiled dmabuf 的路**——Chrome / Firefox 的 GPU 进程给的 buffer 没有 host mapping，CPU 读不了，会整层跳过并留下一个透明的洞。离屏 target 与每表面的纹理都按窗口缓存，不重建。
+    - 没有 renderer 时走 CPU：`CpuCompositor` 配 `CpuView{surface, -x, -y, clip, alpha, scale}` 的 `scale` 字段，把整树按 `scale` 放大绘制——读 shm / 单像素 / LINEAR dmabuf。
+    - 两条路都对画过的表面 `notify_rendered(-1)`（读回是阻塞的，工作已经完成），所以显式同步客户端的 release point 不会悬着。
+  - `set_toplevel_capture(ToplevelCaptureFunc)` 仍然能整个换掉内置渲染，给需要自己裁剪、色彩管理或走别的合成器的场景。
+  - `void set_renderer(VulkanRenderer*)` 同时给 dmabuf 捕获目标（LINEAR 走 mmap、tiled 走 `export_dmabuf()`）和窗口捕获的 GPU 路径开门；没有 dmabuf 支持的 renderer 被忽略（`dmabuf_supported()`），捕获留在 CPU 路径。
 
 ---
 

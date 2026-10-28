@@ -297,7 +297,11 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   `CpuItem = variant<RectFill, CpuView, CpuImage>` with generational ids; each `CpuView`
   carries a device-space `clip` box (empty = whole framebuffer) that confines every surface
   of the tree, so a tiler clips windows to their tiles without background-rect cleanup, and
-  non-Frame compositors release callbacks via the free `send_frame_done(ids, time_ms)`.
+  non-Frame compositors release callbacks via the free `send_frame_done(ids, time_ms)`. A
+  `CpuView` also carries a `scale`: the tree's coordinates are surface units, so `scale 2`
+  places and draws it at twice the size. That is the knob a HiDPI window capture uses to get
+  the buffer's real resolution rather than an upscale of the logical one — and the reason
+  the CPU and GPU capture paths cannot disagree about the size they produce.
   **Above both paths is the scene list.** `SceneItem` (`shell/scene.cppm`, core module) is
   one ordered list of four primitives — client surface tree, solid rect, window border,
   compositor-owned image — that `SceneRenderer` (`shell/scene_renderer.cppm`,
