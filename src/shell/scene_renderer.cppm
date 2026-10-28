@@ -484,7 +484,7 @@ void append_tree(SceneOutput::Impl& state, const Output& output, Surface& root, 
         const auto& x = std::get<CpuView>(a);
         const auto& y = std::get<CpuView>(b);
         return x.surface == y.surface && x.x == y.x && x.y == y.y && x.clip == y.clip &&
-               x.alpha == y.alpha;
+               x.alpha == y.alpha && x.scale == y.scale;
     }
     default: {
         const auto& x = std::get<CpuImage>(a);

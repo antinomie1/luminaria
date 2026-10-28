@@ -48,6 +48,11 @@ struct CpuView {
     /// to composite into here — a tree that overlaps itself seams (ADR 0005),
     /// which is the price of the path that runs without a GPU at all.
     float alpha = 1.0f;
+    /// Framebuffer pixels per surface coordinate. The tree is placed at
+    /// (x*scale, y*scale) and drawn `scale` times as wide and tall, so a
+    /// capture at a HiDPI window's real buffer resolution gets its pixels back
+    /// instead of an upscale of the logical size. 1 draws the tree as it is.
+    int scale = 1;
 };
 
 /// A block of pixels the compositor itself owns — a rasterized bar, a themed
@@ -83,7 +88,7 @@ private:
     void fill_rect(const RectFill& fill);
     void draw_image(const CpuImage& image);
     void draw_view(const CpuView& view);
-    void draw_surface(Surface& surface, int x, int y, const Box& clip, float alpha);
+    void draw_surface(Surface& surface, const Box& dst, const Box& clip, float alpha);
 
     int width_ = 0;
     int height_ = 0;
@@ -234,23 +239,34 @@ void CpuCompositor::draw_view(const CpuView& view) {
     if (clip.empty()) {
         return;
     }
+    const int scale = view.scale < 1 ? 1 : view.scale;
     tree_.clear();
     surface->surface_tree(tree_);
     for (const SurfaceAt& at : tree_) {
-        draw_surface(*at.surface, view.x + at.x, view.y + at.y, clip, view.alpha);
+        Surface& s = *at.surface;
+        const int surface_w = s.surface_width();
+        const int surface_h = s.surface_height();
+        if (surface_w <= 0 || surface_h <= 0) {
+            continue;
+        }
+        // Every coordinate the tree carries is in surface space — the root's
+        // position, a subsurface's offset, a surface's size. `scale` is the
+        // one place they become framebuffer pixels, which is what lets a
+        // capture ask for the window's real buffer resolution.
+        const Box dst{(view.x + at.x) * scale, (view.y + at.y) * scale, surface_w * scale,
+                      surface_h * scale};
+        draw_surface(s, dst, clip, view.alpha);
     }
 }
 
-void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip,
+void CpuCompositor::draw_surface(Surface& surface, const Box& dst, const Box& clip,
                                  float alpha) {
     int buffer_w = 0;
     int buffer_h = 0;
     if (!surface.current_buffer_rgba(rgba_, buffer_w, buffer_h)) {
         return;
     }
-    const int surface_w = surface.surface_width();
-    const int surface_h = surface.surface_height();
-    if (surface_w <= 0 || surface_h <= 0) {
+    if (dst.width <= 0 || dst.height <= 0) {
         return;
     }
     float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
@@ -259,20 +275,23 @@ void CpuCompositor::draw_surface(Surface& surface, int x, int y, const Box& clip
     // The surface's own rectangle, confined to the view clip: pixels the tree
     // would paint outside it are simply never touched, so whatever was already
     // there (a neighbour, the compositor's own rects) stays byte for byte.
-    const Box box = Box{x, y, surface_w, surface_h}.intersection(clip);
+    const Box box = dst.intersection(clip);
     if (box.empty()) {
         return;
     }
-    // Nearest-neighbour sampling: surface point -> normalized crop (u,v) ->
+    // Nearest-neighbour sampling: device point -> normalized crop (u,v) ->
     // raw-buffer pixel. The scale and the viewport crop are both already
-    // folded into the UVs by buffer_source_uv, exactly as for the GPU path.
-    const double du = (u1 - u0) / surface_w;
-    const double dv = (v1 - v0) / surface_h;
+    // folded into the UVs by buffer_source_uv, exactly as for the GPU path;
+    // dividing by the destination box rather than by the surface's logical
+    // size is what makes a scaled-up tree land on the buffer's own pixels
+    // instead of resampling them.
+    const double du = (u1 - u0) / dst.width;
+    const double dv = (v1 - v0) / dst.height;
     const unsigned opacity = alpha_byte(alpha);
     for (int py = box.y; py < box.y + box.height; ++py) {
-        const double v = v0 + (py - y + 0.5) * dv;
+        const double v = v0 + (py - dst.y + 0.5) * dv;
         for (int px = box.x; px < box.x + box.width; ++px) {
-            double u = u0 + (px - x + 0.5) * du;
+            double u = u0 + (px - dst.x + 0.5) * du;
             double w = v;
             unit_point(transform, u, w);
             const int bx = std::clamp(static_cast<int>(u * buffer_w), 0, buffer_w - 1);

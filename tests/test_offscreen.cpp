@@ -111,6 +111,52 @@ int main() {
         }
         assert(offscreen->width() == win_w && offscreen->height() == kQuadH);
 
+        // Reading it back is what a single-window capture does when the window
+        // cannot be read on the CPU at all (a tiled dmabuf has no host
+        // mapping): composite on the GPU, copy the result out. The alpha of
+        // what the window did not cover has to survive — the recorder puts the
+        // window on its own background.
+        {
+            std::vector<std::uint8_t> window_px;
+            // One quad over half the width: the left half is covered, the
+            // right half is not.
+            luminaria::GpuTextureFill left{};
+            left.texture = &*tex_a;
+            left.x = 0;
+            left.y = 0;
+            left.w = win_w / 2;
+            left.h = kQuadH;
+            const luminaria::GpuTextureFill half[] = {left};
+            const luminaria::Color transparent{0, 0, 0, 0};
+            assert(renderer->render_offscreen(*offscreen, transparent, {}, half).has_value());
+            assert(renderer->read_offscreen(*offscreen, window_px).has_value());
+            assert(window_px.size() == static_cast<std::size_t>(win_w) * kQuadH * 4);
+            const auto at = [&](int x, int y, int c) {
+                return static_cast<int>(
+                    window_px[(static_cast<std::size_t>(y) * win_w + x) * 4 + c]);
+            };
+            // Covered: opaque white.
+            assert(at(4, 4, 0) == 255 && at(4, 4, 3) == 255);
+            // Not covered: transparent, not black — the window's background is
+            // nothing at all, not a colour.
+            assert(at(win_w - 4, 4, 0) == 0 && at(win_w - 4, 4, 3) == 0);
+
+            // Reading it back must not consume it: the target is still the
+            // source of the next pass, and rendering into it again has to work.
+            luminaria::GpuTextureFill both_a{};
+            both_a.texture = &*tex_a;
+            both_a.w = kQuadW;
+            both_a.h = kQuadH;
+            luminaria::GpuTextureFill both_b = both_a;
+            both_b.texture = &*tex_b;
+            both_b.x = kBx;
+            const luminaria::GpuTextureFill full[] = {both_a, both_b};
+            assert(renderer->render_offscreen(*offscreen, transparent, {}, full).has_value());
+            assert(renderer->read_offscreen(*offscreen, window_px).has_value());
+            assert(at(kOnlyA, kRow, 3) == 255); // both quads drawn now
+            assert(at(win_w - 4, kRow, 3) == 255);
+        }
+
         // Into the offscreen at full opacity, over a fully transparent
         // background — what the window does not cover has to stay see-through.
         luminaria::GpuTextureFill a{};

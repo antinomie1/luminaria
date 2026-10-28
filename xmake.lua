@@ -535,7 +535,9 @@ for _, file in ipairs(os.files("tests/test_*.cpp")) do
         elseif desktop_tests[name] then
             -- desktop protocols need the core module and nothing else.
             add_deps("luminaria-desktop")
-        elseif name == "test_toplevel_capture" then
+        elseif name == "test_toplevel_capture" or name == "test_toplevel_capture_scale"
+            or name == "test_toplevel_capture_gpu"
+            or name == "test_toplevel_capture_teardown" then
             -- Names a window through the desktop module's list and captures it
             -- through the render module's screencopy: the two meet only here.
             add_deps("luminaria-desktop", "luminaria-render")

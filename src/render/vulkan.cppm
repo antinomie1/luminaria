@@ -11,6 +11,7 @@ module;
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "kawase_down_frag_spv.h"
 #include "kawase_up_frag_spv.h"
@@ -553,6 +554,20 @@ public:
                    std::span<const GpuTextureFill> textures,
                    std::span<const Box> damage = {}, int scale = 1,
                    const RenderSync &sync = {});
+
+  /// Read an offscreen target back as tightly-packed RGBA8, leaving it in the
+  /// layout the next `render_offscreen()` and the next sampling pass expect.
+  ///
+  /// This is what makes a window readable when it cannot be read on the CPU at
+  /// all: a client dmabuf in a tiled layout has no host mapping, so the only
+  /// way to its pixels is to composite it on the GPU and copy the result out.
+  /// Single-window capture is the caller that needs it — `Frame` puts the
+  /// finished window back onto a display and never has to.
+  ///
+  /// `out` is resized to width*height*4. Alpha is preserved: an offscreen
+  /// window is transparent where its surfaces did not reach.
+  [[nodiscard]] Status read_offscreen(OffscreenTarget &target,
+                                      std::vector<std::uint8_t> &out);
 
   /// Allocate an x-ray blur cache for an output. `downsample` is the blur
   /// radius knob: 2 is subtle, 4 is the normal light desktop blur; values
@@ -2049,6 +2064,13 @@ struct OffscreenTarget::Impl {
   // there is no foreign fence to wait for. It exists because the shared pass
   // takes one, and an empty UniqueFd is the honest way to say "none".
   UniqueFd acquire_fence;
+  // Staging buffer for read_offscreen(), created on first use and kept —
+  // single-window capture reads the same window back frame after frame, and a
+  // fresh buffer plus mapping per frame is most of what a readback costs.
+  std::optional<vk::raii::Buffer> readback;
+  std::optional<vk::raii::DeviceMemory> readback_memory;
+  std::uint8_t *readback_map = nullptr;
+  bool readback_coherent = true; // false: needs an explicit invalidate
 };
 
 GpuTexture::GpuTexture(std::unique_ptr<Impl> impl) noexcept
@@ -2932,6 +2954,91 @@ Status VulkanRenderer::render_offscreen(
                        &o.acquire_fence, /*scanout=*/false};
   return render_pass_to(t, background, rects, textures, {}, damage,
                         OutputMapping{Transform::normal, scale}, sync);
+}
+
+Status VulkanRenderer::read_offscreen(OffscreenTarget &target,
+                                      std::vector<std::uint8_t> &out) {
+  try {
+    auto &device = impl_->device;
+    OffscreenTarget::Impl &o = *target.impl_;
+    const GpuTexture::Impl &tex = *o.texture.impl_;
+    const auto uw = static_cast<std::uint32_t>(tex.width);
+    const auto uh = static_cast<std::uint32_t>(tex.height);
+    const vk::DeviceSize size = static_cast<vk::DeviceSize>(uw) * uh * 4;
+    if (uw == 0 || uh == 0) {
+      return fail("read_offscreen: empty target");
+    }
+
+    if (!o.readback.has_value()) {
+      o.readback.emplace(
+          device, vk::BufferCreateInfo{{},
+                                       size,
+                                       vk::BufferUsageFlagBits::eTransferDst,
+                                       vk::SharingMode::eExclusive});
+      const auto req = o.readback->getMemoryRequirements();
+      // HOST_CACHED first, for the same reason read_scanout() does: the
+      // conversion below reads every byte, and scalar reads out of
+      // write-combined memory run at a few tens of MB/s.
+      std::uint32_t type = 0;
+      try {
+        type = find_memory_type(impl_->physical, req.memoryTypeBits,
+                                vk::MemoryPropertyFlagBits::eHostVisible |
+                                    vk::MemoryPropertyFlagBits::eHostCached);
+        o.readback_coherent = false;
+      } catch (const std::exception &) {
+        type = find_memory_type(impl_->physical, req.memoryTypeBits,
+                                vk::MemoryPropertyFlagBits::eHostVisible |
+                                    vk::MemoryPropertyFlagBits::eHostCoherent);
+        o.readback_coherent = true;
+      }
+      o.readback_memory.emplace(device, vk::MemoryAllocateInfo{req.size, type});
+      o.readback->bindMemory(**o.readback_memory, 0);
+      o.readback_map = static_cast<std::uint8_t *>(
+          o.readback_memory->mapMemory(0, VK_WHOLE_SIZE));
+    }
+
+    vk::raii::CommandBuffer cmd = impl_->acquire_cmd();
+    cmd.begin(vk::CommandBufferBeginInfo{
+        vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+    // render_pass_to leaves an offscreen target parked in the sampled layout —
+    // that is where the pass that draws it onto the output expects to find it.
+    // Take it from there, and put it back the same way, so a target that is
+    // rendered, read and rendered again needs no special-casing anywhere.
+    barrier(cmd,
+            image_barrier(*tex.image, vk::PipelineStageFlagBits2::eFragmentShader,
+                          vk::AccessFlagBits2::eShaderSampledRead,
+                          vk::PipelineStageFlagBits2::eTransfer,
+                          vk::AccessFlagBits2::eTransferRead,
+                          vk::ImageLayout::eShaderReadOnlyOptimal,
+                          vk::ImageLayout::eTransferSrcOptimal));
+    vk::BufferImageCopy region{
+        0,         0,          0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        {0, 0, 0}, {uw, uh, 1}};
+    cmd.copyImageToBuffer(*tex.image, vk::ImageLayout::eTransferSrcOptimal,
+                          **o.readback, region);
+    barrier(cmd, image_barrier(*tex.image, vk::PipelineStageFlagBits2::eTransfer,
+                               vk::AccessFlagBits2::eTransferRead,
+                               vk::PipelineStageFlagBits2::eFragmentShader,
+                               vk::AccessFlagBits2::eShaderSampledRead,
+                               vk::ImageLayout::eTransferSrcOptimal,
+                               vk::ImageLayout::eShaderReadOnlyOptimal));
+    host_read_barrier(cmd);
+    cmd.end();
+    impl_->submit_and_wait(std::move(cmd));
+    if (!o.readback_coherent) {
+      device.invalidateMappedMemoryRanges(
+          vk::MappedMemoryRange{**o.readback_memory, 0, VK_WHOLE_SIZE});
+    }
+
+    // The target is R8G8B8A8, so the copy is already in the byte order the
+    // caller wants — no channel swizzle, and alpha survives.
+    out.resize(static_cast<size_t>(size));
+    std::memcpy(out.data(), o.readback_map, static_cast<size_t>(size));
+    return ok();
+  } catch (const std::exception &e) {
+    return fail(std::string{"vulkan read_offscreen: "} + e.what());
+  }
 }
 
 Status VulkanRenderer::render_to_with_shaders(

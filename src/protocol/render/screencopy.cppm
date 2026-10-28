@@ -97,6 +97,13 @@ public:
     /// Enable dmabuf capture targets. Clients may then hand a linux-dmabuf buffer
     /// instead of shm; LINEAR is written via mmap, tiled via the renderer. Without
     /// this, only shm targets are advertised.
+    ///
+    /// It does the same for window captures: with a renderer, a window's surface
+    /// tree is composited on the GPU into an offscreen target and read back,
+    /// which is the only way to see a client buffer in a TILED modifier — those
+    /// have no host mapping, so the CPU path skips that layer. A GPU that cannot
+    /// import/export dmabufs is refused here (`dmabuf_supported()`), and window
+    /// capture stays on the CPU path.
     void set_renderer(VulkanRenderer* renderer);
 
     /// Where the pointer cursor comes from, for cursor capture sessions.
@@ -118,13 +125,23 @@ public:
     /// session is `stopped` when the window is destroyed, and re-advertises its
     /// buffer size when the window is resized.
     ///
+    /// The capture is at the window's own pixel density, not its logical size:
+    /// a HiDPI client that declares `set_buffer_scale(2)` is captured at twice
+    /// its logical dimensions, so the recorder gets the pixels the client
+    /// actually drew instead of an upscale of them. Whatever renders it — the
+    /// GPU path when set_renderer() has a renderer, the CPU path otherwise —
+    /// uses that one size, so the two agree.
+    ///
     /// `resolve` maps a handle to a window; with the desktop module that is
     ///   `[](wl_resource* h) { return ForeignToplevelList::toplevel_for(h); }`
     /// It is a function rather than a type because `luminaria.render` does not
     /// (and, by ADR 0008, may not) depend on `luminaria.desktop`.
     [[nodiscard]] Status enable_toplevel_capture(Display& display, ToplevelResolveFunc resolve);
 
-    /// Replace the CPU rendering of window captures (see ToplevelCaptureFunc).
+    /// Replace the built-in rendering of window captures (see
+    /// ToplevelCaptureFunc). With nothing set, a window is composited on the GPU
+    /// and read back when set_renderer() gave a renderer, and on the CPU
+    /// otherwise.
     void set_toplevel_capture(ToplevelCaptureFunc fn);
 
     /// The cursor moved, changed shape, or left the screen. Re-reads the
@@ -191,16 +208,18 @@ struct OutputEntry {
 // first. Not in an anonymous namespace — a module-linkage member may not name a
 // TU-local type.
 struct ExtCursorSession;
+struct ToplevelTarget;
 
 struct ScreencopyManager::Impl {
     wl_display* display = nullptr;
-    VulkanRenderer* renderer = nullptr; // set → dmabuf targets advertised/writable
+    VulkanRenderer* renderer = nullptr; // set → dmabuf targets advertised/writable,
+                                        // and window captures composite on the GPU
     dev_t render_dev = 0;               // DRM render node dev_t (for ext dmabuf_device)
     bool has_dev = false;
     EventLoop loop;                     // for pacing window captures; set by enable_toplevel_capture
     ToplevelResolveFunc toplevel_resolver;
-    ToplevelCaptureFunc toplevel_capture; // unset → composite the surface tree on the CPU
-    CpuCompositor cpu;                    // scratch for the default window render
+    ToplevelCaptureFunc toplevel_capture; // unset → composite the surface tree ourselves
+    CpuCompositor cpu;                    // scratch for the fallback window render
     ScreencopyCursorFunc cursor_source;             // unset → cursor capture unavailable
     std::vector<ExtCursorSession*> cursor_sessions; // live, weak; each unregisters itself
 
@@ -214,6 +233,11 @@ struct ScreencopyManager::Impl {
     WlGlobal ext_source_toplevel_manager_global;
 
     std::vector<OutputEntry> outputs;
+    // Every live window source, weak. Not for lookup — for teardown: a source
+    // resource can outlive the manager (a connected client's objects are
+    // destroyed inside wl_display_destroy, after the globals), and it caches
+    // GPU objects the renderer owns. ~Impl walks this and severs both.
+    std::vector<std::weak_ptr<ToplevelTarget>> windows;
 
     // Find an output entry by its wl_resource. Returns nullptr if not found.
     OutputEntry* find_output(wl_resource* output) {
@@ -224,6 +248,9 @@ struct ScreencopyManager::Impl {
         }
         return nullptr;
     }
+
+    /// Register a new window source and prune the ones that have died.
+    void track_window(const std::shared_ptr<ToplevelTarget>& target);
 
     ~Impl();
 };
@@ -582,14 +609,6 @@ struct ExtCursorSession {
     int x = 0, y = 0;
 };
 
-// A cursor session is the client's and outlives us at exit (the Display,
-// declared first, is what destroys a still-connected client).
-ScreencopyManager::Impl::~Impl() {
-    for (ExtCursorSession* cs : cursor_sessions) {
-        cs->mgr = nullptr;
-    }
-}
-
 // =============================================================================
 // ext-image-copy-capture-v1 implementation
 // =============================================================================
@@ -623,8 +642,39 @@ bool ext_cursor_read(ExtCursorSession& cs, CursorCapture& out) {
 // the others, the window included. So the window lives behind shared_ptrs:
 // `ToplevelTarget` follows the Toplevel (and nulls it when it dies), and
 // `ToplevelSessionState` is one session's bookkeeping, which its frames share.
+//
+// At namespace scope, not in the anonymous namespace: ScreencopyManager::Impl
+// keeps a vector of these, and a module-linkage member may not name a TU-local
+// type. Unexported, so it stays private to module luminaria all the same.
+} // namespace
+
 struct ExtFrame;
 struct ToplevelSessionState;
+
+/// One surface of a captured window, with the GPU texture of the buffer it is
+/// showing. Cached for the same reason Frame caches its own: importing a dmabuf
+/// allocates a Vulkan image, and a window worth capturing is a window that is
+/// repainting. `live` is the difference between an import (the client keeps
+/// drawing into the same image, so the texture stays valid across commits) and
+/// an upload (a snapshot, dropped the moment the surface commits again).
+struct CaptureSurface {
+    SurfaceId surface;
+    const void* buffer = nullptr;
+    std::optional<GpuTexture> texture;
+    bool live = false;
+    bool used = false;
+    Signal<SurfaceCommit>::Connection committed;
+
+    void watch(Surface& value) {
+        surface = value.id();
+        committed = value.commit.connect([this](SurfaceCommit&) {
+            if (!live) {
+                texture.reset();
+                buffer = nullptr;
+            }
+        });
+    }
+};
 
 struct ToplevelTarget : std::enable_shared_from_this<ToplevelTarget> {
     ScreencopyManager::Impl* mgr = nullptr;
@@ -639,6 +689,34 @@ struct ToplevelTarget : std::enable_shared_from_this<ToplevelTarget> {
     bool wake_pending = false;
     std::vector<ExtFrame*> waiting;           // captures held back until `serial` moves
     std::vector<ToplevelSessionState*> sessions; // live; each unregisters itself
+
+    // GPU capture scratch, kept across frames: a window worth capturing is a
+    // window that keeps repainting, and an import or an allocation per frame is
+    // most of what the capture would cost. `offscreen` is rebuilt when the
+    // window's pixel size changes; `textures` caches one import per surface.
+    //
+    // Both belong to the RENDERER, not to this target: a source resource can
+    // outlive the manager (libwayland destroys a connected client's objects
+    // inside wl_display_destroy, after every global is gone), so the manager
+    // must be able to drop this state — see ~Impl. Nothing here is valid once
+    // `mgr` is null.
+    std::optional<OffscreenTarget> offscreen;
+    std::vector<std::unique_ptr<CaptureSurface>> textures;
+    std::vector<GpuTextureFill> fills;
+    std::vector<int> acquire_fences;
+    std::vector<SurfaceId> drawn;
+    std::vector<SurfaceAt> tree;
+
+    /// The renderer went away: forget everything that was built with it. Called
+    /// from ~ScreencopyManager::Impl before the renderer itself is gone.
+    void forget_gpu() {
+        offscreen.reset();
+        textures.clear();
+        fills.clear();
+        acquire_fences.clear();
+        drawn.clear();
+        tree.clear();
+    }
 
     void follow(Toplevel& tl);
     void refresh_watch();
@@ -686,6 +764,33 @@ struct ExtFrame {
         }
     }
 };
+
+// A window source outlives the manager at exit: its resource is the client's,
+// and libwayland destroys a still-connected client's objects inside
+// wl_display_destroy — after every global, so after this Impl. Sever the back
+// pointer so no late request walks into freed memory, and drop the GPU objects
+// the target cached: they belong to a renderer that is going away too.
+ScreencopyManager::Impl::~Impl() {
+    for (ExtCursorSession* cs : cursor_sessions) {
+        cs->mgr = nullptr;
+    }
+    for (const std::weak_ptr<ToplevelTarget>& weak : windows) {
+        const std::shared_ptr<ToplevelTarget> target = weak.lock();
+        if (target == nullptr) {
+            continue;
+        }
+        target->mgr = nullptr;
+        target->forget_gpu();
+    }
+    windows.clear();
+}
+
+void ScreencopyManager::Impl::track_window(const std::shared_ptr<ToplevelTarget>& target) {
+    std::erase_if(windows, [](const std::weak_ptr<ToplevelTarget>& w) { return w.expired(); });
+    windows.push_back(target);
+}
+
+namespace {
 
 void ext_frame_forget_buffer(wl_listener* listener, void*) {
     auto* f = reinterpret_cast<ExtFrame*>(reinterpret_cast<char*>(listener) -
@@ -801,10 +906,199 @@ void ext_send_constraints(ScreencopyManager::Impl* mgr, wl_resource* session_res
 }
 
 // ---- window capture ----
+//
+// A window is captured from its own surface tree, at the window's own pixel
+// density. Two renderers can do that, and the choice is not a preference:
+//
+//   * With a VulkanRenderer (set_renderer()), the tree is composited into an
+//     OffscreenTarget and copied back out. This is the only path that can see a
+//     TILED dmabuf — Chrome's and Firefox's GPU processes hand those over, and
+//     they have no host mapping at all, so the CPU path skips that layer and
+//     the capture comes out with a hole in it.
+//   * Without one, the same tree is composited by CpuCompositor, which reads
+//     shm, single-pixel and LINEAR dmabufs.
+//
+// Both use the same geometry and the same scale, so a window captured on a
+// machine without a GPU and the same window captured on one with a GPU agree on
+// the size and the layout of the picture.
 
-/// Render a window's surface tree into `rgba`. A custom function wins; the
-/// default composites on the CPU with the window's geometry at the origin.
+/// The pixel density a window is captured at: its root surface's declared
+/// buffer scale, never below 1. A HiDPI client declares 2 and hands over a 2x
+/// buffer, so the capture is 2x the logical size and carries the client's own
+/// pixels rather than an upscale of them.
+int toplevel_scale(Toplevel& tl) {
+    const int scale = tl.surface().buffer_scale();
+    return scale < 1 ? 1 : scale;
+}
+
+/// The window's own rectangle in surface coordinates — its xdg geometry (the
+/// visible bounds inside the buffer), falling back to the whole committed
+/// surface when the client never set one. Empty when it has nothing to show.
+Box toplevel_box(Toplevel& tl) {
+    XdgGeometry g = tl.geometry();
+    if (g.width <= 0 || g.height <= 0) {
+        g = XdgGeometry{0, 0, tl.surface().surface_width(), tl.surface().surface_height()};
+    }
+    if (g.width <= 0 || g.height <= 0) {
+        return {};
+    }
+    return Box{g.x, g.y, g.width, g.height};
+}
+
+/// The GPU texture for a surface's current buffer, or null when there is none
+/// this renderer can take. Falls back from an import to an upload, which is
+/// what a shm or single-pixel buffer gets.
+GpuTexture* capture_texture(ToplevelTarget& target, Surface& surface) {
+    CaptureSurface* entry = nullptr;
+    for (const std::unique_ptr<CaptureSurface>& candidate : target.textures) {
+        if (candidate->surface == surface.id()) {
+            entry = candidate.get();
+            break;
+        }
+    }
+    if (entry == nullptr) {
+        auto fresh = std::make_unique<CaptureSurface>();
+        entry = fresh.get();
+        entry->watch(surface);
+        target.textures.push_back(std::move(fresh));
+    }
+    entry->used = true;
+
+    const void* current = surface.current_buffer_identity();
+    if (current == nullptr) {
+        entry->texture.reset();
+        entry->buffer = nullptr;
+        return nullptr;
+    }
+    if (entry->texture.has_value() && entry->buffer == current) {
+        return &*entry->texture;
+    }
+    entry->texture.reset();
+    entry->buffer = current;
+    entry->live = false;
+
+    if (DmabufPlane plane{}; surface.current_buffer_dmabuf(plane)) {
+        if (auto imported = target.mgr->renderer->import_texture(plane)) {
+            entry->texture.emplace(std::move(*imported));
+            entry->live = true;
+            return &*entry->texture;
+        }
+        // An import this GPU cannot take (a modifier it does not support) is
+        // not fatal here: the CPU read-back below may still work for LINEAR.
+    }
+
+    std::vector<std::uint8_t> rgba;
+    int width = 0;
+    int height = 0;
+    if (!surface.current_buffer_rgba(rgba, width, height)) {
+        entry->buffer = nullptr;
+        return nullptr;
+    }
+    if (auto uploaded = target.mgr->renderer->upload_texture(width, height, rgba)) {
+        entry->texture.emplace(std::move(*uploaded));
+        return &*entry->texture;
+    }
+    entry->buffer = nullptr;
+    return nullptr;
+}
+
+/// Composite the window on the GPU and read the result back. `box` is the
+/// window's rectangle in surface coordinates and `scale` its pixel density, so
+/// the target is the window at its real buffer resolution.
+///
+/// Returns false when this renderer cannot do it — no renderer, nothing
+/// drawable, an allocation that failed — and the caller falls back to the CPU.
+bool toplevel_render_gpu(ToplevelTarget& target, Toplevel& tl, const Box& box, int scale,
+                         int& width, int& height, std::vector<std::uint8_t>& rgba) {
+    VulkanRenderer* renderer = target.mgr->renderer;
+    if (renderer == nullptr) {
+        return false;
+    }
+    width = box.width * scale;
+    height = box.height * scale;
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    if (!target.offscreen || target.offscreen->width() != width ||
+        target.offscreen->height() != height) {
+        auto made = renderer->create_offscreen(width, height);
+        if (!made) {
+            return false;
+        }
+        target.offscreen.emplace(std::move(*made));
+    }
+
+    target.tree.clear();
+    tl.surface().surface_tree(target.tree);
+    target.fills.clear();
+    target.acquire_fences.clear();
+    target.drawn.clear();
+    for (const std::unique_ptr<CaptureSurface>& entry : target.textures) {
+        entry->used = false;
+    }
+    for (const SurfaceAt& at : target.tree) {
+        Surface& s = *at.surface;
+        const int surface_w = s.surface_width();
+        const int surface_h = s.surface_height();
+        if (surface_w <= 0 || surface_h <= 0) {
+            continue;
+        }
+        GpuTexture* texture = capture_texture(target, s);
+        if (texture == nullptr) {
+            continue; // unreadable on both paths: skipped, like the CPU one
+        }
+        GpuTextureFill fill{};
+        fill.texture = texture;
+        // Surface coordinates; `scale` below turns them into target pixels, and
+        // the render pass scissors whatever falls outside the window's box.
+        fill.x = static_cast<float>(at.x - box.x);
+        fill.y = static_cast<float>(at.y - box.y);
+        fill.w = static_cast<float>(surface_w);
+        fill.h = static_cast<float>(surface_h);
+        fill.transform = s.buffer_transform();
+        s.buffer_source_uv(fill.u0, fill.v0, fill.u1, fill.v1);
+        target.fills.push_back(fill);
+        target.drawn.push_back(s.id());
+        if (const int fence = s.acquire_fence_fd(); fence >= 0) {
+            target.acquire_fences.push_back(fence);
+        }
+    }
+    std::erase_if(target.textures,
+                  [](const std::unique_ptr<CaptureSurface>& entry) { return !entry->used; });
+    if (target.fills.empty()) {
+        return false;
+    }
+
+    // A window is not a screen: the pixels its surfaces did not reach have to
+    // stay transparent, so the recorder can put it on its own background.
+    const RenderSync sync{target.acquire_fences, nullptr};
+    if (auto rendered = renderer->render_offscreen(*target.offscreen, Color{0, 0, 0, 0}, {},
+                                                   target.fills, {}, scale, sync);
+        !rendered) {
+        return false;
+    }
+    if (auto read = renderer->read_offscreen(*target.offscreen, rgba); !read) {
+        return false;
+    }
+    // The read-back blocked until the copy retired, so this work is done: an
+    // explicit-sync client's release point is signalled now, not on a fence.
+    for (SurfaceId id : target.drawn) {
+        if (Surface* s = surface_from_id(id); s != nullptr) {
+            s->notify_rendered(-1);
+        }
+    }
+    return true;
+}
+
+/// Render a window's surface tree into `rgba`. A custom function wins; then the
+/// GPU (which alone can see a tiled dmabuf); then the CPU.
 bool toplevel_render(ToplevelTarget& target, int& width, int& height, std::vector<uint8_t>& rgba) {
+    // No manager: this source outlived the global (a client's resources are
+    // destroyed inside wl_display_destroy). Nothing is left to render with or
+    // into; the frame will be answered `failed`.
+    if (target.mgr == nullptr) {
+        return false;
+    }
     Toplevel* tl = target.toplevel;
     if (tl == nullptr) {
         return false;
@@ -812,17 +1106,17 @@ bool toplevel_render(ToplevelTarget& target, int& width, int& height, std::vecto
     if (target.mgr->toplevel_capture) {
         return target.mgr->toplevel_capture(*tl, width, height, rgba) && width > 0 && height > 0;
     }
-    Surface& surface = tl->surface();
-    XdgGeometry g = tl->geometry();
-    if (g.width <= 0 || g.height <= 0) {
-        g = XdgGeometry{0, 0, surface.surface_width(), surface.surface_height()};
-    }
-    if (g.width <= 0 || g.height <= 0) {
+    const Box box = toplevel_box(*tl);
+    if (box.empty()) {
         return false; // nothing committed yet
     }
-    width = g.width;
-    height = g.height;
-    const CpuItem view = CpuView{surface.id(), -g.x, -g.y};
+    const int scale = toplevel_scale(*tl);
+    if (toplevel_render_gpu(target, *tl, box, scale, width, height, rgba)) {
+        return true;
+    }
+    width = box.width * scale;
+    height = box.height * scale;
+    const CpuItem view = CpuView{tl->surface().id(), -box.x, -box.y, {}, 1.0f, scale};
     target.mgr->cpu.composite(width, height, Color{0, 0, 0, 0}, std::span{&view, 1});
     const std::span<const Pixel> pixels = target.mgr->cpu.pixels();
     rgba.resize(pixels.size() * 4);
@@ -830,21 +1124,23 @@ bool toplevel_render(ToplevelTarget& target, int& width, int& height, std::vecto
     return true;
 }
 
-/// How big the window's capture is right now, without rendering it. 0x0 when it
-/// has nothing to show.
+/// How big the window's capture is right now, without rendering it: the
+/// window's rectangle at its own pixel density, which is what the session
+/// advertises as its buffer size. 0x0 when it has nothing to show.
 Size toplevel_size(const ToplevelTarget& target) {
     Toplevel* tl = target.toplevel;
-    if (tl == nullptr) {
+    if (target.mgr == nullptr || tl == nullptr) {
         return {};
     }
     if (target.mgr->toplevel_capture) {
+        return {}; // a custom renderer decides the size only when it draws
+    }
+    const Box box = toplevel_box(*tl);
+    if (box.empty()) {
         return {};
     }
-    XdgGeometry g = tl->geometry();
-    if (g.width <= 0 || g.height <= 0) {
-        g = XdgGeometry{0, 0, tl->surface().surface_width(), tl->surface().surface_height()};
-    }
-    return {std::max(g.width, 0), std::max(g.height, 0)};
+    const int scale = toplevel_scale(*tl);
+    return {box.width * scale, box.height * scale};
 }
 
 void toplevel_fail(ExtFrame& f, uint32_t reason) {
@@ -1364,9 +1660,12 @@ void ext_toplevel_source_create(wl_client* client, wl_resource* mgr_resource, ui
     // be bound — but its sessions are stopped on creation.
     auto target = std::make_shared<ToplevelTarget>();
     target->mgr = mgr;
-    if (mgr != nullptr && mgr->toplevel_resolver) {
-        if (Toplevel* tl = mgr->toplevel_resolver(handle); tl != nullptr) {
-            target->follow(*tl);
+    if (mgr != nullptr) {
+        mgr->track_window(target); // so ~Impl can sever it if the client outlives us
+        if (mgr->toplevel_resolver) {
+            if (Toplevel* tl = mgr->toplevel_resolver(handle); tl != nullptr) {
+                target->follow(*tl);
+            }
         }
     }
     wl_resource_set_implementation(source_res, &ext_source_impl, new ExtSource{nullptr, target},

@@ -245,6 +245,40 @@ int main() {
                 assert(epx(9, 8) == (luminaria::Pixel{0, 255, 0, 255}));
                 assert(epx(8, 9) == (luminaria::Pixel{0, 255, 0, 255}));
 
+                // A scaled view: the tree's coordinates are surface units, so
+                // scale 2 draws it at twice the size from twice the origin.
+                // This is what a HiDPI capture asks for — the window's real
+                // buffer resolution instead of an upscale of its logical size.
+                // The 4x4 red parent at (1,1) becomes an 8x8 red block at
+                // (2,2), and the 2x2 blue subsurface at +1,+1 lands on top at
+                // (4,4)-(8,8).
+                std::vector<luminaria::CpuItem> scaled_items;
+                scaled_items.push_back(
+                    luminaria::CpuView{surfaces[0]->id(), 1, 1, {}, 1.0f, 2});
+                luminaria::CpuCompositor cpu4;
+                cpu4.composite(kWidth * 2, kHeight * 2, luminaria::Color{0, 1, 0, 1},
+                               scaled_items);
+                const auto spx = [&](int x, int y) {
+                    return cpu4.pixels()[static_cast<std::size_t>(y) * kWidth * 2 + x];
+                };
+                assert(spx(2, 2) == (luminaria::Pixel{255, 0, 0, 255})); // scaled parent
+                assert(spx(9, 9) == (luminaria::Pixel{255, 0, 0, 255})); // ... still red
+                assert(spx(4, 4) == (luminaria::Pixel{0, 0, 255, 255})); // subsurface, scaled
+                assert(spx(7, 7) == (luminaria::Pixel{0, 0, 255, 255}));
+                assert(spx(8, 8) == (luminaria::Pixel{255, 0, 0, 255})); // parent again
+                assert(spx(1, 1) == (luminaria::Pixel{0, 255, 0, 255})); // background
+                assert(spx(10, 10) == (luminaria::Pixel{0, 255, 0, 255}));
+                // Scale 1 on the same view is exactly the old placement, so the
+                // field is a pure pixel-density knob and not a second geometry.
+                std::vector<luminaria::CpuItem> unit_items;
+                unit_items.push_back(luminaria::CpuView{surfaces[0]->id(), 1, 1});
+                luminaria::CpuCompositor cpu5;
+                cpu5.composite(kWidth, kHeight, luminaria::Color{0, 1, 0, 1}, unit_items);
+                assert(cpu5.pixels()[static_cast<std::size_t>(2) * kWidth + 2] ==
+                       (luminaria::Pixel{0, 0, 255, 255})); // subsurface, unscaled
+                assert(cpu5.pixels()[static_cast<std::size_t>(1) * kWidth + 1] ==
+                       (luminaria::Pixel{255, 0, 0, 255})); // parent, unscaled
+
                 // Batch frame-callback release: one stamp for the whole frame.
                 const std::array<luminaria::SurfaceId, 2> ids{surfaces[0]->id(),
                                                               surfaces[1]->id()};
