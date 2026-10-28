@@ -108,5 +108,6 @@ private:
 std::unique_ptr<ScreencopyManagerShim> screencopy_manager_new(const DisplayShim& display, rust::String& error);
 bool screencopy_enable_toplevel_capture(ScreencopyManagerShim& mgr, const DisplayShim& display,
                                         std::size_t resolver, rust::String& error);
+void screencopy_set_renderer(ScreencopyManagerShim& mgr, const VulkanRendererShim& renderer);
 
 } // namespace lum

@@ -174,6 +174,14 @@ bool screencopy_enable_toplevel_capture(ScreencopyManagerShim& mgr, const Displa
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
 
+void screencopy_set_renderer(ScreencopyManagerShim& mgr, const VulkanRendererShim& renderer) {
+    if (!mgr.impl().mgr) return;
+    // The manager keeps a raw pointer and refuses a renderer without dmabuf
+    // support, so a machine with no GPU silently stays on the CPU path — which
+    // is the behaviour a Rust caller cannot express any other way.
+    mgr.impl().mgr->set_renderer(raw_ptr(renderer));
+}
+
 struct CpuCompositorShim::Impl {
     lm::CpuCompositor comp;
     std::vector<lm::CpuItem> items;

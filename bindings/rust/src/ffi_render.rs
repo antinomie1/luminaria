@@ -99,5 +99,8 @@ pub(crate) mod ffi {
             resolver: usize,
             error: &mut String,
         ) -> bool;
+        /// Give the capture path a GPU: dmabuf capture targets, and window
+        /// captures composited offscreen instead of on the CPU.
+        fn screencopy_set_renderer(mgr: Pin<&mut ScreencopyManagerShim>, renderer: &VulkanRendererShim);
     }
 }

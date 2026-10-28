@@ -246,6 +246,10 @@ impl<'d> ScreencopyManager<'d> {
     /// costs no wake-ups; the session is stopped when the window is destroyed
     /// and re-advertises its size when the window is resized.
     ///
+    /// The capture is at the window's own pixel density, not its logical size:
+    /// a HiDPI client that declares `set_buffer_scale(2)` is captured at twice
+    /// its logical dimensions, so the recorder gets the pixels the client drew.
+    ///
     /// The list must already track the shell (`ForeignToplevelList::track`).
     #[cfg(feature = "desktop")]
     pub fn enable_toplevel_capture(
@@ -268,5 +272,23 @@ impl<'d> ScreencopyManager<'d> {
         } else {
             Err(Error::new(ErrorKind::Gpu, err))
         }
+    }
+
+    /// Give the capture path a GPU.
+    ///
+    /// Two things change. Dmabuf capture targets become available to clients
+    /// (LINEAR is written through mmap, tiled through the renderer). And a
+    /// window is composited into an offscreen target on the GPU and read back
+    /// instead of being drawn on the CPU — which is the only way to capture a
+    /// window whose buffer is a **tiled dmabuf**: those have no host mapping, so
+    /// the CPU path skips that layer and the capture comes out with a
+    /// transparent hole where the content is. Chrome's and Firefox's GPU
+    /// processes hand over exactly that kind of buffer.
+    ///
+    /// The renderer is borrowed for as long as this manager lives and must
+    /// outlive it. A renderer without dmabuf support is ignored: the manager
+    /// stays on the CPU path, which is what a machine with no usable GPU wants.
+    pub fn set_renderer(&mut self, renderer: &'d VulkanRenderer) {
+        ffi::screencopy_set_renderer(self.raw.pin_mut(), &renderer.raw);
     }
 }
