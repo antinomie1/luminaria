@@ -52,6 +52,37 @@ int main() {
     const luminaria::Color black{0, 0, 0, 1};
     std::vector<std::uint8_t> pixels;
 
+    // --- a rounded solid rect, and a hollow ring ------------------------------
+    {
+        luminaria::GpuTextureFill fill{};
+        fill.solid = true;
+        fill.color = luminaria::Color{1, 1, 1, 1};
+        fill.x = 16;
+        fill.y = 16;
+        fill.w = 32;
+        fill.h = 32;
+        fill.corner_radius = 8.0f;
+        {
+            const luminaria::GpuTextureFill fills[] = {fill};
+            assert(renderer->render_to(*target, black, {}, fills).has_value());
+            assert(renderer->read_scanout(*target, pixels).has_value());
+        }
+        assert(near(value_at(pixels, 32, 32), 255)); // filled to the middle
+        assert(near(value_at(pixels, 16, 16), 0));   // the corner is cut away
+        assert(near(value_at(pixels, 16, 32), 255)); // the edge isn't
+
+        fill.ring = 2.0f;
+        {
+            const luminaria::GpuTextureFill fills[] = {fill};
+            assert(renderer->render_to(*target, black, {}, fills).has_value());
+            assert(renderer->read_scanout(*target, pixels).has_value());
+        }
+        assert(near(value_at(pixels, 32, 32), 0));   // hollow
+        assert(near(value_at(pixels, 16, 32), 255)); // the band along the edge
+        assert(near(value_at(pixels, 19, 32), 0));   // and nothing past its width
+        assert(near(value_at(pixels, 16, 16), 0));   // following the corner
+    }
+
     // --- a rounded window ----------------------------------------------------
     {
         auto texture = renderer->upload_texture(32, 32, opaque_white(32, 32));

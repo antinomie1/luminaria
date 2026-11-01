@@ -122,7 +122,8 @@ struct SceneItem {
     /// itself.
     float alpha = 1.0f;
 
-    /// Rounded corners, in logical pixels. GPU only — the CPU path draws square
+    /// Rounded corners, in logical pixels: a window's or image's, a `rect`'s, and
+    /// the outer radius of a `border`, which stays hollow. GPU only — the CPU path draws square
     /// corners rather than refusing to come up, the same way a missing font
     /// leaves a label blank.
     float corner_radius = 0.0f;

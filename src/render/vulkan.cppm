@@ -18,6 +18,7 @@ module;
 #include "quad_frag_spv.h"
 #include "quad_vert_spv.h"
 #include "rounded_frag_spv.h"
+#include "rounded_solid_frag_spv.h"
 #include "shadow_frag_spv.h"
 #include "solid_frag_spv.h"
 #include <drm_fourcc.h>
@@ -321,6 +322,11 @@ struct GpuTextureFill {
   /// The silhouette is analytic — no blur pass, no extra target. Blurring a
   /// shape that is already in closed form buys nothing.
   float feather = 0.0f;
+
+  /// Solid fills only: paint a ring this many logical pixels thick just inside
+  /// the box, leaving the middle untouched. It follows `corner_radius`, which is
+  /// the ring's outer radius. Ignored with a `feather`.
+  float ring = 0.0f;
 
   /// Four floats handed straight to a custom `FragmentShader` as `pc.params`,
   /// and ignored by every built-in pipeline. The extension point had no way
@@ -722,6 +728,7 @@ struct QuadPipeline {
   vk::raii::Pipeline solid;   // solid-colour quads: no descriptor binding
   vk::raii::Pipeline rounded; // ... with the corners cut out
   vk::raii::Pipeline shadow;  // solid, faded by the distance to a rounded box
+  vk::raii::Pipeline rounded_solid; // solid, cut to a rounded box or ring
 };
 
 /// Renderer-owned so a pipeline cannot die while an asynchronous submit still
@@ -2641,10 +2648,11 @@ QuadPipeline &VulkanRenderer::Impl::quad_pipeline(vk::Format format) {
   vk::raii::Pipeline solid = make(kSolidFragSpv);
   vk::raii::Pipeline rounded = make(kRoundedFragSpv);
   vk::raii::Pipeline shadow = make(kShadowFragSpv);
+  vk::raii::Pipeline rounded_solid = make(kRoundedSolidFragSpv);
 
-  pipelines.push_back(QuadPipeline{format, std::move(layout),
-                                   std::move(pipeline), std::move(solid),
-                                   std::move(rounded), std::move(shadow)});
+  pipelines.push_back(QuadPipeline{
+      format, std::move(layout), std::move(pipeline), std::move(solid),
+      std::move(rounded), std::move(shadow), std::move(rounded_solid)});
   return pipelines.back();
 }
 
@@ -3482,6 +3490,7 @@ Status VulkanRenderer::render_pass_to(
       push.effect[0] =
           tf.corner_radius * static_cast<float>(std::max(1, scale));
       push.effect[1] = grow_dev;
+      push.effect[2] = tf.ring * static_cast<float>(std::max(1, scale));
       std::ranges::copy(tf.params, std::begin(push.params));
       push.rect[0] = 2.0f * dev.x / static_cast<float>(device_w) - 1.0f;
       push.rect[1] = 2.0f * dev.y / static_cast<float>(device_h) - 1.0f;
@@ -3498,8 +3507,11 @@ Status VulkanRenderer::render_pass_to(
         push.uv01[1] = tf.color.g * tf.color.a;
         push.uv01[2] = tf.color.b * tf.color.a;
         push.alpha = tf.color.a;
+        const bool shaped = tf.corner_radius > 0.0f || tf.ring > 0.0f;
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                         grow > 0.0f ? *quad.shadow : *quad.solid);
+                         grow > 0.0f ? *quad.shadow
+                         : shaped    ? *quad.rounded_solid
+                                     : *quad.solid);
       } else {
         const GpuTexture::Impl &tex = *tf.texture->impl_;
         const auto uv = corner_uvs(transform_compose(transform, tf.transform),

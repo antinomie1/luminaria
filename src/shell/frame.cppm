@@ -95,6 +95,8 @@ struct Placement {
   /// pixels *outside* its box, following the same corner radius.
   float corner_radius = 0.0f;
   float feather = 0.0f;
+  /// Solid only: a ring this thick just inside the box instead of a fill.
+  float ring = 0.0f;
 
   /// The opaque region, in layout coordinates, as `[first, first+count)` in
   /// the frame's arena — ask `Frame::opaque_of()`. It lives here as a pair of
@@ -293,6 +295,11 @@ public:
   /// one it drew. It sits in the z-order like anything else: place it where
   /// it belongs among the surfaces.
   void place_rect(int x, int y, int width, int height, Color color);
+  /// The same with rounded corners of `radius` layout pixels. With a `ring` it
+  /// paints only a band that thick just inside the box and leaves the middle
+  /// alone, which is what a border around a translucent window has to do.
+  void place_rounded_rect(const Box &box, Color color, float radius,
+                          float ring = 0.0f);
 
   /// Place one blur placement per region a surface tree declared through
   /// ext-background-effect-v1, translated by the root's origin and clipped to
@@ -651,6 +658,7 @@ struct FrPlacementKey {
   Color color{};
   float corner_radius = 0.0f;
   float feather = 0.0f;
+  float ring = 0.0f;
 
   // Member and not a hidden friend: a defaulted hidden-friend operator== in a
   // module interface ICEs gcc 16.
@@ -662,7 +670,8 @@ struct FrPlacementKey {
            transform == other.transform && u0 == other.u0 && v0 == other.v0 &&
            u1 == other.u1 && v1 == other.v1 && alpha == other.alpha &&
            draw == other.draw && solid == other.solid && color == other.color &&
-           corner_radius == other.corner_radius && feather == other.feather;
+           corner_radius == other.corner_radius && feather == other.feather &&
+           ring == other.ring;
   }
 };
 
@@ -837,6 +846,7 @@ FrPlacementKey Frame::Impl::key_of(const Placement &p,
   key.solid = p.solid;
   key.corner_radius = p.corner_radius;
   key.feather = p.feather;
+  key.ring = p.ring;
   key.color = p.color;
   return key;
 }
@@ -950,6 +960,7 @@ Status Frame::Impl::render_group(std::size_t first_placement,
       solid.color = p.color;
       solid.corner_radius = p.corner_radius;
       solid.feather = p.feather;
+      solid.ring = p.ring;
       solid.x = p.x - static_cast<float>(bounds.x);
       solid.y = p.y - static_cast<float>(bounds.y);
       solid.w = p.width;
@@ -1472,8 +1483,12 @@ void Frame::place_shadow(const Box &box, Color color, float radius,
 }
 
 void Frame::place_rect(int x, int y, int width, int height, Color color) {
+  place_rounded_rect(Box{x, y, width, height}, color, 0.0f);
+}
+
+void Frame::place_rounded_rect(const Box &box, Color color, float radius,
+                               float ring) {
   Impl &impl = *impl_;
-  const Box box{x, y, width, height};
   // Nothing of it lands on this output: not drawn, and not hit-testable here
   // either — the pointer is somewhere else entirely.
   if (box.empty() || impl.view.intersection(box).empty()) {
@@ -1482,10 +1497,12 @@ void Frame::place_rect(int x, int y, int width, int height, Color color) {
   Placement p{};
   p.solid = true;
   p.color = color;
-  p.x = static_cast<float>(x);
-  p.y = static_cast<float>(y);
-  p.width = static_cast<float>(width);
-  p.height = static_cast<float>(height);
+  p.x = static_cast<float>(box.x);
+  p.y = static_cast<float>(box.y);
+  p.width = static_cast<float>(box.width);
+  p.height = static_cast<float>(box.height);
+  p.corner_radius = std::max(radius, 0.0f);
+  p.ring = std::max(ring, 0.0f);
   impl.placements.push_back(p);
 }
 
@@ -1986,6 +2003,7 @@ Result<Presented> Frame::submit(Color background) {
       fill.color = p.color;
       fill.corner_radius = p.corner_radius;
       fill.feather = p.feather;
+      fill.ring = p.ring;
       fill.x = p.x - impl.view.x;
       fill.y = p.y - impl.view.y;
       fill.w = p.width;

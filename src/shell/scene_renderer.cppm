@@ -924,10 +924,14 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
             const PlacementGroup window = frame.begin_group();
             switch (item.kind) {
             case SceneItem::Kind::rect:
-                frame.place_rect(item.box.x, item.box.y, item.box.width, item.box.height,
-                                 faded(item));
+                frame.place_rounded_rect(item.box, faded(item), item.corner_radius);
                 break;
             case SceneItem::Kind::border:
+                if (item.corner_radius > 0.0f) {
+                    frame.place_rounded_rect(item.box, faded(item), item.corner_radius,
+                                             static_cast<float>(item.thickness));
+                    break;
+                }
                 border_rects(item.box, item.thickness, [&](int x, int y, int w, int h) {
                     frame.place_rect(x, y, w, h, faded(item));
                 });
