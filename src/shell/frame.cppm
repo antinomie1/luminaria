@@ -570,11 +570,15 @@ struct FrSurfaceTexture {
   bool live = false; // dmabuf imports see new pixels; uploads are snapshots
   Output *output = nullptr;
   Signal<SurfaceCommit>::Connection committed;
+  /// Bumped per commit. Buffer identity can't say "new pixels": a client reusing
+  /// one shm buffer commits new content under the same pointer.
+  std::uint64_t commits = 0;
 
   void watch(Surface &value, Output &out) {
     surface = value.id();
     output = &out;
     committed = value.commit.connect([this](SurfaceCommit &) {
+      ++commits;
       if (!live) {
         texture.reset();
         buffer = nullptr;
@@ -585,6 +589,37 @@ struct FrSurfaceTexture {
       // then idles again; not asking freezes the screen.
       output->schedule_frame();
     });
+  }
+};
+
+// What a composed group's private target holds: which surfaces, at which commit,
+// where in it. While this stays the same the target is still right, and the
+// group costs nothing. Positions are relative to the group, so a window that only
+// moves keeps its texture; alpha and corners are applied to the finished image.
+struct FrGroupMember {
+  SurfaceId surface;
+  std::uint64_t commits = 0;
+  float x = 0, y = 0, width = 0, height = 0;
+  float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+  Transform transform = Transform::normal;
+
+  // Member and not a hidden friend, for the same gcc 16 ICE as FrPlacementKey.
+  [[nodiscard]] bool operator==(const FrGroupMember &other) const noexcept {
+    return surface == other.surface && commits == other.commits &&
+           x == other.x && y == other.y && width == other.width &&
+           height == other.height && u0 == other.u0 && v0 == other.v0 &&
+           u1 == other.u1 && v1 == other.v1 && transform == other.transform;
+  }
+};
+
+struct FrGroupStamp {
+  // The target's own size too: one reallocated at the same address holds nothing.
+  int width = 0, height = 0;
+  std::vector<FrGroupMember> members;
+
+  [[nodiscard]] bool operator==(const FrGroupStamp &other) const noexcept {
+    return width == other.width && height == other.height &&
+           members == other.members;
   }
 };
 
@@ -629,6 +664,12 @@ struct FrPlacementKey {
 };
 
 struct Frame::Impl {
+  /// What a group's target would hold if rendered now. False if it can't be told:
+  /// a member that isn't a surface this frame has seen commit.
+  [[nodiscard]] bool stamp_group(std::size_t first, std::size_t last,
+                                 const OffscreenTarget &target, const Box &bounds,
+                                 FrGroupStamp &stamp) const;
+
   Output *output = nullptr;
   VulkanRenderer *renderer = nullptr;
   // A Frame may outlive its renderer. Everything it caches stays safe to
@@ -663,6 +704,7 @@ struct Frame::Impl {
   std::vector<int> group_acquire_fences;
   std::vector<UniqueFd> prepass_fences; // owned, joined to the final render
   std::vector<Box> prepass_damage;      // output-local, one box per group
+  std::unordered_map<const OffscreenTarget *, FrGroupStamp> group_stamps;
   struct BlurRegion {
     Box box; // output-local
     int spread = 0;
@@ -829,6 +871,38 @@ void Frame::Impl::keep_list() {
   }
   last_view = view;
   last_valid = true;
+}
+
+bool Frame::Impl::stamp_group(std::size_t first, std::size_t last,
+                              const OffscreenTarget &target, const Box &bounds,
+                              FrGroupStamp &stamp) const {
+  stamp.width = target.width();
+  stamp.height = target.height();
+  stamp.members.clear();
+  for (std::size_t i = first; i < last; ++i) {
+    const Placement &p = placements[i];
+    const auto seen = std::ranges::find_if(
+        texture_cache, [&p](const std::unique_ptr<FrSurfaceTexture> &entry) {
+          return entry->surface == p.surface;
+        });
+    if (!p.surface.valid() || seen == texture_cache.end()) {
+      return false;
+    }
+    stamp.members.push_back(FrGroupMember{
+        .surface = p.surface,
+        .commits = (*seen)->commits,
+        .x = p.x - static_cast<float>(bounds.x),
+        .y = p.y - static_cast<float>(bounds.y),
+        .width = p.width,
+        .height = p.height,
+        .u0 = p.u0,
+        .v0 = p.v0,
+        .u1 = p.u1,
+        .v1 = p.v1,
+        .transform = p.transform,
+    });
+  }
+  return true;
 }
 
 Status Frame::Impl::render_group(std::size_t first_placement,
@@ -1079,6 +1153,7 @@ Status Frame::reset(std::uint32_t drm_format) {
   }
   VulkanRenderer &renderer = *impl.renderer;
   impl.format = drm_format;
+  impl.group_stamps.clear();
 
   impl.targets.clear();
   impl.ids.clear();
@@ -1624,15 +1699,35 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget &target,
                 "output scale");
   }
 
-  if (Status rendered =
-          impl.render_group(group.first_, impl.placements.size(), target,
-                            bounds, scale, /*consume=*/true);
-      !rendered) {
-    return rendered;
+  // A group that hasn't changed must cost nothing: re-rendering it would damage
+  // its whole box, and a frame with damage is never `unchanged`, so the output
+  // would redraw for ever around one idle rounded window.
+  const std::size_t last = impl.placements.size();
+  FrGroupStamp stamp;
+  const bool stamped = impl.stamp_group(group.first_, last, target, bounds, stamp);
+  const auto known = impl.group_stamps.find(&target);
+  const bool current =
+      stamped && known != impl.group_stamps.end() && known->second == stamp;
+  if (current) {
+    for (std::size_t i = group.first_; i < last; ++i) {
+      impl.placements[i].draw = false; // as render_group's `consume` leaves them
+    }
+  } else {
+    if (Status rendered = impl.render_group(group.first_, last, target, bounds,
+                                            scale, /*consume=*/true);
+        !rendered) {
+      return rendered;
+    }
+    // Only now: rendering is what makes a new surface known to the texture cache.
+    if (impl.stamp_group(group.first_, last, target, bounds, stamp)) {
+      impl.group_stamps[&target] = std::move(stamp);
+    } else {
+      impl.group_stamps.erase(&target);
+    }
   }
   const std::size_t before = impl.placements.size();
   place(target.texture(), transform);
-  if (impl.placements.size() != before) {
+  if (!current && impl.placements.size() != before) {
     const Placement &final = impl.placements.back();
     impl.prepass_damage.push_back(fr_coverage(
         final.x - static_cast<float>(impl.view.x),
