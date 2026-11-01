@@ -369,7 +369,7 @@ void border_rects(const Box& box, int thickness, Emit&& emit) {
 }
 
 [[nodiscard]] bool wants_blur(const SceneItem& item) noexcept {
-    return item.blur.enabled && !item.box.empty();
+    return item.blur.enabled && item.blur.opacity > 0.0f && !item.box.empty();
 }
 
 void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
@@ -904,7 +904,7 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
                         }
                     } else {
                         frame.place_blur(self.xray.chain->texture(), view, item.box,
-                                         item.corner_radius, spread);
+                                         item.corner_radius, spread, item.blur.opacity);
                     }
                 } else if (regions && have_targets) {
                     if (Surface* root = surface_from_id(item.surface); root != nullptr &&
@@ -916,7 +916,7 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
                 } else if (have_targets) {
                     if (frame.queue_blur(bottom, *cache->backdrop, *cache->chain, view,
                                          item.blur.params, item.box, item.corner_radius,
-                                         spread)) {
+                                         spread, item.blur.opacity)) {
                         shared_backdrop = shared_backdrop || item.blur.xray;
                     }
                 }

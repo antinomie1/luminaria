@@ -28,6 +28,7 @@ pub(crate) mod ffi {
         corner_radius: f32,
         blur_enabled: bool,
         blur_xray: bool,
+        blur_opacity: f32,
         shadow_r: f32,
         shadow_g: f32,
         shadow_b: f32,

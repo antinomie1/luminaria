@@ -127,6 +127,9 @@ pub struct SceneItem {
     pub corner_radius: f32,
     pub blur_enabled: bool,
     pub blur_xray: bool,
+    /// How much of the blur shows. Separate from `alpha`: a window translucent
+    /// by rule wants all of its blur, one fading in wants it to fade too.
+    pub blur_opacity: f32,
     pub shadow_color: Color,
     pub shadow_feather: f32,
 }
@@ -147,6 +150,7 @@ impl SceneItem {
             corner_radius: 0.0,
             blur_enabled: false,
             blur_xray: false,
+            blur_opacity: 1.0,
             shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
             shadow_feather: 0.0,
         }
@@ -218,6 +222,11 @@ impl SceneItem {
         self
     }
 
+    pub fn with_blur_opacity(mut self, opacity: f32) -> Self {
+        self.blur_opacity = opacity;
+        self
+    }
+
     pub fn with_shadow(mut self, color: Color, feather: f32) -> Self {
         self.shadow_color = color;
         self.shadow_feather = feather;
@@ -250,6 +259,7 @@ impl SceneItem {
             corner_radius: raw.corner_radius,
             blur_enabled: raw.blur_enabled,
             blur_xray: raw.blur_xray,
+            blur_opacity: raw.blur_opacity,
             shadow_color: Color::rgba(raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a),
             shadow_feather: raw.shadow_feather,
         }
@@ -278,6 +288,7 @@ impl SceneItem {
             corner_radius: self.corner_radius,
             blur_enabled: self.blur_enabled,
             blur_xray: self.blur_xray,
+            blur_opacity: self.blur_opacity,
             shadow_r: self.shadow_color.r,
             shadow_g: self.shadow_color.g,
             shadow_b: self.shadow_color.b,

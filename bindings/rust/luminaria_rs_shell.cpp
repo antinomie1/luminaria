@@ -99,6 +99,7 @@ inline lm::SceneItem scene_item(const SceneItemRaw& raw, const std::unordered_ma
     it.corner_radius = raw.corner_radius;
     it.blur.enabled = raw.blur_enabled;
     it.blur.xray = raw.blur_xray;
+    it.blur.opacity = raw.blur_opacity;
     it.shadow.color = lm::Color{raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a};
     it.shadow.feather = raw.shadow_feather;
     if (it.kind == lm::SceneItem::Kind::image && images != nullptr) {
@@ -139,6 +140,7 @@ inline SceneItemRaw scene_item_raw(const lm::SceneItem& it) {
     raw.corner_radius = it.corner_radius;
     raw.blur_enabled = it.blur.enabled;
     raw.blur_xray = it.blur.xray;
+    raw.blur_opacity = it.blur.opacity;
     raw.shadow_r = it.shadow.color.r;
     raw.shadow_g = it.shadow.color.g;
     raw.shadow_b = it.shadow.color.b;

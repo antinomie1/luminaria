@@ -336,8 +336,11 @@ public:
   /// `spread` is `blur_spread()` for the parameters it was made with. It is
   /// not decoration: it tells `submit()` how far away a change still makes
   /// this box stale, and getting it wrong leaves a smear on the screen.
+  ///
+  /// `alpha` fades the blur itself, so it can come and go with its window.
   void place_blur(const GpuTexture &texture, const Box &background,
-                  const Box &box, float radius, int spread);
+                  const Box &box, float radius, int spread,
+                  float alpha = 1.0f);
 
   /// Queue a backdrop capture and add the chain's texture as a blur placement
   /// covering `box`.
@@ -357,7 +360,7 @@ public:
   [[nodiscard]] bool queue_blur(PlacementGroup group, OffscreenTarget &target,
                                 BlurChain &chain, const Box &bounds,
                                 const BlurParams &params, const Box &box,
-                                float radius, int spread);
+                                float radius, int spread, float alpha = 1.0f);
 
   /// As `queue_blur`, but placing one placement per region the surface tree
   /// declared through ext-background-effect-v1 — translated by the root's
@@ -772,9 +775,13 @@ struct Frame::Impl {
   /// normally the end of the list, and a deferred blur job passes its
   /// `capture_end` so its backdrop stops where its own (stale) placement
   /// begins — a capture must never sample the placement it is about to feed.
+  ///
+  /// `clear` is what's behind the first placement: transparent for a window
+  /// being composed, the frame's background for a backdrop that has it.
   [[nodiscard]] Status render_group(std::size_t first, std::size_t last,
                                     OffscreenTarget &target, const Box &bounds,
-                                    int scale, bool consume);
+                                    int scale, bool consume,
+                                    Color clear = Color{0, 0, 0, 0});
 };
 
 // Damage/scissor boxes must cover every pixel a subpixel quad can touch. The
@@ -908,7 +915,7 @@ bool Frame::Impl::stamp_group(std::size_t first, std::size_t last,
 Status Frame::Impl::render_group(std::size_t first_placement,
                                  std::size_t last_placement,
                                  OffscreenTarget &target, const Box &bounds,
-                                 int scale, bool consume) {
+                                 int scale, bool consume, Color clear) {
   if (renderer_alive.expired()) {
     return fail("renderer is gone");
   }
@@ -1004,8 +1011,7 @@ Status Frame::Impl::render_group(std::size_t first_placement,
 
   int fence = -1;
   const RenderSync sync{group_acquire_fences, &fence};
-  const Color transparent{0, 0, 0, 0};
-  if (auto rendered = renderer->render_offscreen(target, transparent, {},
+  if (auto rendered = renderer->render_offscreen(target, clear, {},
                                                  group_fills, {}, scale, sync);
       !rendered) {
     if (fence >= 0) {
@@ -1514,7 +1520,7 @@ Status Frame::capture_blur(PlacementGroup group, OffscreenTarget &target,
 /// placement half of `queue_blur`, so the two cannot drift.
 void append_blur_placement(Frame::Impl &impl, const GpuTexture &texture,
                            const Box &background, const Box &visible,
-                           float radius, int spread) {
+                           float radius, int spread, float alpha) {
   Placement p{};
   p.texture = &texture;
   p.x = static_cast<float>(visible.x);
@@ -1530,6 +1536,7 @@ void append_blur_placement(Frame::Impl &impl, const GpuTexture &texture,
   p.v1 = static_cast<float>(visible.y + visible.height - background.y) /
          static_cast<float>(background.height);
   p.corner_radius = std::max(radius, 0.0f);
+  p.alpha = std::clamp(alpha, 0.0f, 1.0f);
   p.opaque_first = static_cast<std::uint32_t>(impl.opaque_arena.size());
   impl.placements.push_back(p);
   impl.blur_regions.push_back(Frame::Impl::BlurRegion{
@@ -1539,19 +1546,19 @@ void append_blur_placement(Frame::Impl &impl, const GpuTexture &texture,
 }
 
 void Frame::place_blur(const GpuTexture &texture, const Box &background,
-                       const Box &box, float radius, int spread) {
+                       const Box &box, float radius, int spread, float alpha) {
   Impl &impl = *impl_;
   const Box visible = box.intersection(impl.view).intersection(background);
   if (background.empty() || visible.empty()) {
     return;
   }
-  append_blur_placement(impl, texture, background, visible, radius, spread);
+  append_blur_placement(impl, texture, background, visible, radius, spread, alpha);
 }
 
 bool Frame::queue_blur(PlacementGroup group, OffscreenTarget &target,
                        BlurChain &chain, const Box &bounds,
                        const BlurParams &params, const Box &box, float radius,
-                       int spread) {
+                       int spread, float alpha) {
   Impl &impl = *impl_;
   if (group.generation_ != impl.generation ||
       group.first_ >= impl.placements.size()) {
@@ -1570,7 +1577,8 @@ bool Frame::queue_blur(PlacementGroup group, OffscreenTarget &target,
   // The capture is everything below the item that is in the list by now —
   // never the placement this call is about to add.
   const std::size_t placement_first = impl.placements.size();
-  append_blur_placement(impl, chain.texture(), bounds, visible, radius, spread);
+  append_blur_placement(impl, chain.texture(), bounds, visible, radius, spread,
+                        alpha);
   impl.blur_jobs.push_back(Impl::BlurJob{
       .group_first = group.first_,
       .capture_end = placement_first,
@@ -2113,7 +2121,7 @@ Result<Presented> Frame::submit(Color background) {
     const int scale = std::max(1, output.scale());
     Status status =
         impl.render_group(job.group_first, job.capture_end, *job.target,
-                          job.bounds, scale, /*consume=*/false);
+                          job.bounds, scale, /*consume=*/false, background);
     if (status) {
       status =
           impl.renderer->blur(*job.chain, job.target->texture(), job.params);

@@ -57,6 +57,10 @@ struct SceneBlur {
     /// `surface_regions` blurs nothing for one.
     bool surface_regions = false;
     BlurParams params{};
+    /// How much of the blur shows. Separate from the item's `alpha`: a window
+    /// that is translucent by rule wants all of its blur, and one fading in
+    /// wants it to fade too. Whole-box blur only; `surface_regions` ignores it.
+    float opacity = 1.0f;
 
     [[nodiscard]] constexpr bool operator==(const SceneBlur&) const noexcept = default;
 };
