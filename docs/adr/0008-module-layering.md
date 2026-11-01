@@ -43,7 +43,7 @@ ADR 0003 那一刀是**按“链接什么 C 库”切的**，不是按层切的�
 - **`luminaria.render`** — 像素：Vulkan 1.3 渲染器、CPU 合成器、以及三个只为搬运
   buffer 而存在的协议（linux-dmabuf、drm-syncobj、screencopy）。**不碰设备后端**，
   只有 vulkan/libdrm/gbm。
-- **`luminaria.shell`** — 有主见的那一半：`Frame`、`SceneItem`/`SceneRenderer`、
+- **`luminaria.shell`** — 外壳层账本与抽象：`Frame`、`SceneItem`/`SceneRenderer`、
   `Cursor`、`CursorManager`、`LayerManager`、`PopupTree`、`DirectScanout`，以及
   `AutoBackend`（在 nested / DRM / headless 之间选，是策略，因此在这一层）。
   它 `export import` 了 backend 与 render，所以混成器只写一句 `import luminaria.shell;`。

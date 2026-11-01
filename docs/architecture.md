@@ -4,7 +4,7 @@
 
 ## 定位与设计目标
 
-**有主见的纯 Wayland 机制库**：抽象层负责公共的 Wayland 运行机制，策略仍留在混成器。
+**纯 Wayland 机制库**：抽象层负责公共的 Wayland 运行机制，策略仍留在混成器。
 凡是每个混成器都得写一遍、写错就是 bug 的公共账本（帧调度、damage 记账、遮挡剔除、
 fence 编排、光标合成），库替你写好；凡是构成“这个混成器是什么样子”的决定
 （窗口摆在哪、怎么平铺、快捷键、工作区），一律不进来。你仍然自己写每一帧的循环。
@@ -15,7 +15,7 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 - **内存安全靠构造，不靠小心** — 每个 C 句柄 RAII 包装，每个信号监听析构自动摘链，
   没有一处手写 `wl_list_remove`。目标是让悬空指针那一族错误**写不出来**，而不是靠代码评审
   逮住。
-- **API 简洁明了** — 35 个协议对象（wlroots 是 73 个），三个按能力付费的 module，
+- **API 简洁明了** — 44 个协议对象（wlroots 是 73 个），单向按层分立 module，
   一层 `Result<T>`，异常不跨 C 边界。
 - **完整到能日常用** — 而不是停在“能跑个 demo”。
 
@@ -26,8 +26,8 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 - **core** — `Display`（持有 `wl_display` + socket + 主循环）、`EventLoop` / `EventSource`、
   `Signal<Event>`、`Result<T>`、`CUnique`、`UniqueFd`。
 - **backend** — `Backend` 发 `new_output`；`Output` 发 `frame` / `present` / `destroy` /
-  `mode_changed`。四个实现：`HeadlessBackend`（软件帧泵）、`WaylandBackend`（嵌套在父
-  混成器里）、`DrmBackend`（KMS atomic）、`LibinputBackend`（裸机输入）。`Session`（libseat）
+  `mode_changed`。四个实现：`HeadlessBackend`（软件帧泵，按需惰性回读避免阻塞）、`WaylandBackend`（嵌套在父
+  混成器里）、`DrmBackend`（KMS atomic，监听 udev 实现显卡与显示器热插拔）、`LibinputBackend`（裸机输入）。`Session`（libseat）
   决定现在谁有权碰 GPU 和输入设备。
   **为旧 mode 准备的东西由各自的主人重建，不归混成器**：`reset()` 过的 `SceneOutput` 自己
   重新分配，`OutputLayout` 保留位置、换上新尺寸，`OutputGlobal::create(display, output, layout)`
@@ -145,6 +145,8 @@ presentation 反馈、`unchanged` 时的补发）也在它里面；光标是 `Cu
   destroy handler 才开始跑。规矩是：凡是指回 global 的客户端对象，global 都要登记在案，并在
   `~Impl` 里切断——回指针置空；user_data 本身就是 `Impl` 的资源调 `detach_resource()`
   （`protocol_helper`）。destroy handler 和此后仍可能被调用的请求处理，把空指针当作「已惰性」。
+  中途动态注销 global 则经 `destroy_global_safe()` 延迟销毁底层 C 句柄，配合 `GlobalBindingTracker`
+  杜绝飞行请求中的 use-after-free。
   我们**不**要求混成器在析构 global 前先断开客户端，也不为此提供 API：声明顺序本身就该是对的，
   而不是靠每个混成器记得多调一步。`tests/test_teardown_order.cpp` 守着这条：一个客户端握着每一种
   回指对象，global 全部析构之后才析构 `Display`，在 ASan 下跑。新增协议时，把你的对象也加进去。
@@ -180,9 +182,9 @@ src/backend/base/          backend output input_event output_layout（属于 cor
 src/backend/               drm headless libinput session wayland
 src/render/                vulkan cpu_compositor + 着色器 SPIR-V
 src/shell/                 auto_backend cursor cursor_manager cursor_theme default_input_router direct_scanout frame layer pointer popup scene scene_renderer screen_manager
-src/protocol/core/         27 个纯 Wayland 协议
+src/protocol/core/         30 个基础协议（含 core_globals 与外设协议）
 src/protocol/render/       drm_syncobj linux_dmabuf screencopy
-src/protocol/desktop/      data_control foreign_toplevel foreign_toplevel_list input_method output_management session_lock workspace
+src/protocol/desktop/      ctm_control data_control foreign_toplevel foreign_toplevel_list gamma_control input_method output_management session_lock virtual_keyboard virtual_pointer workspace
 src/detail/wayland_fwd.h   唯一剩下的头文件
 ```
 
@@ -230,14 +232,6 @@ src/detail/wayland_fwd.h   唯一剩下的头文件
   的所有 per-output 重建，以及客户端 dmabuf direct scanout 仍须在空闲 VT 上验收。渲染与几何有
   `output-layout` / `output-scale` / `gpu-scanout` / `region` / `cursor-theme` 覆盖；`session` 测试在
   没有 seat 的环境里 skip。
-- **运行中途动态移除 global 已完全支持**：`destroy_global_safe()` 先调用 `wl_global_remove()` 并设置 user_data 为空，
-  在事件循环上延迟执行 `wl_global_destroy()`，避免客户端飞行中 `wl_registry.bind` 触发协议错误；
-  配合 `GlobalBindingTracker` 自动解绑 manager 资源并在析构时 `detach_resource`，杜绝 use-after-free。
-- **GPU 设备热插拔已支持**：`DrmBackend` 与 `AutoBackend` 监听 DRM 子系统的 udev add/remove 事件，
-  显卡被拔出时销毁对应输出并发出 `device_removed` / `gpu_removed` 信号，插入新显卡时发出 `device_added` / `gpu_added` 信号。
-- **headless 后端与 CPU 读回优化**：`read_scanout()` 改用 32 位整字位运算消除 Debug 模式下的逐字节标量循环；
-  同时 `Output` 支持 `requires_commit_pixels()` 与 `set_frame_reader()`，无头与 CI 模式下默认无需逐帧执行阻塞读回，
-  仅在调用 `last_frame()` 或 `read_back()` 时按需回读。
 - **默认构建是 debug（`-O0`）**，逐像素转换会慢 5 倍。跑真实负载用 `xmake f -m release`。
 - **模块化踩到两个 gcc 16 的坑**：接口单元里 defaulted 的 hidden-friend `operator==` 会
   ICE（改成成员形式），`std::function` / `std::make_shared` 要求每个实例化点都能看见

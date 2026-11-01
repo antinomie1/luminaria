@@ -1,4 +1,4 @@
-// The opinionated half: every ledger each compositor would otherwise reimplement.
+// Shell ledgers: every common accounting mechanism each compositor would otherwise reimplement.
 //
 //     import luminaria.shell;
 //

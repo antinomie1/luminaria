@@ -1,4 +1,4 @@
-//! The teardown order CLAUDE.md asks of every protocol, through the binding:
+//! The teardown order AGENTS.md asks of every protocol, through the binding:
 //! a client still connected and holding one of every object the shims watch
 //! while the globals drop, then the Display — which destroys the client and
 //! its objects after every global is gone. The PopupTree and LayerManager are

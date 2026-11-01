@@ -796,7 +796,7 @@ registry 里同时看到它和 luminaria 的 global，并且绑定成功。
 `wayland-backend` 0.3.17 的服务端只会自己 `wl_display_create`，没有 `from_foreign_display`（只有客户端那半边有）。
 所以高层的 `wayland-server` 类型系统用不上，只能走 C API；这要等上游加接口，绑定这边绕不过去。
 
-**销毁顺序**，和 CLAUDE.md 里 C++ 一侧的规矩是同一条：
+**销毁顺序**，和 AGENTS.md 里 C++ 一侧的规矩是同一条：
 
 1. **global 先于 `Display` 死。** 把 `wl_global_destroy` 放进某个 Rust 对象的 `Drop`，并且**把这个对象声明在
    `Display` 之后**（局部变量按声明的逆序析构）。漏掉 `wl_global_destroy` 也不会出错（`wl_display_destroy`

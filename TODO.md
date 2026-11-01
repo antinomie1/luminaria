@@ -1,243 +1,62 @@
 # TODO
 
-未完成的工作，按执行顺序排。方向与理由见 [docs/adr/](docs/adr/)；已完成的东西不在这里，
-在 [docs/features.md](docs/features.md)。
+未完成的工作与技术边界。架构设计见 [docs/architecture.md](docs/architecture.md) 与 [docs/adr/](docs/adr/)；已完成功能见 [docs/features.md](docs/features.md)。
 
 ---
 
-## 执行顺序
+## 待落地任务（按执行优先级）
 
-排序原则：**能不能观测**。为"低功耗"做的每一个决定，效果都只在真机上看得见，所以真机验证
-排在最前面；bench 排第二，因为它是后面所有优化的验收手段。
+### 0. 真机验证 DRM 剩余路径
 
-### 0. 真机验证 DRM 剩余路径 — 多输出、热插拔、直出
+已在一台 1920×1080@60Hz 显示器上验证 atomic 模式设置、翻页、fence 链、libinput、硬件光标平面及 VT 切换。仍需真机覆盖：
 
-2026-08-15 已在一块 1920×1080@60Hz 的真实显示器上完成第一轮空闲 VT 验证：atomic
-模式设置与连续翻页、GPU 合成的 in/out fence 链、libinput 键鼠、硬件光标平面、
-Ctrl+Alt+Fn/libseat VT 切换均正常；Konsole 的客户端装饰、popup 菜单、最大化/还原、最小化、
-关闭以及窗口消失后的双缓冲重绘也经过反复手测。证据由 `scripts/tty-check.sh` 留在 `logs/`。
+- 多显示器 CRTC / primary / cursor plane 分配与跨屏指针。
+- udev connector 热插拔与 per-output 状态回收。
+- `Output::set_mode()` 后的整链重建（scanout target、layout、`wl_output`）。
+- 客户端 dmabuf 直接扫描输出（direct scanout）。
+- 数位板与 VRR（`VRR_ENABLED`）在真实硬件下的翻页与输入行为。
 
-仍需真机覆盖的部分：
+验证方法：空闲 VT 上运行 `minimal`（`LUMINARIA_BACKEND=drm`），配合 `scripts/tty-check.sh` 采集证据日志。
 
-- 两台及以上显示器的 CRTC/primary/cursor plane 分配与跨屏指针。
-- udev connector 热插拔，以及拔屏后所有 per-output 状态的回收。
-- `Output::set_mode()` 后 scanout target、layout、`wl_output` 的整链重建。
-- 客户端 dmabuf 的直接扫描（当前 Konsole 验证只有 GPU 合成，日志中 `scanout=0`）。
+### 1. 性能指标进 CI 门禁
 
-做法：空闲 VT 上跑 `minimal`（`LUMINARIA_BACKEND=drm`），用 `scripts/tty-check.sh` 留证；下一轮优先接第二台显示器，
-再用可全屏 dmabuf 客户端触发直出。
+设立三个自动化指标门禁，防止低功耗与低占用特性退化：
 
-### 1. bench harness + 三个数进 CI
-
-- **空闲态每秒 atomic 提交次数**，目标 **0**。第 2 步按设计已经做到（空闲时没有提交，
-  `minimal` 那行 `frames/s` 就不该再出现），但只在 headless 上量过；真机复核与
-  CI 门禁都还欠着，否则半年后又会悄悄回到 60。
-- **稳态 RSS**（单客户端）。
+- **空闲态每秒 atomic 提交次数**：目标稳定为 **0**（无客户端 damage 时零提交、零翻页）。
+- **稳态 RSS**（单客户端运行下）。
 - **每帧 GPU 提交耗时 p99**。
 
-没有 CI 门禁的话，"低占用"六个月后就只是 README 上的一句话。
+### 2. 视觉特效与渲染进阶
 
-### 2. 低功耗一二级
-
-**已做**（2026-08-15）：无 damage 不提交 + 按需帧。`Frame::submit()` 答 `unchanged` 时
-不再渲染也不再翻页；`frame` 事件改成一次 `Output::schedule_frame()` 换一个，DRM 空闲时因此
-不再有翻页、也就没有 vblank 回调，headless 的定时器不再自续，嵌套后端靠一次空 commit 向父
-混成器要 callback。唤醒由 `Frame` 自己发起（它盯着画过的每个表面的 commit，加上
-`damage_all()` / `reset()`），混成器只需在 `unchanged` 时补发帧回调——那一帧没有 `present`。
-`test_idle_frame` 守后端契约，`test_idle_wake` 用一个按帧回调节流的客户端守「不空转也不冻住」
-（20 轮 20ms，20 帧；自由运行的 1ms 帧泵是 400 帧）。
-
-渲染器那一半的每帧零分配也做了：`Region` 的 subtract/intersect 改成两块缓冲乒乓（原先每次
-`rects_ = std::move(out)` 都是一次分配加一次释放），`render_to()` 的 region 全部改成渲染器
-自己的 scratch，framebuffer 按 render pass 挂在 `ScanoutTarget` 上建一次，command buffer
-与 fence 走按提交 fence 回收的空闲表。`test_render_alloc` 守着：稳态 32 帧，两条路径都是
-**0 次** C++ 堆分配。
-
-仍未做：
-
-- 真机复核：第 0 步的 tty 验证要重跑一遍，看空闲时 `frames/s` 那行是不是真的不再出现。
-
-### 3. 协议补齐 — 已完成（2026-08-15）
-
-五个协议全部落地，协议对象数 25 → 30。
-
-- **`wp-fifo-v1` + `wp-commit-timing-v1`** —— 两者共用 `Surface` 上新加的**提交闸门**：
-  被扣住的那次 commit 对下游完全不存在（不发 commit 信号、不产生 damage、不排帧回调），
-  这正是两个协议承诺的语义。FIFO 的 barrier 由 `Surface::send_frame_done()` 清除，
-  所以按规矩在 present 里答帧回调的 compositor 不需要额外接线；commit-timing 的到点唤醒
-  由 global 自带的 EventLoop 定时器发起。`test_fifo` / `test_commit_timing` 守着。
-- **`wp-content-type-v1`** —— 粘性双缓冲状态，`Surface::content_type()`。`test_content_type`。
-- **`ext-session-lock-v1`** —— 失败向关：客户端崩了不解锁（`SessionLockDestroy::unlocked`
-  区分两种消失），四个锁定表面协议错误全发。`test_session_lock`。
-- **`input-method-v2`** —— 接上了 `text-input-v3` 的另一端，两边状态由库自动抄通，
-  `test_input_method` 用一个同时扮演应用与输入法的客户端跑完整个来回。XML 上游不发，
-  vendored 到 `protocol/`。
-
-五个协议在 Rust 绑定里都有对应类型（`protocol::{FifoManager, CommitTimingManager, ContentTypeManager}`、
-`desktop::{SessionLockManager, InputMethodManager}`），和 C++ 一样由 compositor 自己创建；两个 desktop 协议按
-ADR 0003 只在 `luminaria.desktop` 里，C++ 的 `minimal` 只开最小可用的那一组 global。剩下的收尾在下面「已知的天花板」里。
-
-### 4. 视觉特效地基 —— 给「带模糊与轻动画的混成器」用
-
-目标形态：bspwm 那样的平铺 + sxhkd 式快捷键，外加背景模糊、圆角、淡入淡出与移动动画。
-摆放逻辑仍然是混成器自己的事（见「明确不做」），库要补的是每个这类混成器都会重写一遍的部分。
-
-参考实现的分工是这么摆的：Hyprland 拒绝了 wlroots 的场景图，于是 damage 全靠手工
-（`damageWindow`/`damageBox` 撒满全树，模糊还要单独按半径膨胀），渲染器从一开始就绕过，
-最后整个 wlroots 被换掉。niri 走 smithay 的**渲染元素**路线：每帧一串带 id 的元素，
-`OutputDamageTracker` 靠比对相邻两帧自动出 damage，另有 crop/rescale/relocate 元素包装器、
-bind-to-texture 离屏渲染、自定义 shader 编译接口——niri 只写布局、动画和模糊的 pass。
-
-我们拒绝场景图的决定和 Hyprland 一样，所以必须主动补上 damage 那一半，否则边界迟早失效。
-`Frame` 的摆位串本来就等于 smithay 的元素串，差的是盖在它上面的四层：
-
-- **(a) 摆位串 diff 出 damage —— 已完成（2026-08-15）**。`submit()` 比对相邻两次上屏的摆位
-  串，窗口开 / 关 / 移动 / 缩放 / 换 z 序的 damage 不再需要混成器记账，`invalidate()` 只负责
-  唤醒。`damage_all()` 退为钝器。`test_frame_damage` 用「帧间换底色」同时守住"有 damage"
-  与"damage 最小"两头。两个示例混成器都已改到 `invalidate()`，光标移动因此从「重画一屏」
-  变成「重画两个 24 像素矩形」。
-- **(b) crop / rescale / relocate 型的摆位包装 —— 已完成（2026-08-15）**。`Placement` /
-  `GpuTextureFill` 保存 float rect，shader 消费原始小数，damage/occlusion 向外取整；
-  `PlacementTransform::at(...).crop(...).rescale(...).relocate(...).opacity(...)` 则把同一语义
-  收成可组合的值对象。它能直接摆客户端表面树或 compositor-owned texture，也能决定
-  `compose_group()` 离屏整窗最终的裁剪、缩放、位移与淡入淡出，不需要再往 shader 堆特例；缩放表面
-  的命中测试反向映射回客户端坐标。树的透明度仍应走离屏组，避免重叠子表面的接缝。`test_frame` 与
-  `test_offscreen` 守住两条调用路径。
-- **(c) 把一棵表面树合成到离屏纹理，再当一个摆位贴回 —— 已完成（2026-08-15）**。
-  `OffscreenTarget` + `render_offscreen()` 复用现有合成 pass，`GpuTextureFill::alpha` 支持把结果
-  作为一个 quad 淡入淡出；`Frame::begin_group()` / `compose_group()` 把 marker 后的摆位离屏化，保留
-  源摆位作命中测试、以最终 texture 摆位绘制，并把 prepass fence/damage 接回最终提交。Hyprland 与 niri 都被迫做了同一件
-  事，理由相同：子表面 / popup 重叠处各自乘 alpha 会露接缝。淡入淡出、缩放动画与模糊三者
-  共用这套离屏基础设施，所以它比「给 `Placement` 加个 alpha 字段」更底层。**要单开 ADR**：
-  它是第一个打破「一帧一 pass」的东西。
-- **(d) 模糊，入口是协议而不是渲染特性 —— 协议状态已完成（2026-08-15）**。`ext-background-effect-v1`（staging，KDE 6.7+ /
-  niri / Mutter 已实现，Foot / Kitty / Ghostty / Quickshell 客户端侧已跟进）让客户端自己声明
-  背后哪块要模糊，接口就是 `Surface::blur_region()` 一个粘性双缓冲状态——按 ADR 0003 的准入
-  规则属于核心模块，和 `content_type` 同形。`BackgroundEffectManager` 已把它发布为一个 core global，
-  `Surface::blur_region()` 是粘性双缓冲状态，`test_background_effect` 守住 set / NULL / object destroy
-  三种提交语义。混成器拿到 region 决定画不画，库不猜窗口形状
-  （niri 的手动配置那条路对复杂表面形状效果不好，正是"猜"的代价）。
-  **x-ray 路径已完成（2026-08-16）**：`VulkanRenderer::create_xray_blur()` 建一张按 2–8 倍
-  降采样的静态背景缓存，`update_xray_blur()` 重画壁纸 + layer texture；现有线性采样把它放回原尺寸，
-  以低成本得到柔和的背景。`Frame::place_xray_blur()` 在普通 `place(surface, x, y)` 前把缓存精确贴到
-  `blur_region()`，因此 blur rect 自身也进入摆位 diff/damage。静态层变了以后调用者重建缓存并照常
-  `damage_all()`；它不读回已合成内容。真正采样下层窗口的非 x-ray 再补。`test_xray_blur` 守住缓存
-  确实软化硬边，`test_frame_xray_blur` 守住协议 region 到帧内摆位的顺序与 UV；无论哪档，模糊半径
-  都会让动态底图的 damage 扩散，这也是 (a) 必须先落地的原因。
-
-动画时钟与持续重绘已完成（2026-08-15）：`FrameEvent` 带 CLOCK_MONOTONIC 的
-`predicted_presentation_ns` 和估算 `refresh_ns`；DRM 用上一 vblank 锚定，嵌套/无头后端用自己的
-节拍定时器。构建帧时调用 `Frame::animate()`，它会禁用直出、令本帧完整重绘并只预约一个下一帧；
-最后一帧不调用即自动回到 `unchanged` 的零唤醒路径。`test_frame_animation` 守住这条状态机。
-
-**自定义 shader 钩子已完成（2026-08-16）**：`VulkanRenderer::create_fragment_shader()` 接受
-编译好的 SPIR-V，替换 compositor-owned texture / `compose_group()` 最终纹理的片元阶段；它复用
-现有 descriptor、push constant、同步和预乘混合 ABI。创建时强制声明 `ShaderDamage::{none,full,continuous}`：
-普通静态效果走摆位 diff，`full` 强制本帧整屏重绘，`continuous` 还会持续预约下一帧。任意 shader
-placement 都拒绝 direct scanout，shader identity 也进 placement diff。pipeline cache 归 renderer，
-避免异步 submit 期间提前销毁。`test_fragment_shader` 同时守住真实 SPIR-V 像素替换和无 client damage
-时的全量重绘；取舍见 ADR 0006。
+- **动态下层采样背景模糊**：目前已实现基于静态底图缓存的 x-ray 模糊（`place_xray_blur`）；仍需支持实时采样下层动态窗口内容的真实双重模糊（需处理下层 damage 传播与离屏累加）。
+- **HDR 与色彩空间转换**：目前已完成 `wp-color-management-v1` 协议协商；渲染器内部仍按客户端编码直出，需在片元阶段补充线性化、原色矩阵转换、色调映射与 HDR 元数据传递。
 
 ---
 
-### 5. API 简化 —— 第一轮已完成（2026-10-27）
+## 源码待优化标记
 
-每个混成器都会重抄的机制收回了库里，两个 `minimal` 各少了约三分之一：C++ 639 → 500 行，
-Rust 677 → 420 行。`CoreGlobals`；跟随输出的 `OutputLayout` 与 `OutputGlobal`；`reset()` 之后
-自己跟着 mode 走、接受布局坐标的 `SceneRenderer`；跟随 shell 的 `PopupTree`；`scene_route_pointer`；
-`KeyRouter::route` + `Seat::release_keys` + `Session::switch_vt_for`；`Seat::follow`；合并了整数提示的
-`FractionalScaleManager::set_scale(double)`。renderer 不再需要早于 `Display` 声明。删掉了
-`DesktopGlobals`、`single_pixel_buffer_color()`、`dmabuf_buffer_to_rgba()`，desktop 模块因此不再
-依赖 gpu 模块。
+| 位置 | 内容 |
+|---|---|
+| `region.cppm:14` | `Region` 操作为 O(n)、合并为 O(n²)。矩形数量成为瓶颈时替换为 `pixman_region32`。 |
+| `tearing_control.cppm:96` | 重复创建的 tearing_control 对象暂未下发协议错误。 |
 
-**第二轮：表层啰嗦（同日）。** 只改写法，不动架构，也没有加窗口栈。C++ 500 → 365 行，Rust 420 → 322 行。
-`Signal::connect` 接零参回调；`Connections` 取代 `Window` / `Screen` 里为了保管连接而存在的成员；`match()` /
-`Overloaded` 取代 `std::visit` 惯用法；`to_optional(Result)`；`Size` / `Point`、`Box::size()` / `center()`、接
-`Size` 的 `configure()` / `set_bounds()`；`XdgShell::focus(seat, toplevel)` 取代“哪个窗口是激活的”那个变量；
-`OutputLayout::primary()` / `primary_box()`、`Output::refresh_hz()`；`Cursor` 直接收后端的运动事件、
-绝对运动缺省落在第一块输出、第一块输出出现时自己居中；`dismiss_grabs_outside()` 去掉 `[[nodiscard]]`；
-`SceneRenderer::stats()`。`tty-check.sh` 读的诊断行搬到 `examples/trace.cppm`（`LUMINARIA_TRACE=1`）。Rust：
-`Event::OutputAdded` / `OutputRemoved` / `Toplevel` / `Popup` 取代两层嵌套，`Seat::notify_modifiers` 收事件，
-`Cursor::move_to` 不再每次传边界（要边界的是 `move_to_within`）。
+---
 
-**这一轮没做的，以及为什么：**
-- `Result` 的 monadic 操作：`Result` 本来就是 `std::expected`，`and_then` / `transform` / `or_else` / `value_or`
-  已经在，没有东西可加；缺的只是“建不出来就算了”那一行，由 `to_optional` 补上。
-- 空事件类型收敛（`ToplevelMap` / `Unmap` / `Destroy`、`PopupMap`……）：零参回调以后调用处已经看不到这些名字；
-  它们仍是 `Signal<…>` 的类型参数，收成一个别名省不下代码，还要动测试和 Rust shim 里每处 `Conn<…>`。
-- 让连接“跟着发出它的对象一起死”（不经任何持有者）：回调捕获的是 `main` 里的局部变量，而 `Display` 在最后销毁，
-  客户端对象在 `wl_display_destroy` 里才死——那时这些局部变量早没了，回调会踩进去。所以用 `Connections`，
-  它在被捕获者之后声明、先于它们死。
-- 接 `Box` 的 `configure()`：丢掉位置的重载读起来像是位置有用；调用处写 `box.size()`。
-- 绝对运动映射到输出，Rust 一侧：C++ 的 `Cursor::move_to(const PointerMotionAbsEvent&)` 需要 `Output*`，而 Rust 的
-  `OutputId` 在 C++ 里没有反查表；`minimal.rs` 保留那三行，其余（居中、边界）已由库给默认值。
-- `CursorManager::pointer_bounds()` 和 `send_relative_motion()` 按约定保持不变。
+## 已知边界与技术限制
 
-Rust 绑定改成一条事件流：shim 把每个信号按触发顺序推进同一个线程内队列，`Display::dispatch()`
-返回 `Event`；各 global 的 `next_event()`、`Output::take_frame()` / `take_mode_changed()`、
-`take_close_request()`、`next_activity()`、`next_selection_change()` 都没有了。`SceneOutput` 收进了
-`SceneRenderer`，所以用户代码不必再写 `Screen<'a>`。`Keysym` 由系统的 xkbcommon 头文件生成，
-fourcc 用 `drm-fourcc` 的 `DrmFourcc`，`SceneItem::kind` 是枚举。maximize / fullscreen / minimize
-请求默认由库批准，`XdgShell::forward_window_requests()` 才交给 Rust。
+- **色彩管理**：不支持 ICC profile；`wp-color-representation` 暂不支持 YUV 直读。
+- **复合提交唤醒**：同一个表面同时挂载 `commit-timing` 与 `fifo` 时，队头被 FIFO 放行后需等待下次时间戳或定时器 tick 才能触发后续判定。
+- **不可见表面 FIFO 闸门**：最小化或完全遮挡的表面需由混成器调用 `FifoManager::unblock_hidden()` 主动放行，否则会停在提交闸门中。
+- **输入法键盘 Grab 路由**：`InputMethod::keyboard_grab()` 激活时，按键需由混成器策略决定是否先拦截送入输入法。
+- **Token 校验**：`xdg_activation` 未在库内校验 serial，防焦点窃取由混成器根据上下文核对。
+- **全局过滤槽限制**：`data_control` 依赖 `wl_display` 的单一全局过滤器，混成器若有自定 filter 需合并处理。
+- **嵌套修饰键状态**：嵌套后端下无独立于 Shift/Ctrl 的修饰键状态（以宿主报告为准）。
+- **绝对指针定位**：`LibinputBackend` 尚未将平板与虚拟机的绝对指针事件归一化映射到具体输出。
+- **Headless Present 事件**：无头后端当前在每帧前触发一次 `present`，无法单独测试 `unchanged` 漏发帧回调的情况。
 
-还没定的（每条都可能是 break，等第二个下游混成器来检验）：
-
-- `CursorManager::pointer_bounds()` / `send_relative_motion()` 两个静态 helper 没有使用者，
-  但指针约束总要有人算边界——留着，等有混成器接 pointer-constraints 时再定去留。
-- Rust 的线程内事件队列意味着**一个线程只能有一个 `Display`**（同线程第二个会收到第一个的事件）；
-  测试与示例都满足，要不要在创建时直接拒绝第二个，待定。
-- 混成器自己调用触发的信号（`set_keyboard_focus` 之类）在 Rust 里要到下一次 `dispatch()` /
-  `events()` 才出现，不是当场返回。
+---
 
 ## 明确不做
 
-- **摆放策略**（平铺 / 浮动 / 工作区切换逻辑）—— 每个混成器自己实现，见 `CONTEXT.md`。
-- **窗口装饰绘制** —— 库不画标题栏，所以 `xdg-decoration` 默认答 client-side。
-
----
-
-## 源码里活着的标记
-
-只剩两处（空操作桩为 0）：
-
-| 位置 | 内容 |
-|------|------|
-| `region.cppm:14` | `Region` 的操作 O(n)、合并 O(n²)。矩形数量成为问题时换 `pixman_region32` |
-| `tearing_control.cppm:96` | 重复的 tearing_control 对象不发协议错误 |
-
-## 已知的天花板（不是 bug，是没做完的地方）
-
-- **HDR 渲染 / 色彩转换没有** —— `wp-color-management-v1` 的协商做完了（参数化描述、输出描述、表面偏好、
-  `Surface::image_description()`），但两个渲染器都按客户端给的编码直接合成，不在色彩空间之间换算。所以
-  `ColorSupport` 默认只声明 sRGB；`ColorSupport::full()` 只该给自己有色彩管线的混成器用。真正的 HDR 要在
-  `quad.frag` 里做 线性化 → 原色矩阵 → 色调映射 → 编码，并让 10-bit/FP16 的 scanout target 与 DRM 的
-  `Colorspace` / `HDR_OUTPUT_METADATA` 属性接上——这是下一个独立的大块，不属于协议层。ICC 不支持。
-  `wp-color-representation` 同理：渲染器读不了 YUV，默认只收 RGB。
-- **数位板、VRR 都没在真机上验证** —— `TabletManager` 的协议一侧由 `test_tablet`（真 tablet-v2 客户端）守着，
-  libinput 的 tablet 事件翻译只编译通过：这台机器没有 `/dev/input` 的读权限，uinput 测试跳过。VRR 同理，
-  `VRR_ENABLED` 的提交路径没有真正的 FreeSync 显示器跑过；第 0 步的真机验证应当把这两项加进去。
-  另外数位板没有接进 `minimal`（映射到哪块输出、命中哪个表面是混成器的决定）。
-- **commit-timing 与 FIFO 同挂一个表面时的唤醒** —— 队头被 FIFO 放行后，下一条的时间戳要等下一次
-  `set_timestamp` 或定时器 tick 才会被注意到（放行不经过 commit-timing 的定时器）。单独用任何一个协议都不受影响。
-- **不可见表面的 FIFO 放行归混成器** —— barrier 只在 `send_frame_done()` 时清除，所以最小化
-  或被完全遮挡、混成器不再 present 的客户端会一直停在闸门里。`FifoManager::unblock_hidden()`
-  是那把钥匙，但什么算"不可见"只有混成器知道，示例里还没接。
-- **输入法的键盘 grab 要混成器路由** —— `InputMethod::keyboard_grab()` 非空时按键该先给它
-  再给客户端，库拿不到键盘就替不了这个决定；keymap 已经替你发了。候选窗的摆放同理。
-- **popup 的 `constraint_adjustment` 要混成器配合** —— 不调
-  `XdgShell::set_popup_constraint_query()` 就拿不到父窗口位置，贴边菜单会溢出。
-- **`xdg_activation` 不校验 serial** —— 库没有"这个客户端最近收到过哪些 serial"的账，
-  防焦点窃取要混成器自己核对。
-- **`data_control` 的 filter 无法链式叠加** —— libwayland 的 `wl_display` 只有一个 global
-  filter 槽且拿不回旧值。混成器若自己要 filter，应把 data-control 的判断写进自己那个里。
-- **嵌套模式下没有独立于 Shift/Ctrl 的修饰键状态**（父混成器报告的除外）。裸机一侧已经有
-  了：`LibinputBackend` 自带 xkb 状态机。
-- **`LibinputBackend` 只发相对指针运动** —— 绝对定位设备（触摸屏、数位板，以及虚拟机给客户机
-  的那块 tablet）的 `LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE` 不处理，于是虚拟机里指针根本
-  不动。缺的是"设备映射到哪块输出"这个决定该由谁做：坐标只能归一化后交给混成器。
-- **没有混成器接触摸** —— `LibinputBackend` 的 `input()` 已经发 `Touch*Event`（坐标归一化到
-  触摸面板），但映射到哪块输出、`scene_hit_test`、按 slot 路由这一层没有任何示例在做：C++ 的
-  `minimal` 为了保持最小没接，`set_capabilities()` 传 touch=false；Rust 绑定的
-  `Event::Input` 已经带出 `Touch*` 事件，Rust 的 `minimal` 同样没接。
-- **headless 在每一帧之前都报一次 `present`，不管提交过没有** —— 于是 headless 上看不出
-  `unchanged` 帧漏发帧回调；`test_scene_present` 因此自带一个只在提交后才 present 的测试输出。
+- **窗口摆放策略**：平铺、浮动、分屏、工作区切换逻辑均属混成器策略，明确不属于机制库。
+- **服务端窗口装饰绘制**：库不绘制标题栏与阴影边框，`xdg-decoration` 默认答复 client-side。

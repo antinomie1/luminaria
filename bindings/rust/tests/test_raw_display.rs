@@ -1,6 +1,6 @@
 //! `Display::as_ptr()`: a global registered on luminaria's own `wl_display`
 //! through libwayland-server's C API sits beside luminaria's globals, a
-//! libwayland client sees and binds it, and the teardown order CLAUDE.md asks
+//! libwayland client sees and binds it, and the teardown order AGENTS.md asks
 //! of protocol globals holds for it too — the global dies before the Display,
 //! and the client's resource, still connected, dies inside the Display's drop.
 //!
