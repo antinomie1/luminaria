@@ -111,10 +111,18 @@ fence 编排、光标合成），库替你写好；凡是构成“这个混成�
 上合成，只有成品帧过一次 CPU：`read_scanout()` → `commit_frame()`。输入反向走：后端输入信号
 → `Frame::surface_at()` 得到 `SurfaceId` → 当场 `surface_from_id()` → `Seat` 焦点与路由。
 
-参考实现见 `examples/minimal.cpp`（嵌套 / 裸机 / 无头同一份）。它走的是 `SceneRenderer`：
-上面这条 `Frame` 流水线在它里面，`present` 事件的应答（帧回调、presentation 反馈、
-`unchanged` 时的补发）也在它里面；光标是 `Cursor` 的（主题、cursor-shape、客户端光标表面、
-KMS 光标平面或合成）。示例只剩"窗口放哪、谁拿键盘、按键做什么"。
+参考实现见 `examples/minimal.cpp`（嵌套 / 裸机 / 无头同一份）。它站在 `luminaria.shell` 最上面
+一层：`ScreenManager` 管输出（`reset`、进布局、`wl_output`、VRR、把 `frame` 接到 `present`、
+拔屏时拆干净），只问混成器要一个场景构建器；`DefaultInputRouter` 管输入（光标、座位、绑定、切 VT、
+点菜单外关菜单、点窗口给键盘、场景一变重新选指针下的表面），只问混成器一个键、一次点击意味着什么。
+`SceneRenderer` 在它们下面：上面这条 `Frame` 流水线在它里面，`present` 事件的应答（帧回调、
+presentation 反馈、`unchanged` 时的补发）也在它里面；光标是 `Cursor` 的。示例只剩"窗口放哪、
+谁拿键盘、按键做什么"。
+
+这两个托管件**不是**退回保留模式（ADR 0001）：它们持有的是每输出的机器，从不持有窗口。场景表仍然
+由混成器现搭，每次要用都现问一次构建器——画帧问、命中测试问、摆 popup 也问，所以点中的永远是画出来的。
+稳态每帧只多一次 `std::function` 调用（`test_screen_manager` 数着：一个弹窗开着、一个矩形在动，
+32 帧零次堆分配）。构建器在一轮 dispatch 里可能被调用多次，应该复用同一个 vector。
 
 ## 几条会咬人的规矩
 
@@ -129,7 +137,8 @@ KMS 光标平面或合成）。示例只剩"窗口放哪、谁拿键盘、按键
   `clear_damage()`。
   **`submit()` 答 `unchanged` 时没有 `present`**——这一帧没提交，也就没有翻页可等。那次
   `send_frame_done()` 得在 `frame` 处理里补上：客户端 commit 了却没报 damage 是常事，扣着
-  回调就是把它永久冻住。两个示例混成器都是这么写的。
+  回调就是把它永久冻住。这一切都已在 `SceneRenderer` 里，走它（或 `ScreenManager`）的混成器
+  不必知道；只有直接驱动 `Frame` 的才欠这一笔。
 - **global 先于它的客户端析构，而且这必须是安全的。** 混成器总是先声明 `Display`，所以它最后
   析构；而 libwayland 只在 `wl_display_destroy` 里才销毁仍连着的客户端的资源。于是退出时，
   每个协议 global 都已释放，它交给客户端的对象（数据源、offer、会话锁、句柄、timer……）的
@@ -139,8 +148,13 @@ KMS 光标平面或合成）。示例只剩"窗口放哪、谁拿键盘、按键
   我们**不**要求混成器在析构 global 前先断开客户端，也不为此提供 API：声明顺序本身就该是对的，
   而不是靠每个混成器记得多调一步。`tests/test_teardown_order.cpp` 守着这条：一个客户端握着每一种
   回指对象，global 全部析构之后才析构 `Display`，在 ASan 下跑。新增协议时，把你的对象也加进去。
-- **`Frame` 必须比渲染器先销毁。** `Frame` 的 GPU bridge 缓存着属于 `VulkanRenderer` 的
-  `GpuTexture`；参考混成器仍把渲染器声明在 `Display` 前面，让所有输出和帧账本先析构。
+- **渲染器可以先死。** 声明顺序不再是契约：`GpuTexture`、`ScanoutTarget` 以及建在它们上面的
+  `OffscreenTarget` / `BlurChain` 各持一份设备租约（`VulkanRenderer` 的 `Impl` 是 `shared_ptr`，
+  租约是这些资源 `Impl` 的第一个成员，所以最后析构），`VulkanRenderer` 析构时只排空队列、把自己标成
+  已关闭，最后一个资源走的时候才销毁设备。之后还想**调用**渲染器的持有者看 `alive()`：`Frame`
+  答失败、`LinuxDmabuf` 与 `ScreencopyManager` 退回无渲染器路径；`SceneRenderer` 析构时主动解绑
+  所有 `SceneOutput` 并丢掉它们的 GPU 对象，`Cursor` 与 `ScreenManager` 看它的 `alive()` 变成
+  空操作。`tests/test_renderer_lifetime.cpp` 按过去会中止的那个顺序全部声明一遍，在校验层下跑。
 - **绝不听客户端的话去索引内存。** 宽高、stride、offset 是客户端独立声明的四个整数，上游
   谁也没有按真正的单位交叉验证过。碰像素之前先过 `layout_fits()` / `layout_length()`。
 - **跨 dispatch 留表面身份只留 `SurfaceId`。** 每次使用前经 `surface_from_id()` 解析；表面
@@ -165,7 +179,7 @@ src/util/                  blur box color dmabuf keymap pixel pixel_layout rect_
 src/backend/base/          backend output input_event output_layout（属于 core 的抽象层）
 src/backend/               drm headless libinput session wayland
 src/render/                vulkan cpu_compositor + 着色器 SPIR-V
-src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
+src/shell/                 auto_backend cursor cursor_manager cursor_theme default_input_router direct_scanout frame layer pointer popup scene scene_renderer screen_manager
 src/protocol/core/         27 个纯 Wayland 协议
 src/protocol/render/       drm_syncobj linux_dmabuf screencopy
 src/protocol/desktop/      data_control foreign_toplevel foreign_toplevel_list input_method output_management session_lock workspace
@@ -207,9 +221,10 @@ src/detail/wayland_fwd.h   唯一剩下的头文件
 - **嵌套窗口装饰取决于父 compositor**：KDE/Plasma、wlroots 系给 server-side（有原生标题栏）；
   GNOME/Mutter 不实现 `xdg-decoration`，窗口裸奔。我们**不画** client-side 装饰 ——
   「原生装饰」按定义就是宿主画的，自绘一套是另一回事。
-- **popup 的 `constraint_adjustment` 需要 compositor 配合**：必须调
-  `XdgShell::set_popup_constraint_query()` 告诉 shell 父窗口在哪，否则贴边菜单仍会溢出
-  —— shell 层无从知道窗口摆在哪个位置。`examples/minimal.cpp` 已接线。
+- **popup 的 `constraint_adjustment` 需要知道窗口在哪**：shell 层自己无从知道。
+  `ScreenManager::follow_popups()` 从正在画的场景表里查父窗口、从 `OutputLayout` 查它在哪块屏，
+  混成器什么都不用写；不走 `ScreenManager` 的用 `PopupTree::constrain()` 或
+  `XdgShell::set_popup_constraint_query()`，都不接的话贴边菜单会溢出。
 - **DRM 真机覆盖尚未完成**：一台 1920×1080@60Hz 显示器已经验证 atomic 翻页、`IN_FENCE_FD` /
   `OUT_FENCE_PTR`、libinput、硬件光标平面和 VT 切换；多输出分配、udev connector 热插拔、模式切换
   的所有 per-output 重建，以及客户端 dmabuf direct scanout 仍须在空闲 VT 上验收。渲染与几何有

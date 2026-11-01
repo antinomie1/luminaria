@@ -68,6 +68,8 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
 | `TabletManager<'d>`、`ColorManager<'d>`、`ColorRepresentationManager<'d>` | `Display` |
 | `LinuxDmabuf<'a>` | `Display`，以及传入的 `VulkanRenderer` 或 `SceneRenderer` |
 | `Cursor<'a>` | `SceneRenderer`、`OutputLayout`、`Seat` |
+| `ScreenManager<'a>` | `Display`、`SceneRenderer`、`OutputLayout`；`follow_popups` 之后还有那个 `PopupTree`（后端只在构造时读一次，不借） |
+| `InputRouter<'a>` | `Seat`、`Cursor`、`ScreenManager`、`XdgShell`、`PopupTree`；`attach` 之后还有那个 `AutoBackend` |
 | `Frame<'r>` | `VulkanRenderer` |
 | `Toplevel<'s>`、`Popup<'s>`、`LayerSurface<'s>`、`LockSurface<'m>`、`SessionLock<'m>`、`PointerConstraint<'m>`、`TextInput<'m>`、`InputMethod<'m>` | 发出它的那个 global（只是查询句柄，见 §4"事件"） |
 
@@ -85,8 +87,8 @@ C++ 对象互相持有引用：`lm::Cursor` 存着 `SceneRenderer&`、`OutputLay
   所以和输出有关的都在运行时兜底：`Output` 自己变成空操作（`is_alive()` 为 false）；`OutputLayout` 与渲染器的
   每输出状态自动解除绑定，跟随它的 `OutputGlobal` 停止跟随；`DirectScanout` 不再调用它；`Frame` 随输出一起销毁，之后 `reset` / `submit` 返回错误、其余方法为空操作。
 - **结构体不能同时装被借者和借用者**（自引用）。把被借的放在外层——`main` 的局部变量，或一个只装它们的结构体——
-  再让借用者借用它们。`examples/minimal.rs` 一个带 lifetime 的结构体都没写：每块输出和跟随它的 wl_output 放在
-  `Vec<(Output, Option<OutputGlobal>)>` 里，类型推断替它写了 lifetime。
+  再让借用者借用它们。`examples/minimal.rs` 一个带 lifetime 的结构体都没写：输出全在 `ScreenManager` 里，
+  `main` 里的局部变量靠类型推断写好了 lifetime。
   会话、显卡、libinput 这一组本来就是这种关系（后两者借前者），所以由 `AutoBackend` 在 C++ 一侧一起持有，
   Rust 只借 `Display`。
 
@@ -341,7 +343,8 @@ for event in display.dispatch(Some(Duration::from_millis(16)))? {
   永不复用的 id。`shell.toplevel(id)` 之类返回的句柄每次调用都重新查找；对象销毁后 getter 返回默认值、setter 不做事。
 - **替 Rust 立刻做的事，由 C++ 自己做。** 对象销毁时必须马上放开它的地方——`PopupTree`、`LayerManager`、
   `OutputLayout`、`SceneRenderer` 的每输出状态——都在 C++ 里监听销毁信号，不等 Rust 取到事件。
-- **要同步回答的信号无法转发。** `XdgShell` 的 popup 约束查询改成事先告知（`set_popup_constraint_areas`）；
+- **要同步回答的信号无法转发。** 能回答的东西事先告知：场景用 `ScreenManager::set_scene`（帧、点击、popup 约束
+  都读它，所以 `set_popup_constraint_areas` 只有不走 `ScreenManager` 时才需要），绑定用 `InputRouter::bind`；
   xdg-activation 的发 token 请求总是批准。
 - **maximize / fullscreen / minimize 默认由库回答。** luminaria 对这三个请求有一个"没人监听就自己批准"的兜底，
   和不监听它们的 C++ 混成器一样生效；要自己回答，`XdgShell::new(&display)?.forward_window_requests()`，
@@ -430,6 +433,7 @@ for event in display.dispatch(None)? {
 - `Popup`：`parent()`、`is_mapped()`、`has_grab()`、`geometry()`（相对父窗口几何）、`dismiss()`。
 - `set_popup_constraint_areas(&[PopupArea { parent, parent_box, usable }])`：每个可能当 popup 父亲的 surface 画在哪、
   在哪块屏上。shell 摆 popup 时在 `dispatch` 里同步查询，只能用事先告诉它的；场景一变就更新。不在表里的父亲不受约束。
+  用了 `ScreenManager::follow_popups` 就不要它了（也不再被查询）。
 
 ### `LayerShell`
 发布 `zwlr_layer_shell_v1`（面板、壁纸、通知、锁屏界面）。事件是 `Event::Layer(SurfaceId, LayerSurfaceEvent)`：
@@ -534,7 +538,9 @@ match outcome {
     SceneOutcome::Cpu => { /* 降级至 CPU 软件混合 */ }
 }
 ```
-`gpu_output(&output)` 说这块输出现在走不走 GPU，`read_back(&output)` 读回上一帧。
+`gpu_output(&output)` 说这块输出现在走不走 GPU，`read_back(&output)` 读回上一帧；两者都只认它自己 `reset`/`present`
+过的输出，`ScreenManager` 管着的输出状态在 C++ 那边。`linux_dmabuf(&display)` 是这块 GPU 的 `linux-dmabuf` global，
+没有 GPU 时为 `None`。写混成器时一般不直接调 `reset`/`present`，用 §7 的 `ScreenManager`。
 
 ### `Cursor`
 指针及其图像：主题、cursor-shape、客户端精灵、KMS 光标平面。`Cursor::new(&renderer, &layout, &seat)?`
@@ -647,6 +653,48 @@ layer surface 的 popup 用 `set_parent(&shell, popup, layer_surface)` 指定父
 `scene_route_pointer(&seat, &items, x, y)` 是指针路由：按住按钮（隐式 grab）期间每次运动都按 grab 表面自己的坐标
 发过去，否则把焦点给命中的表面、或在空白处清掉焦点；返回命中结果。`scene_surface_origin(&items, surface)` 是它用的
 那一半：某个表面（子表面也算）的原点画在哪。`SceneItem::kind` 是 `SceneKind::{Surface, Rect, Border, Image}`。
+
+### `SceneItem::toplevel`
+`SceneItem::toplevel(&t, x, y)`：把窗口几何（不是 buffer）放到 (x, y)，tag 是它的 surface，点击回来就是 `SurfaceId(hit.tag)`。
+
+### `ScreenManager`
+一块输出从出现到拔掉，C++ 同名类型的绑定：`reset`、进布局、`wl_output`、VRR、画帧、销毁时拆干净。在 `AutoBackend::start`
+之前创建：
+```rust
+use luminaria::shell::{ScreenManager, ScreenOptions};
+use luminaria::util::Color;
+
+let options = ScreenOptions {
+    background: Color::rgb(0.12, 0.13, 0.16),
+    name: "minimal".into(), // wl_output 叫 minimal-1、minimal-2……编号永不复用
+    ..ScreenOptions::default() // join_layout、announce 默认开，variable_refresh 默认关
+};
+let screens = ScreenManager::new(&display, &backend, &renderer, &layout, &options)?;
+screens.follow_popups(&popups); // 不用再管 set_popup_constraint_areas
+
+loop {
+    for event in display.dispatch(timeout)? { /* 策略 */ }
+    screens.set_scene(&scene);  // 布局坐标；与上一张相同时只是一次比较
+}
+```
+**C++ 给构建器，Rust 事先告知。** C++ 绝不调用 Rust，所以 `set_scene_builder` 在这里是 `set_scene`：每轮 dispatch 之后
+告诉它一次。帧、点击、摆 popup 都读这张表，它最多旧一轮 dispatch；身份是代际的，已销毁的窗口只会画不出来，不会画错。
+列表变了就自动要帧并重新选指针下的表面。C++ 的 `scene_at` 没有绑定：Rust 手里本来就有这张表。
+
+`surface_box(surface)`、`invalidate()`（场景表表达不了的变化）、`len()` / `is_empty()`。布局变化是
+`Event::LayoutChanged`（用来重排窗口），设置失败是 `Event::ScreenFailed(String)`。输出照样以 `Event::OutputAdded` 到来，
+不要可以直接丢掉，什么都不影响。
+
+### `InputRouter`
+输入，只问一个键、一次点击意味着什么，C++ `DefaultInputRouter` 的绑定。
+`InputRouter::new(seat, &cursor, &screens, shell, &popups)?`，`attach(&backend)` 接上后端的输入，有会话时还管
+Ctrl+Alt+Fn、切走放键、切回重画。在 `dispatch` 里同步运行，所以绑定也是事先告知：
+
+- `bind(mods, keysym, id)`：`mods` 与按住的修饰键完全一致才算，`keysym` 按小写比。客户端看不到这个键，来的是
+  `Event::KeyBinding(id)`。C++ 的 `on_key_binding` 要同步回答，没有绑定。
+- `Event::Button { button, pressed, hit }` 对应 `on_button`，事后到来：客户端此时已经收到了这次点击。
+- `on_focus_changed` 对应已有的 `Event::Seat(SeatEvent::…Focus…)`。
+- `set_click_to_focus(bool)`（默认开）、`update_pointer()`、`route(&event)`（不是来自后端的输入；绝对运动按第一块输出算）。
 
 ### `LayerManager`
 按输出管理 layer surface：`add(&layers, surface, output_id)`（`output_id` 由混成器自定）、`set_mapped`、
@@ -820,19 +868,25 @@ ADR 0003 约束的是**核心模块**收什么协议；Vulkan 本来就在 `lumi
 
 ### 9.5 `examples/minimal.rs` 与 C++ 版的对齐情况
 
-`minimal.rs` 与 `minimal.cpp` 的后端选择相同：`LUMINARIA_BACKEND=auto|nested|drm|headless`。
+`minimal.rs` 与 `minimal.cpp` 的后端选择相同：`LUMINARIA_BACKEND=auto|nested|drm|headless`（两边都用
+`backend_options_from_env`）。
 auto 依次尝试嵌套、能拿到 libseat 会话时的 DRM、无头；显卡取第一个参数或 `LUMINARIA_DRM_DEVICE`；
 Ctrl+Alt+Fn 切 VT；多显示器按插入顺序从左到右排，窗口铺满第一块；显示器热插拔、模式变化、VT 切走时放开
 按键、都与 C++ 版一致；DRM 上每秒一行的帧统计和其它诊断行只在 C++ 版里（`LUMINARIA_TRACE=1`，`scripts/tty-check.sh` 读的就是它），Rust 版不带。有了 §4 的事件，弹出菜单也一致了：`PopupTree` 把 popup 放进场景，
-点在菜单外面关掉它，`set_popup_constraint_areas` 让贴边的菜单翻转；窗口按窗口几何摆放；`OutputGlobal`
-告诉客户端位置、模式、缩放与朝向。C++ 版没有 layer shell 与锁屏，所以 Rust 版也没有（两者保持同步）；
+点在菜单外面关掉它，`ScreenManager::follow_popups` 让贴边的菜单翻转；窗口按窗口几何摆放（`toplevel_item`）；
+`OutputGlobal` 告诉客户端位置、模式、缩放与朝向。C++ 版没有 layer shell 与锁屏，所以 Rust 版也没有（两者保持同步）；
 它们的用法见 `tests/test_layer_shell.rs`、`tests/test_session_lock.rs`。
 
 与 C++ 版曾有的差别现已全部补齐，两个示例在行为上已经一致，并且建在同一组库机制上：`CoreGlobals`、
-跟随输出与布局的 `OutputGlobal`、跟随 shell 的 `PopupTree`、`scene_route_pointer`、`KeyRouter::route` +
-`Session::switch_vt_for` + `Seat::release_keys`、`Seat::follow`、用布局坐标的 `present`。两者剩下的差别只在
-语言本身：C++ 在信号回调里处理，Rust 在 `dispatch()` 返回的事件上 match；popup 约束 C++ 同步回答、Rust 事先告知；
-Rust 版一个带 lifetime 的结构体都没写。行数：C++ 639 → 500 → 365，Rust 677 → 420 → 322。
+`ScreenManager`（输出的一生，含 `OutputGlobal`、VRR、帧与 popup 约束）、`DefaultInputRouter`（光标、键盘绑定、VT、
+点击）、跟随 shell 的 `PopupTree`。两者剩下的差别只在语言本身：C++ 把回调交给库，Rust 在 `dispatch()` 返回的事件上
+match；C++ 的场景构建器在 Rust 是 `set_scene`，`on_button` 与绑定的动作在 Rust 是事件（因此 Rust 的场景最多晚一轮
+dispatch，窗口出现或换层最多晚一帧）。Rust 版一个带 lifetime 的结构体都没写。
+行数：C++ 639 → 500 → 365 → 126，Rust 677 → 420 → 322 → 133。C++ 版把 `Trace` 留作 `LUMINARIA_TRACE=1` 的诊断。
+
+- **渲染器的析构顺序**：C++ 的声明顺序已不是契约（渲染器先死也安全，`docs/architecture.md`）；Rust 这边
+  `ScreenManager`、`Cursor`、`LinuxDmabuf` 借用渲染器，顺序本来就由借用检查器管，`ScreenManager` 的文档里有
+  `compile_fail` doctest。
 
 - **窗口状态请求**：两边都不回答 maximize / fullscreen / minimize，由库按兜底批准（Rust 不调
   `forward_window_requests()`）。
@@ -862,7 +916,7 @@ Rust 版一个带 lifetime 的结构体都没写。行数：C++ 639 → 500 → 
 
 现已补全的跨 crate 互操作与功能支持：
 
-- **`LinuxDmabuf` 与 GPU 共享**：可通过 `LinuxDmabuf::from_scene_renderer(&display, &renderer)`（或 `renderer.create_linux_dmabuf(&display)`）直接从 `SceneRenderer` 创建；`examples/minimal.rs` 已接驳该协议，GPU 客户端可直接走零拷贝 dmabuf。
+- **`LinuxDmabuf` 与 GPU 共享**：`renderer.linux_dmabuf(&display)`（无 GPU 时为 `None`），或 `LinuxDmabuf::from_scene_renderer(&display, &renderer)` / `renderer.create_linux_dmabuf(&display)`；`examples/minimal.rs` 已接驳该协议，GPU 客户端可直接走零拷贝 dmabuf。
 - **光标形状协议 (`cursor-shape`)**：通过 `Cursor::new_with_shapes(&renderer, &layout, &seat, &shapes)` 将 `CursorShapeManager` 接入光标引擎，自动呈现客户端请求的命名光标形状，已在 `examples/minimal.rs` 中完整启用。
 - **图像数据输入 (`SceneItem::image`)**：`SceneRenderer::set_image(serial, width, height, rgba: &[u8])` 接受紧凑排布的原始 RGBA `&[u8]` 字节切片（`image` crate 的图像缓冲区可直接传入），与场景中的 `SceneItem::image(rect, serial)` 对应；GPU 路径按 serial 自动去重缓存与动态上传，CPU 路径自动回退合成。
 - **显示器配置 (`OutputGlobal`)**：`for_output()` 跟随输出与布局；`logical_position()`、`size()`、`logical_size()`、`scale()`、`transform()`、`refresh_mhz()`、`name()` 读的都是 C++ global 当前描述的值。

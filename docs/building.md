@@ -74,7 +74,8 @@ Rust 绑定的 `build.rs` 把 cargo 的并行度原样交给 xmake，所以那�
 示例只有一个：`examples/minimal.cpp`，与 `bindings/rust/examples/minimal.rs` 是一对——
 同样的窗口策略（每个窗口最大化到输出上、新的在最上面、点击置顶），同样的快捷键：
 Logo+Return 开 `$TERMINAL`（默认 foot）、Logo+Tab 轮换、Logo+q 关窗、Logo+Escape 退出。
-光标与帧回调全由库处理（`Cursor`、`SceneRenderer`），示例里只剩混成器自己的决定。
+输出、输入、光标与帧回调全由库处理（`ScreenManager`、`DefaultInputRouter`、`Cursor`、`SceneRenderer`），
+示例里只剩混成器自己的决定。
 Rust 那份与 C++ 版同步：同样的后端选择（嵌套 / DRM / headless）、dmabuf、光标形状、首选与分数缩放、
 popup 菜单，见 `bindings/rust/docs/api.md` §9.5。
 

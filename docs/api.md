@@ -184,6 +184,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`KeyRouter`** (`luminaria:input_router`): 在混成器快捷键与焦点客户端之间分配键盘，每个键保持完整。
   - `template <class Binding> void route(Seat&, const KeyEvent&, Binding&& binding)`：按下先交给 `binding`（`bool(const KeyEvent&)`），答 true 则这个键连同它的松开都留下；其余交给 `Seat`。松开丢失（切 VT）后的再次按下按新按下处理。
 - 与之配合的 `Seat::release_keys()`（松开客户端以为按着的键并清修饰键）、`Seat::follow(InputSource&, bool touch = false)`（立即采用并跟随输入源的 keymap 与 capabilities）、`Session::switch_vt_for(keysym)`（Ctrl+Alt+Fn）。
+- `Mod::{shift, ctrl, alt, logo, bindable}` 是 xkb 的核心修饰位，`ModifiersEvent::held()` 给出绑定该比的那几位（按下或锁存，不含 Caps/Num Lock）。这些都已收进 `DefaultInputRouter`（§6.5），自己路由输入时才需要它们。
 
 ---
 
@@ -248,7 +249,8 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 让渲染器选中屏幕背后那块 GPU。`AutoBackend` 就是这一段。
 - **`BackendKind`** = `automatic | nested | drm | headless`；`Result<BackendKind> parse_backend_kind(std::string_view)`
   解析 `"auto" | "nested" | "drm" | "headless"`（示例里 `LUMINARIA_BACKEND` 的取值），`backend_kind_name()` 反过来。
-  读环境变量仍是调用者的事。
+- **`Result<BackendOptions> backend_options_from_env(std::string_view drm_device = {})`**：读 `LUMINARIA_BACKEND`，
+  显卡取 `drm_device`（混成器的命令行）或 `LUMINARIA_DRM_DEVICE`。`create()` 自己从不读环境。
 - **`BackendOptions`**：`kind`（默认 `automatic`）、`drm_device`（空 = 第一块接了显示器的卡）、`width`/`height`
   （嵌套与无头自带的那一块输出，默认 1280×800）、`title`（嵌套窗口标题）。
 - **`static Result<AutoBackend> create(EventLoop loop, const BackendOptions& = {})`**：
@@ -257,8 +259,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - 按名字要某一种时，失败就是错误而不回退；要 `drm` 时没有会话也照跑（切 VT 不安全，原因见 `session_error()`）。
   - DRM 上同时建好同一会话上的 `LibinputBackend`，并设 `VulkanOptions::drm_device = drm_device_id(drm.fd())`。
 - 取用：`kind()`（不会是 `automatic`）、`Backend& backend()`（订阅 `new_output`）、`InputSource* input()`（嵌套后端或
-  libinput，无头为空）、`WaylandBackend* nested()`（`close_requested` 由调用者回答）、`DrmBackend* drm()`、
+  libinput，无头为空）、`WaylandBackend* nested()`、`DrmBackend* drm()`、
   `LibinputBackend* libinput()`、`Session* session()`（VT 切换与 `activity()`，只在 DRM 上）、`session_error()`、
+  `Signal<HostCloseRequest>& close_requested()`（父混成器要关嵌套窗口，由调用者回答；别的后端上从不触发，所以接上它不用先问是哪种后端）、
   `Signal<DrmDeviceRemoved>& gpu_removed()`、`Signal<DrmDeviceAdded>& gpu_added()`、
   `const VulkanOptions& vulkan_options()`（交给 `SceneRenderer` / `VulkanRenderer`）。
 - **`Status start()`**：先 libinput，后后端。
@@ -335,8 +338,11 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y)`**: 全图元命中测试。
 - **`std::optional<ScenePoint> scene_surface_origin(scene, SurfaceId)`**：某表面（含子表面）的原点画在哪。
 - **`SceneHit scene_route_pointer(Seat&, scene, double x, double y)`**：指针路由——有隐式 grab 时按 grab 表面自己的坐标发运动，否则把焦点给命中的表面或清掉焦点。
+- **`SceneItem toplevel_item(Toplevel&, int x, int y)`**：把窗口几何（不是 buffer）放到 (x, y) 的场景项，`tag` 是 `Toplevel*`。
 - **`SceneRenderer`** (`luminaria.shell:scene_renderer`):
   - 将 `std::vector<SceneItem>` 自动分发至 `Frame` 或 `CpuCompositor`，透明处理运行时 GPU 降级。
+  - `std::optional<LinuxDmabuf> linux_dmabuf(Display&)`：这块 GPU 的 `linux-dmabuf` global，没有 GPU 时为空。
+  - `std::weak_ptr<const void> alive() const`：渲染器销毁后过期，给保存 `SceneRenderer*` 的对象用。
   - `Status reset(SceneOutput&, Output&, uint32_t drm_format = XRGB8888)`：每块输出调一次，之后的 mode 变化自己重新分配。
   - `present(state, output, scene, background)`（输出坐标）与 `present(state, output, scene, background, const OutputLayout&)`（全局坐标）。
   - `SceneStats stats() const`：`present()` 到目前为止按结果（composited / scanout / unchanged / cpu）数过的帧，看空闲屏幕是不是真的安静下来。
@@ -348,11 +354,34 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - **`OutputLayout`** (`luminaria:output_layout`): 全局逻辑坐标系管理。不可移动：它盯着装进来的每块输出，销毁的自己离开、换 mode 的保留位置换上新尺寸。
   - `void add(Output&, int x, int y)`, `void add_auto(Output&)`, `void remove(const Output&)`
   - `Output* at(int x, int y) const`, `Box box_of(const Output&) const`
-  - `Output* primary() const`, `Box primary_box() const`：第一块放进来的输出（窗口没有更好主意时去的那块），没有时为空 / 空盒。
+  - `Output* primary() const`, `Box primary_box() const`, `int primary_scale() const`：第一块放进来的输出（窗口没有更好主意时去的那块），没有时为空 / 空盒 / 1。
   - `Signal<OutputLayoutChange> changed`：任何输出的格子变了（含它自己做的变化）。
 - **`Pointer`** (`luminaria:pointer`): 全局光标坐标与约束状态。
-- **`PopupTree`** (`luminaria:popup`): XDG 弹出菜单（Popup）树管理与 Grab 仲裁。`explicit PopupTree(XdgShell&)` 从创建到销毁自己跟踪 shell 的每个 popup，`Signal<PopupTreeChange> changed` 在映射 / 取消映射 / 重定位 / 销毁时广播；layer surface 的 popup 用 `set_parent()` 指定父表面。
+- **`PopupTree`** (`luminaria:popup`): XDG 弹出菜单（Popup）树管理与 Grab 仲裁。`explicit PopupTree(XdgShell&)` 从创建到销毁自己跟踪 shell 的每个 popup，`Signal<PopupTreeChange> changed` 在映射 / 取消映射 / 重定位 / 销毁时广播；layer surface 的 popup 用 `set_parent()` 指定父表面。`constrain(const OutputLayout&, SurfaceLocator)` 回答 shell 的约束查询（popup 留在父窗口所在的输出上），`ScreenManager::follow_popups()` 就是调它。
 - **`LayerManager`** (`luminaria:layer`): Layer-shell 四层拓扑与排版计算器。
+
+### 6.5 ScreenManager & DefaultInputRouter (托管层)
+一个混成器里所有不是策略的接线。两者都不持有窗口（ADR 0001），都借用传进来的对象。
+
+**`ScreenManager`** (`luminaria.shell:screen_manager`)：一块输出从出现到拔掉。
+- `ScreenManager(Display&, Backend&, SceneRenderer&, OutputLayout&, ScreenOptions = {})`：在后端 `start()` 之前构造。
+- `ScreenOptions`：`background`、`join_layout`（默认开，`add_auto`）、`announce`（默认开，开跟随布局的 `wl_output`）、`variable_refresh`（默认关）、`name`（`wl_output` 叫 `<name>-1`、`<name>-2`……编号永不复用）、`drm_format`。
+- `set_scene_builder(SceneBuilder)`：`std::function<std::span<const SceneItem>(Output&)>`，返回布局坐标的列表，通常忽略参数、每块输出同一张表。输入和 popup 也会调它，所以应复用同一个 vector。
+- `follow_popups(PopupTree&)`：popup 变化时 `invalidate()`，并从场景表回答约束查询。取代手写 `set_popup_constraint_query()`。
+- `invalidate()`：发生了客户端不会报告的变化（窗口开、关、移动、换层）：所有输出要一帧，指针重新选表面。
+- `scene_at(x, y)`（该点所在输出的列表，缝隙里取第一块）、`surface_box(SurfaceId)`、`size()`。
+- `Signal<ScreenInvalidated>& invalidated()`；`Signal<ScreenFailure>& failed()`（都不致命，没人听时打到 stderr）。
+
+**`DefaultInputRouter`** (`luminaria.shell:default_input_router`)：输入，只问一个键、一次点击意味着什么。
+- `DefaultInputRouter(Seat&, Cursor&, ScreenManager&, XdgShell&, PopupTree&)`。
+- `attach(InputSource&)`（并让 seat 跟随它）、`attach(Session&)`（Ctrl+Alt+Fn；VT 切走时放开按键，切回时重画）、`attach(AutoBackend&)`（两者都接）。
+- `bind(mods, keysym, action)`：`mods` 要与按住的修饰键完全一致，`keysym` 按小写比，Caps Lock 不影响；客户端看不到这个键。
+- `on_key_binding(bool(const KeyEvent&))`：没被 `bind` 拿走的按下先问它，答 true 则连松开一起留下。
+- `on_button(void(uint32_t button, bool pressed, const SceneHit&))`：在客户端听到之前调用，`hit` 是指针下的东西。
+- `on_focus_changed(void())`：指针或键盘换了表面。通知性质，不替代默认行为。
+- `set_click_to_focus(bool)`：默认开，按下窗口经 `XdgShell::focus()` 给它键盘和 activated，按在 popup 里不动。
+- `route(const InputEvent&)`（`attach` 就是把事件送到这里）、`update_pointer()`（`ScreenManager::invalidate()` 已自动做）。
+- 不管指针约束（缩小边界是混成器的事，直接调 `Cursor`），不管触摸（没有默认可言）。
 
 ---
 
@@ -522,7 +551,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 为确保系统稳健性，使用 Luminaria 时必须严格遵守以下法则：
 
-1. **对象销毁逆序**：`SceneRenderer` / `VulkanRenderer` 必须在缓存其纹理的对象（`SceneOutput` / `Frame`、`Cursor`、`LinuxDmabuf`）之前声明，确保它们先于渲染器析构；不必早于 `Display`。
+1. **对象销毁顺序**：渲染器可以先于任何缓存其纹理的对象析构。纹理与渲染目标持有设备租约，`SceneOutput`、`Frame`、`Cursor`、`ScreenManager`、`LinuxDmabuf` 之后都变成安全的空操作（`Frame` 的方法答失败）。构造函数借用的对象（`ScreenManager` 的 `SceneRenderer&` 之外）仍要活得比借用者久，按依赖顺序声明即可。
 2. **表面引用跨事件循环隔离**：禁止跨 Dispatch 存储 `Surface*`，必须存储 `SurfaceId`，并在使用前通过 `surface_from_id(id)` 动态解析。
 3. **坐标系与像素对齐**：
    - 布局、命中测试、子表面偏移**一律使用逻辑尺寸**（`surface_width()` / `surface_height()`）。

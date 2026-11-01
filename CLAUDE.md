@@ -11,7 +11,8 @@ built with xmake. Roughly wlroots-shaped but far smaller (35 protocol types vs w
 It ships as **C++23 named modules** with no public headers, layered strictly
 downwards (ADR 0008): `luminaria` is the dependency-light protocol/core interface, with
 `luminaria.backend` (outputs + input devices), `luminaria.render` (Vulkan + CPU compositing),
-`luminaria.shell` (Frame, SceneRenderer, Cursor, AutoBackend), `luminaria.desktop`
+`luminaria.shell` (Frame, SceneRenderer, ScreenManager, DefaultInputRouter, Cursor,
+AutoBackend), `luminaria.desktop`
 (privileged protocols) and `luminaria.text` (fcft + pixman glyph rasterization) extensions.
 All prose docs are in Chinese. `README.md` is the introduction only — no technical detail.
 `CONTEXT.md` is the glossary (what "混成器"/"合成"/"布局" mean here, and what they don't);
@@ -75,7 +76,7 @@ interface-from-implementation; `src/` is grouped by responsibility instead:
 src/luminaria.cppm         core primary interface — mechanism kernel + protocols
 src/luminaria.backend.cppm backend primary interface — KMS/libinput/session/nested/headless
 src/luminaria.render.cppm  render primary interface — Vulkan/CPU/dmabuf/syncobj/screencopy
-src/luminaria.shell.cppm   shell primary interface — Frame/Cursor/SceneRenderer/AutoBackend
+src/luminaria.shell.cppm   shell primary interface — Frame/Cursor/SceneRenderer/ScreenManager/DefaultInputRouter/AutoBackend
 src/luminaria.desktop.cppm desktop primary interface — privileged shell protocols
 src/luminaria.text.cppm    text primary interface — fcft glyph rasterization
 src/core/                  display event_loop expected handle signal
@@ -83,7 +84,7 @@ src/util/                  blur box color color_description dmabuf keymap pixel 
 src/backend/base/          backend output input_event output_layout (abstract base in core)
 src/backend/               drm headless libinput session wayland
 src/render/                vulkan cpu_compositor + quad.{vert,frag} + solid.frag
-src/shell/                 auto_backend cursor cursor_manager cursor_theme direct_scanout frame layer pointer popup scene scene_renderer
+src/shell/                 auto_backend cursor cursor_manager cursor_theme default_input_router direct_scanout frame layer pointer popup scene scene_renderer screen_manager
 src/protocol/core/         31 protocol files in core (incl. tablet, color_management)
 src/protocol/render/       drm_syncobj linux_dmabuf screencopy
 src/protocol/desktop/      ctm_control data_control foreign_toplevel foreign_toplevel_list gamma_control input_method output_management session_lock virtual_keyboard virtual_pointer workspace
@@ -142,8 +143,13 @@ same backend choice, same popups, dmabuf, cursor shapes, preferred and fractiona
 same subsurface-aware pointer grab. The Rust binding hands every signal back through one
 stream: each shim pushes onto a per-thread queue in emission order, and
 `Display::dispatch()` returns it as `Event`s (`bindings/rust/src/event.rs`), so there is no
-per-global queue to forget. Adding a visible behaviour to one means adding it to the
-other; `bindings/rust/docs/api.md` §9.5 records what the Rust one does with it:
+per-global queue to forget. C++ never calls Rust, so what a C++ compositor gives
+`ScreenManager`/`DefaultInputRouter` as callbacks a Rust one gives ahead of time: the scene
+through `ScreenManager::set_scene()` after every dispatch (a frame, a click and the shell
+placing a popup all read that list, at most one dispatch old), bindings through
+`InputRouter::bind()`, and what they mean comes back as `Event::KeyBinding` / `Event::Button`.
+Adding a visible behaviour to one example means adding it to the other;
+`bindings/rust/docs/api.md` §9.5 records what the Rust one does with it:
 
 ```sh
 xmake run minimal                                # nested; prints its own socket name
@@ -347,9 +353,27 @@ Layers, bottom-up (one `src/` folder each, one or more partitions per folder):
   keymap and capabilities and follows their changes. `CoreGlobals`
   (`protocol/core_globals.cppm`) creates the dozen globals every usable compositor needs. `region.cppm` is the disjoint-box set both
   damage and wl_region are built on.
+  **`ScreenManager`** (`shell/screen_manager.cppm`, `luminaria.shell`) closes the output loop:
+  given `(display, backend, renderer, layout, options)` it does `reset()`, `add_auto()`, the
+  `OutputGlobal`, VRR, connects `frame` to `present()` and tears all of it down on `destroy`,
+  and asks the compositor for one thing, `set_scene_builder(fn(Output&) -> span<SceneItem>)`.
+  It holds per-output machinery and never a window (ADR 0001): the builder is called again for
+  everything that needs the scene — a frame, `scene_at()` for input, `surface_box()` for a
+  popup's parent — so it may run several times a dispatch and should refill one vector.
+  `follow_popups(popups)` installs the constraint query (`PopupTree::constrain()`, which asks
+  `OutputLayout` for the screen and the builder for the parent) and invalidates on `changed`.
+  `invalidate()` is the one verb for "changed in a way no client reports". **`DefaultInputRouter`**
+  (`shell/default_input_router.cppm`) routes `InputEvent`s against `scene_at()`: motion to
+  `Cursor` + `scene_route_pointer`, keys through `KeyRouter` past the VT switch, a click outside
+  a menu dismissing it, a press giving its toplevel the keyboard (`set_click_to_focus`), and
+  `invalidated()` re-picking the surface under a still pointer. Policy comes in through
+  `bind(mods, keysym, action)`, `on_key_binding`, `on_button` and `on_focus_changed`.
+  `tests/test_screen_manager.cpp` (both paths, including 0 allocations across 32 frames with a
+  popup open and a rect moving) and `tests/test_input_router.cpp` guard them; both run a client
+  on the test's own thread through `tests/shell_harness.h`.
 Per-frame flow in a compositor built on this (see `examples/minimal.cpp`): `Output::frame`
-fires → the compositor builds its `SceneItem` list (windows, then `PopupTree::append_to`) in
-layout coordinates → `SceneRenderer::present(..., layout)` moves it into the output's own
+fires → `ScreenManager` asks the builder for the `SceneItem` list (windows, then
+`PopupTree::append_to`) in layout coordinates → `SceneRenderer::present(..., layout)` moves it into the output's own
 (or the overload without a layout takes output coordinates), which on the GPU path is
 `Frame::begin(view)` → one `Frame::place()` per item (expanding its subsurface tree), then the
 cursor when no plane carries it → `Frame::submit(background)`. Inside that: Frame's GPU bridge imports or uploads each client
@@ -396,14 +420,19 @@ ended up with one table dispatching into the other's function — a `wp_linux_dr
 request landing in colour management's handler. Give the handlers/vtables of a new protocol a prefix
 of its own (`cm_`, `cr_`, `ftl`…) rather than the bare `manager_*` names.
 
-**The renderer must outlive what caches its textures.** Each `Frame` (inside a
-`SceneOutput`), the `Cursor` and `LinuxDmabuf` hold `GpuTexture`s or pointers owned by the
-`VulkanRenderer`, so the renderer has to be declared *before* all of them (locals are
-destroyed in reverse order); nothing tied to the `Display` itself holds one, so it does not
-have to outlive the `Display`. `examples/minimal.cpp` declares it right after the backend
-whose card it renders for; getting the order wrong aborts inside `vk::raii` at shutdown. The
-Rust binding keeps every output's state inside its `SceneRenderer`, and the borrow checker
-enforces the rest.
+**The renderer may die first.** Declaration order is no longer a contract. `VulkanRenderer`'s
+`Impl` is a `shared_ptr`, and `GpuTexture::Impl` / `ScanoutTarget::Impl` hold a lease on it as
+their *first* member (so it goes last); everything else with Vulkan objects is built from those
+two or dies before them. `~VulkanRenderer` drains the queue and marks the `Impl` closed, a
+resource that dies after that destroys its image on the spot, and the last one out destroys the
+device. A holder that keeps a `VulkanRenderer*` and still wants to *call* it looks at `alive()`
+first: `Frame` then answers failures, `LinuxDmabuf` and `ScreencopyManager` take their
+no-renderer path. A dying `SceneRenderer` unbinds every `SceneOutput` and drops its GPU objects;
+`Cursor` and `ScreenManager` check `SceneRenderer::alive()` and go inert. A new holder of a raw
+renderer pointer follows the same pattern, and a new resource with `vk::raii` members takes a
+lease as its first member; `tests/test_renderer_lifetime.cpp` declares everything in the order
+that used to abort and runs under the validation layer (run it under ASan too). The Rust
+binding has the borrow checker on top.
 
 **Frame callbacks belong to whoever presents.** `wl_surface.frame` is NOT answered on commit
 — answering there makes clients render frames the display never shows. They queue until
@@ -413,8 +442,8 @@ works the same way: `Surface::damage()` accumulates until whoever rendered it ca
 `clear_damage()`. The one exception is `Presented::unchanged`: nothing was committed, so no
 `present` follows, and the same `send_frame_done()` has to happen in the `frame` handler
 instead — a client that commits without damaging anything is otherwise frozen for good.
-`SceneRenderer` does all of this itself; only a compositor that drives `Frame` directly still
-owes it. Note that headless reports a `present` before *every* frame, committed or not, so
+`SceneRenderer` (and so `ScreenManager`) does all of this itself; only a compositor that drives
+`Frame` directly still owes it. Note that headless reports a `present` before *every* frame, committed or not, so
 headless alone never shows a missing `unchanged` release — DRM does.
 
 ## Conventions that matter here
