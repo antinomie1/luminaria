@@ -69,6 +69,11 @@ public:
     [[nodiscard]] Box primary_box() const noexcept {
         return outputs_.empty() ? Box{} : outputs_.front().box;
     }
+    /// Its scale: what a window with no better idea should render at, and 1 when
+    /// there are none.
+    [[nodiscard]] int primary_scale() const noexcept {
+        return outputs_.empty() ? 1 : outputs_.front().output->scale();
+    }
 
     [[nodiscard]] const std::vector<OutputBox>& outputs() const noexcept { return outputs_; }
     [[nodiscard]] bool empty() const noexcept { return outputs_.empty(); }

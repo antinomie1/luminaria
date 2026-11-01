@@ -39,6 +39,20 @@ template <class T>
     return std::move(*result);
 }
 
+/// For a `main()` with nothing better to do with a failure: the value, or
+/// "`what`: message" on stderr and exit(1). Never from library code, and never
+/// from anything that runs after startup.
+template <class T>
+T must(Result<T> result, std::string_view what) {
+    if (!result) {
+        std::println(std::cerr, "{}: {}", what, result.error().message);
+        std::exit(1);
+    }
+    if constexpr (!std::is_void_v<T>) {
+        return std::move(*result);
+    }
+}
+
 /// Success sentinel for Status-returning functions: `return ok();`
 [[nodiscard]] inline Status ok() {
     return Status{};

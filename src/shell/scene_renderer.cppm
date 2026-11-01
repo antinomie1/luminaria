@@ -69,7 +69,9 @@ using SceneCursorSource = std::function<SceneCursor(const Output& output)>;
 /// destroyed or when it is itself destroyed, whichever comes first, so dropping
 /// it in an `Output::destroy` handler is as safe as never dropping it.
 ///
-/// Move-only, and it must not outlive the `SceneRenderer` that filled it.
+/// Move-only. It may outlive the `SceneRenderer` that filled it: a renderer that
+/// dies first unbinds every state on its way out and takes their GPU objects
+/// with it, and a state nobody bound again simply holds nothing.
 class SceneOutput {
 public:
     SceneOutput();
@@ -112,6 +114,10 @@ public:
     [[nodiscard]] VulkanRenderer* gpu() noexcept;
     /// Why there is none. Empty when there is.
     [[nodiscard]] std::string_view gpu_error() const noexcept;
+    /// The `linux-dmabuf` global for this GPU: clients hand over dmabufs, and
+    /// they are imported with no copy. Nothing when there is no GPU, or when the
+    /// machine has no render node to advertise.
+    [[nodiscard]] std::optional<LinuxDmabuf> linux_dmabuf(Display& display);
 
     /// Where presentation feedback goes. Null (the default) sends none; frame
     /// callbacks are released either way. Borrowed: it must outlive every
@@ -169,6 +175,10 @@ public:
 
     /// Frames `present()` has finished so far, by outcome.
     [[nodiscard]] SceneStats stats() const noexcept;
+
+    /// Expired once this renderer has been destroyed, for whatever keeps a
+    /// `SceneRenderer*` (`Cursor`, `ScreenManager`) and may outlive it.
+    [[nodiscard]] std::weak_ptr<const void> alive() const noexcept;
 
     struct Impl;
 
@@ -295,6 +305,9 @@ struct SceneOutput::Impl {
 
     void bind(SceneRenderer::Impl& renderer, Output& out);
     void unbind() noexcept;
+    /// Everything built with the renderer's GPU. Sized for a mode, so a mode
+    /// change drops the first half of it and a dying renderer drops all of it.
+    void drop_gpu() noexcept;
     void presented(const PresentEvent& event);
     void send_frame_done(std::uint32_t time_ms);
 };
@@ -314,15 +327,21 @@ struct SceneRenderer::Impl {
     Presentation* presentation = nullptr;
     // Every bound output, so the pointer can be moved on all of them at once.
     std::vector<SceneOutput::Impl*> outputs;
+    // What `SceneRenderer::alive()` hands out weak references to.
+    std::shared_ptr<const void> life = std::make_shared<char>();
 
     Impl() = default;
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
     ~Impl() {
-        // States are meant to die first; one that did not must not unregister
-        // itself from a renderer that is already gone.
-        for (SceneOutput::Impl* state : outputs) {
-            state->owner = nullptr;
+        life.reset();
+        // Whichever order a compositor declared things in, every state lets go
+        // here: unbound, GPU objects dropped while the renderer they came from
+        // is still whole. unbind() erases from `outputs`, so never iterate it.
+        while (!outputs.empty()) {
+            SceneOutput::Impl* state = outputs.back();
+            state->unbind();
+            state->drop_gpu();
         }
     }
 
@@ -629,6 +648,14 @@ void SceneOutput::Impl::unbind() noexcept {
     format.reset();
 }
 
+void SceneOutput::Impl::drop_gpu() noexcept {
+    frame.reset();
+    images.clear();
+    groups.clear();
+    blurs.clear();
+    xray = {};
+}
+
 void SceneOutput::Impl::send_frame_done(std::uint32_t time_ms) {
     if (frame.has_value() && !drew_on_cpu) {
         frame->send_frame_done(time_ms);
@@ -695,6 +722,13 @@ bool SceneRenderer::gpu_enabled() const noexcept { return impl_->gpu != nullptr;
 VulkanRenderer* SceneRenderer::gpu() noexcept { return impl_->gpu.get(); }
 
 std::string_view SceneRenderer::gpu_error() const noexcept { return impl_->gpu_error; }
+
+std::optional<LinuxDmabuf> SceneRenderer::linux_dmabuf(Display& display) {
+    if (impl_->gpu == nullptr) {
+        return std::nullopt;
+    }
+    return to_optional(LinuxDmabuf::create(display, impl_->gpu.get()));
+}
 
 void SceneRenderer::set_presentation(Presentation* presentation) noexcept {
     impl_->presentation = presentation;
@@ -768,6 +802,10 @@ void SceneRenderer::update_cursor() {
 }
 
 SceneStats SceneRenderer::stats() const noexcept { return impl_->stats; }
+
+std::weak_ptr<const void> SceneRenderer::alive() const noexcept {
+    return impl_ != nullptr ? impl_->life : std::shared_ptr<const void>{};
+}
 
 Result<SceneOutcome> SceneRenderer::present(SceneOutput& state, Output& output,
                                             std::span<const SceneItem> scene, Color background) {

@@ -212,6 +212,12 @@ struct ToplevelTarget;
 
 struct ScreencopyManager::Impl {
     wl_display* display = nullptr;
+    // Null while there is none, or once it has been destroyed: the manager may
+    // outlive it, so nothing reads `renderer` except through this.
+    [[nodiscard]] VulkanRenderer* gpu() const noexcept {
+        return renderer_alive.expired() ? nullptr : renderer;
+    }
+    std::weak_ptr<const void> renderer_alive;
     VulkanRenderer* renderer = nullptr; // set → dmabuf targets advertised/writable,
                                         // and window captures composite on the GPU
     dev_t render_dev = 0;               // DRM render node dev_t (for ext dmabuf_device)
@@ -436,7 +442,7 @@ void wlr_frame_do_copy(WlrFrame* f, wl_resource* buffer, bool with_damage) {
     }
 
     const bool wrote = shm ? write_shm_rgba(buffer, rgba, cap_w, cap_h, shm_stride)
-                           : write_dmabuf_rgba(f->mgr->renderer, buffer, rgba, cap_w, cap_h);
+                           : write_dmabuf_rgba(f->mgr->gpu(), buffer, rgba, cap_w, cap_h);
     if (!wrote) {
         zwlr_screencopy_frame_v1_send_failed(f->resource);
         return;
@@ -512,7 +518,7 @@ void wlr_manager_capture_output(wl_client* client, wl_resource* mgr_resource, ui
                                            static_cast<uint32_t>(out->width * 4));
     // v3: advertise dmabuf targets (if enabled), then end enumeration.
     if (version >= 3) {
-        if (mgr->renderer) {
+        if (mgr->gpu()) {
             zwlr_screencopy_frame_v1_send_linux_dmabuf(frame_res, DRM_FORMAT_XRGB8888,
                                                        static_cast<uint32_t>(out->width),
                                                        static_cast<uint32_t>(out->height));
@@ -557,7 +563,7 @@ void wlr_manager_capture_output_region(wl_client* client, wl_resource* mgr_resou
                                            static_cast<uint32_t>(ch),
                                            static_cast<uint32_t>(cw * 4));
     if (version >= 3) {
-        if (mgr->renderer) {
+        if (mgr->gpu()) {
             zwlr_screencopy_frame_v1_send_linux_dmabuf(frame_res, DRM_FORMAT_XRGB8888,
                                                        static_cast<uint32_t>(cw),
                                                        static_cast<uint32_t>(ch));
@@ -856,7 +862,7 @@ void ext_frame_deliver(ExtFrame* f, const std::vector<uint8_t>& rgba, int cap_w,
         }
     } else {
         // write_dmabuf_rgba() re-derives and validates the dmabuf's own layout.
-        wrote = write_dmabuf_rgba(f->mgr->renderer, f->attached_buffer, rgba, cap_w, cap_h);
+        wrote = write_dmabuf_rgba(f->mgr->gpu(), f->attached_buffer, rgba, cap_w, cap_h);
     }
     if (!wrote) {
         ext_image_copy_capture_frame_v1_send_failed(f->resource,
@@ -881,7 +887,7 @@ void ext_send_constraints(ScreencopyManager::Impl* mgr, wl_resource* session_res
     ext_image_copy_capture_session_v1_send_buffer_size(session_res,
         static_cast<uint32_t>(width), static_cast<uint32_t>(height));
     ext_image_copy_capture_session_v1_send_shm_format(session_res, WL_SHM_FORMAT_ARGB8888);
-    if (mgr->renderer && mgr->has_dev) {
+    if (mgr->gpu() && mgr->has_dev) {
         struct wl_array dev;
         wl_array_init(&dev);
         std::memcpy(wl_array_add(&dev, sizeof(dev_t)), &mgr->render_dev, sizeof(dev_t));
@@ -889,7 +895,7 @@ void ext_send_constraints(ScreencopyManager::Impl* mgr, wl_resource* session_res
         wl_array_release(&dev);
 
         for (uint32_t fmt : {DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888}) {
-            auto mods = mgr->renderer->dmabuf_modifiers(fmt);
+            auto mods = mgr->gpu()->dmabuf_modifiers(fmt);
             if (mods.empty()) {
                 mods.push_back(DRM_FORMAT_MOD_LINEAR);
             }
@@ -978,7 +984,7 @@ GpuTexture* capture_texture(ToplevelTarget& target, Surface& surface) {
     entry->live = false;
 
     if (DmabufPlane plane{}; surface.current_buffer_dmabuf(plane)) {
-        if (auto imported = target.mgr->renderer->import_texture(plane)) {
+        if (auto imported = target.mgr->gpu()->import_texture(plane)) {
             entry->texture.emplace(std::move(*imported));
             entry->live = true;
             return &*entry->texture;
@@ -994,7 +1000,7 @@ GpuTexture* capture_texture(ToplevelTarget& target, Surface& surface) {
         entry->buffer = nullptr;
         return nullptr;
     }
-    if (auto uploaded = target.mgr->renderer->upload_texture(width, height, rgba)) {
+    if (auto uploaded = target.mgr->gpu()->upload_texture(width, height, rgba)) {
         entry->texture.emplace(std::move(*uploaded));
         return &*entry->texture;
     }
@@ -1010,7 +1016,7 @@ GpuTexture* capture_texture(ToplevelTarget& target, Surface& surface) {
 /// drawable, an allocation that failed — and the caller falls back to the CPU.
 bool toplevel_render_gpu(ToplevelTarget& target, Toplevel& tl, const Box& box, int scale,
                          int& width, int& height, std::vector<std::uint8_t>& rgba) {
-    VulkanRenderer* renderer = target.mgr->renderer;
+    VulkanRenderer* renderer = target.mgr->gpu();
     if (renderer == nullptr) {
         return false;
     }
@@ -1784,6 +1790,8 @@ void ScreencopyManager::set_toplevel_capture(ToplevelCaptureFunc fn) {
 
 void ScreencopyManager::set_renderer(VulkanRenderer* renderer) {
     impl_->renderer = (renderer != nullptr && renderer->dmabuf_supported()) ? renderer : nullptr;
+    impl_->renderer_alive = impl_->renderer != nullptr ? impl_->renderer->alive()
+                                                       : std::weak_ptr<const void>{};
     // dev_t of the render node clients should allocate dmabufs on (ext protocol).
     struct stat st;
     if (impl_->renderer != nullptr && stat("/dev/dri/renderD128", &st) == 0) {

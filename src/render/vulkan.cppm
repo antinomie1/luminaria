@@ -660,6 +660,16 @@ public:
                                      std::uint64_t modifier,
                                      const std::vector<std::uint8_t> &rgba);
 
+  /// Expired once this renderer has been destroyed. For whatever keeps a
+  /// `VulkanRenderer*` past its own construction (`Frame`, `LinuxDmabuf`,
+  /// `ScreencopyManager`): such a holder may outlive the renderer, as long as
+  /// it looks here before it calls.
+  ///
+  /// Textures and targets need no such check. Each keeps the device alive by
+  /// itself, so they can be destroyed before or after the renderer, in any
+  /// order; `create_*` / `import_*` / `render_*` are what need a live renderer.
+  [[nodiscard]] std::weak_ptr<const void> alive() const noexcept;
+
 private:
   // A GpuTexture caches a descriptor set the renderer owns, and hands it back
   // when it dies; it and ScanoutTarget also hand back images a submit may
@@ -687,7 +697,10 @@ private:
                                  float noise, float saturation);
 
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  // Shared, and that is the whole of what makes teardown order-independent:
+  // every texture and target leases the Impl (and so the VkDevice) it was made
+  // from, and the last one out turns off the lights.
+  std::shared_ptr<Impl> impl_;
   explicit VulkanRenderer(std::unique_ptr<Impl> impl) noexcept;
 };
 
@@ -877,6 +890,29 @@ struct VulkanRenderer::Impl {
   std::vector<RetiredImage> retiring_images;
   std::uint32_t sets_in_pool = 0; ///< allocated out of set_pools.back()
 
+  // What `VulkanRenderer::alive()` hands out weak references to.
+  std::shared_ptr<const void> life = std::make_shared<char>();
+  // The VulkanRenderer is gone; this Impl only lingers for the leases. The
+  // queue was drained on the way out, so nothing retires any more: a resource
+  // that dies from here on is destroyed on the spot.
+  bool closed = false;
+
+  /// The VulkanRenderer is going away. Renders submitted without a CPU wait
+  /// may still be running, so drain before anything can be destroyed.
+  void close() noexcept {
+    closed = true;
+    life.reset();
+    if (!in_flight.empty()) {
+      try {
+        queue.waitIdle();
+      } catch (const std::exception &) {
+        // A lost device has nothing left to wait for.
+      }
+      in_flight.clear();
+    }
+    retiring_images.clear(); // drained above, or never submitted
+  }
+
   QuadPipeline &quad_pipeline(vk::Format format);
   vk::raii::Pipeline &effect_pipeline(const FragmentShader &shader,
                                       QuadPipeline &quad);
@@ -1040,18 +1076,24 @@ std::optional<DrmDeviceId> drm_device_id(const std::string &path) noexcept {
 VulkanRenderer::VulkanRenderer(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 VulkanRenderer::~VulkanRenderer() {
-  // Renders submitted without a CPU wait may still be running. Tearing down
-  // the device out from under them is undefined behaviour, so drain first.
-  if (impl_ && !impl_->in_flight.empty()) {
-    impl_->queue.waitIdle();
-    impl_->in_flight.clear();
-  }
   if (impl_) {
-    impl_->retiring_images.clear(); // drained above, or never submitted
+    impl_->close();
   }
 }
 VulkanRenderer::VulkanRenderer(VulkanRenderer &&) noexcept = default;
-VulkanRenderer &VulkanRenderer::operator=(VulkanRenderer &&) noexcept = default;
+VulkanRenderer &VulkanRenderer::operator=(VulkanRenderer &&other) noexcept {
+  if (this != &other) {
+    if (impl_) {
+      impl_->close();
+    }
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
+
+std::weak_ptr<const void> VulkanRenderer::alive() const noexcept {
+  return impl_ != nullptr ? impl_->life : std::shared_ptr<const void>{};
+}
 
 std::uint64_t VulkanRenderer::submission_count() const noexcept {
   return impl_->submits;
@@ -1991,6 +2033,8 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height,
 // =============================================================================
 
 struct GpuTexture::Impl {
+  // First, so it is destroyed last: everything below is a child of this device.
+  std::shared_ptr<VulkanRenderer::Impl> device_lease;
   vk::raii::Image image;
   vk::raii::DeviceMemory memory;
   vk::raii::ImageView view;
@@ -2026,6 +2070,8 @@ struct VulkanRenderTarget {
 };
 
 struct ScanoutTarget::Impl {
+  // First, so it is destroyed last: everything below is a child of this device.
+  std::shared_ptr<VulkanRenderer::Impl> device_lease;
   vk::raii::Image image;
   vk::raii::DeviceMemory memory;
   vk::raii::ImageView view;
@@ -2078,8 +2124,9 @@ GpuTexture::GpuTexture(std::unique_ptr<Impl> impl) noexcept
 GpuTexture::~GpuTexture() {
   // `owner` is set the first time the texture is drawn. Never drawn, nothing
   // can still be reading it, and its image goes now; drawn, it waits for the
-  // GPU with its descriptor set.
-  if (impl_ && impl_->owner != nullptr) {
+  // GPU with its descriptor set — unless the renderer has already gone, which
+  // drained the queue, and then the image can go now as well.
+  if (impl_ && impl_->owner != nullptr && !impl_->owner->closed) {
     VulkanRenderer::Impl &owner = *impl_->owner;
     owner.retire_set(impl_->set);
     owner.retiring_images.push_back(
@@ -2156,7 +2203,8 @@ ScanoutTarget::ScanoutTarget(std::unique_ptr<Impl> impl) noexcept
 ScanoutTarget::~ScanoutTarget() {
   // Rendered into at least once: the last submit may still be writing it, so
   // the image waits for the timeline like a dead texture does.
-  if (impl_ && impl_->owner != nullptr && impl_->has_content) {
+  if (impl_ && impl_->owner != nullptr && impl_->has_content &&
+      !impl_->owner->closed) {
     VulkanRenderer::Impl &owner = *impl_->owner;
     owner.retiring_images.push_back(
         RetiredImage{std::move(impl_->memory), std::move(impl_->image),
@@ -2641,7 +2689,7 @@ Result<GpuTexture> VulkanRenderer::import_texture(const DmabufPlane &p) {
     vk::raii::ImageView view = make_sampler_view(
         impl_->device, img.image, fmt, p.format == DRM_FORMAT_XRGB8888);
     return GpuTexture{std::make_unique<GpuTexture::Impl>(
-        GpuTexture::Impl{std::move(img.image), std::move(img.memory),
+        GpuTexture::Impl{impl_, std::move(img.image), std::move(img.memory),
                          std::move(view), p.width, p.height, true})};
   } catch (const std::exception &e) {
     return fail(std::string{"vulkan texture import: "} + e.what());
@@ -2732,8 +2780,8 @@ VulkanRenderer::upload_texture(int width, int height,
     vk::raii::ImageView view = make_sampler_view(
         impl_->device, image, vk::Format::eR8G8B8A8Unorm, false);
     return GpuTexture{std::make_unique<GpuTexture::Impl>(
-        GpuTexture::Impl{std::move(image), std::move(memory), std::move(view),
-                         width, height, false})};
+        GpuTexture::Impl{impl_, std::move(image), std::move(memory),
+                         std::move(view), width, height, false})};
   } catch (const std::exception &e) {
     return fail(std::string{"vulkan texture upload: "} + e.what());
   }
@@ -2811,8 +2859,8 @@ Result<OffscreenTarget> VulkanRenderer::create_offscreen(int width,
 
     vk::raii::ImageView view = make_sampler_view(device, image, format, false);
     GpuTexture texture{std::make_unique<GpuTexture::Impl>(
-        GpuTexture::Impl{std::move(image), std::move(memory), std::move(view),
-                         width, height, false})};
+        GpuTexture::Impl{impl_, std::move(image), std::move(memory),
+                         std::move(view), width, height, false})};
     return OffscreenTarget{std::make_unique<OffscreenTarget::Impl>(
         OffscreenTarget::Impl{std::move(texture), format})};
   } catch (const std::exception &e) {
@@ -2918,8 +2966,8 @@ VulkanRenderer::create_scanout(int width, int height, std::uint32_t drm_format,
     // Aggregate-new, not make_unique: Impl closes the fd in its destructor,
     // which costs it the implicit move constructor.
     auto target = std::unique_ptr<ScanoutTarget::Impl>(new ScanoutTarget::Impl{
-        std::move(image), std::move(memory), std::move(view), fmt, plane, false,
-        UniqueFd{}, std::nullopt, std::nullopt, nullptr, true});
+        impl_, std::move(image), std::move(memory), std::move(view), fmt, plane,
+        false, UniqueFd{}, std::nullopt, std::nullopt, nullptr, true});
     target->owner = impl_.get();
     return ScanoutTarget{std::move(target)};
   } catch (const std::exception &e) {

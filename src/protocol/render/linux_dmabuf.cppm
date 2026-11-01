@@ -218,6 +218,7 @@ public:
 struct GlobalData {
     gbm_device* gbm = nullptr;
     VulkanRenderer* renderer = nullptr;
+    std::weak_ptr<const void> renderer_alive;
     std::vector<FormatMods> formats;
     DmabufFormatTable table;
     dev_t main_device = 0; // the render node clients are told to open
@@ -251,6 +252,9 @@ struct DmabufBuffer final : ClientBuffer {
     uint32_t stride = 0;
     uint64_t modifier = DRM_FORMAT_MOD_INVALID;
     VulkanRenderer* renderer = nullptr; // for non-LINEAR import
+    // A client's buffer outlives the renderer as readily as it outlives the
+    // global, so `renderer` is only good for as long as this says.
+    std::weak_ptr<const void> renderer_alive;
 
     ~DmabufBuffer() {
         if (fd >= 0) {
@@ -271,6 +275,7 @@ struct Params {
     bool have_plane0 = false;
     bool used = false;
     VulkanRenderer* renderer = nullptr;
+    std::weak_ptr<const void> renderer_alive;
     DmabufBuffer plane0; // only plane_idx 0 is kept (single-plane ARGB/XRGB)
 };
 
@@ -350,6 +355,7 @@ wl_resource* build_buffer(wl_client* client, wl_resource* params_resource, uint3
     buf->stride = p->plane0.stride;
     buf->modifier = p->plane0.modifier;
     buf->renderer = p->renderer;
+    buf->renderer_alive = p->renderer_alive;
     p->plane0.fd = -1;
     p->have_plane0 = false;
     install_client_buffer(buffer, std::move(buf));
@@ -391,6 +397,7 @@ void dmabuf_create_params(wl_client* client, wl_resource* resource, uint32_t par
     }
     auto* params = new Params{};
     params->renderer = global_of(resource)->renderer;
+    params->renderer_alive = global_of(resource)->renderer_alive;
     wl_resource_set_implementation(r, &params_impl, params, params_resource_destroy);
 }
 
@@ -555,6 +562,9 @@ Result<LinuxDmabuf> LinuxDmabuf::create(Display& display, VulkanRenderer* render
         return fail("linux-dmabuf: no usable DRM render node");
     }
     impl->data.renderer = (renderer != nullptr && renderer->dmabuf_supported()) ? renderer : nullptr;
+    if (impl->data.renderer != nullptr) {
+        impl->data.renderer_alive = impl->data.renderer->alive();
+    }
 
     // Build the advertised (format, modifiers) list: the GPU's modifiers when a
     // renderer is present, LINEAR otherwise. LINEAR is always offered (mmap path).
@@ -639,7 +649,7 @@ bool DmabufBuffer::rgba(std::vector<std::uint8_t>& out, int& width, int& height)
     if (is_linear(modifier)) {
         return linear_to_rgba(this, out, width, height);
     }
-    if (renderer == nullptr) {
+    if (renderer == nullptr || renderer_alive.expired()) {
         return false;
     }
     auto pixels = renderer->import_dmabuf(fd, width_value, height_value, format, offset, stride,

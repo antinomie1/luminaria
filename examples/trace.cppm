@@ -4,6 +4,11 @@
 // Everything here only listens: the backend, the layout, the shell and the
 // renderer's own frame counts. An idle screen asks for no frames at all, so
 // the `frames/s` line stops appearing — which is the point of printing it.
+// Unset, constructing one does nothing.
+module;
+
+#include <cstdio>
+
 export module minimal_trace;
 
 import luminaria.shell;
@@ -17,6 +22,10 @@ class Trace {
 public:
     Trace(lm::Display& display, lm::AutoBackend& backend, lm::SceneRenderer& renderer,
           lm::OutputLayout& layout, lm::XdgShell& shell) {
+        if (const char* on = std::getenv("LUMINARIA_TRACE"); on == nullptr || *on == '\0') {
+            return;
+        }
+        std::setvbuf(stdout, nullptr, _IOLBF, 0); // read through a pipe by tty-check.sh
         const lm::BackendKind kind = backend.kind();
         const bool on_drm = kind == lm::BackendKind::drm;
         if (backend.session() != nullptr) {

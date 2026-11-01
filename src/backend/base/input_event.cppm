@@ -17,8 +17,20 @@ import :signal;
 
 export namespace luminaria {
 
+// xkb's core modifier bits, for matching bindings against `ModifiersEvent::held()`.
+struct Mod {
+    static constexpr uint32_t shift = 1u << 0, ctrl = 1u << 2, alt = 1u << 3, logo = 1u << 6;
+    // The four a binding is made of. Caps and Num Lock are left out on purpose:
+    // a binding must not stop working because a lock is on.
+    static constexpr uint32_t bindable = shift | ctrl | alt | logo;
+};
 struct ModifiersEvent {
     uint32_t depressed, latched, locked, group; // xkb modifier masks + layout group
+
+    // What is held down for a binding: pressed or latched, `Mod::bindable` only.
+    [[nodiscard]] constexpr uint32_t held() const noexcept {
+        return (depressed | latched) & Mod::bindable;
+    }
 };
 // `keysym` and `modifiers` are the backend's own reading of the key, against
 // the keymap `InputSource::keymap()` returns and in the state from BEFORE this

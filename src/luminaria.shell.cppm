@@ -6,9 +6,12 @@
 // threading, direct scanout), `SceneItem` + `SceneRenderer` (one ordered
 // primitive list drawn by whichever of GPU and CPU this machine has, and
 // hit-tested against the same list), `Cursor`, `CursorManager`, `LayerSurface`,
-// `PopupTree`, `DirectScanout`, and `AutoBackend` — the pick between nested,
-// bare metal and headless, which is a policy decision and therefore lives above
-// the two modules it chooses between.
+// `PopupTree`, `DirectScanout`, `AutoBackend` — the pick between nested, bare
+// metal and headless, which is a policy decision and therefore lives above the
+// two modules it chooses between — and the two that close the wiring every
+// compositor would otherwise write: `ScreenManager` (an output from arrival to
+// removal, given a scene builder) and `DefaultInputRouter` (input, given what a
+// key or a click means).
 //
 // Still immediate-mode: nothing here survives a frame except memory (ADR 0001).
 // This module re-exports `luminaria.backend` and `luminaria.render`, so a
@@ -23,6 +26,7 @@ export import :auto_backend;
 export import :cursor;
 export import :cursor_manager;
 export import :cursor_theme;
+export import :default_input_router;
 export import :direct_scanout;
 export import :frame;
 export import :layer;
@@ -30,3 +34,4 @@ export import :pointer;
 export import :popup;
 export import :scene;
 export import :scene_renderer;
+export import :screen_manager;

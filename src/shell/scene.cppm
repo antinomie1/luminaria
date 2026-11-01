@@ -133,6 +133,14 @@ struct SceneItem {
     Box shadow_box{};
 };
 
+/// `toplevel` as a scene item with its window geometry at (`x`, `y`): a client's
+/// shadow sits outside its geometry, so the geometry, not the buffer, is what
+/// lands there. A window that has not set a geometry is placed by its surface.
+///
+/// Tagged with the `Toplevel*`, which is what a hit on it, on its subsurfaces or
+/// on the popups `PopupTree::append_to()` puts above it hands back.
+[[nodiscard]] SceneItem toplevel_item(Toplevel& toplevel, int x, int y);
+
 /// What is under a point.
 ///
 /// `surface` is resolved at the moment of the hit and must not be retained past
@@ -174,6 +182,18 @@ SceneHit scene_route_pointer(Seat& seat, std::span<const SceneItem> scene, doubl
 
 // --------------------------------------------------------------- implementation
 namespace luminaria {
+
+SceneItem toplevel_item(Toplevel& toplevel, int x, int y) {
+    Surface& root = toplevel.surface();
+    const XdgGeometry g = toplevel.geometry();
+    const bool framed = g.width > 0 && g.height > 0;
+    return {.box = {x, y, framed ? g.width : root.surface_width(),
+                    framed ? g.height : root.surface_height()},
+            .surface = root.id(),
+            .x = x - (framed ? g.x : 0),
+            .y = y - (framed ? g.y : 0),
+            .tag = reinterpret_cast<std::uintptr_t>(&toplevel)};
+}
 
 SceneHit scene_hit_test(std::span<const SceneItem> scene, double x, double y) {
     const int ix = static_cast<int>(std::floor(x));

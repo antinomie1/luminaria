@@ -509,6 +509,7 @@ local shell_tests = {
     test_layer_shell = true, test_popup = true, test_scene = true, test_subsurface = true,
     test_cursor_theme = true, test_cursor_capture = true, test_screencopy_bounds = true,
     test_syncobj = true, test_render_output = true, test_drm_hotplug = true,
+    test_screen_manager = true, test_input_router = true, test_renderer_lifetime = true,
 }
 local desktop_tests = {
     test_data_control = true, test_foreign_toplevel = true, test_input_method = true,

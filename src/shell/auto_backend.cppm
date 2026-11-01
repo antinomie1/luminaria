@@ -15,10 +15,10 @@
 // DRM then also runs without a session (VT switching is unsafe, see
 // session.cppm; `session_error()` says why there is none).
 //
-// What stays the caller's: reading the environment (`parse_backend_kind` turns
-// the usual auto|nested|drm|headless string into a kind), and everything after
-// the pick — the outputs arrive through `backend().new_output` at `start()`,
-// input through `input()`.
+// What stays the caller's is everything after the pick: the outputs arrive
+// through `backend().new_output` at `start()`, input through `input()`.
+// `backend_options_from_env()` reads the usual environment variables, for a
+// compositor that wants them; nothing here reads the environment by itself.
 
 module;
 
@@ -58,6 +58,12 @@ struct BackendOptions {
   std::string title = "luminaria";
 };
 
+/// `LUMINARIA_BACKEND` (auto|nested|drm|headless) and the card: `drm_device`
+/// when it is not empty — a compositor's command line — else
+/// `LUMINARIA_DRM_DEVICE`. Fails on a `LUMINARIA_BACKEND` it cannot read.
+[[nodiscard]] Result<BackendOptions>
+backend_options_from_env(std::string_view drm_device = {});
+
 class AutoBackend {
 public:
   /// Pick and create the backend. Nothing is started: subscribe to
@@ -78,7 +84,7 @@ public:
   /// Where input comes from: the nested backend, or libinput on DRM. Null
   /// headless.
   [[nodiscard]] InputSource *input() noexcept;
-  /// Non-null when nested: its `close_requested` is the caller's to answer.
+  /// Non-null when nested.
   [[nodiscard]] WaylandBackend *nested() noexcept;
   /// Non-null on DRM.
   [[nodiscard]] DrmBackend *drm() noexcept;
@@ -95,6 +101,10 @@ public:
   /// renders is the one behind the display.
   [[nodiscard]] const VulkanOptions &vulkan_options() const noexcept;
 
+  /// The parent compositor asked the nested window to close. Advisory: ending
+  /// the session over it is the caller's decision. Never fires off nested, so
+  /// a compositor can connect to it without asking which backend it got.
+  [[nodiscard]] Signal<HostCloseRequest> &close_requested() noexcept;
   /// Emitted on DRM if the GPU device is removed.
   [[nodiscard]] Signal<DrmDeviceRemoved> &gpu_removed() noexcept;
   /// Emitted on DRM if a new GPU device is detected.
@@ -128,6 +138,8 @@ struct AutoBackend::Impl {
   BackendKind kind = BackendKind::headless;
   std::string session_error;
   VulkanOptions vulkan;
+  Signal<HostCloseRequest> close_requested;
+  Signal<HostCloseRequest>::Connection nested_close_conn;
   Signal<DrmDeviceRemoved> gpu_removed;
   Signal<DrmDeviceAdded> gpu_added;
   Signal<DrmDeviceRemoved>::Connection drm_removed_conn;
@@ -159,6 +171,24 @@ std::string_view backend_kind_name(BackendKind kind) noexcept {
   return "auto";
 }
 
+Result<BackendOptions> backend_options_from_env(std::string_view drm_device) {
+  BackendOptions options;
+  if (const char *want = std::getenv("LUMINARIA_BACKEND"); want != nullptr) {
+    Result<BackendKind> kind = parse_backend_kind(want);
+    if (!kind) {
+      return std::unexpected(kind.error());
+    }
+    options.kind = *kind;
+  }
+  if (!drm_device.empty()) {
+    options.drm_device = drm_device;
+  } else if (const char *card = std::getenv("LUMINARIA_DRM_DEVICE");
+             card != nullptr) {
+    options.drm_device = card;
+  }
+  return options;
+}
+
 AutoBackend::AutoBackend(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 AutoBackend::~AutoBackend() = default;
@@ -178,6 +208,11 @@ Result<AutoBackend> AutoBackend::create(EventLoop loop,
       impl->nested = owned.get();
       impl->backend = std::move(owned);
       impl->kind = BackendKind::nested;
+      // `impl` is on the heap, so the signal's address survives the moves.
+      impl->nested_close_conn = impl->nested->close_requested.connect(
+          [raw = impl.get()](HostCloseRequest &e) {
+            raw->close_requested.emit(e);
+          });
       return AutoBackend{std::move(impl)};
     } else if (!any) {
       return std::unexpected(wb.error());
@@ -261,6 +296,10 @@ std::string_view AutoBackend::session_error() const noexcept {
 
 const VulkanOptions &AutoBackend::vulkan_options() const noexcept {
   return impl_->vulkan;
+}
+
+Signal<HostCloseRequest> &AutoBackend::close_requested() noexcept {
+  return impl_->close_requested;
 }
 
 Signal<DrmDeviceRemoved> &AutoBackend::gpu_removed() noexcept {

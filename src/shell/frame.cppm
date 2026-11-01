@@ -631,6 +631,10 @@ struct FrPlacementKey {
 struct Frame::Impl {
   Output *output = nullptr;
   VulkanRenderer *renderer = nullptr;
+  // A Frame may outlive its renderer. Everything it caches stays safe to
+  // destroy (each texture and target leases the device), but `renderer` must
+  // not be called once this has expired, so every way in checks it first.
+  std::weak_ptr<const void> renderer_alive;
   std::uint32_t format = 0;
 
   // Sized for the output's mode; rebuilt by reset().
@@ -831,6 +835,9 @@ Status Frame::Impl::render_group(std::size_t first_placement,
                                  std::size_t last_placement,
                                  OffscreenTarget &target, const Box &bounds,
                                  int scale, bool consume) {
+  if (renderer_alive.expired()) {
+    return fail("renderer is gone");
+  }
   group_fills.clear();
   group_opaque.clear();
   group_acquire_fences.clear();
@@ -945,6 +952,9 @@ Status Frame::Impl::render_group(std::size_t first_placement,
 }
 
 GpuTexture *Frame::Impl::texture_for(Surface &surface) {
+  if (renderer_alive.expired()) {
+    return nullptr;
+  }
   std::erase_if(texture_cache,
                 [](const std::unique_ptr<FrSurfaceTexture> &entry) {
                   return !entry->surface.valid();
@@ -1028,6 +1038,7 @@ Frame::Frame(Output &output, VulkanRenderer &renderer)
     : impl_(std::make_unique<Impl>()) {
   impl_->output = &output;
   impl_->renderer = &renderer;
+  impl_->renderer_alive = renderer.alive();
   Impl *raw = impl_.get();
   impl_->surface_invalidated =
       surface_invalidated().connect([raw](SurfaceInvalidated &event) {
@@ -1063,6 +1074,9 @@ bool Frame::direct_scanout_available() const noexcept {
 Status Frame::reset(std::uint32_t drm_format) {
   Impl &impl = *impl_;
   Output &output = *impl.output;
+  if (impl.renderer_alive.expired()) {
+    return fail("renderer is gone");
+  }
   VulkanRenderer &renderer = *impl.renderer;
   impl.format = drm_format;
 
@@ -1688,6 +1702,9 @@ void Frame::animate() noexcept { impl_->animating = true; }
 
 Result<std::span<const Pixel>> Frame::read_back() {
   Impl &impl = *impl_;
+  if (impl.renderer_alive.expired()) {
+    return fail("renderer is gone");
+  }
   if (impl.targets.empty()) {
     return fail("this frame has no render target to read back");
   }
@@ -1734,6 +1751,9 @@ void Frame::send_frame_done(std::uint32_t time_ms) const {
 
 Result<Presented> Frame::submit(Color background) {
   Impl &impl = *impl_;
+  if (impl.renderer_alive.expired()) {
+    return fail("renderer is gone");
+  }
   Output &output = *impl.output;
 
   // A shader is opaque to the placement diff: if it says its result changes

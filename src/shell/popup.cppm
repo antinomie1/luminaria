@@ -24,11 +24,27 @@ struct PopupTreeChange {};
 /// Not movable: it watches the shell and every popup on its own behalf.
 class PopupTree {
 public:
+    /// Where `surface` is drawn right now, in layout coordinates; nothing when
+    /// it is not drawn. What `constrain()` is asked with.
+    using SurfaceLocator = std::function<std::optional<Box>(SurfaceId surface)>;
+
     explicit PopupTree(XdgShell& shell);
+    ~PopupTree();
     PopupTree(const PopupTree&) = delete;
     PopupTree& operator=(const PopupTree&) = delete;
 
     void set_parent(Popup& popup, SurfaceId parent);
+
+    /// Answer the shell's popup constraint query: a popup stays inside the
+    /// output its parent sits on (the whole layout when the parent is in a
+    /// gap), so a menu near an edge flips or slides instead of hanging off it.
+    /// `ScreenManager::follow_popups()` does this from the scene it draws, which
+    /// is why a compositor on it never calls `XdgShell::set_popup_constraint_query()`.
+    ///
+    /// `layout` is borrowed until the tree dies or `clear_constraint()` is called.
+    void constrain(const OutputLayout& layout, SurfaceLocator locate);
+    /// Popups are placed unconstrained again.
+    void clear_constraint();
 
     /// Append mapped popups above their parents in `scene`. Submenus nest
     /// correctly because creation order is parent-first and each appended
@@ -59,6 +75,23 @@ private:
     [[nodiscard]] Entry* find(Popup& popup) noexcept;
     std::vector<Entry> entries_;
     Signal<NewPopup>::Connection on_new_;
+    // Where each candidate parent is, rebuilt by every append_to(). A member
+    // because that runs per frame: cleared, never freed, so a steady frame with
+    // a menu open allocates nothing.
+    struct Origin {
+        SurfaceId surface;
+        int x, y;
+        std::uint64_t tag;
+    };
+    mutable std::vector<Origin> origins_;
+    // The shell's query keeps this alive: the tree can die first, and the shell
+    // cannot be told then, since it may be gone already.
+    struct Constraint {
+        const OutputLayout* layout = nullptr;
+        SurfaceLocator locate;
+    };
+    std::shared_ptr<Constraint> constraint_ = std::make_shared<Constraint>();
+    XdgShell* shell_ = nullptr;
 };
 
 } // namespace luminaria
@@ -71,8 +104,37 @@ PopupTree::Entry* PopupTree::find(Popup& popup) noexcept {
     return hit == entries_.end() ? nullptr : &*hit;
 }
 
-PopupTree::PopupTree(XdgShell& shell) {
+PopupTree::PopupTree(XdgShell& shell) : shell_(&shell) {
     on_new_ = shell.new_popup().connect([this](NewPopup& e) { add(e.popup); });
+}
+
+PopupTree::~PopupTree() { clear_constraint(); }
+
+void PopupTree::constrain(const OutputLayout& layout, SurfaceLocator locate) {
+    constraint_->layout = &layout;
+    constraint_->locate = std::move(locate);
+    if (!on_new_.connected()) {
+        return; // the shell has gone; there is nobody left to ask
+    }
+    shell_->set_popup_constraint_query(
+        [constraint = constraint_](Surface& parent, Box& parent_box, Box& usable) {
+            if (constraint->layout == nullptr) {
+                return false;
+            }
+            const std::optional<Box> drawn = constraint->locate(parent.id());
+            if (!drawn.has_value()) {
+                return false;
+            }
+            parent_box = *drawn;
+            const Output* on = constraint->layout->at(drawn->x, drawn->y);
+            usable = on != nullptr ? constraint->layout->box_of(*on) : constraint->layout->bounds();
+            return !usable.empty();
+        });
+}
+
+void PopupTree::clear_constraint() {
+    constraint_->layout = nullptr;
+    constraint_->locate = {};
 }
 
 void PopupTree::notify() {
@@ -118,13 +180,8 @@ void PopupTree::remove(Popup& popup) {
 }
 
 void PopupTree::append_to(std::vector<SceneItem>& scene) const {
-    struct Origin {
-        SurfaceId surface;
-        int x, y;
-        std::uint64_t tag;
-    };
-    std::vector<Origin> origins;
-    origins.reserve(scene.size() + entries_.size());
+    std::vector<Origin>& origins = origins_;
+    origins.clear();
     for (const SceneItem& item : scene) {
         if (item.kind == SceneItem::Kind::surface) {
             origins.push_back({item.surface, item.box.x, item.box.y, item.tag});

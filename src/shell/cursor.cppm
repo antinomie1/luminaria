@@ -105,6 +105,8 @@ namespace luminaria {
 
 struct Cursor::Impl {
     SceneRenderer* renderer = nullptr;
+    // The renderer may go first; the seat and the layout keep firing after it.
+    std::weak_ptr<const void> renderer_alive;
     const OutputLayout* layout = nullptr;
     Seat* seat = nullptr;
     ScreencopyManager* capture = nullptr;
@@ -127,13 +129,16 @@ struct Cursor::Impl {
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
     ~Impl() {
-        if (renderer != nullptr) {
+        if (!renderer_alive.expired()) {
             renderer->set_cursor_source({});
         }
     }
 
     /// The picture or the position changed: every screen, and every recorder.
     void update() {
+        if (renderer_alive.expired()) {
+            return;
+        }
         renderer->update_cursor();
         if (capture != nullptr) {
             capture->notify_cursor_changed();
@@ -197,6 +202,7 @@ Cursor::Cursor(SceneRenderer& renderer, OutputLayout& layout, Seat& seat,
         self.update();
     });
     self.renderer = &renderer;
+    self.renderer_alive = renderer.alive();
     self.layout = &layout;
     self.seat = &seat;
     self.capture = capture;
