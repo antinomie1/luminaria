@@ -622,8 +622,11 @@ struct SurfaceRegistry {
     std::vector<std::uint32_t> free;
 };
 
+// Per thread, like the rest of the library: one Display to a thread is the contract,
+// and two compositors in one process (a nested pair, parallel tests) must not race
+// on each other's surfaces.
 SurfaceRegistry& surface_registry() {
-    static SurfaceRegistry registry;
+    thread_local SurfaceRegistry registry;
     return registry;
 }
 
@@ -696,7 +699,7 @@ void send_frame_done(std::span<const SurfaceId> surfaces, std::uint32_t time_ms)
 }
 
 Signal<SurfaceInvalidated>& surface_invalidated() noexcept {
-    static Signal<SurfaceInvalidated> signal;
+    thread_local Signal<SurfaceInvalidated> signal; // per thread, as the registry is
     return signal;
 }
 

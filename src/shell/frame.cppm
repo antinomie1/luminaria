@@ -999,7 +999,7 @@ GpuTexture *Frame::Impl::texture_for(Surface &surface) {
     // readback + CPU->GPU upload — the most expensive path this library
     // has. Say so once per surface; a silent fallback is a mystery a
     // year later.
-    static std::set<std::uint32_t> warned;
+    thread_local std::set<std::uint32_t> warned;
     if (warned.insert(surface.id().index).second) {
       std::cerr << "luminaria: dmabuf import failed for surface "
                 << surface.id().index << ": " << imported.error().message
