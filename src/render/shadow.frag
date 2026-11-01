@@ -27,9 +27,12 @@ float rounded_box_sdf(vec2 point, vec2 half_extent, float radius) {
 
 void main() {
     float d = rounded_box_sdf(gl_FragCoord.xy - pc.shape.xy, pc.shape.zw, pc.effect.x);
-    // smoothstep rather than a linear ramp: a linear falloff has a visible
-    // crease where it meets the window edge, which reads as a drawn outline.
-    float falloff = 1.0 - smoothstep(0.0, max(pc.effect.y, 1.0), d);
+    // Cubic, so it is densest against the box and thins out fast into a long tail,
+    // as light around a real object does. An S-curve holds near full strength for
+    // the first stretch and then drops, which reads as a dark band drawn around
+    // the box. The kink at d = 0 doesn't show: the box covers it.
+    float reach = 1.0 - clamp(d / max(pc.effect.y, 1.0), 0.0, 1.0);
+    float falloff = reach * reach * reach;
     // Nothing inside the casting box. A window is drawn over its own shadow, so
     // the fill would be invisible if it were opaque — and visibly wrong if it
     // is not, since a window must not be darkened by the shadow it casts.

@@ -130,11 +130,13 @@ int main() {
         // Nothing inside the caster: the window drawn on top of it would
         // otherwise be sitting on a bright square it cannot see.
         assert(near(value_at(pixels, 32, 32), 0));
-        // Just outside the edge, almost the full shadow colour.
-        assert(value_at(pixels, 32, 22) > 200);
-        // Halfway through the falloff, roughly half of it. smoothstep is not
-        // linear, so this is the loosest assertion in the file.
-        assert(near(value_at(pixels, 32, 20), 128, 40));
+        // Just outside the edge, the densest it gets; a fifth of the way out it
+        // has already lost nearly half. Holding near full strength here is what
+        // makes a shadow look like a band drawn around the box.
+        assert(near(value_at(pixels, 32, 23), 200, 30));
+        assert(near(value_at(pixels, 32, 22), 137, 30));
+        // Halfway through the falloff, only the tail is left.
+        assert(near(value_at(pixels, 32, 20), 45, 25));
         // And past the falloff, nothing — a shadow that reaches further than it
         // says would be repainting outside the damage its caller reported.
         assert(near(value_at(pixels, 32, 12), 0));
