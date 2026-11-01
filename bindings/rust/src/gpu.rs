@@ -176,6 +176,17 @@ impl SceneRenderer {
         LinuxDmabuf::from_scene_renderer(display, self)
     }
 
+    /// The `linux-dmabuf` global for this GPU: clients hand over dmabufs, and
+    /// they are imported with no copy. `None` when there is no GPU, or when the
+    /// machine has no render node to advertise.
+    pub fn linux_dmabuf<'a>(&'a self, display: &'a Display) -> Option<LinuxDmabuf<'a>> {
+        if self.gpu_enabled() {
+            self.create_linux_dmabuf(display).ok()
+        } else {
+            None
+        }
+    }
+
     /// Register compositor-owned image pixels for a given serial, accepting
     /// tightly-packed RGBA `&[u8]` pixels (e.g. from the `image` crate).
     pub fn set_image(
@@ -242,7 +253,7 @@ impl SceneRenderer {
 /// # Ok::<(), luminaria::core::Error>(())
 /// ```
 pub struct Cursor<'a> {
-    raw: cxx::UniquePtr<ffi::CursorShim>,
+    pub(crate) raw: cxx::UniquePtr<ffi::CursorShim>,
     _borrows: Holds<'a>,
 }
 

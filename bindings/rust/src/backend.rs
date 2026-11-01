@@ -693,8 +693,25 @@ mod bare_metal {
     /// starts, input through [`AutoBackend::input`].
     #[cfg(feature = "shell")]
     pub struct AutoBackend<'d> {
-        raw: cxx::UniquePtr<crate::ffi_shell::AutoBackendShim>,
+        pub(crate) raw: cxx::UniquePtr<crate::ffi_shell::AutoBackendShim>,
         _display: Holds<'d>,
+    }
+
+    impl BackendOptions {
+        /// `LUMINARIA_BACKEND` (auto|nested|drm|headless) and the card:
+        /// `drm_device` when given — a compositor's command line — else
+        /// `LUMINARIA_DRM_DEVICE`. Fails on a `LUMINARIA_BACKEND` it cannot
+        /// read. Everything else is the default.
+        pub fn from_env(drm_device: Option<String>) -> Result<Self, Error> {
+            let mut options = Self {
+                drm_device: drm_device.or_else(|| std::env::var("LUMINARIA_DRM_DEVICE").ok()),
+                ..Self::default()
+            };
+            if let Ok(want) = std::env::var("LUMINARIA_BACKEND") {
+                options.kind = want.parse()?;
+            }
+            Ok(options)
+        }
     }
 
     #[cfg(feature = "shell")]
@@ -736,10 +753,13 @@ mod bare_metal {
         }
 
         /// libinput, then the backend. Every output then arrives as a
-        /// [`BackendEvent::OutputAdded`].
-        pub fn start(&mut self) -> Result<(), Error> {
+        /// [`BackendEvent::OutputAdded`]. `&self`, because a
+        /// [`ScreenManager`](crate::shell::ScreenManager) and an
+        /// [`InputRouter`](crate::shell::InputRouter) are made before it and keep
+        /// the backend borrowed.
+        pub fn start(&self) -> Result<(), Error> {
             let mut err = String::new();
-            if self.raw.pin_mut().start(&mut err) {
+            if self.raw.start(&mut err) {
                 Ok(())
             } else {
                 Err(Error::new(ErrorKind::Backend, err))

@@ -154,6 +154,14 @@ pub(crate) mod ffi {
         // zwp_tablet_tool_v2.set_cursor: `id` is the tool, `other` the cursor's
         // surface (0 hides it), `serial`, `x`/`y` the hotspot.
         TabletToolCursor,
+        // luminaria.shell's managed layer. KeyBinding: `id` is what the binding
+        // was made with. RoutedButton: `serial` the button, `flag` pressed,
+        // `flag2` whether anything was hit, `id` the tag, `other` the surface,
+        // `sx`/`sy` the point on it. ScreenFailed: `text` says what.
+        KeyBinding,
+        RoutedButton,
+        LayoutChanged,
+        ScreenFailed,
     }
 
     /// One luminaria signal, queued by the shim until Rust drains it. Which
@@ -170,6 +178,8 @@ pub(crate) mod ffi {
         flag: bool,
         flag2: bool,
         text: String,
+        sx: f64,
+        sy: f64,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -926,6 +936,7 @@ pub(crate) mod ffi {
         fn remove(self: &OutputLayoutShim, output: Pin<&mut OutputShim>);
         fn output_box(self: &OutputLayoutShim, output: &OutputShim) -> Rect;
         fn primary_box(self: &OutputLayoutShim) -> Rect;
+        fn primary_scale(self: &OutputLayoutShim) -> i32;
 
     }
 }

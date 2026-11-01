@@ -115,6 +115,8 @@ impl ffi::EventRaw {
             flag: false,
             flag2: false,
             text: String::new(),
+            sx: 0.0,
+            sy: 0.0,
         }
     }
 }

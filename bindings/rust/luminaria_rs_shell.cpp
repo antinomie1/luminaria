@@ -217,7 +217,7 @@ std::uint32_t AutoBackendShim::kind() const {
     }
 }
 
-bool AutoBackendShim::start(rust::String& error) {
+bool AutoBackendShim::start(rust::String& error) const {
     auto st = impl_->backend->start();
     if (!st) { error = to_rust(st.error().message); return false; }
     return true;
@@ -764,5 +764,163 @@ std::uint64_t LayerManagerShim::keyboard_target(std::uint64_t surface_id) const 
     return ls != nullptr ? u64_from_id(ls->surface().id()) : 0;
 }
 void LayerManagerShim::close_output(std::uint32_t output_id) { impl_->mgr.close_output(output_id); }
+
+// ============================================================================
+// ScreenManager
+// ============================================================================
+
+struct ScreenManagerShim::Impl {
+    SceneRendererShim::Impl* renderer = nullptr; // for the images; outlives us, by a Rust borrow
+    std::vector<lm::SceneItem> scene;
+    std::optional<lm::ScreenManager> screens;
+    Conn<lm::OutputLayoutChange> on_layout;
+    Conn<lm::ScreenFailure> on_failed;
+
+    // Images resolved per call and not when the list was told: `set_image()` may
+    // have replaced the pixels since, and the span would dangle.
+    std::span<const lm::SceneItem> current() {
+        for (lm::SceneItem& item : scene) {
+            if (item.kind == lm::SceneItem::Kind::image) {
+                const auto image = renderer->images.find(item.serial);
+                item.pixels = image != renderer->images.end() ? std::span<const lm::Pixel>{image->second.pixels}
+                                                              : std::span<const lm::Pixel>{};
+            }
+        }
+        return scene;
+    }
+};
+ScreenManagerShim::~ScreenManagerShim() = default;
+ScreenManagerShim::ScreenManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+ScreenManagerShim::Impl& ScreenManagerShim::impl() const { return *impl_; }
+
+std::unique_ptr<ScreenManagerShim> screen_manager_new(const DisplayShim& display, const AutoBackendShim& backend,
+                                                      const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                      const ScreenOptionsRaw& options, rust::String& error) {
+    try {
+        lm::Display* disp = raw_ptr(display);
+        if (disp == nullptr || !renderer.impl().renderer) { error = "display or renderer not initialized"; return nullptr; }
+        auto impl = std::make_unique<ScreenManagerShim::Impl>();
+        impl->renderer = &renderer.impl();
+        impl->screens.emplace(*disp, backend.impl().backend->backend(), *renderer.impl().renderer, raw_ref(layout),
+                              lm::ScreenOptions{.background = {options.r, options.g, options.b, options.a},
+                                                .join_layout = options.join_layout,
+                                                .announce = options.announce,
+                                                .variable_refresh = options.variable_refresh,
+                                                .name = std::string(options.name),
+                                                .drm_format = options.drm_format});
+        auto* raw = impl.get();
+        raw->screens->set_scene_builder([raw](lm::Output&) { return raw->current(); });
+        raw->on_layout = raw_ref(layout).changed.connect(
+            [](lm::OutputLayoutChange&) { hub_push(event(EventKind::LayoutChanged)); });
+        raw->on_failed = raw->screens->failed().connect([](lm::ScreenFailure& e) {
+            EventRaw raw_event = event(EventKind::ScreenFailed);
+            raw_event.text = to_rust(std::string(e.message));
+            hub_push(std::move(raw_event));
+        });
+        return std::make_unique<ScreenManagerShim>(std::move(impl));
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nullptr;
+    }
+}
+
+void ScreenManagerShim::follow_popups(const PopupTreeShim& popups) const {
+    impl_->screens->follow_popups(popups.impl().tree);
+}
+
+void ScreenManagerShim::set_scene(rust::Slice<const SceneItemRaw> items) const {
+    impl_->scene.clear();
+    for (const SceneItemRaw& raw : items) impl_->scene.push_back(scene_item(raw));
+    impl_->screens->invalidate();
+}
+
+bool ScreenManagerShim::surface_box(std::uint64_t surface_id, Rect& out) const {
+    const std::optional<lm::Box> box = impl_->screens->surface_box(id_from_u64(surface_id));
+    if (!box.has_value()) return false;
+    out = to_rect(*box);
+    return true;
+}
+
+void ScreenManagerShim::invalidate() const { impl_->screens->invalidate(); }
+
+std::size_t ScreenManagerShim::size() const { return impl_->screens->size(); }
+
+// ============================================================================
+// DefaultInputRouter
+// ============================================================================
+
+struct InputRouterShim::Impl {
+    std::optional<lm::DefaultInputRouter> router;
+};
+InputRouterShim::~InputRouterShim() = default;
+InputRouterShim::InputRouterShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+InputRouterShim::Impl& InputRouterShim::impl() const { return *impl_; }
+
+std::unique_ptr<InputRouterShim> input_router_new(const SeatShim& seat, const CursorShim& cursor,
+                                                  const ScreenManagerShim& screens, const XdgShellShim& shell,
+                                                  const PopupTreeShim& popups, rust::String& error) {
+    try {
+        lm::Seat* seat_ptr = raw_ptr(seat);
+        lm::XdgShell* shell_ptr = raw_ptr(shell);
+        if (seat_ptr == nullptr || shell_ptr == nullptr || !cursor.impl().cursor) {
+            error = "null seat, shell or cursor";
+            return nullptr;
+        }
+        auto impl = std::make_unique<InputRouterShim::Impl>();
+        impl->router.emplace(*seat_ptr, *cursor.impl().cursor, *screens.impl().screens, *shell_ptr, popups.impl().tree);
+        impl->router->on_button([](std::uint32_t button, bool pressed, const lm::SceneHit& hit) {
+            EventRaw e = event(EventKind::RoutedButton, hit.tag, surface_u64(hit.surface));
+            e.serial = button;
+            e.flag = pressed;
+            e.flag2 = hit.hit;
+            e.sx = hit.sx;
+            e.sy = hit.sy;
+            hub_push(std::move(e));
+        });
+        return std::make_unique<InputRouterShim>(std::move(impl));
+    } catch (const std::exception& e) {
+        error = e.what();
+        return nullptr;
+    }
+}
+
+void InputRouterShim::attach(const AutoBackendShim& backend) const { impl_->router->attach(*backend.impl().backend); }
+
+void InputRouterShim::bind(std::uint32_t mods, std::uint32_t keysym, std::uint32_t id) const {
+    impl_->router->bind(mods, keysym, [id] { hub_push(event(EventKind::KeyBinding, id)); });
+}
+
+void InputRouterShim::set_click_to_focus(bool enabled) const { impl_->router->set_click_to_focus(enabled); }
+
+void InputRouterShim::update_pointer() const { impl_->router->update_pointer(); }
+
+void InputRouterShim::route_key(std::uint32_t key, bool pressed, std::uint32_t keysym, std::uint32_t depressed,
+                                std::uint32_t latched, std::uint32_t locked, std::uint32_t group) const {
+    impl_->router->route(lm::KeyEvent{key, pressed, keysym, {depressed, latched, locked, group}});
+}
+
+void InputRouterShim::route_modifiers(std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked,
+                                      std::uint32_t group) const {
+    impl_->router->route(lm::ModifiersEvent{depressed, latched, locked, group});
+}
+
+void InputRouterShim::route_motion(double dx, double dy) const {
+    impl_->router->route(lm::PointerMotionEvent{dx, dy});
+}
+
+void InputRouterShim::route_motion_absolute(double x, double y) const {
+    impl_->router->route(lm::PointerMotionAbsEvent{x, y});
+}
+
+void InputRouterShim::route_leave() const { impl_->router->route(lm::PointerLeaveEvent{}); }
+
+void InputRouterShim::route_button(std::uint32_t button, bool pressed) const {
+    impl_->router->route(lm::PointerButtonEvent{button, pressed});
+}
+
+void InputRouterShim::route_axis(double dx, double dy, std::int32_t dx_steps, std::int32_t dy_steps,
+                                 bool stop_horizontal, bool stop_vertical) const {
+    impl_->router->route(lm::PointerAxisEvent{dx, dy, dx_steps, dy_steps, stop_horizontal, stop_vertical});
+}
 
 } // namespace lum

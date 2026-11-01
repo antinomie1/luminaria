@@ -688,6 +688,7 @@ public:
   Rect bounds() const;
   Rect output_box(const OutputShim &output) const;
   Rect primary_box() const;
+  std::int32_t primary_scale() const;
 
   struct Impl;
   Impl &impl() const;

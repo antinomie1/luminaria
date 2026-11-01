@@ -70,6 +70,10 @@ name = "test_gpu"
 required-features = ["gpu"]
 
 [[test]]
+name = "test_screen_manager"
+required-features = ["gpu"]
+
+[[test]]
 name = "test_desktop"
 required-features = ["desktop"]
 

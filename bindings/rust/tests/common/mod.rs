@@ -69,6 +69,11 @@ pub fn take<T: TryFrom<Event, Error = Event>>() -> Vec<T> {
     })
 }
 
+/// Everything in the inbox, oldest first.
+pub fn take_all() -> Vec<Event> {
+    INBOX.with_borrow_mut(std::mem::take)
+}
+
 /// Forget everything in the inbox.
 pub fn clear_inbox() {
     INBOX.with_borrow_mut(Vec::clear);

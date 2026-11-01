@@ -2511,6 +2511,9 @@ void OutputLayoutShim::remove(OutputShim &output) const {
     return;
   impl_->layout.remove(*out);
 }
+std::int32_t OutputLayoutShim::primary_scale() const {
+  return impl_->layout.primary_scale();
+}
 Rect OutputLayoutShim::primary_box() const {
   const auto b = impl_->layout.primary_box();
   return Rect{b.x, b.y, b.width, b.height};

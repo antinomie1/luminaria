@@ -44,6 +44,20 @@ pub(crate) mod ffi {
         sy: f64,
     }
 
+    /// `ScreenManager`'s options, all of them, at arrival of every output.
+    #[derive(Debug, Clone)]
+    struct ScreenOptionsRaw {
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
+        join_layout: bool,
+        announce: bool,
+        variable_refresh: bool,
+        name: String,
+        drm_format: u32,
+    }
+
     unsafe extern "C++" {
         include!("luminaria/luminaria_rs.h");
         include!("luminaria/luminaria_rs_backend.h");
@@ -86,7 +100,7 @@ pub(crate) mod ffi {
             error: &mut String,
         ) -> UniquePtr<AutoBackendShim>;
         fn kind(self: &AutoBackendShim) -> u32;
-        fn start(self: Pin<&mut AutoBackendShim>, error: &mut String) -> bool;
+        fn start(self: &AutoBackendShim, error: &mut String) -> bool;
         fn keymap(self: &AutoBackendShim) -> String;
         fn capabilities(self: &AutoBackendShim) -> u32;
         fn follow_seat(self: &AutoBackendShim, seat: &SeatShim, touch: bool);
@@ -256,6 +270,67 @@ pub(crate) mod ffi {
         fn append_to(self: &LayerManagerShim, output_id: u32, layer: u32) -> Vec<SceneItemRaw>;
         fn keyboard_target(self: &LayerManagerShim, surface_id: u64) -> u64;
         fn close_output(self: Pin<&mut LayerManagerShim>, output_id: u32);
+
+        // ScreenManager
+        type ScreenManagerShim;
+        fn screen_manager_new(
+            display: &DisplayShim,
+            backend: &AutoBackendShim,
+            renderer: &SceneRendererShim,
+            layout: &OutputLayoutShim,
+            options: &ScreenOptionsRaw,
+            error: &mut String,
+        ) -> UniquePtr<ScreenManagerShim>;
+        fn follow_popups(self: &ScreenManagerShim, popups: &PopupTreeShim);
+        fn set_scene(self: &ScreenManagerShim, items: &[SceneItemRaw]);
+        fn surface_box(self: &ScreenManagerShim, surface_id: u64, out: &mut Rect) -> bool;
+        fn invalidate(self: &ScreenManagerShim);
+        fn size(self: &ScreenManagerShim) -> usize;
+
+        // DefaultInputRouter
+        type InputRouterShim;
+        fn input_router_new(
+            seat: &SeatShim,
+            cursor: &CursorShim,
+            screens: &ScreenManagerShim,
+            shell: &XdgShellShim,
+            popups: &PopupTreeShim,
+            error: &mut String,
+        ) -> UniquePtr<InputRouterShim>;
+        fn attach(self: &InputRouterShim, backend: &AutoBackendShim);
+        fn bind(self: &InputRouterShim, mods: u32, keysym: u32, id: u32);
+        fn set_click_to_focus(self: &InputRouterShim, enabled: bool);
+        fn update_pointer(self: &InputRouterShim);
+        fn route_key(
+            self: &InputRouterShim,
+            key: u32,
+            pressed: bool,
+            keysym: u32,
+            depressed: u32,
+            latched: u32,
+            locked: u32,
+            group: u32,
+        );
+        fn route_modifiers(
+            self: &InputRouterShim,
+            depressed: u32,
+            latched: u32,
+            locked: u32,
+            group: u32,
+        );
+        fn route_motion(self: &InputRouterShim, dx: f64, dy: f64);
+        fn route_motion_absolute(self: &InputRouterShim, x: f64, y: f64);
+        fn route_leave(self: &InputRouterShim);
+        fn route_button(self: &InputRouterShim, button: u32, pressed: bool);
+        fn route_axis(
+            self: &InputRouterShim,
+            dx: f64,
+            dy: f64,
+            dx_steps: i32,
+            dy_steps: i32,
+            stop_horizontal: bool,
+            stop_vertical: bool,
+        );
 
         // Scene hit testing
         fn raw_scene_hit_test(items: &[SceneItemRaw], x: f64, y: f64) -> SceneHitRaw;

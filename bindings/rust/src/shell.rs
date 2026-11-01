@@ -1,14 +1,27 @@
-//! Shell primitives: OutputLayout, immediate-mode SceneItem, hit-testing, and software CpuCompositor.
+//! Shell primitives: OutputLayout, immediate-mode SceneItem, hit-testing, and
+//! software CpuCompositor, plus the two that close the wiring every compositor
+//! would otherwise write: [`ScreenManager`] and [`InputRouter`].
+
+#[cfg(feature = "shell")]
+use std::cell::RefCell;
 
 use crate::backend::Output;
+#[cfg(feature = "shell")]
+use crate::backend::{AutoBackend, InputEvent};
+#[cfg(feature = "shell")]
+use crate::core::{Display, Holds};
 use crate::core::{Error, ErrorKind};
 use crate::ffi;
 #[cfg(feature = "shell")]
 use crate::ffi_shell;
-use crate::protocol::SurfaceId;
 #[cfg(feature = "shell")]
-use crate::protocol::{Layer, LayerShell, XdgShell};
+use crate::gpu::{Cursor, SceneRenderer};
+#[cfg(feature = "shell")]
+use crate::protocol::{Layer, LayerShell, Seat, XdgShell};
+use crate::protocol::{SurfaceId, Toplevel};
 use crate::util::{Color, Rect};
+#[cfg(feature = "shell")]
+use crate::util::{DrmFourcc, Keysym};
 
 /// Manages arrangement of multiple outputs in global logical coordinates.
 ///
@@ -57,6 +70,12 @@ impl OutputLayout {
     /// when there are none.
     pub fn primary_box(&self) -> Rect {
         self.raw.primary_box()
+    }
+
+    /// The first output's scale: what a window with no better idea should
+    /// render at, and 1 when there are none.
+    pub fn primary_scale(&self) -> i32 {
+        self.raw.primary_scale()
     }
 
     /// The box around every output, empty when there are none: the bounds a
@@ -139,6 +158,26 @@ impl SceneItem {
             surface_origin: (origin_x, origin_y),
             ..Self::base(SceneKind::Surface, rect)
         }
+    }
+
+    /// `toplevel` with its window geometry at (`x`, `y`): a client's shadow sits
+    /// outside its geometry, so the geometry, not the buffer, is what lands
+    /// there. A window that has not set a geometry is placed by its surface.
+    ///
+    /// Tagged with its surface, which is what a hit on it, on its subsurfaces or
+    /// on the popups [`PopupTree::append_to`] puts above it hands back:
+    /// `SurfaceId(hit.tag)`.
+    pub fn toplevel(toplevel: &Toplevel<'_>, x: i32, y: i32) -> Self {
+        let s = toplevel.surface();
+        let g = toplevel.geometry();
+        let framed = g.width > 0 && g.height > 0;
+        let (w, h) = if framed {
+            (g.width, g.height)
+        } else {
+            (s.surface_width(), s.surface_height())
+        };
+        let (ox, oy) = if framed { (g.x, g.y) } else { (0, 0) };
+        Self::surface(s, Rect::new(x, y, w, h), x - ox, y - oy).with_tag(s.0)
     }
 
     pub fn rect(rect: Rect, color: Color) -> Self {
@@ -318,7 +357,7 @@ pub use crate::render::CpuCompositor;
 /// side goes first.
 #[cfg(feature = "shell")]
 pub struct PopupTree {
-    raw: cxx::UniquePtr<ffi_shell::PopupTreeShim>,
+    pub(crate) raw: cxx::UniquePtr<ffi_shell::PopupTreeShim>,
 }
 
 #[cfg(feature = "shell")]
@@ -440,6 +479,275 @@ impl LayerManager {
     /// Close every surface on `output`: its monitor went away.
     pub fn close_output(&mut self, output: u32) {
         self.raw.pin_mut().close_output(output);
+    }
+}
+
+/// What a [`ScreenManager`] does with an output on arrival.
+#[cfg(feature = "shell")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenOptions {
+    /// What shows where the scene does not reach.
+    pub background: Color,
+    /// Place it right of everything already placed. Off for a compositor that
+    /// arranges outputs itself, from [`Event::OutputAdded`](crate::Event::OutputAdded).
+    pub join_layout: bool,
+    /// Open a `wl_output` that follows the output and the layout.
+    pub announce: bool,
+    /// Variable refresh on a monitor that has it: the panel follows the frames,
+    /// so an idle desktop idles it and a game runs as fast as it renders.
+    pub variable_refresh: bool,
+    /// The `wl_output`s are called "<name>-1", "<name>-2", ...; a number is never
+    /// used twice, so a replugged monitor cannot collide with another.
+    pub name: String,
+    pub format: DrmFourcc,
+}
+
+#[cfg(feature = "shell")]
+impl Default for ScreenOptions {
+    fn default() -> Self {
+        Self {
+            background: Color::rgb(0.0, 0.0, 0.0),
+            join_layout: true,
+            announce: true,
+            variable_refresh: false,
+            name: "luminaria".into(),
+            format: DrmFourcc::Xrgb8888,
+        }
+    }
+}
+
+/// Every output of a backend, for as long as it exists: render targets, its
+/// place in the layout, its `wl_output`, and a frame drawn whenever it asks for
+/// one. What is left to the compositor is what the screen shows.
+///
+/// C++ never calls Rust, so where C++ has a scene builder this is told the scene
+/// ahead of time: [`set_scene`](Self::set_scene) after every dispatch. Everything
+/// that needs the scene inside a dispatch — a frame, a click, the shell placing
+/// a popup — reads the last list it was told, which is at most one dispatch old
+/// and made of generational ids, so a window gone since draws nothing rather than
+/// the wrong thing.
+///
+/// Make it before [`AutoBackend::start`], which is when the outputs arrive. They
+/// arrive as [`Event::OutputAdded`](crate::Event::OutputAdded) too, for a
+/// compositor that wants to look at them; dropping those changes nothing. Listen
+/// to [`Event::LayoutChanged`](crate::Event::LayoutChanged) to lay windows out.
+///
+/// The renderer, the layout and the display stay borrowed for as long as it lives:
+///
+/// ```compile_fail,E0505
+/// # use luminaria::{backend::{AutoBackend, BackendOptions}, core::Display,
+/// #                 gpu::{SceneRenderer, VulkanOptions},
+/// #                 shell::{OutputLayout, ScreenManager, ScreenOptions}};
+/// let display = Display::new()?;
+/// let backend = AutoBackend::new(&display, &BackendOptions::default())?;
+/// let renderer = SceneRenderer::new(&VulkanOptions::default())?;
+/// let layout = OutputLayout::new()?;
+/// let screens = ScreenManager::new(&display, &backend, &renderer, &layout,
+///                                  &ScreenOptions::default())?;
+/// drop(renderer); // error[E0505]: cannot move out of `renderer` because it is borrowed
+/// # drop(screens);
+/// # Ok::<(), luminaria::core::Error>(())
+/// ```
+#[cfg(feature = "shell")]
+pub struct ScreenManager<'a> {
+    pub(crate) raw: cxx::UniquePtr<ffi_shell::ScreenManagerShim>,
+    told: RefCell<Vec<SceneItem>>,
+    _borrows: Holds<'a>,
+}
+
+#[cfg(feature = "shell")]
+impl<'a> ScreenManager<'a> {
+    /// The backend is only read here: its outputs are followed by their own
+    /// signals from then on.
+    pub fn new(
+        display: &'a Display,
+        backend: &AutoBackend<'_>,
+        renderer: &'a SceneRenderer,
+        layout: &'a OutputLayout,
+        options: &ScreenOptions,
+    ) -> Result<Self, Error> {
+        let raw_options = ffi_shell::ScreenOptionsRaw {
+            r: options.background.r,
+            g: options.background.g,
+            b: options.background.b,
+            a: options.background.a,
+            join_layout: options.join_layout,
+            announce: options.announce,
+            variable_refresh: options.variable_refresh,
+            name: options.name.clone(),
+            drm_format: options.format as u32,
+        };
+        let mut err = String::new();
+        let raw = ffi_shell::screen_manager_new(
+            &display.raw,
+            &backend.raw,
+            &renderer.raw,
+            &layout.raw,
+            &raw_options,
+            &mut err,
+        );
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Shell, err))
+        } else {
+            Ok(Self {
+                raw,
+                told: RefCell::new(Vec::new()),
+                _borrows: Holds::new(),
+            })
+        }
+    }
+
+    /// Redraw when `popups` change, and keep a popup on the output its parent is
+    /// on, looked up in the scene when the shell asks. Instead of
+    /// [`XdgShell::set_popup_constraint_areas`], which stops being consulted.
+    pub fn follow_popups(&self, popups: &'a PopupTree) {
+        self.raw.follow_popups(&popups.raw);
+    }
+
+    /// The list to draw, in layout coordinates: one list for every output, each
+    /// showing the part the layout puts it on. Call it after every dispatch. A
+    /// list that differs from the last one asks every output for a frame and
+    /// picks the surface under the pointer again; the same list costs a compare.
+    pub fn set_scene(&self, items: &[SceneItem]) {
+        let mut told = self.told.borrow_mut();
+        if told.as_slice() == items {
+            return;
+        }
+        told.clear();
+        told.extend_from_slice(items);
+        let raw: Vec<ffi_shell::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
+        self.raw.set_scene(&raw);
+    }
+
+    /// Where `surface` is in the scene.
+    pub fn surface_box(&self, surface: SurfaceId) -> Option<Rect> {
+        let mut out = Rect::default();
+        self.raw.surface_box(surface.0, &mut out).then_some(out)
+    }
+
+    /// Something no client reports changed and the scene does not show: every
+    /// output is asked for a frame, and the pointer picks again.
+    pub fn invalidate(&self) {
+        self.raw.invalidate();
+    }
+
+    /// How many outputs are being managed.
+    pub fn len(&self) -> usize {
+        self.raw.size()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Input, given what a key or a click means: motion to the cursor and the scene,
+/// the keyboard through the bindings and past the VT switch, a click outside a
+/// menu closing it, a press giving its window the keyboard, the surface under the
+/// pointer picked again whenever the scene changes. The C++ `DefaultInputRouter`.
+///
+/// It runs inside dispatch, against the list [`ScreenManager::set_scene`] was
+/// last told, so bindings are made ahead of time ([`bind`](Self::bind)) and what
+/// they mean arrives after the fact: [`Event::KeyBinding`](crate::Event::KeyBinding)
+/// and [`Event::Button`](crate::Event::Button).
+#[cfg(feature = "shell")]
+pub struct InputRouter<'a> {
+    raw: cxx::UniquePtr<ffi_shell::InputRouterShim>,
+    _borrows: Holds<'a>,
+}
+
+#[cfg(feature = "shell")]
+impl<'a> InputRouter<'a> {
+    pub fn new(
+        seat: &'a Seat<'_>,
+        cursor: &'a Cursor<'_>,
+        screens: &'a ScreenManager<'_>,
+        shell: &'a XdgShell<'_>,
+        popups: &'a PopupTree,
+    ) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi_shell::input_router_new(
+            &seat.raw,
+            &cursor.raw,
+            &screens.raw,
+            &shell.raw,
+            &popups.raw,
+            &mut err,
+        );
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Shell, err))
+        } else {
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
+        }
+    }
+
+    /// Take input from `backend`, have the seat follow its keymap and devices,
+    /// and on a session: Ctrl+Alt+Fn switches VTs, keys held are released when the
+    /// VT goes away, and every output repaints when it comes back.
+    pub fn attach(&self, backend: &'a AutoBackend<'_>) {
+        self.raw.attach(&backend.raw);
+    }
+
+    /// `mods` ([`Modifiers::LOGO`](crate::backend::Modifiers::LOGO) and friends,
+    /// exactly those held) with `keysym`: the client never sees the key, and
+    /// [`Event::KeyBinding`](crate::Event::KeyBinding)`(id)` arrives instead.
+    /// Caps Lock changes nothing: `keysym` is compared in lower case.
+    pub fn bind(&self, mods: u32, keysym: Keysym, id: u32) {
+        self.raw.bind(mods, keysym.raw(), id);
+    }
+
+    /// A press on a window gives it the keyboard and the activated look; a press
+    /// in a popup, which is its parent's business, changes nothing. On by
+    /// default. Off for a compositor that keeps focus for itself.
+    pub fn set_click_to_focus(&self, enabled: bool) {
+        self.raw.set_click_to_focus(enabled);
+    }
+
+    /// Pick the surface under the pointer again.
+    pub fn update_pointer(&self) {
+        self.raw.update_pointer();
+    }
+
+    /// One event, as [`attach`](Self::attach) would deliver it, for input that
+    /// does not come from the backend. Absolute motion is taken on the layout's
+    /// first output; events no default exists for (touch, tablets) are ignored.
+    pub fn route(&self, event: &InputEvent) {
+        match *event {
+            InputEvent::Key {
+                key,
+                pressed,
+                keysym,
+                modifiers: m,
+            } => self.raw.route_key(
+                key,
+                pressed,
+                keysym.raw(),
+                m.depressed,
+                m.latched,
+                m.locked,
+                m.group,
+            ),
+            InputEvent::Modifiers(m) => {
+                self.raw
+                    .route_modifiers(m.depressed, m.latched, m.locked, m.group);
+            }
+            InputEvent::Motion { dx, dy } => self.raw.route_motion(dx, dy),
+            InputEvent::MotionAbsolute { x, y, .. } => self.raw.route_motion_absolute(x, y),
+            InputEvent::PointerLeave => self.raw.route_leave(),
+            InputEvent::Button { button, pressed } => self.raw.route_button(button, pressed),
+            InputEvent::Axis(a) => self.raw.route_axis(
+                a.dx,
+                a.dy,
+                a.dx_steps,
+                a.dy_steps,
+                a.stop_horizontal,
+                a.stop_vertical,
+            ),
+            _ => {}
+        }
     }
 }
 

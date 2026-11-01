@@ -57,6 +57,7 @@ use crate::protocol::{
     SelectionChange, SurfaceId, TabletCursorRequest, TextInputEvent, ToplevelEvent,
     ToplevelIconChange, XdgEvent,
 };
+use crate::shell::SceneHit;
 
 /// Something luminaria reports, from whichever wrapper forwarded it.
 #[derive(Debug)]
@@ -80,6 +81,23 @@ pub enum Event {
     /// The VT came back (`true`) or was taken away (`false`). On the way out,
     /// `Seat::release_keys()`; on the way back, repaint.
     SessionActive(bool),
+    /// A binding made with [`InputRouter::bind`](crate::shell::InputRouter::bind)
+    /// fired, named by the id it was made with. The client saw nothing of the key.
+    KeyBinding(u32),
+    /// A pointer button went through an [`InputRouter`](crate::shell::InputRouter):
+    /// its `on_button`. `hit` is what was under the pointer.
+    Button {
+        button: u32,
+        pressed: bool,
+        hit: SceneHit,
+    },
+    /// An output's box changed, or one arrived or left: lay windows out again.
+    /// Reported by a [`ScreenManager`](crate::shell::ScreenManager), whose outputs
+    /// are its own.
+    LayoutChanged,
+    /// An output could not be set up or a frame failed, and a
+    /// [`ScreenManager`](crate::shell::ScreenManager) carried on. Never fatal.
+    ScreenFailed(String),
     /// A GPU device was removed from the system.
     GpuRemoved,
     /// A new GPU device was added to the system.
@@ -146,6 +164,20 @@ impl Event {
             K::HostCloseRequest => Event::HostCloseRequest,
             K::SessionActive => Event::SessionActive(true),
             K::SessionInactive => Event::SessionActive(false),
+            K::KeyBinding => Event::KeyBinding(raw.id as u32),
+            K::RoutedButton => Event::Button {
+                button: raw.serial,
+                pressed: raw.flag,
+                hit: SceneHit {
+                    hit: raw.flag2,
+                    tag: raw.id,
+                    surface: SurfaceId::from_raw(raw.other),
+                    sx: raw.sx,
+                    sy: raw.sy,
+                },
+            },
+            K::LayoutChanged => Event::LayoutChanged,
+            K::ScreenFailed => Event::ScreenFailed(raw.text),
             K::GpuRemoved => Event::GpuRemoved,
             K::GpuAdded => Event::GpuAdded(raw.text),
             K::NewSurface

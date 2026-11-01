@@ -13,6 +13,7 @@ namespace lum {
 
 struct SceneItemRaw;
 struct SceneHitRaw;
+struct ScreenOptionsRaw;
 
 SceneHitRaw raw_scene_hit_test(rust::Slice<const SceneItemRaw> items, double x, double y);
 SceneHitRaw raw_scene_route_pointer(const SeatShim& seat, rust::Slice<const SceneItemRaw> items, double x, double y);
@@ -40,7 +41,7 @@ public:
     AutoBackendShim& operator=(const AutoBackendShim&) = delete;
 
     std::uint32_t kind() const;
-    bool start(rust::String& error);
+    bool start(rust::String& error) const;
     rust::String keymap() const;
     std::uint32_t capabilities() const;
     void follow_seat(const SeatShim& seat, bool touch) const;
@@ -209,5 +210,65 @@ private:
 };
 
 std::unique_ptr<LayerManagerShim> layer_manager_new();
+
+// C++ never calls Rust, so the scene a builder would return is told ahead of
+// time: `set_scene()` replaces the list, and everything that asks for the scene
+// inside dispatch — a frame, a click, the shell placing a popup — reads that.
+class ScreenManagerShim {
+public:
+    ~ScreenManagerShim();
+    ScreenManagerShim(const ScreenManagerShim&) = delete;
+    ScreenManagerShim& operator=(const ScreenManagerShim&) = delete;
+
+    void follow_popups(const PopupTreeShim& popups) const;
+    void set_scene(rust::Slice<const SceneItemRaw> items) const;
+    bool surface_box(std::uint64_t surface_id, Rect& out) const;
+    void invalidate() const;
+    std::size_t size() const;
+
+    struct Impl;
+    Impl& impl() const;
+    explicit ScreenManagerShim(std::unique_ptr<Impl> impl) noexcept;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+std::unique_ptr<ScreenManagerShim> screen_manager_new(const DisplayShim& display, const AutoBackendShim& backend,
+                                                      const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                      const ScreenOptionsRaw& options, rust::String& error);
+
+// For the same reason a binding is a table made ahead of time, and what a key or
+// a button means arrives afterwards, as an event.
+class InputRouterShim {
+public:
+    ~InputRouterShim();
+    InputRouterShim(const InputRouterShim&) = delete;
+    InputRouterShim& operator=(const InputRouterShim&) = delete;
+
+    void attach(const AutoBackendShim& backend) const;
+    void bind(std::uint32_t mods, std::uint32_t keysym, std::uint32_t id) const;
+    void set_click_to_focus(bool enabled) const;
+    void update_pointer() const;
+    void route_key(std::uint32_t key, bool pressed, std::uint32_t keysym, std::uint32_t depressed,
+                   std::uint32_t latched, std::uint32_t locked, std::uint32_t group) const;
+    void route_modifiers(std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked,
+                         std::uint32_t group) const;
+    void route_motion(double dx, double dy) const;
+    void route_motion_absolute(double x, double y) const;
+    void route_leave() const;
+    void route_button(std::uint32_t button, bool pressed) const;
+    void route_axis(double dx, double dy, std::int32_t dx_steps, std::int32_t dy_steps,
+                    bool stop_horizontal, bool stop_vertical) const;
+
+    struct Impl;
+    Impl& impl() const;
+    explicit InputRouterShim(std::unique_ptr<Impl> impl) noexcept;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+std::unique_ptr<InputRouterShim> input_router_new(const SeatShim& seat, const CursorShim& cursor,
+                                                  const ScreenManagerShim& screens, const XdgShellShim& shell,
+                                                  const PopupTreeShim& popups, rust::String& error);
 
 } // namespace lum
