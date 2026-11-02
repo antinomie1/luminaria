@@ -50,6 +50,9 @@ struct CursorCapture {
     int hotspot_x = 0, hotspot_y = 0;
     int x = 0, y = 0;               ///< hotspot position, in the output's pixels
     std::vector<std::uint8_t> rgba; ///< tightly packed, width*height*4
+    /// On a KMS plane, so absent from what the output's capture function reads.
+    /// A client that asked for the cursor in its frame gets it drawn in here.
+    bool on_plane = false;
 };
 
 /// Fill `out` and return true when a cursor is visible on `output` (the
@@ -284,6 +287,29 @@ struct WlrFrame {
     }
 };
 
+/// Draw the pointer into a capture of `output` covering (`x`, `y`, `w`, `h`) in
+/// its pixels, if it's on a plane. Composited, it's in the pixels already.
+void overlay_plane_cursor(ScreencopyManager::Impl& mgr, const OutputEntry& output, int x, int y,
+                          int w, int h, std::vector<std::uint8_t>& rgba) {
+    CursorCapture cc;
+    if (!mgr.cursor_source || !mgr.cursor_source(output.output, cc) || !cc.on_plane) {
+        return;
+    }
+    const int left = cc.x - cc.hotspot_x - x;
+    const int top = cc.y - cc.hotspot_y - y;
+    for (int row = std::max(0, -top); row < cc.height && top + row < h; ++row) {
+        for (int col = std::max(0, -left); col < cc.width && left + col < w; ++col) {
+            const std::uint8_t* from = cc.rgba.data() + (row * cc.width + col) * 4;
+            std::uint8_t* to = rgba.data() + ((top + row) * w + left + col) * 4;
+            // Buffers are premultiplied, so the source only dims what's beneath.
+            for (int i = 0; i < 4; ++i) {
+                to[i] = static_cast<std::uint8_t>(
+                    std::min(255, from[i] + to[i] * (255 - from[3]) / 255));
+            }
+        }
+    }
+}
+
 /// Write tightly-packed RGBA8 into the shm buffer. The shm buffer has stride
 /// `shm_stride` bytes per row, format WL_SHM_FORMAT_ARGB8888.
 bool write_shm_rgba(wl_resource* buffer, const std::vector<uint8_t>& rgba,
@@ -442,6 +468,9 @@ void wlr_frame_do_copy(WlrFrame* f, wl_resource* buffer, bool with_damage) {
     if (!f->output->capture(f->region_x, f->region_y, cap_w, cap_h, rgba)) {
         zwlr_screencopy_frame_v1_send_failed(f->resource);
         return;
+    }
+    if (f->overlay_cursor) {
+        overlay_plane_cursor(*f->mgr, *f->output, f->region_x, f->region_y, cap_w, cap_h, rgba);
     }
 
     const bool wrote = shm ? write_shm_rgba(buffer, rgba, cap_w, cap_h, shm_stride)
@@ -755,6 +784,7 @@ struct ExtFrame {
     wl_resource* resource = nullptr;
     OutputEntry* output = nullptr;
     ExtCursorSession* cursor = nullptr; // set → this frame captures the pointer, not the screen
+    bool paint_cursors = false;
     std::shared_ptr<ToplevelSessionState> window; // set → this frame captures a window
     bool waiting = false;                         // parked in window->target->waiting
     wl_resource* attached_buffer = nullptr;
@@ -1125,7 +1155,7 @@ bool toplevel_render(ToplevelTarget& target, int& width, int& height, std::vecto
     }
     width = box.width * scale;
     height = box.height * scale;
-    const CpuItem view = CpuView{tl->surface().id(), -box.x, -box.y, {}, 1.0f, scale};
+    const CpuItem view = CpuView{tl->surface().id(), -box.x, -box.y, {}, 1.0f, static_cast<double>(scale)};
     target.mgr->cpu.composite(width, height, Color{0, 0, 0, 0}, std::span{&view, 1});
     const std::span<const Pixel> pixels = target.mgr->cpu.pixels();
     rgba.resize(pixels.size() * 4);
@@ -1337,6 +1367,9 @@ void ext_frame_capture(wl_client*, wl_resource* resource) {
                 EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
             return;
         }
+        if (f->paint_cursors) {
+            overlay_plane_cursor(*f->mgr, *f->output, 0, 0, cap_w, cap_h, rgba);
+        }
     }
 
     ext_frame_deliver(f, rgba, cap_w, cap_h);
@@ -1361,6 +1394,7 @@ struct ExtSession {
     ExtCursorSession* cursor = nullptr;
     std::shared_ptr<ToplevelSessionState> window; // set → a window capture session
     bool stopped = false;
+    bool paint_cursors = false;
 };
 
 void ext_session_create_frame(wl_client* client, wl_resource* session_resource, uint32_t id) {
@@ -1380,6 +1414,7 @@ void ext_session_create_frame(wl_client* client, wl_resource* session_resource, 
     frame->resource = frame_res;
     frame->output = s->output;
     frame->cursor = s->cursor;
+    frame->paint_cursors = s->paint_cursors;
     frame->window = s->window;
     wl_resource_set_implementation(frame_res, &ext_frame_impl, frame, ext_frame_resource_destroy);
 }
@@ -1415,7 +1450,6 @@ ScreencopyManager::Impl* ext_manager_of(wl_resource* r) {
 
 void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, uint32_t id,
                                  wl_resource* source, uint32_t options) {
-    (void)options; // paint_cursors flag; not implemented yet
     auto* mgr = ext_manager_of(mgr_resource);
     // Find which output this source belongs to. We store the source -> output
     // mapping in source user_data.
@@ -1434,6 +1468,8 @@ void ext_manager_create_session(wl_client* client, wl_resource* mgr_resource, ui
         return;
     }
     auto* session = new ExtSession{mgr, session_res, out, nullptr, nullptr, false};
+    session->paint_cursors =
+        (options & EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS) != 0;
     wl_resource_set_implementation(session_res, &ext_session_impl, session,
                                      ext_session_resource_destroy);
 

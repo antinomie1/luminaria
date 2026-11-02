@@ -82,7 +82,20 @@ int main() {
     assert(right.logical_height() == 1280 / 2);
     layout.add(right, 800, 0); // re-add to pick up the new size
     assert((layout.box_of(right) == Box{800, 0, 360, 640}));
+    // A fractional scale: the logical size rounds up, so nothing is left bare,
+    // and boxes meeting at an edge round it alike whatever falls between pixels.
     right.set_transform(Transform::normal);
+    right.set_scale(1.5);
+    assert(right.logical_width() == 854 && right.logical_height() == 480);
+    const Box left_half = right.to_device({0, 0, 101, 480});
+    const Box right_half = right.to_device({101, 0, 753, 480});
+    assert(left_half.x + left_half.width == right_half.x);
+    assert(right_half.x + right_half.width == 1281); // what the renderer clips
+    right.set_scale(1.8);
+    assert(right.scale() == 1.8);
+    assert(right.logical_height() == 400); // 720/1.8 is a hair off, not 401
+    right.set_scale(1.33333); // to the nearest 120th, as clients will hear it
+    assert(right.scale() == 160.0 / 120.0);
     right.set_scale(1);
     layout.add(right, 800, 0);
 

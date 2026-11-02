@@ -35,6 +35,15 @@ impl SceneOutcome {
     }
 }
 
+impl<'d> ScreencopyManager<'d> {
+    /// [`set_renderer`](Self::set_renderer) with `renderer`'s GPU, which is what
+    /// captures a tiled dmabuf. On a machine without one this does nothing and
+    /// capture stays on the CPU.
+    pub fn set_scene_renderer(&mut self, renderer: &'d SceneRenderer) {
+        ffi::screencopy_use_scene_renderer(self.raw.pin_mut(), &renderer.raw);
+    }
+}
+
 /// Unified scene presenter over Vulkan GPU and CPU fallback.
 ///
 /// It keeps every output's render state itself, by output, and drops it when
@@ -296,6 +305,34 @@ impl<'a> Cursor<'a> {
             &layout.raw,
             &seat.raw,
             &shapes.raw,
+            &mut err,
+        );
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::Gpu, err))
+        } else {
+            Ok(Self {
+                raw,
+                _borrows: Holds::new(),
+            })
+        }
+    }
+
+    /// [`new_with_shapes`](Self::new_with_shapes), also telling `capture` whenever
+    /// the pointer changes, for ext-image-copy-capture's cursor sessions.
+    pub fn new_with_capture(
+        renderer: &'a SceneRenderer,
+        layout: &'a OutputLayout,
+        seat: &'a Seat<'_>,
+        shapes: &'a crate::protocol::CursorShapeManager<'_>,
+        capture: &'a ScreencopyManager<'_>,
+    ) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::cursor_new_with_capture(
+            &renderer.raw,
+            &layout.raw,
+            &seat.raw,
+            &shapes.raw,
+            &capture.raw,
             &mut err,
         );
         if raw.is_null() {

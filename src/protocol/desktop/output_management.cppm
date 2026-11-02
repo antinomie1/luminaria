@@ -58,7 +58,7 @@ struct OutputHeadConfig {
     bool custom_mode = false;
     std::optional<OutputPosition> position; ///< layout coordinates
     std::optional<Transform> transform;
-    std::optional<double> scale; ///< as sent; may be fractional and `Output::scale` is not
+    std::optional<double> scale; ///< as sent
     std::optional<bool> adaptive_sync; ///< variable refresh; apply with `Output::set_vrr()`
 };
 
@@ -154,7 +154,7 @@ struct OmHeadState {
     int x = 0;
     int y = 0;
     Transform transform = Transform::normal;
-    int scale = 1;
+    double scale = 1.0;
     bool adaptive_sync = false;
 };
 
@@ -751,7 +751,7 @@ void OutputManager::Impl::send_state(OmHeadRes& r, const OmHeadState& s, unsigne
         zwlr_output_head_v1_send_transform(r.resource, static_cast<std::int32_t>(s.transform));
     }
     if ((what & kOmScale) != 0) {
-        zwlr_output_head_v1_send_scale(r.resource, wl_fixed_from_int(s.scale));
+        zwlr_output_head_v1_send_scale(r.resource, wl_fixed_from_double(s.scale));
     }
     if ((what & (kOmEnabled | kOmAdaptive)) != 0 &&
         wl_resource_get_version(r.resource) >= ZWLR_OUTPUT_HEAD_V1_ADAPTIVE_SYNC_SINCE_VERSION) {

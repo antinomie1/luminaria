@@ -99,7 +99,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 | render | **异步提交**：`RenderSync` 让 `render_to` 等一组 sync_file（客户端 acquire point）并吐出 out-fence，自己不阻塞；未完成的提交挂在 in-flight 列表上，按一条 timeline semaphore 的计数回收；synchronization2 屏障 + `submit2`，客户端 fence 只挡 fragment 阶段、显示 out-fence 只挡颜色输出 | gpu-scanout |
 | render | **纹理缓存**：`Frame` 的 GPU bridge 按 `SurfaceId` + `wl_buffer` 缓存。dmabuf 导入是客户端内存的实时视图，跨帧保留；shm 上传是快照，客户端重绘时才重传；表面销毁后旧 id 立即失效，旧 placement 再 submit 也不会碰悬空纹理 | frame, texture-cache |
 | render | **光标主题**：自带 XCursor 解析器（`cursor_theme.cpp`），读 `/usr/share/icons/<主题>/cursors`，支持主题继承与动画帧。不依赖 libXcursor / X11 | cursor-theme |
-| render | **纹理四边形管线**（取代原先的 blit）：每个 surface 一次 draw，位置/UV 全走 push constant。由此一并拿到 **整数 scale**、**8 种 transform 全部（含 90/270 转置）**、以及**真正的 alpha 混合**（预乘 `ONE`/`ONE_MINUS_SRC_ALPHA`）。SPIR-V 由 `glslangValidator --vn` 编进二进制 | gpu-scanout |
+| render | **纹理四边形管线**（取代原先的 blit）：每个 surface 一次 draw，位置/UV 全走 push constant。由此一并拿到 **任意 scale（含小数）**、**8 种 transform 全部（含 90/270 转置）**、以及**真正的 alpha 混合**（预乘 `ONE`/`ONE_MINUS_SRC_ALPHA`）。SPIR-V 由 `glslangValidator --vn` 编进二进制 | gpu-scanout |
 | present | `Output::commit_frame(pixels)` 呈现渲染帧（headless 存帧，DRM 写 dumb buffer）—— 保留给无 dmabuf 的降级路径 | render-output |
 | render | **描述符集按纹理缓存**：一个纹理绑定的 image view 终生不变，所以描述符集只在它第一次被画时写一次，之后每帧只是 `bindDescriptorSets`。此前是每帧新建一个描述符池、每个 fill 分配并重写一次描述符 —— 一屏没动过的窗口每秒重写六十遍。纹理销毁后描述符集进空闲表复用，但要等到所有可能仍在采样它的提交都完成（按提交序号比对 in-flight 队列），否则会改掉正在飞行中的那一帧 | texture-cache |
 | render | **每帧零堆分配**：`render_to()` 的 region 与屏障表是渲染器自己的 scratch，动态渲染根本不需要 framebuffer，command buffer 走按 timeline 回收的空闲表，连导入信号量的那个 vector 都跟着提交槽复用。`Region` 的 subtract/intersect 也改成两块缓冲乒乓——原先每次都是一次分配加一次释放，而遮挡剔除每个表面要做好几次 | render-alloc |
@@ -124,7 +124,7 @@ libseat 会话管理、硬件光标平面、多输出热插拔、每输出 scale
 |---|---|---|
 | layout | `OutputLayout` —— 输出在全局坐标系里的位置：`add_auto()` 横向排列、`box_of()` / `bounds()` / `at(x,y)` 命中、`intersecting(box)` 求窗口跨屏时各屏该画哪一块。用的是**逻辑尺寸**，所以旋转/HiDPI 输出占的格子跟它的 mode 不一样 | output-layout |
 | layout | **跟随输出** —— `OutputLayout` 盯着它装的每块输出：销毁的自己离开、换 mode 的保留位置换上新尺寸，每次变化在 `changed` 上广播；`OutputGlobal::create(display, output, layout)` 建的 wl_output 跟着 mode / scale / transform 与位置走，输出销毁后停止跟随。这两件事原来是每个混成器都要写的 handler，漏写前者就在每次命中测试都读的表里留下悬空 `Output*` | output-follow |
-| layout | `Transform` + `Output::scale()` —— 每输出旋转/翻转（值与 `WL_OUTPUT_TRANSFORM_*` 一致）与整数缩放。`transform_box()` 是逻辑坐标 → 帧缓冲像素的唯一映射，`transform_invert()` 供输入反向映射 | output-layout, output-scale |
+| layout | `Transform` + `Output::scale()` —— 每输出旋转/翻转（值与 `WL_OUTPUT_TRANSFORM_*` 一致）与缩放（可为小数，`wl_output.scale` 发向上取整的值）。`transform_box()` 是逻辑坐标 → 帧缓冲像素的唯一映射，`transform_invert()` 供输入反向映射 | output-layout, output-scale |
 
 ## 外壳层 / 示例
 

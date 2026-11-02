@@ -107,22 +107,43 @@ struct UnitPoint {
     return p;
 }
 
+/// A logical coordinate in device pixels, to the nearest one. Boxes that share an
+/// edge round it the same way, which is what stops a fractional scale from
+/// opening a gap between them or laying them one pixel over each other.
+[[nodiscard]] constexpr int scaled_edge(int logical, double scale) noexcept {
+    const double device = logical * scale;
+    const int whole = static_cast<int>(device);
+    const double rest = device - whole;
+    return whole + (rest >= 0.5 ? 1 : rest <= -0.5 ? -1 : 0);
+}
+
+/// How long `device` pixels are at `scale`, rounded up: a screen that doesn't
+/// divide evenly is one logical pixel too large and clips, rather than leaving a
+/// strip at the edge nothing draws to. The slack is for 1.8, which isn't exact.
+[[nodiscard]] constexpr int logical_length(int device, double scale) noexcept {
+    const double logical = device / scale - 1e-6;
+    const int whole = static_cast<int>(logical);
+    return logical > whole ? whole + 1 : whole;
+}
+
 /// Map a box from logical coordinates onto a `device_w`x`device_h` framebuffer.
 /// `scale` is the integer output scale: 2 means one logical unit is 2 pixels.
 ///
 /// The logical space is `device_w/scale` x `device_h/scale`, with width and
 /// height swapped for the rotating transforms.
-[[nodiscard]] constexpr Box transform_box(Transform t, int scale, Box logical, int device_w,
+[[nodiscard]] constexpr Box transform_box(Transform t, double scale, Box logical, int device_w,
                                           int device_h) noexcept {
-    if (scale < 1) {
-        scale = 1;
+    if (scale <= 0.0) {
+        scale = 1.0;
     }
     if (transform_flipped(t)) {
-        const int logical_w = (transform_swaps_axes(t) ? device_h : device_w) / scale;
+        const int logical_w = logical_length(transform_swaps_axes(t) ? device_h : device_w, scale);
         logical.x = logical_w - (logical.x + logical.width);
     }
-    const Box s{logical.x * scale, logical.y * scale, logical.width * scale,
-                logical.height * scale};
+    const int left = scaled_edge(logical.x, scale);
+    const int top = scaled_edge(logical.y, scale);
+    const Box s{left, top, scaled_edge(logical.x + logical.width, scale) - left,
+                scaled_edge(logical.y + logical.height, scale) - top};
     switch (transform_rotation(t)) {
     case 90:
         return Box{device_w - (s.y + s.height), s.x, s.height, s.width};

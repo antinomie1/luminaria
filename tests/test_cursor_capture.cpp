@@ -13,6 +13,10 @@
 // constraints for the cursor's own size rather than the output's, and the
 // pixels. And finally the same flow with no cursor source registered at all,
 // where the session must be created and told `stopped`.
+//
+// Last, a frame of the output itself. A pointer on a KMS plane isn't in what the
+// output reads back, so a client that asks for it has it drawn in; one that
+// doesn't, doesn't.
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -121,6 +125,46 @@ void registry_global(void* data, wl_registry* reg, uint32_t name, const char* if
 }
 void registry_global_remove(void*, wl_registry*, uint32_t) {}
 const wl_registry_listener kRegistry{registry_global, registry_global_remove};
+
+/// `run_client` with an output session: where the plane's cursor would land.
+void run_output_client(int fd, std::uint32_t options) {
+    wl_display* display = wl_display_connect_to_fd(fd);
+    assert(display != nullptr);
+    wl_registry* reg = wl_display_get_registry(display);
+    wl_registry_add_listener(reg, &kRegistry, &g_c);
+    wl_display_roundtrip(display);
+
+    ext_image_capture_source_v1* source =
+        ext_output_image_capture_source_manager_v1_create_source(g_c.source_mgr, g_c.output);
+    ext_image_copy_capture_session_v1* session =
+        ext_image_copy_capture_manager_v1_create_session(g_c.capture_mgr, source, options);
+    ext_image_copy_capture_session_v1_add_listener(session, &kSessionListener, nullptr);
+    wl_display_roundtrip(display);
+
+    const int stride = g_c.buffer_w * 4;
+    const int size = stride * g_c.buffer_h;
+    int bfd = memfd_create("curcap", MFD_CLOEXEC);
+    assert(ftruncate(bfd, size) == 0);
+    auto* px = static_cast<std::uint8_t*>(
+        mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, bfd, 0));
+    wl_shm_pool* pool = wl_shm_create_pool(g_c.shm, bfd, size);
+    wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, g_c.buffer_w, g_c.buffer_h, stride,
+                                                  WL_SHM_FORMAT_ARGB8888);
+    ext_image_copy_capture_frame_v1* frame =
+        ext_image_copy_capture_session_v1_create_frame(session);
+    ext_image_copy_capture_frame_v1_add_listener(frame, &kFrameListener, nullptr);
+    ext_image_copy_capture_frame_v1_attach_buffer(frame, buffer);
+    ext_image_copy_capture_frame_v1_capture(frame);
+    wl_display_roundtrip(display);
+    // The sprite's top-left corner, which is its hotspot away from its position.
+    std::memcpy(g_c.got, px + (20 - kHotY) * stride + (10 - kHotX) * 4, 4);
+    munmap(px, size);
+    wl_shm_pool_destroy(pool);
+    close(bfd);
+    g_c.finished = true;
+    wl_display_roundtrip(display);
+    wl_display_disconnect(display);
+}
 
 void run_client(int fd) {
     wl_display* display = wl_display_connect_to_fd(fd);
@@ -282,10 +326,72 @@ void run(bool with_cursor) {
     }
 }
 
+/// The pixel under the cursor's corner, in a frame of an all-black output whose
+/// pointer is on a plane.
+std::array<std::uint8_t, 4> plane_cursor_frame(std::uint32_t options) {
+    g_c = ClientState{};
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    auto display = luminaria::Display::create();
+    assert(display.has_value());
+    assert(display->init_shm().has_value());
+    auto og = luminaria::OutputGlobal::create(*display, 80, 60, "cap-0");
+    assert(og.has_value());
+    auto screencopy = luminaria::ScreencopyManager::create(*display);
+    assert(screencopy.has_value());
+    auto seat = luminaria::Seat::create(*display);
+    assert(seat.has_value());
+    og->on_bind([&](wl_resource* res) {
+        screencopy->add_output(res, 80, 60,
+                               [](int, int, int w, int h, std::vector<std::uint8_t>& rgba) {
+                                   rgba.assign(static_cast<std::size_t>(w) * h * 4, 0);
+                                   return true;
+                               });
+    });
+    screencopy->set_cursor_source([](wl_resource*, luminaria::CursorCapture& out) {
+        out.width = kCurW;
+        out.height = kCurH;
+        out.hotspot_x = kHotX;
+        out.hotspot_y = kHotY;
+        out.x = 10;
+        out.y = 20;
+        out.on_plane = true;
+        out.rgba.resize(static_cast<std::size_t>(kCurW) * kCurH * 4);
+        for (std::size_t i = 0; i < out.rgba.size(); i += 4) {
+            out.rgba[i + 0] = kCurR;
+            out.rgba[i + 1] = kCurG;
+            out.rgba[i + 2] = kCurB;
+            out.rgba[i + 3] = 255;
+        }
+        return true;
+    });
+    wl_client* client = wl_client_create(display->c_ptr(), fds[0]);
+    assert(client != nullptr);
+    DestroyCtx destroy_ctx{{}, &*display, false};
+    destroy_ctx.listener.notify = on_client_destroy;
+    wl_client_add_destroy_listener(client, &destroy_ctx.listener);
+    std::thread client_thread(run_output_client, fds[1], options);
+    auto stop = display->event_loop().add_timer([&] { display->terminate(); });
+    stop.arm(2000);
+    display->run();
+    if (!destroy_ctx.gone) {
+        wl_client_destroy(client);
+    }
+    client_thread.join();
+    assert(g_c.finished && g_c.ready);
+    return {g_c.got[0], g_c.got[1], g_c.got[2], g_c.got[3]};
+}
+
 } // namespace
 
 int main() {
     run(/*with_cursor=*/true);
     run(/*with_cursor=*/false);
+
+    // ARGB8888 little-endian: B, G, R, A.
+    const auto painted = plane_cursor_frame(EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS);
+    assert(painted[0] == kCurB && painted[1] == kCurG && painted[2] == kCurR);
+    const auto bare = plane_cursor_frame(0);
+    assert(bare[0] == 0 && bare[1] == 0 && bare[2] == 0);
     return 0;
 }

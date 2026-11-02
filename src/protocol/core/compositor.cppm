@@ -201,6 +201,9 @@ public:
     /// on the output it is showing on (wl_compositor v6). Clients that listen
     /// render at the right density instead of guessing from wl_output.
     void set_preferred_buffer_scale(int scale);
+    /// What `FractionalScaleManager` last said, for when the client only asks later.
+    [[nodiscard]] int preferred_scale_120ths() const noexcept { return preferred_scale_120ths_; }
+    void set_preferred_scale_120ths(int scale) noexcept { preferred_scale_120ths_ = scale; }
     void set_preferred_buffer_transform(Transform transform);
 
     /// Escape hatch for protocol wiring (e.g. seat focus): the wl_surface resource.
@@ -508,6 +511,7 @@ private:
     std::uint32_t content_type_ = 0;
     bool fifo_barrier_ = false;
     int buffer_scale_ = 1;
+    int preferred_scale_120ths_ = 0;
     Transform buffer_transform_ = Transform::normal; // buffer -> surface
     Region opaque_;
     Region input_;

@@ -336,11 +336,11 @@ struct GpuTextureFill {
   float params[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
-/// How an output's logical coordinates map onto its framebuffer: the integer
-/// scale (2 for HiDPI) and the rotation/reflection of the panel.
+/// How an output's logical coordinates map onto its framebuffer: the scale,
+/// fractional or not, and the rotation/reflection of the panel.
 struct OutputMapping {
   Transform transform = Transform::normal;
-  int scale = 1;
+  double scale = 1.0;
 };
 
 /// GPU-side synchronisation for one render: fences in, a fence out, no CPU
@@ -558,7 +558,7 @@ public:
   render_offscreen(OffscreenTarget &target, Color background,
                    std::span<const RectFill> rects,
                    std::span<const GpuTextureFill> textures,
-                   std::span<const Box> damage = {}, int scale = 1,
+                   std::span<const Box> damage = {}, double scale = 1.0,
                    const RenderSync &sync = {});
 
   /// Read an offscreen target back as tightly-packed RGBA8, leaving it in the
@@ -2496,13 +2496,13 @@ struct FloatBox {
   return Box{left, top, right - left, bottom - top};
 }
 
-[[nodiscard]] FloatBox transform_float_box(Transform t, int scale,
+[[nodiscard]] FloatBox transform_float_box(Transform t, double scale,
                                            FloatBox logical, int device_w,
                                            int device_h) noexcept {
-  const float s = static_cast<float>(std::max(1, scale));
+  const float s = static_cast<float>(scale);
   if (transform_flipped(t)) {
-    const float logical_w =
-        static_cast<float>(transform_swaps_axes(t) ? device_h : device_w) / s;
+    const float logical_w = static_cast<float>(
+        logical_length(transform_swaps_axes(t) ? device_h : device_w, scale));
     logical.x = logical_w - (logical.x + logical.width);
   }
   const FloatBox scaled{logical.x * s, logical.y * s, logical.width * s,
@@ -3000,7 +3000,7 @@ Status VulkanRenderer::render_to(ScanoutTarget &target, Color background,
 Status VulkanRenderer::render_offscreen(
     OffscreenTarget &target, Color background, std::span<const RectFill> rects,
     std::span<const GpuTextureFill> textures, std::span<const Box> damage,
-    int scale, const RenderSync &sync) {
+    double scale, const RenderSync &sync) {
   OffscreenTarget::Impl &o = *target.impl_;
   const GpuTexture::Impl &tex = *o.texture.impl_;
   // No OutputMapping: this image is its own pixel space, and the output's
@@ -3268,16 +3268,21 @@ Status VulkanRenderer::render_pass_to(
     impl_->reap();
     const int device_w = t.width;
     const int device_h = t.height;
-    const int scale = mapping.scale < 1 ? 1 : mapping.scale;
+    const double scale = mapping.scale > 0.0 ? mapping.scale : 1.0;
+    const bool fractional = scale != std::floor(scale);
+    const float float_scale = static_cast<float>(scale);
     const Transform transform = mapping.transform;
     // Everything the caller hands us is in logical coordinates; the target is
     // device pixels. This is the only place the two meet.
     const int logical_w =
-        (transform_swaps_axes(transform) ? device_h : device_w) / scale;
+        logical_length(transform_swaps_axes(transform) ? device_h : device_w, scale);
     const int logical_h =
-        (transform_swaps_axes(transform) ? device_w : device_h) / scale;
+        logical_length(transform_swaps_axes(transform) ? device_w : device_h, scale);
+    const Box device_box{0, 0, device_w, device_h};
+    // Clipped: a logical space rounded up can reach a pixel past the target.
     auto to_device = [&](const Box &b) {
-      return transform_box(transform, scale, b, device_w, device_h);
+      return transform_box(transform, scale, b, device_w, device_h)
+          .intersection(device_box);
     };
     auto to_rect2d = [](const Box &b) {
       return vk::Rect2D{
@@ -3297,7 +3302,10 @@ Status VulkanRenderer::render_pass_to(
     const bool partial = !damage.empty() && *t.has_content;
     if (partial) {
       for (const Box &d : damage) {
-        repaint.add(d.intersection(full));
+        // A logical pixel covers parts of device pixels it rounds away from.
+        const int grow = fractional ? 1 : 0;
+        const Box wide{d.x - grow, d.y - grow, d.width + 2 * grow, d.height + 2 * grow};
+        repaint.add(wide.intersection(full));
       }
       if (repaint.empty()) {
         return ok(); // nothing changed; the target already shows it
@@ -3473,24 +3481,34 @@ Status VulkanRenderer::render_pass_to(
       // clipping. The source is sampled through the buffer transform folded
       // into the output's, so one draw handles both rotations.
       const float grow = shadow_grow(tf);
-      const FloatBox dev =
+      FloatBox dev =
           transform_float_box(transform, scale,
                               FloatBox{tf.x - grow, tf.y - grow,
                                        tf.w + 2.0f * grow, tf.h + 2.0f * grow},
                               device_w, device_h);
+      if (fractional) {
+        // On whole pixels, as to_device() puts everything else, or a buffer
+        // drawn for this exact scale is resampled half a pixel off and blurs.
+        const float right = std::round(dev.x + dev.width);
+        const float bottom = std::round(dev.y + dev.height);
+        dev.x = std::round(dev.x);
+        dev.y = std::round(dev.y);
+        dev.width = right - dev.x;
+        dev.height = bottom - dev.y;
+      }
       QuadPush push{};
       // The silhouette the shape shaders measure against, in framebuffer
       // pixels: the quad's centre, and the half extent of the box that
       // casts it — which for a shadow is the quad minus what it grew by.
-      const float grow_dev = grow * static_cast<float>(std::max(1, scale));
+      const float grow_dev = grow * float_scale;
       push.shape[0] = dev.x + dev.width * 0.5f;
       push.shape[1] = dev.y + dev.height * 0.5f;
       push.shape[2] = dev.width * 0.5f - grow_dev;
       push.shape[3] = dev.height * 0.5f - grow_dev;
       push.effect[0] =
-          tf.corner_radius * static_cast<float>(std::max(1, scale));
+          tf.corner_radius * float_scale;
       push.effect[1] = grow_dev;
-      push.effect[2] = tf.ring * static_cast<float>(std::max(1, scale));
+      push.effect[2] = tf.ring * float_scale;
       std::ranges::copy(tf.params, std::begin(push.params));
       push.rect[0] = 2.0f * dev.x / static_cast<float>(device_w) - 1.0f;
       push.rect[1] = 2.0f * dev.y / static_cast<float>(device_h) - 1.0f;

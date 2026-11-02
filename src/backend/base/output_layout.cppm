@@ -72,7 +72,7 @@ public:
     /// Its scale: what a window with no better idea should render at, and 1 when
     /// there are none.
     [[nodiscard]] int primary_scale() const noexcept {
-        return outputs_.empty() ? 1 : outputs_.front().output->scale();
+        return outputs_.empty() ? 1 : static_cast<int>(std::ceil(outputs_.front().output->scale()));
     }
 
     [[nodiscard]] const std::vector<OutputBox>& outputs() const noexcept { return outputs_; }

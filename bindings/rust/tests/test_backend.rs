@@ -19,21 +19,21 @@ fn test_headless_backend_and_output() {
         .expect("failed to add output");
     assert_eq!(output.width(), 1920);
     assert_eq!(output.height(), 1080);
-    assert_eq!(output.scale(), 1);
+    assert_eq!(output.scale(), 1.0);
     assert_eq!(output.transform(), Transform::Normal);
     assert_eq!(output.logical_width(), 1920);
     assert_eq!(output.logical_height(), 1080);
 
     // Modify scale & transform
-    output.set_scale(2);
-    assert_eq!(output.scale(), 2);
-    assert_eq!(output.logical_width(), 960);
-    assert_eq!(output.logical_height(), 540);
+    output.set_scale(1.5);
+    assert_eq!(output.scale(), 1.5);
+    assert_eq!(output.logical_width(), 1280);
+    assert_eq!(output.logical_height(), 720);
 
     output.set_transform(Transform::Rotate90);
     assert_eq!(output.transform(), Transform::Rotate90);
-    assert_eq!(output.logical_width(), 540);
-    assert_eq!(output.logical_height(), 960);
+    assert_eq!(output.logical_width(), 720);
+    assert_eq!(output.logical_height(), 1280);
 
     // Frame scheduling
     assert!(!output.frame_scheduled());

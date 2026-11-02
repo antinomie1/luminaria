@@ -202,6 +202,14 @@ pub(crate) mod ffi {
             shapes: &CursorShapeManagerShim,
             error: &mut String,
         ) -> UniquePtr<CursorShim>;
+        fn cursor_new_with_capture(
+            renderer: &SceneRendererShim,
+            layout: &OutputLayoutShim,
+            seat: &SeatShim,
+            shapes: &CursorShapeManagerShim,
+            capture: &ScreencopyManagerShim,
+            error: &mut String,
+        ) -> UniquePtr<CursorShim>;
         fn move_to(self: Pin<&mut CursorShim>, x: f64, y: f64) -> bool;
         fn move_by(self: Pin<&mut CursorShim>, dx: f64, dy: f64) -> bool;
         fn move_to_within(self: Pin<&mut CursorShim>, x: f64, y: f64, bounds: Rect) -> bool;
@@ -279,6 +287,7 @@ pub(crate) mod ffi {
         fn append_to(self: &LayerManagerShim, output_id: u32, layer: u32) -> Vec<SceneItemRaw>;
         fn keyboard_target(self: &LayerManagerShim, surface_id: u64) -> u64;
         fn close_output(self: Pin<&mut LayerManagerShim>, output_id: u32);
+        fn surfaces_on(self: &LayerManagerShim, output_id: u32) -> Vec<u64>;
 
         // ScreenManager
         type ScreenManagerShim;
@@ -292,6 +301,11 @@ pub(crate) mod ffi {
         ) -> UniquePtr<ScreenManagerShim>;
         fn follow_popups(self: &ScreenManagerShim, popups: &PopupTreeShim);
         fn follow_capture(self: &ScreenManagerShim, capture: &ScreencopyManagerShim);
+        fn follow_cursor(self: &ScreenManagerShim, cursor: &CursorShim);
+        fn screencopy_use_scene_renderer(
+            mgr: Pin<&mut ScreencopyManagerShim>,
+            renderer: &SceneRendererShim,
+        );
         fn set_scene(self: &ScreenManagerShim, items: &[SceneItemRaw]);
         fn set_background(self: &ScreenManagerShim, r: f32, g: f32, b: f32, a: f32);
         fn output_identity(self: &ScreenManagerShim, output: &OutputShim) -> u64;

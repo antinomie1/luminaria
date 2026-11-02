@@ -115,9 +115,10 @@ public:
 
   // --- scale and rotation ---
   //
-  // `scale` is the integer output scale (2 = HiDPI); `transform` is how
-  // logical content is rotated/reflected to land on the framebuffer. Together
-  // they define the logical size, which is what windows are laid out in.
+  // `scale` is device pixels per logical pixel, which may be fractional (1.5);
+  // `transform` is how logical content is rotated/reflected to land on the
+  // framebuffer. Together they define the logical size, which is what windows
+  // are laid out in.
 
   /// After `set_scale()` or `set_transform()` on a live output: fires
   /// `mode_changed`, because the logical size moved with them and everything that
@@ -131,16 +132,21 @@ public:
   /// an output that isn't a connector.
   [[nodiscard]] virtual std::string connector() const { return {}; }
 
-  [[nodiscard]] int scale() const noexcept { return scale_; }
-  void set_scale(int scale) noexcept { scale_ = scale < 1 ? 1 : scale; }
+  [[nodiscard]] double scale() const noexcept { return scale_; }
+  /// In 120ths, all wp_fractional_scale_v1 can say, so clients and this agree on
+  /// how big a window's buffer should be.
+  void set_scale(double scale) noexcept {
+    const double steps = std::round(scale * 120.0);
+    scale_ = steps < 1.0 ? 1.0 : steps / 120.0;
+  }
   [[nodiscard]] Transform transform() const noexcept { return transform_; }
   void set_transform(Transform transform) noexcept { transform_ = transform; }
 
   [[nodiscard]] int logical_width() const noexcept {
-    return (transform_swaps_axes(transform_) ? height_ : width_) / scale_;
+    return logical_length(transform_swaps_axes(transform_) ? height_ : width_, scale_);
   }
   [[nodiscard]] int logical_height() const noexcept {
-    return (transform_swaps_axes(transform_) ? width_ : height_) / scale_;
+    return logical_length(transform_swaps_axes(transform_) ? width_ : height_, scale_);
   }
 
   /// A box in this output's logical coordinates, in framebuffer pixels.
@@ -425,7 +431,7 @@ protected:
   bool frame_scheduled_ = false;
   int width_;
   int height_;
-  int scale_ = 1;
+  double scale_ = 1.0;
   Transform transform_ = Transform::normal;
   Color last_committed_{};
 };

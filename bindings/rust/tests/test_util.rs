@@ -222,3 +222,16 @@ fn test_glam_conversions() {
     let from_glam_r = Rect::from(glam_r);
     assert_eq!(from_glam_r, r);
 }
+
+/// What `transform_box` puts where on the framebuffer, read back: each corner of
+/// the logical space, from the panel corner it lands on.
+#[test]
+fn a_panel_point_follows_the_rotation() {
+    use luminaria::util::Transform::*;
+    assert_eq!(Normal.unit_point(0.25, 0.5), (0.25, 0.5));
+    assert_eq!(Rotate90.unit_point(1.0, 0.0), (0.0, 0.0));
+    assert_eq!(Rotate180.unit_point(0.25, 0.5), (0.75, 0.5));
+    assert_eq!(Rotate270.unit_point(0.0, 1.0), (0.0, 0.0));
+    assert_eq!(Flipped.unit_point(0.25, 0.5), (0.75, 0.5));
+    assert_eq!(Flipped90.unit_point(1.0, 0.0), (1.0, 0.0));
+}

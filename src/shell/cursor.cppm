@@ -305,9 +305,10 @@ bool Cursor::capture(const Output& output, CursorCapture& out) const {
     } else {
         return false;
     }
-    const int scale = std::max(1, output.scale());
-    out.x = static_cast<int>(pointer.x() - view.x) * scale;
-    out.y = static_cast<int>(pointer.y() - view.y) * scale;
+    const Box at = output.to_device({static_cast<int>(pointer.x()) - view.x,
+                                     static_cast<int>(pointer.y()) - view.y, 1, 1});
+    out.x = at.x;
+    out.y = at.y;
     return true;
 }
 

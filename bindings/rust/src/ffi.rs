@@ -469,8 +469,8 @@ pub(crate) mod ffi {
         type OutputShim;
         fn width(self: &OutputShim) -> i32;
         fn height(self: &OutputShim) -> i32;
-        fn scale(self: &OutputShim) -> i32;
-        fn set_scale(self: Pin<&mut OutputShim>, scale: i32);
+        fn scale(self: &OutputShim) -> f64;
+        fn set_scale(self: Pin<&mut OutputShim>, scale: f64);
         fn transform(self: &OutputShim) -> u32;
         fn set_transform(self: Pin<&mut OutputShim>, transform: u32);
         fn announce_change(self: Pin<&mut OutputShim>);
@@ -520,6 +520,7 @@ pub(crate) mod ffi {
         fn buffer_width(surface_id: u64) -> i32;
         fn buffer_height(surface_id: u64) -> i32;
         fn buffer_scale(surface_id: u64) -> i32;
+        fn surface_root(surface_id: u64) -> u64;
         fn buffer_transform(surface_id: u64) -> u32;
         fn surface_has_buffer(surface_id: u64) -> bool;
         fn surface_damage(surface_id: u64) -> Vec<Rect>;

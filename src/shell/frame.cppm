@@ -813,7 +813,7 @@ struct Frame::Impl {
   /// being composed, the frame's background for a backdrop that has it.
   [[nodiscard]] Status render_group(std::size_t first, std::size_t last,
                                     OffscreenTarget &target, const Box &bounds,
-                                    int scale, bool consume,
+                                    double scale, bool consume,
                                     Color clear = Color{0, 0, 0, 0});
 };
 
@@ -964,7 +964,7 @@ bool Frame::Impl::stamp_group(std::size_t first, std::size_t last,
 Status Frame::Impl::render_group(std::size_t first_placement,
                                  std::size_t last_placement,
                                  OffscreenTarget &target, const Box &bounds,
-                                 int scale, bool consume, Color clear) {
+                                 double scale, bool consume, Color clear) {
   if (renderer_alive.expired()) {
     return fail("renderer is gone");
   }
@@ -1576,9 +1576,9 @@ Status Frame::capture_blur(PlacementGroup group, OffscreenTarget &target,
       group.first_ >= impl.placements.size()) {
     return fail("blur backdrop is empty or belongs to an earlier frame");
   }
-  const int scale = std::max(1, impl.output->scale());
-  if (bounds.empty() || target.width() != bounds.width * scale ||
-      target.height() != bounds.height * scale) {
+  const double scale = impl.output->scale();
+  if (bounds.empty() || target.width() != scaled_edge(bounds.width, scale) ||
+      target.height() != scaled_edge(bounds.height, scale)) {
     return fail(
         "blur target dimensions do not match the bounds and output scale");
   }
@@ -1643,9 +1643,9 @@ bool Frame::queue_blur(PlacementGroup group, OffscreenTarget &target,
       group.first_ >= impl.placements.size()) {
     return false;
   }
-  const int scale = std::max(1, impl.output->scale());
-  if (bounds.empty() || target.width() != bounds.width * scale ||
-      target.height() != bounds.height * scale ||
+  const double scale = impl.output->scale();
+  if (bounds.empty() || target.width() != scaled_edge(bounds.width, scale) ||
+      target.height() != scaled_edge(bounds.height, scale) ||
       chain.width() != target.width() || chain.height() != target.height()) {
     return false;
   }
@@ -1680,9 +1680,9 @@ bool Frame::queue_blur_regions(PlacementGroup group, OffscreenTarget &target,
       group.first_ >= impl.placements.size() || bounds.empty()) {
     return false;
   }
-  const int scale = std::max(1, impl.output->scale());
-  if (target.width() != bounds.width * scale ||
-      target.height() != bounds.height * scale ||
+  const double scale = impl.output->scale();
+  if (target.width() != scaled_edge(bounds.width, scale) ||
+      target.height() != scaled_edge(bounds.height, scale) ||
       chain.width() != target.width() || chain.height() != target.height()) {
     return false;
   }
@@ -1779,9 +1779,9 @@ Status Frame::compose_group(PlacementGroup group, OffscreenTarget &target,
       group.first_ >= impl.placements.size()) {
     return fail("offscreen group is empty or belongs to an earlier frame");
   }
-  const int scale = std::max(1, impl.output->scale());
-  if (bounds.empty() || target.width() != bounds.width * scale ||
-      target.height() != bounds.height * scale) {
+  const double scale = impl.output->scale();
+  if (bounds.empty() || target.width() != scaled_edge(bounds.width, scale) ||
+      target.height() != scaled_edge(bounds.height, scale)) {
     return fail("offscreen target dimensions do not match the group bounds and "
                 "output scale");
   }
@@ -2198,7 +2198,7 @@ Result<Presented> Frame::submit(Color background) {
   // would have rendered at that point in the list. Their out-fences land in
   // `prepass_fences` and join the final submission below.
   for (Impl::BlurJob &job : impl.blur_jobs) {
-    const int scale = std::max(1, output.scale());
+    const double scale = output.scale();
     Status status =
         impl.render_group(job.group_first, job.capture_end, *job.target,
                           job.bounds, scale, /*consume=*/false, background);

@@ -499,9 +499,11 @@ std::unique_ptr<CursorShim> cursor_new(const SceneRendererShim& renderer, const 
     }
 }
 
-std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
-                                                  const SeatShim& seat, const CursorShapeManagerShim& shapes,
-                                                  rust::String& error) {
+lm::ScreencopyManager& raw_ref(const ScreencopyManagerShim& s);
+
+static std::unique_ptr<CursorShim> cursor_with(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                               const SeatShim& seat, const CursorShapeManagerShim& shapes,
+                                               lm::ScreencopyManager* capture, rust::String& error) {
     try {
         lm::Seat* seat_ptr = raw_ptr(seat);
         if (!renderer.impl().renderer || !seat_ptr) { error = "null renderer or seat"; return nullptr; }
@@ -509,13 +511,25 @@ std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& rend
         lm::CursorShapeManager* shapes_mgr = raw_ptr(shapes);
         impl->cursor = std::make_unique<lm::Cursor>(
             *renderer.impl().renderer, raw_ref(layout), *seat_ptr,
-            shapes_mgr, nullptr
+            shapes_mgr, capture
         );
         return std::make_unique<CursorShim>(std::move(impl));
     } catch (const std::exception& e) {
         error = e.what();
         return nullptr;
     }
+}
+
+std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                  const SeatShim& seat, const CursorShapeManagerShim& shapes,
+                                                  rust::String& error) {
+    return cursor_with(renderer, layout, seat, shapes, nullptr, error);
+}
+
+std::unique_ptr<CursorShim> cursor_new_with_capture(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                    const SeatShim& seat, const CursorShapeManagerShim& shapes,
+                                                    const ScreencopyManagerShim& capture, rust::String& error) {
+    return cursor_with(renderer, layout, seat, shapes, &raw_ref(capture), error);
 }
 
 bool CursorShim::move_to(double x, double y) {
@@ -786,6 +800,11 @@ std::uint64_t LayerManagerShim::keyboard_target(std::uint64_t surface_id) const 
     return ls != nullptr ? u64_from_id(ls->surface().id()) : 0;
 }
 void LayerManagerShim::close_output(std::uint32_t output_id) { impl_->mgr.close_output(output_id); }
+rust::Vec<std::uint64_t> LayerManagerShim::surfaces_on(std::uint32_t output_id) const {
+    rust::Vec<std::uint64_t> out;
+    for (const lm::SurfaceId id : impl_->mgr.surfaces_on(output_id)) out.push_back(u64_from_id(id));
+    return out;
+}
 
 // ============================================================================
 // ScreenManager
@@ -862,10 +881,19 @@ void ScreenManagerShim::follow_popups(const PopupTreeShim& popups) const {
 }
 
 // In the render TU, whose `Impl` is private to it.
-lm::ScreencopyManager& raw_ref(const ScreencopyManagerShim& s);
-
 void ScreenManagerShim::follow_capture(const ScreencopyManagerShim& capture) const {
     impl_->screens->follow_capture(raw_ref(capture));
+}
+
+void ScreenManagerShim::follow_cursor(const CursorShim& cursor) const {
+    impl_->screens->follow_cursor(*cursor.impl().cursor);
+}
+
+void screencopy_use_scene_renderer(ScreencopyManagerShim& mgr, const SceneRendererShim& renderer) {
+    // Null without a GPU, which is the CPU path the manager is already on.
+    if (lm::VulkanRenderer* gpu = renderer.impl().renderer->gpu(); gpu != nullptr) {
+        raw_ref(mgr).set_renderer(gpu);
+    }
 }
 
 void ScreenManagerShim::set_scene(rust::Slice<const SceneItemRaw> items) const {

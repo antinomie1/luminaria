@@ -221,7 +221,7 @@ let (depressed, latched, locked, group) = keymap.modifiers();
 表示一块物理或虚拟显示输出表面：
 - `output.width()`, `output.height()`：物理分辨率。
 - `output.logical_width()`, `output.logical_height()`：结合缩放和朝向后的逻辑分辨率。
-- `output.scale()`, `output.set_scale(scale)`：HiDPI 整数缩放。
+- `output.scale()`, `output.set_scale(scale)`：HiDPI 缩放，`f64`，可为小数，取整到 1/120。
 - `output.transform()`, `output.set_transform(transform)`：旋转/翻转朝向。
 - `output.schedule_frame()`：请求一次硬件帧事件。
 - `output.modes()`, `output.current_mode()`, `output.set_mode(w, h, refresh_mhz)`：模式管理。

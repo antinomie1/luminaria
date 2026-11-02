@@ -127,6 +127,12 @@ void manager_get_scale(wl_client* client, wl_resource* resource, uint32_t id,
     auto object = std::make_unique<ScaleObject>(mgr, surface, scale_resource);
     mgr->objects.push_back(object.get());
     ScaleObject* raw = object.release();
+    // A surface goes on an output when it maps, often before a client asks.
+    if (surface != nullptr && surface->preferred_scale_120ths() > 0) {
+        raw->last_sent = surface->preferred_scale_120ths();
+        wp_fractional_scale_v1_send_preferred_scale(scale_resource,
+                                                    static_cast<uint32_t>(raw->last_sent));
+    }
     wl_resource_set_implementation(scale_resource, &scale_impl, raw, [](wl_resource* r) {
         delete static_cast<ScaleObject*>(wl_resource_get_user_data(r));
     });
@@ -160,9 +166,10 @@ Result<FractionalScaleManager> FractionalScaleManager::create(Display& display) 
 
 void FractionalScaleManager::set_scale(Surface& surface, double scale) {
     const int scale_120ths = static_cast<int>(scale * 120.0 + 0.5);
-    if (scale_120ths < 1) {
+    if (scale_120ths < 1 || scale_120ths == surface.preferred_scale_120ths()) {
         return;
     }
+    surface.set_preferred_scale_120ths(scale_120ths);
     surface.set_preferred_buffer_scale(static_cast<int>(std::ceil(scale_120ths / 120.0)));
     for (ScaleObject* object : impl_->objects) {
         if (object->surface != &surface || object->last_sent == scale_120ths) {

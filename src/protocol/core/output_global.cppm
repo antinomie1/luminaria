@@ -147,7 +147,8 @@ struct OutputGlobal::Impl {
   std::vector<OutputMode> modes; // empty: advertise only the current one
   int logical_x = 0;
   int logical_y = 0;
-  int scale = 1;
+  int scale = 1;           // what wl_output says: whole, so rounded up
+  double exact_scale = 1.0; // what the layout is actually in
   Transform transform = Transform::normal;
   std::string name;
   // What a following global mirrors; both null for a fixed one, and after
@@ -165,10 +166,10 @@ struct OutputGlobal::Impl {
 
   // Layout size: the mode divided by the scale, axes swapped when rotated.
   [[nodiscard]] int logical_width() const {
-    return (transform_swaps_axes(transform) ? height : width) / scale;
+    return logical_length(transform_swaps_axes(transform) ? height : width, exact_scale);
   }
   [[nodiscard]] int logical_height() const {
-    return (transform_swaps_axes(transform) ? width : height) / scale;
+    return logical_length(transform_swaps_axes(transform) ? width : height, exact_scale);
   }
 
   ~Impl() {
@@ -425,7 +426,8 @@ void follow(OutputGlobal::Impl &impl) {
     impl.refresh_mhz = refresh;
   }
   impl.modes = output.modes();
-  impl.scale = std::max(1, output.scale());
+  impl.scale = static_cast<int>(std::ceil(output.scale()));
+  impl.exact_scale = output.scale();
   impl.transform = output.transform();
   if (const Box box = impl.layout->box_of(output); !box.empty()) {
     impl.logical_x = box.x;
@@ -499,6 +501,7 @@ void OutputGlobal::set_mode(int width, int height, int refresh_mhz) {
 
 void OutputGlobal::set_scale(int scale) {
   impl_->scale = scale < 1 ? 1 : scale;
+  impl_->exact_scale = impl_->scale;
   broadcast(*impl_);
 }
 

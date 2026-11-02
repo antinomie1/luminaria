@@ -197,7 +197,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - `void schedule_frame()`: 预约下一帧（向后端申请唤醒）。
   - `void commit(Color color)`: 提交纯色填充帧。
   - `void commit_frame(std::span<const Pixel> rgba, int width, int height)`: 提交 CPU 像素帧。
-  - 属性访问：`width()`, `height()`, `scale()`, `set_scale(int)`, `transform()`, `set_transform(Transform)`, `name()`, `description()`, `make()`, `model()`.
+  - 属性访问：`width()`, `height()`, `scale()`（`double`，可为小数）, `set_scale(double)`（取整到 1/120）, `transform()`, `set_transform(Transform)`, `name()`, `description()`, `make()`, `model()`.
   - 核心信号：
     - `Signal<FrameEvent>& frame()`: 渲染节拍到达信号（携带 `time_ms`, `refresh_nsec`, `predicted_presentation_ms`）。
     - `Signal<PresentEvent>& present()`: 帧上屏呈现完成信号。
@@ -368,6 +368,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - `ScreenOptions`：`background`、`join_layout`（默认开，`add_auto`）、`announce`（默认开，开跟随布局的 `wl_output`）、`variable_refresh`（默认关）、`name`（`wl_output` 叫 `<name>-1`、`<name>-2`……编号永不复用）、`drm_format`。
 - `set_scene_builder(SceneBuilder)`：`std::function<std::span<const SceneItem>(Output&)>`，返回布局坐标的列表，通常忽略参数、每块输出同一张表。输入和 popup 也会调它，所以应复用同一个 vector。
 - `follow_capture(ScreencopyManager&)`：每块输出（现在和将来的）都可被捕获，`grim`、`wf-recorder`、portal 拿到的是最后画出的一帧。`capture` 必须比这个对象活得久。
+- `follow_cursor(const Cursor&)`：在 `follow_capture()` 之后调用，给捕获提供指针：光标捕获会话，以及指针在 KMS plane 上时（回读不到它）按客户端要求（`overlay_cursor` / `paint_cursors`）画进帧里。
 - `follow_popups(PopupTree&)`：popup 变化时 `invalidate()`，并从场景表回答约束查询。取代手写 `set_popup_constraint_query()`。
 - `invalidate()`：发生了客户端不会报告的变化（窗口开、关、移动、换层）：所有输出要一帧，指针重新选表面。
 - `set_background(Color)`：运行中换底色，下一帧起全屏重画，模糊也跟着重采；颜色没变时什么都不做，配置重载可以直接调。壁纸客户端盖住底色时，模糊采的仍是壁纸。

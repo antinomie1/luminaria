@@ -29,6 +29,7 @@ import std;
 import luminaria;
 import luminaria.render;
 
+import :cursor;
 import :popup;
 import :scene;
 import :scene_renderer;
@@ -115,6 +116,10 @@ public:
     /// Let clients capture every output, past and future: `grim`, `wf-recorder`,
     /// a portal. They get what `present` last drew. `capture` must outlive this.
     void follow_capture(ScreencopyManager& capture);
+    /// Where captures get the pointer: for ext-image-copy-capture's cursor
+    /// sessions, and to draw it into a frame when it's on a plane the read-back
+    /// can't see. After `follow_capture()`. `cursor` must outlive this.
+    void follow_cursor(const Cursor& cursor);
 
     /// What `output`'s `wl_output` is called, empty with none: the name a client,
     /// and an output manager's head, knows it by.
@@ -213,6 +218,7 @@ struct ScreenManager::Impl {
     void follow_capture(ScreenEntry& screen);
     void add_capture(ScreenEntry& screen, wl_resource* bound);
     void sync_capture_size(ScreenEntry& screen);
+    bool cursor_capture(const Cursor& cursor, wl_resource* bound, CursorCapture& out);
     [[nodiscard]] bool copy_out(const Output* output, int x, int y, int width, int height,
                                 std::vector<std::uint8_t>& rgba);
     void invalidate();
@@ -301,6 +307,20 @@ void ScreenManager::Impl::sync_capture_size(ScreenEntry& screen) {
     for (wl_resource* bound : screen.captured) {
         add_capture(screen, bound);
     }
+}
+
+bool ScreenManager::Impl::cursor_capture(const Cursor& cursor, wl_resource* bound,
+                                         CursorCapture& out) {
+    for (ScreenEntry& screen : screens) {
+        if (std::ranges::contains(screen.captured, bound)) {
+            if (!cursor.capture(*screen.output, out)) {
+                return false;
+            }
+            out.on_plane = !renderer_alive.expired() && renderer->cursor_on_plane(screen.state);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool ScreenManager::Impl::copy_out(const Output* output, int x, int y, int width, int height,
@@ -392,6 +412,15 @@ void ScreenManager::follow_capture(ScreencopyManager& capture) {
     for (ScreenEntry& screen : self.screens) {
         self.follow_capture(screen);
     }
+}
+
+void ScreenManager::follow_cursor(const Cursor& cursor) {
+    Impl& self = *impl_;
+    self.capture->set_cursor_source([alive = std::weak_ptr<Impl*>(self.self),
+                                     &cursor](wl_resource* bound, CursorCapture& out) {
+        const std::shared_ptr<Impl*> impl = alive.lock();
+        return impl != nullptr && (*impl)->cursor_capture(cursor, bound, out);
+    });
 }
 
 std::string ScreenManager::name_of(const Output& output) const {

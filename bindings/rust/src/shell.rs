@@ -523,6 +523,12 @@ impl LayerManager {
         }
     }
 
+    /// The surfaces on `output`, to tell them about a change to it.
+    pub fn surfaces_on(&self, output: u32) -> Vec<SurfaceId> {
+        let raw = self.raw.surfaces_on(output);
+        raw.into_iter().map(SurfaceId).collect()
+    }
+
     /// Close every surface on `output`: its monitor went away.
     pub fn close_output(&mut self, output: u32) {
         self.raw.pin_mut().close_output(output);
@@ -655,6 +661,13 @@ impl<'a> ScreenManager<'a> {
     /// portal. They get what was last drawn.
     pub fn follow_capture(&self, capture: &'a crate::render::ScreencopyManager<'_>) {
         self.raw.follow_capture(&capture.raw);
+    }
+
+    /// Where captures get the pointer: cursor sessions, and a frame that asks for
+    /// the pointer when a KMS plane is showing it. After
+    /// [`follow_capture`](Self::follow_capture).
+    pub fn follow_cursor(&self, cursor: &'a crate::gpu::Cursor<'_>) {
+        self.raw.follow_cursor(&cursor.raw);
     }
 
     /// The list to draw, in layout coordinates: one list for every output, each

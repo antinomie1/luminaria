@@ -173,6 +173,10 @@ public:
     /// `CpuCompositor::pixels()`.
     [[nodiscard]] Result<std::span<const Pixel>> read_back(SceneOutput& state);
 
+    /// Whether the KMS cursor plane is what's showing the pointer on `state`, so
+    /// that `read_back()` doesn't have it.
+    [[nodiscard]] bool cursor_on_plane(const SceneOutput& state) const noexcept;
+
     /// Whether a `retained` item for `surface` would draw anything, on any output.
     [[nodiscard]] bool has_retained(SurfaceId surface) const noexcept;
 
@@ -488,6 +492,11 @@ void append_tree(SceneOutput::Impl& state, const Output& output, Surface& root, 
     for (const SurfaceAt& at : state.tree) {
         state.drawn.push_back(at.surface->id());
     }
+    if (output.transform() == Transform::normal) {
+        push_item(state, CpuView{root.id(), logical_x, logical_y, clip, alpha, output.scale()});
+        return;
+    }
+    // Not rotated, as this path doesn't: only put where the rotation would.
     const Box origin = output.to_device({logical_x, logical_y, 1, 1});
     push_item(state, CpuView{root.id(), origin.x, origin.y, clip, alpha});
 }
@@ -807,6 +816,10 @@ void SceneRenderer::update_cursor() {
     }
 }
 
+bool SceneRenderer::cursor_on_plane(const SceneOutput& state) const noexcept {
+    return state.impl_->cursor_plane.shown;
+}
+
 SceneStats SceneRenderer::stats() const noexcept { return impl_->stats; }
 
 std::weak_ptr<const void> SceneRenderer::alive() const noexcept {
@@ -850,7 +863,7 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
         }
 
         const Box view{0, 0, output.logical_width(), output.logical_height()};
-        const int scale = std::max(1, output.scale());
+        const double scale = output.scale();
         // Everything is a potential blur backdrop, so the marker is the bottom
         // of the frame. A blurred item captures what has been placed under it
         // by the time its turn comes.
@@ -904,7 +917,8 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
                     cache = &self.blurs[blur++];
                 }
                 const bool have_targets =
-                    ensure_blur(*cache, *impl_->gpu, view.width * scale, view.height * scale);
+                    ensure_blur(*cache, *impl_->gpu, scaled_edge(view.width, scale),
+                                scaled_edge(view.height, scale));
                 if (item.blur.xray && shared_backdrop) {
                     // The one shared capture is already queued below the lowest
                     // x-ray item; place only, sampling the same chain texture.
@@ -976,8 +990,8 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
                 self.groups.resize(group + 1);
             }
             SceneGroupCache& cache = self.groups[group++];
-            const int w = item.box.width * scale;
-            const int h = item.box.height * scale;
+            const int w = scaled_edge(item.box.width, scale);
+            const int h = scaled_edge(item.box.height, scale);
             if (!cache.target.has_value() || cache.width != w || cache.height != h) {
                 cache.target.reset();
                 if (Result<OffscreenTarget> target = impl_->gpu->create_offscreen(w, h); target) {
@@ -1050,7 +1064,7 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
             }
             break;
         case SceneItem::Kind::border:
-            border_rects(device, item.thickness * output.scale(), [&](int x, int y, int w, int h) {
+            border_rects(device, scaled_edge(item.thickness, output.scale()), [&](int x, int y, int w, int h) {
                 if (w > 0 && h > 0) {
                     push_item(self, RectFill{{x, y, w, h}, faded(item)});
                 }

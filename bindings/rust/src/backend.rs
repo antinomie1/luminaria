@@ -33,11 +33,12 @@ impl Output {
         self.raw.height()
     }
 
-    pub fn scale(&self) -> i32 {
+    /// Device pixels per logical pixel; 1.5 is fine.
+    pub fn scale(&self) -> f64 {
         self.raw.scale()
     }
 
-    pub fn set_scale(&mut self, scale: i32) {
+    pub fn set_scale(&mut self, scale: f64) {
         self.pin().set_scale(scale);
     }
 

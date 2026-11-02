@@ -29,6 +29,8 @@ public:
 
     /// Ask all surfaces on `output_id` to close (e.g. when an output is disconnected).
     void close_output(std::uint32_t output_id);
+    /// The surfaces on `output_id`, to tell them about a change to it.
+    [[nodiscard]] std::vector<SurfaceId> surfaces_on(std::uint32_t output_id) const;
 
 private:
     struct Entry {
@@ -120,6 +122,16 @@ LayerSurface* LayerManager::keyboard_target(SurfaceId surface) const {
         }
     }
     return nullptr;
+}
+
+std::vector<SurfaceId> LayerManager::surfaces_on(std::uint32_t output_id) const {
+    std::vector<SurfaceId> surfaces;
+    for (const Entry& entry : entries_) {
+        if (entry.output_id == output_id) {
+            surfaces.push_back(entry.surface->surface().id());
+        }
+    }
+    return surfaces;
 }
 
 void LayerManager::close_output(std::uint32_t output_id) {

@@ -410,10 +410,10 @@ std::int32_t OutputShim::width() const {
 std::int32_t OutputShim::height() const {
   return impl_->output ? impl_->output->height() : 0;
 }
-std::int32_t OutputShim::scale() const {
-  return impl_->output ? impl_->output->scale() : 1;
+double OutputShim::scale() const {
+  return impl_->output ? impl_->output->scale() : 1.0;
 }
-void OutputShim::set_scale(std::int32_t scale) {
+void OutputShim::set_scale(double scale) {
   if (impl_->output)
     impl_->output->set_scale(scale);
 }
@@ -611,6 +611,14 @@ std::int32_t buffer_height(std::uint64_t surface_id) {
 std::int32_t buffer_scale(std::uint64_t surface_id) {
   lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
   return s ? s->buffer_scale() : 1;
+}
+std::uint64_t surface_root(std::uint64_t surface_id) {
+  lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+  if (!s)
+    return surface_id;
+  while (lm::Surface *parent = s->subsurface_parent())
+    s = parent;
+  return u64_from_id(s->id());
 }
 std::uint32_t buffer_transform(std::uint64_t surface_id) {
   lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));

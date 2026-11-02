@@ -52,7 +52,7 @@ struct CpuView {
     /// (x*scale, y*scale) and drawn `scale` times as wide and tall, so a
     /// capture at a HiDPI window's real buffer resolution gets its pixels back
     /// instead of an upscale of the logical size. 1 draws the tree as it is.
-    int scale = 1;
+    double scale = 1.0;
 };
 
 /// A block of pixels the compositor itself owns — a rasterized bar, a themed
@@ -239,7 +239,7 @@ void CpuCompositor::draw_view(const CpuView& view) {
     if (clip.empty()) {
         return;
     }
-    const int scale = view.scale < 1 ? 1 : view.scale;
+    const double scale = view.scale > 0.0 ? view.scale : 1.0;
     tree_.clear();
     surface->surface_tree(tree_);
     for (const SurfaceAt& at : tree_) {
@@ -253,8 +253,10 @@ void CpuCompositor::draw_view(const CpuView& view) {
         // position, a subsurface's offset, a surface's size. `scale` is the
         // one place they become framebuffer pixels, which is what lets a
         // capture ask for the window's real buffer resolution.
-        const Box dst{(view.x + at.x) * scale, (view.y + at.y) * scale, surface_w * scale,
-                      surface_h * scale};
+        const int left = scaled_edge(view.x + at.x, scale);
+        const int top = scaled_edge(view.y + at.y, scale);
+        const Box dst{left, top, scaled_edge(view.x + at.x + surface_w, scale) - left,
+                      scaled_edge(view.y + at.y + surface_h, scale) - top};
         draw_surface(s, dst, clip, view.alpha);
     }
 }

@@ -73,6 +73,12 @@ impl SurfaceId {
         ffi::buffer_scale(self.0)
     }
 
+    /// The top of the subsurface tree this is in, which is this surface when it
+    /// isn't a subsurface, or is gone.
+    pub fn root(&self) -> SurfaceId {
+        SurfaceId(ffi::surface_root(self.0))
+    }
+
     pub fn buffer_transform(&self) -> Transform {
         Transform::from_u32(ffi::buffer_transform(self.0))
     }

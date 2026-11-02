@@ -165,8 +165,8 @@ public:
 
   std::int32_t width() const;
   std::int32_t height() const;
-  std::int32_t scale() const;
-  void set_scale(std::int32_t scale);
+  double scale() const;
+  void set_scale(double scale);
   std::uint32_t transform() const;
   void set_transform(std::uint32_t transform);
   void announce_change();
@@ -231,6 +231,7 @@ std::int32_t surface_height(std::uint64_t surface_id);
 std::int32_t buffer_width(std::uint64_t surface_id);
 std::int32_t buffer_height(std::uint64_t surface_id);
 std::int32_t buffer_scale(std::uint64_t surface_id);
+std::uint64_t surface_root(std::uint64_t surface_id);
 std::uint32_t buffer_transform(std::uint64_t surface_id);
 bool surface_has_buffer(std::uint64_t surface_id);
 rust::Vec<Rect> surface_damage(std::uint64_t surface_id);

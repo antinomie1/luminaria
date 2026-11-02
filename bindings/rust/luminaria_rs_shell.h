@@ -124,6 +124,10 @@ std::unique_ptr<CursorShim> cursor_new(const SceneRendererShim& renderer, const 
 std::unique_ptr<CursorShim> cursor_new_with_shapes(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
                                                   const SeatShim& seat, const CursorShapeManagerShim& shapes,
                                                   rust::String& error);
+std::unique_ptr<CursorShim> cursor_new_with_capture(const SceneRendererShim& renderer, const OutputLayoutShim& layout,
+                                                    const SeatShim& seat, const CursorShapeManagerShim& shapes,
+                                                    const ScreencopyManagerShim& capture, rust::String& error);
+void screencopy_use_scene_renderer(ScreencopyManagerShim& mgr, const SceneRendererShim& renderer);
 
 class FrameShim {
 public:
@@ -203,6 +207,7 @@ public:
     rust::Vec<SceneItemRaw> append_to(std::uint32_t output_id, std::uint32_t layer) const;
     std::uint64_t keyboard_target(std::uint64_t surface_id) const;
     void close_output(std::uint32_t output_id);
+    rust::Vec<std::uint64_t> surfaces_on(std::uint32_t output_id) const;
 
     struct Impl;
     Impl& impl() const;
@@ -224,6 +229,7 @@ public:
 
     void follow_popups(const PopupTreeShim& popups) const;
     void follow_capture(const ScreencopyManagerShim& capture) const;
+    void follow_cursor(const CursorShim& cursor) const;
     void set_scene(rust::Slice<const SceneItemRaw> items) const;
     void set_background(float r, float g, float b, float a) const;
     std::uint64_t output_identity(const OutputShim& output) const;

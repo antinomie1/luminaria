@@ -313,6 +313,19 @@ impl Transform {
         (self as u32) >= 4
     }
 
+    /// Map a point in units of the framebuffer, which is what a touchscreen on
+    /// that panel reports, to the same units of the logical space: (0,0) top-left,
+    /// (1,1) bottom-right, whatever the scale.
+    pub fn unit_point(self, x: f64, y: f64) -> (f64, f64) {
+        let (x, y) = match self.rotation() {
+            90 => (y, 1.0 - x),
+            180 => (1.0 - x, 1.0 - y),
+            270 => (1.0 - y, x),
+            _ => (x, y),
+        };
+        if self.flipped() { (1.0 - x, y) } else { (x, y) } // flipped first going out
+    }
+
     pub const fn rotation(self) -> i32 {
         ((self as u32 & 3) * 90) as i32
     }
