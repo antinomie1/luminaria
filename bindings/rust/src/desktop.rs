@@ -1,5 +1,6 @@
 //! Desktop shell protocols: taskbars, workspaces, screen locking, output configuration, and input methods.
 
+use crate::backend::Output;
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi::EventKind;
 use crate::ffi_desktop as ffi;
@@ -7,7 +8,7 @@ use crate::protocol::{
     DataDeviceManager, OutputGlobal, Seat, SurfaceId, TextInputManager, XdgShell,
 };
 use crate::shell::OutputLayout;
-use crate::util::Rect;
+use crate::util::{Rect, Transform};
 
 /// Taskbar and window switcher request kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +333,12 @@ impl LockSurface<'_> {
         (i.width, i.height)
     }
 
+    /// The output it is for, as [`crate::shell::ScreenManager::output_with`] reads
+    /// it. Taken when the surface was made: the client may release its `wl_output`.
+    pub fn output_identity(&self) -> u64 {
+        self.info().output_identity
+    }
+
     /// Whether this is the lock surface for `output`.
     pub fn is_on(&self, output: &OutputGlobal<'_>) -> bool {
         self.mgr.lock_surface_on_output(self.surface.0, &output.raw)
@@ -345,9 +352,26 @@ impl LockSurface<'_> {
 }
 
 /// A client applied or tested a screen arrangement (`zwlr_output_configuration_v1`).
+/// Under [`OutputManager::set_deferred`], `ticket` is what to read it and answer it
+/// by; otherwise 0, and it has been answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputConfigRequest {
     pub test: bool,
+    pub ticket: u64,
+}
+
+/// One output as a client wants it. `None` leaves that as it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputHeadRequest {
+    /// The name given to [`OutputManager::add_head`].
+    pub name: String,
+    pub enabled: bool,
+    /// Width, height and millihertz.
+    pub mode: Option<(i32, i32, i32)>,
+    pub position: Option<(i32, i32)>,
+    pub transform: Option<Transform>,
+    /// As sent, which may be fractional.
+    pub scale: Option<f64>,
 }
 
 /// Output layout configuration manager (`zwlr_output_manager_v1` for
@@ -371,8 +395,42 @@ impl<'a> OutputManager<'a> {
         }
     }
 
-    pub fn update(&mut self) {
-        self.raw.pin_mut().update();
+    pub fn update(&self) {
+        self.raw.update();
+    }
+
+    /// Advertise `output` as a head called `name`, normally its `wl_output`'s. It
+    /// leaves by itself when the output does.
+    pub fn add_head(&self, output: &Output, name: &str) {
+        self.raw.add_head(&output.raw, name);
+    }
+
+    /// Answer requests by hand: each arrives with a ticket for
+    /// [`heads_of`](Self::heads_of) and [`answer`](Self::answer), and the client
+    /// waits until then. Otherwise they get [`set_auto_verdict`](Self::set_auto_verdict).
+    pub fn set_deferred(&self, deferred: bool) {
+        self.raw.set_deferred(deferred);
+    }
+
+    /// What a deferred request asks for, every head in the order they were added.
+    pub fn heads_of(&self, ticket: u64) -> Vec<OutputHeadRequest> {
+        let heads = self.raw.heads_of(ticket).into_iter();
+        heads
+            .map(|h| OutputHeadRequest {
+                name: h.name,
+                enabled: h.enabled,
+                mode: h.has_mode.then_some((h.width, h.height, h.refresh_mhz)),
+                position: h.has_position.then_some((h.x, h.y)),
+                transform: h.has_transform.then(|| Transform::from_u32(h.transform)),
+                scale: h.has_scale.then_some(h.scale),
+            })
+            .collect()
+    }
+
+    /// The verdict for a deferred request. "Anything but success means nothing
+    /// changed": undo a half-done apply first.
+    pub fn answer(&self, ticket: u64, succeeded: bool) {
+        self.raw.answer(ticket, succeeded);
     }
 
     pub fn set_auto_verdict(&self, succeed: bool) {
@@ -583,7 +641,10 @@ impl OutputConfigRequest {
     pub(crate) fn from_raw(raw: crate::ffi::EventRaw) -> Option<OutputConfigRequest> {
         match raw.kind {
             EventKind::OutputConfigRequest => {
-                return Some(OutputConfigRequest { test: raw.flag });
+                return Some(OutputConfigRequest {
+                    test: raw.flag,
+                    ticket: raw.id,
+                });
             }
             _ => {}
         }

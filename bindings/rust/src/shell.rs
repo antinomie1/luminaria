@@ -17,7 +17,7 @@ use crate::ffi_shell;
 #[cfg(feature = "shell")]
 use crate::gpu::{Cursor, SceneRenderer};
 #[cfg(feature = "shell")]
-use crate::protocol::{Layer, LayerShell, Seat, XdgShell};
+use crate::protocol::{Layer, LayerShell, LayerSurface, Seat, XdgShell};
 use crate::protocol::{SurfaceId, Toplevel};
 use crate::util::{Color, Rect};
 #[cfg(feature = "shell")]
@@ -97,6 +97,8 @@ pub enum SceneKind {
     /// Compositor-owned pixels registered with `SceneRenderer::set_image`
     /// under `serial`.
     Image = 3,
+    /// The last pixels of a surface that may be gone: [`SceneItem::retained`].
+    Retained = 4,
 }
 
 impl SceneKind {
@@ -106,6 +108,7 @@ impl SceneKind {
             0 => Self::Surface,
             1 => Self::Rect,
             2 => Self::Border,
+            4 => Self::Retained,
             _ => Self::Image,
         }
     }
@@ -123,6 +126,13 @@ pub struct SceneItem {
     pub serial: u64,
     pub tag: u64,
     pub accepts_input: bool,
+    /// The [`Output::key`] of the one output to draw this on, or 0 for all of them.
+    /// A window reaching past a shared edge stays whole this way, its rounded
+    /// corners where they are, rather than being cut to fit and rounded again.
+    pub only_on: u64,
+    /// [`SceneKind::Retained`] only: the part of the surface to show, as
+    /// `(x, y, width, height)` from 0 to 1.
+    pub crop: (f32, f32, f32, f32),
     pub alpha: f32,
     pub corner_radius: f32,
     pub blur_enabled: bool,
@@ -146,6 +156,8 @@ impl SceneItem {
             serial: 0,
             tag: 0,
             accepts_input: true,
+            only_on: 0,
+            crop: (0.0, 0.0, 1.0, 1.0),
             alpha: 1.0,
             corner_radius: 0.0,
             blur_enabled: false,
@@ -199,6 +211,18 @@ impl SceneItem {
         }
     }
 
+    /// The last pixels of `surface`, which may be gone: to fade a closed window out
+    /// with. Stops being drawable once a frame goes by without one of these. See
+    /// [`SceneRenderer::has_retained`](crate::gpu::SceneRenderer::has_retained).
+    pub fn retained(surface: SurfaceId, rect: Rect, crop: (f32, f32, f32, f32)) -> Self {
+        Self {
+            surface,
+            crop,
+            accepts_input: false,
+            ..Self::base(SceneKind::Retained, rect)
+        }
+    }
+
     pub fn image(rect: Rect, serial: u64) -> Self {
         Self {
             serial,
@@ -233,6 +257,11 @@ impl SceneItem {
         self
     }
 
+    pub fn with_only_on(mut self, output: u64) -> Self {
+        self.only_on = output;
+        self
+    }
+
     pub fn with_tag(mut self, tag: u64) -> Self {
         self.tag = tag;
         self
@@ -255,6 +284,8 @@ impl SceneItem {
             serial: raw.serial,
             tag: raw.tag,
             accepts_input: raw.accepts_input,
+            only_on: raw.only_on,
+            crop: (raw.crop_x, raw.crop_y, raw.crop_width, raw.crop_height),
             alpha: raw.alpha,
             corner_radius: raw.corner_radius,
             blur_enabled: raw.blur_enabled,
@@ -284,6 +315,11 @@ impl SceneItem {
             serial: self.serial,
             tag: self.tag,
             accepts_input: self.accepts_input,
+            only_on: self.only_on,
+            crop_x: self.crop.0,
+            crop_y: self.crop.1,
+            crop_width: self.crop.2,
+            crop_height: self.crop.3,
             alpha: self.alpha,
             corner_radius: self.corner_radius,
             blur_enabled: self.blur_enabled,
@@ -615,6 +651,12 @@ impl<'a> ScreenManager<'a> {
         self.raw.follow_popups(&popups.raw);
     }
 
+    /// Let clients capture every output, past and future: `grim`, `wf-recorder`, a
+    /// portal. They get what was last drawn.
+    pub fn follow_capture(&self, capture: &'a crate::render::ScreencopyManager<'_>) {
+        self.raw.follow_capture(&capture.raw);
+    }
+
     /// The list to draw, in layout coordinates: one list for every output, each
     /// showing the part the layout puts it on. Call it after every dispatch. A
     /// list that differs from the last one asks every output for a frame and
@@ -628,6 +670,47 @@ impl<'a> ScreenManager<'a> {
         told.extend_from_slice(items);
         let raw: Vec<ffi_shell::SceneItemRaw> = items.iter().map(SceneItem::to_raw).collect();
         self.raw.set_scene(&raw);
+    }
+
+    /// What shows where the scene does not reach, from the next frame on, and
+    /// what a blur over a bare spot samples. The same colour again costs nothing,
+    /// so a config reload can just call this.
+    pub fn set_background(&self, background: Color) {
+        let Color { r, g, b, a } = background;
+        self.raw.set_background(r, g, b, a);
+    }
+
+    /// Which of `outputs` the client asked `surface` to be on: `None` when it left
+    /// that to the compositor ([`LayerSurface::has_output`] tells that apart), or
+    /// named one that is already gone. A wallpaper client makes one surface per
+    /// output, so the focused monitor is the wrong answer.
+    pub fn output_of<'o>(
+        &self,
+        surface: &LayerSurface<'_>,
+        outputs: &'o [Output],
+    ) -> Option<&'o Output> {
+        let (shell, id) = (surface.shell, surface.surface.0);
+        outputs
+            .iter()
+            .find(|output| self.raw.output_is(shell, id, &output.raw))
+    }
+
+    /// What `output`'s `wl_output` is called: "DP-1", or a made-up name for an
+    /// output that isn't a connector.
+    pub fn output_name(&self, output: &Output) -> String {
+        self.raw.output_name(&output.raw)
+    }
+
+    /// Which of `outputs` a protocol object names, by the identity it reports, as
+    /// [`LockSurface::output_identity`](crate::desktop::LockSurface::output_identity)
+    /// does. An output has one for as long as it has a `wl_output`.
+    pub fn output_with<'o>(&self, identity: u64, outputs: &'o [Output]) -> Option<&'o Output> {
+        if identity == 0 {
+            return None;
+        }
+        outputs
+            .iter()
+            .find(|output| self.raw.output_identity(&output.raw) == identity)
     }
 
     /// Where `surface` is in the scene.

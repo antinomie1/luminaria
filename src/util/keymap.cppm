@@ -29,6 +29,11 @@ public:
     /// for forwarding to clients.
     [[nodiscard]] static Result<KeymapState> from_layout(std::string_view layout = {});
 
+    /// As `from_layout`, with an xkb variant ("dvorak", comma-separated like the
+    /// layouts) and options ("ctrl:nocaps"). An empty one is the environment's.
+    [[nodiscard]] static Result<KeymapState>
+    from_names(std::string_view layout, std::string_view variant, std::string_view options);
+
     /// Compile a keymap from its text form — the payload wl_keyboard.keymap
     /// carries, e.g. a nested compositor forwarding its parent's keymap.
     [[nodiscard]] static Result<KeymapState> from_text(std::string_view text);
@@ -100,17 +105,26 @@ KeymapState::KeymapState(KeymapState&&) noexcept = default;
 KeymapState& KeymapState::operator=(KeymapState&&) noexcept = default;
 
 Result<KeymapState> KeymapState::from_layout(std::string_view layout) {
+    return from_names(layout, {}, {});
+}
+
+Result<KeymapState> KeymapState::from_names(std::string_view layout, std::string_view variant,
+                                            std::string_view options) {
     auto impl = std::make_unique<Impl>();
     impl->ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (impl->ctx == nullptr) {
         return fail("xkb_context_new failed");
     }
-    xkb_rule_names names{};
-    if (!layout.empty()) {
-        names.layout = layout.data(); // borrowed only for the call below
-    }
-    impl->map = xkb_keymap_new_from_names(impl->ctx, layout.empty() ? nullptr : &names,
-                                          XKB_KEYMAP_COMPILE_NO_FLAGS);
+    // Null fields are what xkbcommon fills in from XKB_DEFAULT_*. Copies, because
+    // a string_view need not end in a NUL.
+    const std::string layout_text{layout}, variant_text{variant}, options_text{options};
+    const auto named = [](const std::string& text) {
+        return text.empty() ? nullptr : text.c_str();
+    };
+    const xkb_rule_names names{.layout = named(layout_text),
+                               .variant = named(variant_text),
+                               .options = named(options_text)};
+    impl->map = xkb_keymap_new_from_names(impl->ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
     if (impl->map == nullptr) {
         return fail("xkb_keymap_new_from_names failed");
     }

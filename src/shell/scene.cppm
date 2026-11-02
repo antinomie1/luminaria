@@ -94,6 +94,10 @@ struct SceneItem {
         /// *borrowed* until the frame is presented — whoever appended the item
         /// keeps the buffer alive at least that long.
         image,
+        /// The last pixels of `surface`, which may be gone: `Frame::place_retained`.
+        /// GPU only. Nothing is drawn if none were kept, so a caller that wants
+        /// something either way asks `SceneRenderer::has_retained()` first.
+        retained,
     };
 
     Kind kind = Kind::surface;
@@ -104,6 +108,14 @@ struct SceneItem {
     Color color{};                    ///< `rect` and `border`
     int thickness = 0;                ///< `border` only
     std::span<const Pixel> pixels{};  ///< `image` only
+    /// `image` only: the size of `pixels`, which are stretched onto `box`; 0 means
+    /// they're 1:1 with it. For text as sharp as the output: a 2x output wants
+    /// twice the pixels in the same logical box. The CPU path can't stretch, and
+    /// draws only what is 1:1 with the output.
+    int image_width = 0, image_height = 0;
+    /// `retained` only: the part of the surface to show, from 0 to 1, as a window
+    /// is its geometry and not the shadow it draws around it.
+    float crop_x = 0.0f, crop_y = 0.0f, crop_width = 1.0f, crop_height = 1.0f;
     /// `image` only: bumped whenever those pixels change, so the GPU path can
     /// keep a texture across frames instead of comparing a megabyte to find out
     /// it did not. Two items that are the n-th image of their frame and share a

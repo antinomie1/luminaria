@@ -547,6 +547,25 @@ impl KeymapState {
         }
     }
 
+    /// As [`KeymapState::from_layout`], with an xkb variant ("dvorak") and options
+    /// ("ctrl:nocaps"). An empty one is the environment's `XKB_DEFAULT_*`.
+    pub fn from_names(
+        layout: &str,
+        variant: &str,
+        options: &str,
+    ) -> Result<Self, crate::core::Error> {
+        let mut err = String::new();
+        let raw = ffi::keymap_state_from_names(layout, variant, options, &mut err);
+        if raw.is_null() {
+            Err(crate::core::Error::new(
+                crate::core::ErrorKind::InvalidArgument,
+                err,
+            ))
+        } else {
+            Ok(Self { raw })
+        }
+    }
+
     pub fn from_text(text: &str) -> Result<Self, crate::core::Error> {
         let mut err = String::new();
         let raw = ffi::keymap_state_from_text(text, &mut err);

@@ -271,6 +271,16 @@ public:
   void place(const GpuTexture &texture, const PlacementTransform &transform,
              std::uint64_t content = 0);
 
+  /// The last pixels of a surface that may be gone, for a window to fade out
+  /// with: what a client takes with it when it closes. A surface's texture
+  /// outlives it for as long as this keeps asking, every frame, and a few closed
+  /// windows at most. False if there's nothing to show, as for one never placed
+  /// here. An explicit transform crops to the window, without its shadow.
+  bool place_retained(SurfaceId surface, const PlacementTransform &transform);
+
+  /// Whether `place_retained()` has anything to draw for `surface`.
+  [[nodiscard]] bool has_retained(SurfaceId surface) const noexcept;
+
   /// As above, but run `shader` as the fragment stage. The shader's mandatory
   /// ShaderDamage declaration controls full repaint and continuous frames.
   void place(const GpuTexture &texture, const PlacementTransform &transform,
@@ -573,6 +583,10 @@ PlacementTransform PlacementTransform::rounded(float radius) const noexcept {
 // in the GPU shell rather than Surface so the core compositor has no Vulkan
 // dependency. Entries are pointer-stable because their commit handler captures
 // their address; their retained identity is nevertheless generational.
+/// How many closed windows' pixels are kept at once.
+constexpr std::size_t kMaxRetained = 8;
+constexpr int kRetainedGrace = 4;
+
 struct FrSurfaceTexture {
   SurfaceId surface;
   const void *buffer = nullptr;
@@ -580,6 +594,9 @@ struct FrSurfaceTexture {
   bool live = false; // dmabuf imports see new pixels; uploads are snapshots
   Output *output = nullptr;
   Signal<SurfaceCommit>::Connection committed;
+  /// `place_retained()` asked for this since the last repaint.
+  bool wanted = false;
+  int grace = kRetainedGrace; // repaints left without being asked for
   /// Bumped per commit. Buffer identity can't say "new pixels": a client reusing
   /// one shm buffer commits new content under the same pointer.
   std::uint64_t commits = 0;
@@ -587,9 +604,11 @@ struct FrSurfaceTexture {
   void watch(Surface &value, Output &out) {
     surface = value.id();
     output = &out;
-    committed = value.commit.connect([this](SurfaceCommit &) {
+    committed = value.commit.connect([this, &value](SurfaceCommit &) {
       ++commits;
-      if (!live) {
+      // Attaching nothing is how a window hides, and it's the pixels from
+      // before that a close animation wants: they stay until a new buffer.
+      if (!live && value.current_buffer_identity() != nullptr) {
         texture.reset();
         buffer = nullptr;
       }
@@ -740,6 +759,8 @@ struct Frame::Impl {
   std::vector<SurfaceId> prepass_drawn;
   std::vector<SurfaceId> drawn;
   std::vector<std::unique_ptr<FrSurfaceTexture>> texture_cache;
+  /// Textures of surfaces that have gone, while something is still fading them.
+  std::vector<std::unique_ptr<FrSurfaceTexture>> retained;
   Signal<SurfaceInvalidated>::Connection surface_invalidated;
   std::vector<Box> damage;            // this frame's, output-local
   std::vector<Box> repaint;           // damage + what the target still owes
@@ -766,6 +787,9 @@ struct Frame::Impl {
   void rotate_debt();
   void diff_damage();
   void keep_list();
+  void retain(SurfaceId surface);
+  void sweep_retained();
+  [[nodiscard]] const FrSurfaceTexture *find_retained(SurfaceId surface) const noexcept;
   [[nodiscard]] const Effect *effect_at(std::size_t placement) const noexcept;
   [[nodiscard]] FrPlacementKey key_of(const Placement &p,
                                       std::size_t placement) const noexcept;
@@ -877,6 +901,21 @@ void Frame::Impl::diff_damage() {
       damage.push_back(now.box);
     }
   }
+}
+
+bool Frame::has_retained(SurfaceId surface) const noexcept {
+  return impl_->find_retained(surface) != nullptr;
+}
+
+bool Frame::place_retained(SurfaceId surface, const PlacementTransform &transform) {
+  Impl &impl = *impl_;
+  const FrSurfaceTexture *found = impl.find_retained(surface);
+  if (found == nullptr) {
+    return false;
+  }
+  const_cast<FrSurfaceTexture *>(found)->wanted = true;
+  place(*found->texture, transform, surface.index + 1);
+  return true;
 }
 
 void Frame::Impl::keep_list() {
@@ -1042,15 +1081,49 @@ Status Frame::Impl::render_group(std::size_t first_placement,
   return ok();
 }
 
+void Frame::Impl::retain(SurfaceId surface) {
+  const auto entry = std::ranges::find(texture_cache, surface,
+                                       [](const auto &held) { return held->surface; });
+  if (entry == texture_cache.end()) {
+    return;
+  }
+  (*entry)->committed.disconnect();
+  if ((*entry)->texture.has_value()) {
+    retained.push_back(std::move(*entry));
+    if (retained.size() > kMaxRetained) {
+      retained.erase(retained.begin());
+    }
+  }
+  texture_cache.erase(entry);
+}
+
+const FrSurfaceTexture *Frame::Impl::find_retained(SurfaceId surface) const noexcept {
+  for (const auto *list : {&retained, &texture_cache}) {
+    for (const std::unique_ptr<FrSurfaceTexture> &entry : *list) {
+      if (entry->surface == surface && entry->texture.has_value()) {
+        return entry.get();
+      }
+    }
+  }
+  return nullptr;
+}
+
+/// A window closing takes a dozen frames, and this is for nothing but that. The
+/// grace is for the frames before anyone has heard the window went.
+void Frame::Impl::sweep_retained() {
+  std::erase_if(retained, [](const std::unique_ptr<FrSurfaceTexture> &entry) {
+    if (std::exchange(entry->wanted, false)) {
+      entry->grace = kRetainedGrace;
+      return false;
+    }
+    return --entry->grace == 0;
+  });
+}
+
 GpuTexture *Frame::Impl::texture_for(Surface &surface) {
   if (renderer_alive.expired()) {
     return nullptr;
   }
-  std::erase_if(texture_cache,
-                [](const std::unique_ptr<FrSurfaceTexture> &entry) {
-                  return !entry->surface.valid();
-                });
-
   FrSurfaceTexture *entry = nullptr;
   for (const std::unique_ptr<FrSurfaceTexture> &candidate : texture_cache) {
     if (candidate->surface == surface.id()) {
@@ -1067,9 +1140,7 @@ GpuTexture *Frame::Impl::texture_for(Surface &surface) {
 
   const void *current = surface.current_buffer_identity();
   if (current == nullptr) {
-    entry->texture.reset();
-    entry->buffer = nullptr;
-    return nullptr;
+    return nullptr; // the texture stays for a close animation: see `watch()`
   }
   if (entry->texture.has_value() && entry->buffer == current) {
     return &*entry->texture;
@@ -1133,16 +1204,7 @@ Frame::Frame(Output &output, VulkanRenderer &renderer)
   Impl *raw = impl_.get();
   impl_->surface_invalidated =
       surface_invalidated().connect([raw](SurfaceInvalidated &event) {
-        for (const std::unique_ptr<FrSurfaceTexture> &entry :
-             raw->texture_cache) {
-          if (entry->surface != event.surface) {
-            continue;
-          }
-          entry->surface = {};
-          entry->buffer = nullptr;
-          entry->texture.reset();
-          entry->committed.disconnect();
-        }
+        raw->retain(event.surface);
       });
 }
 
@@ -2237,6 +2299,7 @@ Result<Presented> Frame::submit(Color background) {
     return fail(s.error().message);
   }
 
+  impl.sweep_retained();
   // The damage is spent: hand this frame's share to the buffer that will come
   // round again, and start the clients accumulating afresh.
   impl.rotate_debt();

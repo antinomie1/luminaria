@@ -238,7 +238,9 @@ struct ScreencopyManager::Impl {
     WlGlobal ext_source_output_manager_global;
     WlGlobal ext_source_toplevel_manager_global;
 
-    std::vector<OutputEntry> outputs;
+    // By pointer: sessions and frames in flight hold an OutputEntry*, and this grows
+    // whenever a client binds a wl_output.
+    std::vector<std::unique_ptr<OutputEntry>> outputs;
     // Every live window source, weak. Not for lookup — for teardown: a source
     // resource can outlive the manager (a connected client's objects are
     // destroyed inside wl_display_destroy, after the globals), and it caches
@@ -247,7 +249,8 @@ struct ScreencopyManager::Impl {
 
     // Find an output entry by its wl_resource. Returns nullptr if not found.
     OutputEntry* find_output(wl_resource* output) {
-        for (auto& o : outputs) {
+        for (auto& held : outputs) {
+            OutputEntry& o = *held;
             if (o.output == output) {
                 return &o;
             }
@@ -1752,7 +1755,18 @@ Result<ScreencopyManager> ScreencopyManager::create(Display& display) {
 
 void ScreencopyManager::add_output(wl_resource* output, int width, int height,
                                      ScreencopyCaptureFunc capture) {
-    impl_->outputs.push_back(OutputEntry{output, width, height, std::move(capture)});
+    // The same wl_output again is a new size, and frames in flight keep pointers
+    // into this: an entry stays where it is.
+    for (const std::unique_ptr<OutputEntry>& entry : impl_->outputs) {
+        if (entry->output == output) {
+            entry->width = width;
+            entry->height = height;
+            entry->capture = std::move(capture);
+            return;
+        }
+    }
+    impl_->outputs.push_back(
+        std::make_unique<OutputEntry>(OutputEntry{output, width, height, std::move(capture)}));
 }
 
 void ScreencopyManager::set_cursor_source(ScreencopyCursorFunc fn) {

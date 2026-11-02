@@ -161,6 +161,29 @@ void DisplayShim::terminate() const {
     impl_->display->terminate();
 }
 
+struct FdWatchShim::Impl {
+  lm::EventSource source;
+};
+FdWatchShim::FdWatchShim(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+FdWatchShim::~FdWatchShim() = default;
+
+std::unique_ptr<FdWatchShim> fd_watch_new(const DisplayShim &display, std::int32_t fd,
+                                          std::uint64_t tag, rust::String &error) {
+  lm::Display *raw = raw_ptr(display);
+  if (raw == nullptr) {
+    error = "display not initialized";
+    return nullptr;
+  }
+  auto impl = std::make_unique<FdWatchShim::Impl>();
+  impl->source = raw->event_loop().add_fd(fd, [tag] { hub_push(event(EventKind::FdReady, tag)); });
+  if (!impl->source.valid()) {
+    error = "event loop refused the fd";
+    return nullptr;
+  }
+  return std::make_unique<FdWatchShim>(std::move(impl));
+}
+
 int DisplayShim::dispatch(int timeout_ms) const {
   if (!impl_->display)
     return -1;
@@ -207,9 +230,16 @@ KeymapStateShim::Impl &KeymapStateShim::impl() const { return *impl_; }
 
 std::unique_ptr<KeymapStateShim> keymap_state_from_layout(rust::Str layout,
                                                           rust::String &error) {
+  return keymap_state_from_names(layout, "", "", error);
+}
+
+std::unique_ptr<KeymapStateShim> keymap_state_from_names(rust::Str layout,
+                                                         rust::Str variant,
+                                                         rust::Str options,
+                                                         rust::String &error) {
   try {
-    std::string layout_str(layout);
-    auto r = lm::KeymapState::from_layout(layout_str);
+    auto r = lm::KeymapState::from_names(std::string(layout), std::string(variant),
+                                         std::string(options));
     if (!r) {
       error = to_rust(r.error().message);
       return nullptr;
@@ -394,6 +424,14 @@ std::uint32_t OutputShim::transform() const {
 void OutputShim::set_transform(std::uint32_t transform) {
   if (impl_->output)
     impl_->output->set_transform(static_cast<lm::Transform>(transform));
+}
+void OutputShim::announce_change() {
+  if (impl_->output)
+    impl_->output->announce_change();
+}
+std::uint64_t OutputShim::key() const { return reinterpret_cast<std::uint64_t>(impl_->output); }
+rust::String OutputShim::connector() const {
+  return impl_->output ? to_rust(impl_->output->connector()) : rust::String{};
 }
 std::int32_t OutputShim::logical_width() const {
   return impl_->output ? impl_->output->logical_width() : 0;

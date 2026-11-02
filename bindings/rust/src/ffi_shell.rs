@@ -24,6 +24,11 @@ pub(crate) mod ffi {
         serial: u64,
         tag: u64,
         accepts_input: bool,
+        only_on: u64,
+        crop_x: f32,
+        crop_y: f32,
+        crop_width: f32,
+        crop_height: f32,
         alpha: f32,
         corner_radius: f32,
         blur_enabled: bool,
@@ -71,6 +76,7 @@ pub(crate) mod ffi {
         // Types from core bridge
         type DisplayShim = crate::ffi::DisplayShim;
         type OutputShim = crate::ffi::OutputShim;
+        type ScreencopyManagerShim = crate::ffi_render::ScreencopyManagerShim;
         type OutputLayoutShim = crate::ffi::OutputLayoutShim;
         type SeatShim = crate::ffi::SeatShim;
         type XdgShellShim = crate::ffi::XdgShellShim;
@@ -103,6 +109,7 @@ pub(crate) mod ffi {
         fn kind(self: &AutoBackendShim) -> u32;
         fn start(self: &AutoBackendShim, error: &mut String) -> bool;
         fn keymap(self: &AutoBackendShim) -> String;
+        fn set_keymap(self: &AutoBackendShim, xkb_text: &str) -> bool;
         fn capabilities(self: &AutoBackendShim) -> u32;
         fn follow_seat(self: &AutoBackendShim, seat: &SeatShim, touch: bool);
         fn has_session(self: &AutoBackendShim) -> bool;
@@ -161,6 +168,7 @@ pub(crate) mod ffi {
         fn read_back(self: &SceneRendererShim, output: &OutputShim, error: &mut String) -> Vec<u8>;
         #[allow(dead_code)]
         fn vulkan_handles(self: &SceneRendererShim, out: &mut VulkanHandlesRaw) -> bool;
+        fn has_retained(self: &SceneRendererShim, surface_id: u64) -> bool;
         fn set_image(
             self: &SceneRendererShim,
             serial: u64,
@@ -283,7 +291,17 @@ pub(crate) mod ffi {
             error: &mut String,
         ) -> UniquePtr<ScreenManagerShim>;
         fn follow_popups(self: &ScreenManagerShim, popups: &PopupTreeShim);
+        fn follow_capture(self: &ScreenManagerShim, capture: &ScreencopyManagerShim);
         fn set_scene(self: &ScreenManagerShim, items: &[SceneItemRaw]);
+        fn set_background(self: &ScreenManagerShim, r: f32, g: f32, b: f32, a: f32);
+        fn output_identity(self: &ScreenManagerShim, output: &OutputShim) -> u64;
+        fn output_name(self: &ScreenManagerShim, output: &OutputShim) -> String;
+        fn output_is(
+            self: &ScreenManagerShim,
+            shell: &LayerShellShim,
+            surface_id: u64,
+            output: &OutputShim,
+        ) -> bool;
         fn surface_box(self: &ScreenManagerShim, surface_id: u64, out: &mut Rect) -> bool;
         fn invalidate(self: &ScreenManagerShim);
         fn size(self: &ScreenManagerShim) -> usize;

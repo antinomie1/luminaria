@@ -247,6 +247,29 @@ impl AsFd for Display {
     }
 }
 
+/// Wakes the event loop when `fd` is readable, as an [`crate::Event::FdReady`]
+/// with this tag: what lets a compositor wait on a file of its own and still block
+/// in dispatch. Stops when dropped. The fd stays the caller's, and must outlive it.
+pub struct FdWatch<'d> {
+    _raw: cxx::UniquePtr<ffi::FdWatchShim>,
+    _display: Holds<'d>,
+}
+
+impl<'d> FdWatch<'d> {
+    pub fn new(display: &'d Display, fd: BorrowedFd<'_>, tag: u64) -> Result<Self, Error> {
+        let mut err = String::new();
+        let raw = ffi::fd_watch_new(&display.raw, fd.as_raw_fd(), tag, &mut err);
+        if raw.is_null() {
+            Err(Error::new(ErrorKind::EventLoop, err))
+        } else {
+            Ok(Self {
+                _raw: raw,
+                _display: Holds::new(),
+            })
+        }
+    }
+}
+
 /// A non-owning handle to the event loop. It borrows the [`Display`] that owns
 /// the loop, so its fd cannot be used after the loop is gone.
 #[derive(Clone, Copy)]

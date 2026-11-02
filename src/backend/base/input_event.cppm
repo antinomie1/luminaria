@@ -100,6 +100,23 @@ struct TouchFrameEvent {};
 struct TouchCancelEvent {
     int32_t id;
 };
+// --- Touchpad gestures ------------------------------------------------------
+//
+// libinput has already decided these are gestures and not pointer motion. What
+// one means is the compositor's: to act on it, or to pass it to the client under
+// the pointer with `PointerGestures`.
+enum class GestureKind : std::uint8_t { swipe, pinch, hold };
+enum class GesturePhase : std::uint8_t { begin, update, end };
+struct GestureEvent {
+    GestureKind kind = GestureKind::swipe;
+    GesturePhase phase = GesturePhase::begin;
+    std::uint32_t fingers = 0;
+    double dx = 0.0, dy = 0.0;  ///< since the last update; swipe and pinch
+    double scale = 1.0;         ///< since the gesture began; pinch
+    double rotation = 0.0;      ///< degrees clockwise since the last update; pinch
+    bool cancelled = false;     ///< `end` only: another finger came, or it was called off
+};
+
 // --- Graphics tablets -------------------------------------------------------
 //
 // A drawing tablet is two things the kernel reports separately: the TABLET (a
@@ -257,7 +274,7 @@ struct InputCapabilities {
 using InputEvent = std::variant<KeyEvent, ModifiersEvent, KeymapChange, PointerMotionEvent,
                                 PointerMotionAbsEvent, PointerLeaveEvent, PointerButtonEvent,
                                 PointerAxisEvent, TouchDownEvent, TouchMotionEvent, TouchUpEvent,
-                                TouchFrameEvent, TouchCancelEvent, InputCapabilities,
+                                TouchFrameEvent, TouchCancelEvent, GestureEvent, InputCapabilities,
                                 TabletDeviceAdded, TabletDeviceRemoved, TabletToolProximityEvent,
                                 TabletToolAxisEvent, TabletToolTipEvent, TabletToolButtonEvent,
                                 TabletPadButtonEvent, TabletPadRingEvent, TabletPadStripEvent>;

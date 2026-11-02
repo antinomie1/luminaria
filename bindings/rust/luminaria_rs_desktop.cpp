@@ -209,6 +209,8 @@ struct SessionLockManagerShim::Impl {
   struct SurfaceEntry {
     lm::SessionLockSurface *surface = nullptr;
     std::uint64_t lock = 0;
+    // Now, not on request: the client may release its wl_output before asked.
+    std::uint64_t output_identity = 0;
     Conn<lm::SessionLockSurfaceMap> on_map;
     Conn<lm::SessionLockSurfaceDestroy> on_destroy;
   };
@@ -233,6 +235,8 @@ struct SessionLockManagerShim::Impl {
     auto entry = std::make_unique<SurfaceEntry>();
     entry->surface = &ls;
     entry->lock = lock_id;
+    entry->output_identity =
+        reinterpret_cast<std::uint64_t>(lm::OutputGlobal::identity_of(ls.output_resource()));
     entry->on_map = ls.map.connect([this, id](lm::SessionLockSurfaceMap &) {
       events.push(event(EventKind::LockSurfaceMap, id));
     });
@@ -339,6 +343,7 @@ bool SessionLockManagerShim::lock_surface_info(std::uint64_t surface_id,
   out.width = e->surface->width();
   out.height = e->surface->height();
   out.has_output = e->surface->output_resource() != nullptr;
+  out.output_identity = e->output_identity;
   return true;
 }
 std::uint32_t SessionLockManagerShim::lock_surface_configure(
@@ -357,6 +362,8 @@ struct OutputManagerShim::Impl {
   Events events;
   Conn<lm::OutputConfigRequest> on_request;
   lm::OutputConfigVerdict auto_verdict = lm::OutputConfigVerdict::succeeded;
+  bool deferred = false;
+  std::unordered_map<std::uint64_t, std::vector<OutputHeadConfigRaw>> waiting;
 };
 OutputManagerShim::~OutputManagerShim() = default;
 OutputManagerShim::OutputManagerShim(std::unique_ptr<Impl> impl) noexcept
@@ -383,7 +390,28 @@ output_manager_new(const DisplayShim &display, const OutputLayoutShim &layout,
     raw->on_request =
         raw->mgr->request().connect([raw](lm::OutputConfigRequest &r) {
           r.verdict = raw->auto_verdict;
-          EventRaw ev = event(EventKind::OutputConfigRequest, 0);
+          if (raw->deferred) {
+            r.deferred = true;
+            std::vector<OutputHeadConfigRaw> &heads = raw->waiting[r.ticket];
+            for (const lm::OutputHeadConfig &head : r.heads) {
+              OutputHeadConfigRaw out{};
+              out.name = to_rust(head.name);
+              out.enabled = head.enabled;
+              out.has_mode = head.mode.has_value();
+              out.width = head.mode ? head.mode->width : 0;
+              out.height = head.mode ? head.mode->height : 0;
+              out.refresh_mhz = head.mode ? head.mode->refresh_mhz : 0;
+              out.has_position = head.position.has_value();
+              out.x = head.position ? head.position->x : 0;
+              out.y = head.position ? head.position->y : 0;
+              out.has_transform = head.transform.has_value();
+              out.transform = head.transform ? static_cast<std::uint32_t>(*head.transform) : 0;
+              out.has_scale = head.scale.has_value();
+              out.scale = head.scale.value_or(0.0);
+              heads.push_back(std::move(out));
+            }
+          }
+          EventRaw ev = event(EventKind::OutputConfigRequest, r.deferred ? r.ticket : 0);
           ev.flag = r.test;
           raw->events.push(std::move(ev));
         });
@@ -393,9 +421,28 @@ output_manager_new(const DisplayShim &display, const OutputLayoutShim &layout,
     return nullptr;
   }
 }
-void OutputManagerShim::update() {
+void OutputManagerShim::update() const {
   if (impl_->mgr)
     impl_->mgr->update();
+}
+void OutputManagerShim::set_deferred(bool deferred) const { impl_->deferred = deferred; }
+rust::Vec<OutputHeadConfigRaw> OutputManagerShim::heads_of(std::uint64_t ticket) const {
+  rust::Vec<OutputHeadConfigRaw> out;
+  if (const auto it = impl_->waiting.find(ticket); it != impl_->waiting.end()) {
+    for (const OutputHeadConfigRaw &head : it->second)
+      out.push_back(head);
+  }
+  return out;
+}
+void OutputManagerShim::answer(std::uint64_t ticket, bool succeeded) const {
+  impl_->waiting.erase(ticket);
+  if (impl_->mgr)
+    impl_->mgr->answer(ticket, succeeded ? lm::OutputConfigVerdict::succeeded
+                                         : lm::OutputConfigVerdict::failed);
+}
+void OutputManagerShim::add_head(const OutputShim &output, rust::Str name) const {
+  if (lm::Output *raw = raw_ptr(output); raw != nullptr && impl_->mgr)
+    impl_->mgr->add_head(*raw, {.name = std::string(name)});
 }
 void OutputManagerShim::set_auto_verdict(bool succeed) const {
   impl_->auto_verdict = succeed ? lm::OutputConfigVerdict::succeeded

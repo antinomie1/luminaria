@@ -681,7 +681,9 @@ loop {
 告诉它一次。帧、点击、摆 popup 都读这张表，它最多旧一轮 dispatch；身份是代际的，已销毁的窗口只会画不出来，不会画错。
 列表变了就自动要帧并重新选指针下的表面。C++ 的 `scene_at` 没有绑定：Rust 手里本来就有这张表。
 
-`surface_box(surface)`、`invalidate()`（场景表表达不了的变化）、`len()` / `is_empty()`。布局变化是
+`set_background(color)`（运行中换底色，颜色没变时什么都不做）、`output_of(&layer_surface, &outputs)`（客户端点名的那块
+输出；`has_output()` 区分没点名和已经没了）、`surface_box(surface)`、`invalidate()`（场景表表达不了的变化）、
+`len()` / `is_empty()`。布局变化是
 `Event::LayoutChanged`（用来重排窗口），设置失败是 `Event::ScreenFailed(String)`。输出照样以 `Event::OutputAdded` 到来，
 不要可以直接丢掉，什么都不影响。
 

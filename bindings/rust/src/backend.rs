@@ -49,6 +49,23 @@ impl Output {
         self.pin().set_transform(transform.as_u32());
     }
 
+    /// After [`set_scale`](Self::set_scale) or [`set_transform`](Self::set_transform)
+    /// on a live output: the logical size moved with them, and this tells the
+    /// layout, `wl_output` and the render targets, as a mode change does.
+    pub fn announce_change(&mut self) {
+        self.pin().announce_change();
+    }
+
+    /// What [`SceneItem::only_on`](crate::shell::SceneItem::only_on) names it by.
+    pub fn key(&self) -> u64 {
+        self.raw.key()
+    }
+
+    /// What the hardware calls it, like "DP-1"; empty if it isn't a connector.
+    pub fn connector(&self) -> String {
+        self.raw.connector()
+    }
+
     pub fn logical_width(&self) -> i32 {
         self.raw.logical_width()
     }
@@ -776,6 +793,14 @@ mod bare_metal {
             }
         }
 
+        /// Read keys through this keymap from now on, on libinput; a nested
+        /// backend's come from its parent and a headless one has none. False if
+        /// nothing changed. Pass the same text to `Seat::set_keymap()`: modifier
+        /// masks mean nothing without the keymap they were computed against.
+        pub fn set_keymap(&self, xkb_text: &str) -> bool {
+            self.raw.set_keymap(xkb_text)
+        }
+
         /// The libseat session, lent out: VT switching. Only ever on DRM.
         /// Only ever on DRM.
         pub fn session(&self) -> Option<Session<'_>> {
@@ -818,6 +843,37 @@ mod bare_metal {
 
 #[cfg(feature = "backend")]
 pub use bare_metal::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureKind {
+    Swipe,
+    Pinch,
+    Hold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GesturePhase {
+    Begin,
+    Update,
+    End,
+}
+
+/// One step of a touchpad gesture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GestureEvent {
+    pub kind: GestureKind,
+    pub phase: GesturePhase,
+    pub fingers: u32,
+    /// Since the last update.
+    pub dx: f64,
+    pub dy: f64,
+    /// Since the gesture began; pinch only.
+    pub scale: f64,
+    /// Degrees clockwise since the last update; pinch only.
+    pub rotation: f64,
+    /// On `End`: another finger came, or it was called off.
+    pub cancelled: bool,
+}
 
 /// xkb modifier masks plus the layout group, as `Seat::notify_modifiers()`
 /// takes them.
@@ -933,6 +989,9 @@ pub enum InputEvent {
     TouchCancel {
         id: i32,
     },
+    /// A touchpad gesture libinput recognised. Act on it, or pass it to the client
+    /// under the pointer with [`PointerGestures`](crate::protocol::PointerGestures).
+    Gesture(GestureEvent),
     /// What the devices can do changed. Forward to `Seat::set_capabilities()`.
     Capabilities(InputCapabilities),
     /// A graphics tablet, a pen over it, or its pad: feed it to
@@ -949,6 +1008,8 @@ impl InputEvent {
             pressed: false,
             x: 0.0,
             y: 0.0,
+            scale: 1.0,
+            rotation: 0.0,
             steps_x: 0,
             steps_y: 0,
             id: 0,
@@ -1031,6 +1092,24 @@ impl InputEvent {
             K::TouchUp => InputEvent::TouchUp { id: raw.id },
             K::TouchFrame => InputEvent::TouchFrame,
             K::TouchCancel => InputEvent::TouchCancel { id: raw.id },
+            K::Gesture => InputEvent::Gesture(GestureEvent {
+                kind: match raw.code {
+                    0 => GestureKind::Swipe,
+                    1 => GestureKind::Pinch,
+                    _ => GestureKind::Hold,
+                },
+                phase: match raw.flags {
+                    0 => GesturePhase::Begin,
+                    1 => GesturePhase::Update,
+                    _ => GesturePhase::End,
+                },
+                fingers: raw.id as u32,
+                dx: raw.x,
+                dy: raw.y,
+                scale: raw.scale,
+                rotation: raw.rotation,
+                cancelled: raw.pressed,
+            }),
             K::Capabilities => InputEvent::Capabilities(InputCapabilities::from_bits(raw.flags)),
             // Every other kind is a tablet event.
             _ => TabletInput::from_raw(&raw).map_or_else(

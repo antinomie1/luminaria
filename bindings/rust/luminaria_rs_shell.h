@@ -43,6 +43,7 @@ public:
     std::uint32_t kind() const;
     bool start(rust::String& error) const;
     rust::String keymap() const;
+    bool set_keymap(rust::Str xkb_text) const;
     std::uint32_t capabilities() const;
     void follow_seat(const SeatShim& seat, bool touch) const;
     bool has_session() const;
@@ -68,6 +69,7 @@ public:
     SceneRendererShim& operator=(const SceneRendererShim&) = delete;
 
     bool gpu_enabled() const;
+    bool has_retained(std::uint64_t surface_id) const;
     rust::String gpu_error() const;
     bool reset(OutputShim& output, std::uint32_t drm_format, rust::String& error) const;
     int present(OutputShim& output, rust::Slice<const SceneItemRaw> items,
@@ -221,7 +223,12 @@ public:
     ScreenManagerShim& operator=(const ScreenManagerShim&) = delete;
 
     void follow_popups(const PopupTreeShim& popups) const;
+    void follow_capture(const ScreencopyManagerShim& capture) const;
     void set_scene(rust::Slice<const SceneItemRaw> items) const;
+    void set_background(float r, float g, float b, float a) const;
+    std::uint64_t output_identity(const OutputShim& output) const;
+    rust::String output_name(const OutputShim& output) const;
+    bool output_is(const LayerShellShim& shell, std::uint64_t surface_id, const OutputShim& output) const;
     bool surface_box(std::uint64_t surface_id, Rect& out) const;
     void invalidate() const;
     std::size_t size() const;

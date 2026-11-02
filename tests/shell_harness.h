@@ -95,6 +95,7 @@ struct Client {
 
     std::vector<std::uint32_t> output_globals; // registry names still announced
     std::vector<std::string> output_names;     // wl_output.name, in arrival order
+    std::vector<wl_output*> outputs;           // every one bound, in arrival order
 
     int pointer_enters = 0, pointer_leaves = 0;
     double pointer_x = -1.0, pointer_y = -1.0;
@@ -280,6 +281,7 @@ private:
                 },
                 [](void*, wl_output*, const char*) {}};
             wl_output_add_listener(output, &listener, self);
+            self->outputs.push_back(output);
         }
     }
     static void on_global_remove(void* data, wl_registry*, std::uint32_t name) {

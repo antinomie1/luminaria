@@ -13,7 +13,10 @@
 //   4. a monitor unplugged takes all of its state with it, and the number in a
 //      name is not reused;
 //   5. a steady frame allocates nothing, a menu open and a rectangle moving;
-//   6. the options that turn things off do.
+//   6. the options that turn things off do;
+//   7. a new background reaches the screen, and the same one costs no frame;
+//   8. a layer surface is on the output its client named, as a wallpaper
+//      client's one surface per output needs.
 //
 // Run twice, on the machine's GPU when there is one and then with Vulkan made
 // unavailable, so the CPU path is covered on every machine.
@@ -31,6 +34,7 @@
 #include <wayland-client.h>
 #include <wayland-server-core.h>
 
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 import luminaria.shell;
@@ -225,6 +229,126 @@ void options_respected(lm::SceneRenderer& renderer) {
     assert(screens.scene_at(1.0, 1.0).size() == 1);
 }
 
+void background_changes(lm::SceneRenderer& renderer) {
+    auto display = lm::must(lm::Display::create(), "display");
+    auto globals = lm::must(lm::CoreGlobals::create(display), "globals");
+    lm::OutputLayout layout;
+    ManualBackend backend;
+    ManualOutput& output = backend.add(kW, kH);
+    const lm::Color first_colour{0.1f, 0.2f, 0.3f, 1.0f};
+    lm::ScreenManager screens(display, backend, renderer, layout, {.background = first_colour});
+    assert(backend.start());
+    Client client(display);
+    settle(client, output);
+
+    // A config reload says the same thing again, and that must stay idle.
+    screens.set_background(first_colour);
+    assert(!output.frame_scheduled());
+
+    const int flips = output.flips;
+    screens.set_background({0.9f, 0.2f, 0.3f, 1.0f});
+    assert(output.frame_scheduled());
+    settle(client, output);
+    assert(output.flips > flips);
+    assert(!output.frame_scheduled());
+}
+
+void wallpaper_per_output(lm::SceneRenderer& renderer) {
+    auto display = lm::must(lm::Display::create(), "display");
+    auto globals = lm::must(lm::CoreGlobals::create(display), "globals");
+    auto layers = lm::must(lm::LayerShell::create(display), "layer shell");
+    lm::OutputLayout layout;
+    ManualBackend backend;
+    ManualOutput& first = backend.add(kW, kH);
+    ManualOutput* second = &backend.add(32, kH);
+    lm::ScreenManager screens(display, backend, renderer, layout, {.name = "t"});
+    std::vector<lm::LayerSurface*> made;
+    auto on_new = layers.new_layer_surface().connect(
+        [&](lm::NewLayerSurface& e) { made.push_back(&e.layer_surface); });
+    assert(backend.start());
+
+    Client client(display);
+    zwlr_layer_shell_v1* shell = nullptr;
+    wl_registry* registry = wl_display_get_registry(client.display);
+    static const wl_registry_listener listener{
+        [](void* data, wl_registry* r, std::uint32_t name, const char* interface, std::uint32_t) {
+            if (std::string_view{interface} == "zwlr_layer_shell_v1") {
+                *static_cast<zwlr_layer_shell_v1**>(data) = static_cast<zwlr_layer_shell_v1*>(
+                    wl_registry_bind(r, name, &zwlr_layer_shell_v1_interface, 4));
+            }
+        },
+        [](void*, wl_registry*, std::uint32_t) {}};
+    wl_registry_add_listener(registry, &listener, &shell);
+    client.pump();
+    assert(shell != nullptr && client.outputs.size() == 2);
+
+    wl_surface* surface = nullptr;
+    const auto layer_on = [&](wl_output* output) {
+        surface = wl_compositor_create_surface(client.compositor);
+        return zwlr_layer_shell_v1_get_layer_surface(shell, surface, output,
+                                                     ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
+                                                     "wallpaper");
+    };
+    (void)layer_on(client.outputs[1]);
+    (void)layer_on(nullptr);
+    zwlr_layer_surface_v1* wallpaper = layer_on(client.outputs[0]);
+    struct Heard {
+        int configures = 0;
+        std::uint32_t width = 0, height = 0;
+    } heard;
+    static const zwlr_layer_surface_v1_listener heard_listener{
+        [](void* data, zwlr_layer_surface_v1*, std::uint32_t, std::uint32_t w, std::uint32_t h) {
+            auto* me = static_cast<Heard*>(data);
+            ++me->configures;
+            me->width = w;
+            me->height = h;
+        },
+        [](void*, zwlr_layer_surface_v1*) {}};
+    zwlr_layer_surface_v1_add_listener(wallpaper, &heard_listener, &heard);
+    client.pump();
+    assert(made.size() == 3);
+    assert(screens.output_of(*made[0]) == second);
+    assert(screens.output_of(*made[1]) == nullptr); // the compositor's choice
+    assert(screens.output_of(*made[2]) == &first);
+
+    // Asked before it has said what it wants, the answer would be a guess.
+    lm::Box usable{0, 0, kW, kH};
+    (void)lm::arrange_layer_surface(*made[2], usable, usable);
+    client.pump();
+    assert(heard.configures == 0);
+
+    // swaybg leaves the size to the compositor. Nothing has answered yet, as with
+    // anyone who hears of the commit after dispatch, and a 0x0 is not an answer.
+    zwlr_layer_surface_v1_set_size(wallpaper, 0, 0);
+    zwlr_layer_surface_v1_set_anchor(
+        wallpaper, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+                       ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+    zwlr_layer_surface_v1_set_exclusive_zone(wallpaper, -1);
+    wl_surface_commit(surface);
+    client.pump();
+    assert(heard.configures == 0);
+    (void)lm::arrange_layer_surface(*made[2], usable, usable);
+    client.pump();
+    assert(heard.configures == 1);
+    assert(heard.width == static_cast<std::uint32_t>(kW));
+    assert(heard.height == static_cast<std::uint32_t>(kH));
+
+    // Unplugged, the client's wl_output still names something, but nothing here.
+    backend.remove(*second);
+    second = nullptr;
+    client.pump();
+    assert(screens.output_of(*made[0]) == nullptr);
+    assert(made[0]->output_resource() != nullptr);
+
+    // A client may let go of the wl_output before the surface it named.
+    wl_output_release(client.outputs[0]);
+    client.pump();
+    assert(made[2]->output_resource() == nullptr);
+    assert(screens.output_of(*made[2]) == nullptr);
+    zwlr_layer_shell_v1_destroy(shell);
+    wl_registry_destroy(registry);
+}
+
 } // namespace
 
 namespace {
@@ -266,6 +390,8 @@ int main() {
         std::println("{} path", renderer.gpu_enabled() ? "GPU" : "CPU");
         whole_life(renderer);
         options_respected(renderer);
+        background_changes(renderer);
+        wallpaper_per_output(renderer);
     }
     setenv("VK_ICD_FILENAMES", "/nonexistent/luminaria-test-icd.json", 1);
     setenv("VK_DRIVER_FILES", "/nonexistent/luminaria-test-icd.json", 1);
@@ -274,6 +400,8 @@ int main() {
         assert(!renderer.gpu_enabled());
         whole_life(renderer);
         options_respected(renderer);
+        background_changes(renderer);
+        wallpaper_per_output(renderer);
     }
     return 0;
 }

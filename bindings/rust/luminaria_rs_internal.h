@@ -118,6 +118,16 @@ inline InputEventRaw input_event_raw(const lm::InputEvent& event) {
             } else if constexpr (std::is_same_v<E, lm::TouchUpEvent>) {
                 r.kind = InputEventKind::TouchUp;
                 r.id = e.id;
+            } else if constexpr (std::is_same_v<E, lm::GestureEvent>) {
+                r.kind = InputEventKind::Gesture;
+                r.code = static_cast<std::uint32_t>(e.kind);
+                r.flags = static_cast<std::uint32_t>(e.phase);
+                r.id = static_cast<std::int32_t>(e.fingers);
+                r.x = e.dx;
+                r.y = e.dy;
+                r.scale = e.scale;
+                r.rotation = e.rotation;
+                r.pressed = e.cancelled;
             } else if constexpr (std::is_same_v<E, lm::TouchFrameEvent>) {
                 r.kind = InputEventKind::TouchFrame;
             } else if constexpr (std::is_same_v<E, lm::TouchCancelEvent>) {

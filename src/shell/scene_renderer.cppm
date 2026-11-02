@@ -173,6 +173,9 @@ public:
     /// `CpuCompositor::pixels()`.
     [[nodiscard]] Result<std::span<const Pixel>> read_back(SceneOutput& state);
 
+    /// Whether a `retained` item for `surface` would draw anything, on any output.
+    [[nodiscard]] bool has_retained(SurfaceId surface) const noexcept;
+
     /// Frames `present()` has finished so far, by outcome.
     [[nodiscard]] SceneStats stats() const noexcept;
 
@@ -261,6 +264,7 @@ struct SceneOutput::Impl {
     std::vector<std::uint64_t> last_serials;
     std::vector<SurfaceId> last_drawn;
     Color last_background;
+    Color frame_background; // what `frame` last drew behind everything
     int last_width = 0, last_height = 0;
     // `cpu_valid`: the pixels on screen came from the `last_*` description.
     // `cpu_dirty`: a drawn surface has committed since — a new buffer changes
@@ -443,15 +447,17 @@ void place_surface_item(Frame& frame, Surface& root, const SceneItem& item) {
 
 void place_image_item(Frame& frame, VulkanRenderer& gpu, SceneImageCache& cache,
                       const SceneItem& item) {
-    const auto need = static_cast<std::size_t>(item.box.width) * item.box.height;
+    const int width = item.image_width > 0 ? item.image_width : item.box.width;
+    const int height = item.image_height > 0 ? item.image_height : item.box.height;
+    const auto need = static_cast<std::size_t>(std::max(width, 0)) * std::max(height, 0);
     // The caller's word about its own buffer is checked here too: a short span
     // is a bug, but it must not become a read past the end of one.
-    if (item.box.empty() || item.box.width <= 0 || item.pixels.size() < need) {
+    if (item.box.empty() || need == 0 || item.pixels.size() < need) {
         return;
     }
     if (!cache.texture.has_value() || cache.serial != item.serial) {
         Result<GpuTexture> texture = gpu.upload_texture(
-            item.box.width, item.box.height,
+            width, height,
             {reinterpret_cast<const std::uint8_t*>(item.pixels.data()), need * sizeof(Pixel)});
         if (!texture) {
             return;
@@ -836,6 +842,12 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
     if (self.frame.has_value()) {
         Frame& frame = *self.frame;
         frame.begin({0, 0, output.logical_width(), output.logical_height()});
+        // No placement says the background changed, and it is behind every
+        // translucent pixel and in every blur backdrop.
+        if (background != self.frame_background) {
+            self.frame_background = background;
+            frame.damage_all();
+        }
 
         const Box view{0, 0, output.logical_width(), output.logical_height()};
         const int scale = std::max(1, output.scale());
@@ -947,6 +959,12 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
                     place_surface_item(frame, *root, item);
                 }
                 break;
+            case SceneItem::Kind::retained:
+                (void)frame.place_retained(item.surface,
+                                           effect_transform(item).crop(item.crop_x, item.crop_y,
+                                                                       item.crop_width,
+                                                                       item.crop_height));
+                break;
             }
             if (!wants_group(item)) {
                 continue;
@@ -1038,10 +1056,12 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
                 }
             });
             break;
+        case SceneItem::Kind::retained:
+            break; // nothing is kept on this path
         case SceneItem::Kind::image:
-            // The image is rasterized at its logical size, so a scaled output
-            // would want it rasterized larger rather than stretched here.
-            if (!device.empty()) {
+            // No stretching here: only pixels that land 1:1 on this output.
+            if (!device.empty() &&
+                item.pixels.size() >= static_cast<std::size_t>(device.width) * device.height) {
                 push_item(self, CpuImage{device, item.pixels, item.alpha}, item.serial);
             }
             break;
@@ -1136,6 +1156,12 @@ Result<SceneOutcome> SceneRenderer::draw(SceneOutput& state, Output& output,
     // ask for that one event so frame callbacks are paced to what was shown.
     output.schedule_frame();
     return SceneOutcome::cpu;
+}
+
+bool SceneRenderer::has_retained(SurfaceId surface) const noexcept {
+    return std::ranges::any_of(impl_->outputs, [surface](const SceneOutput::Impl* state) {
+        return state->frame.has_value() && state->frame->has_retained(surface);
+    });
 }
 
 Result<std::span<const Pixel>> SceneRenderer::read_back(SceneOutput& state) {

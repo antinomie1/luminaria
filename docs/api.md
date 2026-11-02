@@ -367,8 +367,11 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 - `ScreenManager(Display&, Backend&, SceneRenderer&, OutputLayout&, ScreenOptions = {})`：在后端 `start()` 之前构造。
 - `ScreenOptions`：`background`、`join_layout`（默认开，`add_auto`）、`announce`（默认开，开跟随布局的 `wl_output`）、`variable_refresh`（默认关）、`name`（`wl_output` 叫 `<name>-1`、`<name>-2`……编号永不复用）、`drm_format`。
 - `set_scene_builder(SceneBuilder)`：`std::function<std::span<const SceneItem>(Output&)>`，返回布局坐标的列表，通常忽略参数、每块输出同一张表。输入和 popup 也会调它，所以应复用同一个 vector。
+- `follow_capture(ScreencopyManager&)`：每块输出（现在和将来的）都可被捕获，`grim`、`wf-recorder`、portal 拿到的是最后画出的一帧。`capture` 必须比这个对象活得久。
 - `follow_popups(PopupTree&)`：popup 变化时 `invalidate()`，并从场景表回答约束查询。取代手写 `set_popup_constraint_query()`。
 - `invalidate()`：发生了客户端不会报告的变化（窗口开、关、移动、换层）：所有输出要一帧，指针重新选表面。
+- `set_background(Color)`：运行中换底色，下一帧起全屏重画，模糊也跟着重采；颜色没变时什么都不做，配置重载可以直接调。壁纸客户端盖住底色时，模糊采的仍是壁纸。
+- `output_of(const LayerSurface&)`：客户端为 layer surface 点名的 `Output*`；没点名、或点名的输出已经没了，答 null。壁纸客户端每块输出建一个 surface，不能放到聚焦的那块上。需要 `announce`。
 - `scene_at(x, y)`（该点所在输出的列表，缝隙里取第一块）、`surface_box(SurfaceId)`、`size()`。
 - `Signal<ScreenInvalidated>& invalidated()`；`Signal<ScreenFailure>& failed()`（都不致命，没人听时打到 stderr）。
 

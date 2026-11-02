@@ -148,6 +148,8 @@ ScreencopyManagerShim::~ScreencopyManagerShim() = default;
 ScreencopyManagerShim::ScreencopyManagerShim(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 ScreencopyManagerShim::Impl& ScreencopyManagerShim::impl() const { return *impl_; }
 
+lm::ScreencopyManager& raw_ref(const ScreencopyManagerShim& s) { return *s.impl().mgr; }
+
 std::unique_ptr<ScreencopyManagerShim> screencopy_manager_new(const DisplayShim& display, rust::String& error) {
     try {
         lm::Display* disp = raw_ptr(display);

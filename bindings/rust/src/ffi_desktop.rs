@@ -10,6 +10,23 @@
 
 #[cxx::bridge(namespace = "lum")]
 pub(crate) mod ffi {
+    #[derive(Debug, Clone, Default)]
+    struct OutputHeadConfigRaw {
+        name: String,
+        enabled: bool,
+        has_mode: bool,
+        width: i32,
+        height: i32,
+        refresh_mhz: i32,
+        has_position: bool,
+        x: i32,
+        y: i32,
+        has_transform: bool,
+        transform: u32,
+        has_scale: bool,
+        scale: f64,
+    }
+
     #[derive(Debug, Clone, Copy, Default)]
     struct LockSurfaceInfoRaw {
         lock: u64,
@@ -17,6 +34,7 @@ pub(crate) mod ffi {
         width: u32,
         height: u32,
         has_output: bool,
+        output_identity: u64,
     }
 
     unsafe extern "C++" {
@@ -34,6 +52,7 @@ pub(crate) mod ffi {
         type TextInputManagerShim = crate::ffi::TextInputManagerShim;
         type DataDeviceManagerShim = crate::ffi::DataDeviceManagerShim;
         type OutputGlobalShim = crate::ffi::OutputGlobalShim;
+        type OutputShim = crate::ffi::OutputShim;
         type OutputLayoutShim = crate::ffi::OutputLayoutShim;
 
         type ForeignToplevelManagerShim;
@@ -102,8 +121,12 @@ pub(crate) mod ffi {
             layout: &OutputLayoutShim,
             error: &mut String,
         ) -> UniquePtr<OutputManagerShim>;
-        fn update(self: Pin<&mut OutputManagerShim>);
+        fn update(self: &OutputManagerShim);
         fn set_auto_verdict(self: &OutputManagerShim, succeed: bool);
+        fn set_deferred(self: &OutputManagerShim, deferred: bool);
+        fn heads_of(self: &OutputManagerShim, ticket: u64) -> Vec<OutputHeadConfigRaw>;
+        fn answer(self: &OutputManagerShim, ticket: u64, succeeded: bool);
+        fn add_head(self: &OutputManagerShim, output: &OutputShim, name: &str);
 
         type DataControlManagerShim;
         fn data_control_manager_new(

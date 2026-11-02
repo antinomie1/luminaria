@@ -222,6 +222,12 @@ constexpr std::uint32_t opposite_edge(std::uint32_t edge) {
     }
 }
 
+/// Apart from `LayerSurfaceImpl`, whose vtable rules out `wl_container_of`.
+struct LayerOutputWatch {
+    wl_listener destroyed{};
+    wl_resource** output = nullptr;
+};
+
 class LayerSurfaceImpl final : public LayerSurface {
 public:
     struct State {
@@ -240,10 +246,12 @@ public:
     Surface* surf = nullptr;
     wl_resource* resource = nullptr;
     wl_resource* output = nullptr; // the client's wl_output, or null
+    LayerOutputWatch output_watch;
     std::string scope_;
     State current_, pending_;
     Signal<SurfaceCommit>::Connection commit_conn;
     Signal<SurfaceDestroy>::Connection surface_destroy_conn;
+    bool committed_ = false;  // the initial commit: what it wants is known from here
     bool configured_ = false; // a configure has been sent since (re)initialisation
     bool acked_ = false;
     bool mapped_ = false;
@@ -274,7 +282,9 @@ public:
     [[nodiscard]] int pending_height() const noexcept override { return pending_h_; }
 
     std::uint32_t configure(int width, int height) override {
-        if (closed_ || resource == nullptr) {
+        // Layout runs for everything on an output, including a surface whose
+        // anchors and size are still pending: that would be an answer to nothing.
+        if (closed_ || resource == nullptr || !committed_) {
             return 0;
         }
         // A panel that is re-configured at the size it already has repaints for
@@ -341,6 +351,7 @@ public:
         }
         const bool state_dirty = pending_ != current_;
         current_ = pending_;
+        committed_ = true;
 
         if (!configured_) {
             if (surf->has_buffer()) {
@@ -349,10 +360,13 @@ public:
                 return;
             }
             // Give the compositor its chance to lay us out; if it doesn't, the
-            // client still has to hear something or it will never draw.
+            // client still has to hear something or it will never draw. Unless it
+            // left a size to the compositor: bounced back, that 0 tells a client
+            // like swaybg to draw nothing at all, and it dies of the empty buffer.
+            // Whoever hears of this later, over a language bridge, answers then.
             LayerSurfaceStateChange event{*this};
             state_change.emit(event);
-            if (!configured_) {
+            if (!configured_ && current_.desired_w > 0 && current_.desired_h > 0) {
                 (void)configure(current_.desired_w, current_.desired_h);
             }
             return;
@@ -474,6 +488,9 @@ void layer_surface_resource_destroy(wl_resource* resource) {
     }
     LayerSurfaceDestroy event{*ls};
     ls->destroy.emit(event);
+    if (ls->output != nullptr) {
+        wl_list_remove(&ls->output_watch.destroyed.link);
+    }
     delete ls;
 }
 
@@ -515,6 +532,17 @@ void shell_get_layer_surface(wl_client* client, wl_resource* shell_resource, uin
     }
     wl_resource_set_implementation(ls->resource, &layer_surface_impl, ls,
                                    layer_surface_resource_destroy);
+    if (output_resource != nullptr) {
+        // The client owns its wl_output and may release it first; a surface must
+        // not name a resource that is gone.
+        ls->output_watch.output = &ls->output;
+        ls->output_watch.destroyed.notify = [](wl_listener* l, void*) {
+            auto* self = wl_container_of(l, static_cast<LayerOutputWatch*>(nullptr), destroyed);
+            *self->output = nullptr;
+            wl_list_remove(&self->destroyed.link);
+        };
+        wl_resource_add_destroy_listener(output_resource, &ls->output_watch.destroyed);
+    }
     ls->commit_conn = surface->commit.connect([ls](SurfaceCommit&) { ls->on_commit(); });
     // The wl_surface can die first; after that there is nothing left to drive.
     ls->surface_destroy_conn = surface->destroy.connect([ls](SurfaceDestroy&) {

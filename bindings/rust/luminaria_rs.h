@@ -99,6 +99,20 @@ private:
 
 std::unique_ptr<KeymapStateShim> keymap_state_from_layout(rust::Str layout,
                                                           rust::String &error);
+class FdWatchShim {
+public:
+  ~FdWatchShim();
+  struct Impl;
+  explicit FdWatchShim(std::unique_ptr<Impl> impl) noexcept;
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+std::unique_ptr<FdWatchShim> fd_watch_new(const DisplayShim &display, std::int32_t fd,
+                                          std::uint64_t tag, rust::String &error);
+
+std::unique_ptr<KeymapStateShim> keymap_state_from_names(rust::Str layout, rust::Str variant,
+                                                         rust::Str options, rust::String &error);
 std::unique_ptr<KeymapStateShim> keymap_state_from_text(rust::Str text,
                                                         rust::String &error);
 
@@ -155,6 +169,9 @@ public:
   void set_scale(std::int32_t scale);
   std::uint32_t transform() const;
   void set_transform(std::uint32_t transform);
+  void announce_change();
+  rust::String connector() const;
+  std::uint64_t key() const;
   std::int32_t logical_width() const;
   std::int32_t logical_height() const;
 

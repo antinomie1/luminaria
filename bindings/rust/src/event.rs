@@ -95,6 +95,9 @@ pub enum Event {
     /// Reported by a [`ScreenManager`](crate::shell::ScreenManager), whose outputs
     /// are its own.
     LayoutChanged,
+    /// A [`crate::core::FdWatch`] with this tag has something to read. Readiness
+    /// is level-triggered: read it before the next dispatch, or it fires again.
+    FdReady(u64),
     /// An output could not be set up or a frame failed, and a
     /// [`ScreenManager`](crate::shell::ScreenManager) carried on. Never fatal.
     ScreenFailed(String),
@@ -177,6 +180,7 @@ impl Event {
                 },
             },
             K::LayoutChanged => Event::LayoutChanged,
+            K::FdReady => Event::FdReady(raw.id),
             K::ScreenFailed => Event::ScreenFailed(raw.text),
             K::GpuRemoved => Event::GpuRemoved,
             K::GpuAdded => Event::GpuAdded(raw.text),

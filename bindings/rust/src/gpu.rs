@@ -204,6 +204,12 @@ impl SceneRenderer {
         }
     }
 
+    /// Whether a [`SceneItem::retained`](crate::shell::SceneItem::retained) for
+    /// `surface` would draw anything: its last pixels were kept, on some output.
+    pub fn has_retained(&self, surface: SurfaceId) -> bool {
+        self.raw.has_retained(surface.0)
+    }
+
     /// Remove previously registered image pixels for `serial`.
     pub fn remove_image(&self, serial: u64) {
         self.raw.remove_image(serial);

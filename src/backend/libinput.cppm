@@ -475,6 +475,46 @@ struct LibinputBackend::Impl {
         }
     }
 
+    void handle_gesture(libinput_event* event, libinput_event_type type) {
+        auto* g = libinput_event_get_gesture_event(event);
+        GestureEvent e;
+        e.fingers = static_cast<std::uint32_t>(libinput_event_gesture_get_finger_count(g));
+        switch (type) {
+        case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+        case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+        case LIBINPUT_EVENT_GESTURE_HOLD_BEGIN:
+            e.phase = GesturePhase::begin;
+            break;
+        case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+        case LIBINPUT_EVENT_GESTURE_PINCH_END:
+        case LIBINPUT_EVENT_GESTURE_HOLD_END:
+            e.phase = GesturePhase::end;
+            e.cancelled = libinput_event_gesture_get_cancelled(g) != 0;
+            break;
+        default:
+            e.phase = GesturePhase::update;
+            e.dx = libinput_event_gesture_get_dx(g);
+            e.dy = libinput_event_gesture_get_dy(g);
+            break;
+        }
+        switch (type) {
+        case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+        case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
+        case LIBINPUT_EVENT_GESTURE_PINCH_END:
+            e.kind = GestureKind::pinch;
+            e.scale = libinput_event_gesture_get_scale(g);
+            e.rotation = libinput_event_gesture_get_angle_delta(g);
+            break;
+        case LIBINPUT_EVENT_GESTURE_HOLD_BEGIN:
+        case LIBINPUT_EVENT_GESTURE_HOLD_END:
+            e.kind = GestureKind::hold;
+            break;
+        default:
+            break;
+        }
+        emit(e);
+    }
+
     /// The seat slot, not the device slot: two touchscreens can both have a
     /// slot 0 down at once, and wl_touch ids are per seat. `_transformed` with
     /// a size of 1 is how libinput hands out a position normalised to the
@@ -537,6 +577,16 @@ struct LibinputBackend::Impl {
                                         libinput_event_pointer_get_dy(p)});
                 break;
             }
+            case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+            case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
+            case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+            case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+            case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
+            case LIBINPUT_EVENT_GESTURE_PINCH_END:
+            case LIBINPUT_EVENT_GESTURE_HOLD_BEGIN:
+            case LIBINPUT_EVENT_GESTURE_HOLD_END:
+                handle_gesture(event, type);
+                break;
             case LIBINPUT_EVENT_POINTER_BUTTON: {
                 auto* p = libinput_event_get_pointer_event(event);
                 emit(PointerButtonEvent{libinput_event_pointer_get_button(p),

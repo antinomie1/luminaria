@@ -106,14 +106,20 @@ private:
 std::unique_ptr<SessionLockManagerShim>
 session_lock_manager_new(const DisplayShim &display, rust::String &error);
 
+struct OutputHeadConfigRaw;
+
 class OutputManagerShim {
 public:
   ~OutputManagerShim();
   OutputManagerShim(const OutputManagerShim &) = delete;
   OutputManagerShim &operator=(const OutputManagerShim &) = delete;
 
-  void update();
+  void update() const;
   void set_auto_verdict(bool succeed) const;
+  void set_deferred(bool deferred) const;
+  rust::Vec<OutputHeadConfigRaw> heads_of(std::uint64_t ticket) const;
+  void answer(std::uint64_t ticket, bool succeeded) const;
+  void add_head(const OutputShim &output, rust::Str name) const;
 
   struct Impl;
   Impl &impl() const;

@@ -162,6 +162,8 @@ pub(crate) mod ffi {
         RoutedButton,
         LayoutChanged,
         ScreenFailed,
+        // `id` is the tag the `FdWatch` was made with.
+        FdReady,
     }
 
     /// One luminaria signal, queued by the shim until Rust drains it. Which
@@ -282,6 +284,8 @@ pub(crate) mod ffi {
         TouchUp,
         TouchFrame,
         TouchCancel,
+        // `code` the kind, `flags` the phase, `id` the fingers, `pressed` cancelled.
+        Gesture,
         Capabilities,
         // Graphics tablets (see `TabletInput`). `device` is the tablet or pad.
         TabletDeviceAdded,
@@ -365,6 +369,8 @@ pub(crate) mod ffi {
         pressed: bool,
         x: f64,
         y: f64,
+        scale: f64,
+        rotation: f64,
         steps_x: i32,
         steps_y: i32,
         id: i32,
@@ -407,6 +413,13 @@ pub(crate) mod ffi {
         fn run(self: &DisplayShim);
         fn terminate(self: &DisplayShim);
         fn dispatch(self: &DisplayShim, timeout_ms: i32) -> i32;
+        type FdWatchShim;
+        fn fd_watch_new(
+            display: &DisplayShim,
+            fd: i32,
+            tag: u64,
+            error: &mut String,
+        ) -> UniquePtr<FdWatchShim>;
         fn flush_clients(self: &DisplayShim);
         fn next_event(self: &DisplayShim, out: &mut EventRaw, input: &mut InputEventRaw) -> u32;
         fn take_output(self: &DisplayShim) -> UniquePtr<OutputShim>;
@@ -415,6 +428,12 @@ pub(crate) mod ffi {
         type KeymapStateShim;
         fn keymap_state_from_layout(layout: &str, error: &mut String)
             -> UniquePtr<KeymapStateShim>;
+        fn keymap_state_from_names(
+            layout: &str,
+            variant: &str,
+            options: &str,
+            error: &mut String,
+        ) -> UniquePtr<KeymapStateShim>;
         fn keymap_state_from_text(text: &str, error: &mut String) -> UniquePtr<KeymapStateShim>;
         fn text(self: &KeymapStateShim) -> String;
         fn key_keysym(self: &KeymapStateShim, code: u32) -> u32;
@@ -454,6 +473,9 @@ pub(crate) mod ffi {
         fn set_scale(self: Pin<&mut OutputShim>, scale: i32);
         fn transform(self: &OutputShim) -> u32;
         fn set_transform(self: Pin<&mut OutputShim>, transform: u32);
+        fn announce_change(self: Pin<&mut OutputShim>);
+        fn connector(self: &OutputShim) -> String;
+        fn key(self: &OutputShim) -> u64;
         fn logical_width(self: &OutputShim) -> i32;
         fn logical_height(self: &OutputShim) -> i32;
         fn schedule_frame(self: Pin<&mut OutputShim>);

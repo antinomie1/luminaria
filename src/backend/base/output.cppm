@@ -119,6 +119,18 @@ public:
   // logical content is rotated/reflected to land on the framebuffer. Together
   // they define the logical size, which is what windows are laid out in.
 
+  /// After `set_scale()` or `set_transform()` on a live output: fires
+  /// `mode_changed`, because the logical size moved with them and everything that
+  /// follows the mode (the layout, `wl_output`, render targets) follows this.
+  void announce_change() {
+    OutputModeChange event{*this, current_mode()};
+    mode_changed.emit(event);
+  }
+
+  /// What the hardware calls it, like "DP-1", which survives a reboot; empty for
+  /// an output that isn't a connector.
+  [[nodiscard]] virtual std::string connector() const { return {}; }
+
   [[nodiscard]] int scale() const noexcept { return scale_; }
   void set_scale(int scale) noexcept { scale_ = scale < 1 ? 1 : scale; }
   [[nodiscard]] Transform transform() const noexcept { return transform_; }

@@ -284,6 +284,9 @@ bool create_cursor_fb(int fd, uint32_t w, uint32_t h, DumbFb &fb) {
 
 class DrmOutput final : public Output {
 public:
+  std::string connector_name;
+  [[nodiscard]] std::string connector() const override { return connector_name; }
+
   int fd;
   uint32_t crtc_id;
   uint32_t connector_id;
@@ -1297,6 +1300,9 @@ void DrmBackend::scan_connectors() {
       if (std::unique_ptr<DrmOutput> out =
               impl.make_output(res.get(), connector.get())) {
         DrmOutput &added = *out;
+        const char *type = drmModeGetConnectorTypeName(connector->connector_type);
+        added.connector_name = std::format("{}-{}", type != nullptr ? type : "Unknown",
+                                           connector->connector_type_id);
         impl.outputs.push_back(std::move(out));
         // Before start(), the initial set is announced and lit there —
         // announcing here too would hand the compositor each output twice.

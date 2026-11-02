@@ -95,6 +95,10 @@ inline lm::SceneItem scene_item(const SceneItemRaw& raw, const std::unordered_ma
     it.serial = raw.serial;
     it.tag = raw.tag;
     it.accepts_input = raw.accepts_input;
+    it.crop_x = raw.crop_x;
+    it.crop_y = raw.crop_y;
+    it.crop_width = raw.crop_width;
+    it.crop_height = raw.crop_height;
     it.alpha = raw.alpha;
     it.corner_radius = raw.corner_radius;
     it.blur.enabled = raw.blur_enabled;
@@ -106,6 +110,8 @@ inline lm::SceneItem scene_item(const SceneItemRaw& raw, const std::unordered_ma
         auto it_img = images->find(it.serial);
         if (it_img != images->end()) {
             it.pixels = std::span<const lm::Pixel>{it_img->second.pixels.data(), it_img->second.pixels.size()};
+            it.image_width = it_img->second.width;
+            it.image_height = it_img->second.height;
         }
     }
     return it;
@@ -136,6 +142,11 @@ inline SceneItemRaw scene_item_raw(const lm::SceneItem& it) {
     raw.serial = it.serial;
     raw.tag = it.tag;
     raw.accepts_input = it.accepts_input;
+    raw.only_on = 0;
+    raw.crop_x = it.crop_x;
+    raw.crop_y = it.crop_y;
+    raw.crop_width = it.crop_width;
+    raw.crop_height = it.crop_height;
     raw.alpha = it.alpha;
     raw.corner_radius = it.corner_radius;
     raw.blur_enabled = it.blur.enabled;
@@ -228,6 +239,11 @@ bool AutoBackendShim::start(rust::String& error) const {
 rust::String AutoBackendShim::keymap() const {
     const lm::InputSource* source = impl_->backend->input();
     return source ? to_rust(source->keymap()) : rust::String{};
+}
+
+bool AutoBackendShim::set_keymap(rust::Str xkb_text) const {
+    lm::LibinputBackend* libinput = impl_->backend->libinput();
+    return libinput != nullptr && libinput->set_keymap(std::string(xkb_text));
 }
 
 std::uint32_t AutoBackendShim::capabilities() const {
@@ -335,6 +351,10 @@ bool SceneRendererShim::reset(OutputShim& output, std::uint32_t drm_format, rust
     auto st = impl_->renderer->reset(impl_->state_for(output), *out, drm_format);
     if (!st) { error = to_rust(st.error().message); return false; }
     return true;
+}
+
+bool SceneRendererShim::has_retained(std::uint64_t surface_id) const {
+    return impl_->renderer && impl_->renderer->has_retained(id_from_u64(surface_id));
 }
 
 int SceneRendererShim::present(OutputShim& output, rust::Slice<const SceneItemRaw> items,
@@ -774,21 +794,32 @@ void LayerManagerShim::close_output(std::uint32_t output_id) { impl_->mgr.close_
 struct ScreenManagerShim::Impl {
     SceneRendererShim::Impl* renderer = nullptr; // for the images; outlives us, by a Rust borrow
     std::vector<lm::SceneItem> scene;
+    std::vector<std::uint64_t> only_on; // by item: the one output it's for, or 0
+    std::vector<lm::SceneItem> shown;   // refilled for each output, keeping capacity
     std::optional<lm::ScreenManager> screens;
     Conn<lm::OutputLayoutChange> on_layout;
     Conn<lm::ScreenFailure> on_failed;
 
     // Images resolved per call and not when the list was told: `set_image()` may
     // have replaced the pixels since, and the span would dangle.
-    std::span<const lm::SceneItem> current() {
-        for (lm::SceneItem& item : scene) {
+    std::span<const lm::SceneItem> current(const lm::Output& output) {
+        const auto here = reinterpret_cast<std::uint64_t>(&output);
+        shown.clear();
+        for (std::size_t i = 0; i < scene.size(); ++i) {
+            if (only_on[i] != 0 && only_on[i] != here) {
+                continue;
+            }
+            lm::SceneItem& item = shown.emplace_back(scene[i]);
             if (item.kind == lm::SceneItem::Kind::image) {
                 const auto image = renderer->images.find(item.serial);
-                item.pixels = image != renderer->images.end() ? std::span<const lm::Pixel>{image->second.pixels}
-                                                              : std::span<const lm::Pixel>{};
+                const bool found = image != renderer->images.end();
+                item.pixels = found ? std::span<const lm::Pixel>{image->second.pixels}
+                                    : std::span<const lm::Pixel>{};
+                item.image_width = found ? image->second.width : 0;
+                item.image_height = found ? image->second.height : 0;
             }
         }
-        return scene;
+        return shown;
     }
 };
 ScreenManagerShim::~ScreenManagerShim() = default;
@@ -811,7 +842,7 @@ std::unique_ptr<ScreenManagerShim> screen_manager_new(const DisplayShim& display
                                                 .name = std::string(options.name),
                                                 .drm_format = options.drm_format});
         auto* raw = impl.get();
-        raw->screens->set_scene_builder([raw](lm::Output&) { return raw->current(); });
+        raw->screens->set_scene_builder([raw](lm::Output& output) { return raw->current(output); });
         raw->on_layout = raw_ref(layout).changed.connect(
             [](lm::OutputLayoutChange&) { hub_push(event(EventKind::LayoutChanged)); });
         raw->on_failed = raw->screens->failed().connect([](lm::ScreenFailure& e) {
@@ -830,10 +861,41 @@ void ScreenManagerShim::follow_popups(const PopupTreeShim& popups) const {
     impl_->screens->follow_popups(popups.impl().tree);
 }
 
+// In the render TU, whose `Impl` is private to it.
+lm::ScreencopyManager& raw_ref(const ScreencopyManagerShim& s);
+
+void ScreenManagerShim::follow_capture(const ScreencopyManagerShim& capture) const {
+    impl_->screens->follow_capture(raw_ref(capture));
+}
+
 void ScreenManagerShim::set_scene(rust::Slice<const SceneItemRaw> items) const {
     impl_->scene.clear();
-    for (const SceneItemRaw& raw : items) impl_->scene.push_back(scene_item(raw));
+    impl_->only_on.clear();
+    for (const SceneItemRaw& raw : items) {
+        impl_->scene.push_back(scene_item(raw));
+        impl_->only_on.push_back(raw.only_on);
+    }
     impl_->screens->invalidate();
+}
+
+void ScreenManagerShim::set_background(float r, float g, float b, float a) const {
+    impl_->screens->set_background({r, g, b, a});
+}
+
+rust::String ScreenManagerShim::output_name(const OutputShim& output) const {
+    const lm::Output* raw = raw_ptr(output);
+    return raw != nullptr ? to_rust(impl_->screens->name_of(*raw)) : rust::String{};
+}
+
+std::uint64_t ScreenManagerShim::output_identity(const OutputShim& output) const {
+    const lm::Output* raw = raw_ptr(output);
+    return raw != nullptr ? reinterpret_cast<std::uint64_t>(impl_->screens->identity_of(*raw)) : 0;
+}
+
+bool ScreenManagerShim::output_is(const LayerShellShim& shell, std::uint64_t surface_id,
+                                  const OutputShim& output) const {
+    const lm::LayerSurface* ls = layer_surface(shell, surface_id);
+    return ls != nullptr && raw_ptr(output) != nullptr && impl_->screens->output_of(*ls) == raw_ptr(output);
 }
 
 bool ScreenManagerShim::surface_box(std::uint64_t surface_id, Rect& out) const {

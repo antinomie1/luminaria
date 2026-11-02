@@ -50,6 +50,7 @@ struct OutputPosition {
 /// One head as a client wants it. An unset field means "leave it as it is".
 struct OutputHeadConfig {
     Output* output = nullptr; ///< valid for the duration of the request
+    std::string name;         ///< `OutputHeadInfo::name`, which outlives it
     bool enabled = true;
     /// One of the modes the head advertised, or — with `custom_mode` — a size
     /// and refresh the client made up, which nothing has checked yet.
@@ -79,6 +80,10 @@ struct OutputConfigRequest {
     bool test = false; ///< only say whether it would work; change nothing
     std::vector<OutputHeadConfig> heads;
     OutputConfigVerdict verdict = OutputConfigVerdict::failed;
+    /// Set by a handler that can't answer now, like one across a language bridge.
+    /// Keep `ticket`, and call `OutputManager::answer()` with it later.
+    bool deferred = false;
+    std::uint64_t ticket = 0;
 };
 
 /// The zwlr_output_manager_v1 global (version 4). Move-only; pointer-stable
@@ -108,6 +113,10 @@ public:
     /// Nothing here notices a change by itself — call it after a mode switch,
     /// a scale or transform change, or a move in the layout.
     void update();
+
+    /// The verdict for a request that was `deferred`. A client that gave up in the
+    /// meantime takes the ticket with it, and this does nothing.
+    void answer(std::uint64_t ticket, OutputConfigVerdict verdict);
 
     /// Fires on each apply and test. See `OutputConfigRequest`.
     [[nodiscard]] Signal<OutputConfigRequest>& request() noexcept;
@@ -202,6 +211,7 @@ struct OmConfig {
     std::uint32_t serial = 0;
     bool used = false;  // applied or tested: only destroy is legal now
     bool stale = false; // named a head or mode that has since gone
+    std::uint64_t ticket = 0;
     std::vector<std::unique_ptr<OmConfigHead>> heads;
 };
 
@@ -214,6 +224,7 @@ struct OutputManager::Impl {
     std::vector<OmConfig*> configs; // outstanding, so they can be told the manager died
     std::uint32_t next_id = 1;
     std::uint32_t serial = 0;
+    std::uint64_t next_ticket = 0;
 
     ~Impl();
 
@@ -469,6 +480,20 @@ void om_disable_head(wl_client*, wl_resource* resource, wl_resource* head) {
     }
 }
 
+void om_send_verdict(wl_resource* resource, OutputConfigVerdict verdict) {
+    switch (verdict) {
+    case OutputConfigVerdict::succeeded:
+        zwlr_output_configuration_v1_send_succeeded(resource);
+        break;
+    case OutputConfigVerdict::failed:
+        zwlr_output_configuration_v1_send_failed(resource);
+        break;
+    case OutputConfigVerdict::cancelled:
+        zwlr_output_configuration_v1_send_cancelled(resource);
+        break;
+    }
+}
+
 void om_submit(wl_resource* resource, bool test) {
     OmConfig* c = om_config_of(resource);
     if (!om_unused(*c)) {
@@ -491,19 +516,15 @@ void om_submit(wl_resource* resource, bool test) {
             return;
         }
         request.heads.push_back((*it)->wanted);
+        request.heads.back().name = h->info.name;
     }
+    request.ticket = ++impl->next_ticket;
     impl->request.emit(request);
-    switch (request.verdict) {
-    case OutputConfigVerdict::succeeded:
-        zwlr_output_configuration_v1_send_succeeded(resource);
-        break;
-    case OutputConfigVerdict::failed:
-        zwlr_output_configuration_v1_send_failed(resource);
-        break;
-    case OutputConfigVerdict::cancelled:
-        zwlr_output_configuration_v1_send_cancelled(resource);
-        break;
+    if (request.deferred) {
+        c->ticket = request.ticket;
+        return;
     }
+    om_send_verdict(resource, request.verdict);
 }
 
 void om_apply(wl_client*, wl_resource* resource) { om_submit(resource, false); }
@@ -828,6 +849,16 @@ void OutputManager::add_head(Output& output, OutputHeadInfo info) {
 }
 
 void OutputManager::remove_head(const Output& output) { impl_->remove(output); }
+
+void OutputManager::answer(std::uint64_t ticket, OutputConfigVerdict verdict) {
+    for (OmConfig* config : impl_->configs) {
+        if (config->ticket == ticket && ticket != 0) {
+            config->ticket = 0;
+            om_send_verdict(config->resource, verdict);
+            return;
+        }
+    }
+}
 
 void OutputManager::update() {
     Impl& self = *impl_;

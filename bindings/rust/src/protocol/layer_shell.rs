@@ -113,8 +113,8 @@ impl LayerShell<'_> {
 /// the client's last committed state.
 #[derive(Clone, Copy)]
 pub struct LayerSurface<'s> {
-    shell: &'s ffi::LayerShellShim,
-    surface: SurfaceId,
+    pub(crate) shell: &'s ffi::LayerShellShim,
+    pub(crate) surface: SurfaceId,
 }
 
 impl LayerSurface<'_> {

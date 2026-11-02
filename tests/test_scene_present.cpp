@@ -476,6 +476,45 @@ void cursor_places_itself(luminaria::SceneRenderer& renderer) {
 
 } // namespace
 
+// A background nobody drew is still on screen and still in every blur backdrop,
+// and no placement says it changed: the frame has to notice by itself, or the
+// colour would only arrive with the next thing that happens to move.
+void background_repaints_everything(luminaria::SceneRenderer& renderer) {
+    auto display = luminaria::Display::create();
+    assert(display.has_value());
+    FlipOutput output(display->event_loop());
+    luminaria::SceneOutput state;
+    (void)renderer.reset(state, output, DRM_FORMAT_XRGB8888);
+
+    // Half the output under a blur, which has to sample the background it is on.
+    luminaria::SceneItem glass{.kind = luminaria::SceneItem::Kind::rect,
+                               .box = {0, 0, kOutW / 2, kOutH},
+                               .color = {0, 0, 0, 0}};
+    glass.blur.enabled = true;
+    glass.blur.opacity = 1.0f;
+    const std::vector<luminaria::SceneItem> scene{glass};
+
+    const auto shown = [&](luminaria::Color background) {
+        const auto outcome = renderer.present(state, output, scene, background);
+        assert(outcome.has_value());
+        return *outcome;
+    };
+    const auto pixel = [&](int x) {
+        const auto pixels = renderer.read_back(state);
+        assert(pixels.has_value());
+        return (*pixels)[static_cast<std::size_t>(kOutH / 2 * kOutW + x)];
+    };
+
+    (void)shown({0, 0, 1, 1});
+    assert(pixel(kOutW / 4).b == 0xFF && pixel(kOutW * 3 / 4).b == 0xFF);
+    assert(shown({0, 0, 1, 1}) == luminaria::SceneOutcome::unchanged);
+
+    assert(shown({1, 0, 0, 1}) != luminaria::SceneOutcome::unchanged);
+    assert(pixel(kOutW * 3 / 4).r == 0xFF && pixel(kOutW * 3 / 4).b == 0);
+    assert(pixel(kOutW / 4).r == 0xFF && pixel(kOutW / 4).b == 0); // the blur too
+    assert(shown({1, 0, 0, 1}) == luminaria::SceneOutcome::unchanged);
+}
+
 int main() {
     {
         luminaria::SceneRenderer renderer;
@@ -483,6 +522,7 @@ int main() {
         run_idle_session(renderer);
         cursor_follows_the_pointer(renderer);
         cursor_places_itself(renderer);
+        background_repaints_everything(renderer);
     }
     // The same on the CPU path, wherever this runs: a loader with no driver
     // to load cannot create an instance, which is exactly a GPU-less machine.
@@ -494,5 +534,6 @@ int main() {
     run_idle_session(cpu);
     cursor_follows_the_pointer(cpu);
     cursor_places_itself(cpu);
+    background_repaints_everything(cpu);
     return 0;
 }
