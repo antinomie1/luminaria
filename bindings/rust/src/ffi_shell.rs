@@ -309,6 +309,7 @@ pub(crate) mod ffi {
         fn set_scene(self: &ScreenManagerShim, items: &[SceneItemRaw]);
         fn set_background(self: &ScreenManagerShim, r: f32, g: f32, b: f32, a: f32);
         fn output_identity(self: &ScreenManagerShim, output: &OutputShim) -> u64;
+        fn output_global(self: &ScreenManagerShim, output: &OutputShim) -> u64;
         fn output_name(self: &ScreenManagerShim, output: &OutputShim) -> String;
         fn output_is(
             self: &ScreenManagerShim,

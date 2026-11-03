@@ -143,7 +143,23 @@ pub struct WorkspaceRequest {
     pub name: String,
 }
 
+/// Workspace state bits for [`WorkspaceManager::set_state`]
+/// (`ext_workspace_handle_v1.state`).
+pub mod workspace_state {
+    /// Shown on its group's outputs.
+    pub const ACTIVE: u32 = 1;
+    /// Wants attention.
+    pub const URGENT: u32 = 2;
+    /// Pagers should not show it.
+    pub const HIDDEN: u32 = 4;
+}
+
 /// Workspace protocol manager (`ext_workspace_manager_v1`).
+///
+/// The compositor owns the workspaces: it declares groups (usually one per
+/// output) and workspaces in them, sets their state, and answers
+/// [`crate::Event::Workspace`] requests. Changes reach clients together at
+/// [`Self::commit`].
 pub struct WorkspaceManager<'d> {
     pub(crate) raw: cxx::UniquePtr<ffi::WorkspaceManagerShim>,
     _display: Holds<'d>,
@@ -163,20 +179,68 @@ impl<'d> WorkspaceManager<'d> {
         }
     }
 
+    /// A new group; returns its handle.
     pub fn create_group(&mut self) -> u32 {
         self.raw.create_group()
     }
 
+    /// Removes a group. Remove its workspaces first.
+    pub fn remove_group(&mut self, group: u32) {
+        self.raw.remove_group(group);
+    }
+
+    /// Announces `output` as one of `group`'s, to clients bound now and to
+    /// those that bind the output later. The group remembers it by
+    /// [`ScreenManager::output_identity`](crate::shell::ScreenManager::output_identity),
+    /// so the output may go at any time. False while `output` has no `wl_output`.
+    #[cfg(feature = "shell")]
+    pub fn group_add_output(
+        &mut self,
+        group: u32,
+        screens: &crate::shell::ScreenManager<'_>,
+        output: &crate::backend::Output,
+    ) -> bool {
+        let global = screens.raw.output_global(&output.raw);
+        if global != 0 {
+            self.raw.group_add_output(group, global);
+        }
+        global != 0
+    }
+
+    /// Takes an output out of `group`, by the identity it had, which still
+    /// works after the output is gone.
+    pub fn group_remove_output(&mut self, group: u32, output_identity: u64) {
+        self.raw.group_remove_output(group, output_identity);
+    }
+
+    /// A workspace named `name`, with `name` as its id too.
     pub fn create_workspace(&mut self, group: u32, name: &str) -> u32 {
         self.raw.create_workspace(group, name)
+    }
+
+    /// A workspace in `group`: `id` is the stable string clients match on
+    /// across restarts, `coordinates` its place on a grid (may be empty).
+    pub fn add_workspace(&mut self, group: u32, id: &str, name: &str, coordinates: &[i32]) -> u32 {
+        self.raw.add_workspace(group, id, name, coordinates)
     }
 
     pub fn remove_workspace(&mut self, workspace: u32) {
         self.raw.remove_workspace(workspace);
     }
 
+    /// Makes `workspace` the only active one of its group.
     pub fn activate_workspace(&mut self, workspace: u32) {
         self.raw.activate_workspace(workspace);
+    }
+
+    /// Replaces a workspace's [`workspace_state`] bits.
+    pub fn set_state(&mut self, workspace: u32, state: u32) {
+        self.raw.set_workspace_state(workspace, state);
+    }
+
+    /// Sends everything changed since the last commit as one update.
+    pub fn commit(&mut self) {
+        self.raw.workspaces_done();
     }
 }
 

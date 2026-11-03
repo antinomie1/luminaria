@@ -920,6 +920,11 @@ std::uint64_t ScreenManagerShim::output_identity(const OutputShim& output) const
     return raw != nullptr ? reinterpret_cast<std::uint64_t>(impl_->screens->identity_of(*raw)) : 0;
 }
 
+std::uint64_t ScreenManagerShim::output_global(const OutputShim& output) const {
+    const lm::Output* raw = raw_ptr(output);
+    return raw != nullptr ? reinterpret_cast<std::uint64_t>(impl_->screens->output_global(*raw)) : 0;
+}
+
 bool ScreenManagerShim::output_is(const LayerShellShim& shell, std::uint64_t surface_id,
                                   const OutputShim& output) const {
     const lm::LayerSurface* ls = layer_surface(shell, surface_id);

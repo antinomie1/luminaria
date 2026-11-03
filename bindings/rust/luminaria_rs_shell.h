@@ -233,6 +233,7 @@ public:
     void set_scene(rust::Slice<const SceneItemRaw> items) const;
     void set_background(float r, float g, float b, float a) const;
     std::uint64_t output_identity(const OutputShim& output) const;
+    std::uint64_t output_global(const OutputShim& output) const;
     rust::String output_name(const OutputShim& output) const;
     bool output_is(const LayerShellShim& shell, std::uint64_t surface_id, const OutputShim& output) const;
     bool surface_box(std::uint64_t surface_id, Rect& out) const;

@@ -714,6 +714,13 @@ impl<'a> ScreenManager<'a> {
         self.raw.output_name(&output.raw)
     }
 
+    /// The identity protocol objects report for `output`'s `wl_output`, 0 while
+    /// it has none: what [`crate::desktop::WorkspaceManager::group_remove_output`]
+    /// and [`Self::output_with`] take.
+    pub fn output_identity(&self, output: &Output) -> u64 {
+        self.raw.output_identity(&output.raw)
+    }
+
     /// Which of `outputs` a protocol object names, by the identity it reports, as
     /// [`LockSurface::output_identity`](crate::desktop::LockSurface::output_identity)
     /// does. An output has one for as long as it has a `wl_output`.

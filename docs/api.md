@@ -509,7 +509,9 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 
 ### 9.1 Workspace (工作区)
 - **`WorkspaceManager`** (`luminaria.desktop:workspace`): `ext-workspace-v1`
-  - 管理工作区组与工作区句柄，通告活跃状态并处理客户端切换请求。
+  - 管理工作区组与工作区句柄，通告活跃状态并处理客户端切换请求。改动在 `done()` 时一次性生效。
+  - `group_add_output(group, OutputGlobal&)` 按 `identity()` 记住输出，不持有指针；经 `on_bind` 对之后才绑定该 `wl_output` 的客户端补发 `output_enter`。`group_remove_output(group, identity)` 在输出销毁后仍可用；`remove_group(group)` 前先移除其工作区。
+  - `ScreenManager::output_global(output)` 给出受管输出的 `OutputGlobal`，供这类协议通告输出。
 
 ### 9.2 ForeignToplevel (顶层窗口监控)
 - **`ForeignToplevelManager`** (`luminaria.desktop:foreign_toplevel`): `zwlr_foreign_toplevel_management_v1`

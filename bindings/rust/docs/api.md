@@ -576,13 +576,18 @@ match outcome {
   let mut list = ForeignToplevelList::new(&display)?;
   list.track(&xdg_shell);
   ```
-- **`WorkspaceManager`**：为分页器提供 `ext-workspace` 支持：
+- **`WorkspaceManager`**：为分页器提供 `ext-workspace` 支持。混成器拥有工作区，改动在 `commit()` 时一次性发给客户端：
   ```rust
   let mut wm = WorkspaceManager::new(&display)?;
   let group = wm.create_group();
-  let ws = wm.create_workspace(group, "Workspace 1");
+  wm.group_add_output(group, &screens, &output); // 之后才绑定 wl_output 的客户端也会收到 output_enter
+  let ws = wm.add_workspace(group, "ws-1", "1", &[0]);  // 稳定 id、名字、网格坐标
   wm.activate_workspace(ws);
+  wm.set_state(ws, workspace_state::ACTIVE | workspace_state::URGENT);
+  wm.commit();
   ```
+  组按 `ScreenManager::output_identity` 记住输出而不持有指针，输出随时可以消失；拔掉显示器后
+  `group_remove_output(group, identity)`、移除其工作区，再 `remove_group(group)`。
 - **`SessionLockManager`**：`ext-session-lock` 锁屏协议。事件 `Event::SessionLock(SessionLockEvent)`：`NewLock(LockId)`、
   `NewSurface { lock, surface }`、`SurfaceMap`、`SurfaceDestroy`、`LockDestroy { lock, unlocked }`。盖住所有输出后
   `locks.lock(id).send_locked()`，拒绝用 `send_finished()`；`lock_surface(surface)` 的句柄 `is_on(&output_global)`、

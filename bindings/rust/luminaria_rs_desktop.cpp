@@ -191,6 +191,41 @@ std::uint32_t WorkspaceManagerShim::create_workspace(std::uint32_t group,
                                                 std::string(name))
                     : 0;
 }
+void WorkspaceManagerShim::remove_group(std::uint32_t group) const {
+  if (impl_->mgr)
+    impl_->mgr->remove_group(group);
+}
+void WorkspaceManagerShim::group_add_output(std::uint32_t group,
+                                            std::uint64_t output_global) const {
+  // A token from ScreenManagerShim::output_global, used before it can go stale.
+  auto *global = reinterpret_cast<lm::OutputGlobal *>(output_global);
+  if (impl_->mgr && global != nullptr)
+    impl_->mgr->group_add_output(group, *global);
+}
+void WorkspaceManagerShim::group_remove_output(
+    std::uint32_t group, std::uint64_t output_identity) const {
+  if (impl_->mgr)
+    impl_->mgr->group_remove_output(
+        group, reinterpret_cast<const void *>(output_identity));
+}
+std::uint32_t WorkspaceManagerShim::add_workspace(
+    std::uint32_t group, rust::Str id, rust::Str name,
+    rust::Slice<const std::int32_t> coordinates) const {
+  if (!impl_->mgr)
+    return 0;
+  return impl_->mgr->add_workspace(
+      group, std::string(id), std::string(name),
+      std::vector<std::int32_t>(coordinates.begin(), coordinates.end()));
+}
+void WorkspaceManagerShim::set_workspace_state(std::uint32_t workspace,
+                                               std::uint32_t state) const {
+  if (impl_->mgr)
+    impl_->mgr->set_state(workspace, state);
+}
+void WorkspaceManagerShim::workspaces_done() const {
+  if (impl_->mgr)
+    impl_->mgr->done();
+}
 void WorkspaceManagerShim::remove_workspace(std::uint32_t workspace) const {
   if (impl_->mgr)
     impl_->mgr->remove_workspace(workspace);

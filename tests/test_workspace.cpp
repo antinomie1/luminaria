@@ -6,6 +6,11 @@
 // the pointer, and a monitor unplugged before a pager started was a
 // use-after-free. Run it under ASan to see the read; here it shows up as an
 // output_enter that should not exist.
+//
+// Also: a pager that binds the manager before the wl_output (the order a
+// compositor's registry usually hands them out) still hears output_enter when
+// it binds the output; an output unplugged while still in its group, and a
+// removed group, leave nothing behind.
 #include <cstdint>
 #include <cassert>
 #include <cstddef>
@@ -38,6 +43,7 @@ struct ClientState {
     int groups = 0;
     int dones = 0;
     int output_enters = 0;
+    std::vector<uint32_t> output_names;
 };
 
 ClientState* g_client = nullptr;
@@ -92,7 +98,9 @@ const ext_workspace_manager_v1_listener kManager{mgr_workspace_group, mgr_worksp
 
 void registry_global(void* data, wl_registry* reg, uint32_t name, const char* iface, uint32_t) {
     auto* st = static_cast<ClientState*>(data);
-    if (std::strcmp(iface, "ext_workspace_manager_v1") == 0) {
+    if (std::strcmp(iface, "wl_output") == 0) {
+        st->output_names.push_back(name);
+    } else if (std::strcmp(iface, "ext_workspace_manager_v1") == 0) {
         st->manager = static_cast<ext_workspace_manager_v1*>(
             wl_registry_bind(reg, name, &ext_workspace_manager_v1_interface, 1));
     }
@@ -115,8 +123,14 @@ void run_client(int fd) {
     wl_display_roundtrip(display); // the initial dump lands here
     wl_display_roundtrip(display); // …plus the events it triggered
 
-    assert(st.groups == 1);
-    assert(st.output_enters == 0); // the removed output is gone from the group
+    assert(st.groups == 1);        // the removed group is not announced
+    assert(st.output_enters == 0); // no wl_output bound yet; the gone ones never
+    // Bind the outputs only now: the live one enters its group late.
+    assert(st.output_names.size() == 1);
+    wl_registry_bind(reg, st.output_names[0], &wl_output_interface, 4);
+    wl_display_roundtrip(display);
+    wl_display_roundtrip(display);
+    assert(st.output_enters == 1);
     assert(st.workspaces.size() == 2);
     assert(st.workspaces[0].id == "ws-1");
     assert(st.workspaces[1].name == "two");
@@ -161,6 +175,21 @@ int main() {
     const std::uint32_t first = workspaces->add_workspace(group, "ws-1", "one", {0});
     (void)workspaces->add_workspace(group, "ws-2", "two", {1});
     workspaces->activate(first);
+    workspaces->done();
+
+    // A monitor that stays.
+    auto live = luminaria::OutputGlobal::create(*display, 800, 600, "live-1");
+    assert(live.has_value());
+    workspaces->group_add_output(group, *live);
+    workspaces->group_add_output(group, *live); // twice is once
+    // A monitor unplugged while still in the group.
+    {
+        auto unplugged = luminaria::OutputGlobal::create(*display, 640, 480, "unplugged-1");
+        assert(unplugged.has_value());
+        workspaces->group_add_output(group, *unplugged);
+    }
+    // A group that went away.
+    workspaces->remove_group(workspaces->add_group());
     workspaces->done();
 
     // A monitor that came and went before any pager bound.

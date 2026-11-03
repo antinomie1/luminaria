@@ -129,6 +129,11 @@ public:
     /// null while it has none: how to match a protocol object that names an output
     /// to the output, for roles this class knows nothing about.
     [[nodiscard]] const void* identity_of(const Output& output) const noexcept;
+    /// The `wl_output` global of `output`, null while it has none: for desktop
+    /// protocols that announce outputs to their clients, such as
+    /// `WorkspaceManager::group_add_output`. It lives until `output` is
+    /// destroyed; don't keep the pointer.
+    [[nodiscard]] OutputGlobal* output_global(const Output& output) noexcept;
 
     /// Draw `popups` the way the scene does: an `invalidate()` whenever one maps,
     /// moves or goes away, and a popup kept on the output its parent is on,
@@ -436,6 +441,15 @@ const void* ScreenManager::identity_of(const Output& output) const noexcept {
     for (const ScreenEntry& screen : impl_->screens) {
         if (screen.output == &output && screen.global.has_value()) {
             return screen.global->identity();
+        }
+    }
+    return nullptr;
+}
+
+OutputGlobal* ScreenManager::output_global(const Output& output) noexcept {
+    for (ScreenEntry& screen : impl_->screens) {
+        if (screen.output == &output && screen.global.has_value()) {
+            return &*screen.global;
         }
     }
     return nullptr;

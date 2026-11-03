@@ -57,12 +57,19 @@ public:
 
     /// A new workspace group. Returns its handle id.
     [[nodiscard]] std::uint32_t add_group();
-    /// Tell clients this group drives `output` (ext_workspace_group.output_enter).
+    /// Remove a group (ext_workspace_group.removed). Remove or reassign its
+    /// workspaces first.
+    void remove_group(std::uint32_t group);
+    /// Tell clients this group drives `output` (ext_workspace_group.output_enter),
+    /// including clients that bind the `wl_output` only later. The group
+    /// remembers the output by `identity()`, so the output may be destroyed
+    /// at any time; a gone output simply matches no client object.
     void group_add_output(std::uint32_t group, OutputGlobal& output);
-    /// The reverse (ext_workspace_group.output_leave), and required before
-    /// `output` is destroyed: the group keeps a pointer to it, which the next
-    /// client to bind would otherwise read.
+    /// The reverse (ext_workspace_group.output_leave).
     void group_remove_output(std::uint32_t group, OutputGlobal& output);
+    /// The reverse, by `OutputGlobal::identity()`: what is left of an output
+    /// after it is gone. Clients whose `wl_output` is already dead hear nothing.
+    void group_remove_output(std::uint32_t group, const void* output_identity);
 
     /// A new workspace in `group`. `id` is the stable string clients match on
     /// across compositor restarts; `coordinates` places it on a grid (e.g. {2}
@@ -108,7 +115,8 @@ namespace luminaria {
 // TU-local type. Still unexported — private to module luminaria.
 struct GroupInfo {
     std::uint32_t id;
-    std::vector<OutputGlobal*> outputs;
+    /// `OutputGlobal::identity()` of each output; never dereferenced.
+    std::vector<const void*> outputs;
 };
 
 // Lifted out of the anonymous namespace below: WorkspaceInfo names it in a
@@ -129,6 +137,8 @@ struct WorkspaceManager::Impl {
     std::vector<GroupInfo> groups;
     std::vector<WorkspaceInfo> workspaces;
     std::uint32_t next_id = 1;
+    /// Expires with us, so `on_bind` callbacks left on outputs go inert.
+    std::shared_ptr<bool> alive = std::make_shared<bool>(true);
 
     // One per bound ext_workspace_manager_v1.
     struct Binding {
@@ -153,6 +163,7 @@ struct WorkspaceManager::Impl {
 
     void send_group(Binding& b, const GroupInfo& g);
     void send_group_outputs(Binding& b, const GroupInfo& g);
+    void output_bound(std::uint32_t group, const void* identity, wl_resource* output);
     void send_workspace(Binding& b, const WorkspaceInfo& w);
     void send_done() {
         for (auto& b : bindings) {
@@ -162,6 +173,25 @@ struct WorkspaceManager::Impl {
 
     ~Impl();
 };
+
+// The wl_output objects `client` has for the output with `identity`.
+std::vector<wl_resource*> ws_outputs_of(wl_client* client, const void* identity) {
+    struct Search {
+        const void* identity;
+        std::vector<wl_resource*> found;
+    } search{identity, {}};
+    wl_client_for_each_resource(
+        client,
+        [](wl_resource* resource, void* data) {
+            auto* search = static_cast<Search*>(data);
+            if (OutputGlobal::identity_of(resource) == search->identity) {
+                search->found.push_back(resource);
+            }
+            return WL_ITERATOR_CONTINUE;
+        },
+        &search);
+    return search.found;
+}
 
 namespace {
 
@@ -360,10 +390,28 @@ void WorkspaceManager::Impl::send_group_outputs(WsBinding& b, const GroupInfo& g
         return;
     }
     wl_client* client = wl_resource_get_client(b.resource);
-    for (OutputGlobal* output : g.outputs) {
+    for (const void* identity : g.outputs) {
         // Only clients that actually bound the wl_output can be told about it.
-        if (wl_resource* out = output->resource_for(client); out != nullptr) {
+        for (wl_resource* out : ws_outputs_of(client, identity)) {
             ext_workspace_group_handle_v1_send_output_enter(it->second, out);
+        }
+    }
+}
+
+void WorkspaceManager::Impl::output_bound(std::uint32_t group_id, const void* identity,
+                                          wl_resource* output) {
+    GroupInfo* g = group(group_id);
+    if (g == nullptr || std::ranges::find(g->outputs, identity) == g->outputs.end()) {
+        return;
+    }
+    wl_client* client = wl_resource_get_client(output);
+    for (auto& b : bindings) {
+        if (wl_resource_get_client(b->resource) != client) {
+            continue;
+        }
+        if (auto it = b->group_handles.find(group_id); it != b->group_handles.end()) {
+            ext_workspace_group_handle_v1_send_output_enter(it->second, output);
+            ext_workspace_manager_v1_send_done(b->resource);
         }
     }
 }
@@ -429,20 +477,42 @@ std::uint32_t WorkspaceManager::add_group() {
     return id;
 }
 
-void WorkspaceManager::group_add_output(std::uint32_t group, OutputGlobal& output) {
-    GroupInfo* g = impl_->group(group);
-    if (g == nullptr) {
+void WorkspaceManager::remove_group(std::uint32_t group) {
+    if (impl_->group(group) == nullptr) {
         return;
     }
-    g->outputs.push_back(&output);
     for (auto& b : impl_->bindings) {
-        impl_->send_group_outputs(*b, *g);
+        if (auto it = b->group_handles.find(group); it != b->group_handles.end()) {
+            ext_workspace_group_handle_v1_send_removed(it->second);
+        }
     }
+    std::erase_if(impl_->groups, [group](const GroupInfo& g) { return g.id == group; });
+}
+
+void WorkspaceManager::group_add_output(std::uint32_t group, OutputGlobal& output) {
+    GroupInfo* g = impl_->group(group);
+    const void* identity = output.identity();
+    if (g == nullptr || std::ranges::find(g->outputs, identity) != g->outputs.end()) {
+        return;
+    }
+    g->outputs.push_back(identity);
+    // Called for every wl_output object of this output, already bound or bound
+    // later: the late ones are how a pager that bound us first learns it.
+    output.on_bind([alive = std::weak_ptr<bool>(impl_->alive), impl = impl_.get(), group,
+                    identity](wl_resource* bound) {
+        if (!alive.expired()) {
+            impl->output_bound(group, identity, bound);
+        }
+    });
 }
 
 void WorkspaceManager::group_remove_output(std::uint32_t group, OutputGlobal& output) {
+    group_remove_output(group, output.identity());
+}
+
+void WorkspaceManager::group_remove_output(std::uint32_t group, const void* identity) {
     GroupInfo* g = impl_->group(group);
-    if (g == nullptr || std::erase(g->outputs, &output) == 0) {
+    if (g == nullptr || std::erase(g->outputs, identity) == 0) {
         return;
     }
     for (auto& b : impl_->bindings) {
@@ -450,8 +520,7 @@ void WorkspaceManager::group_remove_output(std::uint32_t group, OutputGlobal& ou
         if (it == b->group_handles.end()) {
             continue;
         }
-        if (wl_resource* out = output.resource_for(wl_resource_get_client(b->resource));
-            out != nullptr) {
+        for (wl_resource* out : ws_outputs_of(wl_resource_get_client(b->resource), identity)) {
             ext_workspace_group_handle_v1_send_output_leave(it->second, out);
         }
     }

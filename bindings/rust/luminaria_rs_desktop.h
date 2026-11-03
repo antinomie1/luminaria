@@ -62,9 +62,16 @@ public:
   WorkspaceManagerShim &operator=(const WorkspaceManagerShim &) = delete;
 
   std::uint32_t create_group() const;
+  void remove_group(std::uint32_t group) const;
+  void group_add_output(std::uint32_t group, std::uint64_t output_global) const;
+  void group_remove_output(std::uint32_t group, std::uint64_t output_identity) const;
   std::uint32_t create_workspace(std::uint32_t group, rust::Str name) const;
+  std::uint32_t add_workspace(std::uint32_t group, rust::Str id, rust::Str name,
+                              rust::Slice<const std::int32_t> coordinates) const;
   void remove_workspace(std::uint32_t workspace) const;
   void activate_workspace(std::uint32_t workspace) const;
+  void set_workspace_state(std::uint32_t workspace, std::uint32_t state) const;
+  void workspaces_done() const;
 
   struct Impl;
   Impl &impl() const;

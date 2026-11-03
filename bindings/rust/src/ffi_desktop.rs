@@ -83,9 +83,21 @@ pub(crate) mod ffi {
             error: &mut String,
         ) -> UniquePtr<WorkspaceManagerShim>;
         fn create_group(self: &WorkspaceManagerShim) -> u32;
+        fn remove_group(self: &WorkspaceManagerShim, group: u32);
+        fn group_add_output(self: &WorkspaceManagerShim, group: u32, output_global: u64);
+        fn group_remove_output(self: &WorkspaceManagerShim, group: u32, output_identity: u64);
         fn create_workspace(self: &WorkspaceManagerShim, group: u32, name: &str) -> u32;
+        fn add_workspace(
+            self: &WorkspaceManagerShim,
+            group: u32,
+            id: &str,
+            name: &str,
+            coordinates: &[i32],
+        ) -> u32;
         fn remove_workspace(self: &WorkspaceManagerShim, workspace: u32);
         fn activate_workspace(self: &WorkspaceManagerShim, workspace: u32);
+        fn set_workspace_state(self: &WorkspaceManagerShim, workspace: u32, state: u32);
+        fn workspaces_done(self: &WorkspaceManagerShim);
 
         type SessionLockManagerShim;
         fn session_lock_manager_new(
