@@ -140,6 +140,9 @@ pub struct SceneItem {
     /// How much of the blur shows. Separate from `alpha`: a window translucent
     /// by rule wants all of its blur, one fading in wants it to fade too.
     pub blur_opacity: f32,
+    /// A surface item blurs only the regions its client declared through
+    /// ext-background-effect-v1, not its whole box; none declared blurs nothing.
+    pub blur_surface_regions: bool,
     pub shadow_color: Color,
     pub shadow_feather: f32,
 }
@@ -163,6 +166,7 @@ impl SceneItem {
             blur_enabled: false,
             blur_xray: false,
             blur_opacity: 1.0,
+            blur_surface_regions: false,
             shadow_color: Color::rgba(0.0, 0.0, 0.0, 0.0),
             shadow_feather: 0.0,
         }
@@ -246,6 +250,14 @@ impl SceneItem {
         self
     }
 
+    /// Blurs behind the regions the surface's client asks for, as
+    /// ext-background-effect-v1 sets them, rather than behind the whole box.
+    pub fn with_surface_blur(mut self, xray: bool) -> Self {
+        self = self.with_blur(xray);
+        self.blur_surface_regions = true;
+        self
+    }
+
     pub fn with_blur_opacity(mut self, opacity: f32) -> Self {
         self.blur_opacity = opacity;
         self
@@ -291,6 +303,7 @@ impl SceneItem {
             blur_enabled: raw.blur_enabled,
             blur_xray: raw.blur_xray,
             blur_opacity: raw.blur_opacity,
+            blur_surface_regions: raw.blur_surface_regions,
             shadow_color: Color::rgba(raw.shadow_r, raw.shadow_g, raw.shadow_b, raw.shadow_a),
             shadow_feather: raw.shadow_feather,
         }
@@ -325,6 +338,7 @@ impl SceneItem {
             blur_enabled: self.blur_enabled,
             blur_xray: self.blur_xray,
             blur_opacity: self.blur_opacity,
+            blur_surface_regions: self.blur_surface_regions,
             shadow_r: self.shadow_color.r,
             shadow_g: self.shadow_color.g,
             shadow_b: self.shadow_color.b,
