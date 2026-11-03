@@ -263,6 +263,9 @@ public:
     void bind(std::uint32_t mods, std::uint32_t keysym, std::uint32_t id) const;
     void set_click_to_focus(bool enabled) const;
     void update_pointer() const;
+    void follow_constraints(const PointerConstraintsShim& constraints) const;
+    void follow_constraints_relative(const PointerConstraintsShim& constraints,
+                                     const RelativePointerManagerShim& relative) const;
     void route_key(std::uint32_t key, bool pressed, std::uint32_t keysym, std::uint32_t depressed,
                    std::uint32_t latched, std::uint32_t locked, std::uint32_t group) const;
     void route_modifiers(std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked,

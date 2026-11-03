@@ -5,6 +5,7 @@
 #include <cstring>
 #include <thread>
 
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -63,6 +64,15 @@ void run_client(int fd) {
   st.vp = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(st.vp_mgr,
                                                                  st.seat);
   wl_display_roundtrip(display);
+
+  // A keymap first: keys before one are the protocol's no_keymap error.
+  constexpr char kKeymap[] = "xkb_keymap { xkb_keycodes { include \"evdev\" }; };";
+  const int keymap_fd = memfd_create("keymap", MFD_CLOEXEC);
+  assert(keymap_fd >= 0);
+  assert(write(keymap_fd, kKeymap, sizeof kKeymap) == static_cast<ssize_t>(sizeof kKeymap));
+  zwp_virtual_keyboard_v1_keymap(st.vk, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, keymap_fd,
+                                 sizeof kKeymap);
+  close(keymap_fd);
 
   // Send virtual keyboard events
   zwp_virtual_keyboard_v1_key(st.vk, 100, 30, WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -127,6 +137,8 @@ int main() {
     assert(e.time == 100);
     assert(e.key == 30);
     assert(e.pressed);
+    // The keyboard's own keymap, to read its keys with.
+    assert(vk_mgr->keymap(e.keyboard).starts_with("xkb_keymap {"));
     key_received = true;
   });
 

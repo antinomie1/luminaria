@@ -125,6 +125,26 @@ impl TabletAxes {
             wheel_clicks: raw.wheel_clicks,
         }
     }
+    /// A sample with only a position, normalised across the tablet: for tests
+    /// and for input that does not come from libinput.
+    pub fn at(x: f64, y: f64) -> Self {
+        Self {
+            changed: 1,
+            x,
+            y,
+            ..Self::default()
+        }
+    }
+
+    /// The same with a pressure as well.
+    pub fn pressed(x: f64, y: f64, pressure: f64) -> Self {
+        Self {
+            changed: 1 | 2,
+            pressure,
+            ..Self::at(x, y)
+        }
+    }
+
     pub fn has_position(&self) -> bool {
         self.changed & 1 != 0
     }

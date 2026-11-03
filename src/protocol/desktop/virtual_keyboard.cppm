@@ -1,10 +1,14 @@
 // luminaria/protocol/desktop/virtual_keyboard.cppm — zwp_virtual_keyboard_v1.
 //
-// Client input injection for keyboard events.
+// Client input injection for keyboard events. Each virtual keyboard names its
+// own keymap (wtype, for one, makes up a keymap holding just the keys it types),
+// so keys carry the keyboard they came from and `keymap()` says how to read
+// them; a key before any keymap is the protocol's `no_keymap` error.
 
 module;
 
 #include <cstdint>
+#include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
@@ -26,6 +30,8 @@ struct VirtualKey {
   uint32_t key = 0;
   bool pressed = false;
   wl_resource *seat_resource = nullptr;
+  /// Which virtual keyboard: an id for `VirtualKeyboardManager::keymap()`.
+  std::uint64_t keyboard = 0;
 };
 
 struct VirtualModifiers {
@@ -34,6 +40,7 @@ struct VirtualModifiers {
   uint32_t locked = 0;
   uint32_t group = 0;
   wl_resource *seat_resource = nullptr;
+  std::uint64_t keyboard = 0;
 };
 
 class VirtualKeyboardManager {
@@ -48,6 +55,9 @@ public:
 
   [[nodiscard]] Signal<VirtualKey> &key_event() noexcept;
   [[nodiscard]] Signal<VirtualModifiers> &modifiers_event() noexcept;
+
+  /// The XKB keymap text `keyboard` uploaded, empty for one that is gone.
+  [[nodiscard]] std::string keymap(std::uint64_t keyboard) const;
 
   struct Impl;
 
@@ -67,6 +77,7 @@ struct VirtualKeyboardDevice;
 struct VirtualKeyboardManager::Impl : GlobalBindingTracker {
   WlGlobal global;
   std::vector<VirtualKeyboardDevice *> devices;
+  std::uint64_t next_id = 1;
   Signal<VirtualKey> key_event;
   Signal<VirtualModifiers> modifiers_event;
 
@@ -78,10 +89,12 @@ struct VirtualKeyboardDevice {
   wl_resource *resource = nullptr;
   wl_resource *seat_resource = nullptr;
   wl_listener seat_destroy{};
+  std::uint64_t id = 0;
+  std::string keymap;
 
   VirtualKeyboardDevice(VirtualKeyboardManager::Impl *m, wl_resource *r,
                         wl_resource *seat)
-      : mgr(m), resource(r), seat_resource(seat) {}
+      : mgr(m), resource(r), seat_resource(seat), id(m->next_id++) {}
   ~VirtualKeyboardDevice();
 };
 
@@ -103,19 +116,43 @@ VirtualKeyboardManager::Impl::~Impl() {
 
 namespace {
 
-void vk_keymap(wl_client *, wl_resource *resource, uint32_t, int32_t fd,
-               uint32_t) {
-  if (fd >= 0) {
-    ::close(fd);
+// A keymap bigger than this is not a keymap.
+constexpr std::uint32_t vk_max_keymap = 16u << 20;
+
+void vk_keymap(wl_client *, wl_resource *resource, uint32_t format, int32_t fd,
+               uint32_t size) {
+  auto *dev =
+      static_cast<VirtualKeyboardDevice *>(wl_resource_get_user_data(resource));
+  if (fd < 0) {
+    return;
   }
-  (void)resource;
+  if (dev != nullptr && format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 &&
+      size > 0 && size <= vk_max_keymap) {
+    void *map = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map != MAP_FAILED) {
+      const char *text = static_cast<const char *>(map);
+      dev->keymap.assign(text, ::strnlen(text, size));
+      ::munmap(map, size);
+    }
+  }
+  ::close(fd);
+}
+
+// Keys and modifiers mean nothing without a keymap: the protocol's error.
+bool vk_has_keymap(wl_resource *resource, const VirtualKeyboardDevice *dev) {
+  if (!dev->keymap.empty()) {
+    return true;
+  }
+  wl_resource_post_error(resource, ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP,
+                         "a virtual keyboard sent input before its keymap");
+  return false;
 }
 
 void vk_key(wl_client *, wl_resource *resource, uint32_t time, uint32_t key,
             uint32_t state) {
   auto *dev =
       static_cast<VirtualKeyboardDevice *>(wl_resource_get_user_data(resource));
-  if (dev == nullptr || dev->mgr == nullptr) {
+  if (dev == nullptr || dev->mgr == nullptr || !vk_has_keymap(resource, dev)) {
     return;
   }
   VirtualKey event{
@@ -123,6 +160,7 @@ void vk_key(wl_client *, wl_resource *resource, uint32_t time, uint32_t key,
       .key = key,
       .pressed = (state == WL_KEYBOARD_KEY_STATE_PRESSED),
       .seat_resource = dev->seat_resource,
+      .keyboard = dev->id,
   };
   dev->mgr->key_event.emit(event);
 }
@@ -131,7 +169,7 @@ void vk_modifiers(wl_client *, wl_resource *resource, uint32_t mods_depressed,
                   uint32_t mods_latched, uint32_t mods_locked, uint32_t group) {
   auto *dev =
       static_cast<VirtualKeyboardDevice *>(wl_resource_get_user_data(resource));
-  if (dev == nullptr || dev->mgr == nullptr) {
+  if (dev == nullptr || dev->mgr == nullptr || !vk_has_keymap(resource, dev)) {
     return;
   }
   VirtualModifiers event{
@@ -140,6 +178,7 @@ void vk_modifiers(wl_client *, wl_resource *resource, uint32_t mods_depressed,
       .locked = mods_locked,
       .group = group,
       .seat_resource = dev->seat_resource,
+      .keyboard = dev->id,
   };
   dev->mgr->modifiers_event.emit(event);
 }
@@ -212,6 +251,15 @@ Signal<VirtualKey> &VirtualKeyboardManager::key_event() noexcept {
 
 Signal<VirtualModifiers> &VirtualKeyboardManager::modifiers_event() noexcept {
   return impl_->modifiers_event;
+}
+
+std::string VirtualKeyboardManager::keymap(std::uint64_t keyboard) const {
+  for (const VirtualKeyboardDevice *dev : impl_->devices) {
+    if (dev->id == keyboard) {
+      return dev->keymap;
+    }
+  }
+  return {};
 }
 
 Result<VirtualKeyboardManager>

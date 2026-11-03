@@ -1,6 +1,10 @@
 // luminaria/protocol/desktop/gamma_control.cppm — zwlr_gamma_control_v1.
 //
 // Allows a client (night light / gamma adjuster) to set gamma ramps on outputs.
+// Tables differ per output, so the compositor says how big each one is
+// (`set_output_size`, by `OutputGlobal::identity()`); a client asking for an
+// output with no table gets `failed`. Applying the ramp is the compositor's:
+// `Output::set_gamma` does it on DRM.
 
 module;
 
@@ -28,7 +32,10 @@ struct GammaRamp {
 };
 
 struct GammaRampUpdate {
+  /// The client's wl_output; null on a reset whose wl_output is already gone.
   wl_resource *output_resource = nullptr;
+  /// Which output, as `OutputGlobal::identity()`: still right on that reset.
+  const void *output_identity = nullptr;
   std::optional<GammaRamp>
       ramp; ///< nullopt indicates gamma was reset to default
 };
@@ -48,6 +55,13 @@ public:
 
   [[nodiscard]] uint32_t gamma_size() const noexcept;
 
+  /// The entries per channel the output with `identity` takes; 0 (the
+  /// default for an output never named) means it has no gamma table.
+  void set_output_size(const void *identity, uint32_t gamma_size);
+  /// The `OutputGlobal::identity()` a client's wl_output names, as
+  /// `GammaRampUpdate::output_resource` carries it; null for a gone output.
+  [[nodiscard]] static const void *output_identity(wl_resource *wl_output) noexcept;
+
   struct Impl;
 
 private:
@@ -66,7 +80,23 @@ struct GammaControl;
 struct GammaControlManager::Impl : GlobalBindingTracker {
   WlGlobal global;
   uint32_t gamma_size = 256;
+  /// Set by the compositor; an output missing from here falls back to
+  /// `gamma_size` only while nothing was set at all.
+  std::vector<std::pair<const void *, uint32_t>> sizes;
   std::vector<GammaControl *> controls;
+
+  [[nodiscard]] uint32_t size_for(wl_resource *output) const {
+    if (sizes.empty()) {
+      return gamma_size;
+    }
+    const void *identity = OutputGlobal::identity_of(output);
+    for (const auto &[id, size] : sizes) {
+      if (id == identity) {
+        return size;
+      }
+    }
+    return 0;
+  }
   Signal<GammaRampUpdate> gamma_changed;
 
   ~Impl() override;
@@ -77,6 +107,19 @@ struct GammaControl {
   wl_resource *resource = nullptr;
   wl_resource *output_resource = nullptr;
   wl_listener output_destroy{};
+  uint32_t gamma_size = 0;
+  const void *identity = nullptr;
+  /// A ramp of ours is on the output: our end must reset it.
+  bool applied = false;
+
+  /// Hands the output back to the identity ramp, once.
+  void reset() {
+    if (applied && mgr != nullptr) {
+      applied = false;
+      GammaRampUpdate event{output_resource, identity, std::nullopt};
+      mgr->gamma_changed.emit(event);
+    }
+  }
 
   GammaControl(GammaControlManager::Impl *m, wl_resource *r, wl_resource *out)
       : mgr(m), resource(r), output_resource(out) {}
@@ -89,10 +132,8 @@ GammaControl::~GammaControl() {
   }
   if (mgr != nullptr) {
     std::erase(mgr->controls, this);
-    if (output_resource != nullptr) {
-      GammaRampUpdate event{output_resource, std::nullopt};
-      mgr->gamma_changed.emit(event);
-    }
+    // A night-light tool quitting, or crashing, leaves the screen as it was.
+    reset();
   }
 }
 
@@ -114,7 +155,13 @@ void control_set_gamma(wl_client *, wl_resource *resource, int32_t fd) {
     return;
   }
 
-  const uint32_t gamma_size = self->mgr->gamma_size;
+  const uint32_t gamma_size = self->gamma_size;
+  if (gamma_size == 0 || self->output_resource == nullptr) {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+    return; // already told `failed`
+  }
   const size_t expected_size =
       static_cast<size_t>(gamma_size) * 3 * sizeof(uint16_t);
 
@@ -149,7 +196,8 @@ void control_set_gamma(wl_client *, wl_resource *resource, int32_t fd) {
   ramp.blue.assign(words + 2 * gamma_size, words + 3 * gamma_size);
   ::munmap(map, expected_size);
 
-  GammaRampUpdate event{self->output_resource, std::move(ramp)};
+  self->applied = true;
+  GammaRampUpdate event{self->output_resource, self->identity, std::move(ramp)};
   self->mgr->gamma_changed.emit(event);
 }
 
@@ -161,8 +209,11 @@ constexpr struct zwlr_gamma_control_v1_interface control_impl = {
 void on_output_destroyed(wl_listener *l, void *) {
   auto *ctrl =
       wl_container_of(l, static_cast<GammaControl *>(nullptr), output_destroy);
-  zwlr_gamma_control_v1_send_failed(ctrl->resource);
-  ctrl->output_resource = nullptr;
+  if (ctrl->output_resource != nullptr) {
+    zwlr_gamma_control_v1_send_failed(ctrl->resource);
+    ctrl->output_resource = nullptr;
+    ctrl->reset();
+  }
 }
 
 void manager_get_gamma_control(wl_client *client, wl_resource *resource,
@@ -187,12 +238,16 @@ void manager_get_gamma_control(wl_client *client, wl_resource *resource,
     if (existing->output_resource == output) {
       zwlr_gamma_control_v1_send_failed(existing->resource);
       existing->output_resource = nullptr;
+      // The newcomer owns the output now; the old ramp stays until it sets one.
+      existing->applied = false;
     }
   }
 
   auto ctrl = std::make_unique<GammaControl>(self, res, output);
   ctrl->output_destroy.notify = on_output_destroyed;
   wl_resource_add_destroy_listener(output, &ctrl->output_destroy);
+  ctrl->gamma_size = self->size_for(output);
+  ctrl->identity = OutputGlobal::identity_of(output);
 
   self->controls.push_back(ctrl.get());
   GammaControl *raw = ctrl.release();
@@ -200,7 +255,13 @@ void manager_get_gamma_control(wl_client *client, wl_resource *resource,
     delete static_cast<GammaControl *>(wl_resource_get_user_data(r));
   });
 
-  zwlr_gamma_control_v1_send_gamma_size(res, self->gamma_size);
+  if (raw->gamma_size == 0) {
+    // This output has no table to set; the client should not wait for one.
+    zwlr_gamma_control_v1_send_failed(res);
+    raw->output_resource = nullptr;
+    return;
+  }
+  zwlr_gamma_control_v1_send_gamma_size(res, raw->gamma_size);
 }
 
 constexpr struct zwlr_gamma_control_manager_v1_interface manager_impl = {
@@ -220,6 +281,16 @@ GammaControlManager::operator=(GammaControlManager &&) noexcept = default;
 
 Signal<GammaRampUpdate> &GammaControlManager::gamma_changed() noexcept {
   return impl_->gamma_changed;
+}
+
+void GammaControlManager::set_output_size(const void *identity, uint32_t gamma_size) {
+  auto &sizes = impl_->sizes;
+  std::erase_if(sizes, [identity](const auto &entry) { return entry.first == identity; });
+  sizes.emplace_back(identity, gamma_size);
+}
+
+const void *GammaControlManager::output_identity(wl_resource *wl_output) noexcept {
+  return OutputGlobal::identity_of(wl_output);
 }
 
 uint32_t GammaControlManager::gamma_size() const noexcept {

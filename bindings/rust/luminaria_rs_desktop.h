@@ -196,6 +196,7 @@ public:
   GammaControlManagerShim &operator=(const GammaControlManagerShim &) = delete;
 
   std::uint32_t gamma_size() const;
+  void set_output_size(std::uint64_t output_identity, std::uint32_t gamma_size) const;
   bool get_ramp(std::uint64_t output_res_id, rust::Vec<std::uint16_t> &red,
                 rust::Vec<std::uint16_t> &green,
                 rust::Vec<std::uint16_t> &blue) const;
@@ -236,6 +237,8 @@ public:
   VirtualKeyboardManagerShim(const VirtualKeyboardManagerShim &) = delete;
   VirtualKeyboardManagerShim &
   operator=(const VirtualKeyboardManagerShim &) = delete;
+
+  rust::String keymap(std::uint64_t keyboard) const;
 
   struct Impl;
   Impl &impl() const;

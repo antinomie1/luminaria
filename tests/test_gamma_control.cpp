@@ -1,4 +1,7 @@
-// Test zwlr_gamma_control_v1: gamma size, set_gamma via fd, reset on destroy.
+// Test zwlr_gamma_control_v1: a per-output gamma size, `failed` for an output
+// without a table, set_gamma via fd, and the reset when the client goes away
+// without tidying up (a crash), named by the output's identity even though
+// its wl_output went first.
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +26,7 @@ namespace {
 
 struct ClientState {
   wl_output *output = nullptr;
+  wl_output *tableless = nullptr;
   zwlr_gamma_control_manager_v1 *manager = nullptr;
   zwlr_gamma_control_v1 *control = nullptr;
   uint32_t gamma_size = 0;
@@ -45,8 +49,9 @@ void registry_global(void *data, wl_registry *reg, uint32_t name,
                      const char *iface, uint32_t) {
   auto *st = static_cast<ClientState *>(data);
   if (std::strcmp(iface, "wl_output") == 0) {
-    st->output = static_cast<wl_output *>(
+    auto *output = static_cast<wl_output *>(
         wl_registry_bind(reg, name, &wl_output_interface, 1));
+    (st->output == nullptr ? st->output : st->tableless) = output;
   } else if (std::strcmp(iface, "zwlr_gamma_control_manager_v1") == 0) {
     st->manager = static_cast<zwlr_gamma_control_manager_v1 *>(wl_registry_bind(
         reg, name, &zwlr_gamma_control_manager_v1_interface, 1));
@@ -62,7 +67,13 @@ void run_client(int fd) {
   wl_registry *reg = wl_display_get_registry(display);
   wl_registry_add_listener(reg, &kRegistry, &st);
   wl_display_roundtrip(display);
-  assert(st.output && st.manager);
+  assert(st.output && st.tableless && st.manager);
+
+  ClientState none;
+  auto *refused = zwlr_gamma_control_manager_v1_get_gamma_control(st.manager, st.tableless);
+  zwlr_gamma_control_v1_add_listener(refused, &kControlListener, &none);
+  wl_display_roundtrip(display);
+  assert(none.failed && none.gamma_size == 0);
 
   st.control =
       zwlr_gamma_control_manager_v1_get_gamma_control(st.manager, st.output);
@@ -92,13 +103,8 @@ void run_client(int fd) {
   zwlr_gamma_control_v1_set_gamma(st.control, memfd);
   wl_display_roundtrip(display);
 
-  // Destroy gamma control to test reset back to default
-  zwlr_gamma_control_v1_destroy(st.control);
-  wl_display_roundtrip(display);
-
-  zwlr_gamma_control_manager_v1_destroy(st.manager);
-  wl_output_destroy(st.output);
-  wl_registry_destroy(reg);
+  // Go without destroying anything, as a crashed night-light tool does: the
+  // ramp must still be reset.
   wl_display_disconnect(display);
 }
 
@@ -124,14 +130,19 @@ int main() {
   auto output_global =
       luminaria::OutputGlobal::create(*display, 800, 600, "HEAD-1");
   assert(output_global.has_value());
+  auto tableless = luminaria::OutputGlobal::create(*display, 800, 600, "HEAD-2");
+  assert(tableless.has_value());
 
-  auto gamma_mgr = luminaria::GammaControlManager::create(*display, 256);
+  auto gamma_mgr = luminaria::GammaControlManager::create(*display, 1024);
   assert(gamma_mgr.has_value());
+  // HEAD-1's table takes 256 entries; HEAD-2 is never named, so it has none.
+  gamma_mgr->set_output_size(output_global->identity(), 256);
 
   bool ramp_received = false;
   bool reset_received = false;
   auto conn =
       gamma_mgr->gamma_changed().connect([&](luminaria::GammaRampUpdate &e) {
+        assert(e.output_identity == output_global->identity());
         if (e.ramp.has_value()) {
           assert(e.ramp->red.size() == 256);
           assert(e.ramp->green.size() == 256);

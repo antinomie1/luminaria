@@ -192,6 +192,12 @@ public:
   bool vrr_capable() const;
   bool vrr_enabled() const;
   bool set_vrr(bool enabled, rust::String &error);
+  std::uint32_t gamma_size() const;
+  bool set_gamma(rust::Slice<const std::uint16_t> red,
+                 rust::Slice<const std::uint16_t> green,
+                 rust::Slice<const std::uint16_t> blue, rust::String &error);
+  bool has_ctm() const;
+  bool set_ctm(rust::Slice<const double> matrix, rust::String &error);
   bool move_cursor(std::int32_t x, std::int32_t y, rust::String &error);
   bool hide_cursor(rust::String &error);
   bool alive() const;

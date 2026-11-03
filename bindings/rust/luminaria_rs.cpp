@@ -2596,6 +2596,12 @@ lm::DataDeviceManager *raw_ptr(const DataDeviceManagerShim &s) {
 lm::TextInputManager *raw_ptr(const TextInputManagerShim &s) {
   return s.impl().mgr ? &*s.impl().mgr : nullptr;
 }
+lm::PointerConstraints *raw_ptr(const PointerConstraintsShim &s) {
+  return s.impl().mgr ? &*s.impl().mgr : nullptr;
+}
+lm::RelativePointerManager *raw_ptr(const RelativePointerManagerShim &s) {
+  return s.impl().mgr ? &*s.impl().mgr : nullptr;
+}
 
 lm::Popup *xdg_popup(const XdgShellShim &shell, std::uint64_t popup) {
   return shell.impl().popup(popup);
@@ -2627,6 +2633,49 @@ bool OutputShim::vrr_capable() const {
 }
 bool OutputShim::vrr_enabled() const {
   return impl_->output ? impl_->output->vrr_enabled() : false;
+}
+std::uint32_t OutputShim::gamma_size() const {
+  return impl_->output ? impl_->output->gamma_size() : 0;
+}
+bool OutputShim::set_gamma(rust::Slice<const std::uint16_t> red,
+                           rust::Slice<const std::uint16_t> green,
+                           rust::Slice<const std::uint16_t> blue,
+                           rust::String &error) {
+  if (!impl_->output) {
+    error = "output destroyed";
+    return false;
+  }
+  auto st = impl_->output->set_gamma({red.data(), red.size()},
+                                     {green.data(), green.size()},
+                                     {blue.data(), blue.size()});
+  if (!st) {
+    error = to_rust(st.error().message);
+    return false;
+  }
+  return true;
+}
+bool OutputShim::has_ctm() const {
+  return impl_->output ? impl_->output->has_ctm() : false;
+}
+bool OutputShim::set_ctm(rust::Slice<const double> matrix, rust::String &error) {
+  if (!impl_->output) {
+    error = "output destroyed";
+    return false;
+  }
+  std::optional<std::array<double, 9>> m;
+  if (matrix.size() == 9) {
+    m.emplace();
+    std::copy(matrix.begin(), matrix.end(), m->begin());
+  } else if (matrix.size() != 0) {
+    error = "a colour matrix has 9 entries";
+    return false;
+  }
+  auto st = impl_->output->set_ctm(m);
+  if (!st) {
+    error = to_rust(st.error().message);
+    return false;
+  }
+  return true;
 }
 bool OutputShim::set_vrr(bool enabled, rust::String &error) {
   if (!impl_->output) {

@@ -13,9 +13,11 @@
 // from, so what gets clicked is what is shown. Nothing is remembered between
 // events but the keys a binding kept.
 //
-// Where the pointer may go is not here: pointer constraints narrow the bounds
-// and are the compositor's, through `Cursor::move_by()` directly. Touch is not
-// here either; there is no default for it to be.
+// Pointer constraints and relative motion are opt-in, through
+// `follow_constraints()`: a locked pointer stays where it is, a confined one
+// stays in its surface (and region), and relative motion goes to the focused
+// client whether the cursor moved or not. Touch is not here; there is no
+// default for it to be.
 module;
 
 #include <xkbcommon/xkbcommon.h>
@@ -29,6 +31,7 @@ import luminaria.backend;
 
 import :auto_backend;
 import :cursor;
+import :cursor_manager;
 import :popup;
 import :scene;
 import :screen_manager;
@@ -84,6 +87,14 @@ public:
     /// `ScreenManager` does this by itself.
     void update_pointer();
 
+    /// Honour `constraints`: a constraint activates when the pointer enters
+    /// its surface (inside its region, if it has one), a locked pointer then
+    /// stops moving, and a confined one stays in the surface's region. With
+    /// `relative`, every relative motion reaches the focused client as such,
+    /// moved or not, which is what games and 3D views read. Both are borrowed.
+    void follow_constraints(PointerConstraints& constraints,
+                            RelativePointerManager* relative = nullptr);
+
     struct Impl;
 
 private:
@@ -119,6 +130,8 @@ struct DefaultInputRouter::Impl {
     ButtonHook on_button;
     FocusHook on_focus;
     bool click_to_focus = true;
+    PointerConstraints* constraints = nullptr;
+    RelativePointerManager* relative = nullptr;
     // Every toplevel, to get from the root of a hit back to the window.
     std::list<InputKnownToplevel> toplevels;
 
@@ -134,6 +147,9 @@ struct DefaultInputRouter::Impl {
     void update_pointer();
     void focus_window(const SceneHit& hit);
     void route(const InputEvent& event);
+    void motion(const PointerMotionEvent& event);
+    void activate_constraint();
+    [[nodiscard]] std::optional<Box> confinement(PointerConstraint& constraint);
 };
 
 bool DefaultInputRouter::Impl::binding(const KeyEvent& event) {
@@ -157,10 +173,77 @@ void DefaultInputRouter::Impl::key(const KeyEvent& event) {
 }
 
 void DefaultInputRouter::Impl::update_pointer() {
+    // A locked pointer keeps its surface and hears no motion; the lock ends
+    // by itself when that surface loses focus some other way.
+    if (constraints != nullptr) {
+        if (const PointerConstraint* active = constraints->active_constraint();
+            active != nullptr && active->type() == PointerConstraintType::locked) {
+            return;
+        }
+    }
     if (const Pointer& pointer = cursor->pointer(); pointer.present()) {
         scene_route_pointer(*seat, screens->scene_at(pointer.x(), pointer.y()), pointer.x(),
                             pointer.y());
+        activate_constraint();
     }
+}
+
+// Where a confined pointer may go, in layout coordinates: its surface, narrowed
+// to the region's extents when it set one. Null while the surface is not shown.
+std::optional<Box> DefaultInputRouter::Impl::confinement(PointerConstraint& constraint) {
+    std::optional<Box> box = screens->surface_box(constraint.surface().id());
+    if (box && constraint.has_region()) {
+        Box region = constraint.region().extents();
+        region.x += box->x;
+        region.y += box->y;
+        *box = box->intersection(region);
+    }
+    return box;
+}
+
+// The pointer just arrived somewhere: a constraint waiting on that surface
+// takes it, if the pointer is inside the constraint's region.
+void DefaultInputRouter::Impl::activate_constraint() {
+    if (constraints == nullptr) {
+        return;
+    }
+    Surface* focus = surface_from_id(seat->pointer_focus());
+    if (focus == nullptr) {
+        return;
+    }
+    PointerConstraint* constraint = constraints->constraint_for(*focus);
+    if (constraint == nullptr || constraint->active()) {
+        return;
+    }
+    if (constraint->has_region()) {
+        const std::optional<Box> box = screens->surface_box(focus->id());
+        const Pointer& pointer = cursor->pointer();
+        if (!box || !constraint->region().contains(static_cast<int>(pointer.x()) - box->x,
+                                                   static_cast<int>(pointer.y()) - box->y)) {
+            return;
+        }
+    }
+    constraint->activate();
+}
+
+void DefaultInputRouter::Impl::motion(const PointerMotionEvent& event) {
+    CursorManager::send_relative_motion(relative, event.dx, event.dy);
+    PointerConstraint* active = constraints != nullptr ? constraints->active_constraint() : nullptr;
+    if (active != nullptr && active->type() == PointerConstraintType::locked) {
+        return; // the cursor stays; the client had the relative motion
+    }
+    std::optional<Box> bounds = active != nullptr ? confinement(*active) : std::nullopt;
+    const bool moved = bounds && !bounds->empty() ? cursor->move_by(event.dx, event.dy, *bounds)
+                                                  : cursor->move_by(event);
+    if (moved) {
+        update_pointer();
+    }
+}
+
+void DefaultInputRouter::follow_constraints(PointerConstraints& constraints,
+                                            RelativePointerManager* relative) {
+    impl_->constraints = &constraints;
+    impl_->relative = relative;
 }
 
 void DefaultInputRouter::Impl::focus_window(const SceneHit& hit) {
@@ -280,11 +363,7 @@ void DefaultInputRouter::Impl::route(const InputEvent& event) {
     match(
         event, [this](const KeyEvent& e) { key(e); },
         [this](const ModifiersEvent& e) { seat->notify_modifiers(e); },
-        [this](const PointerMotionEvent& e) {
-            if (cursor->move_by(e)) {
-                update_pointer();
-            }
-        },
+        [this](const PointerMotionEvent& e) { motion(e); },
         [this](const PointerMotionAbsEvent& e) {
             cursor->move_to(e);
             update_pointer();

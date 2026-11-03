@@ -535,14 +535,17 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
 ### 9.6 GammaControl (伽马曲线调节)
 - **`GammaControlManager`** (`luminaria.desktop:gamma_control`): `zwlr_gamma_control_manager_v1`
   - 管理输出的 16 位 RGB 查找表（夜间模式、色温调节），支持设置通过 shm fd 传输的 gamma table，销毁时自动还原默认查找表。
+  - 每个输出的表大小不同：`set_output_size(identity, size)` 按 `OutputGlobal::identity()` 告知；表大小为 0（或从未告知）的输出，客户端收到 `failed`。事件带 `output_identity`，客户端的 `wl_output` 先于控制对象销毁（工具崩溃）时复位也照样指向正确的输出。
+  - 落到硬件：`Output::gamma_size()` / `set_gamma(r, g, b)`（DRM 经 `GAMMA_LUT`，屏幕静止时单独翻页一次；headless / nested 没有查找表）。
 
 ### 9.7 CtmControl (色彩变换矩阵)
 - **`CtmControlManager`** (`luminaria.desktop:ctm_control`): `hyprland_ctm_control_v1` (v2)
-  - 允许特权客户端配置输出的 3×3 行优先色彩变换矩阵（CTM），带非负值检验与独占互斥控制。
+  - 允许特权客户端配置输出的 3×3 行优先色彩变换矩阵（CTM），带非负值检验与独占互斥控制。事件与复位按 `output_identity` 指向输出。
+  - 落到硬件：`Output::has_ctm()` / `set_ctm(matrix)`（DRM 经 `CTM`，S31.32 符号-数值格式）。
 
 ### 9.8 VirtualKeyboard (虚拟键盘输入注入)
 - **`VirtualKeyboardManager`** (`luminaria.desktop:virtual_keyboard`): `zwp_virtual_keyboard_v1`
-  - 接收虚拟键盘注入事件，提供 `key_event()` 与 `modifiers_event()` 信号。
+  - 接收虚拟键盘注入事件，提供 `key_event()` 与 `modifiers_event()` 信号。事件带 `keyboard`；`keymap(keyboard)` 是这个虚拟键盘上传的 XKB keymap（wtype 这类工具自编 keymap），混成器转发其按键前把 seat 切到它、真实按键到来时切回。没有 keymap 就发键是协议错误 `no_keymap`。
 
 ### 9.9 VirtualPointer (虚拟指针输入注入)
 - **`VirtualPointerManager`** (`luminaria.desktop:virtual_pointer`): `zwlr_virtual_pointer_v1` (v2)

@@ -509,6 +509,16 @@ pub(crate) mod ffi {
         fn vrr_capable(self: &OutputShim) -> bool;
         fn vrr_enabled(self: &OutputShim) -> bool;
         fn set_vrr(self: Pin<&mut OutputShim>, enabled: bool, error: &mut String) -> bool;
+        fn gamma_size(self: &OutputShim) -> u32;
+        fn set_gamma(
+            self: Pin<&mut OutputShim>,
+            red: &[u16],
+            green: &[u16],
+            blue: &[u16],
+            error: &mut String,
+        ) -> bool;
+        fn has_ctm(self: &OutputShim) -> bool;
+        fn set_ctm(self: Pin<&mut OutputShim>, matrix: &[f64], error: &mut String) -> bool;
         fn move_cursor(self: Pin<&mut OutputShim>, x: i32, y: i32, error: &mut String) -> bool;
         fn hide_cursor(self: Pin<&mut OutputShim>, error: &mut String) -> bool;
         fn alive(self: &OutputShim) -> bool;

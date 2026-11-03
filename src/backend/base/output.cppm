@@ -259,6 +259,30 @@ public:
     return enabled ? fail("this output cannot do variable refresh") : ok();
   }
 
+  // Colour correction in the display engine: night light (wlr-gamma-control)
+  // and colour matrices (hyprland-ctm-control). Both ride on the next commit;
+  // an output that is not redrawing commits once just for them.
+
+  /// Entries per channel of the gamma ramp `set_gamma` takes; 0 when this
+  /// output has no gamma table (headless, nested).
+  [[nodiscard]] virtual std::uint32_t gamma_size() const noexcept { return 0; }
+  /// Replace the gamma ramp: three ramps of `gamma_size()` 16-bit entries, or
+  /// all empty to restore the identity.
+  virtual Status set_gamma(std::span<const std::uint16_t> red,
+                           std::span<const std::uint16_t> green,
+                           std::span<const std::uint16_t> blue) {
+    (void)green;
+    (void)blue;
+    return red.empty() ? ok() : fail("this output has no gamma table");
+  }
+  /// Whether `set_ctm` works here.
+  [[nodiscard]] virtual bool has_ctm() const noexcept { return false; }
+  /// Replace the 3x3 colour matrix (row-major, applied to linear-ish RGB by
+  /// the display engine); `std::nullopt` restores the identity.
+  virtual Status set_ctm(std::optional<std::array<double, 9>> matrix) {
+    return matrix.has_value() ? fail("this output has no colour matrix") : ok();
+  }
+
   /// Present a solid color (convenience / bring-up path).
   virtual Status commit(Color color) = 0;
 

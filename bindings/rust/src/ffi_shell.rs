@@ -85,6 +85,8 @@ pub(crate) mod ffi {
         type PresentationShim = crate::ffi::PresentationShim;
         type Rect = crate::ffi::Rect;
         type InputEventRaw = crate::ffi::InputEventRaw;
+        type PointerConstraintsShim = crate::ffi::PointerConstraintsShim;
+        type RelativePointerManagerShim = crate::ffi::RelativePointerManagerShim;
 
         // Types from backend bridge
         type SessionShim = crate::ffi_backend::SessionShim;
@@ -335,6 +337,12 @@ pub(crate) mod ffi {
         fn bind(self: &InputRouterShim, mods: u32, keysym: u32, id: u32);
         fn set_click_to_focus(self: &InputRouterShim, enabled: bool);
         fn update_pointer(self: &InputRouterShim);
+        fn follow_constraints(self: &InputRouterShim, constraints: &PointerConstraintsShim);
+        fn follow_constraints_relative(
+            self: &InputRouterShim,
+            constraints: &PointerConstraintsShim,
+            relative: &RelativePointerManagerShim,
+        );
         fn route_key(
             self: &InputRouterShim,
             key: u32,

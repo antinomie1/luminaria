@@ -22,6 +22,7 @@ mod pointer_constraints;
 mod seat;
 mod selection;
 mod tablet;
+mod tablet_feed;
 mod text_input;
 mod xdg_shell;
 
@@ -34,6 +35,7 @@ pub use pointer_constraints::*;
 pub use seat::*;
 pub use selection::*;
 pub use tablet::*;
+pub use tablet_feed::*;
 pub use text_input::*;
 pub use xdg_shell::*;
 

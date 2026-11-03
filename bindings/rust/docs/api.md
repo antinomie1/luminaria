@@ -599,9 +599,9 @@ match outcome {
   之间的桥接它自己完成。事件 `Event::InputMethod(InputMethodEvent)`：`New`、`GrabChange { input_method, grabbed }`、`Destroy`、
   `NewPopupSurface { input_method, surface }`、`PopupSurfaceDestroy`。抢占键盘期间按键经 `input_method(id).grab_send_key(...)`
   送给输入法，候选窗口放在 `popup_text_input_rectangle(surface)` 旁边。
-- **`GammaControlManager`**：`zwlr_gamma_control_manager_v1`。输出伽马曲线查找表管理（夜间模式等）。`gamma_size()` 返回查找表条目数，`ramp(output_res)` 查询当前设定的 16 位 RGB 曲线。事件 `Event::Gamma(GammaEvent { output_resource, has_ramp })`。
+- **`GammaControlManager`**：`zwlr_gamma_control_manager_v1`。输出伽马曲线查找表管理（夜间模式等）。`set_output_size(identity, output.gamma_size())` 告知每个输出的表大小（0 = 没有，客户端收到 `failed`）；`ramp(output_identity)` 查询当前设定的 16 位 RGB 曲线。事件 `Event::Gamma(GammaEvent { output_resource, output_identity, has_ramp })`，用 `output_identity` 找输出再 `output.set_gamma(...)`。`CtmControlManager` 同理：`matrix(output_identity)` 与 `output.set_ctm(...)`。
 - **`CtmControlManager`**：`hyprland_ctm_control_manager_v1` (v2)。输出色彩变换矩阵（CTM）控制。`matrix(output_res)` 查询当前提交的 3×3 行优先变换矩阵。事件 `Event::Ctm(CtmEvent { output_resource })`。
-- **`VirtualKeyboardManager`**：`zwp_virtual_keyboard_manager_v1`。接收客户端虚拟键盘按键与修饰键注入。事件 `Event::VirtualKey(VirtualKeyEvent)`、`Event::VirtualModifiers(VirtualModifiersEvent)`。
+- **`VirtualKeyboardManager`**：`zwp_virtual_keyboard_manager_v1`。接收客户端虚拟键盘按键与修饰键注入。事件 `Event::VirtualKey(VirtualKeyEvent)`、`Event::VirtualModifiers(VirtualModifiersEvent)`，都带 `keyboard`；`keymap(keyboard)` 是它自己的 keymap，转发其按键前把 seat 切过去、真实按键到来时切回。
 - **`VirtualPointerManager`**：`zwlr_virtual_pointer_manager_v1` (v2)。接收客户端虚拟指针移动、按键与轴滚轮注入。事件 `Event::VirtualPointer(VirtualPointerEvent)`（`Motion`、`MotionAbsolute`、`Button`、`Axis`、`Frame`）。
 
 ---
@@ -978,8 +978,11 @@ DRM 路径编译通过，嵌套 / headless 实际跑过；它在真实空闲 VT 
   `Event::Input(InputEvent::Tablet(TabletInput))` 送来（`DeviceAdded` / `Proximity` / `Axis` / `Tip` / `Button` /
   `PadButton` / `PadRing` / `PadStrip`，位置按板子归一化）；混成器映射到布局、找笔下表面，再调 `add_tablet` / `add_tool` /
   `add_pad` 与 `tool_proximity_in` / `tool_motion` / `tool_pressure` / `tool_tilt` / `tool_button` / `tool_frame` 等。
-  C++ 的一步到位 `feed()` 要回调 `locate`，而 C++ 从不调用 Rust，所以 Rust 版把这几步留给调用方。客户端改笔的光标是
-  `Event::TabletCursor`；`wp_cursor_shape` 的请求带 `tablet_tool`。
+  这些步骤由 `TabletFeed` 一步完成：`feed.feed(&tablets, &input, area, |x, y| locate(x, y))`，`locate` 返回笔下的
+  `TabletTarget { surface, x, y }`，与 C++ 的 `feed()` 等价（跨表面时补 proximity、pad 跟随笔所在表面、只发工具具备的轴）。
+  客户端改笔的光标是 `Event::TabletCursor`；`wp_cursor_shape` 的请求带 `tablet_tool`。
+- **指针约束与相对运动**：`router.follow_constraints(&constraints, Some(&relative))` 之后，指针进入受约束的表面（且在其区域内）
+  时约束自动激活；锁定时光标不动、不发 `wl_pointer.motion`，相对运动照常发给焦点客户端；限制（confine）时光标留在表面区域内。
 - **色彩管理**（`protocol::ColorManager`、`ColorRepresentationManager`）：协商，不是转换——两个渲染器都不在色彩空间之间换算。
   `ColorSupport::SrgbOnly`（默认）让客户端都渲染 sRGB；`Full` 只给自己有色彩管线的混成器。`set_output_description` /
   `set_preferred` 告诉客户端显示器与表面最好用什么；读客户端的声明用 `SurfaceId::image_description()` /

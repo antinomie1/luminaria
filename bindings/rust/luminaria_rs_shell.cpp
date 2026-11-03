@@ -991,6 +991,19 @@ void InputRouterShim::set_click_to_focus(bool enabled) const { impl_->router->se
 
 void InputRouterShim::update_pointer() const { impl_->router->update_pointer(); }
 
+void InputRouterShim::follow_constraints(const PointerConstraintsShim& constraints) const {
+    if (lm::PointerConstraints* raw = raw_ptr(constraints)) {
+        impl_->router->follow_constraints(*raw);
+    }
+}
+
+void InputRouterShim::follow_constraints_relative(const PointerConstraintsShim& constraints,
+                                                  const RelativePointerManagerShim& relative) const {
+    if (lm::PointerConstraints* raw = raw_ptr(constraints)) {
+        impl_->router->follow_constraints(*raw, raw_ptr(relative));
+    }
+}
+
 void InputRouterShim::route_key(std::uint32_t key, bool pressed, std::uint32_t keysym, std::uint32_t depressed,
                                 std::uint32_t latched, std::uint32_t locked, std::uint32_t group) const {
     impl_->router->route(lm::KeyEvent{key, pressed, keysym, {depressed, latched, locked, group}});

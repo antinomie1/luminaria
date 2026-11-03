@@ -825,6 +825,24 @@ impl<'a> InputRouter<'a> {
         self.raw.update_pointer();
     }
 
+    /// Honour pointer constraints from now on: one activates when the pointer
+    /// enters its surface (inside its region), a locked pointer stops moving,
+    /// a confined one stays in its region. With `relative`, every relative
+    /// motion also reaches the focused client as such, moved or not.
+    /// Both must outlive the router.
+    pub fn follow_constraints(
+        &self,
+        constraints: &'a crate::protocol::PointerConstraints<'_>,
+        relative: Option<&'a crate::protocol::RelativePointerManager<'_>>,
+    ) {
+        match relative {
+            Some(relative) => self
+                .raw
+                .follow_constraints_relative(&constraints.raw, &relative.raw),
+            None => self.raw.follow_constraints(&constraints.raw),
+        }
+    }
+
     /// One event, as [`attach`](Self::attach) would deliver it, for input that
     /// does not come from the backend. Absolute motion is taken on the layout's
     /// first output; events no default exists for (touch, tablets) are ignored.

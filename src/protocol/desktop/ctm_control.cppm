@@ -28,7 +28,10 @@ constexpr ColorTransformMatrix identity_ctm() noexcept {
 }
 
 struct CtmUpdate {
+  /// The client's wl_output; null on the reset when the client goes.
   wl_resource *output_resource = nullptr;
+  /// Which output, as `OutputGlobal::identity()`: what a compositor matches on.
+  const void *output_identity = nullptr;
   ColorTransformMatrix matrix = identity_ctm();
 };
 
@@ -61,7 +64,9 @@ struct CtmClient {
   CtmControlManager::Impl *mgr = nullptr;
   wl_resource *resource = nullptr;
   bool blocked = false;
-  std::map<wl_resource *, ColorTransformMatrix> pending;
+  // By output identity, not the client's wl_output: those may be destroyed
+  // before this, and the reset on the way out still has to name the output.
+  std::map<const void *, std::pair<wl_resource *, ColorTransformMatrix>> pending;
 
   CtmClient(CtmControlManager::Impl *m, wl_resource *r, bool b)
       : mgr(m), resource(r), blocked(b) {}
@@ -88,8 +93,8 @@ CtmClient::~CtmClient() {
     if (mgr->active_client == this) {
       mgr->active_client = nullptr;
       // Reset CTMs back to identity
-      for (const auto &[out_res, _] : pending) {
-        CtmUpdate event{out_res, identity_ctm()};
+      for (const auto &[identity, _] : pending) {
+        CtmUpdate event{nullptr, identity, identity_ctm()};
         mgr->ctm_changed.emit(event);
       }
     }
@@ -122,7 +127,9 @@ void ctm_set_ctm_for_output(wl_client *, wl_resource *resource,
     mat[i] = d;
   }
 
-  client->pending[output] = mat;
+  if (const void *identity = OutputGlobal::identity_of(output); identity != nullptr) {
+    client->pending[identity] = {output, mat};
+  }
 }
 
 void ctm_commit(wl_client *, wl_resource *resource) {
@@ -131,8 +138,8 @@ void ctm_commit(wl_client *, wl_resource *resource) {
     return;
   }
 
-  for (const auto &[out_res, matrix] : client->pending) {
-    CtmUpdate event{out_res, matrix};
+  for (const auto &[identity, entry] : client->pending) {
+    CtmUpdate event{entry.first, identity, entry.second};
     client->mgr->ctm_changed.emit(event);
   }
 }

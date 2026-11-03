@@ -48,6 +48,8 @@
 - **复合提交唤醒**：同一个表面同时挂载 `commit-timing` 与 `fifo` 时，队头被 FIFO 放行后需等待下次时间戳或定时器 tick 才能触发后续判定。
 - **不可见表面 FIFO 闸门**：最小化或完全遮挡的表面需由混成器调用 `FifoManager::unblock_hidden()` 主动放行，否则会停在提交闸门中。
 - **输入法键盘 Grab 路由**：`InputMethod::keyboard_grab()` 激活时，按键需由混成器策略决定是否先拦截送入输入法。
+- **伽马 / CTM**：只有 DRM 输出能落到硬件；headless / nested 输出没有查找表，客户端收到 `failed`。
+- **绝对运动与约束**：nested 后端只给绝对坐标，锁定 / 限制不作用于它（宿主光标归宿主管），相对运动也无从产生。
 - **Token 校验**：`xdg_activation` 未在库内校验 serial，防焦点窃取由混成器根据上下文核对。
 - **全局过滤槽限制**：`data_control` 依赖 `wl_display` 的单一全局过滤器，混成器若有自定 filter 需合并处理。
 - **嵌套修饰键状态**：嵌套后端下无独立于 Shift/Ctrl 的修饰键状态（以宿主报告为准）。

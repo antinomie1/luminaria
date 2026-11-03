@@ -712,14 +712,18 @@ gamma_control_manager_new(const DisplayShim &display, std::uint32_t gamma_size,
     auto *raw = impl.get();
     raw->on_gamma =
         raw->mgr->gamma_changed().connect([raw](lm::GammaRampUpdate &e) {
-          const std::uint64_t out_id =
-              reinterpret_cast<std::uintptr_t>(e.output_resource);
+          // Keyed by the output itself: the client's wl_output may be gone
+          // by the time Rust reads a reset.
+          const std::uint64_t output =
+              reinterpret_cast<std::uintptr_t>(e.output_identity);
           if (e.ramp.has_value()) {
-            raw->ramps[out_id] = *e.ramp;
+            raw->ramps[output] = *e.ramp;
           } else {
-            raw->ramps.erase(out_id);
+            raw->ramps.erase(output);
           }
-          EventRaw ev = event(EventKind::GammaChange, out_id);
+          EventRaw ev = event(EventKind::GammaChange,
+                              reinterpret_cast<std::uintptr_t>(e.output_resource));
+          ev.other = output;
           ev.flag = e.ramp.has_value();
           raw->events.push(std::move(ev));
         });
@@ -732,6 +736,13 @@ gamma_control_manager_new(const DisplayShim &display, std::uint32_t gamma_size,
 
 std::uint32_t GammaControlManagerShim::gamma_size() const {
   return impl_->mgr ? impl_->mgr->gamma_size() : 0;
+}
+
+void GammaControlManagerShim::set_output_size(std::uint64_t output_identity,
+                                              std::uint32_t gamma_size) const {
+  if (impl_->mgr)
+    impl_->mgr->set_output_size(reinterpret_cast<const void *>(output_identity),
+                                gamma_size);
 }
 
 bool GammaControlManagerShim::get_ramp(std::uint64_t output_res_id,
@@ -781,10 +792,12 @@ ctm_control_manager_new(const DisplayShim &display, rust::String &error) {
     impl->mgr.emplace(std::move(*r));
     auto *raw = impl.get();
     raw->on_ctm = raw->mgr->ctm_changed().connect([raw](lm::CtmUpdate &e) {
-      const std::uint64_t out_id =
-          reinterpret_cast<std::uintptr_t>(e.output_resource);
-      raw->matrices[out_id] = e.matrix;
-      EventRaw ev = event(EventKind::CtmChange, out_id);
+      const std::uint64_t output =
+          reinterpret_cast<std::uintptr_t>(e.output_identity);
+      raw->matrices[output] = e.matrix;
+      EventRaw ev = event(EventKind::CtmChange,
+                          reinterpret_cast<std::uintptr_t>(e.output_resource));
+      ev.other = output;
       raw->events.push(std::move(ev));
     });
     return std::make_unique<CtmControlManagerShim>(std::move(impl));
@@ -810,6 +823,9 @@ struct VirtualKeyboardManagerShim::Impl {
   Conn<lm::VirtualKey> on_key;
   Conn<lm::VirtualModifiers> on_mods;
 };
+rust::String VirtualKeyboardManagerShim::keymap(std::uint64_t keyboard) const {
+  return impl_->mgr ? to_rust(impl_->mgr->keymap(keyboard)) : rust::String{};
+}
 VirtualKeyboardManagerShim::~VirtualKeyboardManagerShim() = default;
 VirtualKeyboardManagerShim::VirtualKeyboardManagerShim(
     std::unique_ptr<Impl> impl) noexcept
@@ -840,6 +856,7 @@ virtual_keyboard_manager_new(const DisplayShim &display, rust::String &error) {
       ev.value = e.key;
       ev.serial = e.time;
       ev.flag = e.pressed;
+      ev.other = e.keyboard;
       raw->events.push(std::move(ev));
     });
     raw->on_mods =
@@ -851,6 +868,7 @@ virtual_keyboard_manager_new(const DisplayShim &display, rust::String &error) {
           ev.serial = e.latched;
           ev.x = static_cast<std::int32_t>(e.locked);
           ev.y = static_cast<std::int32_t>(e.group);
+          ev.other = e.keyboard;
           raw->events.push(std::move(ev));
         });
     return std::make_unique<VirtualKeyboardManagerShim>(std::move(impl));

@@ -6,9 +6,9 @@ use std::pin::Pin;
 use crate::core::{Display, Holds};
 use crate::core::{Error, ErrorKind};
 use crate::ffi;
-use crate::protocol::TabletInput;
 #[cfg(feature = "backend")]
 use crate::ffi_backend;
+use crate::protocol::TabletInput;
 use crate::util::{Color, DrmFourcc, Keysym, Mode, Transform};
 
 /// An active output surface (display or virtual window).
@@ -158,6 +158,42 @@ impl Output {
     pub fn set_vrr(&mut self, enabled: bool) -> Result<(), Error> {
         let mut err = String::new();
         if self.pin().set_vrr(enabled, &mut err) {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::Backend, err))
+        }
+    }
+
+    /// Entries per channel of this output's gamma table; 0 when it has none
+    /// (headless and nested outputs, and drivers without `GAMMA_LUT`).
+    pub fn gamma_size(&self) -> u32 {
+        self.raw.gamma_size()
+    }
+
+    /// Replace the gamma ramp (night light): three ramps of
+    /// [`gamma_size`](Self::gamma_size) entries, or `None` for the identity.
+    /// Shows with the next commit; an output that is not redrawing commits
+    /// once just for it.
+    pub fn set_gamma(&mut self, ramp: Option<(&[u16], &[u16], &[u16])>) -> Result<(), Error> {
+        let mut err = String::new();
+        let (r, g, b) = ramp.unwrap_or((&[], &[], &[]));
+        if self.pin().set_gamma(r, g, b, &mut err) {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::Backend, err))
+        }
+    }
+
+    /// Whether [`set_ctm`](Self::set_ctm) works here.
+    pub fn has_ctm(&self) -> bool {
+        self.raw.has_ctm()
+    }
+
+    /// Replace the 3x3 colour matrix (row-major), or `None` for the identity.
+    pub fn set_ctm(&mut self, matrix: Option<[f64; 9]>) -> Result<(), Error> {
+        let mut err = String::new();
+        let matrix = matrix.as_ref().map_or(&[][..], |m| &m[..]);
+        if self.pin().set_ctm(matrix, &mut err) {
             Ok(())
         } else {
             Err(Error::new(ErrorKind::Backend, err))

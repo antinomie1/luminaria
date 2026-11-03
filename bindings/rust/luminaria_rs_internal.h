@@ -286,6 +286,8 @@ lm::XdgShell* raw_ptr(const XdgShellShim& s);
 lm::CursorShapeManager* raw_ptr(const CursorShapeManagerShim& s);
 lm::DataDeviceManager* raw_ptr(const DataDeviceManagerShim& s);
 lm::TextInputManager* raw_ptr(const TextInputManagerShim& s);
+lm::PointerConstraints* raw_ptr(const PointerConstraintsShim& s);
+lm::RelativePointerManager* raw_ptr(const RelativePointerManagerShim& s);
 
 struct PresentationObserver {
     virtual ~PresentationObserver() = default;

@@ -175,6 +175,8 @@ struct CrtcProps {
   uint32_t mode_id = 0;
   uint32_t active = 0;
   uint32_t vrr_enabled = 0;   // optional: variable refresh (FreeSync, Adaptive-Sync)
+  uint32_t gamma_lut = 0;     // optional: per-channel gamma table blob
+  uint32_t ctm = 0;           // optional: 3x3 colour matrix blob
   uint32_t out_fence_ptr = 0; // optional: a fence for "this frame is on screen"
 };
 
@@ -296,6 +298,12 @@ public:
   bool vrr_capable_ = false; // the connector's `vrr_capable` property
   bool vrr_want = false;     // what set_vrr() asked for
   bool vrr_applied = false;  // what the last successful commit carried
+  uint32_t gamma_lut_size = 0;      // entries the CRTC's table holds
+  uint32_t gamma_blob = 0;          // on screen, or to go on the next commit
+  uint32_t ctm_blob = 0;
+  uint32_t applied_gamma_blob = 0;  // what the hardware holds now
+  uint32_t applied_ctm_blob = 0;
+  bool color_dirty = false;         // a gamma or CTM change waits for a commit
   PlaneProps plane_props;
   drmModeModeInfo mode;
   // Everything the connector reported, copied: the drmModeConnector it came
@@ -466,6 +474,91 @@ public:
     return vrr_capable_ && crtc_props.vrr_enabled != 0;
   }
   [[nodiscard]] bool vrr_enabled() const noexcept override { return vrr_want; }
+
+  [[nodiscard]] std::uint32_t gamma_size() const noexcept override {
+    return crtc_props.gamma_lut != 0 ? gamma_lut_size : 0;
+  }
+
+  /// The next commit carries `blob` (0: the identity) in `slot`; the old one
+  /// goes once the hardware has the new one.
+  void stage_blob(uint32_t &slot, uint32_t blob) {
+    if (slot != 0 && slot != applied_gamma_blob && slot != applied_ctm_blob) {
+      drmModeDestroyPropertyBlob(fd, slot);
+    }
+    slot = blob;
+    color_dirty = true;
+    flush_color();
+  }
+
+  Status set_gamma(std::span<const std::uint16_t> red,
+                   std::span<const std::uint16_t> green,
+                   std::span<const std::uint16_t> blue) override {
+    if (red.empty() && green.empty() && blue.empty()) {
+      stage_blob(gamma_blob, 0);
+      return ok();
+    }
+    const std::uint32_t size = gamma_size();
+    if (size == 0) {
+      return fail("drm: this CRTC has no gamma table");
+    }
+    if (red.size() != size || green.size() != size || blue.size() != size) {
+      return fail("drm: a gamma ramp has the wrong number of entries");
+    }
+    std::vector<drm_color_lut> lut(size);
+    for (std::uint32_t i = 0; i < size; ++i) {
+      lut[i] = drm_color_lut{red[i], green[i], blue[i], 0};
+    }
+    uint32_t blob = 0;
+    if (drmModeCreatePropertyBlob(fd, lut.data(), lut.size() * sizeof(drm_color_lut),
+                                  &blob) != 0) {
+      return fail(std::string{"drm: gamma blob: "} + std::strerror(errno));
+    }
+    stage_blob(gamma_blob, blob);
+    return ok();
+  }
+
+  [[nodiscard]] bool has_ctm() const noexcept override { return crtc_props.ctm != 0; }
+
+  Status set_ctm(std::optional<std::array<double, 9>> matrix) override {
+    if (!matrix.has_value()) {
+      stage_blob(ctm_blob, 0);
+      return ok();
+    }
+    if (crtc_props.ctm == 0) {
+      return fail("drm: this CRTC has no colour matrix");
+    }
+    // KMS wants S31.32 sign-magnitude, not two's complement.
+    drm_color_ctm ctm{};
+    for (std::size_t i = 0; i < 9; ++i) {
+      const double v = (*matrix)[i];
+      if (!std::isfinite(v) || std::abs(v) >= 2147483648.0) {
+        return fail("drm: a colour matrix entry is out of range");
+      }
+      const auto magnitude = static_cast<std::uint64_t>(std::llround(std::abs(v) * 4294967296.0));
+      ctm.matrix[i] = (v < 0 ? (1ull << 63) : 0) | (magnitude & ~(1ull << 63));
+    }
+    uint32_t blob = 0;
+    if (drmModeCreatePropertyBlob(fd, &ctm, sizeof(ctm), &blob) != 0) {
+      return fail(std::string{"drm: colour matrix blob: "} + std::strerror(errno));
+    }
+    stage_blob(ctm_blob, blob);
+    return ok();
+  }
+
+  /// Like `flush_cursor`: a screen that is not redrawing re-flips the buffer
+  /// already on it, so a night-light change shows without waiting for damage.
+  void flush_color() {
+    if (!color_dirty || suspended || flip_pending || !modeset_done || pending_fb == 0) {
+      return;
+    }
+    const bool was_tearing = tearing;
+    tearing = false;
+    const Status flipped = atomic(pending_fb, false);
+    tearing = was_tearing;
+    if (!flipped) {
+      retry_timer.arm(16);
+    }
+  }
   Status set_vrr(bool enabled) override {
     if (enabled && !vrr_capable()) {
       return fail("drm: this connector/CRTC cannot do variable refresh");
@@ -504,6 +597,7 @@ public:
     // it. If it decided nothing had changed, it committed nothing, and the
     // cursor is still ours to deliver.
     flush_cursor();
+    flush_color();
   }
 
   /// Get a moved cursor onto its plane when no primary-plane commit is going
@@ -559,6 +653,11 @@ public:
     destroy_fb(fd, cursor.fb);
     if (mode_blob != 0) {
       drmModeDestroyPropertyBlob(fd, mode_blob);
+    }
+    for (uint32_t blob : {gamma_blob, ctm_blob, applied_gamma_blob, applied_ctm_blob}) {
+      if (blob != 0) {
+        drmModeDestroyPropertyBlob(fd, blob);
+      }
     }
   }
 
@@ -680,6 +779,17 @@ public:
         flags |= DRM_MODE_PAGE_FLIP_ASYNC;
       }
     }
+    // Colour state is restated on a modeset, which may reset it, and
+    // otherwise only when it changed.
+    const bool color_prop = color_dirty || (modeset && (gamma_blob != 0 || ctm_blob != 0));
+    if (color_prop) {
+      if (crtc_props.gamma_lut != 0) {
+        add(crtc_id, crtc_props.gamma_lut, gamma_blob);
+      }
+      if (crtc_props.ctm != 0) {
+        add(crtc_id, crtc_props.ctm, ctm_blob);
+      }
+    }
     if (vrr_prop) {
       req_before_vrr = drmModeAtomicGetCursor(req.get());
       add(crtc_id, crtc_props.vrr_enabled, vrr_want ? 1 : 0);
@@ -708,6 +818,17 @@ public:
     pending_fb = fb_id;
     flip_pending = true;
     cursor_dirty = false;
+    if (color_prop) {
+      // The hardware has the new tables; the ones it replaced can go.
+      for (uint32_t old : {applied_gamma_blob, applied_ctm_blob}) {
+        if (old != 0 && old != gamma_blob && old != ctm_blob) {
+          drmModeDestroyPropertyBlob(fd, old);
+        }
+      }
+      applied_gamma_blob = gamma_blob;
+      applied_ctm_blob = ctm_blob;
+      color_dirty = false;
+    }
     if (vrr_prop) {
       vrr_applied = vrr_want;
     }
@@ -998,6 +1119,16 @@ bool resolve_props(int fd, DrmOutput &out) {
   // whether THIS monitor supports it; the CRTC property is the switch.
   out.crtc_props.vrr_enabled =
       find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "VRR_ENABLED");
+  // Optional colour management: night light and colour matrices.
+  out.crtc_props.gamma_lut =
+      find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "GAMMA_LUT");
+  out.crtc_props.ctm = find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "CTM");
+  {
+    uint64_t size = 0;
+    if (find_prop(fd, out.crtc_id, DRM_MODE_OBJECT_CRTC, "GAMMA_LUT_SIZE", &size) != 0) {
+      out.gamma_lut_size = static_cast<uint32_t>(size);
+    }
+  }
   {
     uint64_t capable = 0;
     if (find_prop(fd, out.connector_id, DRM_MODE_OBJECT_CONNECTOR, "vrr_capable",

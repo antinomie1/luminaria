@@ -751,7 +751,12 @@ pub struct GammaRamp {
 /// A gamma change event from a client (`zwlr_gamma_control_v1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GammaEvent {
+    /// The client's `wl_output`; 0 on a reset after it was destroyed.
     pub output_resource: u64,
+    /// Which output, as [`ScreenManager::output_identity`](crate::shell::ScreenManager::output_identity)
+    /// reports it: what [`GammaControlManager::ramp`] takes.
+    pub output_identity: u64,
+    /// False: back to the identity ramp.
     pub has_ramp: bool,
 }
 
@@ -760,6 +765,7 @@ impl GammaEvent {
         match raw.kind {
             EventKind::GammaChange => Some(GammaEvent {
                 output_resource: raw.id,
+                output_identity: raw.other,
                 has_ramp: raw.flag,
             }),
             _ => None,
@@ -787,17 +793,26 @@ impl<'d> GammaControlManager<'d> {
         }
     }
 
+    /// How many entries the output with `output_identity` takes per channel,
+    /// [`Output::gamma_size`](crate::backend::Output::gamma_size); 0 makes a
+    /// client asking for it hear `failed`. Once any is set, outputs never
+    /// named count as 0.
+    pub fn set_output_size(&self, output_identity: u64, gamma_size: u32) {
+        self.raw.set_output_size(output_identity, gamma_size);
+    }
+
     pub fn gamma_size(&self) -> u32 {
         self.raw.gamma_size()
     }
 
-    pub fn ramp(&self, output_resource: u64) -> Option<GammaRamp> {
+    /// The ramp a client set on the output with `output_identity`.
+    pub fn ramp(&self, output_identity: u64) -> Option<GammaRamp> {
         let mut red = Vec::new();
         let mut green = Vec::new();
         let mut blue = Vec::new();
         if self
             .raw
-            .get_ramp(output_resource, &mut red, &mut green, &mut blue)
+            .get_ramp(output_identity, &mut red, &mut green, &mut blue)
         {
             Some(GammaRamp { red, green, blue })
         } else {
@@ -809,7 +824,10 @@ impl<'d> GammaControlManager<'d> {
 /// A Color Transform Matrix (CTM) update event (`hyprland_ctm_control_v1`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CtmEvent {
+    /// The client's `wl_output`; 0 on the reset when the client goes.
     pub output_resource: u64,
+    /// Which output: what [`CtmControlManager::matrix`] takes.
+    pub output_identity: u64,
 }
 
 impl CtmEvent {
@@ -817,6 +835,7 @@ impl CtmEvent {
         match raw.kind {
             EventKind::CtmChange => Some(CtmEvent {
                 output_resource: raw.id,
+                output_identity: raw.other,
             }),
             _ => None,
         }
@@ -843,9 +862,10 @@ impl<'d> CtmControlManager<'d> {
         }
     }
 
-    pub fn matrix(&self, output_resource: u64) -> Option<[f64; 9]> {
+    /// The matrix a client set on the output with `output_identity`.
+    pub fn matrix(&self, output_identity: u64) -> Option<[f64; 9]> {
         let mut mat = Vec::new();
-        if self.raw.get_ctm(output_resource, &mut mat) && mat.len() == 9 {
+        if self.raw.get_ctm(output_identity, &mut mat) && mat.len() == 9 {
             let mut arr = [0.0; 9];
             arr.copy_from_slice(&mat);
             Some(arr)
@@ -859,6 +879,8 @@ impl<'d> CtmControlManager<'d> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualKeyEvent {
     pub seat_resource: u64,
+    /// The virtual keyboard: what [`VirtualKeyboardManager::keymap`] takes.
+    pub keyboard: u64,
     pub time: u32,
     pub key: u32,
     pub pressed: bool,
@@ -869,6 +891,7 @@ impl VirtualKeyEvent {
         match raw.kind {
             EventKind::VirtualKey => Some(VirtualKeyEvent {
                 seat_resource: raw.id,
+                keyboard: raw.other,
                 time: raw.serial,
                 key: raw.value,
                 pressed: raw.flag,
@@ -882,6 +905,7 @@ impl VirtualKeyEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualModifiersEvent {
     pub seat_resource: u64,
+    pub keyboard: u64,
     pub depressed: u32,
     pub latched: u32,
     pub locked: u32,
@@ -893,6 +917,7 @@ impl VirtualModifiersEvent {
         match raw.kind {
             EventKind::VirtualModifiers => Some(VirtualModifiersEvent {
                 seat_resource: raw.id,
+                keyboard: raw.other,
                 depressed: raw.value,
                 latched: raw.serial,
                 locked: raw.x as u32,
@@ -921,6 +946,13 @@ impl<'d> VirtualKeyboardManager<'d> {
                 _display: Holds::new(),
             })
         }
+    }
+
+    /// The XKB keymap `keyboard` uploaded, empty for one that is gone: how to
+    /// read its keys. Each virtual keyboard has its own; a compositor switches
+    /// the seat to it before forwarding them, and back for real keys.
+    pub fn keymap(&self, keyboard: u64) -> String {
+        self._raw.keymap(keyboard)
     }
 }
 

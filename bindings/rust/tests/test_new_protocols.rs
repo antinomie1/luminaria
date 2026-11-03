@@ -1,10 +1,10 @@
+use luminaria::Event;
 use luminaria::core::Display;
 use luminaria::desktop::{
     CtmControlManager, CtmEvent, GammaControlManager, GammaEvent, VirtualKeyEvent,
     VirtualKeyboardManager, VirtualModifiersEvent, VirtualPointerEvent, VirtualPointerManager,
 };
 use luminaria::protocol::{PointerGestures, SurfaceId};
-use luminaria::Event;
 
 #[test]
 fn test_new_protocols_initialization_and_methods() {
@@ -55,6 +55,7 @@ fn test_new_protocols_events_roundtrip() {
     // Test event conversions
     let gamma_ev = GammaEvent {
         output_resource: 42,
+        output_identity: 7,
         has_ramp: true,
     };
     let event: Event = gamma_ev.clone().into();
@@ -63,6 +64,7 @@ fn test_new_protocols_events_roundtrip() {
 
     let ctm_ev = CtmEvent {
         output_resource: 42,
+        output_identity: 7,
     };
     let event: Event = ctm_ev.clone().into();
     let back: Result<CtmEvent, Event> = event.try_into();
@@ -70,6 +72,7 @@ fn test_new_protocols_events_roundtrip() {
 
     let vk_key_ev = VirtualKeyEvent {
         seat_resource: 10,
+        keyboard: 3,
         time: 100,
         key: 30,
         pressed: true,
@@ -80,6 +83,7 @@ fn test_new_protocols_events_roundtrip() {
 
     let vk_mod_ev = VirtualModifiersEvent {
         seat_resource: 10,
+        keyboard: 3,
         depressed: 4,
         latched: 0,
         locked: 0,

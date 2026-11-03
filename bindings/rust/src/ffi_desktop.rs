@@ -188,6 +188,7 @@ pub(crate) mod ffi {
             error: &mut String,
         ) -> UniquePtr<GammaControlManagerShim>;
         fn gamma_size(self: &GammaControlManagerShim) -> u32;
+        fn set_output_size(self: &GammaControlManagerShim, output_identity: u64, gamma_size: u32);
         fn get_ramp(
             self: &GammaControlManagerShim,
             output_res_id: u64,
@@ -212,6 +213,7 @@ pub(crate) mod ffi {
             display: &DisplayShim,
             error: &mut String,
         ) -> UniquePtr<VirtualKeyboardManagerShim>;
+        fn keymap(self: &VirtualKeyboardManagerShim, keyboard: u64) -> String;
 
         type VirtualPointerManagerShim;
         fn virtual_pointer_manager_new(
