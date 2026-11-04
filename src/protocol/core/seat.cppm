@@ -1073,8 +1073,12 @@ SurfaceId Seat::touch_focus(int32_t id) const noexcept {
 
 void Seat::begin_drag(SeatDragHooks hooks) {
     // The pointer leaves the client for the duration of the drag: from here on
-    // it only sees wl_data_device events.
+    // it only sees wl_data_device events. The drag takes the pointer from the
+    // press that started it: its implicit grab would keep every hit on the
+    // source, and the release is the drop, never delivered as a button.
     const SurfaceId focus = impl_->ptr_focus;
+    impl_->ptr_grab = {};
+    impl_->ptr_buttons.clear();
     pointer_clear_focus();
     impl_->drag = std::move(hooks);
     impl_->dragging = true;

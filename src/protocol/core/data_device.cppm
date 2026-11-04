@@ -417,6 +417,17 @@ void source_resource_destroy(wl_resource* resource) {
 }
 
 // ---- drag and drop ----
+/// Ends a drag offer the drag no longer goes to. The client owns the
+/// resource and destroys it after the leave; destroying it here would free
+/// its id while the client still holds it, and the next offer would reuse it.
+void detach_offer(wl_resource* offer) {
+    Offer* state = offer_of(offer);
+    if (state->source != nullptr) {
+        std::erase(state->source->offers, offer);
+        state->source = nullptr;
+    }
+}
+
 void drag_send_leave(DdMgr* mgr) {
     if (!mgr->drag_focus.valid()) {
         return;
@@ -430,9 +441,8 @@ void drag_send_leave(DdMgr* mgr) {
         }
     }
     if (mgr->drag_offer != nullptr) {
-        wl_resource* offer = mgr->drag_offer;
+        detach_offer(mgr->drag_offer);
         mgr->drag_offer = nullptr;
-        wl_resource_destroy(offer);
     }
     mgr->drag_focus = {};
 }
@@ -677,9 +687,8 @@ Result<DataDeviceManager> DataDeviceManager::create(Display& display, Seat& seat
             }
             raw->drag_focus = {};
             if (raw->drag_offer != nullptr) {
-                wl_resource* offer = raw->drag_offer;
+                detach_offer(raw->drag_offer);
                 raw->drag_offer = nullptr;
-                wl_resource_destroy(offer);
             }
         });
     return DataDeviceManager{std::move(impl)};
