@@ -1688,16 +1688,24 @@ VulkanRenderer::composite(int width, int height, Color background,
 // =============================================================================
 namespace {
 
-// DRM ARGB8888/XRGB8888 are little-endian BGRA bytes ==
-// VK_FORMAT_B8G8R8A8_UNORM.
+// DRM fourccs name a little-endian word: *RGB8888 is B,G,R,A bytes ==
+// VK_FORMAT_B8G8R8A8_UNORM, *BGR8888 is R,G,B,A == VK_FORMAT_R8G8B8A8_UNORM.
 vk::Format drm_to_vk(std::uint32_t fourcc) {
   switch (fourcc) {
   case DRM_FORMAT_ARGB8888:
   case DRM_FORMAT_XRGB8888:
     return vk::Format::eB8G8R8A8Unorm;
+  case DRM_FORMAT_ABGR8888:
+  case DRM_FORMAT_XBGR8888:
+    return vk::Format::eR8G8B8A8Unorm;
   default:
     return vk::Format::eUndefined;
   }
+}
+
+/// No meaningful alpha byte: it reads as 1.
+bool drm_opaque(std::uint32_t fourcc) {
+  return fourcc == DRM_FORMAT_XRGB8888 || fourcc == DRM_FORMAT_XBGR8888;
 }
 
 struct DmabufImage {
@@ -1925,15 +1933,18 @@ VulkanRenderer::import_dmabuf(int fd, int width, int height,
     cmd.end();
     impl_->submit_and_wait(std::move(cmd));
 
-    const bool opaque = drm_format == DRM_FORMAT_XRGB8888;
+    const bool opaque = drm_opaque(drm_format);
+    // Read back in the image's own byte order; emit RGBA.
+    const bool bgra = fmt == vk::Format::eB8G8R8A8Unorm;
+    const size_t red = bgra ? 2 : 0;
+    const size_t blue = bgra ? 0 : 2;
     std::vector<std::uint8_t> out(static_cast<size_t>(uw) * uh * 4);
     auto *base = static_cast<std::uint8_t *>(
         readback_memory.mapMemory(0, VK_WHOLE_SIZE));
     for (size_t i = 0; i < static_cast<size_t>(uw) * uh; ++i) {
-      // readback is BGRA; emit RGBA.
-      out[i * 4 + 0] = base[i * 4 + 2];
+      out[i * 4 + 0] = base[i * 4 + red];
       out[i * 4 + 1] = base[i * 4 + 1];
-      out[i * 4 + 2] = base[i * 4 + 0];
+      out[i * 4 + 2] = base[i * 4 + blue];
       out[i * 4 + 3] = opaque ? 255 : base[i * 4 + 3];
     }
     readback_memory.unmapMemory();
@@ -1985,11 +1996,15 @@ Status VulkanRenderer::export_dmabuf(int fd, int width, int height,
     staging.bindMemory(*staging_memory, 0);
     auto *sp =
         static_cast<std::uint8_t *>(staging_memory.mapMemory(0, VK_WHOLE_SIZE));
+    // Copied in the image's own byte order.
+    const bool bgra = fmt == vk::Format::eB8G8R8A8Unorm;
+    const size_t red = bgra ? 2 : 0;
+    const size_t blue = bgra ? 0 : 2;
     for (size_t i = 0; i < static_cast<size_t>(uw) * uh; ++i) {
-      sp[i * 4 + 0] = rgba[i * 4 + 2]; // B
-      sp[i * 4 + 1] = rgba[i * 4 + 1]; // G
-      sp[i * 4 + 2] = rgba[i * 4 + 0]; // R
-      sp[i * 4 + 3] = rgba[i * 4 + 3]; // A
+      sp[i * 4 + 0] = rgba[i * 4 + red];
+      sp[i * 4 + 1] = rgba[i * 4 + 1];
+      sp[i * 4 + 2] = rgba[i * 4 + blue];
+      sp[i * 4 + 3] = rgba[i * 4 + 3];
     }
     staging_memory.unmapMemory();
 
@@ -2695,7 +2710,7 @@ Result<GpuTexture> VulkanRenderer::import_texture(const DmabufPlane &p) {
         p.stride, p.modifier, vk::ImageUsageFlagBits::eSampled);
     // XRGB has no meaningful alpha byte; force it to opaque in the view.
     vk::raii::ImageView view = make_sampler_view(
-        impl_->device, img.image, fmt, p.format == DRM_FORMAT_XRGB8888);
+        impl_->device, img.image, fmt, drm_opaque(p.format));
     return GpuTexture{std::make_unique<GpuTexture::Impl>(
         GpuTexture::Impl{impl_, std::move(img.image), std::move(img.memory),
                          std::move(view), p.width, p.height, true})};

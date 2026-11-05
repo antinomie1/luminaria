@@ -226,11 +226,14 @@ struct GlobalData {
 
 namespace {
 
-// Formats we advertise + can convert. DRM fourcc.
-constexpr std::array<uint32_t, 2> kFormats{DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888};
+// Formats we advertise + can convert. DRM fourcc. The *BGR ones are what
+// Chromium (and so Electron) allocates without checking the list: refusing them
+// kills the client.
+constexpr std::array<uint32_t, 4> kFormats{DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
+                                           DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888};
 
 bool supported_format(uint32_t fourcc) {
-    return fourcc == DRM_FORMAT_ARGB8888 || fourcc == DRM_FORMAT_XRGB8888;
+    return std::find(kFormats.begin(), kFormats.end(), fourcc) != kFormats.end();
 }
 
 uint64_t join_modifier(uint32_t hi, uint32_t lo) {
@@ -620,17 +623,20 @@ bool linear_to_rgba(const DmabufBuffer* buf, std::vector<std::uint8_t>& out, int
     if (map == MAP_FAILED) {
         return false;
     }
-    const bool opaque = buf->format == DRM_FORMAT_XRGB8888;
+    const bool opaque = buf->format == DRM_FORMAT_XRGB8888 || buf->format == DRM_FORMAT_XBGR8888;
+    // Little-endian: *RGB8888 is bytes B,G,R,A; *BGR8888 is already R,G,B,A.
+    const bool bgra = buf->format == DRM_FORMAT_ARGB8888 || buf->format == DRM_FORMAT_XRGB8888;
+    const int red = bgra ? 2 : 0;
+    const int blue = bgra ? 0 : 2;
     const auto* base = static_cast<const uint8_t*>(map) + buf->offset;
     out.resize(static_cast<size_t>(w) * h * 4);
     for (int y = 0; y < h; ++y) {
         const uint8_t* src = base + static_cast<size_t>(y) * buf->stride;
         uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
         for (int x = 0; x < w; ++x) {
-            // LINEAR ARGB8888 is little-endian: bytes B,G,R,A. Emit RGBA.
-            dst[x * 4 + 0] = src[x * 4 + 2];
+            dst[x * 4 + 0] = src[x * 4 + red];
             dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 0];
+            dst[x * 4 + 2] = src[x * 4 + blue];
             dst[x * 4 + 3] = opaque ? 255 : src[x * 4 + 3];
         }
     }

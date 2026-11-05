@@ -54,43 +54,47 @@ void run_client(int fd, int render_fd) {
     wl_registry_add_listener(reg, &kRegistry, &st);
     wl_display_roundtrip(display);
 
-    if (gbm != nullptr && st.compositor != nullptr && st.dmabuf != nullptr) {
-        const int w = 4, h = 4;
-        gbm_bo* bo =
-            gbm_bo_create(gbm, w, h, GBM_FORMAT_ARGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
-        if (bo != nullptr) {
-            uint32_t map_stride = 0;
-            void* map_data = nullptr;
-            void* map = gbm_bo_map(bo, 0, 0, w, h, GBM_BO_TRANSFER_WRITE, &map_stride, &map_data);
-            if (map != nullptr && map != MAP_FAILED) {
-                for (int y = 0; y < h; ++y) {
-                    auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(map) +
-                                                            static_cast<size_t>(y) * map_stride);
-                    for (int x = 0; x < w; ++x) {
-                        row[x] = 0xFFFF0000u; // ARGB: red, opaque
-                    }
-                }
-                gbm_bo_unmap(bo, map_data);
-
-                int bfd = gbm_bo_get_fd(bo);
-                const uint32_t offset = gbm_bo_get_offset(bo, 0);
-                const uint32_t stride = gbm_bo_get_stride(bo);
-                const uint64_t mod = gbm_bo_get_modifier(bo);
-                zwp_linux_buffer_params_v1* params =
-                    zwp_linux_dmabuf_v1_create_params(st.dmabuf);
-                zwp_linux_buffer_params_v1_add(params, bfd, 0, offset, stride,
-                                               static_cast<uint32_t>(mod >> 32),
-                                               static_cast<uint32_t>(mod));
-                wl_buffer* buffer = zwp_linux_buffer_params_v1_create_immed(
-                    params, w, h, GBM_FORMAT_ARGB8888, 0);
-                wl_surface* surface = wl_compositor_create_surface(st.compositor);
-                wl_surface_attach(surface, buffer, 0, 0);
-                wl_surface_commit(surface);
-                wl_display_roundtrip(display);
-                close(bfd);
-            }
-            gbm_bo_destroy(bo);
+    // One red surface per format: the word differs, the pixel must not.
+    const std::pair<uint32_t, uint32_t> reds[] = {{GBM_FORMAT_ARGB8888, 0xFFFF0000u},
+                                                  {GBM_FORMAT_ABGR8888, 0xFF0000FFu}};
+    for (const auto& [format, word] : reds) {
+        if (gbm == nullptr || st.compositor == nullptr || st.dmabuf == nullptr) {
+            break;
         }
+        const int w = 4, h = 4;
+        gbm_bo* bo = gbm_bo_create(gbm, w, h, format, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+        if (bo == nullptr) {
+            continue;
+        }
+        uint32_t map_stride = 0;
+        void* map_data = nullptr;
+        void* map = gbm_bo_map(bo, 0, 0, w, h, GBM_BO_TRANSFER_WRITE, &map_stride, &map_data);
+        if (map != nullptr && map != MAP_FAILED) {
+            for (int y = 0; y < h; ++y) {
+                auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(map) +
+                                                        static_cast<size_t>(y) * map_stride);
+                for (int x = 0; x < w; ++x) {
+                    row[x] = word;
+                }
+            }
+            gbm_bo_unmap(bo, map_data);
+
+            int bfd = gbm_bo_get_fd(bo);
+            const uint32_t offset = gbm_bo_get_offset(bo, 0);
+            const uint32_t stride = gbm_bo_get_stride(bo);
+            const uint64_t mod = gbm_bo_get_modifier(bo);
+            zwp_linux_buffer_params_v1* params = zwp_linux_dmabuf_v1_create_params(st.dmabuf);
+            zwp_linux_buffer_params_v1_add(params, bfd, 0, offset, stride,
+                                           static_cast<uint32_t>(mod >> 32),
+                                           static_cast<uint32_t>(mod));
+            wl_buffer* buffer = zwp_linux_buffer_params_v1_create_immed(params, w, h, format, 0);
+            wl_surface* surface = wl_compositor_create_surface(st.compositor);
+            wl_surface_attach(surface, buffer, 0, 0);
+            wl_surface_commit(surface);
+            wl_display_roundtrip(display);
+            close(bfd);
+        }
+        gbm_bo_destroy(bo);
     }
     if (gbm != nullptr) {
         gbm_device_destroy(gbm);
@@ -109,6 +113,7 @@ void on_client_destroy(wl_listener* l, void*) {
 }
 
 bool g_ok = false;
+int g_red = 0;
 std::vector<luminaria::Pixel> g_frame;
 
 } // namespace
@@ -127,16 +132,19 @@ int main() {
 
     // Vulkan import/export roundtrip on whatever modifier the driver picks (tiled
     // included). Exercises the GPU path; the protocol test below covers LINEAR mmap.
-    if (renderer->dmabuf_supported()) {
+    for (const uint32_t format : {GBM_FORMAT_ARGB8888, GBM_FORMAT_ABGR8888}) {
+        if (!renderer->dmabuf_supported()) {
+            break;
+        }
         gbm_device* g = gbm_create_device(render_fd);
         assert(g != nullptr);
         const int W = 4, H = 4;
         // With an explicit modifier from the renderer's own list: a plain
         // gbm_bo_create may answer DRM_FORMAT_MOD_INVALID (implicit), which
         // Vulkan cannot import as an explicit-modifier image at all.
-        const std::vector<std::uint64_t> mods = renderer->dmabuf_modifiers(GBM_FORMAT_ARGB8888);
+        const std::vector<std::uint64_t> mods = renderer->dmabuf_modifiers(format);
         assert(!mods.empty());
-        gbm_bo* bo = gbm_bo_create_with_modifiers2(g, W, H, GBM_FORMAT_ARGB8888, mods.data(),
+        gbm_bo* bo = gbm_bo_create_with_modifiers2(g, W, H, format, mods.data(),
                                                    static_cast<unsigned>(mods.size()),
                                                    GBM_BO_USE_RENDERING);
         assert(bo != nullptr);
@@ -150,16 +158,15 @@ int main() {
             red[i] = 255;
             red[i + 3] = 255;
         }
-        assert(renderer->export_dmabuf(bfd, W, H, GBM_FORMAT_ARGB8888, off, st, mod, red)
-                   .has_value());
-        auto back = renderer->import_dmabuf(bfd, W, H, GBM_FORMAT_ARGB8888, off, st, mod);
+        assert(renderer->export_dmabuf(bfd, W, H, format, off, st, mod, red).has_value());
+        auto back = renderer->import_dmabuf(bfd, W, H, format, off, st, mod);
         assert(back.has_value());
         assert((*back)[0] == 255 && (*back)[1] == 0 && (*back)[2] == 0 && (*back)[3] == 255);
 
         close(bfd);
         gbm_bo_destroy(bo);
         gbm_device_destroy(g);
-        std::fprintf(stderr, "dmabuf vulkan roundtrip OK (modifier=0x%llx)\n",
+        std::fprintf(stderr, "dmabuf vulkan roundtrip OK (format=0x%x modifier=0x%llx)\n", format,
                      static_cast<unsigned long long>(mod));
     }
 
@@ -183,6 +190,7 @@ int main() {
             std::vector<std::uint8_t> rgba;
             int w = 0, h = 0;
             if (s->current_buffer_rgba(rgba, w, h)) {
+                g_red += rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0 && rgba[3] == 255;
                 luminaria::TextureFill tex{0, 0, w, h, rgba.data()};
                 auto frame = renderer->composite(8, 8, luminaria::Color{0, 0, 0, 1}, {}, {&tex, 1});
                 if (frame) {
@@ -207,6 +215,7 @@ int main() {
     close(render_fd);
 
     assert(g_ok);
+    assert(g_red == 2); // ARGB8888 and ABGR8888 alike
     assert((g_frame[1 * 8 + 1] == luminaria::Pixel{255, 0, 0, 255})); // client red inside texture
     assert((g_frame[5 * 8 + 5] == luminaria::Pixel{0, 0, 0, 255}));   // background outside
     return 0;
