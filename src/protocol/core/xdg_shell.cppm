@@ -800,7 +800,11 @@ void on_surface_commit(XdgSurface* xs) {
         // Initial commit: the client is waiting for its first configure.
         xs->initialized = true;
         if (xs->toplevel != nullptr) {
-            (void)xs->toplevel->configure(0, 0);
+            // A compositor that sized the window as soon as it appeared (before
+            // this commit) has decided already: answering 0x0 would tell the
+            // client to pick its own size, and later state changes would repeat it.
+            ToplevelImpl* tl = xs->toplevel;
+            (void)tl->configure(tl->pending_width(), tl->pending_height());
         } else if (xs->popup != nullptr) {
             xs->popup->send_configure();
         } else {
