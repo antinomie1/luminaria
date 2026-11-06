@@ -3,6 +3,10 @@
 // produce data_device.enter (carrying an offer) followed by drop, after which
 // the receiving side can still pull the payload over a pipe.
 //
+// Then again with a target that refuses the offer, as a wallpaper or a panel
+// does by never accepting: that drop must be a cancel, not a drop, which is
+// what tells a browser to open a tab dragged out of its window on its own.
+//
 // Everything is one client here: what is being exercised is the compositor's
 // drag state machine and its hand-off between wl_pointer and wl_data_device.
 #include <cassert>
@@ -32,8 +36,10 @@ struct ClientState {
     wl_data_device* device = nullptr;
     wl_surface* surface = nullptr;
 
+    bool accept = true;
     uint32_t enter_serial = 0;
     bool got_pointer_enter = false;
+    bool got_cancelled = false;
     bool got_dnd_enter = false;
     bool got_drop = false;
     bool got_drop_performed = false;
@@ -52,7 +58,9 @@ void source_send(void*, wl_data_source*, const char* mime, int32_t fd) {
     }
     close(fd);
 }
-void source_cancelled(void*, wl_data_source*) {}
+void source_cancelled(void* data, wl_data_source*) {
+    static_cast<ClientState*>(data)->got_cancelled = true;
+}
 void source_dnd_drop_performed(void* data, wl_data_source*) {
     static_cast<ClientState*>(data)->got_drop_performed = true;
 }
@@ -83,7 +91,9 @@ void device_enter(void* data, wl_data_device*, uint32_t serial, wl_surface*, wl_
     auto* st = static_cast<ClientState*>(data);
     st->got_dnd_enter = true;
     st->drag_offer = offer;
-    if (offer != nullptr) {
+    if (offer != nullptr && !st->accept) {
+        wl_data_offer_accept(offer, serial, nullptr);
+    } else if (offer != nullptr) {
         wl_data_offer_accept(offer, serial, kMime);
         wl_data_offer_set_actions(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
                                   WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
@@ -167,6 +177,7 @@ void run_client(int fd) {
         wl_surface* icon = wl_compositor_create_surface(st.compositor);
         wl_data_device_start_drag(st.device, source, st.surface, icon, st.enter_serial);
 
+        wl_display_roundtrip(display); // dnd enter arrives; the target answers
         wl_surface_commit(st.surface); // commit #2: the server releases the button
         wl_display_roundtrip(display);
         wl_display_roundtrip(display); // dnd enter + drop arrive
@@ -201,9 +212,9 @@ void on_client_destroy(wl_listener* l, void*) {
     ctx->display->terminate();
 }
 
-} // namespace
-
-int main() {
+void scenario(bool accept) {
+    g_client = ClientState{};
+    g_client.accept = accept;
     int fds[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
@@ -257,11 +268,19 @@ int main() {
     assert(dragging_seen);          // the seat handed the pointer to the drag
     assert(g_client.got_dnd_enter); // wl_data_device.enter, with an offer
     assert(g_client.offer_has_mime);
-    assert(g_client.got_drop);
-    assert(g_client.got_drop_performed);
-    assert(g_client.received == kPayload);
+    assert(g_client.got_drop == accept);
+    assert(g_client.got_drop_performed == accept);
+    assert(g_client.got_cancelled == !accept); // nothing took it: nothing moved
+    assert(g_client.received == (accept ? kPayload : ""));
     assert(icon_seen);              // the drag says what to draw under the pointer
     assert(!seat->dragging()); // the drag ended cleanly
     assert(!data_device->drag_icon().valid());
+}
+
+} // namespace
+
+int main() {
+    scenario(true);
+    scenario(false);
     return 0;
 }

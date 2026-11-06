@@ -214,6 +214,10 @@ struct Offer {
     Source* source = nullptr;
     DdMgr* mgr = nullptr;
     bool is_drag = false;
+    // What the drop target last said: a format it takes, and the action
+    // chosen from both sides' masks. A drop counts only with both.
+    bool accepted = false;
+    uint32_t action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
 };
 
 namespace {
@@ -243,9 +247,30 @@ void source_cancel(Source* source) {
     }
 }
 
+/// A source too old to set actions offers a copy, as it always did.
+uint32_t source_actions(const Source* source) {
+    if (source->external == nullptr &&
+        wl_resource_get_version(source->resource) < WL_DATA_SOURCE_ACTION_SINCE_VERSION) {
+        return WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    }
+    return source->dnd_actions;
+}
+
+/// Whether the drop target takes the drag: it accepted a format and, unless
+/// it predates actions, chose one.
+bool drop_taken(wl_resource* offer_resource) {
+    if (offer_resource == nullptr) {
+        return false;
+    }
+    const Offer* offer = offer_of(offer_resource);
+    const bool old = wl_resource_get_version(offer_resource) < WL_DATA_OFFER_ACTION_SINCE_VERSION;
+    return offer->accepted && (old || offer->action != WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE);
+}
+
 // ---- wl_data_offer ----
 void offer_accept(wl_client*, wl_resource* resource, uint32_t, const char* mime) {
     Offer* offer = offer_of(resource);
+    offer->accepted = mime != nullptr;
     // An external source has no `target` event to receive; it is a clipboard
     // owner, and only drag-and-drop uses target.
     if (offer->source != nullptr && offer->source->external == nullptr) {
@@ -273,7 +298,7 @@ void offer_set_actions(wl_client*, wl_resource* resource, uint32_t actions,
     Offer* offer = offer_of(resource);
     uint32_t chosen = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     const uint32_t available =
-        offer->source != nullptr ? (actions & offer->source->dnd_actions) : 0;
+        offer->source != nullptr ? (actions & source_actions(offer->source)) : 0;
     if ((available & preferred_action) != 0) {
         chosen = preferred_action;
     } else if ((available & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) != 0) {
@@ -281,6 +306,7 @@ void offer_set_actions(wl_client*, wl_resource* resource, uint32_t actions,
     } else if ((available & WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE) != 0) {
         chosen = WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
     }
+    offer->action = chosen;
     if (wl_resource_get_version(resource) >= WL_DATA_OFFER_ACTION_SINCE_VERSION) {
         wl_data_offer_send_action(resource, chosen);
     }
@@ -510,7 +536,10 @@ void end_drag(DdMgr* mgr, bool cancelled) {
 
 void drag_drop(DdMgr* mgr) {
     Surface* focus = surface_from_id(mgr->drag_focus);
-    if (focus == nullptr || mgr->drag_source == nullptr) {
+    // A drop nothing takes (a wallpaper, a panel, a window that refused it) is
+    // a cancel: the source learns nothing moved, and a browser opens a tab
+    // dragged out of its window in a window of its own.
+    if (focus == nullptr || mgr->drag_source == nullptr || !drop_taken(mgr->drag_offer)) {
         end_drag(mgr, true);
         return;
     }

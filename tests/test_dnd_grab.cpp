@@ -166,9 +166,12 @@ void run_client(int fd) {
         wl_data_source_set_actions(source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
         wl_data_device_start_drag(st.device, source, st.surface, nullptr, st.enter_serial);
 
-        wl_surface_commit(st.surface); // commit #2: onto the target, then release
+        wl_surface_commit(st.surface); // commit #2: onto the target
         wl_display_roundtrip(display);
-        wl_display_roundtrip(display); // dnd enter + drop arrive
+        wl_display_roundtrip(display); // dnd enter arrives; the target accepts
+        wl_surface_commit(st.surface); // commit #3: release
+        wl_display_roundtrip(display);
+        wl_display_roundtrip(display); // the drop arrives
 
         if (st.drag_offer != nullptr && st.got_drop) {
             int pipe_fds[2];
@@ -236,6 +239,8 @@ int main() {
                 // The hit test now finds the target; the press's grab must
                 // not keep the drag on the source.
                 seat->pointer_enter(*surfaces.at(1), 5, 5);
+            } else if (commits == 3) {
+                // Only once the target has accepted: a drop nothing took is a cancel.
                 seat->pointer_button(272 /*BTN_LEFT*/, false);
             }
         }));
