@@ -454,7 +454,7 @@ for event in display.dispatch(None)? {
 | `XdgActivation` | `Activation(ActivationEvent)`：`ActivationRequest { surface, token_valid, app_id, requesting_surface, serial }` | 给不给焦点由混成器决定 |
 | `PointerConstraints` | `PointerConstraint(…)`：`PointerConstraintEvent::{New, Destroy, RegionChange}(SurfaceId)` | `constraint(surface)`：`kind()`、`region()`、`cursor_hint()`、`activate()`（只在指针焦点在该 surface 时生效）、`deactivate()`；`active_constraint()` |
 | `TextInputManager` | `TextInput(…)`：`TextInputEvent::{New, Enable, Disable, Commit, Destroy}(TextInputId)` | `focused()`、`text_input(id)`：`state()`、`surrounding_text()`、`send_preedit_string` / `send_commit_string` / `send_delete_surrounding_text` / `send_done` |
-| `DataDeviceManager`、`PrimarySelectionManager` | `Selection(SelectionChange { primary, mime_types })`（新所有者提供的 MIME 类型，空表示清空） | `selection_mime_types()`、`selection_receive(mime, OwnedFd)`（写进管道写端，dispatch 后读另一端） |
+| `DataDeviceManager`、`PrimarySelectionManager` | `Selection(SelectionChange { primary, mime_types })`（新所有者提供的 MIME 类型，空表示清空） | `selection_mime_types()`、`selection_receive(mime, OwnedFd)`（写进管道写端，dispatch 后读另一端）；`DataDeviceManager::dragging()`、`drag_icon() -> Option<SurfaceId>`（画在指针加 `SurfaceId::offset()` 处） |
 
 ### `CoreGlobals`
 每个可用混成器都要的那一组，一次建好（C++ `CoreGlobals` 的对应物）：wl_shm、wl_compositor、wl_subcompositor、

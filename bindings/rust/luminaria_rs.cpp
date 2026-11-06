@@ -620,6 +620,14 @@ std::uint64_t surface_root(std::uint64_t surface_id) {
     s = parent;
   return u64_from_id(s->id());
 }
+std::int32_t surface_offset_x(std::uint64_t surface_id) {
+  lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+  return s ? s->offset_x() : 0;
+}
+std::int32_t surface_offset_y(std::uint64_t surface_id) {
+  lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
+  return s ? s->offset_y() : 0;
+}
 std::uint32_t buffer_transform(std::uint64_t surface_id) {
   lm::Surface *s = lm::surface_from_id(id_from_u64(surface_id));
   return s ? static_cast<std::uint32_t>(s->buffer_transform()) : 0;
@@ -2095,6 +2103,12 @@ rust::Vec<rust::String> DataDeviceManagerShim::selection_mime_types() const {
 }
 bool DataDeviceManagerShim::selection_receive(rust::Str mime, int fd) const {
   return impl_->receive(mime, fd);
+}
+bool DataDeviceManagerShim::dragging() const {
+  return impl_->mgr && impl_->mgr->dragging();
+}
+std::uint64_t DataDeviceManagerShim::drag_icon() const {
+  return impl_->mgr ? u64_from_id(impl_->mgr->drag_icon()) : 0;
 }
 
 struct PrimarySelectionManagerShim::Impl

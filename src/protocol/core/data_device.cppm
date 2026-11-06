@@ -80,6 +80,11 @@ public:
 
     /// True while a drag-and-drop is in progress.
     [[nodiscard]] bool dragging() const noexcept;
+    /// The surface the dragging client draws under the pointer (a browser
+    /// tab, a file icon), or an invalid id when the drag has none or none is
+    /// running. Drawing it is the compositor's: at the pointer plus the
+    /// surface's accumulated `offset_x()` / `offset_y()`.
+    [[nodiscard]] SurfaceId drag_icon() const noexcept;
 
     // --- the clipboard, from outside the protocol ---
 
@@ -696,6 +701,10 @@ Result<DataDeviceManager> DataDeviceManager::create(Display& display, Seat& seat
 
 bool DataDeviceManager::dragging() const noexcept {
     return impl_->drag_source != nullptr;
+}
+
+SurfaceId DataDeviceManager::drag_icon() const noexcept {
+    return impl_->drag_source != nullptr ? impl_->drag_icon : SurfaceId{};
 }
 
 Signal<SelectionChange>& DataDeviceManager::selection_changed() noexcept {

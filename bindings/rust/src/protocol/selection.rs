@@ -6,7 +6,7 @@ use std::os::fd::{IntoRawFd, OwnedFd};
 use crate::core::{Display, Error, ErrorKind, Holds};
 use crate::ffi;
 
-use super::Seat;
+use super::{Seat, SurfaceId};
 
 macro_rules! selection_manager {
     ($(#[$doc:meta])* $name:ident, $shim:ident, $new:ident) => {
@@ -80,6 +80,22 @@ selection_manager!(
     DataDeviceManagerShim,
     data_device_manager_new
 );
+
+impl DataDeviceManager<'_> {
+    /// A drag-and-drop is running: the pointer belongs to it until the
+    /// button that began it is released.
+    pub fn dragging(&self) -> bool {
+        self.raw.dragging()
+    }
+
+    /// What a running drag shows under the pointer (a browser tab, a file):
+    /// drawing it is the compositor's, at the pointer plus
+    /// [`SurfaceId::offset`]. It takes no input. `None` when no drag is running
+    /// or the drag has no icon.
+    pub fn drag_icon(&self) -> Option<SurfaceId> {
+        SurfaceId::from_raw(self.raw.drag_icon())
+    }
+}
 
 selection_manager!(
     /// The `zwp_primary_selection_device_manager_v1` global. It routes through

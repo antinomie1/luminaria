@@ -238,6 +238,8 @@ std::int32_t buffer_width(std::uint64_t surface_id);
 std::int32_t buffer_height(std::uint64_t surface_id);
 std::int32_t buffer_scale(std::uint64_t surface_id);
 std::uint64_t surface_root(std::uint64_t surface_id);
+std::int32_t surface_offset_x(std::uint64_t surface_id);
+std::int32_t surface_offset_y(std::uint64_t surface_id);
 std::uint32_t buffer_transform(std::uint64_t surface_id);
 bool surface_has_buffer(std::uint64_t surface_id);
 rust::Vec<Rect> surface_damage(std::uint64_t surface_id);
@@ -564,6 +566,8 @@ public:
   rust::Vec<rust::String> selection_mime_types() const;
   // Takes ownership of `fd` either way.
   bool selection_receive(rust::Str mime, int fd) const;
+  bool dragging() const;
+  std::uint64_t drag_icon() const;
   struct Impl;
   Impl &impl() const;
   explicit DataDeviceManagerShim(std::unique_ptr<Impl> impl) noexcept;

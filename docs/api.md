@@ -432,7 +432,7 @@ Luminaria 废弃了传统 C/C++ 的公共头文件体系（无 `include/`），�
   - 指针输入：`void pointer_motion(double sx, double sy)`, `void pointer_button(uint32_t button, bool pressed)`, `void pointer_axis(double dx, double dy)`, `pointer_axis_discrete(...)`, `pointer_axis_stop(...)`，以及把后端的一帧滚动按「刻度优先」转成以上三者的 `pointer_axis(const PointerAxisEvent&)`
   - 焦点控制：`void set_keyboard_focus(Surface* surface)`, `void set_pointer_focus(Surface* surface, double sx, double sy)`
   - 信号：`cursor_change()`, `pointer_focus_changed()`, `keyboard_focus_changed()`
-- **`DataDeviceManager` & `PrimarySelectionManager`** (`luminaria:data_device`): 剪贴板、主选区与拖放（DnD）支持。
+- **`DataDeviceManager` & `PrimarySelectionManager`** (`luminaria:data_device`): 剪贴板、主选区与拖放（DnD）支持。`dragging()`；`SurfaceId drag_icon()` 是拖动方要画在指针下的图标（无拖动或无图标时无效），由合成器画在指针位置加 `Surface::offset_x()/offset_y()` 处。
 
 ### 7.4 PresentationTime & TearingControl & Fifo & CommitTiming
 - **`PresentationTime`** (`luminaria:presentation_time`): `wp_presentation_time` 精准时间戳协议。

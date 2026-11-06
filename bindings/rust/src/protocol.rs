@@ -81,6 +81,13 @@ impl SurfaceId {
         SurfaceId(ffi::surface_root(self.0))
     }
 
+    /// Where the content sits from the surface's position, accumulated from
+    /// `wl_surface.offset` and `attach(x, y)`. A drag icon is drawn this far
+    /// from the pointer.
+    pub fn offset(&self) -> (i32, i32) {
+        (ffi::surface_offset_x(self.0), ffi::surface_offset_y(self.0))
+    }
+
     pub fn buffer_transform(&self) -> Transform {
         Transform::from_u32(ffi::buffer_transform(self.0))
     }

@@ -163,7 +163,9 @@ void run_client(int fd) {
         wl_data_source_add_listener(source, &kSourceListener, &st);
         wl_data_source_offer(source, kMime);
         wl_data_source_set_actions(source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
-        wl_data_device_start_drag(st.device, source, st.surface, nullptr, st.enter_serial);
+        // Never committed, so it adds nothing to the server's commit count.
+        wl_surface* icon = wl_compositor_create_surface(st.compositor);
+        wl_data_device_start_drag(st.device, source, st.surface, icon, st.enter_serial);
 
         wl_surface_commit(st.surface); // commit #2: the server releases the button
         wl_display_roundtrip(display);
@@ -215,10 +217,15 @@ int main() {
     assert(data_device.has_value());
 
     bool dragging_seen = false;
+    bool icon_seen = false;
+    luminaria::SurfaceId icon;
     int commits = 0;
     std::vector<luminaria::Signal<luminaria::SurfaceCommit>::Connection> conns;
     auto ns = compositor->new_surface().connect([&](luminaria::NewSurface& e) {
         luminaria::Surface* surface = &e.surface;
+        if (commits > 0) {
+            icon = surface->id(); // the only surface made after the first commit
+        }
         conns.push_back(e.surface.commit.connect([&, surface](luminaria::SurfaceCommit&) {
             ++commits;
             if (commits == 1) {
@@ -227,6 +234,7 @@ int main() {
             } else if (commits == 2) {
                 // The drag is running by now; releasing the button drops.
                 dragging_seen = seat->dragging() && data_device->dragging();
+                icon_seen = icon.valid() && data_device->drag_icon() == icon;
                 seat->pointer_button(272 /*BTN_LEFT*/, false);
             }
         }));
@@ -252,6 +260,8 @@ int main() {
     assert(g_client.got_drop);
     assert(g_client.got_drop_performed);
     assert(g_client.received == kPayload);
+    assert(icon_seen);              // the drag says what to draw under the pointer
     assert(!seat->dragging()); // the drag ended cleanly
+    assert(!data_device->drag_icon().valid());
     return 0;
 }

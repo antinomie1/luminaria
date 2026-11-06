@@ -531,6 +531,8 @@ pub(crate) mod ffi {
         fn buffer_height(surface_id: u64) -> i32;
         fn buffer_scale(surface_id: u64) -> i32;
         fn surface_root(surface_id: u64) -> u64;
+        fn surface_offset_x(surface_id: u64) -> i32;
+        fn surface_offset_y(surface_id: u64) -> i32;
         fn buffer_transform(surface_id: u64) -> u32;
         fn surface_has_buffer(surface_id: u64) -> bool;
         fn surface_damage(surface_id: u64) -> Vec<Rect>;
@@ -792,6 +794,8 @@ pub(crate) mod ffi {
         ) -> UniquePtr<DataDeviceManagerShim>;
         fn selection_mime_types(self: &DataDeviceManagerShim) -> Vec<String>;
         fn selection_receive(self: &DataDeviceManagerShim, mime: &str, fd: i32) -> bool;
+        fn dragging(self: &DataDeviceManagerShim) -> bool;
+        fn drag_icon(self: &DataDeviceManagerShim) -> u64;
 
         type PrimarySelectionManagerShim;
         fn primary_selection_manager_new(
