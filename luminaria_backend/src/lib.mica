@@ -1,0 +1,5 @@
+// luminaria_backend: where pixels go and input comes from. DRM/KMS (atomic
+// commits, planes and their formats, page flips, hotplug), a nested Wayland
+// backend and a headless one; seat sessions through libseat, input devices
+// through libinput, keymaps through xkbcommon. Frames are requested, never
+// polled: an idle output costs no wakeups.

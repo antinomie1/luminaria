@@ -1,0 +1,220 @@
+// Protocol XML as data: interfaces with their requests, events and enums,
+// and the Mica names they get.
+
+import std.xml
+import std.str
+
+pub struct Arg {
+    pub name: str
+    /// int, uint, fixed, string, object, new_id, array, fd
+    pub kind: str
+    /// Interface of an object / new_id ("" for any).
+    pub iface: str
+    pub nullable: bool
+    /// "enum" or "iface.enum" ("" for none).
+    pub enum_ref: str
+    pub summary: str
+}
+
+pub struct Message {
+    pub name: str
+    pub since: int
+    pub destructor: bool
+    pub summary: str
+    pub args: List[Arg]
+}
+
+pub struct Entry {
+    pub name: str
+    pub value: str
+    pub summary: str
+}
+
+pub struct Enum {
+    pub name: str
+    pub bitfield: bool
+    pub summary: str
+    pub entries: List[Entry]
+}
+
+pub struct Iface {
+    pub name: str
+    pub version: int
+    pub summary: str
+    pub requests: List[Message]
+    pub events: List[Message]
+    pub enums: List[Enum]
+    /// Interface number on the wire map (1 is wl_display).
+    pub num: int = 0
+    /// Type name inside its module: wl_surface is `Surface`.
+    pub short: str = ""
+    /// Variant name across modules: wl_surface is `WlSurface`.
+    pub full: str = ""
+}
+
+pub struct Proto {
+    /// Module name: xdg-shell.xml is `xdg_shell`, fifo-v1.xml is `fifo`.
+    pub module: str
+    pub file: str
+    pub ifaces: List[Iface]
+}
+
+let keywords: List[str] = ["fn", "let", "var", "if", "else", "match", "return", "for", "in", "while", "type", "struct", "enum", "import", "pub", "take", "mut", "self", "true", "false", "and", "or", "not", "guard", "defer", "discard", "unsafe", "extern", "static", "when", "trait", "go", "break", "continue", "test", "par", "thread", "where", "derive"]
+
+/// Method names Mica gives a meaning (drop hooks, iterators, operators,
+/// derives): a message with one of these names gets a trailing `_`.
+let special: List[str] = ["drop", "clone", "show", "cmp", "hash", "next", "view", "view_mut", "add", "sub", "mul", "div", "rem", "neg", "bit_or", "bit_and", "bit_xor", "bit_not", "shl", "shr", "eq", "default", "from"]
+
+pub fn method(s: str) -> str {
+    return if special.contains(s) { s + "_" } else { ident(s) }
+}
+
+/// A value name, raw when it is a keyword.
+pub fn ident(s: str) -> str {
+    return if keywords.contains(s) { "r#" + s } else { s.clone() }
+}
+
+/// snake_case to CamelCase.
+pub fn camel(s: str) -> str {
+    var out = ""
+    for part in s.split("_") {
+        guard not part.is_empty() else {
+            continue
+        }
+        out += part.slice(0, 1).to_upper() + part.slice(1, part.len())
+    }
+    return out
+}
+
+/// Drop a trailing `_v1` / `-v2`.
+fn unversion(s: str) -> str {
+    for sep in ["_v", "-v"] {
+        if let Some(i) = s.rfind(sep) {
+            let tail = s.slice(i + 2, s.len())
+            if not tail.is_empty() and tail.to_int().is_some() {
+                return s.slice(0, i)
+            }
+        }
+    }
+    return s.clone()
+}
+
+fn summary(d: xml.Doc, e: int) -> str {
+    let s = d.attr_or(e, "summary", "")
+    let desc = d.first(e, "description")
+    let t = if s.is_empty() and desc >= 0 { d.attr_or(desc, "summary", "") } else { s }
+    return t.replace("\n", " ").trim()
+}
+
+fn message(d: xml.Doc, e: int) -> Message {
+    var args: List[Arg] = []
+    for a in d.children(e, "arg") {
+        args.push(Arg {
+            name: d.attr_or(a, "name", ""),
+            kind: d.attr_or(a, "type", ""),
+            iface: d.attr_or(a, "interface", ""),
+            nullable: d.attr_or(a, "allow-null", "false") == "true",
+            enum_ref: d.attr_or(a, "enum", ""),
+            summary: summary(d, a),
+        })
+    }
+    return Message {
+        name: d.attr_or(e, "name", ""),
+        since: d.attr_or(e, "since", "1").to_int().unwrap_or(1),
+        destructor: d.attr_or(e, "type", "") == "destructor",
+        summary: summary(d, e),
+        args,
+    }
+}
+
+/// Read one protocol file.
+pub fn parse(path: str, src: str) -> Result[Proto, str] {
+    let d = match xml.parse(src) {
+        Ok(v) => v
+        Err(e) => {
+            return Err("{path}: {e}")
+        }
+    }
+    var ifaces: List[Iface] = []
+    for i in d.children(xml.root, "interface") {
+        var requests: List[Message] = []
+        for r in d.children(i, "request") {
+            requests.push(message(d, r))
+        }
+        var events: List[Message] = []
+        for ev in d.children(i, "event") {
+            events.push(message(d, ev))
+        }
+        var enums: List[Enum] = []
+        for en in d.children(i, "enum") {
+            var entries: List[Entry] = []
+            for x in d.children(en, "entry") {
+                entries.push(Entry { name: d.attr_or(x, "name", ""), value: d.attr_or(x, "value", "0"), summary: summary(d, x) })
+            }
+            enums.push(Enum { name: d.attr_or(en, "name", ""), bitfield: d.attr_or(en, "bitfield", "false") == "true", summary: summary(d, en), entries })
+        }
+        ifaces.push(Iface {
+            name: d.attr_or(i, "name", ""),
+            version: d.attr_or(i, "version", "1").to_int().unwrap_or(1),
+            summary: summary(d, i),
+            requests,
+            events,
+            enums,
+        })
+    }
+    guard not ifaces.is_empty() else {
+        return Err("{path}: no interfaces")
+    }
+    let base = path.rsplit_once("/").map(fn(p) => p.right.clone()).unwrap_or(path.clone())
+    let stem = base.strip_suffix(".xml").unwrap_or(base.clone())
+    var p = Proto { module: unversion(stem).replace("-", "_"), file: base, ifaces }
+    name_types(mut p)
+    return Ok(p)
+}
+
+/// Type names: drop the version and the leading words every interface of
+/// the file shares, keeping at least one word each (wl_surface: Surface;
+/// zwp_linux_buffer_params_v1: BufferParams).
+fn name_types(mut p: Proto) {
+    var segs: List[List[str]] = []
+    for i in p.ifaces {
+        segs.push(unversion(i.name).split("_"))
+    }
+    var k = 0
+    while true {
+        var same = true
+        for s in segs {
+            if s.len() <= k + 1 or s[k] != segs[0][k] {
+                same = false
+            }
+        }
+        if not same {
+            break
+        }
+        k += 1
+    }
+    if p.ifaces.len() == 1 {
+        k = min(1, segs[0].len() - 1)
+    }
+    for n, mut i in p.ifaces {
+        let s = segs[n].clone()
+        i.short = camel(str.join(s.slice(k, s.len()), "_"))
+        i.full = camel(unversion(i.name))
+    }
+}
+
+/// `short` in snake_case: `ShmPool` is `shm_pool`.
+pub fn snake(s: str) -> str {
+    var out = ""
+    for i, c in s {
+        if c >= 65 and c <= 90 {
+            if i > 0 {
+                out += "_"
+            }
+            out += str.from_byte(c + 32)
+        } else {
+            out += str.from_byte(c)
+        }
+    }
+    return out
+}

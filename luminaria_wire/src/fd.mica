@@ -1,0 +1,31 @@
+// File descriptors that travel with messages.
+
+import std.os
+
+/// A file descriptor received from a peer: closed when dropped, unless
+/// `take` hands it over first.
+pub struct Fd {
+    raw: int
+}
+
+pub fn Fd.of(raw: int) -> Fd {
+    return Fd { raw }
+}
+
+/// The descriptor, still owned by this `Fd`.
+pub fn Fd.raw(self) -> int {
+    return self.raw
+}
+
+/// The descriptor, now owned by the caller.
+pub fn Fd.take(mut self) -> int {
+    let r = self.raw
+    self.raw = -1
+    return r
+}
+
+fn Fd.drop(mut self) {
+    if self.raw >= 0 {
+        os.close(self.raw)
+    }
+}

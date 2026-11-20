@@ -1,0 +1,4 @@
+// luminaria: a library for writing Wayland compositors. It provides the
+// mechanism (protocol state, composition, devices); the compositor keeps
+// the policy and its own loop: where windows go, who gets focus, what keys
+// do, what each frame shows.

@@ -1,0 +1,439 @@
+// One end of a Wayland connection: a non-blocking Unix socket, its receive
+// and send buffers, the descriptors queued both ways, and the id map.
+//
+// Receiving is one `recvmsg` into a fixed buffer; messages are decoded in
+// place by offset and stay valid until the next `read`. Sending appends
+// encoded messages to one buffer that `flush` hands to the kernel in as few
+// `sendmsg` calls as the descriptor limit allows. Steady state allocates
+// nothing.
+
+import std.libc
+import std.net
+import std.os
+import fd
+import codec
+
+/// Largest message on the wire (libwayland's limit).
+pub let max_message = 4096
+/// Bytes queued for a peer that does not read before it is dropped.
+pub let max_queued = 1 << 20
+/// Received descriptors waiting for their message.
+let max_fds_in = 256
+/// Descriptors per `sendmsg`: what a libwayland peer accepts at once.
+let max_fds_out = 28
+let rx_cap = 2 * max_message
+
+/// Ids at and above this are allocated by the server, below by the client.
+pub let server_base: u32 = 0xff000000
+
+/// wl_display.error codes, for `Conn.error`.
+pub let invalid_object: u32 = 0
+pub let invalid_method: u32 = 1
+pub let no_memory: u32 = 2
+pub let implementation: u32 = 3
+
+pub enum End {
+    Server
+    Client
+}
+
+pub enum Error {
+    /// The peer hung up, or stopped reading.
+    Closed
+    /// A protocol error on `object` with `code`; a server has sent it to
+    /// the client already.
+    Protocol(u32, u32, str)
+    Io(net.IoError)
+}
+
+pub fn Error.show(self, mut out: str) {
+    match self {
+        Closed => out += "connection closed"
+        Protocol(o, c, m) => out += "protocol error {c} on object {o}: {m}"
+        Io(e) => e.show(mut out)
+    }
+}
+
+/// An id map entry; interface 0 is a free id.
+struct Obj {
+    iface: u16 = 0
+    /// False once destroyed here and waiting for the server's delete_id
+    /// (client end only): its events are still decoded, then dropped.
+    alive: bool = false
+    version: u32 = 0
+}
+
+/// One received message: its target and where its arguments are.
+pub struct Msg {
+    pub id: u32
+    pub op: u16
+    /// Interface number and version of the target object.
+    pub iface: u16
+    pub version: u32
+    /// False for an event to an object this client destroyed: decode it
+    /// (to consume its descriptors), then drop it.
+    pub alive: bool
+    at: int
+    size: int
+}
+
+pub struct Conn {
+    pub fd: int
+    pub end: End
+    rx: List[u8]
+    rx_lo: int = 0
+    rx_hi: int = 0
+    fds_in: List[int] = []
+    fds_in_lo: int = 0
+    tx: List[u8] = []
+    tx_lo: int = 0
+    /// Start of the message being written (where its descriptors belong).
+    tx_msg: int = 0
+    fds_out: List[int] = []
+    /// tx offset of each queued descriptor's message.
+    fds_at: List[int] = []
+    /// Ids below `server_base`, indexed by id (0 unused).
+    low: List[Obj] = []
+    /// Ids from `server_base`, indexed by id - server_base.
+    high: List[Obj] = []
+    /// This end's freed ids, reused first.
+    free: List[u32] = []
+    /// Set when the connection must close after the last flush.
+    dead: Option[str] = None
+}
+
+/// Wrap a connected socket (made non-blocking here). Id 1 is the display,
+/// interface 1 at version 1.
+pub fn Conn.new(sock: int, end: End) -> Result[Conn, Error] {
+    let c = net.Conn { fd: sock }
+    match c.set_nonblocking(true) {
+        Err(e) => {
+            return Err(Error.Io(e))
+        }
+        Ok => {}
+    }
+    var rx: List[u8] = List.with_cap(rx_cap)
+    unsafe rx.set_len(rx_cap)
+    var low: List[Obj] = [Obj {}, Obj { iface: 1, alive: true, version: 1 }]
+    return Ok(Conn { fd: sock, end, rx, low })
+}
+
+fn Conn.drop(mut self) {
+    os.close(self.fd)
+    for i in self.fds_in_lo..self.fds_in.len() {
+        os.close(self.fds_in[i])
+    }
+    for f in self.fds_out {
+        os.close(f)
+    }
+}
+
+// ------------------------------------------------------------ receiving
+
+/// Receive what the peer has sent: false when nothing was waiting.
+/// Messages from earlier reads must be decoded before this.
+pub fn Conn.read(mut self) -> Result[bool, Error] {
+    let left = self.rx_hi - self.rx_lo
+    if self.rx_lo > 0 {
+        unsafe Ptr.copy(self.rx.as_ptr(), self.rx.as_ptr().offset(self.rx_lo), left)
+        self.rx_lo = 0
+        self.rx_hi = left
+    }
+    if self.fds_in_lo > 0 {
+        let n = self.fds_in.len() - self.fds_in_lo
+        for i in 0..n {
+            self.fds_in[i] = self.fds_in[self.fds_in_lo + i]
+        }
+        self.fds_in.truncate(n)
+        self.fds_in_lo = 0
+    }
+    guard self.rx_hi < rx_cap and self.fds_in.len() < max_fds_in else {
+        return Err(self.error(1, implementation, "too much unprocessed input"))
+    }
+    let base = self.fds_in.len()
+    self.fds_in.reserve(64)
+    var nfd = 0
+    var k = 0
+    unsafe {
+        k = libc.mc_net_recvmsg(self.fd, self.rx.as_ptr().offset(self.rx_hi), rx_cap - self.rx_hi, self.fds_in.as_ptr().offset(base), 64, mut nfd)
+        if k >= 0 {
+            self.fds_in.set_len(base + nfd)
+        }
+    }
+    guard k >= 0 else {
+        let e = net.os_err("receive")
+        return if e.would_block() { Ok(false) } else { Err(Error.Io(e)) }
+    }
+    guard k > 0 else {
+        return Err(Error.Closed)
+    }
+    self.rx_hi += k
+    return Ok(true)
+}
+
+fn Conn.rx_u32(self, at: int) -> u32 {
+    unsafe {
+        return self.rx.as_ptr().offset(at).cast[u32]().read()
+    }
+}
+
+/// The next complete message, or `None` until more is read.
+pub fn Conn.next(mut self) -> Result[Option[Msg], Error] {
+    let avail = self.rx_hi - self.rx_lo
+    guard avail >= 8 else {
+        return Ok(None)
+    }
+    let id = self.rx_u32(self.rx_lo)
+    let w = self.rx_u32(self.rx_lo + 4)
+    let size = int(w >> 16)
+    guard size >= 8 and size % 4 == 0 and size <= max_message else {
+        return Err(self.error(1, implementation, "malformed message of {size} bytes"))
+    }
+    guard avail >= size else {
+        return Ok(None)
+    }
+    let o = self.lookup(id)
+    guard o.iface != 0 else {
+        return Err(self.error(1, invalid_object, "invalid object {id}"))
+    }
+    let m = Msg { id, op: u16(w & 0xffff), iface: o.iface, version: o.version, alive: o.alive, at: self.rx_lo, size }
+    self.rx_lo += size
+    // wl_display.delete_id: the server is done with one of our ids.
+    if self.end == End.Client and id == 1 and m.op == 1 and size == 12 {
+        self.release(self.rx_u32(m.at + 8))
+    }
+    return Ok(Some(m))
+}
+
+/// The next received descriptor, or `None` when the peer sent none.
+pub fn Conn.take_fd(mut self) -> Option[fd.Fd] {
+    guard self.fds_in_lo < self.fds_in.len() else {
+        return None
+    }
+    let f = self.fds_in[self.fds_in_lo]
+    self.fds_in_lo += 1
+    return Some(fd.Fd.of(f))
+}
+
+pub fn Conn.reader(self, m: Msg) -> codec.Reader {
+    return codec.Reader { at: m.at + 8, end: m.at + m.size }
+}
+
+// -------------------------------------------------------------- objects
+
+fn Conn.lookup(self, id: u32) -> Obj {
+    if id >= server_base {
+        let i = int(id - server_base)
+        return if i < self.high.len() { self.high[i] } else { Obj {} }
+    }
+    return if int(id) < self.low.len() { self.low[int(id)] } else { Obj {} }
+}
+
+fn Conn.set(mut self, id: u32, o: Obj) {
+    if id >= server_base {
+        self.high[int(id - server_base)] = o
+    } else {
+        self.low[int(id)] = o
+    }
+}
+
+/// Interface number of live object `id`, 0 when there is none.
+pub fn Conn.iface(self, id: u32) -> u16 {
+    let o = self.lookup(id)
+    return if o.alive { o.iface } else { 0 }
+}
+
+/// Version of object `id`, 0 when there is none.
+pub fn Conn.version(self, id: u32) -> u32 {
+    return self.lookup(id).version
+}
+
+fn Conn.own(self, id: u32) -> bool {
+    return (id >= server_base) == (self.end == End.Server)
+}
+
+/// Add the peer's new object `id` (a new_id argument): it must be the
+/// peer's next id or one it has freed.
+pub fn Conn.insert(mut self, id: u32, iface: u16, version: u32) -> bool {
+    guard id != 0 and not self.own(id) else {
+        return false
+    }
+    let o = Obj { iface, alive: true, version }
+    if id >= server_base {
+        let i = int(id - server_base)
+        if i == self.high.len() {
+            self.high.push(o)
+            return true
+        }
+        guard i < self.high.len() and self.high[i].iface == 0 else {
+            return false
+        }
+        self.high[i] = o
+        return true
+    }
+    let i = int(id)
+    if i == self.low.len() {
+        self.low.push(o)
+        return true
+    }
+    guard i < self.low.len() and self.low[i].iface == 0 else {
+        return false
+    }
+    self.low[i] = o
+    return true
+}
+
+/// A new id for an object made at this end (a new_id this end sends).
+pub fn Conn.alloc(mut self, iface: u16, version: u32) -> u32 {
+    let o = Obj { iface, alive: true, version }
+    if let Some(id) = self.free.pop() {
+        self.set(id, o)
+        return id
+    }
+    if self.end == End.Server {
+        self.high.push(o)
+        return server_base + u32(self.high.len() - 1)
+    }
+    self.low.push(o)
+    return u32(self.low.len() - 1)
+}
+
+/// Destroy object `id`. A server frees the client's id and tells it with
+/// wl_display.delete_id; a client keeps its own id until that arrives.
+pub fn Conn.remove(mut self, id: u32) {
+    guard self.lookup(id).iface != 0 else {
+        return
+    }
+    if self.end == End.Client and id < server_base {
+        var o = self.lookup(id)
+        o.alive = false
+        self.set(id, o)
+        return
+    }
+    self.set(id, Obj {})
+    if self.own(id) {
+        self.free.push(id)
+    } else if self.end == End.Server {
+        var w = self.begin(1, 1, 12)
+        w.u32(mut self, id)
+    }
+}
+
+/// The server freed our id `id`.
+fn Conn.release(mut self, id: u32) {
+    guard id != 0 and id < server_base and int(id) < self.low.len() and self.low[int(id)].iface != 0 else {
+        return
+    }
+    self.low[int(id)] = Obj {}
+    self.free.push(id)
+}
+
+// --------------------------------------------------------------- sending
+
+/// Start a message of `size` bytes (header included) to object `id`;
+/// write its arguments with the returned writer, in order.
+pub fn Conn.begin(mut self, id: u32, op: u16, size: int) -> codec.Writer {
+    if self.dead.is_some() {
+        // Nothing more reaches this peer: keep the buffer to one message.
+        self.tx.clear()
+        self.tx_lo = 0
+    } else if size > max_message {
+        self.dead = Some("message of {size} bytes to object {id}")
+    } else if self.tx.len() - self.tx_lo + size > max_queued {
+        self.dead = Some("peer stopped reading")
+    }
+    if self.tx_lo > 0 and self.tx_lo >= self.tx.len() / 2 {
+        let n = self.tx.len() - self.tx_lo
+        unsafe Ptr.copy(self.tx.as_ptr(), self.tx.as_ptr().offset(self.tx_lo), n)
+        self.tx.truncate(n)
+        for mut a in self.fds_at {
+            a -= self.tx_lo
+        }
+        self.tx_lo = 0
+    }
+    let at = self.tx.len()
+    self.tx.reserve(size)
+    unsafe {
+        self.tx.set_len(at + size)
+        let p = self.tx.as_ptr().offset(at).cast[u32]()
+        p.write(id)
+        p.offset(1).write((u32(size) << 16) | u32(op))
+    }
+    self.tx_msg = at
+    return codec.Writer { at: at + 8, end: at + size }
+}
+
+/// Send a copy of descriptor `f` with the message being written.
+pub fn Conn.put_fd(mut self, f: int) {
+    match os.dup(f) {
+        Ok(d) => {
+            self.fds_out.push(d)
+            self.fds_at.push(self.tx_msg)
+        }
+        Err(e) => self.dead = Some("duplicate fd: {e}")
+    }
+}
+
+/// Whether messages wait to be sent.
+pub fn Conn.pending(self) -> bool {
+    return self.tx_lo < self.tx.len()
+}
+
+/// Send what is queued: true when all of it went out, false when the
+/// socket is full (wait until it is writable and flush again).
+pub fn Conn.flush(mut self) -> Result[bool, Error] {
+    while self.tx_lo < self.tx.len() {
+        let nf = min(self.fds_out.len(), max_fds_out)
+        // With more descriptors than one call carries, stop before the
+        // first message whose descriptors would come later.
+        var end = self.tx.len()
+        if self.fds_out.len() > max_fds_out and self.fds_at[max_fds_out] > self.tx_lo {
+            end = self.fds_at[max_fds_out]
+        }
+        var k = 0
+        unsafe {
+            k = libc.mc_net_sendmsg(self.fd, self.tx.as_ptr().offset(self.tx_lo), end - self.tx_lo, Ptr.null(), 0, self.fds_out.as_ptr(), nf)
+        }
+        guard k >= 0 else {
+            let e = net.os_err("send")
+            if e.would_block() {
+                // A dying connection does not wait for its peer.
+                return if self.dead.is_some() { Err(Error.Closed) } else { Ok(false) }
+            }
+            return Err(if e.kind == net.IoKind.BrokenPipe or e.kind == net.IoKind.ConnectionReset { Error.Closed } else { Error.Io(e) })
+        }
+        if nf > 0 {
+            for i in 0..nf {
+                os.close(self.fds_out[i])
+            }
+            let rest = self.fds_out.len() - nf
+            for i in 0..rest {
+                self.fds_out[i] = self.fds_out[nf + i]
+                self.fds_at[i] = self.fds_at[nf + i]
+            }
+            self.fds_out.truncate(rest)
+            self.fds_at.truncate(rest)
+        }
+        self.tx_lo += k
+    }
+    self.tx.clear()
+    self.tx_lo = 0
+    self.fds_at.clear()
+    guard self.dead.is_none() else {
+        return Err(Error.Closed)
+    }
+    return Ok(true)
+}
+
+/// A protocol error on object `id`. A server tells the client
+/// (wl_display.error) and closes after the next flush.
+pub fn Conn.error(mut self, id: u32, code: u32, msg: &str) -> Error {
+    if self.end == End.Server and self.dead.is_none() {
+        var w = self.begin(1, 0, 16 + codec.str_size(msg))
+        w.u32(mut self, id)
+        w.u32(mut self, code)
+        w.str(mut self, msg)
+        self.dead = Some(msg.to_str())
+    }
+    return Error.Protocol(id, code, msg.to_str())
+}

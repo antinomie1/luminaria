@@ -1,0 +1,254 @@
+// Arguments of one message. A `Reader` walks a received message in place;
+// a failed read returns a zero value and fails `finish`, so a decoder reads
+// every argument and checks once. A `Writer` fills the bytes `Conn.begin`
+// reserved; sizes come from `str_size` / `array_size`.
+
+import std.rt
+import conn
+import fd
+
+/// 24.8 fixed point (wl_fixed_t) to and from f64.
+pub fn fixed_to_f64(v: i32) -> f64 {
+    return f64(v) / 256.0
+}
+
+pub fn fixed_from_f64(v: f64) -> i32 {
+    return i32((v * 256.0).round())
+}
+
+fn pad(n: int) -> int {
+    return (n + 3) & ~3
+}
+
+/// Wire size of a string argument (length, bytes, NUL, padding).
+pub fn str_size(s: &str) -> int {
+    return 4 + pad(s.len() + 1)
+}
+
+pub fn opt_str_size(s: Option[&str]) -> int {
+    return match s {
+        Some(v) => str_size(v)
+        None => 4
+    }
+}
+
+/// Wire size of an array argument.
+pub fn array_size(a: &[u8]) -> int {
+    return 4 + pad(a.len())
+}
+
+pub struct Reader {
+    at: int
+    end: int
+    ok: bool = true
+    /// An object argument that named no object of the right interface.
+    bad_object: u32 = 0
+}
+
+fn Reader.word(mut self, c: conn.Conn) -> u32 {
+    guard self.at + 4 <= self.end else {
+        self.ok = false
+        return 0
+    }
+    let v = c.rx_u32(self.at)
+    self.at += 4
+    return v
+}
+
+pub fn Reader.u32(mut self, c: conn.Conn) -> u32 {
+    return self.word(c)
+}
+
+pub fn Reader.i32(mut self, c: conn.Conn) -> i32 {
+    guard self.at + 4 <= self.end else {
+        self.ok = false
+        return 0
+    }
+    unsafe let v = c.rx.as_ptr().offset(self.at).cast[i32]().read()
+    self.at += 4
+    return v
+}
+
+pub fn Reader.fixed(mut self, c: conn.Conn) -> f64 {
+    return fixed_to_f64(self.i32(c))
+}
+
+/// Bytes `at..at + n` of the message, checked.
+fn Reader.bytes(mut self, n: int) -> int {
+    let at = self.at
+    guard n >= 0 and at + pad(n) <= self.end else {
+        self.ok = false
+        return -1
+    }
+    self.at += pad(n)
+    return at
+}
+
+pub fn Reader.opt_str(mut self, c: conn.Conn) -> Option[str] {
+    let n = int(self.word(c))
+    guard n > 0 else {
+        return None
+    }
+    let at = self.bytes(n)
+    guard at >= 0 and c.rx[at + n - 1] == 0 else {
+        self.ok = false
+        return None
+    }
+    unsafe {
+        return Some(rt.str_from_cstr(c.rx.as_ptr().offset(at)))
+    }
+}
+
+pub fn Reader.str(mut self, c: conn.Conn) -> str {
+    guard let Some(s) = self.opt_str(c) else {
+        self.ok = false
+        return ""
+    }
+    return s
+}
+
+pub fn Reader.array(mut self, c: conn.Conn) -> List[u8] {
+    let n = int(self.word(c))
+    let at = self.bytes(n)
+    var out: List[u8] = []
+    guard at >= 0 and n > 0 else {
+        return out
+    }
+    out.reserve(n)
+    unsafe {
+        out.set_len(n)
+        Ptr.copy(out.as_ptr(), c.rx.as_ptr().offset(at), n)
+    }
+    return out
+}
+
+/// An object argument of interface `iface` (0: any); 0 for a null one,
+/// which only `nullable` allows.
+pub fn Reader.object(mut self, c: conn.Conn, iface: u16, nullable: bool) -> u32 {
+    let id = self.word(c)
+    if id == 0 {
+        if not nullable {
+            self.ok = false
+        }
+        return 0
+    }
+    let o = c.lookup(id)
+    // A client still decodes events naming objects it destroyed.
+    let live = o.alive or c.end == conn.End.Client
+    guard o.iface != 0 and live and (iface == 0 or o.iface == iface) else {
+        self.ok = false
+        self.bad_object = id
+        return 0
+    }
+    return id
+}
+
+/// A new_id argument: the peer's new object, added to the id map.
+pub fn Reader.new_id(mut self, mut c: conn.Conn, iface: u16, version: u32) -> u32 {
+    let id = self.word(c)
+    guard self.ok and c.insert(id, iface, version) else {
+        self.ok = false
+        self.bad_object = id
+        return 0
+    }
+    return id
+}
+
+/// A new object whose interface travels with it (wl_registry.bind).
+pub struct Object {
+    pub id: u32
+    /// Interface number (0 when the name is unknown).
+    pub iface: u16
+    pub version: u32
+}
+
+/// An untyped new_id argument: its interface (resolved by the caller from
+/// the name read before it) and version, added to the id map.
+pub fn Reader.new_object(mut self, mut c: conn.Conn, iface: u16, version: u32) -> Object {
+    let id = self.word(c)
+    guard self.ok and iface != 0 and version != 0 and c.insert(id, iface, version) else {
+        self.ok = false
+        self.bad_object = id
+        return Object { id: 0, iface: 0, version: 0 }
+    }
+    return Object { id, iface, version }
+}
+
+/// A descriptor argument (sent alongside, in order).
+pub fn Reader.fd(mut self, mut c: conn.Conn) -> fd.Fd {
+    guard let Some(f) = c.take_fd() else {
+        self.ok = false
+        return fd.Fd.of(-1)
+    }
+    return f
+}
+
+/// Check that every argument of message `m` was valid and read.
+pub fn Reader.finish(self, mut c: conn.Conn, m: conn.Msg) -> Result[(), conn.Error] {
+    guard self.bad_object == 0 else {
+        return Err(c.error(m.id, conn.invalid_object, "invalid object {self.bad_object} in request {m.op}"))
+    }
+    guard self.ok and self.at == self.end else {
+        return Err(c.error(m.id, conn.invalid_method, "invalid arguments for request {m.op}"))
+    }
+    return Ok(())
+}
+
+pub struct Writer {
+    at: int
+    end: int
+}
+
+pub fn Writer.u32(mut self, mut c: conn.Conn, v: u32) {
+    assert(self.at + 4 <= self.end)
+    unsafe c.tx.as_ptr().offset(self.at).cast[u32]().write(v)
+    self.at += 4
+}
+
+pub fn Writer.i32(mut self, mut c: conn.Conn, v: i32) {
+    assert(self.at + 4 <= self.end)
+    unsafe c.tx.as_ptr().offset(self.at).cast[i32]().write(v)
+    self.at += 4
+}
+
+pub fn Writer.fixed(mut self, mut c: conn.Conn, v: f64) {
+    self.i32(mut c, fixed_from_f64(v))
+}
+
+/// `n` bytes from `p`, zero padded.
+unsafe fn Writer.raw(mut self, mut c: conn.Conn, p: Ptr[u8], n: int) {
+    let size = pad(n)
+    assert(self.at + size <= self.end)
+    let dst = c.tx.as_ptr().offset(self.at)
+    if size > 0 {
+        dst.offset(size - 4).cast[u32]().write(0)
+    }
+    Ptr.copy(dst, p, n)
+    self.at += size
+}
+
+pub fn Writer.str(mut self, mut c: conn.Conn, s: &str) {
+    self.u32(mut c, u32(s.len() + 1))
+    // The zeroed last word holds the NUL.
+    let n = s.len()
+    let size = pad(n + 1)
+    assert(self.at + size <= self.end)
+    unsafe {
+        let dst = c.tx.as_ptr().offset(self.at)
+        dst.offset(size - 4).cast[u32]().write(0)
+        Ptr.copy(dst, s.as_ptr(), n)
+    }
+    self.at += size
+}
+
+pub fn Writer.opt_str(mut self, mut c: conn.Conn, s: Option[&str]) {
+    match s {
+        Some(v) => self.str(mut c, v)
+        None => self.u32(mut c, 0)
+    }
+}
+
+pub fn Writer.array(mut self, mut c: conn.Conn, a: &[u8]) {
+    self.u32(mut c, u32(a.len()))
+    unsafe self.raw(mut c, a.as_ptr(), a.len())
+}

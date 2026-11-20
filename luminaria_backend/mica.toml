@@ -1,0 +1,13 @@
+[package]
+name = "luminaria_backend"
+version = "0.1.0"
+description = "Outputs and input devices: DRM/KMS, nested Wayland, headless; seat sessions, libinput and xkb"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+luminaria_proto = { workspace = true }
+libdrm_sys = { workspace = true }
+libudev_sys = { workspace = true }
+libseat_sys = { workspace = true }
+libinput_sys = { workspace = true }
+xkbcommon_sys = { workspace = true }

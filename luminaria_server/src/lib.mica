@@ -1,0 +1,5 @@
+// luminaria_server: the protocol state every compositor needs, with no GPU
+// and no policy. Surfaces and subsurfaces with double-buffered commits,
+// xdg-shell, seats and focus, outputs, shm and dmabuf buffers, explicit
+// sync, presentation and frame timing. Buffers and damage come out as plain
+// data; requests that need a decision come out as events.

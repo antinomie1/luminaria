@@ -1,0 +1,497 @@
+// Mica source for luminaria_proto: one module per protocol file, `ifaces`
+// (interface numbers by name), and `lib` (the Request / Event enums over
+// every interface and their decoders).
+//
+// Server side: typed object ids, request enums decoded in place, event
+// senders. Client side: event enums and request senders. A program links
+// only what it calls, so a compositor carries no client code.
+
+import model
+
+pub struct World {
+    pub protos: List[model.Proto]
+}
+
+/// Where interface `name` lives: (module, type name, number).
+fn World.find(self, name: str) -> Option[(str, str, int)] {
+    for p in self.protos {
+        for i in p.ifaces {
+            if i.name == name {
+                return Some((p.module.clone(), i.short.clone(), i.num))
+            }
+        }
+    }
+    return None
+}
+
+/// One module being written: its text and the modules it uses.
+struct Out {
+    module: str
+    text: str = ""
+    imports: List[str] = []
+}
+
+fn Out.line(mut self, s: str) {
+    self.text += s
+    self.text += "\n"
+}
+
+/// `name` as seen from this module.
+fn Out.qual(mut self, module: str, name: str) -> str {
+    guard module != self.module else {
+        return name.clone()
+    }
+    if not self.imports.contains(module) {
+        self.imports.push(module.clone())
+    }
+    return module + "." + name
+}
+
+fn doc(mut o: Out, indent: str, s: str) {
+    if not s.is_empty() {
+        o.line(indent + "/// " + s)
+    }
+}
+
+/// An argument's local name: raw keywords, and clear of the generated
+/// locals.
+fn local(a: model.Arg) -> str {
+    let n = model.ident(a.name)
+    return if ["conn", "wr", "rd", "m", "self", "id"].contains(n) and a.kind != "new_id" { n + "_arg" } else { n }
+}
+
+fn World.iface_type(self, mut o: Out, name: str) -> Result[str, str] {
+    guard let Some((m, t, _)) = self.find(name) else {
+        return Err("unknown interface {name}")
+    }
+    return Ok(o.qual(m, t))
+}
+
+fn World.iface_const(self, mut o: Out, name: str) -> Result[str, str] {
+    guard let Some((m, t, _)) = self.find(name) else {
+        return Err("unknown interface {name}")
+    }
+    return Ok(o.qual(m, model.snake(t) + "_iface"))
+}
+
+/// The Mica type of enum reference `r` made from interface `owner`.
+fn World.enum_type(self, mut o: Out, owner: str, r: str) -> Result[str, str] {
+    var iface = owner.clone()
+    var name = r.clone()
+    if let Some(p) = r.split_once(".") {
+        iface = p.left.clone()
+        name = p.right.clone()
+    }
+    guard let Some((m, t, _)) = self.find(iface) else {
+        return Err("unknown interface {iface} in enum {r}")
+    }
+    return Ok(o.qual(m, t + model.camel(name)))
+}
+
+/// Type of a decoded argument (request payloads, event payloads).
+fn World.decoded(self, mut o: Out, owner: str, a: model.Arg) -> Result[str, str] {
+    if not a.enum_ref.is_empty() and (a.kind == "int" or a.kind == "uint") {
+        return self.enum_type(mut o, owner, a.enum_ref)
+    }
+    return match a.kind {
+        "int" => Ok("i32")
+        "uint" => Ok("u32")
+        "fixed" => Ok("f64")
+        "string" => Ok(if a.nullable { "Option[str]" } else { "str" })
+        "array" => Ok("List[u8]")
+        "fd" => Ok("wire.Fd")
+        "new_id" => if a.iface.is_empty() { Ok("wire.Object") } else { self.iface_type(mut o, a.iface) }
+        "object" => self.object_type(mut o, a)
+        _ => Err("unknown argument type {a.kind}")
+    }
+}
+
+fn World.object_type(self, mut o: Out, a: model.Arg) -> Result[str, str] {
+    guard not a.iface.is_empty() else {
+        return Ok("u32")
+    }
+    let t = try self.iface_type(mut o, a.iface)
+    return Ok(if a.nullable { "Option[" + t + "]" } else { t })
+}
+
+/// Type of an argument passed to a sender; "" for a new_id it returns.
+fn World.param(self, mut o: Out, owner: str, a: model.Arg) -> Result[str, str] {
+    return match a.kind {
+        "string" => Ok(if a.nullable { "Option[&str]" } else { "&str" })
+        "array" => Ok("&[u8]")
+        "fd" => Ok("int")
+        "new_id" => Ok("")
+        _ => self.decoded(mut o, owner, a)
+    }
+}
+
+/// `let` statements reading `a` from `rd` into local `local(a)`.
+fn World.read(self, mut o: Out, owner: str, a: model.Arg) -> Result[(), str] {
+    let n = local(a)
+    let ind = "            "
+    if not a.enum_ref.is_empty() and (a.kind == "int" or a.kind == "uint") {
+        let t = try self.enum_type(mut o, owner, a.enum_ref)
+        o.line(ind + "let {n} = {t}(rd.u32(conn))")
+        return Ok(())
+    }
+    match a.kind {
+        "int" => o.line(ind + "let {n} = rd.i32(conn)")
+        "uint" => o.line(ind + "let {n} = rd.u32(conn)")
+        "fixed" => o.line(ind + "let {n} = rd.fixed(conn)")
+        "string" => o.line(ind + "let {n} = " + (if a.nullable { "rd.opt_str(conn)" } else { "rd.str(conn)" }))
+        "array" => o.line(ind + "let {n} = rd.array(conn)")
+        "fd" => o.line(ind + "let {n} = rd.fd(mut conn)")
+        "new_id" => {
+            if a.iface.is_empty() {
+                o.line(ind + "let {n}_iface = rd.str(conn)")
+                o.line(ind + "let {n}_version = rd.u32(conn)")
+                let by_name = o.qual("ifaces", "by_name")
+                o.line(ind + "let {n} = rd.new_object(mut conn, {by_name}({n}_iface), {n}_version)")
+            } else {
+                let t = try self.iface_type(mut o, a.iface)
+                let c = try self.iface_const(mut o, a.iface)
+                o.line(ind + "let {n} = {t} \{ id: rd.new_id(mut conn, {c}, m.version) \}")
+            }
+        }
+        "object" => {
+            if a.iface.is_empty() {
+                o.line(ind + "let {n} = rd.object(conn, 0, {a.nullable})")
+            } else {
+                let t = try self.iface_type(mut o, a.iface)
+                let c = try self.iface_const(mut o, a.iface)
+                if a.nullable {
+                    o.line(ind + "let {n}_raw = rd.object(conn, {c}, true)")
+                    o.line(ind + "let {n}: Option[{t}] = if {n}_raw == 0 \{ None \} else \{ Some({t} \{ id: {n}_raw \}) \}")
+                } else {
+                    o.line(ind + "let {n} = {t} \{ id: rd.object(conn, {c}, false) \}")
+                }
+            }
+        }
+        _ => {
+            return Err("unknown argument type {a.kind}")
+        }
+    }
+    return Ok(())
+}
+
+/// One enum of payloads over `msgs` (`Request` or `Event`) and its decoder.
+fn World.decoder(self, mut o: Out, i: model.Iface, msgs: List[model.Message], kind: str) -> Result[(), str] {
+    let t = i.short + kind
+    let what = kind.to_lower()
+    o.line("/// {kind}s of {i.name}.")
+    o.line("pub enum {t} \{")
+    for msg in msgs {
+        var names: List[str] = []
+        var types: List[str] = []
+        for a in msg.args {
+            names.push(a.name.clone())
+            types.push(try self.decoded(mut o, i.name, a))
+        }
+        let sig = if names.is_empty() { "" } else { " (" + names.join(", ") + ")" }
+        doc(mut o, "    ", msg.summary + sig)
+        o.line("    " + model.camel(msg.name) + (if types.is_empty() { "" } else { "(" + types.join(", ") + ")" }))
+    }
+    o.line("\}")
+    o.line("")
+    let suffix = if kind == "Event" { "_event" } else { "" }
+    o.line("fn decode_{model.snake(i.short)}{suffix}(mut conn: wire.Conn, m: wire.Msg) -> Result[{t}, wire.Error] \{")
+    o.line("    var rd = conn.reader(m)")
+    o.line("    match m.op \{")
+    for op, msg in msgs {
+        o.line("        {op} => \{")
+        if msg.since > 1 {
+            o.line("            guard m.version >= {msg.since} else \{")
+            o.line("                return Err(conn.error(m.id, wire.invalid_method, \"{i.name}.{msg.name} needs version {msg.since}\"))")
+            o.line("            \}")
+        }
+        var vals: List[str] = []
+        for a in msg.args {
+            try self.read(mut o, i.name, a)
+            vals.push(local(a))
+        }
+        o.line("            try rd.finish(mut conn, m)")
+        if msg.destructor {
+            o.line("            conn.remove(m.id)")
+        }
+        let v = t + "." + model.camel(msg.name) + (if vals.is_empty() { "" } else { "(" + vals.join(", ") + ")" })
+        o.line("            return Ok({v})")
+        o.line("        \}")
+    }
+    o.line("        _ => \{\}")
+    o.line("    \}")
+    o.line("    return Err(conn.error(m.id, wire.invalid_method, \"invalid {what} \{m.op\} on {i.name}\"))")
+    o.line("\}")
+    o.line("")
+    return Ok(())
+}
+
+/// Methods on `i` that send `msgs` (events from a server, requests from a
+/// client), skipped for objects older than a message's version.
+fn World.senders(self, mut o: Out, i: model.Iface, msgs: List[model.Message]) -> Result[(), str] {
+    for op, msg in msgs {
+        var params: List[str] = []
+        var ret = ""
+        var made = ""
+        var size = "8"
+        var fixed = 0
+        var body: List[str] = []
+        for a in msg.args {
+            let n = local(a)
+            let p = try self.param(mut o, i.name, a)
+            if not p.is_empty() {
+                params.push(n + ": " + p)
+            }
+            let enum_arg = not a.enum_ref.is_empty() and (a.kind == "int" or a.kind == "uint")
+            match a.kind {
+                "int" => {
+                    fixed += 1
+                    body.push(if enum_arg { "wr.u32(mut conn, u32({n}))" } else { "wr.i32(mut conn, {n})" })
+                }
+                "uint" => {
+                    fixed += 1
+                    body.push(if enum_arg { "wr.u32(mut conn, u32({n}))" } else { "wr.u32(mut conn, {n})" })
+                }
+                "fixed" => {
+                    fixed += 1
+                    body.push("wr.fixed(mut conn, {n})")
+                }
+                "string" => {
+                    size += if a.nullable { " + wire.opt_str_size({n})" } else { " + wire.str_size({n})" }
+                    body.push(if a.nullable { "wr.opt_str(mut conn, {n})" } else { "wr.str(mut conn, {n})" })
+                }
+                "array" => {
+                    size += " + wire.array_size({n})"
+                    body.push("wr.array(mut conn, {n})")
+                }
+                "fd" => body.push("conn.put_fd({n})")
+                "object" => {
+                    fixed += 1
+                    if a.iface.is_empty() {
+                        body.push("wr.u32(mut conn, {n})")
+                    } else if a.nullable {
+                        body.push("wr.u32(mut conn, {n}.map(fn(o) => o.id).unwrap_or(0))")
+                    } else {
+                        body.push("wr.u32(mut conn, {n}.id)")
+                    }
+                }
+                "new_id" => {
+                    if a.iface.is_empty() {
+                        // wl_registry.bind: interface and version come first.
+                        let name_of = o.qual("ifaces", "name")
+                        params.push("iface: u16")
+                        params.push("version: u32")
+                        size += " + wire.str_size({name_of}(iface)) + 8"
+                        made = "    let {n} = conn.alloc(iface, version)"
+                        ret = "u32"
+                        body.push("wr.str(mut conn, {name_of}(iface))")
+                        body.push("wr.u32(mut conn, version)")
+                        body.push("wr.u32(mut conn, {n})")
+                    } else {
+                        fixed += 1
+                        let t = try self.iface_type(mut o, a.iface)
+                        let c = try self.iface_const(mut o, a.iface)
+                        made = "    let {n} = {t} \{ id: conn.alloc({c}, conn.version(self.id)) \}"
+                        ret = t
+                        body.push("wr.u32(mut conn, {n}.id)")
+                    }
+                }
+                _ => {
+                    return Err("unknown argument type {a.kind}")
+                }
+            }
+        }
+        if fixed > 0 {
+            size += " + {4 * fixed}"
+        }
+        let made_name = msg.args.position(fn(a) => a.kind == "new_id").map(fn(k) => local(msg.args[k])).unwrap_or("")
+        doc(mut o, "", msg.summary)
+        let head = "pub fn {i.short}.{model.method(msg.name)}(self, mut conn: wire.Conn" + (if params.is_empty() { "" } else { ", " + params.join(", ") }) + ")"
+        o.line(head + (if ret.is_empty() { "" } else { " -> " + ret }) + " \{")
+        if msg.since > 1 {
+            o.line("    guard conn.version(self.id) >= {msg.since} else \{")
+            if ret.is_empty() {
+                o.line("        return")
+            } else if ret == "u32" {
+                o.line("        return 0")
+            } else {
+                o.line("        return {ret} \{ id: 0 \}")
+            }
+            o.line("    \}")
+        }
+        if not made.is_empty() {
+            o.line(made)
+        }
+        let writes = body.any(fn(b) => b.starts_with("wr."))
+        if writes {
+            o.line("    var wr = conn.begin(self.id, {op}, {size})")
+        } else {
+            o.line("    discard conn.begin(self.id, {op}, {size})")
+        }
+        for b in body {
+            o.line("    " + b)
+        }
+        if msg.destructor {
+            o.line("    conn.remove(self.id)")
+        }
+        if not ret.is_empty() {
+            o.line("    return {made_name}")
+        }
+        o.line("\}")
+        o.line("")
+    }
+    return Ok(())
+}
+
+fn enum_variant(e: model.Enum, x: model.Entry) -> str {
+    let c = model.camel(x.name)
+    return if x.name[0] >= 48 and x.name[0] <= 57 { model.camel(e.name) + c } else { c }
+}
+
+fn World.iface_items(self, mut o: Out, i: model.Iface) -> Result[(), str] {
+    let s = model.snake(i.short)
+    doc(mut o, "", i.name + ": " + i.summary)
+    o.line("pub struct {i.short} derive(Hash, Show) \{")
+    o.line("    pub id: u32")
+    o.line("\}")
+    o.line("")
+    o.line("pub let {s}_iface: u16 = {i.num}")
+    o.line("pub let {s}_version: u32 = {i.version}")
+    o.line("")
+    for e in i.enums {
+        doc(mut o, "", e.summary)
+        o.line("pub enum {i.short}{model.camel(e.name)}: u32" + (if e.bitfield { " derive(Flags)" } else { "" }) + " \{")
+        for x in e.entries {
+            doc(mut o, "    ", x.summary)
+            o.line("    {enum_variant(e, x)} = {x.value}")
+        }
+        o.line("\}")
+        o.line("")
+    }
+    if not i.requests.is_empty() {
+        try self.decoder(mut o, i, i.requests, "Request")
+    }
+    try self.senders(mut o, i, i.events)
+    return Ok(())
+}
+
+fn World.client_items(self, mut o: Out, i: model.Iface) -> Result[(), str] {
+    if not i.events.is_empty() {
+        try self.decoder(mut o, i, i.events, "Event")
+    }
+    try self.senders(mut o, i, i.requests)
+    return Ok(())
+}
+
+fn header(o: Out, source: str) -> str {
+    var h = "// Generated by luminaria_scanner from {source}; do not edit.\n\n"
+    h += "import std.collections.map\n"
+    h += "import luminaria_wire as wire\n"
+    for m in o.imports {
+        h += "import {m}\n"
+    }
+    return h + "\n" + o.text
+}
+
+/// The module for protocol `p`.
+pub fn World.module(self, p: model.Proto) -> Result[str, str] {
+    var o = Out { module: p.module.clone() }
+    for i in p.ifaces {
+        try self.iface_items(mut o, i)
+    }
+    for i in p.ifaces {
+        try self.client_items(mut o, i)
+    }
+    return Ok(header(o, p.file).trim_end() + "\n")
+}
+
+/// `ifaces`: interface numbers, names and versions.
+pub fn World.ifaces(self) -> str {
+    var t = "// Generated by luminaria_scanner; do not edit.\n// Interface numbers in the id map; 1 is wl_display.\n\n"
+    var n = 0
+    for p in self.protos {
+        n += p.ifaces.len()
+    }
+    t += "pub let count = {n}\n\n"
+    t += "/// The number of interface `name`, 0 when there is none.\n"
+    t += "pub fn by_name(name: str) -> u16 \{\n    return match name \{\n"
+    for p in self.protos {
+        for i in p.ifaces {
+            t += "        \"{i.name}\" => {i.num}\n"
+        }
+    }
+    t += "        _ => 0\n    \}\n\}\n\n"
+    t += "pub fn name(iface: u16) -> str \{\n    return match iface \{\n"
+    for p in self.protos {
+        for i in p.ifaces {
+            t += "        {i.num} => \"{i.name}\"\n"
+        }
+    }
+    t += "        _ => \"\"\n    \}\n\}\n\n"
+    t += "/// The newest version this build speaks.\n"
+    t += "pub fn version(iface: u16) -> u32 \{\n    return match iface \{\n"
+    for p in self.protos {
+        for i in p.ifaces {
+            t += "        {i.num} => {i.version}\n"
+        }
+    }
+    t += "        _ => 0\n    \}\n\}\n"
+    return t
+}
+
+/// The `Request` (or `Event`) enum over every interface and `next`.
+fn World.dispatch(self, mut t: str, kind: str, fname: str) {
+    let event = kind == "Event"
+    t += "/// A decoded {kind.to_lower()} and the object it was sent to.\n"
+    t += "pub enum {kind} \{\n"
+    for p in self.protos {
+        for i in p.ifaces {
+            if (if event { i.events.len() } else { i.requests.len() }) > 0 {
+                t += "    {i.full}({p.module}.{i.short}, {p.module}.{i.short}{kind})\n"
+            }
+        }
+    }
+    t += "\}\n\n"
+    t += "/// The next {kind.to_lower()} received on `conn`, `None` until more is read.\n"
+    t += "pub fn {fname}(mut conn: wire.Conn) -> Result[Option[{kind}], wire.Error] \{\n"
+    t += "    while true \{\n"
+    t += "        guard let Some(m) = try conn.next() else \{\n            return Ok(None)\n        \}\n"
+    t += "        let v = match m.iface \{\n"
+    for p in self.protos {
+        for i in p.ifaces {
+            if (if event { i.events.len() } else { i.requests.len() }) > 0 {
+                let suffix = if event { "_event" } else { "" }
+                t += "            {i.num} => {kind}.{i.full}({p.module}.{i.short} \{ id: m.id \}, try {p.module}.decode_{model.snake(i.short)}{suffix}(mut conn, m))\n"
+            }
+        }
+    }
+    t += "            _ => \{\n"
+    t += "                return Err(conn.error(m.id, wire.invalid_method, \"no {kind.to_lower()}s on interface \{m.iface\}\"))\n"
+    t += "            \}\n"
+    t += "        \}\n"
+    if event {
+        t += "        // Events to objects destroyed here are read, then dropped.\n"
+        t += "        if m.alive \{\n            return Ok(Some(v))\n        \}\n"
+    } else {
+        t += "        return Ok(Some(v))\n"
+    }
+    t += "    \}\n"
+    t += "\}\n"
+}
+
+/// `lib`: the modules, `Request` with `next`, and `Event` with `next_event`.
+pub fn World.lib(self) -> str {
+    var t = "// Generated by luminaria_scanner; do not edit.\n"
+    t += "// luminaria_proto: every interface of protocols/*.xml. A server reads\n"
+    t += "// requests with `next` and sends events with methods on typed ids; a\n"
+    t += "// client the reverse (`next_event`, request methods).\n\n"
+    t += "import luminaria_wire as wire\n"
+    t += "pub import ifaces\n"
+    for p in self.protos {
+        t += "pub import {p.module}\n"
+    }
+    t += "\n"
+    self.dispatch(mut t, "Request", "next")
+    t += "\n"
+    self.dispatch(mut t, "Event", "next_event")
+    return t
+}

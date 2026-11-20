@@ -1,0 +1,56 @@
+// A US keymap through the generated API: keysyms, Shift, UTF-8, keysym
+// names, and the log function.
+
+import xkbcommon_sys as xkb
+
+thread var logged: int = 0
+
+extern fn xkb_test_log(ctx: xkb.Context, level: i32, msg: str) {
+    logged += 1
+}
+
+test "a us keymap" {
+    guard let Some(ctx) = xkb.context_new(xkb.xkb_context_no_flags) else {
+        return
+    }
+    defer xkb.context_unref(ctx)
+    unsafe {
+        let names = xkb.RuleNames { rules: "evdev".as_cstr().cast[i8](), model: "pc105".as_cstr().cast[i8](), layout: "us".as_cstr().cast[i8]() }
+        guard let Some(km) = xkb.keymap_new_from_names(ctx, Ptr.of(names), xkb.xkb_keymap_compile_no_flags) else {
+            return
+        }
+        defer xkb.keymap_unref(km)
+        guard let Some(st) = xkb.state_new(km) else {
+            return
+        }
+        defer xkb.state_unref(st)
+        // evdev KEY_A is 30, KEY_LEFTSHIFT 42; xkb keycodes are 8 higher.
+        let a: u32 = 38
+        let shift: u32 = 50
+        assert_eq(xkb.keymap_key_by_name(km, "AC01"), a)
+        assert_eq(xkb.state_key_get_one_sym(st, a), xkb.key_a)
+        discard xkb.state_update_key(st, shift, xkb.xkb_key_down)
+        assert_eq(xkb.state_key_get_one_sym(st, a), xkb.key_A)
+        assert_eq(xkb.state_mod_name_is_active(st, "Shift", xkb.xkb_state_mods_effective), 1)
+        var buf: List[i8] = [0, 0, 0, 0, 0, 0, 0, 0]
+        assert_eq(xkb.state_key_get_utf8(st, a, buf, 8), 1)
+        assert_eq(buf[0], i8(65))
+    }
+}
+
+test "keysym names keep their case" {
+    assert_eq(xkb.keysym_from_name("Escape", xkb.xkb_keysym_no_flags), xkb.key_Escape)
+    assert_eq(xkb.keysym_from_name("a", xkb.xkb_keysym_no_flags), xkb.key_a)
+    assert_eq(xkb.keysym_from_name("A", xkb.xkb_keysym_no_flags), xkb.key_A)
+    assert_eq(xkb.keysym_to_utf32(xkb.key_eacute), u32(0xe9))
+}
+
+test "log messages reach the handler" {
+    guard let Some(ctx) = xkb.context_new(xkb.xkb_context_no_flags) else {
+        return
+    }
+    defer xkb.context_unref(ctx)
+    xkb.context_set_log_fn(ctx, Some(xkb_test_log))
+    assert(xkb.keymap_new_from_string(ctx, "not a keymap", xkb.xkb_keymap_format_text_v1, 0).is_none())
+    assert(logged > 0)
+}

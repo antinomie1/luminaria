@@ -1,0 +1,76 @@
+// The generated API against the real kernel: a render node's version and
+// caps (through libdrm and through a raw ioctl with the uapi module), and a
+// primary node's KMS resources. Skipped without /dev/dri.
+
+import std.fs
+import std.os
+import libdrm_sys as drm
+import libdrm_sys.uapi as uapi
+
+fn first(prefix: str) -> Option[str] {
+    for i in 0..8 {
+        let n = if prefix == "renderD" { 128 + i } else { i }
+        let p = "/dev/dri/{prefix}{n}"
+        if fs.exists(p) {
+            return Some(p)
+        }
+    }
+    return None
+}
+
+test "fourcc and ioctl constants" {
+    assert_eq(uapi.drm_format_xrgb8888, 0x34325258)
+    assert_eq(uapi.drm_format_argb8888, 0x34325241)
+    assert_eq(uapi.drm_format_mod_linear, 0)
+    assert_eq(uapi.drm_format_mod_invalid, 0xffffffffffffff)
+    assert_eq(uapi.drm_ioctl_get_cap, 0xc010640c)
+}
+
+test "a render node" {
+    guard let Some(path) = first("renderD") else {
+        return
+    }
+    guard let Ok(fd) = os.open(path, true) else {
+        return
+    }
+    defer os.close(fd)
+    assert_eq(drm.get_node_type_from_fd(i32(fd)), drm.drm_node_render)
+    unsafe {
+        let v = drm.get_version(i32(fd))
+        assert(not v.is_null())
+        assert(v.read().name_len > 0)
+        drm.free_version(v)
+        var prime: u64 = 0
+        assert_eq(drm.get_cap(i32(fd), uapi.drm_cap_prime, Ptr.of_mut(mut prime)), 0)
+        var cap = uapi.GetCap { capability: uapi.drm_cap_prime }
+        assert_eq(drm.ioctl(i32(fd), uapi.drm_ioctl_get_cap, Ptr.of_mut(mut cap).cast[u8]()), 0)
+        assert_eq(cap.value, prime)
+    }
+}
+
+test "a primary node's KMS resources" {
+    guard let Some(path) = first("card") else {
+        return
+    }
+    guard let Ok(fd) = os.open(path, true) else {
+        return
+    }
+    defer os.close(fd)
+    guard drm.is_kms(i32(fd)) == 1 else {
+        return
+    }
+    unsafe {
+        let res = drm.mode_get_resources(i32(fd))
+        assert(not res.is_null())
+        let r = res.read()
+        assert(r.count_crtcs > 0)
+        for i in 0..int(r.count_connectors) {
+            let c = drm.mode_get_connector(i32(fd), r.connectors.offset(i).read())
+            assert(not c.is_null())
+            let k = c.read()
+            assert(k.connection >= drm.drm_mode_connected)
+            drm.mode_free_connector(c)
+        }
+        drm.mode_free_resources(res)
+    }
+}

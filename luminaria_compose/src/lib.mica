@@ -1,0 +1,6 @@
+// luminaria_compose: one frame of composition on vk_gpu. The compositor
+// lists placements each frame; the library diffs them into damage, culls
+// occluded surfaces, assigns planes, picks the compositor clock's start
+// time, never waits on a client fence (an unready buffer shows its last
+// frame), holds layout transactions together, and rebuilds after device
+// loss. Client buffers are imported and cached as textures here.

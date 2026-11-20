@@ -1,0 +1,7 @@
+[package]
+name = "luminaria_wire"
+version = "0.1.0"
+description = "Wayland wire protocol: sockets, fd passing, message encoding, object maps, server and client ends"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]

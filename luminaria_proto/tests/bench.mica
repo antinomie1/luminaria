@@ -1,0 +1,93 @@
+// Throughput through a real socket, in batches of 128 messages per flush:
+// requests (damage_buffer + commit) client to server, and pointer motion
+// events server to client. Prints ns per message; run with --release for
+// meaningful numbers.
+
+import std.env
+import std.fs
+import std.io
+import std.time
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+
+let rounds = 2000
+let batch = 128
+
+fn pair() -> (wire.Listener, wire.Conn, wire.Conn) {
+    let dir = fs.create_temp_dir("luminaria-bench").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let l = wire.listen("").expect("listen")
+    let client = wire.connect(l.name).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some(server)) = l.accept() {
+            return (l, server, client)
+        }
+    }
+    panic("accept")
+}
+
+/// Drain requests until `want` have arrived.
+fn serve(mut s: wire.Conn, want: int) -> int {
+    var n = 0
+    while n < want {
+        match proto.next(mut s) {
+            Ok(Some) => n += 1
+            Ok(None) => {
+                discard s.read()
+            }
+            Err(e) => panic("server: {e}")
+        }
+    }
+    return n
+}
+
+test "request and event throughput" {
+    var (l, s, c) = pair()
+    let reg = wl.Display { id: 1 }.get_registry(mut c)
+    let comp = wl.Compositor { id: reg.bind(mut c, 1, wl.compositor_iface, 6) }
+    let seat = wl.Seat { id: reg.bind(mut c, 2, wl.seat_iface, 9) }
+    let surf = comp.create_surface(mut c)
+    let ptr = seat.get_pointer(mut c)
+    discard c.flush()
+    discard serve(mut s, 5)
+
+    let t0 = time.now_ns()
+    for _ in 0..rounds {
+        for _ in 0..batch / 2 {
+            surf.damage_buffer(mut c, 0, 0, 64, 64)
+            surf.commit(mut c)
+        }
+        discard c.flush()
+        discard serve(mut s, batch)
+    }
+    let req_ns = (time.now_ns() - t0) / (rounds * batch)
+
+    let t1 = time.now_ns()
+    var got = 0
+    for r in 0..rounds {
+        for k in 0..batch {
+            ptr.motion(mut s, u32(r * batch + k), 10.5, 20.25)
+        }
+        discard s.flush()
+        var n = 0
+        while n < batch {
+            match proto.next_event(mut c) {
+                Ok(Some(WlPointer(_, Motion(_, x, y)))) => {
+                    assert(x == 10.5 and y == 20.25)
+                    n += 1
+                }
+                Ok(Some) => {}
+                Ok(None) => {
+                    discard c.read()
+                }
+                Err(e) => panic("client: {e}")
+            }
+        }
+        got += n
+    }
+    let ev_ns = (time.now_ns() - t1) / (rounds * batch)
+    assert_eq(got, rounds * batch)
+    io.print("requests: {req_ns} ns each (encode, sendmsg, recvmsg, decode)")
+    io.print("events:   {ev_ns} ns each")
+}

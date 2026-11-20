@@ -1,0 +1,9 @@
+[package]
+name = "luminaria_proto"
+version = "0.1.0"
+description = "Wayland protocol interfaces generated from protocols/*.xml"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+luminaria_wire = { workspace = true }
+

@@ -1,0 +1,139 @@
+// Display sockets: a compositor listens on $XDG_RUNTIME_DIR/wayland-N
+// (guarded by wayland-N.lock, as libwayland does); a client connects to
+// $WAYLAND_SOCKET, $WAYLAND_DISPLAY or wayland-0.
+
+import std.env
+import std.fs
+import std.net
+import std.os
+import conn
+
+pub struct Listener {
+    pub fd: int
+    /// The display name clients use (WAYLAND_DISPLAY).
+    pub name: str
+    path: str
+    lock_path: str
+    lock: int
+}
+
+fn runtime_dir() -> Result[str, str] {
+    guard let Some(d) = env.get("XDG_RUNTIME_DIR") else {
+        return Err("XDG_RUNTIME_DIR is not set")
+    }
+    return Ok(d)
+}
+
+fn bind(dir: str, take name: str) -> Result[Option[Listener], str] {
+    let path = "{dir}/{name}"
+    let lock_path = path + ".lock"
+    if not fs.exists(lock_path) {
+        discard fs.write(lock_path, "")
+    }
+    let lock = match os.open(lock_path, true) {
+        Ok(f) => f
+        Err(e) => {
+            return Err("open {lock_path}: {e}")
+        }
+    }
+    let held = match os.try_lock(lock) {
+        Ok(v) => v
+        Err(e) => {
+            os.close(lock)
+            return Err("lock {lock_path}: {e}")
+        }
+    }
+    guard held else {
+        os.close(lock)
+        return Ok(None)
+    }
+    // We hold the lock: a socket file left here is stale.
+    if fs.exists(path) {
+        discard fs.remove(path)
+    }
+    let l = match net.unix_listen(path) {
+        Ok(v) => v
+        Err(e) => {
+            os.close(lock)
+            return Err("listen on {path}: {e}")
+        }
+    }
+    match l.set_nonblocking(true) {
+        Err(e) => {
+            l.close()
+            os.close(lock)
+            return Err("listen on {path}: {e}")
+        }
+        Ok => {}
+    }
+    return Ok(Some(Listener { fd: l.fd, name, path, lock_path, lock }))
+}
+
+/// Listen for clients on display `name`; "" takes the first free of
+/// wayland-1 to wayland-32.
+pub fn listen(name: str) -> Result[Listener, str] {
+    let dir = try runtime_dir()
+    if not name.is_empty() {
+        guard let Some(l) = try bind(dir, name.clone()) else {
+            return Err("display {name} is in use")
+        }
+        return Ok(l)
+    }
+    for i in 1..33 {
+        if let Some(l) = try bind(dir.clone(), "wayland-{i}") {
+            return Ok(l)
+        }
+    }
+    return Err("no free display among wayland-1 to wayland-32")
+}
+
+/// A waiting client, or `None` when there is none.
+pub fn Listener.accept(self) -> Result[Option[conn.Conn], conn.Error] {
+    let l = net.Listener { fd: self.fd }
+    let c = match l.accept() {
+        Ok(v) => v
+        Err(e) => {
+            return if e.would_block() { Ok(None) } else { Err(conn.Error.Io(e)) }
+        }
+    }
+    return Ok(Some(try conn.Conn.new(c.fd, conn.End.Server)))
+}
+
+fn Listener.drop(mut self) {
+    os.close(self.fd)
+    discard fs.remove(self.path)
+    discard fs.remove(self.lock_path)
+    os.close(self.lock)
+}
+
+/// Connect to display `name` ("": $WAYLAND_SOCKET, then $WAYLAND_DISPLAY,
+/// then wayland-0); an absolute path is used as is.
+pub fn connect(name: str) -> Result[conn.Conn, str] {
+    if name.is_empty() {
+        if let Some(s) = env.get("WAYLAND_SOCKET") {
+            guard let Some(fd) = s.to_int() else {
+                return Err("WAYLAND_SOCKET is not a descriptor: {s}")
+            }
+            discard env.remove("WAYLAND_SOCKET")
+            return open(fd)
+        }
+    }
+    var display = if name.is_empty() { env.get("WAYLAND_DISPLAY").unwrap_or("wayland-0") } else { name.clone() }
+    if not display.starts_with("/") {
+        display = "{try runtime_dir()}/{display}"
+    }
+    let c = match net.unix_connect(display) {
+        Ok(v) => v
+        Err(e) => {
+            return Err("{e}")
+        }
+    }
+    return open(c.fd)
+}
+
+fn open(fd: int) -> Result[conn.Conn, str] {
+    return match conn.Conn.new(fd, conn.End.Client) {
+        Ok(c) => Ok(c)
+        Err(e) => Err("{e}")
+    }
+}

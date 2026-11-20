@@ -1,0 +1,51 @@
+// The generated API against the real library: enumerating the drm
+// subsystem, a device from its syspath, and a netlink monitor.
+
+import std.fs
+import libudev_sys as udev
+
+test "enumerate drm devices" {
+    guard let Some(u) = udev.new() else {
+        return
+    }
+    defer discard udev.unref(u)
+    guard let Some(en) = udev.enumerate_new(u) else {
+        return
+    }
+    defer discard udev.enumerate_unref(en)
+    assert_eq(udev.enumerate_add_match_subsystem(en, "drm"), 0)
+    assert_eq(udev.enumerate_scan_devices(en), 0)
+    var n = 0
+    var e = udev.enumerate_get_list_entry(en)
+    while true {
+        guard let Some(cur) = e else {
+            break
+        }
+        let path = udev.list_entry_get_name(cur).unwrap_or("")
+        assert(path.starts_with("/sys/"))
+        guard let Some(d) = udev.device_new_from_syspath(u, path) else {
+            return
+        }
+        assert_eq(udev.device_get_subsystem(d).unwrap_or(""), "drm")
+        discard udev.device_unref(d)
+        n += 1
+        e = udev.list_entry_get_next(cur)
+    }
+    if fs.is_dir("/dev/dri") {
+        assert(n > 0)
+    }
+}
+
+test "a netlink monitor" {
+    guard let Some(u) = udev.new() else {
+        return
+    }
+    defer discard udev.unref(u)
+    guard let Some(m) = udev.monitor_new_from_netlink(u, "udev") else {
+        return
+    }
+    defer discard udev.monitor_unref(m)
+    assert_eq(udev.monitor_filter_add_match_subsystem_devtype(m, "drm", "drm_minor"), 0)
+    assert_eq(udev.monitor_enable_receiving(m), 0)
+    assert(udev.monitor_get_fd(m) >= 0)
+}

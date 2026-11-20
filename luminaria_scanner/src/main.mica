@@ -1,0 +1,58 @@
+// luminaria_scanner: writes luminaria_proto/src from protocols/*.xml.
+// Run it after changing a protocol file; its output is committed.
+//
+//   sheaf run -p luminaria_scanner -- protocols luminaria_proto/src
+
+import std.env
+import std.fs
+import std.io
+import model
+import gen
+
+fn run(dir: str, out: str) -> Result[(), str] {
+    var files = try fs.list_dir(dir)
+    files = files.filter(fn(f) => f.ends_with(".xml"))
+    files.sort()
+    // wayland.xml first: wl_display is interface 1.
+    if let Some(k) = files.position(fn(f) => f == "wayland.xml") {
+        let w = files.remove(k)
+        files.insert(0, w)
+    }
+    var protos: List[model.Proto] = []
+    var num = 1
+    for f in files {
+        let path = "{dir}/{f}"
+        var p = try model.parse(path, try fs.read_to_str(path))
+        for mut i in p.ifaces {
+            i.num = num
+            num += 1
+        }
+        protos.push(p)
+    }
+    guard not protos.is_empty() and protos[0].ifaces[0].name == "wl_display" else {
+        return Err("{dir}/wayland.xml must come first and start with wl_display")
+    }
+    let w = gen.World { protos }
+    for p in w.protos {
+        try fs.write("{out}/{p.module}.mica", try w.module(p))
+    }
+    try fs.write("{out}/ifaces.mica", w.ifaces())
+    try fs.write("{out}/lib.mica", w.lib())
+    io.print("{num - 1} interfaces from {w.protos.len()} files into {out}")
+    return Ok(())
+}
+
+fn main() {
+    let args = env.args()
+    guard args.len() == 3 else {
+        io.eprint("usage: luminaria_scanner <protocol dir> <output dir>")
+        env.exit(2)
+    }
+    match run(args[1], args[2]) {
+        Ok => {}
+        Err(e) => {
+            io.eprint("luminaria_scanner: {e}")
+            env.exit(1)
+        }
+    }
+}

@@ -1,0 +1,39 @@
+// The generated API against the real library on the noop backend, which
+// needs no seatd or logind: the seat is enabled at once and devices are
+// opened directly.
+
+import std.env
+import libseat_sys as seat
+
+thread var enabled: int = 0
+
+extern unsafe fn libseat_test_enable(s: seat.Libseat, data: Ptr[u8]) {
+    enabled += 1
+}
+
+extern unsafe fn libseat_test_disable(s: seat.Libseat, data: Ptr[u8]) {
+    discard seat.disable_seat(s)
+}
+
+extern fn libseat_test_log(level: i32, msg: str) {}
+
+test "a noop seat opens a device" {
+    discard env.set("LIBSEAT_BACKEND", "noop")
+    seat.set_log_handler(Some(libseat_test_log))
+    seat.set_log_level(seat.libseat_log_level_info)
+    let l = seat.SeatListener { enable_seat: Some(libseat_test_enable), disable_seat: Some(libseat_test_disable) }
+    unsafe {
+        guard let Some(s) = seat.open_seat(Ptr.of(l), Ptr.null()) else {
+            return
+        }
+        defer discard seat.close_seat(s)
+        assert(seat.dispatch(s, 0) >= 0)
+        assert_eq(enabled, 1)
+        assert(seat.seat_name(s).is_some())
+        var fd: i32 = -1
+        let id = seat.open_device(s, "/dev/null", Ptr.of_mut(mut fd))
+        assert(id >= 0)
+        assert(fd >= 0)
+        assert_eq(seat.close_device(s, id), 0)
+    }
+}

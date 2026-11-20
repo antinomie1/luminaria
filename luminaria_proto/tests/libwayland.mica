@@ -1,0 +1,116 @@
+// A real libwayland client (tests/c/client.c, built with cc) against a
+// server written with the generated API: globals, binds, an shm pool fd,
+// a buffer, surface state and a frame callback. Skipped without cc or
+// libwayland-client.
+
+import std.env
+import std.fs
+import std.os
+import std.process
+import std.time
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+
+struct Seen {
+    pool_size: int = 0
+    buffers: int = 0
+    attached: bool = false
+    transform: bool = false
+    commits: int = 0
+    destroyed: int = 0
+    frames: List[wl.Callback] = []
+}
+
+fn handle(mut c: wire.Conn, take r: proto.Request, mut seen: Seen) -> Result[(), str] {
+    match take r {
+        WlDisplay(_, GetRegistry(reg)) => {
+            reg.global(mut c, 1, "wl_compositor", 6)
+            reg.global(mut c, 2, "wl_shm", 1)
+        }
+        WlDisplay(_, Sync(cb)) => cb.done(mut c, 7)
+        WlRegistry(_, Bind(name, obj)) => {
+            let want = if name == 1 { wl.compositor_iface } else { wl.shm_iface }
+            guard obj.iface == want else {
+                return Err("bind {name} gave interface {obj.iface}")
+            }
+            if obj.iface == wl.shm_iface {
+                let shm = wl.Shm { id: obj.id }
+                shm.format(mut c, wl.ShmFormat.Argb8888)
+                shm.format(mut c, wl.ShmFormat.Xrgb8888)
+            }
+        }
+        WlShm(_, CreatePool(_, f, size)) => {
+            guard (try os.size(f.raw()).map_err(fn(e) => "{e}")) >= int(size) else {
+                return Err("pool fd smaller than {size}")
+            }
+            seen.pool_size = int(size)
+        }
+        WlShmPool(_, CreateBuffer(_, offset, w, h, stride, format)) => {
+            guard offset == 0 and w == 64 and h == 64 and stride == 256 and format == wl.ShmFormat.Argb8888 else {
+                return Err("bad buffer")
+            }
+            seen.buffers += 1
+        }
+        WlSurface(_, Attach(Some, 0, 0)) => seen.attached = true
+        WlSurface(_, SetBufferTransform(t)) => seen.transform = t == wl.OutputTransform.Transform90
+        WlSurface(_, Frame(cb)) => seen.frames.push(cb)
+        WlSurface(_, Commit) => {
+            seen.commits += 1
+            for cb in seen.frames {
+                cb.done(mut c, 1000)
+            }
+            seen.frames.clear()
+        }
+        WlSurface(_, Destroy) or WlBuffer(_, Destroy) or WlShmPool(_, Destroy) => seen.destroyed += 1
+        _ => {}
+    }
+    return Ok(())
+}
+
+test "a libwayland client against generated server code" {
+    let dir = fs.create_temp_dir("luminaria-proto").expect("temp dir")
+    let src = if fs.exists("luminaria_proto/tests/c/client.c") { "luminaria_proto/tests/c/client.c" } else { "tests/c/client.c" }
+    let bin = "{dir}/client"
+    guard let Ok(st) = process.status("cc", [src, "-o", bin.clone(), "-lwayland-client"]) else {
+        return
+    }
+    guard st == 0 else {
+        return
+    }
+    discard env.set("XDG_RUNTIME_DIR", dir.clone())
+    let l = wire.listen("").expect("listen")
+    var child = process.command(bin).env("WAYLAND_DISPLAY", l.name.clone()).env("XDG_RUNTIME_DIR", dir).pipe_stdout().spawn().expect("spawn")
+    var conns: List[wire.Conn] = []
+    var seen = Seen {}
+    var code = -1
+    let start = time.now_ns()
+    while time.now_ns() - start < 5000000000 {
+        if let Ok(Some(c)) = l.accept() {
+            conns.push(c)
+        }
+        for mut c in conns {
+            discard c.read()
+            while true {
+                guard let Ok(Some(r)) = proto.next(mut c) else {
+                    break
+                }
+                handle(mut c, r, mut seen).expect("server")
+            }
+            discard c.flush()
+        }
+        if let Ok(Some(k)) = child.try_wait() {
+            code = k
+            break
+        }
+        time.sleep_ms(1)
+    }
+    assert_eq(code, 0)
+    assert_eq(child.read_stdout().expect("stdout").trim(), "ok")
+    assert_eq(seen.pool_size, 64 * 64 * 4)
+    assert_eq(seen.buffers, 1)
+    assert(seen.attached)
+    assert(seen.transform)
+    assert_eq(seen.commits, 1)
+    assert_eq(seen.destroyed, 3)
+}

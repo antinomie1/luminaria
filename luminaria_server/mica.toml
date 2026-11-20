@@ -1,0 +1,9 @@
+[package]
+name = "luminaria_server"
+version = "0.1.0"
+description = "Wayland protocol state: surfaces, xdg-shell, seats, outputs, buffers and timing, without a GPU"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+luminaria_proto = { workspace = true }
+luminaria_wire = { workspace = true }

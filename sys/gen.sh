@@ -1,0 +1,121 @@
+#!/bin/sh
+# Regenerates every */src/*.mica and libdrm_sys/c/uapi.c under sys/ from the
+# system headers. Each header is copied into an empty directory first:
+# `mica bind` takes in every header of a named header's directory, and
+# /usr/include would bring libc along.
+set -eu
+MICA=${MICA:-mica}
+INC=${INC:-/usr/include}
+root=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# bind <package> <headers...> [-- <mica bind options...>]
+bind() {
+    pkg=$1
+    shift
+    dir=$tmp/$pkg
+    mkdir -p "$dir"
+    files=""
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+        mkdir -p "$dir/$(dirname "$1")"
+        cp "$INC/$1" "$dir/$1"
+        files="$files $dir/$1"
+        shift
+    done
+    [ $# -gt 0 ] && shift
+    # shellcheck disable=SC2086
+    "$MICA" bind $files -I "$dir" "$@" -o "$root/$pkg/src/lib.mica"
+}
+
+# consts <out.mica> <header> [cc options...]: appends the object-like macros
+# of <header> that `bind` skipped because they expand to function-like ones
+# (DRM_FORMAT_XRGB8888 is fourcc_code('X', 'R', '2', '4')), evaluated by cc.
+consts() {
+    out=$1
+    hdr=$2
+    shift 2
+    awk -v hdr="$hdr" '
+        FNR == NR { if ($1 == "pub" && $2 == "let") { sub(/:.*/, "", $3); have[$3] = 1 } next }
+        FNR == 1 { printf "#include <fcntl.h>\n#include <stdio.h>\n#include <%s>\nint main(void) {\n", hdr }
+        $1 == "#define" && NF >= 3 && $2 !~ /\(/ && $2 !~ /^_/ && $3 !~ /^"/ && !(tolower($2) in have) {
+            printf "    printf(\"pub let %s = 0x%%llx\\n\", (unsigned long long)(%s));\n", tolower($2), $2
+        }
+        END { print "}" }
+    ' "$out" "$INC/$hdr" > "$tmp/consts.c"
+    cc "$tmp/consts.c" -o "$tmp/consts" "$@"
+    printf '\n// Macros built from function-like ones (%s), evaluated by cc.\n' "$hdr" >> "$out"
+    "$tmp/consts" >> "$out"
+}
+
+bind libudev_sys libudev.h
+bind libseat_sys libseat.h
+# Keysym names differ only by case (XKB_KEY_a, XKB_KEY_A), which `bind`
+# would fold into one: they are written out below with their case kept.
+bind xkbcommon_sys xkbcommon/xkbcommon.h xkbcommon/xkbcommon-compose.h xkbcommon/xkbcommon-names.h
+{
+    printf '\n// Keysyms from xkbcommon-keysyms.h, case kept: XKB_KEY_a is key_a, XKB_KEY_A is key_A.\n'
+    awk '$1 == "#define" && $2 ~ /^XKB_KEY_/ { printf "pub let key_%s: u32 = %s\n", substr($2, 9), $3 }' \
+        "$INC/xkbcommon/xkbcommon-keysyms.h"
+} >> "$root/xkbcommon_sys/src/lib.mica"
+# libdrm's own types (drmVersion, drmModeCrtc) and the kernel's (drm_version,
+# drm_mode_crtc) strip to one name, so the kernel uapi headers, whose
+# constants (DRM_MODE_*, DRM_CLIENT_CAP_*, DRM_FORMAT_*) are the point, get
+# their own module.
+# xf86drmMode.h's two static inline helpers are written in Mica below: a C
+# wrapper would need -I$INC/libdrm, which a dependency cannot pass to cc.
+mkdir -p "$root/libdrm_sys/c"
+bind libdrm_sys xf86drm.h xf86drmMode.h -- -I "$INC/libdrm"
+sed -i '2a\\nimport uapi' "$root/libdrm_sys/src/lib.mica"
+cat >> "$root/libdrm_sys/src/lib.mica" <<'END'
+
+// xf86drmMode.h's static inline helpers.
+pub unsafe fn mode_get_property_type(prop: Ptr[ModePropertyRes]) -> u32 {
+    return prop.read().flags & u32(uapi.drm_mode_prop_legacy_type | uapi.drm_mode_prop_extended_type)
+}
+
+pub unsafe fn property_type_is(prop: Ptr[ModePropertyRes], t: u32) -> bool {
+    return mode_get_property_type(prop) == t
+}
+END
+"$MICA" bind "$INC/libdrm/drm.h" "$INC/libdrm/drm_mode.h" "$INC/libdrm/drm_fourcc.h" \
+    --wrappers "$root/libdrm_sys/c/uapi.c" -o "$root/libdrm_sys/src/uapi.mica"
+consts "$root/libdrm_sys/src/uapi.mica" libdrm/drm_fourcc.h
+consts "$root/libdrm_sys/src/uapi.mica" libdrm/drm.h
+bind libinput_sys libinput.h
+
+# libinput takes and returns libudev's handles: use libudev_sys's types so
+# the two bindings interoperate.
+f=$root/libinput_sys/src/lib.mica
+sed -i \
+    -e 's/^extern struct Udev$/pub type Udev = udev.Udev/' \
+    -e 's/^extern struct UdevDevice$/pub type UdevDevice = udev.Device/' \
+    -e '2a\\nimport libudev_sys as udev' "$f"
+
+# `bind` keeps record fields private; other bundles must build and read them.
+for f in "$root"/*/src/*.mica; do
+    awk '/^pub struct [A-Za-z0-9_]+ \{$/ { open = 1 } /^}$/ { open = 0 }
+        open && /^    [^ ]/ && !/^    pub / { sub(/^    /, "    pub ") } { print }' "$f" > "$tmp/f" && mv "$tmp/f" "$f"
+done
+
+# Log handlers take a va_list, which Mica cannot: each package's c/log.c
+# formats the message and passes it on without its trailing newline. One
+# handler per process; the last one set wins, `None` silences.
+cat >> "$root/libinput_sys/src/lib.mica" <<'END'
+
+// Log handler through c/log.c: the formatted message, no trailing newline.
+pub type LogHandler = extern fn(Libinput, i32, str)
+extern fn log_set_handler(libinput: Libinput, handler: Option[LogHandler]) = "mc_libinput_log_set_handler"
+END
+cat >> "$root/libseat_sys/src/lib.mica" <<'END'
+
+// Log handler through c/log.c: the formatted message, no trailing newline.
+pub type LogHandler = extern fn(i32, str)
+extern fn set_log_handler(handler: Option[LogHandler]) = "mc_libseat_set_log_handler"
+END
+cat >> "$root/xkbcommon_sys/src/lib.mica" <<'END'
+
+// Log function through c/log.c: the formatted message, no trailing newline.
+pub type LogFn = extern fn(Context, i32, str)
+extern fn context_set_log_fn(context: Context, log_fn: Option[LogFn]) = "mc_xkb_context_set_log_fn"
+END

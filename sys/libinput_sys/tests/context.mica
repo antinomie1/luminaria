@@ -1,0 +1,51 @@
+// The generated API against the real library: path and udev contexts
+// (sharing libudev_sys's handles), the event loop, and the log handler.
+// No device is opened: that needs access to /dev/input.
+
+import libinput_sys as li
+import libudev_sys as udev
+
+thread var logged: int = 0
+
+extern unsafe fn libinput_test_open(path: str, flags: i32, data: Ptr[u8]) -> i32 {
+    return -2
+}
+
+extern unsafe fn libinput_test_close(fd: i32, data: Ptr[u8]) {}
+
+extern fn libinput_test_log(ctx: li.Libinput, priority: i32, msg: str) {
+    logged += 1
+}
+
+test "a path context and its log handler" {
+    let iface = li.Interface { open_restricted: Some(libinput_test_open), close_restricted: Some(libinput_test_close) }
+    unsafe {
+        guard let Some(ctx) = li.path_create_context(Ptr.of(iface), Ptr.null()) else {
+            return
+        }
+        defer discard li.unref(ctx)
+        li.log_set_handler(ctx, Some(libinput_test_log))
+        assert(li.get_fd(ctx) >= 0)
+        assert_eq(li.dispatch(ctx), 0)
+        assert(li.get_event(ctx).is_none())
+        // Fails in libinput's udev lookup, which logs why.
+        assert(li.path_add_device(ctx, "/dev/input/no-such-device").is_none())
+        assert(logged > 0)
+    }
+}
+
+test "a udev context takes libudev_sys's handle" {
+    guard let Some(u) = udev.new() else {
+        return
+    }
+    defer discard udev.unref(u)
+    let iface = li.Interface { open_restricted: Some(libinput_test_open), close_restricted: Some(libinput_test_close) }
+    unsafe {
+        guard let Some(ctx) = li.udev_create_context(Ptr.of(iface), Ptr.null(), u) else {
+            return
+        }
+        defer discard li.unref(ctx)
+        assert(li.get_fd(ctx) >= 0)
+        assert_eq(li.dispatch(ctx), 0)
+    }
+}

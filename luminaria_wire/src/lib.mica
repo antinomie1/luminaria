@@ -1,0 +1,47 @@
+// luminaria_wire: the Wayland wire protocol in Mica, without libwayland.
+// Non-blocking Unix sockets with fd passing (SCM_RIGHTS), in-place message
+// decoding, encoding into one send buffer flushed once per dispatch, and
+// the per-connection id map. Both ends: the server for compositors, the
+// client for the nested backend and tests.
+
+pub import conn
+pub import codec
+pub import socket
+pub import fd
+
+pub type Conn = conn.Conn
+pub type End = conn.End
+pub type Error = conn.Error
+pub type Msg = conn.Msg
+pub type Reader = codec.Reader
+pub type Writer = codec.Writer
+pub type Object = codec.Object
+pub type Fd = fd.Fd
+pub type Listener = socket.Listener
+
+pub let max_message = conn.max_message
+pub let server_base = conn.server_base
+pub let invalid_object = conn.invalid_object
+pub let invalid_method = conn.invalid_method
+pub let no_memory = conn.no_memory
+pub let implementation = conn.implementation
+
+pub fn listen(name: str) -> Result[socket.Listener, str] {
+    return socket.listen(name)
+}
+
+pub fn connect(name: str) -> Result[conn.Conn, str] {
+    return socket.connect(name)
+}
+
+pub fn str_size(s: &str) -> int {
+    return codec.str_size(s)
+}
+
+pub fn opt_str_size(s: Option[&str]) -> int {
+    return codec.opt_str_size(s)
+}
+
+pub fn array_size(a: &[u8]) -> int {
+    return codec.array_size(a)
+}

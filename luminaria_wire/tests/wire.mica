@@ -1,0 +1,193 @@
+// Both ends over a real Unix socket in a private XDG_RUNTIME_DIR: requests
+// and events with every argument kind, descriptors (more than one sendmsg
+// carries), the id map with delete_id, protocol errors, and a peer that
+// stops reading.
+
+import std.env
+import std.fs
+import std.os
+import luminaria_wire as wire
+
+fn pair() -> (wire.Listener, wire.Conn, wire.Conn) {
+    let dir = fs.create_temp_dir("luminaria-wire").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let l = wire.listen("").expect("listen")
+    let client = wire.connect(l.name).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some(server)) = l.accept() {
+            return (l, server, client)
+        }
+    }
+    panic("accept")
+}
+
+/// Read until a message arrives.
+fn recv(mut c: wire.Conn) -> wire.Msg {
+    for _ in 0..1000 {
+        if let Ok(Some(m)) = c.next() {
+            return m
+        }
+        discard c.read()
+    }
+    panic("no message")
+}
+
+test "a request and an event with every argument kind" {
+    var (l, s, c) = pair()
+    assert(l.name.starts_with("wayland-"))
+    // wl_display.get_registry(new_id): client id 2, interface 2.
+    let reg = c.alloc(2, 1)
+    assert_eq(reg, u32(2))
+    var w = c.begin(1, 1, 12)
+    w.u32(mut c, reg)
+    assert(c.flush().expect("flush"))
+
+    let m = recv(mut s)
+    assert_eq(m.id, u32(1))
+    assert_eq(m.op, u16(1))
+    var r = s.reader(m)
+    assert_eq(r.new_id(mut s, 2, 1), reg)
+    assert(r.finish(mut s, m).is_ok())
+    assert_eq(s.iface(reg), u16(2))
+
+    // An event: uint, int, fixed, string, null string, array, object, fd.
+    let f = os.memfd("wire-test", 4096).expect("memfd")
+    defer os.close(f)
+    let name = "wl_compositor"
+    let arr: List[u8] = [1, 2, 3, 4, 5]
+    var e = s.begin(reg, 0, 8 + 4 + 4 + 4 + wire.str_size(name) + 4 + wire.array_size(arr) + 4)
+    e.u32(mut s, 7)
+    e.i32(mut s, -3)
+    e.fixed(mut s, 1.5)
+    e.str(mut s, name)
+    e.opt_str(mut s, None)
+    e.array(mut s, arr)
+    e.u32(mut s, 1)
+    s.put_fd(f)
+    assert(s.flush().expect("flush"))
+
+    let m = recv(mut c)
+    assert_eq(m.id, reg)
+    var r = c.reader(m)
+    assert_eq(r.u32(c), u32(7))
+    assert_eq(r.i32(c), i32(-3))
+    assert_eq(r.fixed(c), 1.5)
+    assert_eq(r.str(c), "wl_compositor")
+    assert(r.opt_str(c).is_none())
+    assert_eq(r.array(c), arr)
+    assert_eq(r.object(c, 1, false), u32(1))
+    var got = r.fd(mut c)
+    assert(r.finish(mut c, m).is_ok())
+    assert_eq(os.size(got.raw()).expect("size"), 4096)
+}
+
+test "descriptors beyond one sendmsg arrive with their messages" {
+    var (l, s, c) = pair()
+    let reg = c.alloc(2, 1)
+    var w = c.begin(1, 1, 12)
+    w.u32(mut c, reg)
+    discard c.flush()
+    let m = recv(mut s)
+    var r = s.reader(m)
+    discard r.new_id(mut s, 2, 1)
+    // 40 messages, each with a descriptor of its own size.
+    var made: List[int] = []
+    for i in 0..40 {
+        let f = os.memfd("fd{i}", 4096 * (i + 1)).expect("memfd")
+        made.push(f)
+        var e = s.begin(reg, 1, 12)
+        e.u32(mut s, u32(i))
+        s.put_fd(f)
+    }
+    for f in made {
+        os.close(f)
+    }
+    for _ in 0..10 {
+        if s.flush().expect("flush") {
+            break
+        }
+    }
+    for i in 0..40 {
+        let m = recv(mut c)
+        var r = c.reader(m)
+        assert_eq(r.u32(c), u32(i))
+        var f = r.fd(mut c)
+        assert(r.finish(mut c, m).is_ok())
+        assert_eq(os.size(f.raw()).expect("size"), 4096 * (i + 1))
+    }
+}
+
+test "destroyed client ids come back through delete_id" {
+    var (l, s, c) = pair()
+    let a = c.alloc(2, 1)
+    var w = c.begin(1, 1, 12)
+    w.u32(mut c, a)
+    discard c.flush()
+    let m = recv(mut s)
+    var r = s.reader(m)
+    discard r.new_id(mut s, 2, 1)
+    // The client destroys `a`: it stays reserved until the server says so.
+    c.remove(a)
+    assert_eq(c.iface(a), u16(0))
+    assert_eq(c.alloc(2, 1), u32(3))
+    s.remove(a)
+    assert_eq(s.iface(a), u16(0))
+    discard s.flush()
+    let d = recv(mut c)
+    assert_eq(d.id, u32(1))
+    assert_eq(d.op, u16(1))
+    assert_eq(c.alloc(2, 1), a)
+    // A server takes a client's new id only if it is the next or a freed one.
+    assert(not s.insert(9, 2, 1))
+    assert(s.insert(a, 2, 1))
+}
+
+test "a request to an unknown object is a protocol error the client sees" {
+    var (l, s, c) = pair()
+    var w = c.begin(99, 0, 8)
+    discard w
+    discard c.flush()
+    discard s.read()
+    match s.next() {
+        Err(wire.Error.Protocol(o, code, _)) => {
+            assert_eq(o, u32(1))
+            assert_eq(code, wire.invalid_object)
+        }
+        _ => panic("expected a protocol error")
+    }
+    // The error goes out, then the connection is done.
+    assert(s.flush().is_err())
+    let m = recv(mut c)
+    assert_eq(m.id, u32(1))
+    assert_eq(m.op, u16(0))
+    var r = c.reader(m)
+    assert_eq(r.u32(c), u32(1))
+    assert_eq(r.u32(c), wire.invalid_object)
+    assert_eq(r.str(c), "invalid object 99")
+}
+
+test "a peer that stops reading is dropped, not buffered forever" {
+    var (l, s, c) = pair()
+    var closed = false
+    for i in 0..400000 {
+        var e = s.begin(1, 1, 12)
+        e.u32(mut s, u32(i))
+        if i % 64 == 0 {
+            match s.flush() {
+                Err(wire.Error.Closed) => {
+                    closed = true
+                    break
+                }
+                _ => {}
+            }
+        }
+    }
+    assert(closed)
+    discard c
+}
+
+test "fixed point" {
+    assert_eq(wire.codec.fixed_from_f64(1.0), i32(256))
+    assert_eq(wire.codec.fixed_from_f64(-0.5), i32(-128))
+    assert_eq(wire.codec.fixed_to_f64(i32(384)), 1.5)
+}

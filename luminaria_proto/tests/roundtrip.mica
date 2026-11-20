@@ -1,0 +1,156 @@
+// Generated client and server code against each other: typed requests and
+// events, version gates both ways, destructor events with delete_id, and
+// events to destroyed objects being dropped.
+
+import std.env
+import std.fs
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.ifaces as ifaces
+import luminaria_proto.wayland as wl
+
+fn pair() -> (wire.Listener, wire.Conn, wire.Conn) {
+    let dir = fs.create_temp_dir("luminaria-roundtrip").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let l = wire.listen("").expect("listen")
+    let client = wire.connect(l.name).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some(server)) = l.accept() {
+            return (l, server, client)
+        }
+    }
+    panic("accept")
+}
+
+fn request(mut s: wire.Conn, mut c: wire.Conn) -> proto.Request {
+    discard c.flush()
+    for _ in 0..1000 {
+        match proto.next(mut s) {
+            Ok(Some(r)) => {
+                return r
+            }
+            Ok(None) => {
+                discard s.read()
+            }
+            Err(e) => panic("server: {e}")
+        }
+    }
+    panic("no request")
+}
+
+fn event(mut s: wire.Conn, mut c: wire.Conn) -> Option[proto.Event] {
+    discard s.flush()
+    for _ in 0..50 {
+        match proto.next_event(mut c) {
+            Ok(Some(e)) => {
+                return Some(e)
+            }
+            Ok(None) => {
+                discard c.read()
+            }
+            Err(e) => panic("client: {e}")
+        }
+    }
+    return None
+}
+
+/// The client binds wl_compositor at `version` and makes a surface.
+fn surface(mut s: wire.Conn, mut c: wire.Conn, version: u32) -> wl.Surface {
+    let reg = wl.Display { id: 1 }.get_registry(mut c)
+    discard request(mut s, mut c)
+    let id = reg.bind(mut c, 1, wl.compositor_iface, version)
+    match request(mut s, mut c) {
+        WlRegistry(_, Bind(1, obj)) => assert_eq(obj.version, version)
+        _ => panic("expected bind")
+    }
+    let surf = wl.Compositor { id }.create_surface(mut c)
+    match request(mut s, mut c) {
+        WlCompositor(_, CreateSurface(made)) => assert_eq(made, surf)
+        _ => panic("expected create_surface")
+    }
+    return surf
+}
+
+test "requests and events through the generated API" {
+    var (l, s, c) = pair()
+    let surf = surface(mut s, mut c, 6)
+    surf.damage_buffer(mut c, 1, 2, 30, 40)
+    match request(mut s, mut c) {
+        WlSurface(t, DamageBuffer(1, 2, 30, 40)) => assert_eq(t, surf)
+        _ => panic("expected damage_buffer")
+    }
+    // Server to client: an event at the surface's version.
+    surf.preferred_buffer_scale(mut s, 2)
+    match event(mut s, mut c) {
+        Some(WlSurface(_, PreferredBufferScale(2))) => {}
+        _ => panic("expected preferred_buffer_scale")
+    }
+    assert_eq(ifaces.name(wl.surface_iface), "wl_surface")
+    assert_eq(ifaces.by_name("xdg_toplevel"), proto.xdg_shell.toplevel_iface)
+}
+
+test "versions gate requests and events" {
+    var (l, s, c) = pair()
+    let surf = surface(mut s, mut c, 4)
+    // preferred_buffer_scale is version 6: not sent to a version 4 object.
+    surf.preferred_buffer_scale(mut s, 2)
+    assert(not s.pending())
+    // offset is version 5: a version 4 object may not send it.
+    var w = c.begin(surf.id, 10, 16)
+    w.i32(mut c, 0)
+    w.i32(mut c, 0)
+    discard c.flush()
+    var failed = false
+    for _ in 0..1000 {
+        match proto.next(mut s) {
+            Err(wire.Error.Protocol(o, code, _)) => {
+                assert_eq(o, surf.id)
+                assert_eq(code, wire.invalid_method)
+                failed = true
+                break
+            }
+            Ok(None) => {
+                discard s.read()
+            }
+            _ => panic("expected a protocol error")
+        }
+    }
+    assert(failed)
+}
+
+test "a destructor event frees the id through delete_id" {
+    var (l, s, c) = pair()
+    let cb = wl.Display { id: 1 }.sync(mut c)
+    match request(mut s, mut c) {
+        WlDisplay(_, Sync(got)) => got.done(mut s, 5)
+        _ => panic("expected sync")
+    }
+    // done, then delete_id: the id is free on both ends.
+    match event(mut s, mut c) {
+        Some(WlCallback(got, Done(5))) => assert_eq(got, cb)
+        _ => panic("expected done")
+    }
+    match event(mut s, mut c) {
+        Some(WlDisplay(_, DeleteId(id))) => assert_eq(id, cb.id)
+        _ => panic("expected delete_id")
+    }
+    assert_eq(s.iface(cb.id), u16(0))
+    assert_eq(wl.Display { id: 1 }.sync(mut c).id, cb.id)
+}
+
+test "events to an object the client destroyed are dropped" {
+    var (l, s, c) = pair()
+    let surf = surface(mut s, mut c, 6)
+    // The server sends before it sees the destroy.
+    surf.preferred_buffer_scale(mut s, 3)
+    surf.destroy(mut c)
+    match request(mut s, mut c) {
+        WlSurface(_, Destroy) => {}
+        _ => panic("expected destroy")
+    }
+    // The scale event is read and dropped; delete_id comes through.
+    match event(mut s, mut c) {
+        Some(WlDisplay(_, DeleteId(id))) => assert_eq(id, surf.id)
+        _ => panic("expected only delete_id")
+    }
+}

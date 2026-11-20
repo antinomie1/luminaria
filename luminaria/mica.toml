@@ -1,0 +1,10 @@
+[package]
+name = "luminaria"
+version = "0.1.0"
+description = "A library for writing Wayland compositors: mechanism, no policy"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+luminaria_server = { workspace = true }
+luminaria_backend = { workspace = true }
+luminaria_compose = { workspace = true }
