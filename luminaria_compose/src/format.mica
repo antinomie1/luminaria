@@ -3,11 +3,12 @@
 // steps the compositor's client textures are made with.
 
 import vk_gpu as gpu
+import luminaria_types.buffer as fourcc
 
-pub let argb8888: u32 = 0x34325241
-pub let xrgb8888: u32 = 0x34325258
-pub let abgr8888: u32 = 0x34324241
-pub let xbgr8888: u32 = 0x34324258
+pub let argb8888 = fourcc.argb8888
+pub let xrgb8888 = fourcc.xrgb8888
+pub let abgr8888 = fourcc.abgr8888
+pub let xbgr8888 = fourcc.xbgr8888
 
 /// The Vulkan format a fourcc samples as, and whether alpha is ignored.
 pub fn vk_format(fourcc: u32) -> Option[(gpu.Format, bool)] {
@@ -18,15 +19,6 @@ pub fn vk_format(fourcc: u32) -> Option[(gpu.Format, bool)] {
         return Some((gpu.Format.R8G8B8A8_UNORM, fourcc == xbgr8888))
     }
     return None
-}
-
-/// The GPU's DRM device number (dev_t, as linux-dmabuf feedback names
-/// it), 0 when it has no DRM node.
-pub fn device_id(dev: gpu.Device) -> u64 {
-    guard let Some((major, minor)) = dev.drm_node() else {
-        return 0
-    }
-    return u64(major) << 8 | u64(minor & 0xff) | (u64(minor & ~0xff) << 12)
 }
 
 /// Every fourcc and modifier the GPU samples dmabufs of (linux-dmabuf's

@@ -1,11 +1,11 @@
 [package]
 name = "luminaria_compose"
 version = "0.1.0"
-description = "Composition on vk_compose: placement diffs into damage, client buffer textures, fences, compositor clock"
+description = "The Vulkan renderer on vk_compose: placement diffs into damage, client and compositor textures, render targets"
 license = "Apache-2.0 OR BSD-2-Clause"
 
 [dependencies]
 vk_gpu = { workspace = true }
 vk_draw2d = { workspace = true }
 vk_compose = { workspace = true }
-libdrm_sys = { workspace = true }
+luminaria_types = { workspace = true }

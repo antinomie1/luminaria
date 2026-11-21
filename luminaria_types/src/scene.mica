@@ -1,0 +1,32 @@
+// What a renderer shows: placements, back to front, in output pixels.
+// Textures are named by key; the renderer owns them.
+
+pub struct Rect {
+    pub x: f32 = 0.0
+    pub y: f32 = 0.0
+    pub w: f32 = 0.0
+    pub h: f32 = 0.0
+}
+
+/// One thing to show: a texture placed on an output.
+pub struct Placement {
+    /// Stable identity (a surface, a compositor image): a key keeps its
+    /// view, so only what changes is damaged.
+    pub key: u64 = 0
+    /// The texture's key (a client buffer, an shm surface, an image).
+    pub tex: u64 = 0
+    /// Where, in output pixels.
+    pub x: f32 = 0.0
+    pub y: f32 = 0.0
+    pub w: f32 = 0.0
+    pub h: f32 = 0.0
+    /// Part of the texture (pixels of the upright picture); empty: all.
+    pub src: Rect = Rect {}
+    /// wl_output.transform the texture is turned by.
+    pub transform: u32 = 0
+    pub opacity: f32 = 1.0
+    pub radius: f32 = 0.0
+    pub shadow: f32 = 0.0
+    /// Opaque part, relative to x, y.
+    pub opaque: Rect = Rect {}
+}

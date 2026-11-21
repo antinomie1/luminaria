@@ -5,7 +5,7 @@
 // methods, outputs, shm, dmabuf and single-pixel buffers, explicit sync,
 // presentation and frame timing, selections and drag and drop, idle
 // notification, screen capture, sandboxes (security-context) and output
-// configuration.
+// configuration, and protocol extensions added at run time.
 // Buffers and damage come out as plain data; requests that need a
 // decision come out as events.
 
@@ -14,6 +14,7 @@ pub import server
 pub import state
 pub import xdg
 pub import positioner
+pub import ext
 
 pub type Server = server.Server
 pub type Event = server.Event

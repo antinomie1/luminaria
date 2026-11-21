@@ -85,7 +85,7 @@ fn decode_registry(mut conn: wire.Conn, m: wire.Msg) -> Result[RegistryRequest, 
             let name = rd.u32(conn)
             let id_iface = rd.str(conn)
             let id_version = rd.u32(conn)
-            let id = rd.new_object(mut conn, ifaces.by_name(id_iface), id_version)
+            let id = rd.new_object(mut conn, conn.resolve(ifaces.by_name(id_iface), id_iface), id_version)
             try rd.finish(mut conn, m)
             return Ok(RegistryRequest.Bind(name, id))
         }

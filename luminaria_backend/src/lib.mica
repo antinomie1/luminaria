@@ -2,17 +2,18 @@
 // commits, planes and their formats, page flips, hotplug), a nested Wayland
 // backend and a headless one; seat sessions through libseat, input devices
 // through libinput, keymaps through xkbcommon. Frames are requested, never
-// polled: an idle output costs no wakeups. Every backend presents through
-// the same calls: `acquire` a frame, draw, `present` it with the changed
-// rectangles (KMS FB_DAMAGE_CLIPS, a parent's damage), or `scanout` a
-// client's buffer directly.
+// polled: an idle output costs no wakeups. No GPU here: the renderer makes
+// the images outputs show. `acquire` names the image to draw into (or the
+// render targets the output needs first, which `give` hands back), and
+// `present` shows it with the renderer's fence and the changed rectangles
+// (KMS IN_FENCE_FD and FB_DAMAGE_CLIPS, a parent's implicit fence and
+// damage); `scanout` shows a client's dmabuf directly.
 
 import std.env
 import std.os
-import vk_gpu as gpu
 import libudev_sys as udev
 import libdrm_sys.uapi as uapi
-pub import types
+import luminaria_types as types
 pub import keyboard
 pub import xkbcommon_sys.keysym as keysym
 import session
@@ -34,22 +35,11 @@ pub type Input = types.Input
 pub type Event = types.Event
 pub type AxisSource = types.AxisSource
 pub type DeviceDesc = types.DeviceDesc
-pub type Names = keyboard.Names
-pub type Mods = keyboard.Mods
-pub type InputConfig = input.Config
+pub type Names = types.Names
+pub type Mods = types.Mods
+pub type InputConfig = types.InputConfig
 
-pub let presented_vsync = types.presented_vsync
-pub let presented_hw_clock = types.presented_hw_clock
-pub let presented_hw_completion = types.presented_hw_completion
-pub let presented_zero_copy = types.presented_zero_copy
-
-pub enum Kind {
-    /// Nested when WAYLAND_DISPLAY is set, else DRM.
-    Auto
-    Drm
-    Nested
-    Headless
-}
+pub type Kind = types.OutputKind
 
 pub struct Options {
     pub kind: Kind = Kind.Auto
@@ -92,11 +82,8 @@ pub struct Backend {
     active: bool = true
     /// Slot index each output's acquired frame uses.
     acquired: List[int] = []
-}
-
-/// A backend with nothing behind it (a placeholder to move one out).
-pub fn Backend.none() -> Backend {
-    return Backend { kind: Kind.Headless }
+    /// Render targets let go of, for the renderer to free.
+    retired: List[u64] = []
 }
 
 pub fn Backend.open(o: Options) -> Result[Backend, str] {
@@ -426,52 +413,84 @@ pub fn Backend.can_present(self, o: u32) -> bool {
     return false
 }
 
-/// The next image to draw output `o` into, or None when every buffer is
-/// in use.
-pub fn Backend.acquire(mut self, o: u32, mut dev: gpu.Device) -> Result[Option[gpu.Frame], str] {
+/// The image to draw output `o` into, Busy when every one is in use, or
+/// the render targets the output needs first.
+pub fn Backend.acquire(mut self, o: u32) -> types.Acquire {
     let oi = int(o)
-    var pick: Option[(int, u32, gpu.Texture)] = None
+    var pick: Option[(int, u32, u64)] = None
     if let Some(dd) = self.drm.take() {
         var d = dd
-        let r = d.prepare(oi, mut dev, self.buffers)
-        if r.is_ok() {
+        let want = d.prepare(oi, self.buffers, mut self.retired)
+        if want.is_none() {
             if let Some(s) = d.outputs[oi].swap {
                 if let Some((i, age)) = s.acquire() {
-                    pick = Some((i, age, s.slots[i].tex))
+                    pick = Some((i, age, s.slots[i].key))
                 }
             }
         }
         self.drm = Some(d)
-        try r
+        if let Some(w) = take want {
+            return types.Acquire.Need(w)
+        }
     } else if let Some(nn) = self.nested.take() {
         var n = nn
         // The parent holds the shown buffer and may hold the queued one.
-        let r = n.prepare(mut dev, max(self.buffers, 3))
-        if r.is_ok() {
+        let want = n.prepare(max(self.buffers, 3), mut self.retired)
+        if want.is_none() {
             if let Some(s) = n.swap {
                 if let Some((i, age)) = s.acquire() {
-                    pick = Some((i, age, s.slots[i].tex))
+                    pick = Some((i, age, s.slots[i].key))
                 }
             }
         }
         self.nested = Some(n)
-        try r
-    } else if let Some(hh) = self.headless.take() {
-        var h = hh
-        let r = h.prepare(oi, mut dev, self.buffers)
-        if r.is_ok() {
-            if let Some((i, age)) = h.acquire(oi) {
-                pick = Some((i, age, h.outs[oi].slots[i]))
-            }
+        if let Some(w) = take want {
+            return types.Acquire.Need(w)
         }
-        self.headless = Some(h)
-        try r
+    } else if let Some(h) = self.headless {
+        if let Some(w) = h.prepare(oi, self.buffers) {
+            return types.Acquire.Need(w)
+        }
+        if let Some((i, age)) = h.acquire(oi) {
+            pick = Some((i, age, h.outs[oi].slots[i]))
+        }
     }
-    guard let Some((i, age, tex)) = pick else {
-        return Ok(None)
+    guard let Some((i, age, key)) = pick else {
+        return types.Acquire.Busy
     }
     self.acquired[oi] = i
-    return Ok(Some(gpu.Frame.new(tex, age)))
+    return types.Acquire.Draw(key, age)
+}
+
+/// The render targets output `o` asked for.
+pub fn Backend.give(mut self, o: u32, ts: &[types.Target]) -> Result[(), str] {
+    let oi = int(o)
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        let r = d.give(oi, ts)
+        self.drm = Some(d)
+        return r
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        n.give(ts)
+        self.nested = Some(n)
+        return Ok(())
+    }
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        h.give(oi, ts)
+        self.headless = Some(h)
+    }
+    return Ok(())
+}
+
+/// Render targets no output uses any more (the renderer frees them).
+pub fn Backend.retired(mut self, mut out: List[u64]) {
+    for k in self.retired {
+        out.push(k)
+    }
+    self.retired.clear()
 }
 
 fn to_clips(rects: &[Rect]) -> List[uapi.ModeRect] {
@@ -482,19 +501,21 @@ fn to_clips(rects: &[Rect]) -> List[uapi.ModeRect] {
     return out
 }
 
-/// Submit the frame's drawing and show it; `rects` is what changed
-/// (empty: everything), `tear` lets a full-screen game flip immediately.
-pub fn Backend.present(mut self, o: u32, mut dev: gpu.Device, take e: gpu.Encoder, rects: &[Rect], tear: bool) -> Result[(), str] {
+/// Show the acquired image once `fence` (a sync_file the output closes;
+/// -1: none) signals; `rects` is what changed (empty: everything), `tear`
+/// lets a full-screen game flip immediately.
+pub fn Backend.present(mut self, o: u32, fence: int, rects: &[Rect], tear: bool) -> Result[(), str] {
     let oi = int(o)
     let i = self.acquired[oi]
     guard i >= 0 else {
-        dev.cancel(take e)
+        if fence >= 0 {
+            os.close(fence)
+        }
         return Err("present without acquire")
     }
     self.acquired[oi] = -1
     if let Some(dd) = self.drm.take() {
         var d = dd
-        let (_, fence) = try dev.submit_sync_file(take e)
         var fb: u32 = 0
         if let Some(s) = d.outputs[oi].swap {
             fb = s.slots[i].id
@@ -518,35 +539,37 @@ pub fn Backend.present(mut self, o: u32, mut dev: gpu.Device, take e: gpu.Encode
     }
     if let Some(nn) = self.nested.take() {
         var n = nn
-        let r = dev.submit_sync_file(take e)
-        match r {
-            Ok((_, fence)) => n.present(i, fence, rects)
-            Err => {}
-        }
+        n.present(i, fence, rects)
         n.flush()
         self.nested = Some(n)
-        discard try r
         return Ok(())
+    }
+    if fence >= 0 {
+        os.close(fence)
     }
     if let Some(hh) = self.headless.take() {
         var h = hh
-        let r = dev.submit(take e)
-        if r.is_ok() {
-            h.present(oi, i)
-        }
+        h.present(oi, i)
         self.headless = Some(h)
-        discard try r
-        return Ok(())
     }
-    dev.cancel(take e)
     return Ok(())
 }
 
 /// A client's dmabuf to show on `o` as is (it fills the output, opaque,
 /// unscaled): framebuffer import, an atomic test, then the flip. False
 /// when the display cannot take it (compose instead).
-pub fn Backend.scanout(mut self, o: u32, key: u64, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32, rects: &[Rect], tear: bool) -> bool {
+pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rect], tear: bool) -> bool {
+    guard b.planes == 1 else {
+        return false
+    }
     let oi = int(o)
+    let fd = b.plane[0].fd
+    let width = u32(b.width)
+    let height = u32(b.height)
+    let format = b.format
+    let modifier = b.modifier
+    let offset = b.plane[0].offset
+    let stride = b.plane[0].stride
     if let Some(dd) = self.drm.take() {
         var d = dd
         var fb: u32 = 0
@@ -623,8 +646,8 @@ pub fn Backend.forget(mut self, key: u64) {
     }
 }
 
-/// What a headless output shows (tests, screenshots).
-pub fn Backend.shown(self, o: u32) -> Option[gpu.Texture] {
+/// The render target a headless output shows (tests, screenshots).
+pub fn Backend.shown(self, o: u32) -> Option[u64] {
     if let Some(h) = self.headless {
         return h.shown(int(o))
     }
@@ -758,18 +781,37 @@ pub fn Backend.scanout_modifiers(self, o: u32) -> List[u64] {
     return none
 }
 
-/// Release every GPU resource (before the device goes away).
-pub fn Backend.shutdown(mut self, mut dev: gpu.Device) {
+/// Let go of every render target (their keys go to `retired`, for the
+/// renderer to free) before the renderer goes away.
+pub fn Backend.shutdown(mut self, mut retired: List[u64]) {
+    self.retired(mut retired)
     if let Some(dd) = self.drm.take() {
         var d = dd
-        d.release(mut dev)
+        d.release(mut retired)
         self.drm = Some(d)
     }
     if let Some(nn) = self.nested.take() {
         var n = nn
-        n.release(mut dev)
+        n.release(mut retired)
         self.nested = Some(n)
     }
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        h.release(mut retired)
+        self.headless = Some(h)
+    }
+}
+
+/// Whether the output paces frames itself (a parent compositor's frame
+/// callbacks): then a frame starts as soon as one may, not by a clock.
+pub fn Backend.paced(self) -> bool {
+    return self.kind == Kind.Nested
+}
+
+/// Whether outputs take any mode they list (KMS); otherwise only the
+/// current one.
+pub fn Backend.sets_modes(self) -> bool {
+    return self.kind == Kind.Drm
 }
 
 /// The displays connected to DRM card `path` ("" for the default card),

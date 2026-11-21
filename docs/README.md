@@ -18,8 +18,9 @@ luminaria 是用来写 Wayland 合成器的库：协议状态、合成、设备�
 
 ```
 luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_wire
-           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu
-           └─ luminaria_backend ── vk_gpu, sys/*；luminaria_proto（仅嵌套）
+           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu   （特性 vulkan）
+           └─ luminaria_backend ── sys/*；luminaria_proto（仅嵌套） （特性 backend）
+                  它们都依赖 ──── luminaria_types
 ```
 
 | 包 | 负责 | 不碰 |
@@ -27,12 +28,16 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 | 协议语义 |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的类型化接口 | 状态 |
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、seat、输出、缓冲、时序 | GPU、策略 |
-| `luminaria_compose` | 放置表比对成场景、客户端缓冲的纹理（导入、上传、释放都在这里）、栅栏、合成器时钟 | 协议、设备 |
-| `luminaria_backend` | DRM/KMS、嵌套（特性 `nested`，默认开）、无头三种输出；libseat、libinput、xkb、keysym 常量 | 协议、合成 |
-| `luminaria` | `Display`：一个事件循环把以上接起来，加上布局、输入路由、操纵快速路径 | 策略 |
+| `luminaria_types` | 各层交换的纯数据：dmabuf、fourcc、放置、输出描述、输入、渲染目标 | 一切行为 |
+| `luminaria_compose` | Vulkan 渲染器：持有设备和所有纹理（客户端缓冲、合成器图像、渲染目标），放置表比对成场景、只画损坏 | 协议、显示 |
+| `luminaria_backend` | DRM/KMS、嵌套（特性 `nested`，默认开）、无头三种输出；libseat、libinput、xkb、keysym 常量 | 协议、GPU |
+| `luminaria` | `Display[O, R]`：一个事件循环把服务端、输出端 `O`、渲染器 `R` 接起来，加上布局、输入路由、操纵快速路径、帧时钟、栅栏 | 策略 |
 
-server、compose、backend 之间互不依赖，只交换纯数据，由门面 `luminaria` 接线。所以每一层都能单独
-测试，也能单独拿去用（例如只要协议层写测试桩）。
+server、compose、backend 之间互不依赖，只交换 `luminaria_types` 里的纯数据，由门面 `luminaria` 接线。
+所以每一层都能单独测试、单独拿去用，也能整层换掉：输出端和渲染器是 `plug.mica` 里的两个结构化 trait，
+有同名方法的类型就能接上（`display.Display.with`），`Display` 单态化，没有间接调用；可选能力带默认实现。
+输出端和渲染器之间只有一条约定：输出端要渲染目标（`Acquire.Need(Want)`），渲染器造出来（导出成 dmabuf），
+每帧画进其中一个并交回 sync_file，输出端拿它显示。服务端不懂的协议可以在运行时按签名加上。
 
 ## 核心决策
 
@@ -43,6 +48,7 @@ server、compose、backend 之间互不依赖，只交换纯数据，由门面 `
 | 客户端栅栏 | 渲染路径上 CPU 和 GPU 都不等；栅栏 fd 进事件循环，就绪才生效 | 一个慢应用拖不住整帧，没就绪的缓冲继续显示上一帧 |
 | 出帧方式 | 库来选：不出帧 → 直接扫描输出 → 合成 | 对策略层不可见，总选最省的 |
 | 帧驱动 | 有东西要显示才按时钟定时 | 空闲零唤醒 |
+| 可插拔 | 输出端、渲染器是结构化 trait，`Display` 单态化；两者只交换渲染目标和栅栏 | 换层不付运行时代价；后端不碰 GPU |
 | 线程 | 一个线程 | 边缘设备上最省；放置表与帧数据都是纯数据，需要时再拆出合成线程不改接口 |
 
 ## 一帧和一次输入

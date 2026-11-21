@@ -15,10 +15,9 @@ import luminaria_proto.wayland as wl
 import luminaria_proto.xdg_shell as xdg
 import luminaria_proto.xdg_decoration_unstable as deco
 import luminaria_proto.linux_dmabuf as dmabuf
-import vk_gpu as gpu
 import keyboard
 import swap
-import types
+import luminaria_types as types
 
 /// Built in (nested_off.mica stands in without the `nested` feature).
 let available = true
@@ -302,27 +301,32 @@ fn Nested.wrap(mut self, fd: int, width: u32, height: u32, format: u32, modifier
     return b.id
 }
 
-fn Nested.prepare(mut self, mut dev: gpu.Device, count: int) -> Result[(), str] {
+/// Render targets the window needs before it can draw (None: it has
+/// them, of its size): linear, which every parent can import. Old ones'
+/// keys go to `retired`.
+fn Nested.prepare(mut self, count: int, mut retired: List[u64]) -> Option[types.Want] {
     if self.resized {
         if let Some(s) = self.swap.take() {
             for sl in s.slots {
                 wl.Buffer { id: sl.id }.destroy(mut self.c)
             }
-            s.destroy(mut dev)
+            s.keys(mut retired)
         }
         self.resized = false
     }
     guard self.swap.is_none() else {
-        return Ok(())
+        return None
     }
-    let linear: [1]u64 = [0]
-    var s = try swap.create(mut dev, u32(self.width), u32(self.height), gpu.Format.B8G8R8A8_UNORM, linear, count)
+    return Some(types.Want { width: self.width, height: self.height, format: types.buffer.xrgb8888, modifiers: [0], count })
+}
+
+fn Nested.give(mut self, ts: &[types.Target]) {
+    var s = swap.create(self.width, self.height, ts)
     for i in 0..s.slots.len() {
         let b = s.slots[i].buf
-        s.slots[i].id = self.wrap(b.fd, b.width, b.height, 0x34325258, b.modifier, u32(b.offset), u32(b.stride))
+        s.slots[i].id = self.wrap(b.plane[0].fd, u32(b.width), u32(b.height), types.buffer.xrgb8888, b.modifier, b.plane[0].offset, b.plane[0].stride)
     }
     self.swap = Some(s)
-    return Ok(())
 }
 
 fn Nested.damage(mut self, rects: &[(i32, i32, i32, i32)]) {
@@ -342,7 +346,7 @@ fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) 
     var s = sw
     let buf = s.slots[i].id
     if fence >= 0 {
-        discard import_fence(s.slots[i].buf.fd, fence)
+        discard import_fence(s.slots[i].buf.plane[0].fd, fence)
         os.close(fence)
     }
     s.queued(i)
@@ -438,8 +442,8 @@ fn Nested.show_cursor(mut self) {
     self.pointer.set_cursor(mut self.c, self.enter_serial, s, self.hot_x, self.hot_y)
 }
 
-fn Nested.release(mut self, mut dev: gpu.Device) {
+fn Nested.release(mut self, mut retired: List[u64]) {
     if let Some(s) = self.swap.take() {
-        s.destroy(mut dev)
+        s.keys(mut retired)
     }
 }

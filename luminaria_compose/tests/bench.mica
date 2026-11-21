@@ -3,24 +3,33 @@
 // --release on the target device.
 
 import std.io
+import std.net
+import std.os
 import std.time
-import vk_gpu as gpu
+import luminaria_types as types
 import luminaria_compose as compose
 
 test "frame cost with damage and occlusion" {
-    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true }) else {
+    guard let Ok(cc) = compose.Compositor.open(false) else {
         return
     }
-    var dev = d
-    var out = gpu.Offscreen.create(mut dev, 1920, 1080, gpu.Format.B8G8R8A8_UNORM).unwrap()
-    var c = compose.Compositor.new(mut dev).unwrap()
-    c.add_output(0, 1920, 1080, 60000, vec4(0.1, 0.1, 0.1, 1.0))
-    let tex = compose.format.shm_texture(mut dev, 300, 200, compose.format.xrgb8888).unwrap()
-    var ps: List[compose.Placement] = []
+    var c = cc
+    c.add_output(0, 1920, 1080, vec4(0.1, 0.1, 0.1, 1.0))
+    let t = c.targets(types.Want { width: 1920, height: 1080, count: 1, export: false }).unwrap()[0].key
+    var px: List[u8] = []
+    for _ in 0..300 * 200 {
+        for b in [u8(40), 80, 120, 255] {
+            px.push(b)
+        }
+    }
+    assert(c.image(9, 300, 200, types.buffer.xrgb8888, px, 1200))
+    var ps: List[types.Placement] = []
     for i in 0..50 {
-        ps.push(compose.Placement { key: u64(i + 1), tex, x: f32((i % 10) * 180), y: f32((i / 10) * 200), w: 300.0, h: 200.0, radius: 8.0, shadow: 16.0 })
+        ps.push(types.Placement { key: u64(i + 1), tex: 9, x: f32((i % 10) * 180), y: f32((i / 10) * 200), w: 300.0, h: 200.0, radius: 8.0, shadow: 16.0 })
     }
     c.layout(0, ps)
+    var poll = net.poller().unwrap()
+    var evs: List[net.Event] = []
     let frames = 300
     var cpu = 0
     var total = 0
@@ -28,14 +37,17 @@ test "frame cost with damage and occlusion" {
         ps[49].x = f32(k % 600)
         c.layout(0, ps)
         let t0 = time.now_ns()
-        let f = out.acquire(mut dev).unwrap().unwrap()
-        var e = dev.encoder().unwrap()
-        discard c.render(0, mut dev, mut e, f).unwrap()
-        let ticket = out.present(mut dev, f, take e).unwrap()
+        let fence = c.render(0, t, if k == 0 { u32(0) } else { u32(1) }).unwrap()
         let t1 = time.now_ns()
-        dev.wait(ticket).unwrap()
+        if let Some(f) = fence {
+            discard poll.add(f, 1, true, false)
+            discard poll.wait(mut evs, 1000)
+            discard poll.remove(f)
+            os.close(f)
+        }
         cpu += t1 - t0
         total += time.now_ns() - t0
     }
     io.print("frame, 50 windows, one moving: {cpu / frames / 1000} us CPU, {total / frames / 1000} us until the GPU is done")
+    c.close()
 }

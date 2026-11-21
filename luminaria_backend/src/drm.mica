@@ -10,13 +10,12 @@ import std.env
 import std.fs
 import std.os
 import std.str
-import vk_gpu as gpu
 import libdrm_sys as drm
 import libdrm_sys.uapi as uapi
 import libudev_sys as udev
 import session
 import swap
-import types
+import luminaria_types as types
 
 struct Props {
     names: List[str] = []
@@ -467,39 +466,38 @@ fn Drm.rm_fb(self, id: u32) {
     }
 }
 
-/// Scanout buffers for output `o` laid out the way its primary plane and
-/// the GPU agree on.
-fn Drm.prepare(mut self, o: int, mut dev: gpu.Device, count: int) -> Result[(), str] {
-    let w = u32(self.outputs[o].mode.hdisplay)
-    let h = u32(self.outputs[o].mode.vdisplay)
+/// What output `o` needs before it can draw: None when its scanout
+/// buffers are there (and of the mode's size), else render targets laid
+/// out the way its primary plane can scan them out. Old buffers' keys go
+/// to `retired`.
+fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[types.Want] {
+    let w = i32(self.outputs[o].mode.hdisplay)
+    let h = i32(self.outputs[o].mode.vdisplay)
     // A new mode needs buffers of its size.
     if let Some(old) = self.outputs[o].swap.take() {
         if old.width == w and old.height == h {
             self.outputs[o].swap = Some(old)
-            return Ok(())
+            return None
         }
         for sl in old.slots {
             self.rm_fb(sl.id)
         }
-        old.destroy(mut dev)
+        old.keys(mut retired)
         self.outputs[o].shown = -1
         self.outputs[o].queued = -1
     }
-    let gpu_mods = dev.dmabuf_modifiers(gpu.Format.B8G8R8A8_UNORM, true)
     let plane = self.outputs[o].primary
-    var mods: List[u64] = []
-    for m in self.planes[plane].xrgb {
-        if gpu_mods.contains(m) {
-            mods.push(m)
-        }
-    }
-    if mods.is_empty() {
-        mods.push(0)
-    }
-    var s = try swap.create(mut dev, w, h, gpu.Format.B8G8R8A8_UNORM, mods, count)
+    return Some(types.Want { width: w, height: h, format: types.buffer.xrgb8888, modifiers: self.planes[plane].xrgb.clone(), count })
+}
+
+/// Output `o`'s scanout buffers: framebuffers for the targets made.
+fn Drm.give(mut self, o: int, ts: &[types.Target]) -> Result[(), str] {
+    let w = i32(self.outputs[o].mode.hdisplay)
+    let h = i32(self.outputs[o].mode.vdisplay)
+    var s = swap.create(w, h, ts)
     for i in 0..s.slots.len() {
         let b = s.slots[i].buf
-        s.slots[i].id = try self.add_fb(b.fd, w, h, u32(uapi.drm_format_xrgb8888), b.modifier, u32(b.offset), u32(b.stride))
+        s.slots[i].id = try self.add_fb(b.plane[0].fd, u32(w), u32(h), u32(uapi.drm_format_xrgb8888), b.modifier, b.plane[0].offset, b.plane[0].stride)
     }
     self.outputs[o].swap = Some(s)
     try self.make_cursor(o)
@@ -748,13 +746,13 @@ fn Drm.free_slot(mut self, o: int, i: int) {
 }
 
 /// Turn every output off (the session ends or the compositor exits).
-fn Drm.release(mut self, mut dev: gpu.Device) {
+fn Drm.release(mut self, mut retired: List[u64]) {
     for o in 0..self.outputs.len() {
         if let Some(s) = self.outputs[o].swap.take() {
             for sl in s.slots {
                 self.rm_fb(sl.id)
             }
-            s.destroy(mut dev)
+            s.keys(mut retired)
         }
         self.rm_fb(self.outputs[o].cursor_fb)
         for (_, fb) in self.outputs[o].fbs {

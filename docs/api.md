@@ -6,7 +6,7 @@
 ## 事件循环
 
 ```mica
-var d = try lum.Display.open(lum.Options {})
+var d = try lum.open(lum.Options {})
 while true {
     guard let Some(e) = try d.next() else {
         break
@@ -29,7 +29,8 @@ while true {
 
 | 接口 | 用途 |
 |---|---|
-| `Display.open(Options)` | 选后端（`Kind.Auto`：有 `WAYLAND_DISPLAY` 就嵌套，否则 DRM）、开 socket、打开 GPU |
+| `lum.open(Options)` | 内置输出端（`Kind.Auto`：有 `WAYLAND_DISPLAY` 就嵌套，否则 DRM）和 Vulkan 渲染器，开 socket |
+| `display.Display.with(Options, o, r)` | 任意输出端和渲染器（`plug.Output`、`plug.Renderer`） |
 | `socket()` | 给客户端的 `WAYLAND_DISPLAY` |
 | `next()` / `poll()` / `fd()` | 阻塞取事件 / 不阻塞取事件 / 嵌进别人的循环时要监听的 fd |
 | `watch(fd, token)` / `unwatch(fd)` | 合成器自己的 fd 进同一个循环，可读时产生 `Ready(token)` |
@@ -88,8 +89,9 @@ d.layout(fn(mut l) {
 
 - 整张放置表替换，自下而上，全局逻辑坐标。一直有效到下次调用。
 - `window` 把窗口几何的左上角放在给定位置；子表面和弹出菜单自动跟随。
-- `image` 是合成器自己的纹理（`d.image(w, h, pixels, opaque)` 创建，`update_image` 局部更新，
-  `drop_image` 释放），用于壁纸、服务端装饰、面板。
+- `image` 是合成器自己的纹理（`d.image(w, h, pixels, opaque)` 创建，`update_image(img, x, y, w, h,
+  pixels, stride)` 局部更新：`pixels` 是整幅图像，只拷 `x, y, w, h`；`drop_image` 释放），用于壁纸、
+  服务端装饰、面板。
 - `Style`：`opacity`、`radius`、`shadow`、`scale`（缩略图；输入坐标同步缩放）、`transition_ms`
   （从上一次的位置和不透明度动画过去，由库插值）。
 - 每个输出只拿到它显示的那部分；只有变化的部分被重绘。
@@ -163,7 +165,29 @@ d.end(100)
 | `set_keymap(Names)` / `mods()` | 键盘布局、当前修饰键 |
 | `read_output(o)` | 无头输出当前显示的像素（测试、截图） |
 
+## 扩展协议
+
+服务端不懂的协议按消息签名在运行时加上，不必改库：
+
+| 接口 | 用途 |
+|---|---|
+| `extend(Interface, global)` | 加一个接口（名字、版本、请求和事件的签名，同 libwayland 的 `wl_message`：`i u f s o n a h`，`?` 表示可空；请求可标 `destructor`），`global` 时成为可绑定的 global；返回它的序号 |
+| `ExtensionBound(o, version)` | 客户端绑定了它 |
+| `ExtensionRequest(o, op, args)` | 对它的对象的请求，参数按签名解码（`server.ext.Arg`）；`accept` 关掉其中的 fd |
+| `ext_send(o, op, args)` | 按签名编码发事件 |
+| `ext_new(client, k, version)` / `ext_destroy(o)` | 服务端创建对象（放进事件的 `n` 参数）/ 释放对象 |
+
+只有扩展协议的消息走这条通用路径（每条消息会分配参数表）；内置协议仍是生成的零分配代码。
+
+## 换输出端和渲染器
+
+`plug.Output` 和 `plug.Renderer` 是两个结构化 trait：类型有同名同签名的方法就满足，不用声明实现。
+`display.Display.with(o, output, renderer)` 用它们组装；`Display` 单态化，没有间接调用。必需的只有
+各自的核心方法（输出端：事件、fd、输出描述、取帧 / 给目标 / 呈现 / 退还目标；渲染器：输出、放置表、
+纹理、shm 上传、渲染目标、渲染、读回），其余是带默认实现的可选能力（直接扫描输出、光标平面、键盘、
+模式设置、dmabuf 导入、遮挡判断）。`tests/plug.mica` 是一个定时器驱动的输出端加一个软件渲染器。
+
 ## 底层
 
-`luminaria` 同时导出 `server`、`backend`、`compose`、`proto`、`wire`。要自己写协议扩展、
-自己做渲染，或只用协议层，可以绕过 `Display` 直接用下层包。
+`luminaria` 同时导出 `types`、`server`、`proto`、`wire`、`plug`、`clock`、`fence`，开着对应特性时还有
+`backend`、`compose`。只用协议层、自己做渲染或自己管设备时，可以绕过 `Display` 直接用下层包。

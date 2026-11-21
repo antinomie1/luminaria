@@ -1,0 +1,31 @@
+// luminaria_types: the plain data the layers exchange, so each layer can
+// be replaced on its own. Buffers (dmabufs, fourccs), what a renderer
+// shows (placements), and what an output reports (modes, input, frames)
+// and trades with a renderer (render targets).
+
+pub import buffer
+pub import scene
+pub import device
+
+pub type Plane = buffer.Plane
+pub type Dmabuf = buffer.Dmabuf
+pub type Rect = scene.Rect
+pub type Placement = scene.Placement
+pub type OutputKind = device.OutputKind
+pub type Names = device.Names
+pub type Mods = device.Mods
+pub type InputConfig = device.InputConfig
+pub type Mode = device.Mode
+pub type OutputDesc = device.OutputDesc
+pub type AxisSource = device.AxisSource
+pub type DeviceDesc = device.DeviceDesc
+pub type Input = device.Input
+pub type Event = device.Event
+pub type Want = device.Want
+pub type Target = device.Target
+pub type Acquire = device.Acquire
+
+pub let presented_vsync = device.presented_vsync
+pub let presented_hw_clock = device.presented_hw_clock
+pub let presented_hw_completion = device.presented_hw_completion
+pub let presented_zero_copy = device.presented_zero_copy

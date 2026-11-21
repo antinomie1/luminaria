@@ -1,0 +1,26 @@
+// The compositor clock: frames start just before the vblank they aim at,
+// and the margin adapts to late frames.
+
+import luminaria as lum
+
+test "the clock starts frames just in time and adapts to late ones" {
+    var c = lum.clock.Clock.new(60000)
+    let r = c.refresh_ns
+    // Nothing presented yet: start now.
+    assert_eq(c.start(1000), 1000)
+    c.presented(1, 1000000000)
+    // Right after a vblank: start at the next one minus the margin.
+    let s = c.start(1000000000 + 1000)
+    assert_eq(s, 1000000000 + r - c.margin_ns)
+    // Too late for the next one: the one after.
+    let late = 1000000000 + r - 1000
+    assert_eq(c.start(late), 1000000000 + 2 * r - c.margin_ns)
+    let m = c.margin_ns
+    let target = c.begin(s)
+    assert_eq(target, 1000000000 + r)
+    // It landed a vblank late: the margin grows.
+    c.presented(3, 1000000000 + 2 * r)
+    assert(c.margin_ns > m)
+    c.vrr = true
+    assert_eq(c.start(1000000000 + 2 * r + 10), 1000000000 + 3 * r - c.margin_ns)
+}

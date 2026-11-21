@@ -10,6 +10,7 @@ import server
 import surface
 import buffer
 import xdg
+import ext
 import seat
 import output
 import data
@@ -80,6 +81,7 @@ fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
 
 fn handle(mut srv: server.Server, ci: u32, take r: proto.Request) {
     match take r {
+        Extension(m) => ext.request(mut srv, ci, m)
         WlDisplay(_, req) => display(mut srv, ci, req)
         WlRegistry(reg, req) => registry(mut srv, ci, reg, req)
         WlFixes(_, req) => {
@@ -219,7 +221,7 @@ fn display(mut srv: server.Server, ci: u32, take req: wl.DisplayRequest) {
             for i in 0..srv.globals.len() {
                 let g = srv.globals[i]
                 if g.alive and srv.sees(ci, g.iface) {
-                    reg.global(mut srv.conns[int(ci)], u32(i + 1), ifaces.name(g.iface), g.version)
+                    reg.global(mut srv.conns[int(ci)], u32(i + 1), ext.name(srv, g.iface), g.version)
                 }
             }
         }
@@ -239,7 +241,7 @@ fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.Regi
                 return
             }
             guard obj.iface == g.iface and obj.version >= 1 and obj.version <= g.version else {
-                srv.fail(ci, reg.id, wire.invalid_object, "bind of global {name} as {ifaces.name(obj.iface)} v{obj.version}")
+                srv.fail(ci, reg.id, wire.invalid_object, "bind of global {name} as {ext.name(srv, obj.iface)} v{obj.version}")
                 return
             }
             guard g.alive else {
@@ -249,6 +251,7 @@ fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.Regi
             match g.kind {
                 Output(slot) => output.bound(mut srv, ci, slot, obj.id, obj.version)
                 Seat(slot) => seat.bound(mut srv, ci, slot, obj.id, obj.version)
+                Ext(k) => ext.bound(mut srv, ci, int(k), obj.id, obj.version)
                 Static => {
                     if g.iface == wl.shm_iface {
                         buffer.shm_bound(mut srv, ci, obj.id)

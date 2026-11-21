@@ -1,7 +1,7 @@
 [package]
 name = "luminaria_backend"
 version = "0.1.0"
-description = "Outputs and input devices: DRM/KMS, nested Wayland, headless; seat sessions, libinput and xkb"
+description = "Outputs and input devices: DRM/KMS, nested Wayland, headless; seat sessions, libinput and xkb; no GPU"
 license = "Apache-2.0 OR BSD-2-Clause"
 
 [dependencies]
@@ -11,8 +11,11 @@ libudev_sys = { workspace = true }
 libseat_sys = { workspace = true }
 libinput_sys = { workspace = true }
 xkbcommon_sys = { workspace = true }
-vk_gpu = { workspace = true }
+luminaria_types = { workspace = true }
 luminaria_wire = { workspace = true, optional = true }
+
+[dev-dependencies]
+luminaria_compose = { workspace = true }
 
 [features]
 default = ["nested"]

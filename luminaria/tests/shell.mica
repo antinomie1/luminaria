@@ -32,7 +32,7 @@ struct Fx {
 fn setup() -> Option[Fx] {
     let dir = fs.create_temp_dir("luminaria-shell").expect("temp dir")
     discard env.set("XDG_RUNTIME_DIR", dir)
-    match lum.Display.open(lum.Options { backend: lum.Kind.Headless, headless: [lum.Mode { width: 128, height: 96, refresh_mhz: 60000 }] }) {
+    match lum.open(lum.Options { backend: lum.Kind.Headless, headless: [lum.Mode { width: 128, height: 96, refresh_mhz: 60000 }] }) {
         Ok(d) => {
             let c = wire.connect(d.socket()).expect("connect")
             return Some(Fx { d, c })

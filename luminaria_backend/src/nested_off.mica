@@ -2,10 +2,9 @@
 // lib.mica uses, never opened, so luminaria_proto and luminaria_wire stay
 // out of the build.
 
-import vk_gpu as gpu
+import luminaria_types as types
 import keyboard
 import swap
-import types
 
 let available = false
 
@@ -34,9 +33,11 @@ fn Nested.desc(self) -> types.OutputDesc {
     return types.OutputDesc {}
 }
 
-fn Nested.prepare(mut self, mut dev: gpu.Device, count: int) -> Result[(), str] {
-    return Ok(())
+fn Nested.prepare(mut self, count: int, mut retired: List[u64]) -> Option[types.Want] {
+    return None
 }
+
+fn Nested.give(mut self, ts: &[types.Target]) {}
 
 fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) {}
 
@@ -52,4 +53,4 @@ fn Nested.forget(mut self, key: u64) {}
 
 fn Nested.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {}
 
-fn Nested.release(mut self, mut dev: gpu.Device) {}
+fn Nested.release(mut self, mut retired: List[u64]) {}

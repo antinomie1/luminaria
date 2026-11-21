@@ -1,0 +1,280 @@
+// A Display on an output and a renderer of the test's own, plugged in by
+// their methods alone: an output paced by a timer that keeps what it is
+// given, and a software renderer that fills its targets from the
+// placement list. A compositor image shows in the frame read back.
+
+import std.collections.map
+import std.env
+import std.fs
+import std.os
+import std.time
+import luminaria as lum
+
+struct TestOut {
+    timer: int
+    events: List[lum.types.Event] = [lum.types.Event.OutputAdded(0)]
+    targets: List[u64] = []
+    drawing: int = -1
+    pending: int = -1
+    shown: int = -1
+    seq: u64 = 0
+}
+
+pub fn TestOut.next(mut self) -> Option[lum.types.Event] {
+    guard not self.events.is_empty() else {
+        return None
+    }
+    return Some(self.events.remove(0))
+}
+
+pub fn TestOut.fds(self, mut out: List[(int, int)]) {
+    out.push((self.timer, 1))
+}
+
+pub fn TestOut.dispatch(mut self, token: int) -> Result[(), str] {
+    discard os.count(self.timer)
+    if self.pending >= 0 {
+        self.shown = self.pending
+        self.pending = -1
+        self.seq += 1
+        self.events.push(lum.types.Event.Presented(0, self.seq, time.now_ns(), 0))
+    }
+    return Ok(())
+}
+
+pub fn TestOut.output(self, o: u32) -> lum.types.OutputDesc {
+    let m = lum.types.Mode { width: 32, height: 24, refresh_mhz: 60000, preferred: true }
+    return lum.types.OutputDesc { name: "TEST-1", modes: [m], mode: m }
+}
+
+pub fn TestOut.can_present(self, o: u32) -> bool {
+    return self.pending < 0
+}
+
+pub fn TestOut.acquire(mut self, o: u32) -> lum.types.Acquire {
+    guard not self.targets.is_empty() else {
+        return lum.types.Acquire.Need(lum.types.Want { width: 32, height: 24, count: 2, export: false })
+    }
+    self.drawing = if self.shown == 0 { 1 } else { 0 }
+    return lum.types.Acquire.Draw(self.targets[self.drawing], 0)
+}
+
+pub fn TestOut.give(mut self, o: u32, ts: &[lum.types.Target]) -> Result[(), str] {
+    for t in ts {
+        self.targets.push(t.key)
+    }
+    return Ok(())
+}
+
+pub fn TestOut.present(mut self, o: u32, fence: int, rects: &[(i32, i32, i32, i32)], tear: bool) -> Result[(), str] {
+    if fence >= 0 {
+        os.close(fence)
+    }
+    self.pending = self.drawing
+    discard os.timer_arm(self.timer, 1000000, 0)
+    return Ok(())
+}
+
+pub fn TestOut.retired(mut self, mut out: List[u64]) {}
+
+pub fn TestOut.shutdown(mut self, mut retired: List[u64]) {
+    for k in self.targets {
+        retired.push(k)
+    }
+    self.targets.clear()
+}
+
+pub fn TestOut.shown(self, o: u32) -> Option[u64] {
+    return if self.shown < 0 { None } else { Some(self.targets[self.shown]) }
+}
+
+/// A texture: size and BGRA pixels.
+struct Tex {
+    w: i32
+    h: i32
+    px: List[u8]
+}
+
+struct SoftRen {
+    texs: map.Map[u64, Tex]
+    targets: map.Map[u64, Tex]
+    lists: List[List[lum.types.Placement]] = []
+    bg: [4]u8 = [0, 0, 0, 255]
+    next_key: u64 = 1
+}
+
+pub fn SoftRen.add_output(mut self, o: int, width: u32, height: u32, background: vec4) {
+    while self.lists.len() <= o {
+        self.lists.push([])
+    }
+    self.bg = [u8(background.z * 255.0), u8(background.y * 255.0), u8(background.x * 255.0), 255]
+}
+
+pub fn SoftRen.resize(mut self, o: int, width: u32, height: u32) {}
+
+pub fn SoftRen.remove_output(mut self, o: int) {}
+
+pub fn SoftRen.layout(mut self, o: int, ps: &[lum.types.Placement]) {
+    self.lists[o] = ps.to_list()
+}
+
+pub fn SoftRen.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {}
+
+pub fn SoftRen.idle(self, o: int) -> bool {
+    return false
+}
+
+pub fn SoftRen.has(self, key: u64) -> bool {
+    return self.texs.contains(key)
+}
+
+pub fn SoftRen.forget(mut self, key: u64) {
+    discard self.texs.remove(key)
+}
+
+pub fn SoftRen.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool {
+    // RGBA (abgr8888, xbgr8888) to BGRA.
+    let swap = fourcc == lum.types.buffer.abgr8888 or fourcc == lum.types.buffer.xbgr8888
+    var px: List[u8] = []
+    for y in 0..int(height) {
+        for x in 0..int(width) {
+            let i = y * stride + x * 4
+            if swap {
+                px.push(pixels[i + 2])
+                px.push(pixels[i + 1])
+                px.push(pixels[i])
+            } else {
+                px.push(pixels[i])
+                px.push(pixels[i + 1])
+                px.push(pixels[i + 2])
+            }
+            px.push(pixels[i + 3])
+        }
+    }
+    discard self.texs.insert(key, Tex { w: width, h: height, px })
+    return true
+}
+
+pub fn SoftRen.update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool {
+    return false
+}
+
+pub fn SoftRen.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+    return false
+}
+
+pub fn SoftRen.shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool {
+    return false
+}
+
+pub fn SoftRen.targets(mut self, w: lum.types.Want) -> Result[List[lum.types.Target], str] {
+    var out: List[lum.types.Target] = []
+    for _ in 0..w.count {
+        let key = self.next_key
+        self.next_key += 1
+        var px: List[u8] = []
+        for _ in 0..int(w.width * w.height * 4) {
+            px.push(0)
+        }
+        discard self.targets.insert(key, Tex { w: w.width, h: w.height, px })
+        out.push(lum.types.Target { key })
+    }
+    return Ok(out)
+}
+
+pub fn SoftRen.drop_target(mut self, key: u64) {
+    discard self.targets.remove(key)
+}
+
+/// Background, then each placement's texture, unscaled, back to front.
+pub fn SoftRen.render(mut self, o: int, key: u64, age: u32) -> Result[Option[int], str] {
+    guard let Some(t) = self.targets.remove(key) else {
+        return Err("no target {key}")
+    }
+    var dst = t
+    for i in 0..int(dst.w * dst.h) {
+        for c in 0..4 {
+            dst.px[i * 4 + c] = self.bg[c]
+        }
+    }
+    for p in self.lists[o] {
+        guard let Some(src) = self.texs.get(p.tex) else {
+            continue
+        }
+        for y in 0..int(src.h) {
+            for x in 0..int(src.w) {
+                let dx = int(p.x) + x
+                let dy = int(p.y) + y
+                if dx >= 0 and dy >= 0 and dx < int(dst.w) and dy < int(dst.h) {
+                    for c in 0..4 {
+                        dst.px[(dy * int(dst.w) + dx) * 4 + c] = src.px[(y * int(src.w) + x) * 4 + c]
+                    }
+                }
+            }
+        }
+    }
+    discard self.targets.insert(key, dst)
+    return Ok(Some(-1))
+}
+
+pub fn SoftRen.read(mut self, key: u64) -> Result[List[u8], str] {
+    guard let Some(t) = self.targets.get(key) else {
+        return Err("no target {key}")
+    }
+    return Ok(t.px.clone())
+}
+
+pub fn SoftRen.close(mut self) {
+    self.texs.clear()
+    self.targets.clear()
+}
+
+test "a display on an output and a renderer of its own" {
+    let dir = fs.create_temp_dir("luminaria-plug").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap() }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new() }
+    var d = lum.display.Display.with(lum.Options { background: [0.0, 0.0, 1.0, 1.0] }, out, ren).expect("display")
+    let outs = d.outputs()
+    assert_eq(outs.len(), 1)
+    var red: List[u8] = []
+    for _ in 0..16 {
+        for b in [u8(255), 0, 0, 255] {
+            red.push(b)
+        }
+    }
+    let img = d.image(4, 4, red, true).expect("image")
+    d.layout(fn(mut l) {
+        l.image(img, 8.0, 4.0, 4.0, 4.0, lum.Style {})
+    })
+    d.hide_cursor()
+    d.timer(2000, 1)
+    var frames = 0
+    while frames < 2 {
+        guard let Some(e) = d.next().expect("next") else {
+            break
+        }
+        match e {
+            Frame => frames += 1
+            Timer(1) => {
+                break
+            }
+            _ => d.accept(e)
+        }
+    }
+    assert(frames >= 1)
+    var px: List[u8] = []
+    for _ in 0..100 {
+        if let Ok(got) = d.read_output(outs[0]) {
+            px = got
+            break
+        }
+        discard d.poll()
+        time.sleep_ms(2)
+    }
+    assert_eq(px.len(), 32 * 24 * 4)
+    let at = fn(x: int, y: int) => (px[(y * 32 + x) * 4], px[(y * 32 + x) * 4 + 1], px[(y * 32 + x) * 4 + 2])
+    // BGRA: the blue background, the red image at 8, 4.
+    assert_eq(at(0, 0), (u8(255), u8(0), u8(0)))
+    assert_eq(at(9, 5), (u8(0), u8(0), u8(255)))
+}

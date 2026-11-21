@@ -1,0 +1,28 @@
+// Buffers as the layers pass them around: a dmabuf by its planes (the
+// descriptors stay their owner's), DRM fourcc codes, and device numbers.
+
+pub let argb8888: u32 = 0x34325241
+pub let xrgb8888: u32 = 0x34325258
+pub let abgr8888: u32 = 0x34324241
+pub let xbgr8888: u32 = 0x34324258
+
+pub struct Plane {
+    pub fd: int = -1
+    pub offset: u32 = 0
+    pub stride: u32 = 0
+}
+
+/// A dmabuf: size, fourcc, modifier and up to four planes.
+pub struct Dmabuf {
+    pub width: i32 = 0
+    pub height: i32 = 0
+    pub format: u32 = 0
+    pub modifier: u64 = 0
+    pub planes: int = 0
+    pub plane: [4]Plane = [Plane {}, Plane {}, Plane {}, Plane {}]
+}
+
+/// A DRM device number (dev_t) from its major and minor.
+pub fn dev_t(major: i64, minor: i64) -> u64 {
+    return u64(major) << 8 | u64(minor & 0xff) | (u64(minor & ~0xff) << 12)
+}

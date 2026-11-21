@@ -9,7 +9,7 @@ import libinput_sys as li
 import libudev_sys as udev
 import session
 import keyboard
-import types
+import luminaria_types as types
 
 extern unsafe fn open_restricted(path: str, flags: i32, data: Ptr[u8]) -> i32 {
     match session.open_device(path) {
@@ -260,15 +260,7 @@ fn Input.event(mut self, ev: li.Event, mut kb: keyboard.Keyboard, mut out: List[
 }
 
 /// Device settings the compositor chooses.
-pub struct Config {
-    pub tap: bool = true
-    pub natural_scroll: bool = false
-    /// -1..1, 0 is the default speed.
-    pub accel: f64 = 0.0
-    pub left_handed: bool = false
-    /// Disable the device (send no events).
-    pub disabled: bool = false
-}
+pub type Config = types.InputConfig
 
 fn Input.configure(mut self, id: u32, c: Config) {
     for x in self.devices {

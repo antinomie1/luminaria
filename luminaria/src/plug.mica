@@ -1,0 +1,139 @@
+// The two seams of a Display: where frames go and input comes from (an
+// Output) and what draws the frames (a Renderer). luminaria_backend's
+// Backend and luminaria_compose's Compositor are the built-in ones; a type
+// with the same methods plugs in instead (traits are structural, and
+// Display is monomorphized: no indirection). They meet only through
+// luminaria_types: an output asks for render targets, the renderer makes
+// them (dmabufs to show), draws into one and hands back a fence. Methods
+// with bodies are optional capabilities.
+
+import luminaria_types as types
+
+pub trait Output {
+    /// Its next event (outputs added and removed, frames presented,
+    /// input, the session), None when there is none.
+    fn next(mut self) -> Option[types.Event]
+    /// Descriptors to poll, each with the token `dispatch` takes.
+    fn fds(self, mut out: List[(int, int)])
+    fn dispatch(mut self, token: int) -> Result[(), str]
+    fn output(self, o: u32) -> types.OutputDesc
+    /// Whether a frame may be presented on `o` now.
+    fn can_present(self, o: u32) -> bool
+    /// The target to draw `o` into, Busy, or the targets it needs first.
+    fn acquire(mut self, o: u32) -> types.Acquire
+    fn give(mut self, o: u32, ts: &[types.Target]) -> Result[(), str]
+    /// Show the acquired target once `fence` signals (the output closes
+    /// it; -1: none); `rects` changed (empty: all).
+    fn present(mut self, o: u32, fence: int, rects: &[(i32, i32, i32, i32)], tear: bool) -> Result[(), str]
+    /// Targets let go of, for the renderer to free.
+    fn retired(mut self, mut out: List[u64])
+    /// Let go of everything; every target's key goes to `retired`.
+    fn shutdown(mut self, mut retired: List[u64])
+
+    /// Show a client dmabuf as is; false: compose instead.
+    fn scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[(i32, i32, i32, i32)], tear: bool) -> bool {
+        return false
+    }
+    /// Whether the display still reads client buffer `key`.
+    fn holds(self, key: u64) -> bool {
+        return false
+    }
+    fn forget(mut self, key: u64) {}
+    /// The target output `o` shows, when it can be read back.
+    fn shown(self, o: u32) -> Option[u64] {
+        return None
+    }
+    /// A cursor image it shows itself (ARGB8888); false: it is drawn.
+    fn set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+        return false
+    }
+    fn move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {}
+    /// The keymap for clients: memfd and size (-1: none yet).
+    fn keymap(self) -> (int, u32) {
+        return (-1, 0)
+    }
+    fn mods(self) -> types.Mods {
+        return types.Mods {}
+    }
+    fn set_keymap(mut self, names: types.Names) -> Result[(), str] {
+        return Err("this output has no keyboard")
+    }
+    fn configure_input(mut self, device: u32, c: types.InputConfig) {}
+    fn switch_vt(self, n: int) {}
+    /// The display's DRM device (dev_t) and the modifiers output `o` can
+    /// scan out (linux-dmabuf feedback).
+    fn scanout_device(self) -> u64 {
+        return 0
+    }
+    fn scanout_modifiers(self, o: u32) -> List[u64] {
+        let none: List[u64] = []
+        return none
+    }
+    fn set_mode(mut self, o: u32, m: types.Mode) {}
+    fn enable(mut self, o: u32, on: bool) {}
+    fn set_vrr(mut self, o: u32, on: bool) {}
+    /// It paces frames itself (a parent's frame callbacks).
+    fn paced(self) -> bool {
+        return false
+    }
+    /// Outputs take any mode they list, not only the current one.
+    fn sets_modes(self) -> bool {
+        return false
+    }
+}
+
+pub trait Renderer {
+    fn add_output(mut self, o: int, width: u32, height: u32, background: vec4)
+    fn resize(mut self, o: int, width: u32, height: u32)
+    fn remove_output(mut self, o: int)
+    /// Show `ps` on `o` from the next frame (a key keeps its view).
+    fn layout(mut self, o: int, ps: &[types.Placement])
+    /// Texture `key` changed in `rects` (texture pixels; empty: all).
+    fn commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)])
+    /// Whether output `o` has nothing new to draw.
+    fn idle(self, o: int) -> bool
+    fn has(self, key: u64) -> bool
+    fn forget(mut self, key: u64)
+    /// Texture `key` from pixels (create or replace) and its updates.
+    fn image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool
+    fn update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool
+    /// An shm commit (damage merges) and its upload before the next frame.
+    fn shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool
+    fn shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool
+    fn targets(mut self, w: types.Want) -> Result[List[types.Target], str]
+    fn drop_target(mut self, key: u64)
+    /// Draw output `o` into target `key` (`age` frames old): the fence,
+    /// or None when nothing changed.
+    fn render(mut self, o: int, key: u64, age: u32) -> Result[Option[int], str]
+    /// A target's pixels (B8G8R8A8).
+    fn read(mut self, key: u64) -> Result[List[u8], str]
+    fn close(mut self)
+
+    /// Fourccs and modifiers it samples dmabufs of (none: shm only).
+    fn formats(self) -> List[(u32, u64)] {
+        let none: List[(u32, u64)] = []
+        return none
+    }
+    /// Its DRM node (major, minor), for linux-dmabuf and drm_syncobj.
+    fn render_node(self) -> Option[(i64, i64)] {
+        return None
+    }
+    fn import_dmabuf(mut self, key: u64, d: types.Dmabuf) -> bool {
+        return false
+    }
+    fn solid(mut self, key: u64, rgba: [4]u32) -> bool {
+        let px: List[u8] = [u8(rgba[0] >> 24), u8(rgba[1] >> 24), u8(rgba[2] >> 24), u8(rgba[3] >> 24)]
+        return self.image(key, 1, 1, types.buffer.abgr8888, px, 4)
+    }
+    fn damage_all(mut self) {}
+    /// Whether `key` shows on `o` (not hidden by opaque views).
+    fn visible(self, o: int, key: u64) -> bool {
+        return true
+    }
+    /// The key of the view that alone fills `o` as is (scan it out).
+    fn scanout(self, o: int) -> Option[u64] {
+        return None
+    }
+    /// What the last frame of `o` changed (empty: all of it).
+    fn changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {}
+}

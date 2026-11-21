@@ -5,12 +5,12 @@
 
 import std.os
 import std.time
-import vk_gpu as gpu
-import types
+import luminaria_types as types
 
 struct Out {
     desc: types.OutputDesc
-    slots: List[gpu.Texture] = []
+    /// The renderer's keys of its images.
+    slots: List[u64] = []
     drawn: List[u64] = []
     frame: u64 = 0
     timer: int = -1
@@ -39,17 +39,30 @@ fn Headless.drop(mut self) {
     }
 }
 
-fn Headless.prepare(mut self, o: int, mut dev: gpu.Device, count: int) -> Result[(), str] {
+/// Images output `o` needs before it can draw (None: it has them).
+fn Headless.prepare(self, o: int, count: int) -> Option[types.Want] {
     guard self.outs[o].slots.is_empty() else {
-        return Ok(())
+        return None
     }
     let m = self.outs[o].desc.mode
-    for _ in 0..count {
-        let t = try dev.texture(gpu.TextureDesc { width: u32(m.width), height: u32(m.height), format: gpu.Format.B8G8R8A8_UNORM, target: true })
-        self.outs[o].slots.push(t)
+    return Some(types.Want { width: m.width, height: m.height, format: types.buffer.xrgb8888, count, export: false })
+}
+
+fn Headless.give(mut self, o: int, ts: &[types.Target]) {
+    for t in ts {
+        self.outs[o].slots.push(t.key)
         self.outs[o].drawn.push(0)
     }
-    return Ok(())
+}
+
+fn Headless.release(mut self, mut retired: List[u64]) {
+    for o in 0..self.outs.len() {
+        for k in self.outs[o].slots {
+            retired.push(k)
+        }
+        self.outs[o].slots.clear()
+        self.outs[o].drawn.clear()
+    }
 }
 
 fn Headless.acquire(self, o: int) -> Option[(int, u32)] {
@@ -89,8 +102,8 @@ fn Headless.tick(mut self, o: int) -> Option[(u64, int)] {
     return Some((self.outs[o].seq, time.now_ns()))
 }
 
-/// What output `o` shows (for screenshots and tests).
-fn Headless.shown(self, o: int) -> Option[gpu.Texture] {
+/// The renderer's key of what output `o` shows (screenshots, tests).
+fn Headless.shown(self, o: int) -> Option[u64] {
     let s = self.outs[o].shown
     return if s < 0 { None } else { Some(self.outs[o].slots[s]) }
 }

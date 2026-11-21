@@ -6,9 +6,10 @@
 
 import std.collections.map
 import luminaria_server as server
-import luminaria_compose as compose
+import luminaria_types as types
 import layout
 import display
+import plug
 
 /// Where a layer surface goes: output index, global logical position.
 struct Spot {
@@ -41,7 +42,7 @@ fn zone_edge(st: server.LayerState) -> u32 {
 
 /// The output a layer surface is on: the one it asked for, else the one
 /// it was given when it appeared.
-fn layer_output(mut d: display.Display, l: server.Layer, info: server.LayerInfo) -> int {
+fn layer_output[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], l: server.Layer, info: server.LayerInfo) -> int {
     if let Some(so) = info.output {
         let o = d.out_index(so)
         if o >= 0 {
@@ -68,7 +69,7 @@ fn layer_output(mut d: display.Display, l: server.Layer, info: server.LayerInfo)
 /// Lay out every layer surface: zones first (overlay to background), then
 /// sizes and positions; configure what changed. Outputs whose usable area
 /// changed report OutputArea.
-fn arrange(mut d: display.Display) {
+fn arrange[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let ls = d.srv.layers()
     var areas: List[(f64, f64, f64, f64)] = []
     for o in 0..d.outs.len() {
@@ -147,7 +148,7 @@ fn arrange(mut d: display.Display) {
 }
 
 /// Place the mapped layer surfaces of `layer` (and their popups).
-fn place_layers(mut d: display.Display, layer: u32, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], layer: u32, mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
     for l in d.srv.layers() {
         let info = d.srv.layer(l)
         guard info.mapped and info.state.layer == layer else {
@@ -162,7 +163,7 @@ fn place_layers(mut d: display.Display, layer: u32, mut per: List[List[compose.P
 }
 
 /// Popups whose chain of parents starts at `root` (placed already).
-fn place_popups(mut d: display.Display, root: server.Surface, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+fn place_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], root: server.Surface, mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
     for pp in d.popups.clone() {
         var top = d.srv.popup_parent(pp)
         for _ in 0..16 {
@@ -197,7 +198,7 @@ fn place_popups(mut d: display.Display, root: server.Surface, mut per: List[List
 }
 
 /// While locked: each output shows its lock surface, nothing else.
-fn place_lock(mut d: display.Display, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+fn place_lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
     for k in d.srv.lock_surfaces() {
         let (s, so, mapped) = d.srv.lock_surface(k)
         guard mapped else {
@@ -215,7 +216,7 @@ fn place_lock(mut d: display.Display, mut per: List[List[compose.Placement]], mu
 }
 
 /// Input method popups, their top left under the text cursor.
-fn place_ime(mut d: display.Display, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+fn place_ime[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
     guard let Some((ts, r)) = d.srv.text_cursor(d.seat) else {
         return
     }
@@ -228,7 +229,7 @@ fn place_ime(mut d: display.Display, mut per: List[List[compose.Placement]], mut
 }
 
 /// Configure a lock surface to its output's size.
-fn configure_lock(mut d: display.Display, k: server.LockSurface) {
+fn configure_lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], k: server.LockSurface) {
     let (_, so, _) = d.srv.lock_surface(k)
     guard let Some(out) = so else {
         return
@@ -242,7 +243,7 @@ fn configure_lock(mut d: display.Display, k: server.LockSurface) {
 
 /// A client asked to lock: hide the session at once; the locker hears
 /// `locked` once every output showed a frame without it.
-fn lock(mut d: display.Display) {
+fn lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let was = d.locked
     d.locked = true
     d.lock_wait.clear()
@@ -264,7 +265,7 @@ fn lock(mut d: display.Display) {
     }
 }
 
-fn unlock(mut d: display.Display) {
+fn unlock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     d.locked = false
     d.lock_wait.clear()
     for o in 0..d.outs.len() {
@@ -276,7 +277,7 @@ fn unlock(mut d: display.Display) {
 }
 
 /// Output `o` presented a frame: part of a pending lock.
-fn presented(mut d: display.Display, o: int) {
+fn presented[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
     guard not d.lock_wait.is_empty() else {
         return
     }
@@ -288,7 +289,7 @@ fn presented(mut d: display.Display, o: int) {
 
 /// Who gets the keyboard: the lock screen, an exclusive layer surface,
 /// a grabbing popup, a layer surface clicked on, else the focused window.
-fn keyboard_target(d: display.Display) -> Option[server.Surface] {
+fn keyboard_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R]) -> Option[server.Surface] {
     if d.locked {
         var any: Option[server.Surface] = None
         let here = d.output_at(d.px, d.py)
@@ -330,14 +331,14 @@ fn keyboard_target(d: display.Display) -> Option[server.Surface] {
     return d.focus
 }
 
-fn update_keyboard(mut d: display.Display) {
+fn update_keyboard[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let t = keyboard_target(d)
     d.srv.keyboard_focus(d.seat, t)
     d.update_constraint()
 }
 
 /// A click on a layer surface that takes the keyboard on demand.
-fn clicked(mut d: display.Display, s: server.Surface) {
+fn clicked[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
     // A popup keeps the focus of what it pops up from.
     guard d.srv.popup_of(s).is_none() else {
         return
@@ -357,7 +358,7 @@ fn clicked(mut d: display.Display, s: server.Surface) {
 }
 
 /// A layer surface went away.
-fn layer_gone(mut d: display.Display, l: server.Layer) {
+fn layer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], l: server.Layer) {
     discard d.spots.remove(l)
     if let Some(s) = d.layer_focus {
         if not d.srv.surface_alive(s) or d.srv.layer_of(s).is_none() {
@@ -367,7 +368,7 @@ fn layer_gone(mut d: display.Display, l: server.Layer) {
 }
 
 /// Output `o` goes: its layer surfaces are closed.
-fn output_gone(mut d: display.Display, o: int) {
+fn output_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
     for l in d.srv.layers() {
         if let Some(sp) = d.spots.get(l) {
             if sp.o == o {

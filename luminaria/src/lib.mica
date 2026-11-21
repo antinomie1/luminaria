@@ -3,7 +3,7 @@
 // the policy and its own loop: where windows go, who gets focus, what keys
 // do, what each frame shows.
 //
-//     var d = try lum.Display.open(lum.Options {})
+//     var d = try lum.open(lum.Options {})
 //     while true {
 //         guard let Some(e) = try d.next() else {
 //             break
@@ -14,17 +14,42 @@
 //         }
 //     }
 
+//
+// A Display joins an Output and a Renderer (plug.mica): the built-in
+// ones by default, any others through `display.Display.with`.
+
 pub import display
+pub import plug
 pub import layout
 pub import cursor
 pub import hit
+pub import clock
+pub import fence
+pub import luminaria_types as types
 pub import luminaria_server as server
-pub import luminaria_backend as backend
-pub import luminaria_compose as compose
 pub import luminaria_proto as proto
 pub import luminaria_wire as wire
 
-pub type Display = display.Display
+when feature == "backend" {
+    pub import luminaria_backend as backend
+}
+
+when feature == "vulkan" {
+    pub import luminaria_compose as compose
+}
+
+when feature == "backend" and feature == "vulkan" {
+    /// A display on the built-in output (DRM, nested or headless, by
+    /// `backend`) and the Vulkan renderer.
+    pub type Display = display.Display[backend.Backend, compose.Compositor]
+
+    pub fn open(o: Options) -> Result[Display, str] {
+        let comp = try compose.Compositor.open(o.validation)
+        let be = try backend.Backend.open(backend.Options { kind: o.backend, headless: o.headless.clone(), keymap: o.keymap.clone(), buffers: o.buffers, title: o.title.clone() })
+        return Display.with(o, be, comp)
+    }
+}
+
 pub type Options = display.Options
 pub type Event = display.Event
 pub type Key = display.Key
@@ -42,9 +67,9 @@ pub type Output = server.Output
 pub type Client = server.Client
 pub type Surface = server.Surface
 pub type States = server.States
-pub type Mode = backend.Mode
-pub type Mods = backend.Mods
-pub type Names = backend.Names
-pub type AxisSource = backend.AxisSource
-pub type InputConfig = backend.InputConfig
-pub type Kind = backend.Kind
+pub type Mode = types.Mode
+pub type Mods = types.Mods
+pub type Names = types.Names
+pub type AxisSource = types.AxisSource
+pub type InputConfig = types.InputConfig
+pub type Kind = types.OutputKind

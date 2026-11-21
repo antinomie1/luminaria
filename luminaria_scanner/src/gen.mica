@@ -146,7 +146,8 @@ fn World.read(self, mut o: Out, owner: str, a: model.Arg) -> Result[(), str] {
                 o.line(ind + "let {n}_iface = rd.str(conn)")
                 o.line(ind + "let {n}_version = rd.u32(conn)")
                 let by_name = o.qual("ifaces", "by_name")
-                o.line(ind + "let {n} = rd.new_object(mut conn, {by_name}({n}_iface), {n}_version)")
+                // Interfaces added at run time resolve through the id map.
+                o.line(ind + "let {n} = rd.new_object(mut conn, conn.resolve({by_name}({n}_iface), {n}_iface), {n}_version)")
             } else {
                 let t = try self.iface_type(mut o, a.iface)
                 let c = try self.iface_const(mut o, a.iface)
@@ -450,6 +451,11 @@ fn World.dispatch(self, mut t: str, kind: str, fname: str) {
             }
         }
     }
+    if not event {
+        t += "    /// A request to an object of an interface added at run time (an\n"
+        t += "    /// extension of luminaria_server): decode it by its signature.\n"
+        t += "    Extension(wire.Msg)\n"
+    }
     t += "\}\n\n"
     t += "/// The next {kind.to_lower()} received on `conn`, `None` until more is read.\n"
     t += "pub fn {fname}(mut conn: wire.Conn) -> Result[Option[{kind}], wire.Error] \{\n"
@@ -465,6 +471,9 @@ fn World.dispatch(self, mut t: str, kind: str, fname: str) {
         }
     }
     t += "            _ => \{\n"
+    if not event {
+        t += "                if m.iface > ifaces.count \{\n                    return Ok(Some(Request.Extension(m)))\n                \}\n"
+    }
     t += "                return Err(conn.error(m.id, wire.invalid_method, \"no {kind.to_lower()}s on interface \{m.iface\}\"))\n"
     t += "            \}\n"
     t += "        \}\n"

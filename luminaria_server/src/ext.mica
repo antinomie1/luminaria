@@ -1,0 +1,229 @@
+// Protocol extensions: interfaces the generated protocols do not have,
+// added at run time. The compositor describes an interface by the
+// signatures of its messages (libwayland's wl_message strings), gets each
+// request to one of its objects as an event with the arguments decoded,
+// and answers with `ext_send`. Only extension traffic is decoded this way;
+// the core protocols keep their generated, allocation-free paths.
+
+import std.os
+import luminaria_wire as wire
+import luminaria_proto.ifaces as ifaces
+import ids
+import state
+import server
+
+pub struct Message {
+    pub name: str = ""
+    /// One letter an argument: i u f s o n a h; `?` before s or o makes
+    /// it nullable.
+    pub signature: str = ""
+    /// The interface an `n` argument makes.
+    pub new_iface: str = ""
+    /// The object is gone after this request.
+    pub destructor: bool = false
+}
+
+pub struct Interface {
+    pub name: str = ""
+    pub version: u32 = 1
+    pub requests: List[Message] = []
+    pub events: List[Message] = []
+}
+
+pub enum Arg {
+    Int(i32)
+    Uint(u32)
+    Fixed(f64)
+    Str(Option[str])
+    /// An object id (0: none).
+    Object(u32)
+    /// The id of a new object (made by the client in requests; by
+    /// `ext_new` for events).
+    NewId(u32)
+    Array(List[u8])
+    /// A descriptor: in a request the compositor's to close; in an event
+    /// a copy is sent.
+    Fd(int)
+}
+
+/// An object of an extension: its client, its id, and which interface
+/// (the index `extend` returned).
+pub struct Object {
+    pub client: ids.Client
+    pub id: u32
+    pub iface: int
+}
+
+/// The id-map number of extension `k`.
+fn number(k: int) -> u16 {
+    return u16(ifaces.count + 1 + k)
+}
+
+/// Which extension id-map number `iface` is (-1: a generated one).
+fn index(srv: server.Server, iface: u16) -> int {
+    let k = int(iface) - ifaces.count - 1
+    return if k >= 0 and k < srv.exts.len() { k } else { -1 }
+}
+
+/// Name of interface `iface`, generated or added.
+fn name(srv: server.Server, iface: u16) -> str {
+    let k = index(srv, iface)
+    return if k >= 0 { srv.exts[k].name.clone() } else { ifaces.name(iface) }
+}
+
+/// Add interface `i`; a global clients can bind when `global`.
+fn extend(mut srv: server.Server, take i: Interface, global: bool) -> int {
+    let k = srv.exts.len()
+    let n = number(k)
+    let version = i.version
+    for ci in 0..srv.conns.len() {
+        srv.conns[ci].names.push((i.name.clone(), n))
+    }
+    srv.exts.push(i)
+    if global {
+        srv.globals.push(state.Global { iface: n, version, kind: state.GlobalKind.Ext(u32(k)) })
+        srv.announce(u32(srv.globals.len()))
+    }
+    return k
+}
+
+/// The names table a new connection starts with.
+fn names(srv: server.Server) -> List[(str, u16)] {
+    var out: List[(str, u16)] = []
+    for k in 0..srv.exts.len() {
+        out.push((srv.exts[k].name.clone(), number(k)))
+    }
+    return out
+}
+
+fn bound(mut srv: server.Server, ci: u32, k: int, id: u32, version: u32) {
+    srv.push(server.Event.ExtBound(Object { client: ids.Client { id: srv.clients.id(ci) }, id, iface: k }, version))
+}
+
+/// A request to an extension object: its arguments by the signature.
+fn request(mut srv: server.Server, ci: u32, m: wire.Msg) {
+    let k = index(srv, m.iface)
+    guard k >= 0 and int(m.op) < srv.exts[k].requests.len() else {
+        srv.fail(ci, m.id, wire.invalid_method, "invalid request {m.op} on {name(srv, m.iface)}")
+        return
+    }
+    let sig = srv.exts[k].requests[int(m.op)].signature.clone()
+    let new_name = srv.exts[k].requests[int(m.op)].new_iface.clone()
+    let destructor = srv.exts[k].requests[int(m.op)].destructor
+    let c = int(ci)
+    var rd = srv.conns[c].reader(m)
+    var args: List[Arg] = []
+    var nullable = false
+    for i in 0..sig.len() {
+        let ch = sig[i]
+        if ch == u8(63) {
+            nullable = true
+            continue
+        }
+        if ch == u8(105) {
+            args.push(Arg.Int(rd.i32(srv.conns[c])))
+        } else if ch == u8(117) {
+            args.push(Arg.Uint(rd.u32(srv.conns[c])))
+        } else if ch == u8(102) {
+            args.push(Arg.Fixed(rd.fixed(srv.conns[c])))
+        } else if ch == u8(115) {
+            args.push(Arg.Str(if nullable { rd.opt_str(srv.conns[c]) } else { Some(rd.str(srv.conns[c])) }))
+        } else if ch == u8(111) {
+            args.push(Arg.Object(rd.object(srv.conns[c], 0, nullable)))
+        } else if ch == u8(110) {
+            let ni = srv.conns[c].resolve(ifaces.by_name(new_name), new_name)
+            args.push(Arg.NewId(rd.new_id(mut srv.conns[c], ni, m.version)))
+        } else if ch == u8(97) {
+            args.push(Arg.Array(rd.array(srv.conns[c])))
+        } else if ch == u8(104) {
+            var f = rd.fd(mut srv.conns[c])
+            args.push(Arg.Fd(f.take()))
+        }
+        nullable = false
+    }
+    guard rd.finish(mut srv.conns[c], m).is_ok() else {
+        for a in args {
+            match a {
+                Fd(f) => {
+                    if f >= 0 {
+                        os.close(f)
+                    }
+                }
+                _ => {}
+            }
+        }
+        return
+    }
+    let o = Object { client: ids.Client { id: srv.clients.id(ci) }, id: m.id, iface: k }
+    srv.push(server.Event.ExtRequest(o, m.op, args))
+    if destructor {
+        srv.conns[c].remove(m.id)
+    }
+}
+
+fn size(a: Arg) -> int {
+    return match a {
+        Str(v) => {
+            match v {
+                Some(t) => wire.str_size(t)
+                None => 4
+            }
+        }
+        Array(b) => wire.array_size(b)
+        Fd => 0
+        _ => 4
+    }
+}
+
+/// Send event `op` of `o`'s interface with `args`; false when the object
+/// or the event is unknown.
+fn send(mut srv: server.Server, o: Object, op: u16, args: &[Arg]) -> bool {
+    guard srv.clients.live(o.client.id) and o.iface >= 0 and o.iface < srv.exts.len() and int(op) < srv.exts[o.iface].events.len() else {
+        return false
+    }
+    let c = int(o.client.id.index)
+    guard srv.conns[c].iface(o.id) == number(o.iface) else {
+        return false
+    }
+    var n = 8
+    for a in args {
+        n += size(a)
+    }
+    var w = srv.conns[c].begin(o.id, op, n)
+    for a in args {
+        match a {
+            Int(v) => w.i32(mut srv.conns[c], v)
+            Uint(v) => w.u32(mut srv.conns[c], v)
+            Fixed(v) => w.fixed(mut srv.conns[c], v)
+            Str(v) => {
+                match v {
+                    Some(t) => w.str(mut srv.conns[c], t)
+                    None => w.u32(mut srv.conns[c], 0)
+                }
+            }
+            Object(v) => w.u32(mut srv.conns[c], v)
+            NewId(v) => w.u32(mut srv.conns[c], v)
+            Array(b) => w.array(mut srv.conns[c], b)
+            Fd(f) => srv.conns[c].put_fd(f)
+        }
+    }
+    return true
+}
+
+/// A new object of extension `k` for `client` (sent in an event's `n`).
+fn make(mut srv: server.Server, client: ids.Client, k: int, version: u32) -> Option[Object] {
+    guard srv.clients.live(client.id) and k >= 0 and k < srv.exts.len() else {
+        return None
+    }
+    let id = srv.conns[int(client.id.index)].alloc(number(k), version)
+    return Some(Object { client, id, iface: k })
+}
+
+/// `o` is gone (its destructor event was sent, or the compositor drops
+/// it): its id goes back.
+fn destroy(mut srv: server.Server, o: Object) {
+    guard srv.clients.live(o.client.id) and srv.conns[int(o.client.id.index)].iface(o.id) == number(o.iface) else {
+        return
+    }
+    srv.conns[int(o.client.id.index)].remove(o.id)
+}

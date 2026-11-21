@@ -6,6 +6,7 @@
 
 import std.mem
 import std.net
+import luminaria_types as types
 import luminaria_wire as wire
 import luminaria_proto as proto
 import luminaria_proto.wayland as wl
@@ -28,11 +29,16 @@ import inhibit
 import capture
 import security
 import outman
+import ext
 
 /// What happened, for the compositor (and luminaria's glue) to act on.
 pub enum Event {
     ClientNew(ids.Client)
     ClientGone(ids.Client)
+    /// A client bound an extension's global: the new object, its version.
+    ExtBound(ext.Object, u32)
+    /// A request to an extension object: opcode, arguments.
+    ExtRequest(ext.Object, u16, List[ext.Arg])
     /// A wl_buffer exists: import it now (dmabuf) or wait for its first
     /// commit (shm).
     BufferNew(ids.Buffer)
@@ -131,6 +137,8 @@ pub struct Server {
     clients: ids.Slab[state.ClientData] = ids.Slab {}
     conns: List[wire.Conn] = []
     globals: List[state.Global] = []
+    /// Protocol extensions, by index.
+    exts: List[ext.Interface] = []
     surfaces: ids.Slab[state.SurfaceData] = ids.Slab {}
     buffers: ids.Slab[state.BufferData] = ids.Slab {}
     pools: ids.Slab[state.PoolData] = ids.Slab {}
@@ -287,7 +295,7 @@ fn Server.add_dynamic(mut self, iface: u16, version: u32, kind: state.GlobalKind
 /// Tell every registry about global `name`.
 fn Server.announce(mut self, name: u32) {
     let g = self.globals[int(name - 1)]
-    let iface = ifaces.name(g.iface)
+    let iface = ext.name(self, g.iface)
     for ci in 0..self.clients.items.len() {
         guard self.clients.used(ci) and self.sees(u32(ci), g.iface) else {
             continue
@@ -320,7 +328,7 @@ fn Server.sees(self, ci: u32, iface: u16) -> bool {
     return not self.clients.items[int(ci)].sandboxed or not security.privileged(iface)
 }
 
-fn Server.push(mut self, e: Event) {
+fn Server.push(mut self, take e: Event) {
     self.events.push(e)
 }
 
@@ -331,7 +339,7 @@ pub fn Server.next(mut self) -> Option[Event] {
         self.head = 0
         return None
     }
-    let e = self.events[self.head]
+    let e = mem.replace(mut self.events[self.head], Event.ClientNew(ids.Client { id: ids.Id {} }))
     self.head += 1
     return Some(e)
 }
@@ -426,6 +434,7 @@ fn Server.add_client(mut self, take conn: wire.Conn, k: u32) -> (ids.Client, int
         self.conns.push(wire.Conn.closed())
     }
     self.conns[int(id.index)] = conn
+    self.conns[int(id.index)].names = ext.names(self)
     let c = ids.Client { id }
     self.push(Event.ClientNew(c))
     return (c, fd)
@@ -507,6 +516,29 @@ pub fn Server.dispatch(mut self, c: ids.Client) -> bool {
             }
         }
     }
+}
+
+// ----------------------------------------------------------- extensions
+
+/// Add protocol extension `i` (a global when `global`); its index names
+/// it in ExtBound and ExtRequest.
+pub fn Server.extend(mut self, take i: ext.Interface, global: bool) -> int {
+    return ext.extend(mut self, i, global)
+}
+
+/// Send event `op` of `o`'s interface; false when either is unknown.
+pub fn Server.ext_send(mut self, o: ext.Object, op: u16, args: &[ext.Arg]) -> bool {
+    return ext.send(mut self, o, op, args)
+}
+
+/// A new object of extension `k` for `client`, to pass in an event.
+pub fn Server.ext_new(mut self, client: ids.Client, k: int, version: u32) -> Option[ext.Object] {
+    return ext.make(mut self, client, k, version)
+}
+
+/// Drop `o` (after its destructor event, or to retire it).
+pub fn Server.ext_destroy(mut self, o: ext.Object) {
+    ext.destroy(mut self, o)
 }
 
 /// Send what is queued for every client; the clients that must go (they
@@ -832,13 +864,18 @@ pub fn Server.buffer(self, b: ids.Buffer) -> BufferInfo {
     }
 }
 
-/// Plane `k` of a dmabuf: fd (still the server's), offset, stride.
-pub fn Server.plane(self, b: ids.Buffer, k: int) -> (int, u32, u32) {
-    guard self.buffers.live(b.id) and k < self.buffers.items[int(b.id.index)].planes.len() else {
-        return (-1, 0, 0)
+/// A dmabuf buffer as its planes (the descriptors stay the server's);
+/// no planes when `b` is not a live dmabuf.
+pub fn Server.dmabuf(self, b: ids.Buffer) -> types.Dmabuf {
+    guard self.buffers.live(b.id) else {
+        return types.Dmabuf {}
     }
     let i = int(b.id.index)
-    return (self.buffers.items[i].planes[k].fd.raw(), self.buffers.items[i].planes[k].offset, self.buffers.items[i].planes[k].stride)
+    var d = types.Dmabuf { width: self.buffers.items[i].width, height: self.buffers.items[i].height, format: self.buffers.items[i].format, modifier: self.buffers.items[i].modifier, planes: min(self.buffers.items[i].planes.len(), 4) }
+    for k in 0..d.planes {
+        d.plane[k] = types.Plane { fd: self.buffers.items[i].planes[k].fd.raw(), offset: self.buffers.items[i].planes[k].offset, stride: self.buffers.items[i].planes[k].stride }
+    }
+    return d
 }
 
 /// Lend `f` the shm buffer's bytes and stride (SIGBUS-safe; the view

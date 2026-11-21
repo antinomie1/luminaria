@@ -36,6 +36,8 @@ enum GlobalKind {
     Static
     Output(u32)
     Seat(u32)
+    /// A protocol extension (its index).
+    Ext(u32)
 }
 
 struct Global {

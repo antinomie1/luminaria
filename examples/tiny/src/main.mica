@@ -198,7 +198,7 @@ fn Tiny.press(mut self, p: lum.Pointer) -> bool {
 }
 
 fn run(startup: str) -> Result[(), str] {
-    var t = Tiny { d: try lum.Display.open(lum.Options { title: "tiny" }) }
+    var t = Tiny { d: try lum.open(lum.Options { title: "tiny" }) }
     let socket = t.d.socket()
     io.eprint("tiny: WAYLAND_DISPLAY={socket}")
     if not startup.is_empty() {

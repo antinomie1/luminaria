@@ -5,26 +5,10 @@
 import std.os
 import std.utf8
 import xkbcommon_sys as xkb
+import luminaria_types as types
 
-/// Rules, model, layout, variant and options, as XKB_DEFAULT_* names them;
-/// empty means the system default.
-pub struct Names {
-    pub rules: str = ""
-    pub model: str = ""
-    pub layout: str = ""
-    pub variant: str = ""
-    pub options: str = ""
-}
-
-/// Modifiers in effect.
-pub struct Mods {
-    pub shift: bool = false
-    pub ctrl: bool = false
-    pub alt: bool = false
-    pub logo: bool = false
-    pub caps: bool = false
-    pub num: bool = false
-}
+pub type Names = types.Names
+pub type Mods = types.Mods
 
 pub struct Keyboard {
     ctx: xkb.Context

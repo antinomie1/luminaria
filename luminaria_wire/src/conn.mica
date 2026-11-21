@@ -104,6 +104,8 @@ pub struct Conn {
     removed: List[(u32, u16)] = []
     /// Set when the connection must close after the last flush.
     dead: Option[str] = None
+    /// Interfaces added at run time (past the generated ones), by name.
+    pub names: List[(str, u16)] = []
 }
 
 /// Wrap a connected socket (made non-blocking here). Id 1 is the display,
@@ -256,6 +258,20 @@ fn Conn.set(mut self, id: u32, o: Obj) {
 }
 
 /// Interface number of live object `id`, 0 when there is none.
+/// Interface `known` (the generated number of `name`) or, when that is
+/// 0, the run-time one called `name`; 0 when there is none.
+pub fn Conn.resolve(self, known: u16, name: &str) -> u16 {
+    guard known == 0 else {
+        return known
+    }
+    for (n, i) in self.names {
+        if n == name {
+            return i
+        }
+    }
+    return 0
+}
+
 pub fn Conn.iface(self, id: u32) -> u16 {
     let o = self.lookup(id)
     return if o.alive { o.iface } else { 0 }

@@ -8,22 +8,30 @@
 
 | 包 | 作用 |
 |----|------|
-| `luminaria` | `Display`：一个事件循环接起下面所有的包，加上布局、输入路由、操纵 |
+| `luminaria` | `Display`：一个事件循环接起输出端、渲染器和服务端；布局、输入路由、操纵、帧时钟、栅栏 |
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、layer shell、锁屏、seat 与输入法、选区与拖放、输出及其配置、截屏、沙盒、缓冲、时序；不碰 GPU |
-| `luminaria_compose` | 基于 `vk_compose` 的合成：放置表比对、客户端缓冲的纹理（归它所有）、栅栏、时钟 |
-| `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb |
+| `luminaria_compose` | 基于 `vk_compose` 的 Vulkan 渲染器：放置表比对、所有纹理、渲染目标 |
+| `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb；不碰 GPU |
+| `luminaria_types` | 各层交换的纯数据：dmabuf、放置、输出、输入、渲染目标 |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的接口 |
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 |
 | `luminaria_scanner` | 生成 `luminaria_proto`（开发工具） |
 
 ```
 luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_wire
-           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu (github.com/antinomie1/vk)
-           └─ luminaria_backend ── vk_gpu, sys/*；luminaria_proto（仅嵌套）
+           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu (github.com/antinomie1/vk)   [vulkan]
+           └─ luminaria_backend ── sys/*；luminaria_proto（仅嵌套）                             [backend]
+                  它们都依赖 ──── luminaria_types
 ```
 
-构建特性：`nested`（默认开启）是嵌套后端，`luminaria_backend` 只因它才依赖 `luminaria_proto` 和
-`luminaria_wire`。关掉它（`--no-default-features`）后端只有 DRM 和无头两种输出，`Kind.Auto` 总选 DRM。
+`Display` 通过两个结构化 trait（`plug.Output`、`plug.Renderer`）接起一个输出端和一个渲染器；
+`Display` 单态化，换上自己的类型没有间接调用。两者只交换 `luminaria_types`：输出端要渲染目标，
+渲染器造出来（要显示的 dmabuf）、画进其中一个、交回栅栏。可选能力（直接扫描输出、光标平面、dmabuf
+导入、遮挡）带默认实现。`lum.open` 用内置的两个；`display.Display.with(o, output, renderer)` 接任意
+别的。服务端不懂的协议可在运行时按消息签名加上（`d.extend`）。
+
+`luminaria` 的构建特性：`backend`（内置输出端）、`vulkan`（内置渲染器）、`nested`（嵌套输出；后端
+只因它才依赖 `luminaria_proto` 和 `luminaria_wire`），默认全开。关掉 `nested` 时 `Kind.Auto` 总选 DRM。
 
 `protocols/` 是 wayland 1.26、wayland-protocols 1.50 和 wlr-protocols 的 XML。服务端支持：
 
@@ -44,7 +52,7 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 ```mica
 import luminaria as lum
 
-var d = try lum.Display.open(lum.Options {})   // DRM，或在 WAYLAND_DISPLAY 下嵌套
+var d = try lum.open(lum.Options {})   // DRM，或在 WAYLAND_DISPLAY 下嵌套
 var wins: List[lum.Window] = []
 while true {
     guard let Some(e) = try d.next() else {
@@ -230,7 +238,8 @@ MICA=/path/to/mica sys/gen.sh    # 默认 INC=/usr/include
 ```sh
 sheaf test    # luminaria：libwayland xdg 窗口（用 cc 编译）和 foot 在无头输出上：
               # configure、合成、读回、焦点、点击；server：提交、事务、toplevel、
-              # 子表面、弹出菜单、焦点、dmabuf 等待；compose：比对、上传、时钟；
+              # 子表面、弹出菜单、焦点、dmabuf 等待、运行时扩展协议；compose：比对、
+              # 上传、渲染目标；自定义输出端与软件渲染器；
               # backend：xkb、无头帧、DRM 卡上已连接的显示器、嵌套窗口；
               # protocols：layer 表面、锁屏、选区、输入法、装饰与激活、
               # 窗口列表、指针锁定、空闲、单像素缓冲、拖放、截屏、沙盒、

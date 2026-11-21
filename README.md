@@ -10,24 +10,36 @@ and its own loop. The design is in [docs/](docs/README.md) (Chinese).
 
 | Package | Role |
 |---------|------|
-| `luminaria` | `Display`: one event loop over everything below, layouts, input routing, manipulations |
+| `luminaria` | `Display`: one event loop over an output, a renderer and the server; layouts, input routing, manipulations, frame clock, fences |
 | `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, layer shell, session lock, seats and input methods, selections and drag and drop, outputs and their configuration, capture, sandboxes, buffers, timing; no GPU |
-| `luminaria_compose` | Composition on `vk_compose`: placement diffs, client buffer textures (owned here), fences, clock |
-| `luminaria_backend` | DRM/KMS, nested and headless outputs; libseat, libinput, xkb |
+| `luminaria_compose` | The Vulkan renderer on `vk_compose`: placement diffs, every texture, render targets |
+| `luminaria_backend` | DRM/KMS, nested and headless outputs; libseat, libinput, xkb; no GPU |
+| `luminaria_types` | Plain data the layers trade: dmabufs, placements, outputs, input, render targets |
 | `luminaria_proto` | Interfaces generated from `protocols/*.xml` |
 | `luminaria_wire` | Wire protocol: sockets, fd passing, encoding, object maps |
 | `luminaria_scanner` | Writes `luminaria_proto` (dev tool) |
 
 ```
 luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_wire
-           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu (github.com/antinomie1/vk)
-           └─ luminaria_backend ── vk_gpu, sys/*; luminaria_proto (nested only)
+           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu (github.com/antinomie1/vk)   [vulkan]
+           └─ luminaria_backend ── sys/*; luminaria_proto (nested only)                         [backend]
+                  all of them ──── luminaria_types
 ```
 
-Build features: `nested` (default) is the nested backend, and only it
-makes `luminaria_backend` depend on `luminaria_proto` and
-`luminaria_wire`. Without it (`--no-default-features`) the backend has DRM
-and headless outputs, and `Kind.Auto` always picks DRM.
+A `Display` joins an output and a renderer through two structural traits
+(`plug.Output`, `plug.Renderer`); `Display` is monomorphized, so a plugged
+in type costs no indirection. They trade only `luminaria_types`: the
+output asks for render targets, the renderer makes them (dmabufs to show),
+draws into one and returns its fence. Optional capabilities (direct
+scanout, a cursor plane, dmabuf import, occlusion) have default bodies.
+`lum.open` uses the built-in ones; `display.Display.with(o, output,
+renderer)` takes any others. Protocols the server does not speak are added
+at run time by their message signatures (`d.extend`).
+
+Build features of `luminaria`: `backend` (the built-in output), `vulkan`
+(the built-in renderer), `nested` (the nested output; only it makes the
+backend depend on `luminaria_proto` and `luminaria_wire`), all on by
+default. Without `nested`, `Kind.Auto` always picks DRM.
 
 `protocols/` holds the XML from wayland 1.26, wayland-protocols 1.50 and
 wlr-protocols. The server speaks:
@@ -49,7 +61,7 @@ Not yet: tablets, dmabuf and window capture.
 ```mica
 import luminaria as lum
 
-var d = try lum.Display.open(lum.Options {})   // DRM, or nested under WAYLAND_DISPLAY
+var d = try lum.open(lum.Options {})   // DRM, or nested under WAYLAND_DISPLAY
 var wins: List[lum.Window] = []
 while true {
     guard let Some(e) = try d.next() else {
@@ -280,8 +292,9 @@ MICA=/path/to/mica sys/gen.sh    # INC=/usr/include by default
 sheaf test    # luminaria: a libwayland xdg window (built with cc) and foot on a
               # headless output: configured, composited, read back, focused,
               # clicked; server: commits, transactions, toplevels,
-              # subsurfaces, popups, focus, dmabuf waits; compose: diffs,
-              # uploads, clock; backend: xkb, headless frames, the DRM card's
+              # subsurfaces, popups, focus, dmabuf waits, a run-time
+              # extension; compose: diffs, uploads, render targets; a custom
+              # output and software renderer; backend: xkb, headless frames, the DRM card's
               # displays, a nested window; protocols: layer surfaces, the
               # session lock, selections, input methods, decorations and
               # activation, the toplevel list, pointer locks, idle, single

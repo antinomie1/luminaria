@@ -1,58 +1,15 @@
-// Composition on the real device: placement lists diffed by key into
-// damage, restacking, shm damage uploads, client textures, dmabuf formats,
-// and the clock's deadlines.
+// The Vulkan renderer on the real device: placement lists diffed by key
+// into damage, restacking, shm damage uploads, client textures, render
+// targets and dmabuf formats.
 
+import std.os
 import vk_gpu as gpu
+import luminaria_types as types
 import luminaria_compose as compose
 
-test "the clock starts frames just in time and adapts to late ones" {
-    var c = compose.Clock.new(60000)
-    let r = c.refresh_ns
-    // Nothing presented yet: start now.
-    assert_eq(c.start(1000), 1000)
-    c.presented(1, 1000000000)
-    // Right after a vblank: start at the next one minus the margin.
-    let s = c.start(1000000000 + 1000)
-    assert_eq(s, 1000000000 + r - c.margin_ns)
-    // Too late for the next one: the one after.
-    let late = 1000000000 + r - 1000
-    assert_eq(c.start(late), 1000000000 + 2 * r - c.margin_ns)
-    let m = c.margin_ns
-    let target = c.begin(s)
-    assert_eq(target, 1000000000 + r)
-    // It landed a vblank late: the margin grows.
-    c.presented(3, 1000000000 + 2 * r)
-    assert(c.margin_ns > m)
-    c.vrr = true
-    assert_eq(c.start(1000000000 + 2 * r + 10), 1000000000 + 3 * r - c.margin_ns)
-}
-
-fn solid(mut dev: gpu.Device, rgba: [4]u8) -> gpu.Texture {
-    let t = compose.format.shm_texture(mut dev, 8, 8, compose.format.abgr8888).unwrap()
+fn fill(rgba: [4]u8, n: int) -> List[u8] {
     var px: List[u8] = []
-    for _ in 0..64 {
-        for b in rgba {
-            px.push(b)
-        }
-    }
-    var e = dev.encoder().unwrap()
-    let none: List[(i32, i32, i32, i32)] = []
-    compose.format.upload(mut dev, mut e, t, px, 32, none).unwrap()
-    discard dev.submit(take e).unwrap()
-    return t
-}
-
-fn draw(mut dev: gpu.Device, mut c: compose.Compositor, mut out: gpu.Offscreen) -> List[u8] {
-    let f = out.acquire(mut dev).unwrap().unwrap()
-    var e = dev.encoder().unwrap()
-    discard c.render(0, mut dev, mut e, f).unwrap()
-    discard out.present(mut dev, f, take e).unwrap()
-    return dev.read_texture(out.texture()).unwrap()
-}
-
-fn fill(rgba: [4]u8) -> List[u8] {
-    var px: List[u8] = []
-    for _ in 0..64 {
+    for _ in 0..n {
         for b in rgba {
             px.push(b)
         }
@@ -60,42 +17,59 @@ fn fill(rgba: [4]u8) -> List[u8] {
     return px
 }
 
-fn px(img: List[u8], x: int, y: int) -> (u8, u8, u8) {
-    let i = (y * 16 + x) * 4
+/// A renderer with output 0 of `size` x `size` and one render target.
+fn open(size: i32) -> Option[(compose.Compositor, u64)] {
+    guard let Ok(c) = compose.Compositor.open(true) else {
+        return None
+    }
+    var r = c
+    r.add_output(0, u32(size), u32(size), vec4(0.0, 0.0, 0.0, 1.0))
+    let ts = r.targets(types.Want { width: size, height: size, count: 1, export: false }).unwrap()
+    return Some((r, ts[0].key))
+}
+
+fn draw(mut c: compose.Compositor, t: u64) -> List[u8] {
+    if let Some(fence) = c.render(0, t, 0).unwrap() {
+        os.close(fence)
+    }
+    return c.read(t).unwrap()
+}
+
+fn px(img: List[u8], size: int, x: int, y: int) -> (u8, u8, u8) {
+    let i = (y * size + x) * 4
     return (img[i], img[i + 1], img[i + 2])
 }
 
 test "placement lists diff into damage and order" {
-    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+    guard let Some((cc, t)) = open(16) else {
         return
     }
-    var dev = d
-    var out = gpu.Offscreen.create(mut dev, 16, 16, gpu.Format.B8G8R8A8_UNORM).unwrap()
-    var c = compose.Compositor.new(mut dev).unwrap()
-    c.add_output(0, 16, 16, 60000, vec4(0.0, 0.0, 0.0, 1.0))
-    let red = solid(mut dev, [255, 0, 0, 255])
-    let green = solid(mut dev, [0, 255, 0, 255])
-    let a = compose.Placement { key: 1, tex: red, w: 8.0, h: 8.0 }
-    let b = compose.Placement { key: 2, tex: green, x: 4.0, y: 4.0, w: 8.0, h: 8.0 }
+    var c = cc
+    assert(c.image(101, 8, 8, types.buffer.xbgr8888, fill([255, 0, 0, 255], 64), 32))
+    assert(c.image(102, 8, 8, types.buffer.xbgr8888, fill([0, 255, 0, 255], 64), 32))
+    let a = types.Placement { key: 1, tex: 101, w: 8.0, h: 8.0 }
+    let b = types.Placement { key: 2, tex: 102, x: 4.0, y: 4.0, w: 8.0, h: 8.0 }
     c.layout(0, [a, b])
-    var img = draw(mut dev, mut c, mut out)
+    var img = draw(mut c, t)
     // B8G8R8A8: blue, green, red.
-    assert_eq(px(img, 1, 1), (u8(0), u8(0), u8(255)))
-    assert_eq(px(img, 6, 6), (u8(0), u8(255), u8(0)))
+    assert_eq(px(img, 16, 1, 1), (u8(0), u8(0), u8(255)))
+    assert_eq(px(img, 16, 6, 6), (u8(0), u8(255), u8(0)))
     // The same list again: nothing to draw.
     c.layout(0, [a, b])
     assert(c.idle(0))
     // Red on top now.
     c.layout(0, [b, a])
     assert(not c.idle(0))
-    img = draw(mut dev, mut c, mut out)
-    assert_eq(px(img, 6, 6), (u8(0), u8(0), u8(255)))
-    // Green gone.
-    c.layout(0, [a])
-    img = draw(mut dev, mut c, mut out)
-    assert_eq(px(img, 10, 10), (u8(0), u8(0), u8(0)))
+    img = draw(mut c, t)
+    assert_eq(px(img, 16, 6, 6), (u8(0), u8(0), u8(255)))
+    // Green gone; a placement without a texture shows nothing.
+    c.layout(0, [a, types.Placement { key: 3, tex: 999, w: 16.0, h: 16.0 }])
+    img = draw(mut c, t)
+    assert_eq(px(img, 16, 10, 10), (u8(0), u8(0), u8(0)))
     assert(c.visible(0, 1))
     assert(not c.visible(0, 2))
+    assert(not c.visible(0, 3))
+    c.close()
 }
 
 test "shm damage uploads only the rectangles" {
@@ -103,16 +77,12 @@ test "shm damage uploads only the rectangles" {
         return
     }
     var dev = d
-    let t = solid(mut dev, [0, 0, 0, 255])
-    var px: List[u8] = []
-    for _ in 0..64 {
-        for b in [u8(9), 8, 7, 255] {
-            px.push(b)
-        }
-    }
+    let t = compose.format.shm_texture(mut dev, 8, 8, compose.format.abgr8888).unwrap()
     var e = dev.encoder().unwrap()
+    let none: List[(i32, i32, i32, i32)] = []
+    compose.format.upload(mut dev, mut e, t, fill([0, 0, 0, 255], 64), 32, none).unwrap()
     let rects: List[(i32, i32, i32, i32)] = [(2, 2, 2, 2), (-4, -4, 5, 5)]
-    compose.format.upload(mut dev, mut e, t, px, 32, rects).unwrap()
+    compose.format.upload(mut dev, mut e, t, fill([9, 8, 7, 255], 64), 32, rects).unwrap()
     discard dev.submit(take e).unwrap()
     let got = dev.read_texture(t).unwrap()
     let at = fn(x: int, y: int) => got[(y * 8 + x) * 4]
@@ -126,42 +96,57 @@ test "shm damage uploads only the rectangles" {
 }
 
 test "client textures: shm damage merges until uploaded, single pixels" {
-    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+    guard let Some((cc, t)) = open(8) else {
         return
     }
-    var dev = d
-    var c = compose.Compositor.new(mut dev).unwrap()
-    let fmt = compose.format.abgr8888
+    var c = cc
+    let fmt = types.buffer.xbgr8888
     let all: List[(i32, i32, i32, i32)] = []
-    let t = c.shm_commit(mut dev, 7, 8, 8, fmt, all).unwrap()
-    let black = fill([0, 0, 0, 255])
-    c.shm_upload(mut dev, 7, black, 32).unwrap()
+    assert(c.shm_commit(7, 8, 8, fmt, all))
+    assert(c.shm_upload(7, fill([0, 0, 0, 255], 64), 32))
+    c.layout(0, [types.Placement { key: 1, tex: 7, w: 8.0, h: 8.0 }])
+    discard draw(mut c, t)
     // Two commits before the next frame: their damage is uploaded once,
-    // from the newest pixels, into the same texture.
+    // from the newest pixels.
     let a: List[(i32, i32, i32, i32)] = [(1, 1, 1, 1)]
     let b: List[(i32, i32, i32, i32)] = [(3, 3, 1, 1)]
-    assert_eq(c.shm_commit(mut dev, 7, 8, 8, fmt, a), Some(t))
-    assert_eq(c.shm_commit(mut dev, 7, 8, 8, fmt, b), Some(t))
-    let white = fill([255, 255, 255, 255])
-    c.shm_upload(mut dev, 7, white, 32).unwrap()
-    c.flush_uploads(mut dev).unwrap()
-    let got = dev.read_texture(t).unwrap()
-    let at = fn(x: int, y: int) => got[(y * 8 + x) * 4]
-    assert_eq(at(1, 1), u8(255))
-    assert_eq(at(2, 2), u8(255))
-    assert_eq(at(3, 3), u8(255))
-    assert_eq(at(0, 0), u8(0))
-    assert_eq(at(5, 5), u8(0))
-    // A new size is a new texture; an unknown format none.
-    assert(c.shm_commit(mut dev, 7, 4, 4, fmt, all) != Some(t))
-    assert(c.shm_commit(mut dev, 8, 4, 4, 0x30303030, all).is_none())
-    c.drop_surface(mut dev, 7)
-    // One premultiplied pixel, 32 bits a channel.
-    assert(c.solid(mut dev, 1, [0xFFFFFFFF, 0, 0x80000000, 0xFFFFFFFF]))
-    c.flush_uploads(mut dev).unwrap()
-    let s = dev.read_texture(c.buffer(1).unwrap()).unwrap()
-    assert_eq((s[0], s[1], s[2], s[3]), (u8(255), u8(0), u8(128), u8(255)))
-    c.drop_buffer(mut dev, 1)
-    assert(c.buffer(1).is_none())
-    c.destroy(mut dev)
+    assert(c.shm_commit(7, 8, 8, fmt, a))
+    assert(c.shm_commit(7, 8, 8, fmt, b))
+    assert(c.shm_upload(7, fill([255, 255, 255, 255], 64), 32))
+    c.commit(1, all)
+    let got = draw(mut c, t)
+    assert_eq(px(got, 8, 1, 1), (u8(255), u8(255), u8(255)))
+    assert_eq(px(got, 8, 2, 2), (u8(255), u8(255), u8(255)))
+    assert_eq(px(got, 8, 3, 3), (u8(255), u8(255), u8(255)))
+    assert_eq(px(got, 8, 0, 0), (u8(0), u8(0), u8(0)))
+    assert_eq(px(got, 8, 5, 5), (u8(0), u8(0), u8(0)))
+    // An unknown format makes no texture.
+    assert(not c.shm_commit(8, 4, 4, 0x30303030, all))
+    assert(not c.has(8))
+    c.forget(7)
+    assert(not c.has(7))
+    // One premultiplied pixel, 32 bits a channel, stretched.
+    assert(c.solid(2, [0xFFFFFFFF, 0, 0x80000000, 0xFFFFFFFF]))
+    c.layout(0, [types.Placement { key: 2, tex: 2, w: 8.0, h: 8.0 }])
+    let s = draw(mut c, t)
+    assert_eq(px(s, 8, 4, 4), (u8(128), u8(0), u8(255)))
+    c.close()
+}
+
+test "exported render targets are dmabufs" {
+    guard let Ok(cc) = compose.Compositor.open(true) else {
+        return
+    }
+    var c = cc
+    assert(not c.formats().is_empty())
+    let ts = c.targets(types.Want { width: 64, height: 32, count: 2 }).unwrap()
+    assert_eq(ts.len(), 2)
+    assert(ts[0].key != ts[1].key)
+    for x in ts {
+        assert_eq(x.buf.planes, 1)
+        assert(x.buf.plane[0].fd >= 0)
+        assert(x.buf.plane[0].stride >= 64 * 4)
+        c.drop_target(x.key)
+    }
+    c.close()
 }

@@ -177,6 +177,9 @@ pub enum Request {
     XdgToplevelIconManager(xdg_toplevel_icon.IconManager, xdg_toplevel_icon.IconManagerRequest)
     XdgToplevelIcon(xdg_toplevel_icon.Icon, xdg_toplevel_icon.IconRequest)
     XdgToplevelTagManager(xdg_toplevel_tag.ToplevelTagManager, xdg_toplevel_tag.ToplevelTagManagerRequest)
+    /// A request to an object of an interface added at run time (an
+    /// extension of luminaria_server): decode it by its signature.
+    Extension(wire.Msg)
 }
 
 /// The next request received on `conn`, `None` until more is read.
@@ -315,6 +318,9 @@ pub fn next(mut conn: wire.Conn) -> Result[Option[Request], wire.Error] {
             129 => Request.XdgToplevelIcon(xdg_toplevel_icon.Icon { id: m.id }, try xdg_toplevel_icon.decode_icon(mut conn, m))
             130 => Request.XdgToplevelTagManager(xdg_toplevel_tag.ToplevelTagManager { id: m.id }, try xdg_toplevel_tag.decode_toplevel_tag_manager(mut conn, m))
             _ => {
+                if m.iface > ifaces.count {
+                    return Ok(Some(Request.Extension(m)))
+                }
                 return Err(conn.error(m.id, wire.invalid_method, "no requests on interface {m.iface}"))
             }
         }

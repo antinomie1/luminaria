@@ -1,64 +1,38 @@
-// luminaria_compose: composition on vk_compose. Each output is a scene the
-// compositor's placement list (back to front, output pixels) is diffed
-// into: what moved, appeared or changed becomes damage, opaque views hide
-// what is under them, and only the damage is redrawn, in one pass. Client
-// buffers become textures here and live here: a dmabuf is imported once
-// and a single-pixel buffer becomes one texel, each under its buffer's
-// key; an shm surface has one texture under its surface's key that
-// commits upload their damage into, merged and recorded once before the
-// next frame. Fences become descriptors to poll, and each output keeps a
-// compositor clock that starts frames as late as the next vblank allows.
+// luminaria_compose: the Vulkan renderer, on vk_compose. Each output is a
+// scene the placement list (back to front, output pixels) is diffed into:
+// what moved, appeared or changed becomes damage, opaque views hide what
+// is under them, and only the damage is redrawn, in one pass. The renderer
+// owns the device and every texture, each under the caller's key: client
+// dmabufs imported once, single-pixel buffers as one texel, one texture
+// per shm surface that commits upload their merged damage into once
+// before the next frame, the compositor's images, and the render targets
+// outputs show (exported as dmabufs, drawn with a sync_file fence out).
 
 import std.collections.map
 import std.mem
 import vk_gpu as gpu
 import vk_draw2d as draw2d
 import vk_compose as vc
+import luminaria_types as types
 pub import format
-pub import fence
-pub import clock
 
-pub type Clock = clock.Clock
-pub type Syncobj = fence.Syncobj
-pub type Rect = vc.Rect
-pub type Transform = vc.Transform
+pub type Placement = types.Placement
+pub type Rect = types.Rect
 
-/// One thing to show: a texture placed on an output.
-pub struct Placement {
-    /// Stable identity (a surface, a compositor image): a key keeps its
-    /// view, so only what changes is damaged.
-    pub key: u64 = 0
-    pub tex: gpu.Texture
-    /// Where, in output pixels.
-    pub x: f32 = 0.0
-    pub y: f32 = 0.0
-    pub w: f32 = 0.0
-    pub h: f32 = 0.0
-    /// Part of the texture (pixels of the upright picture); empty: all.
-    pub src: Rect = Rect {}
-    /// wl_output.transform the texture is turned by.
-    pub transform: u32 = 0
-    pub opacity: f32 = 1.0
-    pub radius: f32 = 0.0
-    pub shadow: f32 = 0.0
-    /// Opaque part, relative to x, y.
-    pub opaque: Rect = Rect {}
-}
-
-pub struct Output {
-    pub scene: vc.Scene
-    pub clock: Clock
-    pub width: u32
-    pub height: u32
-    pub alive: bool = true
+struct Output {
+    scene: vc.Scene
+    alive: bool = true
     keys: List[u64] = []
     ids: List[u32] = []
 }
 
-/// An shm surface's texture and the damage still to upload (x0, y0 to
-/// x1, y1; none when x0 >= x1).
+fn blank() -> Output {
+    return Output { scene: vc.Scene.new(1, 1, vec4(0.0)), alive: false }
+}
+
+/// The damage of an shm texture still to upload (x0, y0 to x1, y1; none
+/// when x0 >= x1), and its fourcc.
 struct Shm {
-    tex: gpu.Texture
     format: u32
     x0: i32 = 0
     y0: i32 = 0
@@ -67,41 +41,57 @@ struct Shm {
 }
 
 pub struct Compositor {
+    dev: gpu.Device
     canvas: Option[draw2d.Canvas] = None
-    pub outputs: List[Output] = []
+    outputs: List[Output] = []
     /// Uploads waiting for the next frame (recorded once, before any draw).
     uploads: Option[gpu.Encoder] = None
-    /// Client buffers' textures by buffer key; shm surfaces' by surface key.
-    bufs: map.Map[u64, gpu.Texture]
+    /// Textures by key; shm ones also have their pending damage.
+    texs: map.Map[u64, gpu.Texture]
     shms: map.Map[u64, Shm]
+    /// Render targets by key.
+    targets: map.Map[u64, gpu.Texture]
+    next_target: u64 = 1
+    /// The views of the placement list being laid out (kept: no
+    /// allocation in steady state).
+    views: List[(u64, vc.View)] = []
 }
 
-pub fn Compositor.new(mut dev: gpu.Device) -> Result[Compositor, str] {
-    let canvas = try draw2d.Canvas.create(mut dev, gpu.Format.B8G8R8A8_UNORM)
-    return Ok(Compositor { canvas: Some(canvas), bufs: map.Map.new(), shms: map.Map.new() })
+/// The renderer on a GPU of its own choosing (`validation` loads the
+/// Vulkan validation layer).
+pub fn Compositor.open(validation: bool) -> Result[Compositor, str] {
+    let dev = try gpu.Device.open(gpu.Options { headless: true, validation })
+    return Compositor.with(dev)
 }
 
-/// A compositor with nothing behind it (a placeholder to move one out).
-pub fn Compositor.none() -> Compositor {
-    return Compositor { bufs: map.Map.new(), shms: map.Map.new() }
+pub fn Compositor.with(take dev: gpu.Device) -> Result[Compositor, str] {
+    var c = Compositor { dev, texs: map.Map.new(), shms: map.Map.new(), targets: map.Map.new() }
+    c.canvas = Some(try draw2d.Canvas.create(mut c.dev, gpu.Format.B8G8R8A8_UNORM))
+    return Ok(c)
 }
 
-/// Output `o` (the backend's index) is `width` x `height` at `refresh_mhz`.
-pub fn Compositor.add_output(mut self, o: int, width: u32, height: u32, refresh_mhz: int, background: vec4) {
+/// Every fourcc and modifier clients may hand over as dmabufs.
+pub fn Compositor.formats(self) -> List[(u32, u64)] {
+    return format.dmabuf_formats(self.dev)
+}
+
+/// The GPU's DRM node (major, minor), for linux-dmabuf and drm_syncobj.
+pub fn Compositor.render_node(self) -> Option[(i64, i64)] {
+    return self.dev.drm_node()
+}
+
+/// Output `o` (the output's index) is `width` x `height`.
+pub fn Compositor.add_output(mut self, o: int, width: u32, height: u32, background: vec4) {
     while self.outputs.len() <= o {
-        self.outputs.push(Output { scene: vc.Scene.new(1, 1, background), clock: Clock.new(60000), width: 1, height: 1, alive: false })
+        self.outputs.push(blank())
     }
-    self.outputs[o] = Output { scene: vc.Scene.new(width, height, background), clock: Clock.new(refresh_mhz), width, height }
+    self.outputs[o] = Output { scene: vc.Scene.new(width, height, background) }
 }
 
-pub fn Compositor.resize(mut self, o: int, width: u32, height: u32, refresh_mhz: int) {
-    guard o < self.outputs.len() else {
-        return
+pub fn Compositor.resize(mut self, o: int, width: u32, height: u32) {
+    if o < self.outputs.len() {
+        self.outputs[o].scene.resize(width, height)
     }
-    self.outputs[o].scene.resize(width, height)
-    self.outputs[o].width = width
-    self.outputs[o].height = height
-    self.outputs[o].clock.refresh_ns = 1000000000000 / max(refresh_mhz, 1000)
 }
 
 pub fn Compositor.remove_output(mut self, o: int) {
@@ -112,24 +102,34 @@ pub fn Compositor.remove_output(mut self, o: int) {
     }
 }
 
-fn view(p: Placement) -> vc.View {
-    return vc.View { tex: p.tex, x: p.x, y: p.y, w: p.w, h: p.h, src: p.src, transform: vc.Transform(p.transform), opacity: p.opacity, radius: p.radius, shadow: p.shadow, opaque: p.opaque }
+fn view(p: Placement, t: gpu.Texture) -> vc.View {
+    let src = vc.Rect { x: p.src.x, y: p.src.y, w: p.src.w, h: p.src.h }
+    let opaque = vc.Rect { x: p.opaque.x, y: p.opaque.y, w: p.opaque.w, h: p.opaque.h }
+    return vc.View { tex: t, x: p.x, y: p.y, w: p.w, h: p.h, src, transform: vc.Transform(p.transform), opacity: p.opacity, radius: p.radius, shadow: p.shadow, opaque }
 }
 
 /// Show `ps` (back to front) on output `o` from the next frame: views are
 /// added, changed, restacked and removed by key, and only that is damaged.
-pub fn Compositor.layout(mut self, o: int, ps: &[Placement]) {
+pub fn Compositor.layout(mut self, o: int, placements: &[Placement]) {
     guard o < self.outputs.len() and self.outputs[o].alive else {
         return
     }
-    var out = mem.replace(mut self.outputs[o], Output { scene: vc.Scene.new(1, 1, vec4(0.0)), clock: Clock {}, width: 0, height: 0 })
+    // Placements whose texture is not here (yet) are not shown.
+    var ps = mem.replace(mut self.views, [])
+    ps.clear()
+    for p in placements {
+        if let Some(t) = self.texs.get(p.tex) {
+            ps.push((p.key, view(p, t)))
+        }
+    }
+    var out = mem.replace(mut self.outputs[o], blank())
     // Gone keys.
     var i = out.keys.len() - 1
     while i >= 0 {
         let k = out.keys[i]
         var keep = false
         for p in ps {
-            if p.key == k {
+            if p.0 == k {
                 keep = true
                 break
             }
@@ -144,15 +144,15 @@ pub fn Compositor.layout(mut self, o: int, ps: &[Placement]) {
     // New and changed views; then the order.
     var ordered = true
     var n = 0
-    for p in ps {
-        let at = out.keys.position(fn(k) => k == p.key).unwrap_or(-1)
+    for (key, v) in ps {
+        let at = out.keys.position(fn(k) => k == key).unwrap_or(-1)
         if at < 0 {
-            let id = out.scene.add(view(p))
-            out.keys.push(p.key)
+            let id = out.scene.add(v)
+            out.keys.push(key)
             out.ids.push(id)
             ordered = ordered and n == out.keys.len() - 1
         } else {
-            out.scene.set(out.ids[at], view(p))
+            out.scene.set(out.ids[at], v)
             ordered = ordered and at == n
         }
         n += 1
@@ -161,13 +161,13 @@ pub fn Compositor.layout(mut self, o: int, ps: &[Placement]) {
         var keys: List[u64] = []
         var ids: List[u32] = []
         var prev: u32 = 0
-        for p in ps {
-            let at = out.keys.position(fn(k) => k == p.key).unwrap_or(-1)
+        for (key, _) in ps {
+            let at = out.keys.position(fn(k) => k == key).unwrap_or(-1)
             if at >= 0 {
                 let id = out.ids[at]
                 out.scene.place_above(id, prev)
                 prev = id
-                keys.push(p.key)
+                keys.push(key)
                 ids.push(id)
             }
         }
@@ -175,6 +175,7 @@ pub fn Compositor.layout(mut self, o: int, ps: &[Placement]) {
         out.ids = ids
     }
     self.outputs[o] = out
+    self.views = ps
 }
 
 /// The client drew into key `key`'s texture: `rects` in texture pixels
@@ -189,16 +190,16 @@ pub fn Compositor.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {
             self.outputs[o].scene.commit(id, None)
         }
         for r in rects {
-            self.outputs[o].scene.commit(id, Some(Rect { x: f32(r.0), y: f32(r.1), w: f32(r.2), h: f32(r.3) }))
+            self.outputs[o].scene.commit(id, Some(vc.Rect { x: f32(r.0), y: f32(r.1), w: f32(r.2), h: f32(r.3) }))
         }
     }
 }
 
-/// Redraw `r` (output pixels) of output `o` next frame (a software cursor,
-/// an effect).
-pub fn Compositor.damage(mut self, o: int, r: Rect) {
-    if o < self.outputs.len() {
-        self.outputs[o].scene.damage(r)
+/// Redraw every output whole next frame (the background or a scale
+/// changed).
+pub fn Compositor.damage_all(mut self) {
+    for o in 0..self.outputs.len() {
+        self.outputs[o].scene.damage_all()
     }
 }
 
@@ -231,161 +232,238 @@ pub fn Compositor.scanout(self, o: int) -> Option[u64] {
     return if at < 0 { None } else { Some(self.outputs[o].keys[at]) }
 }
 
-/// The uploads encoder (created on first use), submitted before the next
-/// frame draws.
-pub fn Compositor.uploads(mut self, mut dev: gpu.Device) -> Result[gpu.Encoder, str] {
+// ------------------------------------------------------------- textures
+
+fn Compositor.encoder(mut self) -> Result[gpu.Encoder, str] {
     if let Some(e) = self.uploads.take() {
         return Ok(e)
     }
-    return dev.encoder()
+    return self.dev.encoder()
 }
 
-pub fn Compositor.put_uploads(mut self, take e: gpu.Encoder) {
-    self.uploads = Some(e)
-}
-
-/// Submit pending uploads now (frames sample what they wrote).
-pub fn Compositor.flush_uploads(mut self, mut dev: gpu.Device) -> Result[(), str] {
-    if let Some(e) = self.uploads.take() {
-        var enc = e
-        discard try dev.submit(take enc)
+fn Compositor.put(mut self, key: u64, t: gpu.Texture) {
+    if let Some(old) = self.texs.insert(key, t) {
+        self.dev.destroy_texture(old)
     }
-    return Ok(())
 }
 
-// ------------------------------------------------------- client buffers
+/// Whether texture `key` exists.
+pub fn Compositor.has(self, key: u64) -> bool {
+    return self.texs.contains(key)
+}
 
-/// Buffer `key` is a single-plane dmabuf: import it (the fd stays the
-/// caller's). False when the GPU cannot sample it.
-pub fn Compositor.import_dmabuf(mut self, mut dev: gpu.Device, key: u64, fd: int, width: i32, height: i32, fourcc: u32, modifier: u64, offset: u32, stride: u32) -> bool {
-    guard let Ok(t) = format.import_dmabuf(mut dev, fd, width, height, fourcc, modifier, offset, stride) else {
+/// Free texture `key` (nothing shows it any more).
+pub fn Compositor.forget(mut self, key: u64) {
+    if let Some(t) = self.texs.remove(key) {
+        self.dev.destroy_texture(t)
+    }
+    discard self.shms.remove(key)
+}
+
+/// Texture `key` is a single-plane dmabuf (the descriptor stays the
+/// caller's); false when the GPU cannot sample it.
+pub fn Compositor.import_dmabuf(mut self, key: u64, d: types.Dmabuf) -> bool {
+    guard d.planes == 1 else {
         return false
     }
-    discard self.bufs.insert(key, t)
+    let p = d.plane[0]
+    guard let Ok(t) = format.import_dmabuf(mut self.dev, p.fd, d.width, d.height, d.format, d.modifier, p.offset, p.stride) else {
+        return false
+    }
+    self.put(key, t)
     return true
 }
 
-/// Buffer `key` is one premultiplied pixel (32 bits a channel), stretched
-/// by its viewport.
-pub fn Compositor.solid(mut self, mut dev: gpu.Device, key: u64, rgba: [4]u32) -> bool {
+/// Texture `key` is one premultiplied pixel (32 bits a channel),
+/// stretched by its viewport.
+pub fn Compositor.solid(mut self, key: u64, rgba: [4]u32) -> bool {
     let px: List[u8] = [u8(rgba[0] >> 24), u8(rgba[1] >> 24), u8(rgba[2] >> 24), u8(rgba[3] >> 24)]
-    guard let Ok(t) = dev.texture(gpu.TextureDesc { width: 1, height: 1, format: gpu.Format.R8G8B8A8_UNORM, opaque: rgba[3] == 0xFFFFFFFF }) else {
+    let fourcc = if rgba[3] == 0xFFFFFFFF { types.buffer.xbgr8888 } else { types.buffer.abgr8888 }
+    return self.image(key, 1, 1, fourcc, px, 4)
+}
+
+/// Texture `key` holds `pixels` (`width` x `height` of `fourcc`, rows
+/// `stride` bytes apart), made again only when the size or format changes;
+/// the copy is recorded for the next frame. False when the format is not
+/// supported.
+pub fn Compositor.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool {
+    guard self.target(key, width, height, fourcc) else {
         return false
     }
-    guard let Ok(got) = self.uploads(mut dev) else {
-        dev.destroy_texture(t)
+    let none: List[(i32, i32, i32, i32)] = []
+    return self.write(key, pixels, stride, none)
+}
+
+/// Copy `rects` (texture pixels) of `pixels` into texture `key`.
+pub fn Compositor.update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool {
+    return self.texs.contains(key) and self.write(key, pixels, stride, rects)
+}
+
+/// Make sure texture `key` is `width` x `height` of `fourcc`.
+fn Compositor.target(mut self, key: u64, width: i32, height: i32, fourcc: u32) -> bool {
+    if let Some(t) = self.texs.get(key) {
+        let same = i32(t.width()) == width and i32(t.height()) == height and self.shms.get(key).map(fn(s) => s.format).unwrap_or(0) == fourcc
+        if same {
+            return true
+        }
+    }
+    guard let Ok(t) = format.shm_texture(mut self.dev, width, height, fourcc) else {
+        self.forget(key)
+        return false
+    }
+    self.put(key, t)
+    discard self.shms.insert(key, Shm { format: fourcc, x1: width, y1: height })
+    return true
+}
+
+fn Compositor.write(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool {
+    guard let Some(t) = self.texs.get(key) else {
+        return false
+    }
+    guard let Ok(got) = self.encoder() else {
         return false
     }
     var e = got
-    let ok = dev.write_texture_rect(mut e, t, 0, 0, 1, 1, px, 4).is_ok()
+    let ok = format.upload(mut self.dev, mut e, t, pixels, stride, rects).is_ok()
     self.uploads = Some(e)
-    if not ok {
-        dev.destroy_texture(t)
-        return false
+    if let Some(s) = self.shms.get(key) {
+        discard self.shms.insert(key, Shm { format: s.format })
     }
-    discard self.bufs.insert(key, t)
-    return true
-}
-
-/// Buffer `key`'s texture.
-pub fn Compositor.buffer(self, key: u64) -> Option[gpu.Texture] {
-    return self.bufs.get(key)
-}
-
-/// Free buffer `key`'s texture (nothing shows it any more).
-pub fn Compositor.drop_buffer(mut self, mut dev: gpu.Device, key: u64) {
-    if let Some(t) = self.bufs.remove(key) {
-        dev.destroy_texture(t)
-    }
+    return ok
 }
 
 /// Surface `key` committed a `width` x `height` shm buffer of `fourcc`
-/// with `rects` damaged (buffer pixels; empty: all). Its texture, made
-/// again when the size or format changed; None when the format is not
-/// supported. The damage waits for `shm_upload`.
-pub fn Compositor.shm_commit(mut self, mut dev: gpu.Device, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> Option[gpu.Texture] {
-    var sh = self.shms.get(key)
-    if let Some(old) = sh {
-        if i32(old.tex.width()) != width or i32(old.tex.height()) != height or old.format != fourcc {
-            dev.destroy_texture(old.tex)
-            discard self.shms.remove(key)
-            sh = None
-        }
+/// with `rects` damaged (buffer pixels; empty: all). Its texture is made
+/// again when the size or format changed; the damage merges with what is
+/// not uploaded yet and waits for `shm_upload`. False when the format is
+/// not supported.
+pub fn Compositor.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+    guard self.target(key, width, height, fourcc) else {
+        return false
     }
-    var fresh = false
-    if sh.is_none() {
-        guard let Ok(t) = format.shm_texture(mut dev, width, height, fourcc) else {
-            return None
-        }
-        sh = Some(Shm { tex: t, format: fourcc })
-        fresh = true
-    }
-    var s = sh.unwrap()
-    if fresh or rects.is_empty() {
+    var s = self.shms.get(key).unwrap()
+    if rects.is_empty() {
         s.x0 = 0
         s.y0 = 0
         s.x1 = width
         s.y1 = height
-    } else {
-        for r in rects {
-            if s.x0 >= s.x1 {
-                s.x0 = r.0
-                s.y0 = r.1
-                s.x1 = r.0 + r.2
-                s.y1 = r.1 + r.3
-            } else {
-                s.x0 = min(s.x0, r.0)
-                s.y0 = min(s.y0, r.1)
-                s.x1 = max(s.x1, r.0 + r.2)
-                s.y1 = max(s.y1, r.1 + r.3)
-            }
+    }
+    for r in rects {
+        if s.x0 >= s.x1 {
+            s.x0 = r.0
+            s.y0 = r.1
+            s.x1 = r.0 + r.2
+            s.y1 = r.1 + r.3
+        } else {
+            s.x0 = min(s.x0, r.0)
+            s.y0 = min(s.y0, r.1)
+            s.x1 = max(s.x1, r.0 + r.2)
+            s.y1 = max(s.y1, r.1 + r.3)
         }
     }
     discard self.shms.insert(key, s)
-    return Some(s.tex)
+    return true
 }
 
-/// Record surface `key`'s pending damage from the shm pixels `bytes` into
-/// the uploads; the bytes may go back to the client after this returns.
-pub fn Compositor.shm_upload(mut self, mut dev: gpu.Device, key: u64, bytes: &[u8], stride: int) -> Result[(), str] {
+/// Record surface `key`'s merged damage from the shm pixels `bytes`; the
+/// bytes may go back to the client after this returns.
+pub fn Compositor.shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool {
     guard let Some(s) = self.shms.get(key) else {
-        return Ok(())
+        return false
     }
     guard s.x0 < s.x1 and s.y0 < s.y1 else {
-        return Ok(())
+        return true
     }
-    var e = try self.uploads(mut dev)
     let rect: List[(i32, i32, i32, i32)] = [(s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0)]
-    let r = format.upload(mut dev, mut e, s.tex, bytes, stride, rect)
-    self.uploads = Some(e)
-    discard self.shms.insert(key, Shm { x0: 0, y0: 0, x1: 0, y1: 0, ..s })
-    return r
+    return self.write(key, bytes, stride, rect)
 }
 
-/// Surface `key` is gone: free its shm texture.
-pub fn Compositor.drop_surface(mut self, mut dev: gpu.Device, key: u64) {
-    if let Some(s) = self.shms.remove(key) {
-        dev.destroy_texture(s.tex)
+// -------------------------------------------------------------- targets
+
+/// Render targets an output asked for.
+pub fn Compositor.targets(mut self, w: types.Want) -> Result[List[types.Target], str] {
+    guard let Some((vf, _)) = format.vk_format(w.format) else {
+        return Err("render target format {w.format:08x} is not supported")
+    }
+    let desc = gpu.TextureDesc { width: u32(w.width), height: u32(w.height), format: vf, target: true }
+    var mods: List[u64] = []
+    if w.export {
+        let gpu_mods = self.dev.dmabuf_modifiers(vf, true)
+        for m in gpu_mods {
+            if w.modifiers.is_empty() or w.modifiers.contains(m) {
+                mods.push(m)
+            }
+        }
+        if mods.is_empty() {
+            mods.push(0)
+        }
+    }
+    var out: List[types.Target] = []
+    for _ in 0..w.count {
+        let key = self.next_target
+        self.next_target += 1
+        if w.export {
+            let (t, b) = try self.dev.export_dmabuf_with(desc, mods)
+            discard self.targets.insert(key, t)
+            var buf = types.Dmabuf { width: w.width, height: w.height, format: w.format, modifier: b.modifier, planes: 1 }
+            buf.plane[0] = types.Plane { fd: int(b.fd), offset: u32(b.offset), stride: u32(b.stride) }
+            out.push(types.Target { key, buf })
+        } else {
+            discard self.targets.insert(key, try self.dev.texture(desc))
+            out.push(types.Target { key })
+        }
+    }
+    return Ok(out)
+}
+
+/// Free render target `key` (its output let it go).
+pub fn Compositor.drop_target(mut self, key: u64) {
+    if let Some(t) = self.targets.remove(key) {
+        self.dev.destroy_texture(t)
     }
 }
 
-/// Draw what frame `f` of output `o` needs into encoder `e`; false when
-/// the image is already up to date.
-pub fn Compositor.render(mut self, o: int, mut dev: gpu.Device, mut e: gpu.Encoder, f: gpu.Frame) -> Result[bool, str] {
-    try self.flush_uploads(mut dev)
+/// Draw what output `o` needs into target `key`, whose content is `age`
+/// frames old: the sync_file fence of the drawing, or None when the image
+/// is already up to date.
+pub fn Compositor.render(mut self, o: int, key: u64, age: u32) -> Result[Option[int], str] {
+    if let Some(u) = self.uploads.take() {
+        var enc = u
+        discard try self.dev.submit(take enc)
+    }
     guard o < self.outputs.len() else {
-        return Ok(false)
+        return Ok(None)
     }
-    var out = mem.replace(mut self.outputs[o], Output { scene: vc.Scene.new(1, 1, vec4(0.0)), clock: Clock {}, width: 0, height: 0 })
+    guard let Some(t) = self.targets.get(key) else {
+        return Err("no render target {key}")
+    }
     guard let Some(cv) = self.canvas.take() else {
-        self.outputs[o] = out
         return Err("no canvas")
     }
     var canvas = cv
-    let r = out.scene.render(mut dev, mut canvas, mut e, f)
-    self.canvas = Some(canvas)
+    var e = try self.dev.encoder()
+    var out = mem.replace(mut self.outputs[o], blank())
+    let r = out.scene.render(mut self.dev, mut canvas, mut e, gpu.Frame.new(t, age))
     self.outputs[o] = out
-    return r
+    self.canvas = Some(canvas)
+    guard let Ok(drew) = r else {
+        self.dev.cancel(take e)
+        return Err(r.unwrap_err())
+    }
+    guard drew else {
+        self.dev.cancel(take e)
+        return Ok(None)
+    }
+    let (_, fence) = try self.dev.submit_sync_file(take e)
+    return Ok(Some(int(fence)))
+}
+
+/// The pixels of target `key` (B8G8R8A8), once the GPU is done with it.
+pub fn Compositor.read(mut self, key: u64) -> Result[List[u8], str] {
+    guard let Some(t) = self.targets.get(key) else {
+        return Err("no render target {key}")
+    }
+    return self.dev.read_texture(t)
 }
 
 /// What the last frame of output `o` changed (damage for KMS and parents).
@@ -398,14 +476,27 @@ pub fn Compositor.changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {
     }
 }
 
-pub fn Compositor.destroy(self, mut dev: gpu.Device) {
-    self.bufs.each(fn(_, t) {
-        dev.destroy_texture(t)
+/// Free everything (after the outputs let go of their targets).
+pub fn Compositor.close(mut self) {
+    discard self.dev.idle()
+    if let Some(u) = self.uploads.take() {
+        var enc = u
+        self.dev.cancel(take enc)
+    }
+    var ts: List[gpu.Texture] = []
+    self.texs.each(fn(_, t) {
+        ts.push(t)
     })
-    self.shms.each(fn(_, s) {
-        dev.destroy_texture(s.tex)
+    self.targets.each(fn(_, t) {
+        ts.push(t)
     })
-    if let Some(c) = self.canvas {
-        c.destroy(mut dev)
+    for t in ts {
+        self.dev.destroy_texture(t)
+    }
+    self.texs.clear()
+    self.targets.clear()
+    self.shms.clear()
+    if let Some(c) = self.canvas.take() {
+        c.destroy(mut self.dev)
     }
 }

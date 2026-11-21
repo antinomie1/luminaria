@@ -1,0 +1,181 @@
+// A protocol the server does not speak, added at run time: the global
+// shows in the registry, binds, requests arrive decoded by signature
+// (including a new object of a second interface and a destructor), and
+// events go out encoded the same way. The client writes raw messages.
+
+import std.env
+import std.fs
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_server as server
+
+struct Fx {
+    srv: server.Server
+    c: wire.Conn
+    client: server.Client
+}
+
+fn setup() -> Fx {
+    let dir = fs.create_temp_dir("luminaria-ext").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    var srv = server.Server.open("").expect("listen")
+    let c = wire.connect(srv.name()).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some((client, _))) = srv.accept() {
+            return Fx { srv, c, client }
+        }
+    }
+    panic("accept")
+}
+
+/// Hand the client's requests to the server and its events back: the raw
+/// messages as (object, opcode, first word).
+fn pump(mut f: Fx) -> List[(u32, u16, u32)] {
+    discard f.c.flush()
+    for _ in 0..3 {
+        assert(f.srv.dispatch(f.client))
+    }
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    var out: List[(u32, u16, u32)] = []
+    for _ in 0..3 {
+        discard f.c.read()
+        while true {
+            guard let Ok(Some(m)) = f.c.next() else {
+                break
+            }
+            var rd = f.c.reader(m)
+            out.push((m.id, m.op, rd.u32(f.c)))
+        }
+    }
+    return out
+}
+
+fn events(mut f: Fx) -> List[server.Event] {
+    var out: List[server.Event] = []
+    while true {
+        guard let Some(e) = f.srv.next() else {
+            break
+        }
+        out.push(e)
+    }
+    return out
+}
+
+test "an extension added at run time binds, decodes and encodes" {
+    var f = setup()
+    let counter = server.ext.Interface {
+        name: "test_counter_v1",
+        version: 2,
+        requests: [
+            server.ext.Message { name: "add", signature: "iu?s" },
+            server.ext.Message { name: "make", signature: "n", new_iface: "test_item_v1" },
+            server.ext.Message { name: "destroy", destructor: true },
+        ],
+        events: [server.ext.Message { name: "total", signature: "i" }],
+    }
+    assert_eq(f.srv.extend(counter, true), 0)
+    assert_eq(f.srv.extend(server.ext.Interface { name: "test_item_v1" }, false), 1)
+    // The registry lists it; find its name by reading the globals raw.
+    let reg = wl.Display { id: 1 }.get_registry(mut f.c)
+    discard f.c.flush()
+    for _ in 0..3 {
+        assert(f.srv.dispatch(f.client))
+    }
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    var name: u32 = 0
+    for _ in 0..3 {
+        discard f.c.read()
+        while true {
+            guard let Ok(Some(e)) = proto.next_event(mut f.c) else {
+                break
+            }
+            match e {
+                WlRegistry(_, Global(n, i, v)) => {
+                    if i == "test_counter_v1" {
+                        assert_eq(v, u32(2))
+                        name = n
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert(name != 0)
+    // Bind it (the client numbers its own interfaces as it likes).
+    let id = f.c.alloc(900, 1)
+    var w = f.c.begin(reg.id, 0, 8 + wire.str_size("test_counter_v1") + 12)
+    w.u32(mut f.c, name)
+    w.str(mut f.c, "test_counter_v1")
+    w.u32(mut f.c, 1)
+    w.u32(mut f.c, id)
+    discard pump(mut f)
+    var obj: Option[server.ext.Object] = None
+    for e in events(mut f) {
+        match e {
+            ExtBound(o, v) => {
+                assert_eq((o.id, o.iface, v), (id, 0, u32(1)))
+                obj = Some(o)
+            }
+            _ => {}
+        }
+    }
+    let o = obj.expect("bound")
+    // An event, encoded by its signature.
+    assert(f.srv.ext_send(o, 0, [server.ext.Arg.Int(5)]))
+    assert(not f.srv.ext_send(o, 1, [server.ext.Arg.Int(5)]))
+    let got = pump(mut f)
+    assert(got.contains((id, u16(0), u32(5))))
+    // add(-3, 7, "hi"), then make(new item), then destroy.
+    var a = f.c.begin(id, 0, 8 + 8 + wire.str_size("hi"))
+    a.i32(mut f.c, -3)
+    a.u32(mut f.c, 7)
+    a.str(mut f.c, "hi")
+    let item = f.c.alloc(901, 1)
+    var mk = f.c.begin(id, 1, 12)
+    mk.u32(mut f.c, item)
+    discard f.c.begin(id, 2, 8)
+    let back = pump(mut f)
+    var reqs = 0
+    for e in events(mut f) {
+        match e {
+            ExtRequest(r, op, args) => {
+                assert_eq(r.id, id)
+                if op == 0 {
+                    assert_eq(args.len(), 3)
+                    match args[0] {
+                        Int(v) => assert_eq(v, -3)
+                        _ => assert(false)
+                    }
+                    match args[1] {
+                        Uint(v) => assert_eq(v, u32(7))
+                        _ => assert(false)
+                    }
+                    match args[2] {
+                        Str(s) => assert_eq(s, Some("hi"))
+                        _ => assert(false)
+                    }
+                } else if op == 1 {
+                    match args[0] {
+                        NewId(n) => assert_eq(n, item)
+                        _ => assert(false)
+                    }
+                }
+                reqs += 1
+            }
+            _ => {}
+        }
+    }
+    assert_eq(reqs, 3)
+    // The new object is of the second interface; the destructor freed the
+    // first (wl_display.delete_id).
+    assert(back.contains((1, u16(1), id)))
+    let it = server.ext.Object { client: f.client, id: item, iface: 1 }
+    let none: List[server.ext.Arg] = []
+    assert(not f.srv.ext_send(it, 0, none))
+    assert(not f.srv.ext_send(o, 0, [server.ext.Arg.Int(1)]))
+    f.srv.ext_destroy(it)
+    assert(pump(mut f).contains((1, u16(1), item)))
+}
