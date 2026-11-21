@@ -82,6 +82,9 @@ pub enum Event {
     /// A frame reached the screen: output, sequence, CLOCK_MONOTONIC ns,
     /// presentation flags (wp_presentation kinds).
     Presented(u32, u64, int, u32)
+    /// A buffer the parent held is free again: a frame that found every
+    /// buffer in use can go now.
+    Released(u32)
     Input(Input)
     /// The session became active (true) or was switched away.
     Session(bool)

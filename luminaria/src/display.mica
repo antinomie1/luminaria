@@ -598,6 +598,7 @@ fn Display.backend_events(mut self) {
             OutputRemoved(o) => self.output_removed(int(o))
             OutputChanged(o) => self.output_changed(int(o))
             Presented(o, seq, ns, flags) => self.presented(int(o), seq, ns, flags)
+            Released(o) => self.schedule(int(o))
             Input(i) => self.input(i)
             Session(on) => {
                 if on {
@@ -1814,8 +1815,12 @@ fn Display.window_output_size(self, w: server.Window) -> (i32, i32) {
 
 /// Move window `w` with the pointer until the buttons go up, inside the
 /// library: every motion moves it with no round trip through the
-/// compositor, and Moved tells the compositor where it ended.
+/// compositor, and Moved tells the compositor where it ended. Nothing
+/// happens with no button down (a client asking after a quick click).
 pub fn Display.manipulate_move(mut self, w: server.Window) {
+    guard self.buttons > 0 else {
+        return
+    }
     let cur = self.wins.get(w).unwrap_or(Win {})
     self.manip = Manip.Move(w, self.px, self.py, cur.off_x, cur.off_y)
     self.dismiss_popups()
@@ -1824,8 +1829,12 @@ pub fn Display.manipulate_move(mut self, w: server.Window) {
 
 /// Resize window `w` from `edges` (top 1, bottom 2, left 4, right 8) with
 /// the pointer: one configure at a time (the next goes when the client
-/// answered), the opposite edge staying put.
+/// answered), the opposite edge staying put. Nothing happens with no
+/// button down.
 pub fn Display.manipulate_resize(mut self, w: server.Window, edges: u32) {
+    guard self.buttons > 0 else {
+        return
+    }
     let cur = self.wins.get(w).unwrap_or(Win {})
     let geo = self.srv.info(self.srv.window_surface(w)).geometry
     let w0 = if cur.width > 0 { cur.width } else { geo.w }
@@ -1963,7 +1972,9 @@ fn Display.schedule(mut self, o: int) {
         return
     }
     let now = time.now_ns()
-    let start = self.comp.outputs[o].clock.start(now)
+    // Nested, the parent's frame callback already says when to draw: a
+    // second, predicted deadline would only miss the parent's.
+    let start = if self.be.kind() == backend.Kind.Nested { now } else { self.comp.outputs[o].clock.start(now) }
     if start <= now + 200000 {
         self.frame_due(o)
         return

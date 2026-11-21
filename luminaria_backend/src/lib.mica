@@ -438,7 +438,8 @@ pub fn Backend.acquire(mut self, o: u32, mut dev: gpu.Device) -> Result[Option[g
         try r
     } else if let Some(nn) = self.nested.take() {
         var n = nn
-        let r = n.prepare(mut dev, self.buffers)
+        // The parent holds the shown buffer and may hold the queued one.
+        let r = n.prepare(mut dev, max(self.buffers, 3))
         if r.is_ok() {
             if let Some(s) = n.swap {
                 if let Some((i, age)) = s.acquire() {

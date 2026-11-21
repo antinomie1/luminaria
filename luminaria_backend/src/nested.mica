@@ -3,7 +3,8 @@
 // attached to the dmabuf as its implicit fence, so the parent waits on the
 // GPU, never we. Only the changed rectangles are damaged. A client buffer
 // that fills the window goes to the parent as is (direct scanout through
-// the parent). Input comes from the parent's seat.
+// the parent). Input comes from the parent's seat. The parent draws the
+// window's title bar and borders when it offers xdg-decoration.
 
 import std.os
 import std.str as strs
@@ -12,6 +13,7 @@ import luminaria_wire as wire
 import luminaria_proto as proto
 import luminaria_proto.wayland as wl
 import luminaria_proto.xdg_shell as xdg
+import luminaria_proto.xdg_decoration_unstable as deco
 import luminaria_proto.linux_dmabuf as dmabuf
 import vk_gpu as gpu
 import keyboard
@@ -47,6 +49,7 @@ struct Nested {
     surf: wl.Surface = wl.Surface { id: 0 }
     xs: xdg.Surface = xdg.Surface { id: 0 }
     top: xdg.Toplevel = xdg.Toplevel { id: 0 }
+    decorations: deco.DecorationManager = deco.DecorationManager { id: 0 }
     width: i32 = 1280
     height: i32 = 720
     /// A configure of another size arrived.
@@ -81,6 +84,9 @@ fn open(title: str) -> Result[Nested, str] {
     n.top = n.xs.get_toplevel(mut n.c)
     n.top.set_title(mut n.c, title)
     n.top.set_app_id(mut n.c, "luminaria")
+    if n.decorations.id != 0 {
+        n.decorations.get_toplevel_decoration(mut n.c, n.top).set_mode(mut n.c, deco.ToplevelDecorationMode.ServerSide)
+    }
     n.surf.commit(mut n.c)
     for _ in 0..200 {
         try n.roundtrip()
@@ -120,6 +126,9 @@ fn Nested.dispatch(mut self, mut out: List[types.Event]) -> Result[(), str] {
         }
         try self.handle(mut out)
     }
+    // Replies (pong, configure acks) go out now, not with the next frame:
+    // an idle window that sits on a ping looks hung to the parent.
+    self.flush()
     if self.closed {
         out.push(types.Event.Closed)
     }
@@ -149,6 +158,8 @@ fn Nested.bind(mut self, name: u32, iface: str, version: u32) {
         self.wm = xdg.WmBase { id: reg.bind(mut self.c, name, xdg.wm_base_iface, 1) }
     } else if iface == "zwp_linux_dmabuf_v1" and version >= 3 {
         self.dm = dmabuf.Dmabuf { id: reg.bind(mut self.c, name, dmabuf.dmabuf_iface, 3) }
+    } else if iface == "zxdg_decoration_manager_v1" {
+        self.decorations = deco.DecorationManager { id: reg.bind(mut self.c, name, deco.decoration_manager_iface, 1) }
     } else if iface == "wl_shm" {
         self.shm = wl.Shm { id: reg.bind(mut self.c, name, wl.shm_iface, 1) }
     } else if iface == "wl_seat" and self.seat.id == 0 {
@@ -192,6 +203,7 @@ fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
                 let i = s.find(b.id)
                 if i >= 0 {
                     s.free(i)
+                    out.push(types.Event.Released(0))
                 }
                 self.swap = Some(s)
             }

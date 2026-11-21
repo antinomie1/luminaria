@@ -1,0 +1,259 @@
+// tiny: a minimal stacking compositor on luminaria. Windows open centred
+// on the output under the pointer and stack in focus order; a click
+// focuses and raises. Everything else (input routing, configures, popups,
+// client-requested moves and resizes, frames) is `accept`.
+//
+//     Alt+Escape        quit (or the title bar's close button when nested)
+//     Alt+Q             close the focused window
+//     Alt+F1            focus the window below
+//     Alt+left drag     move
+//     Alt+right drag    resize from the nearest corner
+//
+// On DRM from a VT, or as a window inside another Wayland session:
+//
+//     tiny -s foot
+
+import std.flag
+import std.io
+import std.process
+import luminaria as lum
+
+let btn_left: u32 = 272
+let btn_right: u32 = 273
+
+struct View {
+    w: lum.Window
+    x: f64
+    y: f64
+    /// Maximized or fullscreen: shown at this output's origin instead.
+    full: Option[lum.Output] = None
+}
+
+struct Tiny {
+    d: lum.Display
+    /// Back to front; the last one has the keyboard.
+    views: List[View] = []
+}
+
+fn Tiny.find(self, w: lum.Window) -> int {
+    for i, v in self.views {
+        if v.w == w {
+            return i
+        }
+    }
+    return -1
+}
+
+fn Tiny.show(mut self) {
+    var places: List[(lum.Window, f64, f64)] = []
+    for v in self.views {
+        if let Some(o) = v.full {
+            let (x, y, _, _) = self.d.output_rect(o)
+            places.push((v.w, x, y))
+        } else {
+            places.push((v.w, v.x, v.y))
+        }
+    }
+    self.d.layout(fn(mut l) {
+        for (w, x, y) in places {
+            l.window(w, x, y, lum.Style {})
+        }
+    })
+}
+
+/// Put `w` on top and give it the keyboard.
+fn Tiny.raise(mut self, w: lum.Window) {
+    let i = self.find(w)
+    guard i >= 0 else {
+        return
+    }
+    if i != self.views.len() - 1 {
+        let v = self.views.remove(i)
+        self.views.push(v)
+        self.show()
+    }
+    self.d.focus(Some(w))
+}
+
+fn Tiny.focus_top(mut self) {
+    if self.views.is_empty() {
+        self.d.focus(None)
+    } else {
+        self.d.focus(Some(self.views[self.views.len() - 1].w))
+    }
+}
+
+fn Tiny.mapped(mut self, w: lum.Window) {
+    let (px, py) = self.d.pointer()
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    if let Some(o) = self.d.output_under(px, py) {
+        let (ox, oy, ow, oh) = self.d.output_rect(o)
+        let (ww, wh) = self.d.size(w)
+        x = ox + max((ow - f64(ww)) / 2.0, 0.0)
+        y = oy + max((oh - f64(wh)) / 2.0, 0.0)
+    }
+    self.views.push(View { w, x, y })
+    self.show()
+    self.d.focus(Some(w))
+}
+
+fn Tiny.gone(mut self, w: lum.Window) {
+    let i = self.find(w)
+    guard i >= 0 else {
+        return
+    }
+    discard self.views.remove(i)
+    self.show()
+    self.focus_top()
+}
+
+/// Fold a finished move or resize into the window's position.
+fn Tiny.shift(mut self, w: lum.Window, dx: f64, dy: f64) {
+    let i = self.find(w)
+    guard i >= 0 else {
+        return
+    }
+    self.views[i].x += dx
+    self.views[i].y += dy
+    self.show()
+}
+
+fn Tiny.full(mut self, w: lum.Window, o: Option[lum.Output], on: bool) {
+    let i = self.find(w)
+    guard i >= 0 else {
+        return
+    }
+    self.views[i].full = if not on {
+        None
+    } else if o.is_some() {
+        o
+    } else {
+        self.d.output_under(self.views[i].x + 1.0, self.views[i].y + 1.0)
+    }
+    self.show()
+}
+
+/// A compositor binding: true when the key was taken.
+fn Tiny.bind(mut self, k: lum.Key) -> bool {
+    guard k.pressed and k.mods.alt else {
+        return false
+    }
+    if k.sym == lum.keysym.key_Escape {
+        self.d.quit()
+        return true
+    }
+    if k.sym == lum.keysym.key_q {
+        if let Some(w) = self.d.focused() {
+            self.d.close(w)
+        }
+        return true
+    }
+    if k.sym == lum.keysym.key_F1 {
+        if self.views.len() > 1 {
+            let v = self.views.pop().unwrap()
+            self.views.insert(0, v)
+            self.show()
+            self.focus_top()
+        }
+        return true
+    }
+    return false
+}
+
+/// Click to focus; Alt+drag moves or resizes. True when the press was
+/// taken (the library swallows its release).
+fn Tiny.press(mut self, p: lum.Pointer) -> bool {
+    guard p.pressed else {
+        return false
+    }
+    guard let Some(w) = self.d.window_at(p.x, p.y) else {
+        return false
+    }
+    self.raise(w)
+    guard self.d.mods().alt else {
+        return false
+    }
+    let i = self.find(w)
+    guard i >= 0 and self.views[i].full.is_none() else {
+        return false
+    }
+    if p.button == btn_left {
+        self.d.manipulate_move(w)
+        return true
+    }
+    if p.button == btn_right {
+        let (ww, wh) = self.d.size(w)
+        let v = self.views[i]
+        let h: u32 = if p.x < v.x + f64(ww) / 2.0 { 4 } else { 8 }
+        let t: u32 = if p.y < v.y + f64(wh) / 2.0 { 1 } else { 2 }
+        self.d.manipulate_resize(w, h | t)
+        return true
+    }
+    return false
+}
+
+fn run(startup: str) -> Result[(), str] {
+    var t = Tiny { d: try lum.Display.open(lum.Options { title: "tiny" }) }
+    let socket = t.d.socket()
+    io.eprint("tiny: WAYLAND_DISPLAY={socket}")
+    if not startup.is_empty() {
+        // The shell backgrounds it and exits, so no child is left to reap.
+        discard process.command("sh").args(["-c", "{startup} &"]).env("WAYLAND_DISPLAY", socket).status()
+    }
+    while true {
+        guard let Some(e) = try t.d.next() else {
+            break
+        }
+        match e {
+            WindowMapped(w) => t.mapped(w)
+            WindowUnmapped(w) => t.gone(w)
+            Moved(w, dx, dy) => t.shift(w, dx, dy)
+            Resized(w, dx, dy, _, _) => t.shift(w, dx, dy)
+            RequestMaximize(w, on) => {
+                t.d.accept(e)
+                t.full(w, None, on)
+            }
+            RequestFullscreen(w, o, on) => {
+                t.d.accept(e)
+                t.full(w, o, on)
+            }
+            Key(k) => {
+                if not t.bind(k) {
+                    t.d.accept(e)
+                }
+            }
+            Button(p) => {
+                if not t.press(p) {
+                    t.d.accept(e)
+                }
+            }
+            _ => t.d.accept(e)
+        }
+    }
+    return Ok(())
+}
+
+fn main() -> int {
+    var f = flag.new("tiny", "A minimal stacking Wayland compositor")
+    f.add_str("startup", "s", "", "command to run once the compositor is up (sh -c)")
+    match f.parse_env() {
+        Err(e) => {
+            io.eprint("tiny: {e}\n{f.usage()}")
+            return 2
+        }
+        _ => {}
+    }
+    if f.help {
+        io.print(f.usage())
+        return 0
+    }
+    match run(f.get_str("startup")) {
+        Err(e) => {
+            io.eprint("tiny: {e}")
+            return 1
+        }
+        _ => {}
+    }
+    return 0
+}

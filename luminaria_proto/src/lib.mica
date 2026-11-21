@@ -14,6 +14,7 @@ pub import linux_drm_syncobj
 pub import presentation_time
 pub import tearing_control
 pub import viewporter
+pub import xdg_decoration_unstable
 pub import xdg_shell
 
 /// A decoded request and the object it was sent to.
@@ -57,6 +58,8 @@ pub enum Request {
     WpTearingControl(tearing_control.Control, tearing_control.ControlRequest)
     WpViewporter(viewporter.Viewporter, viewporter.ViewporterRequest)
     WpViewport(viewporter.Viewport, viewporter.ViewportRequest)
+    ZxdgDecorationManager(xdg_decoration_unstable.DecorationManager, xdg_decoration_unstable.DecorationManagerRequest)
+    ZxdgToplevelDecoration(xdg_decoration_unstable.ToplevelDecoration, xdg_decoration_unstable.ToplevelDecorationRequest)
     XdgWmBase(xdg_shell.WmBase, xdg_shell.WmBaseRequest)
     XdgPositioner(xdg_shell.Positioner, xdg_shell.PositionerRequest)
     XdgSurface(xdg_shell.Surface, xdg_shell.SurfaceRequest)
@@ -110,11 +113,13 @@ pub fn next(mut conn: wire.Conn) -> Result[Option[Request], wire.Error] {
             39 => Request.WpTearingControl(tearing_control.Control { id: m.id }, try tearing_control.decode_control(mut conn, m))
             40 => Request.WpViewporter(viewporter.Viewporter { id: m.id }, try viewporter.decode_viewporter(mut conn, m))
             41 => Request.WpViewport(viewporter.Viewport { id: m.id }, try viewporter.decode_viewport(mut conn, m))
-            42 => Request.XdgWmBase(xdg_shell.WmBase { id: m.id }, try xdg_shell.decode_wm_base(mut conn, m))
-            43 => Request.XdgPositioner(xdg_shell.Positioner { id: m.id }, try xdg_shell.decode_positioner(mut conn, m))
-            44 => Request.XdgSurface(xdg_shell.Surface { id: m.id }, try xdg_shell.decode_surface(mut conn, m))
-            45 => Request.XdgToplevel(xdg_shell.Toplevel { id: m.id }, try xdg_shell.decode_toplevel(mut conn, m))
-            46 => Request.XdgPopup(xdg_shell.Popup { id: m.id }, try xdg_shell.decode_popup(mut conn, m))
+            42 => Request.ZxdgDecorationManager(xdg_decoration_unstable.DecorationManager { id: m.id }, try xdg_decoration_unstable.decode_decoration_manager(mut conn, m))
+            43 => Request.ZxdgToplevelDecoration(xdg_decoration_unstable.ToplevelDecoration { id: m.id }, try xdg_decoration_unstable.decode_toplevel_decoration(mut conn, m))
+            44 => Request.XdgWmBase(xdg_shell.WmBase { id: m.id }, try xdg_shell.decode_wm_base(mut conn, m))
+            45 => Request.XdgPositioner(xdg_shell.Positioner { id: m.id }, try xdg_shell.decode_positioner(mut conn, m))
+            46 => Request.XdgSurface(xdg_shell.Surface { id: m.id }, try xdg_shell.decode_surface(mut conn, m))
+            47 => Request.XdgToplevel(xdg_shell.Toplevel { id: m.id }, try xdg_shell.decode_toplevel(mut conn, m))
+            48 => Request.XdgPopup(xdg_shell.Popup { id: m.id }, try xdg_shell.decode_popup(mut conn, m))
             _ => {
                 return Err(conn.error(m.id, wire.invalid_method, "no requests on interface {m.iface}"))
             }
@@ -146,6 +151,7 @@ pub enum Event {
     ZwpLinuxDmabufFeedback(linux_dmabuf.DmabufFeedback, linux_dmabuf.DmabufFeedbackEvent)
     WpPresentation(presentation_time.Presentation, presentation_time.PresentationEvent)
     WpPresentationFeedback(presentation_time.PresentationFeedback, presentation_time.PresentationFeedbackEvent)
+    ZxdgToplevelDecoration(xdg_decoration_unstable.ToplevelDecoration, xdg_decoration_unstable.ToplevelDecorationEvent)
     XdgWmBase(xdg_shell.WmBase, xdg_shell.WmBaseEvent)
     XdgSurface(xdg_shell.Surface, xdg_shell.SurfaceEvent)
     XdgToplevel(xdg_shell.Toplevel, xdg_shell.ToplevelEvent)
@@ -180,10 +186,11 @@ pub fn next_event(mut conn: wire.Conn) -> Result[Option[Event], wire.Error] {
             32 => Event.ZwpLinuxDmabufFeedback(linux_dmabuf.DmabufFeedback { id: m.id }, try linux_dmabuf.decode_dmabuf_feedback_event(mut conn, m))
             36 => Event.WpPresentation(presentation_time.Presentation { id: m.id }, try presentation_time.decode_presentation_event(mut conn, m))
             37 => Event.WpPresentationFeedback(presentation_time.PresentationFeedback { id: m.id }, try presentation_time.decode_presentation_feedback_event(mut conn, m))
-            42 => Event.XdgWmBase(xdg_shell.WmBase { id: m.id }, try xdg_shell.decode_wm_base_event(mut conn, m))
-            44 => Event.XdgSurface(xdg_shell.Surface { id: m.id }, try xdg_shell.decode_surface_event(mut conn, m))
-            45 => Event.XdgToplevel(xdg_shell.Toplevel { id: m.id }, try xdg_shell.decode_toplevel_event(mut conn, m))
-            46 => Event.XdgPopup(xdg_shell.Popup { id: m.id }, try xdg_shell.decode_popup_event(mut conn, m))
+            43 => Event.ZxdgToplevelDecoration(xdg_decoration_unstable.ToplevelDecoration { id: m.id }, try xdg_decoration_unstable.decode_toplevel_decoration_event(mut conn, m))
+            44 => Event.XdgWmBase(xdg_shell.WmBase { id: m.id }, try xdg_shell.decode_wm_base_event(mut conn, m))
+            46 => Event.XdgSurface(xdg_shell.Surface { id: m.id }, try xdg_shell.decode_surface_event(mut conn, m))
+            47 => Event.XdgToplevel(xdg_shell.Toplevel { id: m.id }, try xdg_shell.decode_toplevel_event(mut conn, m))
+            48 => Event.XdgPopup(xdg_shell.Popup { id: m.id }, try xdg_shell.decode_popup_event(mut conn, m))
             _ => {
                 return Err(conn.error(m.id, wire.invalid_method, "no events on interface {m.iface}"))
             }

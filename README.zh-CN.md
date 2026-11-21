@@ -24,7 +24,7 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 
 `protocols/` 是 wayland 1.26 和 wayland-protocols 1.50 的 XML：核心协议、xdg-shell、linux-dmabuf、
 linux-drm-syncobj、presentation-time、viewporter、fractional-scale、fifo、commit-timing、
-tearing-control。
+tearing-control、xdg-decoration（嵌套时向父合成器请求）。
 
 ## 写一个合成器
 
@@ -72,6 +72,14 @@ while true {
 - **事务。** `begin` 和 `end` 之间的 configure 与其间给出的布局一起显示：等每个窗口按新尺寸画好，或
   到超时为止按已到的显示。
 
+[`examples/tiny`](examples/tiny/src/main.mica) 是一个完整的堆叠式合成器，约 250 行：新窗口居中，
+点击聚焦并置顶，Alt+左键拖动移动、Alt+右键拖动缩放，Alt+F1 切换，Alt+Q 关闭，Alt+Escape 退出；
+`-s` 在启动后运行一条命令。
+
+```sh
+sheaf run -p tiny -- -s foot    # 在 VT 上，或作为当前桌面里的一个窗口
+```
+
 ### 出帧
 
 - 每个输出有一个合成器时钟：帧在下一个 vblank 允许的范围内尽量晚开始（帧迟到后余量变大，再慢慢
@@ -91,7 +99,7 @@ while true {
 | 后端 | 输出 | 输入 |
 |------|------|------|
 | DRM | 原子 KMS：主平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、热插拔 | libinput（经 libseat）、xkb |
-| 嵌套 | 父合成器里的一个窗口，dmabuf 经 linux-dmabuf 交出，带隐式栅栏 | 父合成器的 seat 和 keymap |
+| 嵌套 | 父合成器里的一个窗口（标题栏和边框经 xdg-decoration 由父合成器画），dmabuf 经 linux-dmabuf 交出，带隐式栅栏 | 父合成器的 seat 和 keymap |
 | 无头 | 按模式刷新率定时的纹理 | `inject` |
 
 release 构建，本机实测（`sheaf test --release`）：

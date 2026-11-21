@@ -1,5 +1,5 @@
 [workspace]
-members = ["sys/*", "luminaria", "luminaria_wire", "luminaria_proto", "luminaria_server", "luminaria_backend", "luminaria_compose", "luminaria_scanner"]
+members = ["sys/*", "luminaria", "examples/*", "luminaria_wire", "luminaria_proto", "luminaria_server", "luminaria_backend", "luminaria_compose", "luminaria_scanner"]
 
 [workspace.dependencies]
 vk_gpu = { git = "https://github.com/antinomie1/vk.git", dir = "vk_gpu" }
@@ -10,6 +10,7 @@ libinput_sys = { path = "sys/libinput_sys" }
 libseat_sys = { path = "sys/libseat_sys" }
 libudev_sys = { path = "sys/libudev_sys" }
 libdrm_sys = { path = "sys/libdrm_sys" }
+luminaria = { path = "luminaria" }
 luminaria_wire = { path = "luminaria_wire" }
 luminaria_proto = { path = "luminaria_proto" }
 luminaria_server = { path = "luminaria_server" }

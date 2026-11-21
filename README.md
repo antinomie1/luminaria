@@ -26,7 +26,8 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 
 `protocols/` holds the XML from wayland 1.26 and wayland-protocols 1.50:
 core, xdg-shell, linux-dmabuf, linux-drm-syncobj, presentation-time,
-viewporter, fractional-scale, fifo, commit-timing and tearing-control.
+viewporter, fractional-scale, fifo, commit-timing, tearing-control and
+xdg-decoration (asked of the parent when nested).
 
 ## Writing a compositor
 
@@ -85,6 +86,15 @@ while true {
   with the layout given meanwhile, once every window drew its new size,
   or at the timeout with what arrived.
 
+[`examples/tiny`](examples/tiny/src/main.mica) is a complete stacking
+compositor in about 250 lines: windows open centred, click to focus and
+raise, Alt+drag moves (left) or resizes (right), Alt+F1 cycles, Alt+Q
+closes, Alt+Escape quits; `-s` runs a command once it is up.
+
+```sh
+sheaf run -p tiny -- -s foot    # on a VT, or as a window in your session
+```
+
 ### Frames
 
 - Each output keeps a compositor clock: a frame starts as late as the
@@ -112,7 +122,7 @@ while true {
 | Backend | Output | Input |
 |---------|--------|-------|
 | DRM | atomic KMS: primary and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat, xkb |
-| Nested | a window of the parent compositor, dmabufs over linux-dmabuf with implicit fences | the parent's seat and keymap |
+| Nested | a window of the parent compositor (its title bar and borders through xdg-decoration), dmabufs over linux-dmabuf with implicit fences | the parent's seat and keymap |
 | Headless | textures paced by a timer at the mode's refresh | `inject` |
 
 Release build, measured on this machine (`sheaf test --release`):

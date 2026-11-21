@@ -54,9 +54,15 @@
 
 - 父合成器里一个 xdg 窗口就是输出；窗口 configure 改尺寸时报 `OutputChanged`，下一帧按新尺寸重建缓冲；
   关窗口时报 `Closed`，`next` 随之结束。
+- 装饰：父合成器有 `zxdg_decoration_manager_v1` 就在首次提交前请求服务端装饰，标题栏、边框、
+  关闭按钮由父合成器画（KWin、sway 等）；没有它（GNOME）时窗口不带装饰。
 - 帧：导出的 dmabuf 经父合成器的 linux-dmabuf（v3，`create_immed`）包成 `wl_buffer`；提交前用
   `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` 把 GPU 栅栏挂成 dmabuf 的隐式写栅栏，父合成器等 GPU，我们不等；
   只 `damage_buffer` 变化的矩形；父合成器的帧回调当作 vblank。
+- 节奏：帧回调一到、有东西要画就马上开始，不再按预测的 vblank 推迟（那会错过父合成器自己的截止
+  时间）；至少 3 个缓冲，因为父合成器拿着正在显示的，可能还拿着排队的；缓冲释放时，因为没有空闲
+  缓冲而放弃的帧立刻重排。
+- 回复（pong、configure 的 ack）每次分派后立刻 flush，空闲时也不会被父合成器判成无响应。
 - 直接扫描输出：铺满窗口的客户端 dmabuf 包成父合成器的 `wl_buffer` 直接 attach，父合成器释放它之前
   不释放给客户端。
 - 输入：父合成器的指针（窗口内绝对坐标）、按钮、滚动，键盘的 keymap、按键和修饰键。

@@ -68,6 +68,12 @@ version = "0.1.0"
 source = "git+https://github.com/antinomie1/vk.git?dir=raw_window_handle#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
 
 [[package]]
+name = "tiny"
+version = "0.1.0"
+source = "path+examples/tiny"
+dependencies = ["luminaria"]
+
+[[package]]
 name = "vk"
 version = "0.1.0"
 source = "git+https://github.com/antinomie1/vk.git?dir=vk#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
