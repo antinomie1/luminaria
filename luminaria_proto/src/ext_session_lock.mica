@@ -9,7 +9,7 @@ pub struct LockManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let lock_manager_iface: u16 = 40
+pub let lock_manager_iface: u16 = 47
 pub let lock_manager_version: u32 = 1
 
 /// Requests of ext_session_lock_manager_v1.
@@ -43,7 +43,7 @@ pub struct Lock derive(Hash, Show) {
     pub id: u32
 }
 
-pub let lock_iface: u16 = 41
+pub let lock_iface: u16 = 48
 pub let lock_version: u32 = 1
 
 pub enum LockError: u32 {
@@ -109,7 +109,7 @@ pub struct LockSurface derive(Hash, Show) {
     pub id: u32
 }
 
-pub let lock_surface_iface: u16 = 42
+pub let lock_surface_iface: u16 = 49
 pub let lock_surface_version: u32 = 1
 
 pub enum LockSurfaceError: u32 {

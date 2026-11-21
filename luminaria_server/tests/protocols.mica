@@ -1,11 +1,13 @@
 // The desktop protocols against the generated client API through a real
 // socket: layer surfaces, the session lock, selections for clipboard
 // managers, input methods, decorations and activation, the toplevel
-// list, pointer constraints and relative motion, idle notification and
-// single-pixel buffers.
+// list, pointer constraints and relative motion, idle notification,
+// single-pixel buffers, drag and drop, screen capture, sandboxes and
+// output configuration.
 
 import std.env
 import std.fs
+import std.net
 import std.os
 import luminaria_wire as wire
 import luminaria_proto as proto
@@ -24,6 +26,10 @@ import luminaria_proto.pointer_constraints_unstable as pc
 import luminaria_proto.relative_pointer_unstable as rp
 import luminaria_proto.ext_idle_notify as idle
 import luminaria_proto.single_pixel_buffer as spb
+import luminaria_proto.ext_image_capture_source as ics
+import luminaria_proto.ext_image_copy_capture as icc
+import luminaria_proto.security_context as sctx
+import luminaria_proto.wlr_output_management_unstable as wom
 import luminaria_server as server
 
 struct Fx {
@@ -550,4 +556,317 @@ test "a single-pixel buffer carries its colour" {
     assert(info.kind == server.BufferKind.SinglePixel)
     assert_eq((info.width, info.height), (i32(1), i32(1)))
     assert_eq(info.color, [0xFFFFFFFF, 0, 0, 0xFFFFFFFF])
+}
+
+test "a drag carries an offer to the surface under the pointer and drops" {
+    var f = setup()
+    let st = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(st, 1)
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let ddm = wl.DataDeviceManager { id: bind(mut f, wl.data_device_manager_iface, 3) }
+    let ptr = ws.get_pointer(mut f.c)
+    let dev = ddm.get_data_device(mut f.c, ws)
+    let (a, sa) = plain_surface(mut f, comp)
+    let (b, sb) = plain_surface(mut f, comp)
+    discard ptr
+    // Without a button held the drag is refused.
+    let early = ddm.create_data_source(mut f.c)
+    f.srv.pointer_focus(st, Some(sa), 1.0, 1.0)
+    dev.start_drag(mut f.c, Some(early), a, None, 0)
+    assert(pump(mut f).any(fn(e) => match e {
+        WlDataSource(s, Cancelled) => s == early
+        _ => false
+    }))
+    let src = ddm.create_data_source(mut f.c)
+    src.offer(mut f.c, "text/plain")
+    src.set_actions(mut f.c, wl.DataDeviceManagerDndAction.Copy | wl.DataDeviceManagerDndAction.Move)
+    let serial = f.srv.pointer_button(st, 0, 272, true)
+    dev.start_drag(mut f.c, Some(src), a, None, serial)
+    var left = false
+    var entered_a = false
+    for e in pump(mut f) {
+        match e {
+            WlPointer(_, Leave(_, s)) => left = s == a
+            WlDataDevice(_, Enter(_, s, _, _, Some)) => entered_a = s == a
+            _ => {}
+        }
+    }
+    assert(left and entered_a)
+    assert(f.srv.dragging(st))
+    assert(events(mut f).any(fn(e) => match e {
+        Drag(x) => x == st
+        _ => false
+    }))
+    // Over b: a fresh offer with the source's types and actions.
+    f.srv.pointer_focus(st, Some(sb), 2.0, 2.0)
+    var offer: Option[wl.DataOffer] = None
+    var mime = ""
+    var actions: u32 = 0
+    var entered_b = false
+    for e in pump(mut f) {
+        match e {
+            WlDataOffer(o, Offer(m)) => {
+                offer = Some(o)
+                mime = m.clone()
+            }
+            WlDataOffer(_, SourceActions(x)) => actions = u32(x)
+            WlDataDevice(_, Enter(_, s, x, y, Some)) => entered_b = s == b and x == 2.0 and y == 2.0
+            _ => {}
+        }
+    }
+    assert(entered_b)
+    assert_eq(mime, "text/plain")
+    assert_eq(actions, u32(3))
+    let o = offer.expect("offer")
+    o.accept(mut f.c, serial, Some("text/plain"))
+    o.set_actions(mut f.c, wl.DataDeviceManagerDndAction.Copy | wl.DataDeviceManagerDndAction.Move, wl.DataDeviceManagerDndAction.Move)
+    var target = ""
+    var chosen: u32 = 0
+    for e in pump(mut f) {
+        match e {
+            WlDataSource(_, Target(Some(m))) => target = m.clone()
+            WlDataSource(_, Action(x)) => chosen = u32(x)
+            _ => {}
+        }
+    }
+    assert_eq(target, "text/plain")
+    assert_eq(chosen, u32(2))
+    // Release: drop on b, the pointer is back on it.
+    discard f.srv.pointer_button(st, 1, 272, false)
+    var dropped = false
+    var performed = false
+    var back = false
+    for e in pump(mut f) {
+        match e {
+            WlDataDevice(_, Drop) => dropped = true
+            WlDataSource(_, DndDropPerformed) => performed = true
+            WlPointer(_, Enter(_, s, _, _)) => back = s == b
+            _ => {}
+        }
+    }
+    assert(dropped and performed and back)
+    assert(not f.srv.dragging(st))
+    o.finish(mut f.c)
+    assert(pump(mut f).any(fn(e) => match e {
+        WlDataSource(_, DndFinished) => true
+        _ => false
+    }))
+}
+
+/// An shm buffer and its memory (to read what the server wrote).
+fn mapped_buffer(mut f: Fx, w: i32, h: i32) -> (wl.Buffer, os.Map) {
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let size = w * h * 4
+    let fd = os.memfd("t", int(size)).expect("memfd")
+    let m = os.map(fd, int(size), 0, true).expect("map")
+    let pool = shm.create_pool(mut f.c, fd, size)
+    os.close(fd)
+    return (pool.create_buffer(mut f.c, 0, w, h, w * 4, wl.ShmFormat.Xrgb8888), m)
+}
+
+test "a screen capture copies the output's image into the client's buffer" {
+    var f = setup()
+    let o = f.srv.add_output(server.OutputInfo { name: "TEST-1", width: 4, height: 2 })
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let srcs = ics.OutputImageCaptureSourceManager { id: bind(mut f, ics.output_image_capture_source_manager_iface, 1) }
+    let mgr = icc.Manager { id: bind(mut f, icc.manager_iface, 1) }
+    let src = srcs.create_source(mut f.c, out)
+    let sess = mgr.create_session(mut f.c, src, icc.ManagerOptions(0))
+    var size = (u32(0), u32(0))
+    var formats = 0
+    var done = false
+    for e in pump(mut f) {
+        match e {
+            ExtImageCopyCaptureSession(_, BufferSize(w, h)) => size = (w, h)
+            ExtImageCopyCaptureSession(_, ShmFormat) => formats += 1
+            ExtImageCopyCaptureSession(_, Done) => done = true
+            _ => {}
+        }
+    }
+    assert_eq(size, (u32(4), u32(2)))
+    assert(formats == 2 and done)
+    let (buf, m) = mapped_buffer(mut f, 4, 2)
+    let fr = sess.create_frame(mut f.c)
+    fr.attach_buffer(mut f.c, buf)
+    fr.damage_buffer(mut f.c, 0, 0, 4, 2)
+    fr.capture(mut f.c)
+    discard pump(mut f)
+    // The first frame is wanted now.
+    assert(events(mut f).any(fn(e) => match e {
+        Capture(x) => x == o
+        _ => false
+    }))
+    assert(f.srv.capture_waiting(o))
+    var px: List[u8] = []
+    for i in 0..32 {
+        px.push(u8(i))
+    }
+    f.srv.capture(o, px, 4, 2, 1500000000)
+    var ready = false
+    var when = (u32(9), u32(9), u32(9))
+    for e in pump(mut f) {
+        match e {
+            ExtImageCopyCaptureFrame(_, PresentationTime(hi, lo, ns)) => when = (hi, lo, ns)
+            ExtImageCopyCaptureFrame(_, Ready) => ready = true
+            _ => {}
+        }
+    }
+    assert(ready)
+    assert_eq(when, (u32(0), u32(1), u32(500000000)))
+    var mm = m
+    let got = mm.bytes()
+    assert_eq(got[0], u8(0))
+    assert_eq(got[31], u8(31))
+    // Later frames wait for new content; a buffer of the wrong size fails.
+    fr.destroy(mut f.c)
+    let fr2 = sess.create_frame(mut f.c)
+    fr2.attach_buffer(mut f.c, shm_buffer(mut f, 2, 2))
+    fr2.capture(mut f.c)
+    discard pump(mut f)
+    assert(not events(mut f).any(fn(e) => match e {
+        Capture => true
+        _ => false
+    }))
+    f.srv.capture(o, px, 4, 2, 0)
+    assert(pump(mut f).any(fn(e) => match e {
+        ExtImageCopyCaptureFrame(_, Failed(r)) => r == icc.FrameFailureReason.BufferConstraints
+        _ => false
+    }))
+    // The output goes: the session stops.
+    f.srv.remove_output(o)
+    assert(pump(mut f).any(fn(e) => match e {
+        ExtImageCopyCaptureSession(_, Stopped) => true
+        _ => false
+    }))
+}
+
+test "a sandboxed client is marked and does not see privileged globals" {
+    var f = setup()
+    let mgr = sctx.ContextManager { id: bind(mut f, sctx.context_manager_iface, 1) }
+    let dir = env.get("XDG_RUNTIME_DIR").unwrap()
+    let path = "{dir}/sandbox-0"
+    let l = net.unix_listen(path).expect("listen")
+    let closer = os.memfd("close", 1).expect("memfd")
+    let ctx = mgr.create_listener(mut f.c, l.fd, closer)
+    ctx.set_sandbox_engine(mut f.c, "flatpak")
+    ctx.set_app_id(mut f.c, "org.example.App")
+    ctx.set_instance_id(mut f.c, "7")
+    ctx.commit(mut f.c)
+    ctx.destroy(mut f.c)
+    discard pump(mut f)
+    var listen: Option[u32] = None
+    for e in events(mut f) {
+        match e {
+            Listen(k) => listen = Some(k)
+            _ => {}
+        }
+    }
+    let k = listen.expect("Listen")
+    var c2 = wire.connect(path).expect("connect")
+    var client: Option[server.Client] = None
+    for _ in 0..100 {
+        if let Some((c, _)) = f.srv.accept_from(k) {
+            client = Some(c)
+            break
+        }
+    }
+    let sc = client.expect("accept_from")
+    assert_eq(f.srv.sandbox(sc), Some(("flatpak", "org.example.App", "7")))
+    assert_eq(f.srv.sandbox(f.client), None)
+    discard wl.Display { id: 1 }.get_registry(mut c2)
+    discard c2.flush()
+    for _ in 0..3 {
+        assert(f.srv.dispatch(sc))
+    }
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    var seen: List[u16] = []
+    for _ in 0..3 {
+        discard c2.read()
+        while true {
+            match proto.next_event(mut c2) {
+                Ok(Some(WlRegistry(_, Global(_, i, _)))) => seen.push(proto.ifaces.by_name(i))
+                Ok(Some) => {}
+                _ => {
+                    break
+                }
+            }
+        }
+    }
+    assert(seen.contains(wl.compositor_iface))
+    assert(not seen.contains(dc.manager_iface))
+    assert(not seen.contains(icc.manager_iface))
+    assert(not seen.contains(sctx.context_manager_iface))
+    f.srv.close_listener(k)
+    assert(f.srv.accept_from(k).is_none())
+}
+
+test "output configuration: heads, a mode and position applied, a stale one cancelled" {
+    var f = setup()
+    let o = f.srv.add_output(server.OutputInfo { name: "TEST-1", width: 640, height: 480, modes: [(640, 480, 60000, true), (800, 600, 60000, false)] })
+    let mgr = wom.Manager { id: bind(mut f, wom.manager_iface, 4) }
+    var head: Option[wom.Head] = None
+    var modes: List[wom.Mode] = []
+    var current: Option[wom.Mode] = None
+    var serial: u32 = 0
+    var name = ""
+    for e in pump(mut f) {
+        match e {
+            ZwlrOutputManager(_, Head(h)) => head = Some(h)
+            ZwlrOutputHead(_, Name(n)) => name = n.clone()
+            ZwlrOutputHead(_, Mode(m)) => modes.push(m)
+            ZwlrOutputHead(_, CurrentMode(m)) => current = Some(m)
+            ZwlrOutputManager(_, Done(s)) => serial = s
+            _ => {}
+        }
+    }
+    let h = head.expect("head")
+    assert_eq(name, "TEST-1")
+    assert_eq(modes.len(), 2)
+    assert_eq(current, Some(modes[0]))
+    let cfg = mgr.create_configuration(mut f.c, serial)
+    let ch = cfg.enable_head(mut f.c, h)
+    ch.set_mode(mut f.c, modes[1])
+    ch.set_position(mut f.c, 10, 20)
+    cfg.apply(mut f.c)
+    discard pump(mut f)
+    var asked: Option[server.OutputConfig] = None
+    for e in events(mut f) {
+        match e {
+            OutputConfig(c, false) => asked = Some(c)
+            _ => {}
+        }
+    }
+    let c = asked.expect("OutputConfig")
+    let heads = f.srv.output_config(c)
+    assert_eq(heads.len(), 1)
+    assert(heads[0].output == o and heads[0].enabled)
+    assert_eq(heads[0].mode, Some((800, 600, 60000)))
+    assert_eq(heads[0].position, Some((10, 20)))
+    f.srv.output_config_done(c, true)
+    assert(pump(mut f).any(fn(e) => match e {
+        ZwlrOutputConfiguration(_, Succeeded) => true
+        _ => false
+    }))
+    // The output changed: heads hear it with a new serial, and a
+    // configuration against the old one is cancelled.
+    f.srv.update_output(o, server.OutputInfo { name: "TEST-1", x: 10, y: 20, width: 800, height: 600, modes: [(640, 480, 60000, true), (800, 600, 60000, false)] })
+    var moved = false
+    var next: u32 = 0
+    for e in pump(mut f) {
+        match e {
+            ZwlrOutputHead(_, Position(10, 20)) => moved = true
+            ZwlrOutputManager(_, Done(s)) => next = s
+            _ => {}
+        }
+    }
+    assert(moved and next != serial)
+    let stale = mgr.create_configuration(mut f.c, serial)
+    discard stale.enable_head(mut f.c, h)
+    stale.apply(mut f.c)
+    assert(pump(mut f).any(fn(e) => match e {
+        ZwlrOutputConfiguration(_, Cancelled) => true
+        _ => false
+    }))
 }

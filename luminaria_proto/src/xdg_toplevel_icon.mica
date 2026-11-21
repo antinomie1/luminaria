@@ -10,7 +10,7 @@ pub struct IconManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let icon_manager_iface: u16 = 114
+pub let icon_manager_iface: u16 = 128
 pub let icon_manager_version: u32 = 1
 
 /// Requests of xdg_toplevel_icon_manager_v1.
@@ -64,7 +64,7 @@ pub struct Icon derive(Hash, Show) {
     pub id: u32
 }
 
-pub let icon_iface: u16 = 115
+pub let icon_iface: u16 = 129
 pub let icon_version: u32 = 1
 
 pub enum IconError: u32 {

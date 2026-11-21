@@ -89,7 +89,13 @@ pub fn listen(name: str) -> Result[Listener, str] {
 
 /// A waiting client, or `None` when there is none.
 pub fn Listener.accept(self) -> Result[Option[conn.Conn], conn.Error] {
-    let l = net.Listener { fd: self.fd }
+    return accept_on(self.fd)
+}
+
+/// A waiting client on the non-blocking listening socket `fd` (one a
+/// sandbox handed over, say), or `None`.
+pub fn accept_on(fd: int) -> Result[Option[conn.Conn], conn.Error] {
+    let l = net.Listener { fd }
     let c = match l.accept() {
         Ok(v) => v
         Err(e) => {

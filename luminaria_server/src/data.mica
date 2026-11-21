@@ -4,7 +4,9 @@
 // offers MIME types; the focused client (and every data-control client)
 // gets an offer and asks for one type with a pipe, which goes straight to
 // the source. The data never passes through the compositor. Drag and drop
-// is declined (the source is cancelled).
+// moves an offer with the pointer: the surface under it gets enter, motion
+// and drop instead of pointer events, and source and target settle on an
+// action (copy, move, ask) the way they prefer.
 
 import luminaria_wire as wire
 import luminaria_proto.wayland as wl
@@ -13,6 +15,7 @@ import luminaria_proto.ext_data_control as dc
 import ids
 import state
 import server
+import seat
 
 // ----------------------------------------------------------- clipboard
 
@@ -28,7 +31,17 @@ fn source(mut srv: server.Server, ci: u32, src: wl.DataSource, take req: wl.Data
     match take req {
         Offer(mime) => offer_mime(mut srv, ci, src.id, mime)
         Destroy => drop_source(mut srv, ci, src.id)
-        SetActions => {}
+        SetActions(a) => {
+            let si = srv.slot(ci, src.id)
+            guard si != state.none else {
+                return
+            }
+            guard u32(a) & ~u32(7) == 0 else {
+                srv.fail(ci, src.id, u32(wl.DataSourceError.InvalidActionMask), "dnd actions {u32(a)}")
+                return
+            }
+            srv.sources.items[int(si)].actions = u32(a)
+        }
     }
 }
 
@@ -39,9 +52,15 @@ fn device(mut srv: server.Server, ci: u32, dev: wl.DataDevice, take req: wl.Data
     }
     match req {
         StartDrag(src, origin, icon, serial) => {
-            if let Some(s) = src {
-                s.cancelled(mut srv.conns[int(ci)])
+            let sid = match src {
+                Some(x) => x.id
+                None => 0
             }
+            let iid = match icon {
+                Some(x) => x.id
+                None => 0
+            }
+            start_drag(mut srv, ci, si, dev.id, sid, origin.id, iid)
         }
         SetSelection(src, serial) => {
             let slot = source_slot(srv, ci, match src {
@@ -58,7 +77,19 @@ fn offer(mut srv: server.Server, ci: u32, o: wl.DataOffer, take req: wl.DataOffe
     match take req {
         Receive(mime, f) => receive(mut srv, ci, o.id, mime, f)
         Destroy => drop_offer(mut srv, ci, o.id)
-        _ => {}
+        Accept(serial, mime) => drag_accept(mut srv, ci, o.id, mime)
+        SetActions(actions, preferred) => drag_actions(mut srv, ci, o.id, u32(actions), u32(preferred))
+        Finish => {
+            let oi = srv.slot(ci, o.id)
+            guard oi != state.none and srv.offers.items[int(oi)].dnd else {
+                return
+            }
+            let src = srv.offers.items[int(oi)].source
+            if src != state.none and srv.sources.used(int(src)) {
+                let sc = int(srv.sources.items[int(src)].client)
+                wl.DataSource { id: srv.sources.items[int(src)].obj }.dnd_finished(mut srv.conns[sc])
+            }
+        }
     }
 }
 
@@ -356,6 +387,12 @@ fn destroy_source(mut srv: server.Server, si: u32) {
         guard srv.seats.used(i) else {
             continue
         }
+        // Its drag ends where it is.
+        if srv.seats.items[i].drag.active and srv.seats.items[i].drag.source == si {
+            srv.seats.items[i].drag.source = state.none
+            drag_leave(mut srv, u32(i), false)
+            end_drag(mut srv, u32(i))
+        }
         if srv.seats.items[i].selection == si {
             srv.seats.items[i].selection = state.none
             changed(mut srv, u32(i), false)
@@ -369,5 +406,229 @@ fn destroy_source(mut srv: server.Server, si: u32) {
         if srv.offers.used(k) and srv.offers.items[k].source == si {
             srv.offers.items[k].source = state.none
         }
+    }
+}
+
+// ------------------------------------------------------------- drag
+
+/// wl_data_device.start_drag: only from the surface under the pointer
+/// while a button is held; otherwise the source is cancelled.
+fn start_drag(mut srv: server.Server, ci: u32, si: u32, dev: u32, src: u32, origin: u32, icon: u32) {
+    let i = int(si)
+    let os = srv.slot(ci, origin)
+    let ss = source_slot(srv, ci, src)
+    guard not srv.seats.items[i].drag.active and os != state.none and srv.seats.items[i].ptr_focus == os and srv.seats.items[i].buttons > 0 else {
+        cancel(mut srv, ss)
+        return
+    }
+    var ic = state.none
+    if icon != 0 {
+        ic = srv.slot(ci, icon)
+        if ic != state.none {
+            let role = srv.surfaces.items[int(ic)].role
+            guard role == state.Role.Plain or role == state.Role.DragIcon else {
+                srv.fail(ci, dev, u32(wl.DataDeviceError.Role), "drag icon has another role")
+                return
+            }
+            srv.surfaces.items[int(ic)].role = state.Role.DragIcon
+        }
+    }
+    let x = srv.seats.items[i].ptr_x
+    let y = srv.seats.items[i].ptr_y
+    // The pointer leaves the origin; the drag enters it.
+    seat.pointer_focus(mut srv, si, state.none, 0.0, 0.0)
+    srv.seats.items[i].drag = state.DragData { active: true, source: ss, client: ci, icon: ic, x, y }
+    drag_focus(mut srv, si, os, x, y)
+    srv.push(server.Event.Drag(ids.Seat { id: srv.seats.id(si) }))
+}
+
+/// The pointer is over `surf` (`none`: no client) during a drag.
+fn drag_focus(mut srv: server.Server, si: u32, surf: u32, x: f64, y: f64) {
+    let i = int(si)
+    srv.seats.items[i].drag.x = x
+    srv.seats.items[i].drag.y = y
+    srv.seats.items[i].drag.under = surf
+    guard srv.seats.items[i].drag.focus != surf else {
+        return
+    }
+    drag_leave(mut srv, si, true)
+    guard surf != state.none and srv.surfaces.used(int(surf)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(surf)].client
+    let src = srv.seats.items[i].drag.source
+    let live = src != state.none and srv.sources.used(int(src))
+    // A drag without a source stays inside its client.
+    guard live or (src == state.none and fc == srv.seats.items[i].drag.client) else {
+        return
+    }
+    srv.seats.items[i].drag.focus = surf
+    let serial = srv.next_serial()
+    let obj = srv.surfaces.items[int(surf)].obj
+    let c = int(fc)
+    for r in srv.seats.items[i].devices.clone() {
+        guard r.client == fc else {
+            continue
+        }
+        var offer: Option[wl.DataOffer] = None
+        if live {
+            let oid = wl.DataDevice { id: r.id }.data_offer(mut srv.conns[c]).id
+            let o = srv.offers.add(state.OfferData { client: fc, obj: oid, kind: state.DataKind.Data, source: src, dnd: true })
+            srv.bind(fc, oid, o.index)
+            for mime in srv.sources.items[int(src)].mimes.clone() {
+                wl.DataOffer { id: oid }.offer(mut srv.conns[c], mime)
+            }
+            wl.DataOffer { id: oid }.source_actions(mut srv.conns[c], wl.DataDeviceManagerDndAction(srv.sources.items[int(src)].actions))
+            srv.seats.items[i].drag.offer = o.index
+            offer = Some(wl.DataOffer { id: oid })
+        }
+        wl.DataDevice { id: r.id }.enter(mut srv.conns[c], serial, wl.Surface { id: obj }, x, y, offer)
+    }
+}
+
+/// The drag leaves the surface it is over; `reset` tells the source that
+/// nothing accepts it now.
+fn drag_leave(mut srv: server.Server, si: u32, reset: bool) {
+    let i = int(si)
+    let f = srv.seats.items[i].drag.focus
+    srv.seats.items[i].drag.focus = state.none
+    srv.seats.items[i].drag.offer = state.none
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    for r in srv.seats.items[i].devices.clone() {
+        if r.client == fc {
+            wl.DataDevice { id: r.id }.leave(mut srv.conns[int(fc)])
+        }
+    }
+    let src = srv.seats.items[i].drag.source
+    if reset and src != state.none and srv.sources.used(int(src)) {
+        let sc = int(srv.sources.items[int(src)].client)
+        let sobj = wl.DataSource { id: srv.sources.items[int(src)].obj }
+        sobj.target(mut srv.conns[sc], None)
+        if srv.sources.items[int(src)].action != 0 {
+            srv.sources.items[int(src)].action = 0
+            sobj.action(mut srv.conns[sc], wl.DataDeviceManagerDndAction.None)
+        }
+    }
+}
+
+fn drag_motion(mut srv: server.Server, si: u32, time: u32, x: f64, y: f64) {
+    let i = int(si)
+    srv.seats.items[i].drag.x = x
+    srv.seats.items[i].drag.y = y
+    let f = srv.seats.items[i].drag.focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    for r in srv.seats.items[i].devices.clone() {
+        if r.client == fc {
+            wl.DataDevice { id: r.id }.motion(mut srv.conns[int(fc)], time, x, y)
+        }
+    }
+}
+
+/// The last button went up: drop on a target that accepts, else cancel.
+fn drop(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let d = srv.seats.items[i].drag
+    let src = d.source
+    let live = src != state.none and srv.sources.used(int(src))
+    var ok = d.focus != state.none and srv.surfaces.used(int(d.focus))
+    if live {
+        let o = d.offer
+        let accepted = o != state.none and srv.offers.used(int(o)) and srv.offers.items[int(o)].accepted
+        let sc = srv.sources.items[int(src)].client
+        let old = srv.conns[int(sc)].version(srv.sources.items[int(src)].obj) < 3
+        ok = ok and accepted and (old or srv.sources.items[int(src)].action != 0)
+    }
+    if ok {
+        let fc = srv.surfaces.items[int(d.focus)].client
+        for r in srv.seats.items[i].devices.clone() {
+            if r.client == fc {
+                wl.DataDevice { id: r.id }.drop_(mut srv.conns[int(fc)])
+            }
+        }
+        if live {
+            let sc = int(srv.sources.items[int(src)].client)
+            wl.DataSource { id: srv.sources.items[int(src)].obj }.dnd_drop_performed(mut srv.conns[sc])
+        }
+    }
+    drag_leave(mut srv, si, false)
+    if not ok {
+        cancel(mut srv, src)
+    }
+    end_drag(mut srv, si)
+}
+
+/// The drag is over: the pointer enters what it is over again.
+fn end_drag(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let d = srv.seats.items[i].drag
+    srv.seats.items[i].drag = state.DragData {}
+    srv.push(server.Event.Drag(ids.Seat { id: srv.seats.id(si) }))
+    if d.under != state.none and srv.surfaces.used(int(d.under)) {
+        seat.pointer_focus(mut srv, si, d.under, d.x, d.y)
+    }
+}
+
+fn drag_accept(mut srv: server.Server, ci: u32, id: u32, mime: Option[str]) {
+    let oi = srv.slot(ci, id)
+    guard oi != state.none and srv.offers.items[int(oi)].dnd else {
+        return
+    }
+    srv.offers.items[int(oi)].accepted = mime.is_some()
+    let src = srv.offers.items[int(oi)].source
+    guard src != state.none and srv.sources.used(int(src)) else {
+        return
+    }
+    let sc = int(srv.sources.items[int(src)].client)
+    let sobj = wl.DataSource { id: srv.sources.items[int(src)].obj }
+    match mime {
+        Some(m) => sobj.target(mut srv.conns[sc], Some(m))
+        None => sobj.target(mut srv.conns[sc], None)
+    }
+}
+
+/// The target's actions: pick its preferred one when the source offers
+/// it, else copy, move, ask in that order; both hear the choice.
+fn drag_actions(mut srv: server.Server, ci: u32, id: u32, actions: u32, preferred: u32) {
+    let oi = srv.slot(ci, id)
+    guard oi != state.none and srv.offers.items[int(oi)].dnd else {
+        return
+    }
+    guard actions & ~u32(7) == 0 else {
+        srv.fail(ci, id, u32(wl.DataOfferError.InvalidActionMask), "dnd actions {actions}")
+        return
+    }
+    guard preferred == 0 or preferred == 1 or preferred == 2 or preferred == 4 else {
+        srv.fail(ci, id, u32(wl.DataOfferError.InvalidAction), "preferred action {preferred}")
+        return
+    }
+    srv.offers.items[int(oi)].actions = actions
+    srv.offers.items[int(oi)].preferred = preferred
+    let src = srv.offers.items[int(oi)].source
+    guard src != state.none and srv.sources.used(int(src)) else {
+        return
+    }
+    let common = actions & srv.sources.items[int(src)].actions
+    var a: u32 = 0
+    if common & preferred != 0 {
+        a = preferred
+    } else {
+        for bit in [u32(1), u32(2), u32(4)] {
+            if common & bit != 0 {
+                a = bit
+                break
+            }
+        }
+    }
+    wl.DataOffer { id }.action(mut srv.conns[int(ci)], wl.DataDeviceManagerDndAction(a))
+    if srv.sources.items[int(src)].action != a {
+        srv.sources.items[int(src)].action = a
+        let sc = int(srv.sources.items[int(src)].client)
+        wl.DataSource { id: srv.sources.items[int(src)].obj }.action(mut srv.conns[sc], wl.DataDeviceManagerDndAction(a))
     }
 }

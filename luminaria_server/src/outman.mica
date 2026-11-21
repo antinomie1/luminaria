@@ -1,0 +1,358 @@
+// wlr-output-management: tools like wlr-randr and kanshi see every output
+// (a head) with its modes, position, scale and adaptive sync, and ask for
+// a new configuration of all of them at once. The request comes out as an
+// event; the compositor tests or applies it and answers with
+// `output_config_done`. Each change to the outputs bumps the serial, so a
+// configuration made against an old state is cancelled.
+
+import luminaria_proto.wayland as wl
+import luminaria_proto.wlr_output_management_unstable as wom
+import ids
+import state
+import server
+
+fn bound(mut srv: server.Server, ci: u32, id: u32) {
+    let k = srv.outmans.add(state.OutmanData { client: ci, obj: id })
+    srv.bind(ci, id, k.index)
+    for oi in 0..srv.outputs.items.len() {
+        if srv.outputs.used(oi) {
+            add_head(mut srv, k.index, u32(oi))
+        }
+    }
+    wom.Manager { id }.done(mut srv.conns[int(ci)], srv.out_serial)
+}
+
+/// Announce output `oi` to manager `k`: a head with its modes.
+fn add_head(mut srv: server.Server, k: u32, oi: u32) {
+    let c = srv.outmans.items[int(k)].client
+    let h = wom.Manager { id: srv.outmans.items[int(k)].obj }.head(mut srv.conns[int(c)])
+    srv.bind(c, h.id, k)
+    let inf = srv.outputs.items[int(oi)].info.clone()
+    h.name(mut srv.conns[int(c)], inf.name)
+    h.description(mut srv.conns[int(c)], inf.description)
+    if inf.width_mm > 0 and inf.height_mm > 0 {
+        h.physical_size(mut srv.conns[int(c)], inf.width_mm, inf.height_mm)
+    }
+    h.make(mut srv.conns[int(c)], inf.make)
+    h.model(mut srv.conns[int(c)], inf.model)
+    var modes: List[u32] = []
+    for (w, hh, mhz, pref) in modes_of(inf) {
+        let m = h.mode(mut srv.conns[int(c)])
+        srv.bind(c, m.id, k)
+        m.size(mut srv.conns[int(c)], w, hh)
+        m.refresh(mut srv.conns[int(c)], mhz)
+        if pref {
+            m.preferred(mut srv.conns[int(c)])
+        }
+        modes.push(m.id)
+    }
+    srv.outmans.items[int(k)].heads.push(state.Head { output: oi, id: h.id, modes })
+    send_state(mut srv, k, srv.outmans.items[int(k)].heads.len() - 1)
+}
+
+/// The output's modes, or its current mode when the backend lists none.
+fn modes_of(inf: state.OutputInfo) -> List[(i32, i32, i32, bool)] {
+    if inf.modes.is_empty() {
+        return [(inf.width, inf.height, inf.refresh_mhz, true)]
+    }
+    return inf.modes.clone()
+}
+
+/// What can change: enabled, mode, position, transform, scale, sync.
+fn send_state(mut srv: server.Server, k: u32, hk: int) {
+    let c = int(srv.outmans.items[int(k)].client)
+    let head = srv.outmans.items[int(k)].heads[hk].clone()
+    let h = wom.Head { id: head.id }
+    let inf = srv.outputs.items[int(head.output)].info.clone()
+    h.enabled(mut srv.conns[c], if inf.enabled { 1 } else { 0 })
+    guard inf.enabled else {
+        return
+    }
+    let modes = modes_of(inf)
+    for j in 0..min(modes.len(), head.modes.len()) {
+        let (w, hh, mhz, _) = modes[j]
+        if w == inf.width and hh == inf.height and int(mhz - inf.refresh_mhz).abs() < 500 and head.modes[j] != 0 {
+            h.current_mode(mut srv.conns[c], wom.Mode { id: head.modes[j] })
+            break
+        }
+    }
+    h.position(mut srv.conns[c], inf.x, inf.y)
+    h.transform(mut srv.conns[c], wl.OutputTransform(inf.transform))
+    h.scale(mut srv.conns[c], f64(inf.scale120) / 120.0)
+    if inf.vrr_capable {
+        h.adaptive_sync(mut srv.conns[c], if inf.vrr { wom.HeadAdaptiveSyncState.Enabled } else { wom.HeadAdaptiveSyncState.Disabled })
+    }
+}
+
+fn done_all(mut srv: server.Server) {
+    srv.out_serial += 1
+    for k in 0..srv.outmans.items.len() {
+        if srv.outmans.used(k) {
+            wom.Manager { id: srv.outmans.items[k].obj }.done(mut srv.conns[int(srv.outmans.items[k].client)], srv.out_serial)
+        }
+    }
+}
+
+fn output_added(mut srv: server.Server, oi: u32) {
+    for k in 0..srv.outmans.items.len() {
+        if srv.outmans.used(k) {
+            add_head(mut srv, u32(k), oi)
+        }
+    }
+    done_all(mut srv)
+}
+
+fn output_changed(mut srv: server.Server, oi: u32) {
+    for k in 0..srv.outmans.items.len() {
+        guard srv.outmans.used(k) else {
+            continue
+        }
+        for hk in 0..srv.outmans.items[k].heads.len() {
+            if srv.outmans.items[k].heads[hk].output == oi {
+                send_state(mut srv, u32(k), hk)
+            }
+        }
+    }
+    done_all(mut srv)
+}
+
+fn output_gone(mut srv: server.Server, oi: u32) {
+    for k in 0..srv.outmans.items.len() {
+        guard srv.outmans.used(k) else {
+            continue
+        }
+        let c = int(srv.outmans.items[k].client)
+        for head in srv.outmans.items[k].heads.clone() {
+            guard head.output == oi else {
+                continue
+            }
+            for m in head.modes {
+                if m != 0 {
+                    wom.Mode { id: m }.finished(mut srv.conns[c])
+                }
+            }
+            wom.Head { id: head.id }.finished(mut srv.conns[c])
+        }
+        srv.outmans.items[k].heads.retain(fn(h) => h.output != oi)
+    }
+    done_all(mut srv)
+}
+
+/// The head (or mode, when `mode`) object `id` of manager `k`: head index
+/// and mode index (-1 for a head).
+fn find(srv: server.Server, k: u32, id: u32) -> (int, int) {
+    guard k != state.none and srv.outmans.used(int(k)) else {
+        return (-1, -1)
+    }
+    for hk, head in srv.outmans.items[int(k)].heads {
+        if head.id == id {
+            return (hk, -1)
+        }
+        for j, m in head.modes {
+            if m == id {
+                return (hk, j)
+            }
+        }
+    }
+    return (-1, -1)
+}
+
+fn manager(mut srv: server.Server, ci: u32, m: wom.Manager, take req: wom.ManagerRequest) {
+    let k = srv.slot(ci, m.id)
+    match req {
+        CreateConfiguration(cfg, serial) => {
+            let x = srv.configs.add(state.ConfigData { client: ci, obj: cfg.id, serial })
+            srv.bind(ci, cfg.id, x.index)
+        }
+        Stop => {
+            m.finished(mut srv.conns[int(ci)])
+            srv.unbind(ci, m.id)
+            if k != state.none and srv.outmans.used(int(k)) {
+                srv.outmans.remove(k, state.OutmanData {})
+            }
+        }
+    }
+}
+
+fn head(mut srv: server.Server, ci: u32, h: wom.Head, take req: wom.HeadRequest) {
+    match req {
+        Release => {
+            let k = srv.slot(ci, h.id)
+            srv.unbind(ci, h.id)
+            let (hk, _) = find(srv, k, h.id)
+            if hk >= 0 {
+                discard srv.outmans.items[int(k)].heads.remove(hk)
+            }
+        }
+    }
+}
+
+fn mode(mut srv: server.Server, ci: u32, md: wom.Mode, take req: wom.ModeRequest) {
+    match req {
+        Release => {
+            let k = srv.slot(ci, md.id)
+            srv.unbind(ci, md.id)
+            let (hk, j) = find(srv, k, md.id)
+            if hk >= 0 and j >= 0 {
+                srv.outmans.items[int(k)].heads[hk].modes[j] = 0
+            }
+        }
+    }
+}
+
+/// The output slot head `id` of client `ci` stands for, or none.
+fn head_output(srv: server.Server, ci: u32, id: u32) -> u32 {
+    let k = srv.slot(ci, id)
+    let (hk, j) = find(srv, k, id)
+    guard hk >= 0 and j < 0 else {
+        return state.none
+    }
+    return srv.outmans.items[int(k)].heads[hk].output
+}
+
+fn configuration(mut srv: server.Server, ci: u32, cfg: wom.Configuration, take req: wom.ConfigurationRequest) {
+    let x = srv.slot(ci, cfg.id)
+    guard x != state.none and srv.configs.used(int(x)) else {
+        return
+    }
+    let i = int(x)
+    match req {
+        EnableHead(ch, h) => add_config(mut srv, ci, cfg.id, x, ch.id, h.id, true)
+        DisableHead(h) => add_config(mut srv, ci, cfg.id, x, 0, h.id, false)
+        Apply => finish(mut srv, ci, cfg, x, false)
+        Test => finish(mut srv, ci, cfg, x, true)
+        Destroy => {
+            srv.unbind(ci, cfg.id)
+            for id in srv.configs.items[i].head_objs.clone() {
+                if id != 0 {
+                    srv.unbind(ci, id)
+                }
+            }
+            srv.configs.remove(x, state.ConfigData {})
+        }
+    }
+}
+
+fn add_config(mut srv: server.Server, ci: u32, cfg: u32, x: u32, ch: u32, head: u32, enabled: bool) {
+    let i = int(x)
+    guard not srv.configs.items[i].used else {
+        srv.fail(ci, cfg, u32(wom.ConfigurationError.AlreadyUsed), "configuration already used")
+        return
+    }
+    let oi = head_output(srv, ci, head)
+    guard oi != state.none and srv.outputs.used(int(oi)) else {
+        // The head went away meanwhile: the serial check cancels this.
+        srv.configs.items[i].head_objs.push(ch)
+        srv.configs.items[i].heads.push(state.HeadConfig { enabled: false })
+        if ch != 0 {
+            srv.bind(ci, ch, x)
+        }
+        return
+    }
+    let o = ids.Output { id: srv.outputs.id(oi) }
+    guard not srv.configs.items[i].heads.any(fn(h) => h.output == o) else {
+        srv.fail(ci, cfg, u32(wom.ConfigurationError.AlreadyConfiguredHead), "head configured twice")
+        return
+    }
+    srv.configs.items[i].heads.push(state.HeadConfig { output: o, enabled })
+    srv.configs.items[i].head_objs.push(ch)
+    if ch != 0 {
+        srv.bind(ci, ch, x)
+    }
+}
+
+fn finish(mut srv: server.Server, ci: u32, cfg: wom.Configuration, x: u32, only_test: bool) {
+    let i = int(x)
+    guard not srv.configs.items[i].used else {
+        srv.fail(ci, cfg.id, u32(wom.ConfigurationError.AlreadyUsed), "configuration already used")
+        return
+    }
+    srv.configs.items[i].used = true
+    guard srv.configs.items[i].serial == srv.out_serial else {
+        cfg.cancelled(mut srv.conns[int(ci)])
+        return
+    }
+    for oi in 0..srv.outputs.items.len() {
+        guard srv.outputs.used(oi) else {
+            continue
+        }
+        let o = ids.Output { id: srv.outputs.id(u32(oi)) }
+        guard srv.configs.items[i].heads.any(fn(h) => h.output == o) else {
+            srv.fail(ci, cfg.id, u32(wom.ConfigurationError.UnconfiguredHead), "every head must be configured")
+            return
+        }
+    }
+    srv.push(server.Event.OutputConfig(ids.OutputConfig { id: srv.configs.id(x) }, only_test))
+}
+
+fn config_head(mut srv: server.Server, ci: u32, ch: wom.ConfigurationHead, take req: wom.ConfigurationHeadRequest) {
+    let x = srv.slot(ci, ch.id)
+    guard x != state.none and srv.configs.used(int(x)) else {
+        return
+    }
+    let i = int(x)
+    guard let Some(at) = srv.configs.items[i].head_objs.position(fn(id) => id == ch.id) else {
+        return
+    }
+    match req {
+        SetMode(m) => {
+            let (hk, j) = find(srv, srv.slot(ci, m.id), m.id)
+            guard hk >= 0 and j >= 0 else {
+                srv.fail(ci, ch.id, u32(wom.ConfigurationHeadError.InvalidMode), "unknown mode")
+                return
+            }
+            let oi = srv.outmans.items[int(srv.slot(ci, m.id))].heads[hk].output
+            let modes = modes_of(srv.outputs.items[int(oi)].info)
+            guard j < modes.len() else {
+                return
+            }
+            let (w, h, mhz, _) = modes[j]
+            srv.configs.items[i].heads[at].mode = Some((w, h, mhz))
+        }
+        SetCustomMode(w, h, mhz) => {
+            guard w > 0 and h > 0 and mhz >= 0 else {
+                srv.fail(ci, ch.id, u32(wom.ConfigurationHeadError.InvalidCustomMode), "mode {w}x{h}@{mhz}")
+                return
+            }
+            srv.configs.items[i].heads[at].mode = Some((w, h, mhz))
+        }
+        SetPosition(px, py) => srv.configs.items[i].heads[at].position = Some((px, py))
+        SetTransform(t) => srv.configs.items[i].heads[at].transform = Some(u32(t))
+        SetScale(sc) => {
+            guard sc > 0.0 else {
+                srv.fail(ci, ch.id, u32(wom.ConfigurationHeadError.InvalidScale), "scale {sc}")
+                return
+            }
+            srv.configs.items[i].heads[at].scale = Some(sc)
+        }
+        SetAdaptiveSync(a) => srv.configs.items[i].heads[at].vrr = Some(a == wom.HeadAdaptiveSyncState.Enabled)
+    }
+}
+
+/// The compositor's answer to a configuration (applied or tested).
+fn config_done(mut srv: server.Server, x: u32, ok: bool) {
+    let c = int(srv.configs.items[int(x)].client)
+    let cfg = wom.Configuration { id: srv.configs.items[int(x)].obj }
+    if ok {
+        cfg.succeeded(mut srv.conns[c])
+    } else {
+        cfg.failed(mut srv.conns[c])
+    }
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == wom.manager_iface {
+        if srv.outmans.used(int(slot)) and srv.outmans.items[int(slot)].obj == id {
+            srv.outmans.remove(slot, state.OutmanData {})
+        }
+    } else if iface == wom.configuration_iface {
+        if srv.configs.used(int(slot)) and srv.configs.items[int(slot)].obj == id {
+            srv.configs.remove(slot, state.ConfigData {})
+        }
+    } else if iface == wom.head_iface or iface == wom.mode_iface or iface == wom.configuration_head_iface {
+        return true
+    } else {
+        return false
+    }
+    return true
+}

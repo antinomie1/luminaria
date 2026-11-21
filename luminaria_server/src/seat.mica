@@ -298,6 +298,12 @@ fn frame_ptrs(mut srv: server.Server, si: u32, fc: u32) {
 /// client): leave the old surface, enter the new one.
 fn pointer_focus(mut srv: server.Server, si: u32, surf: u32, x: f64, y: f64) {
     let i = int(si)
+    if srv.seats.items[i].drag.active {
+        data.drag_focus(mut srv, si, surf, x, y)
+        return
+    }
+    srv.seats.items[i].ptr_x = x
+    srv.seats.items[i].ptr_y = y
     let old = srv.seats.items[i].ptr_focus
     guard old != surf else {
         return
@@ -338,6 +344,12 @@ fn focused_client(srv: server.Server, si: u32) -> u32 {
 }
 
 fn pointer_motion(mut srv: server.Server, si: u32, time: u32, x: f64, y: f64) {
+    if srv.seats.items[int(si)].drag.active {
+        data.drag_motion(mut srv, si, time, x, y)
+        return
+    }
+    srv.seats.items[int(si)].ptr_x = x
+    srv.seats.items[int(si)].ptr_y = y
     let fc = focused_client(srv, si)
     guard fc != state.none else {
         return
@@ -354,6 +366,14 @@ fn pointer_motion(mut srv: server.Server, si: u32, time: u32, x: f64, y: f64) {
 
 fn pointer_button(mut srv: server.Server, si: u32, time: u32, button: u32, pressed: bool) -> u32 {
     let serial = srv.next_serial()
+    let i0 = int(si)
+    srv.seats.items[i0].buttons = if pressed { srv.seats.items[i0].buttons + 1 } else { max(srv.seats.items[i0].buttons - 1, 0) }
+    if srv.seats.items[i0].drag.active {
+        if not pressed and srv.seats.items[i0].buttons == 0 {
+            data.drop(mut srv, si)
+        }
+        return serial
+    }
     let fc = focused_client(srv, si)
     guard fc != state.none else {
         return serial
@@ -521,6 +541,16 @@ fn surface_gone(mut srv: server.Server, surf: u32) {
         }
         if srv.seats.items[i].ptr_focus == surf {
             srv.seats.items[i].ptr_focus = state.none
+        }
+        if srv.seats.items[i].drag.focus == surf {
+            srv.seats.items[i].drag.focus = state.none
+            srv.seats.items[i].drag.offer = state.none
+        }
+        if srv.seats.items[i].drag.under == surf {
+            srv.seats.items[i].drag.under = state.none
+        }
+        if srv.seats.items[i].drag.icon == surf {
+            srv.seats.items[i].drag.icon = state.none
         }
         srv.seats.items[i].touch_points.retain(fn(p) => p.1 != surf)
     }

@@ -9,7 +9,7 @@ pub struct Keyboard derive(Hash, Show) {
     pub id: u32
 }
 
-pub let keyboard_iface: u16 = 92
+pub let keyboard_iface: u16 = 101
 pub let keyboard_version: u32 = 1
 
 pub enum KeyboardError: u32 {
@@ -69,7 +69,7 @@ pub struct KeyboardManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let keyboard_manager_iface: u16 = 93
+pub let keyboard_manager_iface: u16 = 102
 pub let keyboard_manager_version: u32 = 1
 
 pub enum KeyboardManagerError: u32 {

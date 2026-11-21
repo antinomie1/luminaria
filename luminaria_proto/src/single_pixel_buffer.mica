@@ -9,7 +9,7 @@ pub struct SinglePixelBufferManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let single_pixel_buffer_manager_iface: u16 = 76
+pub let single_pixel_buffer_manager_iface: u16 = 85
 pub let single_pixel_buffer_manager_version: u32 = 1
 
 /// Requests of wp_single_pixel_buffer_manager_v1.

@@ -1,0 +1,121 @@
+// wp-security-context: a sandbox (Flatpak) gives the compositor a
+// listening socket for one app. Clients connecting there carry the
+// sandbox engine, app id and instance id, and the privileged globals
+// (screen capture, clipboard managers, panels, the lock screen, input
+// methods, toplevel lists, output configuration) are hidden from them.
+// The socket stops taking clients when the sandbox closes `close_fd`.
+
+import std.net
+import luminaria_proto as proto
+import luminaria_proto.security_context as sc
+import state
+import server
+
+/// Globals a sandboxed client cannot see or bind.
+fn privileged(iface: u16) -> bool {
+    let hidden: [11]u16 = [
+        sc.context_manager_iface,
+        proto.ext_data_control.manager_iface,
+        proto.wlr_layer_shell_unstable.shell_iface,
+        proto.ext_session_lock.lock_manager_iface,
+        proto.input_method_unstable.method_manager_iface,
+        proto.virtual_keyboard_unstable.keyboard_manager_iface,
+        proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface,
+        proto.ext_foreign_toplevel_list.toplevel_list_iface,
+        proto.ext_image_capture_source.output_image_capture_source_manager_iface,
+        proto.ext_image_copy_capture.manager_iface,
+        proto.wlr_output_management_unstable.manager_iface,
+    ]
+    for h in hidden {
+        if h == iface {
+            return true
+        }
+    }
+    return false
+}
+
+fn manager(mut srv: server.Server, ci: u32, take req: sc.ContextManagerRequest) {
+    match take req {
+        CreateListener(ctx, listen, close) => {
+            guard not srv.clients.items[int(ci)].sandboxed else {
+                srv.fail(ci, ctx.id, u32(sc.ContextManagerError.Nested), "a sandboxed client cannot make sandboxes")
+                return
+            }
+            guard (net.Listener { fd: listen.raw() }).set_nonblocking(true).is_ok() else {
+                srv.fail(ci, ctx.id, u32(sc.ContextManagerError.InvalidListenFd), "not a listening socket")
+                return
+            }
+            let k = srv.contexts.add(state.ContextData { client: ci, obj: ctx.id, listen: Some(listen), close: Some(close) })
+            srv.bind(ci, ctx.id, k.index)
+        }
+        Destroy => {}
+    }
+}
+
+fn context(mut srv: server.Server, ci: u32, ctx: sc.Context, take req: sc.ContextRequest) {
+    let k = srv.slot(ci, ctx.id)
+    guard k != state.none else {
+        return
+    }
+    let i = int(k)
+    match take req {
+        Destroy => {
+            srv.unbind(ci, ctx.id)
+            forget(mut srv, k)
+        }
+        Commit => {
+            guard not srv.contexts.items[i].committed else {
+                srv.fail(ci, ctx.id, u32(sc.ContextError.AlreadyUsed), "committed twice")
+                return
+            }
+            srv.contexts.items[i].committed = true
+            srv.push(server.Event.Listen(k))
+        }
+        SetSandboxEngine(v) => set(mut srv, ci, ctx.id, k, 0, v)
+        SetAppId(v) => set(mut srv, ci, ctx.id, k, 1, v)
+        SetInstanceId(v) => set(mut srv, ci, ctx.id, k, 2, v)
+    }
+}
+
+/// Metadata `which` (engine 0, app id 1, instance id 2), set once before
+/// the commit.
+fn set(mut srv: server.Server, ci: u32, id: u32, k: u32, which: int, take v: str) {
+    let i = int(k)
+    guard not srv.contexts.items[i].committed else {
+        srv.fail(ci, id, u32(sc.ContextError.AlreadyUsed), "set after commit")
+        return
+    }
+    let cur = if which == 0 { srv.contexts.items[i].engine.clone() } else if which == 1 { srv.contexts.items[i].app_id.clone() } else { srv.contexts.items[i].instance_id.clone() }
+    guard cur.is_empty() else {
+        srv.fail(ci, id, u32(sc.ContextError.AlreadySet), "metadata set twice")
+        return
+    }
+    if which == 0 {
+        srv.contexts.items[i].engine = v
+    } else if which == 1 {
+        srv.contexts.items[i].app_id = v
+    } else {
+        srv.contexts.items[i].instance_id = v
+    }
+}
+
+/// The context object went away: an uncommitted one is dropped, a
+/// committed one keeps listening (until its close descriptor hangs up).
+fn forget(mut srv: server.Server, k: u32) {
+    guard srv.contexts.used(int(k)) else {
+        return
+    }
+    if srv.contexts.items[int(k)].committed {
+        srv.contexts.items[int(k)].obj = 0
+    } else {
+        srv.contexts.remove(k, state.ContextData {})
+    }
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    guard iface == sc.context_iface else {
+        return false
+    }
+    forget(mut srv, slot)
+    return true
+}

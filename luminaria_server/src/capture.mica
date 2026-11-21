@@ -1,0 +1,270 @@
+// Screen capture: ext-image-capture-source (outputs as sources) and
+// ext-image-copy-capture (screenshots and recording). A session offers
+// the output's size and the shm formats; each frame the client attaches a
+// buffer and asks for the next image. The first frame of a session is
+// taken at once, later ones when the output shows something new. The
+// compositor hands the pixels over with `Server.capture`; they are copied
+// straight into the client's shm buffer. Cursor sessions stop at once.
+
+import luminaria_proto.wayland as wl
+import luminaria_proto.ext_image_capture_source as ics
+import luminaria_proto.ext_image_copy_capture as icc
+import ids
+import state
+import server
+
+fn source_manager(mut srv: server.Server, ci: u32, take req: ics.OutputImageCaptureSourceManagerRequest) {
+    match req {
+        CreateSource(src, o) => {
+            // The source names its output's slot.
+            srv.bind(ci, src.id, srv.slot(ci, o.id))
+        }
+        Destroy => {}
+    }
+}
+
+fn manager(mut srv: server.Server, ci: u32, take req: icc.ManagerRequest) {
+    match req {
+        CreateSession(sess, src, options) => {
+            guard u32(options) & ~u32(1) == 0 else {
+                srv.fail(ci, sess.id, u32(icc.ManagerError.InvalidOption), "capture options {u32(options)}")
+                return
+            }
+            let oi = srv.slot(ci, src.id)
+            let k = srv.captures.add(state.CaptureData { client: ci, obj: sess.id, output: oi })
+            srv.bind(ci, sess.id, k.index)
+            guard oi != state.none and srv.outputs.used(int(oi)) else {
+                sess.stopped(mut srv.conns[int(ci)])
+                return
+            }
+            constraints(mut srv, k.index)
+        }
+        CreatePointerCursorSession(c, src, p) => {
+            srv.bind(ci, c.id, state.none)
+        }
+        Destroy => {}
+    }
+}
+
+/// Cursors are part of the image or not captured at all: a cursor
+/// session's capture session stops at once.
+fn cursor_session(mut srv: server.Server, ci: u32, c: icc.CursorSession, take req: icc.CursorSessionRequest) {
+    match req {
+        GetCaptureSession(sess) => {
+            let k = srv.captures.add(state.CaptureData { client: ci, obj: sess.id })
+            srv.bind(ci, sess.id, k.index)
+            sess.stopped(mut srv.conns[int(ci)])
+        }
+        Destroy => {}
+    }
+}
+
+/// Buffer size and formats of session `k`, then done.
+fn constraints(mut srv: server.Server, k: u32) {
+    let i = int(k)
+    let oi = int(srv.captures.items[i].output)
+    let c = int(srv.captures.items[i].client)
+    let s = icc.Session { id: srv.captures.items[i].obj }
+    let inf = srv.outputs.items[oi].info.clone()
+    s.buffer_size(mut srv.conns[c], u32(inf.width), u32(inf.height))
+    s.shm_format(mut srv.conns[c], wl.ShmFormat.Argb8888)
+    s.shm_format(mut srv.conns[c], wl.ShmFormat.Xrgb8888)
+    s.done(mut srv.conns[c])
+}
+
+fn session(mut srv: server.Server, ci: u32, sess: icc.Session, take req: icc.SessionRequest) {
+    let k = srv.slot(ci, sess.id)
+    guard k != state.none else {
+        return
+    }
+    match req {
+        CreateFrame(f) => {
+            guard srv.captures.items[int(k)].frame == 0 else {
+                srv.fail(ci, sess.id, u32(icc.SessionError.DuplicateFrame), "a frame exists")
+                return
+            }
+            srv.captures.items[int(k)].frame = f.id
+            srv.captures.items[int(k)].buffer = state.none
+            srv.captures.items[int(k)].waiting = false
+            srv.bind(ci, f.id, k)
+        }
+        Destroy => {
+            srv.unbind(ci, sess.id)
+            drop_session(mut srv, k)
+        }
+    }
+}
+
+fn frame(mut srv: server.Server, ci: u32, f: icc.Frame, take req: icc.FrameRequest) {
+    let k = srv.slot(ci, f.id)
+    guard k != state.none and srv.captures.used(int(k)) and srv.captures.items[int(k)].frame == f.id else {
+        return
+    }
+    let i = int(k)
+    match req {
+        AttachBuffer(b) => {
+            guard not srv.captures.items[i].waiting else {
+                srv.fail(ci, f.id, u32(icc.FrameError.AlreadyCaptured), "attach after capture")
+                return
+            }
+            srv.captures.items[i].buffer = srv.slot(ci, b.id)
+        }
+        DamageBuffer(x, y, w, h) => {
+            guard x >= 0 and y >= 0 and w > 0 and h > 0 else {
+                srv.fail(ci, f.id, u32(icc.FrameError.InvalidBufferDamage), "damage {x},{y} {w}x{h}")
+                return
+            }
+        }
+        Capture => {
+            guard not srv.captures.items[i].waiting else {
+                srv.fail(ci, f.id, u32(icc.FrameError.AlreadyCaptured), "capture sent twice")
+                return
+            }
+            guard srv.captures.items[i].buffer != state.none else {
+                srv.fail(ci, f.id, u32(icc.FrameError.NoBuffer), "capture without a buffer")
+                return
+            }
+            let oi = srv.captures.items[i].output
+            guard oi != state.none and srv.outputs.used(int(oi)) else {
+                f.failed(mut srv.conns[int(ci)], icc.FrameFailureReason.Stopped)
+                return
+            }
+            srv.captures.items[i].waiting = true
+            if not srv.captures.items[i].shot {
+                srv.push(server.Event.Capture(ids.Output { id: srv.outputs.id(oi) }))
+            }
+        }
+        Destroy => {
+            srv.unbind(ci, f.id)
+            srv.captures.items[i].frame = 0
+            srv.captures.items[i].waiting = false
+        }
+    }
+}
+
+fn drop_session(mut srv: server.Server, k: u32) {
+    guard srv.captures.used(int(k)) else {
+        return
+    }
+    let ci = srv.captures.items[int(k)].client
+    let f = srv.captures.items[int(k)].frame
+    if f != 0 {
+        // The frame outlives its session, inert.
+        srv.unbind(ci, f)
+        icc.Frame { id: f }.failed(mut srv.conns[int(ci)], icc.FrameFailureReason.Stopped)
+    }
+    srv.captures.remove(k, state.CaptureData {})
+}
+
+/// Whether a frame of output `oi` waits for an image.
+fn waiting(srv: server.Server, oi: u32) -> bool {
+    for k in 0..srv.captures.items.len() {
+        if srv.captures.used(k) and srv.captures.items[k].output == oi and srv.captures.items[k].waiting {
+            return true
+        }
+    }
+    return false
+}
+
+/// The image output `oi` shows: `pixels` (BGRA8, rows packed) of
+/// `width` x `height`, shown at `ns`. Every waiting frame gets a copy.
+fn deliver(mut srv: server.Server, oi: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+    for k in 0..srv.captures.items.len() {
+        guard srv.captures.used(k) and srv.captures.items[k].output == oi and srv.captures.items[k].waiting else {
+            continue
+        }
+        let c = int(srv.captures.items[k].client)
+        let f = icc.Frame { id: srv.captures.items[k].frame }
+        srv.captures.items[k].waiting = false
+        guard copy(mut srv, srv.captures.items[k].buffer, pixels, width, height) else {
+            f.failed(mut srv.conns[c], icc.FrameFailureReason.BufferConstraints)
+            continue
+        }
+        srv.captures.items[k].shot = true
+        f.transform(mut srv.conns[c], wl.OutputTransform.Normal)
+        f.damage(mut srv.conns[c], 0, 0, width, height)
+        let sec = u64(ns / 1000000000)
+        f.presentation_time(mut srv.conns[c], u32(sec >> 32), u32(sec & 0xffffffff), u32(ns % 1000000000))
+        f.ready(mut srv.conns[c])
+    }
+}
+
+/// Copy `pixels` into shm buffer `bi`; false when it is not a writable
+/// argb8888 / xrgb8888 buffer of this size.
+fn copy(mut srv: server.Server, bi: u32, pixels: &[u8], width: i32, height: i32) -> bool {
+    guard bi != state.none and srv.buffers.used(int(bi)) else {
+        return false
+    }
+    let b = int(bi)
+    guard srv.buffers.items[b].kind == state.BufferKind.Shm and srv.buffers.items[b].width == width and srv.buffers.items[b].height == height else {
+        return false
+    }
+    let fmt = srv.buffers.items[b].format
+    guard fmt == 0x34325241 or fmt == 0x34325258 else {
+        return false
+    }
+    let row = int(width) * 4
+    guard pixels.len() >= row * int(height) else {
+        return false
+    }
+    let pi = int(srv.buffers.items[b].pool)
+    guard srv.pools.used(pi) and srv.pools.items[pi].writable else {
+        return false
+    }
+    let off = srv.buffers.items[b].offset
+    let stride = srv.buffers.items[b].stride
+    guard let Some(m) = srv.pools.items[pi].map else {
+        return false
+    }
+    guard off + stride * int(height) <= m.len else {
+        return false
+    }
+    discard m.begin_access()
+    unsafe {
+        for y in 0..int(height) {
+            Ptr.copy(m.ptr.offset(off + y * stride), pixels.as_ptr().offset(y * row), row)
+        }
+    }
+    return not m.end_access()
+}
+
+/// Output `oi` changed size: sessions on it learn the new constraints.
+fn output_changed(mut srv: server.Server, oi: u32) {
+    for k in 0..srv.captures.items.len() {
+        if srv.captures.used(k) and srv.captures.items[k].output == oi {
+            constraints(mut srv, u32(k))
+        }
+    }
+}
+
+/// Output `oi` is gone: its sessions stop.
+fn output_gone(mut srv: server.Server, oi: u32) {
+    for k in 0..srv.captures.items.len() {
+        guard srv.captures.used(k) and srv.captures.items[k].output == oi else {
+            continue
+        }
+        let c = int(srv.captures.items[k].client)
+        if srv.captures.items[k].waiting {
+            icc.Frame { id: srv.captures.items[k].frame }.failed(mut srv.conns[c], icc.FrameFailureReason.Stopped)
+            srv.captures.items[k].waiting = false
+        }
+        icc.Session { id: srv.captures.items[k].obj }.stopped(mut srv.conns[c])
+        srv.captures.items[k].output = state.none
+    }
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == icc.session_iface {
+        drop_session(mut srv, slot)
+    } else if iface == icc.frame_iface {
+        if srv.captures.used(int(slot)) and srv.captures.items[int(slot)].frame == id {
+            srv.captures.items[int(slot)].frame = 0
+            srv.captures.items[int(slot)].waiting = false
+        }
+    } else if iface == ics.image_capture_source_iface or iface == icc.cursor_session_iface {
+        return true
+    } else {
+        return false
+    }
+    return true
+}

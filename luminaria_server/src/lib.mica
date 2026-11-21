@@ -3,7 +3,9 @@
 // transactions, xdg-shell and its extensions, layer shell and session
 // lock, seats and focus with pointer constraints, gestures and input
 // methods, outputs, shm, dmabuf and single-pixel buffers, explicit sync,
-// presentation and frame timing, selections, idle notification.
+// presentation and frame timing, selections and drag and drop, idle
+// notification, screen capture, sandboxes (security-context) and output
+// configuration.
 // Buffers and damage come out as plain data; requests that need a
 // decision come out as events.
 
@@ -37,6 +39,8 @@ pub type LockSurface = ids.LockSurface
 pub type LayerInfo = server.LayerInfo
 pub type LayerState = state.LayerState
 pub type Constraint = server.Constraint
+pub type OutputConfig = ids.OutputConfig
+pub type HeadConfig = state.HeadConfig
 pub type Icon = state.Icon
 pub type IconImage = state.IconImage
 

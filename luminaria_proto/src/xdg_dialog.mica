@@ -9,7 +9,7 @@ pub struct WmDialog derive(Hash, Show) {
     pub id: u32
 }
 
-pub let wm_dialog_iface: u16 = 100
+pub let wm_dialog_iface: u16 = 114
 pub let wm_dialog_version: u32 = 1
 
 pub enum WmDialogError: u32 {
@@ -49,7 +49,7 @@ pub struct Dialog derive(Hash, Show) {
     pub id: u32
 }
 
-pub let dialog_iface: u16 = 101
+pub let dialog_iface: u16 = 115
 pub let dialog_version: u32 = 1
 
 /// Requests of xdg_dialog_v1.

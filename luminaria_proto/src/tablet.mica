@@ -9,7 +9,7 @@ pub struct TabletManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_manager_iface: u16 = 77
+pub let tablet_manager_iface: u16 = 86
 pub let tablet_manager_version: u32 = 2
 
 /// Requests of zwp_tablet_manager_v2.
@@ -44,7 +44,7 @@ pub struct TabletSeat derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_seat_iface: u16 = 78
+pub let tablet_seat_iface: u16 = 87
 pub let tablet_seat_version: u32 = 2
 
 /// Requests of zwp_tablet_seat_v2.
@@ -95,7 +95,7 @@ pub struct TabletTool derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_tool_iface: u16 = 79
+pub let tablet_tool_iface: u16 = 88
 pub let tablet_tool_version: u32 = 2
 
 /// a physical tool type
@@ -301,7 +301,7 @@ pub struct Tablet derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_iface: u16 = 80
+pub let tablet_iface: u16 = 89
 pub let tablet_version: u32 = 2
 
 /// bus type
@@ -380,7 +380,7 @@ pub struct TabletPadRing derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_pad_ring_iface: u16 = 81
+pub let tablet_pad_ring_iface: u16 = 90
 pub let tablet_pad_ring_version: u32 = 2
 
 /// ring axis source
@@ -444,7 +444,7 @@ pub struct TabletPadStrip derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_pad_strip_iface: u16 = 82
+pub let tablet_pad_strip_iface: u16 = 91
 pub let tablet_pad_strip_version: u32 = 2
 
 /// strip axis source
@@ -508,7 +508,7 @@ pub struct TabletPadGroup derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_pad_group_iface: u16 = 83
+pub let tablet_pad_group_iface: u16 = 92
 pub let tablet_pad_group_version: u32 = 2
 
 /// Requests of zwp_tablet_pad_group_v2.
@@ -587,7 +587,7 @@ pub struct TabletPad derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_pad_iface: u16 = 84
+pub let tablet_pad_iface: u16 = 93
 pub let tablet_pad_version: u32 = 2
 
 /// physical button state
@@ -684,7 +684,7 @@ pub struct TabletPadDial derive(Hash, Show) {
     pub id: u32
 }
 
-pub let tablet_pad_dial_iface: u16 = 85
+pub let tablet_pad_dial_iface: u16 = 94
 pub let tablet_pad_dial_version: u32 = 2
 
 /// Requests of zwp_tablet_pad_dial_v2.

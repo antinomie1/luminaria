@@ -1,8 +1,9 @@
 // The Display's shell on a headless output, with an in-process client
 // on the generated API: a panel is arranged along its edge and the rest
 // of the output stays usable; the session lock shows only the lock
-// surface and tells the locker once a frame without the session is out.
-// Skipped without a Vulkan device.
+// surface and tells the locker once a frame without the session is out;
+// a screen capture gets the composed image; an output configuration is
+// applied. Skipped without a Vulkan device.
 
 import std.env
 import std.fs
@@ -15,6 +16,9 @@ import luminaria_proto as proto
 import luminaria_proto.wayland as wl
 import luminaria_proto.wlr_layer_shell_unstable as ls
 import luminaria_proto.ext_session_lock as sl
+import luminaria_proto.ext_image_capture_source as ics
+import luminaria_proto.ext_image_copy_capture as icc
+import luminaria_proto.wlr_output_management_unstable as wom
 
 struct Fx {
     d: lum.Display
@@ -181,4 +185,77 @@ test "the lock screen alone shows until unlock" {
         Locked(false) => true
         _ => false
     }))
+}
+
+test "a screen capture gets the composed image" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let srcs = ics.OutputImageCaptureSourceManager { id: bind(mut f, ics.output_image_capture_source_manager_iface, 1) }
+    let mgr = icc.Manager { id: bind(mut f, icc.manager_iface, 1) }
+    let sess = mgr.create_session(mut f.c, srcs.create_source(mut f.c, out), icc.ManagerOptions(0))
+    discard pump(mut f, 50)
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let size = 128 * 96 * 4
+    let fd = os.memfd("shot", size).expect("memfd")
+    var m = os.map(fd, size, 0, true).expect("map")
+    let buf = shm.create_pool(mut f.c, fd, i32(size)).create_buffer(mut f.c, 0, 128, 96, 512, wl.ShmFormat.Xrgb8888)
+    os.close(fd)
+    let fr = sess.create_frame(mut f.c)
+    fr.attach_buffer(mut f.c, buf)
+    fr.damage_buffer(mut f.c, 0, 0, 128, 96)
+    fr.capture(mut f.c)
+    assert(pump(mut f, 200).any(fn(e) => match e {
+        ExtImageCopyCaptureFrame(_, Ready) => true
+        _ => false
+    }))
+    // The background, everywhere.
+    let px = m.bytes()
+    assert_eq(px[3], u8(255))
+    assert(px[0] > 0)
+    assert_eq((px[0], px[1], px[2]), (px[size - 4], px[size - 3], px[size - 2]))
+}
+
+test "an output configuration moves and scales the output" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let mgr = wom.Manager { id: bind(mut f, wom.manager_iface, 4) }
+    var head: Option[wom.Head] = None
+    var serial: u32 = 0
+    for e in pump(mut f, 50) {
+        match e {
+            ZwlrOutputManager(_, Head(h)) => head = Some(h)
+            ZwlrOutputManager(_, Done(s)) => serial = s
+            _ => {}
+        }
+    }
+    let cfg = mgr.create_configuration(mut f.c, serial)
+    let ch = cfg.enable_head(mut f.c, head.expect("head"))
+    ch.set_position(mut f.c, 200, 0)
+    ch.set_scale(mut f.c, 2.0)
+    cfg.apply(mut f.c)
+    var ok = false
+    for e in pump(mut f, 100) {
+        match e {
+            ZwlrOutputConfiguration(_, Succeeded) => ok = true
+            ZwlrOutputManager(_, Done(s)) => serial = s
+            _ => {}
+        }
+    }
+    assert(ok)
+    let o = f.d.outputs()[0]
+    assert_eq(f.d.output_rect(o), (200.0, 0.0, 64.0, 48.0))
+    // Outputs are not rotated: that fails and changes nothing.
+    let bad = mgr.create_configuration(mut f.c, serial)
+    bad.enable_head(mut f.c, head.expect("head")).set_transform(mut f.c, wl.OutputTransform.Transform90)
+    bad.apply(mut f.c)
+    assert(pump(mut f, 100).any(fn(e) => match e {
+        ZwlrOutputConfiguration(_, Failed) => true
+        _ => false
+    }))
+    assert_eq(f.d.output_rect(o), (200.0, 0.0, 64.0, 48.0))
 }

@@ -9,7 +9,7 @@ pub struct DeviceManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let device_manager_iface: u16 = 70
+pub let device_manager_iface: u16 = 77
 pub let device_manager_version: u32 = 1
 
 /// Requests of zwp_primary_selection_device_manager_v1.
@@ -51,7 +51,7 @@ pub struct Device derive(Hash, Show) {
     pub id: u32
 }
 
-pub let device_iface: u16 = 71
+pub let device_iface: u16 = 78
 pub let device_version: u32 = 1
 
 /// Requests of zwp_primary_selection_device_v1.
@@ -101,7 +101,7 @@ pub struct Offer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let offer_iface: u16 = 72
+pub let offer_iface: u16 = 79
 pub let offer_version: u32 = 1
 
 /// Requests of zwp_primary_selection_offer_v1.
@@ -142,7 +142,7 @@ pub struct Source derive(Hash, Show) {
     pub id: u32
 }
 
-pub let source_iface: u16 = 73
+pub let source_iface: u16 = 80
 pub let source_version: u32 = 1
 
 /// Requests of zwp_primary_selection_source_v1.

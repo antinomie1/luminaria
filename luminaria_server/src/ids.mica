@@ -50,6 +50,11 @@ pub struct LockSurface derive(Hash, Show) {
     pub id: Id
 }
 
+/// A zwlr_output_configuration_v1 waiting for the compositor's answer.
+pub struct OutputConfig derive(Hash, Show) {
+    pub id: Id
+}
+
 /// A commit (with the synchronized subsurfaces it carries) waiting for
 /// its buffers to be ready.
 pub struct Txn derive(Hash, Show) {

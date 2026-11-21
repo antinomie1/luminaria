@@ -25,6 +25,9 @@ import ime
 import pointer
 import toplevel
 import inhibit
+import capture
+import security
+import outman
 
 /// What happened, for the compositor (and luminaria's glue) to act on.
 pub enum Event {
@@ -86,6 +89,19 @@ pub enum Event {
     ImeChanged(ids.Seat)
     /// Idle notifications were added: `idle_check` again.
     IdleChanged
+    /// A drag started or ended on the seat (`drag_icon` follows the
+    /// pointer meanwhile).
+    Drag(ids.Seat)
+    /// A screen capture of the output waits: draw a frame now, even
+    /// without damage, and hand it to `capture`.
+    Capture(ids.Output)
+    /// A sandbox listener is ready: poll `listener_fds(k)` and accept
+    /// with `accept_from`, close with `close_listener` when the second
+    /// one hangs up.
+    Listen(u32)
+    /// A tool asks for this output configuration (`output_config`):
+    /// test it only (true) or apply it, then `output_config_done`.
+    OutputConfig(ids.OutputConfig, bool)
 }
 
 /// A toplevel's request for a decision.
@@ -136,6 +152,12 @@ pub struct Server {
     constraints: ids.Slab[state.ConstraintData] = ids.Slab {}
     idles: ids.Slab[state.IdleData] = ids.Slab {}
     vkeys: ids.Slab[state.VirtualKeyboardData] = ids.Slab {}
+    captures: ids.Slab[state.CaptureData] = ids.Slab {}
+    contexts: ids.Slab[state.ContextData] = ids.Slab {}
+    outmans: ids.Slab[state.OutmanData] = ids.Slab {}
+    configs: ids.Slab[state.ConfigData] = ids.Slab {}
+    /// wlr-output-management serial: bumped by every output change.
+    out_serial: u32 = 1
     /// The session lock: its client and ext_session_lock_v1 id (0: none);
     /// whether the session is locked (it stays locked when the locker dies).
     lock_client: u32 = 0
@@ -213,6 +235,10 @@ pub fn Server.open(name: str) -> Result[Server, str] {
     s.add_global(proto.single_pixel_buffer.single_pixel_buffer_manager_iface, 1)
     s.add_global(proto.alpha_modifier.modifier_iface, 1)
     s.add_global(proto.content_type.type_manager_iface, 1)
+    s.add_global(proto.ext_image_capture_source.output_image_capture_source_manager_iface, 1)
+    s.add_global(proto.ext_image_copy_capture.manager_iface, 1)
+    s.add_global(proto.security_context.context_manager_iface, 1)
+    s.add_global(proto.wlr_output_management_unstable.manager_iface, 4)
     return Ok(s)
 }
 
@@ -257,7 +283,7 @@ fn Server.announce(mut self, name: u32) {
     let g = self.globals[int(name - 1)]
     let iface = ifaces.name(g.iface)
     for ci in 0..self.clients.items.len() {
-        guard self.clients.used(ci) else {
+        guard self.clients.used(ci) and self.sees(u32(ci), g.iface) else {
             continue
         }
         for r in self.clients.items[ci].registries.clone() {
@@ -271,14 +297,21 @@ fn Server.remove_global(mut self, name: u32) {
         return
     }
     self.globals[int(name - 1)].alive = false
+    let gi = self.globals[int(name - 1)].iface
     for ci in 0..self.clients.items.len() {
-        guard self.clients.used(ci) else {
+        guard self.clients.used(ci) and self.sees(u32(ci), gi) else {
             continue
         }
         for r in self.clients.items[ci].registries.clone() {
             wl.Registry { id: r }.global_remove(mut self.conns[ci], name)
         }
     }
+}
+
+/// Whether client `ci` may see globals of `iface` (sandboxed clients do
+/// not see privileged ones).
+fn Server.sees(self, ci: u32, iface: u16) -> bool {
+    return not self.clients.items[int(ci)].sandboxed or not security.privileged(iface)
 }
 
 fn Server.push(mut self, e: Event) {
@@ -310,8 +343,72 @@ pub fn Server.accept(mut self) -> Result[Option[(ids.Client, int)], str] {
     guard let Some(conn) = try got else {
         return Ok(None)
     }
+    return Ok(Some(self.add_client(conn, state.none)))
+}
+
+/// Accept a waiting client of sandbox listener `k`; it is sandboxed.
+pub fn Server.accept_from(mut self, k: u32) -> Option[(ids.Client, int)] {
+    guard self.contexts.used(int(k)) else {
+        return None
+    }
+    let (fd, _) = self.listener_fds(k)
+    guard fd >= 0 else {
+        return None
+    }
+    guard let Ok(Some(conn)) = wire.socket.accept_on(fd) else {
+        return None
+    }
+    return Some(self.add_client(conn, k))
+}
+
+/// The descriptors of sandbox listener `k`: the socket to accept on and
+/// the one whose hangup ends it.
+pub fn Server.listener_fds(self, k: u32) -> (int, int) {
+    guard self.contexts.used(int(k)) else {
+        return (-1, -1)
+    }
+    var out = (-1, -1)
+    if let Some(l) = self.contexts.items[int(k)].listen {
+        out.0 = l.raw()
+    }
+    if let Some(c) = self.contexts.items[int(k)].close {
+        out.1 = c.raw()
+    }
+    return out
+}
+
+/// Stop sandbox listener `k` (its clients stay).
+pub fn Server.close_listener(mut self, k: u32) {
+    guard self.contexts.used(int(k)) else {
+        return
+    }
+    let c = self.contexts.items[int(k)].client
+    let obj = self.contexts.items[int(k)].obj
+    if obj != 0 and self.clients.used(int(c)) {
+        self.unbind(c, obj)
+    }
+    self.contexts.remove(k, state.ContextData {})
+}
+
+/// The sandbox a client connected through: engine, app id, instance id
+/// (None: not sandboxed).
+pub fn Server.sandbox(self, c: ids.Client) -> Option[(str, str, str)] {
+    guard self.clients.live(c.id) and self.clients.items[int(c.id.index)].sandboxed else {
+        return None
+    }
+    let i = int(c.id.index)
+    return Some((self.clients.items[i].engine.clone(), self.clients.items[i].app_id.clone(), self.clients.items[i].instance_id.clone()))
+}
+
+fn Server.add_client(mut self, take conn: wire.Conn, k: u32) -> (ids.Client, int) {
     let fd = conn.fd
     var cd = state.ClientData {}
+    if k != state.none {
+        cd.sandboxed = true
+        cd.engine = self.contexts.items[int(k)].engine.clone()
+        cd.app_id = self.contexts.items[int(k)].app_id.clone()
+        cd.instance_id = self.contexts.items[int(k)].instance_id.clone()
+    }
     let sock = net.Conn { fd }
     if let Ok(cred) = sock.peer_cred() {
         cd.pid = cred.pid
@@ -325,7 +422,7 @@ pub fn Server.accept(mut self) -> Result[Option[(ids.Client, int)], str] {
     self.conns[int(id.index)] = conn
     let c = ids.Client { id }
     self.push(Event.ClientNew(c))
-    return Ok(Some((c, fd)))
+    return (c, fd)
 }
 
 /// The generation of client slot `index` (to rebuild a handle from a
@@ -597,7 +694,7 @@ pub fn Server.accepts(self, s: ids.Surface, x: f64, y: f64) -> bool {
         return false
     }
     let i = int(s.id.index)
-    guard x >= 0.0 and y >= 0.0 and x < f64(self.surfaces.items[i].width) and y < f64(self.surfaces.items[i].height) else {
+    guard x >= 0.0 and y >= 0.0 and x < f64(self.surfaces.items[i].width) and y < f64(self.surfaces.items[i].height) and self.surfaces.items[i].role != state.Role.DragIcon else {
         return false
     }
     return match self.surfaces.items[i].current.input {
@@ -1394,6 +1491,54 @@ pub fn Server.shortcuts_inhibited(self, st: ids.Seat) -> bool {
     }
     let f = self.seats.items[int(st.id.index)].kb_focus
     return f != state.none and self.shortcut_inhibitors.any(fn(x) => x.2 == f and x.4)
+}
+
+// --------------------------------------------------------------- drag
+
+pub fn Server.dragging(self, st: ids.Seat) -> bool {
+    return self.seats.live(st.id) and self.seats.items[int(st.id.index)].drag.active
+}
+
+/// The image a drag shows under the pointer.
+pub fn Server.drag_icon(self, st: ids.Seat) -> Option[ids.Surface] {
+    guard self.dragging(st) else {
+        return None
+    }
+    let ic = self.seats.items[int(st.id.index)].drag.icon
+    return if ic == state.none or not self.surfaces.used(int(ic)) { None } else { Some(ids.Surface { id: self.surfaces.id(ic) }) }
+}
+
+// ------------------------------------------------------------ capture
+
+/// Whether a screen capture waits for the output's next image.
+pub fn Server.capture_waiting(self, o: ids.Output) -> bool {
+    return self.outputs.live(o.id) and capture.waiting(self, o.id.index)
+}
+
+/// What the output shows (BGRA8, rows packed), shown at `ns`
+/// (CLOCK_MONOTONIC): the waiting captures get it.
+pub fn Server.capture(mut self, o: ids.Output, pixels: &[u8], width: i32, height: i32, ns: int) {
+    if self.outputs.live(o.id) {
+        capture.deliver(mut self, o.id.index, pixels, width, height, ns)
+    }
+}
+
+// ------------------------------------------------- output configuration
+
+/// What a configuration asks of each output.
+pub fn Server.output_config(self, c: ids.OutputConfig) -> List[state.HeadConfig] {
+    guard self.configs.live(c.id) else {
+        return []
+    }
+    return self.configs.items[int(c.id.index)].heads.clone()
+}
+
+/// The configuration was applied (or would apply, for a test): `ok`, or
+/// it failed and nothing changed.
+pub fn Server.output_config_done(mut self, c: ids.OutputConfig, ok: bool) {
+    if self.configs.live(c.id) {
+        outman.config_done(mut self, c.id.index, ok)
+    }
 }
 
 /// The XCursor name of a wp_cursor_shape shape.

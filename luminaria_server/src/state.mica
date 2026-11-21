@@ -23,6 +23,12 @@ struct ClientData {
     /// Pointer enter serial last sent to this client (cursor requests
     /// must name it).
     enter_serial: u32 = 0
+    /// Connected through a wp_security_context_v1 listener: privileged
+    /// globals are hidden; what the sandbox said about it.
+    sandboxed: bool = false
+    engine: str = ""
+    app_id: str = ""
+    instance_id: str = ""
 }
 
 /// A global's kind: static ones by interface, outputs and seats by slot.
@@ -132,6 +138,8 @@ enum Role {
     ImePopup(u32)
     /// A wl_surface given to xdg_toplevel_icon (shown nowhere).
     Icon
+    /// The image under the pointer during a drag (gets no input).
+    DragIcon
 }
 
 struct SurfaceData {
@@ -235,6 +243,8 @@ struct PoolData {
     obj: u32 = 0
     fd: Option[wire.Fd] = None
     map: Option[os.Map] = None
+    /// Mapped writable (screen captures write into its buffers).
+    writable: bool = false
     size: int = 0
     /// The pool object (while not destroyed) and each buffer.
     refs: int = 0
@@ -345,6 +355,13 @@ pub struct OutputInfo {
     /// Fractional scale in 120ths (120 = 1.0).
     pub scale120: i32 = 120
     pub transform: u32 = 0
+    /// The modes it can run (width, height, mHz, preferred), for output
+    /// configuration tools.
+    pub modes: List[(i32, i32, i32, bool)] = []
+    pub enabled: bool = true
+    /// Variable refresh: supported, on.
+    pub vrr_capable: bool = false
+    pub vrr: bool = false
 }
 
 struct OutputData {
@@ -422,6 +439,28 @@ struct SeatData {
     /// slot k. Content hashes avoid resending equal keymaps.
     keymap_from: u32 = 0
     keymap_hash: u64 = 0
+    /// Pointer buttons held (a drag drops when the last goes up), and
+    /// where the pointer is on its focus.
+    buttons: int = 0
+    ptr_x: f64 = 0.0
+    ptr_y: f64 = 0.0
+    drag: DragData = DragData {}
+}
+
+/// A drag and drop in progress (wl_data_device.start_drag).
+struct DragData {
+    active: bool = false
+    /// Source slot (none: a drag inside one client) and the client.
+    source: u32 = 0xFFFFFFFF
+    client: u32 = 0
+    icon: u32 = 0xFFFFFFFF
+    /// The surface under the pointer; the one the drag entered (its
+    /// client takes the data) and the offer it got; where.
+    under: u32 = 0xFFFFFFFF
+    focus: u32 = 0xFFFFFFFF
+    offer: u32 = 0xFFFFFFFF
+    x: f64 = 0.0
+    y: f64 = 0.0
 }
 
 /// zwp_virtual_keyboard_v1 (input methods, on-screen keyboards, wtype).
@@ -528,6 +567,10 @@ struct SourceData {
     obj: u32 = 0
     kind: DataKind = DataKind.Data
     mimes: List[str] = []
+    /// Drag and drop actions it offers (copy 1, move 2, ask 4), the one
+    /// chosen with the target.
+    actions: u32 = 0
+    action: u32 = 0
 }
 
 struct OfferData {
@@ -535,6 +578,77 @@ struct OfferData {
     obj: u32 = 0
     kind: DataKind = DataKind.Data
     source: u32 = 0xFFFFFFFF
+    /// A drag offer: the target's actions, preferred one and whether it
+    /// accepts a type.
+    dnd: bool = false
+    actions: u32 = 0
+    preferred: u32 = 0
+    accepted: bool = false
+}
+
+/// ext_image_copy_capture_session_v1 on an output, and its frame.
+struct CaptureData {
+    client: u32 = 0
+    obj: u32 = 0
+    output: u32 = 0xFFFFFFFF
+    /// The frame (0: none), the buffer attached to it, and whether it
+    /// waits for the next image.
+    frame: u32 = 0
+    buffer: u32 = 0xFFFFFFFF
+    waiting: bool = false
+    /// A frame was delivered: later ones wait for new content.
+    shot: bool = false
+}
+
+/// A wp_security_context_v1 listener: clients connecting to `listen` are
+/// sandboxed with this metadata until `close` hangs up.
+struct ContextData {
+    client: u32 = 0
+    obj: u32 = 0
+    listen: Option[wire.Fd] = None
+    close: Option[wire.Fd] = None
+    engine: str = ""
+    app_id: str = ""
+    instance_id: str = ""
+    committed: bool = false
+}
+
+/// zwlr_output_head_v1 a manager announced: output slot, head id, mode
+/// ids (as in `OutputInfo.modes`).
+struct Head {
+    output: u32
+    id: u32
+    modes: List[u32] = []
+}
+
+/// A bound zwlr_output_manager_v1.
+struct OutmanData {
+    client: u32 = 0
+    obj: u32 = 0
+    heads: List[Head] = []
+    stopped: bool = false
+}
+
+/// What a zwlr_output_configuration_v1 asks of one output.
+pub struct HeadConfig {
+    pub output: ids.Output = ids.Output { id: ids.Id {} }
+    pub enabled: bool = true
+    /// Width, height, mHz (0: any refresh).
+    pub mode: Option[(i32, i32, i32)] = None
+    pub position: Option[(i32, i32)] = None
+    pub transform: Option[u32] = None
+    pub scale: Option[f64] = None
+    pub vrr: Option[bool] = None
+}
+
+struct ConfigData {
+    client: u32 = 0
+    obj: u32 = 0
+    serial: u32 = 0
+    heads: List[HeadConfig] = []
+    /// zwlr_output_configuration_head_v1 ids, as `heads`.
+    head_objs: List[u32] = []
+    used: bool = false
 }
 
 struct ParamsData {

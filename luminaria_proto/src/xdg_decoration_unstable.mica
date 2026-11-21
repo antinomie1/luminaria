@@ -9,7 +9,7 @@ pub struct DecorationManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let decoration_manager_iface: u16 = 98
+pub let decoration_manager_iface: u16 = 112
 pub let decoration_manager_version: u32 = 2
 
 /// Requests of zxdg_decoration_manager_v1.
@@ -44,7 +44,7 @@ pub struct ToplevelDecoration derive(Hash, Show) {
     pub id: u32
 }
 
-pub let toplevel_decoration_iface: u16 = 99
+pub let toplevel_decoration_iface: u16 = 113
 pub let toplevel_decoration_version: u32 = 2
 
 pub enum ToplevelDecorationError: u32 {

@@ -9,7 +9,7 @@ pub struct Dmabuf derive(Hash, Show) {
     pub id: u32
 }
 
-pub let dmabuf_iface: u16 = 55
+pub let dmabuf_iface: u16 = 62
 pub let dmabuf_version: u32 = 6
 
 /// Requests of zwp_linux_dmabuf_v1.
@@ -81,7 +81,7 @@ pub struct BufferParams derive(Hash, Show) {
     pub id: u32
 }
 
-pub let buffer_params_iface: u16 = 56
+pub let buffer_params_iface: u16 = 63
 pub let buffer_params_version: u32 = 6
 
 pub enum BufferParamsError: u32 {
@@ -197,7 +197,7 @@ pub struct DmabufFeedback derive(Hash, Show) {
     pub id: u32
 }
 
-pub let dmabuf_feedback_iface: u16 = 57
+pub let dmabuf_feedback_iface: u16 = 64
 pub let dmabuf_feedback_version: u32 = 6
 
 pub enum DmabufFeedbackTrancheFlags: u32 derive(Flags) {

@@ -9,7 +9,7 @@ pub struct PointerManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let pointer_manager_iface: u16 = 74
+pub let pointer_manager_iface: u16 = 81
 pub let pointer_manager_version: u32 = 1
 
 /// Requests of zwp_relative_pointer_manager_v1.
@@ -44,7 +44,7 @@ pub struct Pointer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let pointer_iface: u16 = 75
+pub let pointer_iface: u16 = 82
 pub let pointer_version: u32 = 1
 
 /// Requests of zwp_relative_pointer_v1.

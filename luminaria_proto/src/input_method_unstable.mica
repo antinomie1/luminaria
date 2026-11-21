@@ -10,7 +10,7 @@ pub struct Method derive(Hash, Show) {
     pub id: u32
 }
 
-pub let method_iface: u16 = 49
+pub let method_iface: u16 = 56
 pub let method_version: u32 = 1
 
 /// Requests of zwp_input_method_v2.
@@ -124,7 +124,7 @@ pub struct PopupSurface derive(Hash, Show) {
     pub id: u32
 }
 
-pub let popup_surface_iface: u16 = 50
+pub let popup_surface_iface: u16 = 57
 pub let popup_surface_version: u32 = 1
 
 /// Requests of zwp_input_popup_surface_v2.
@@ -159,7 +159,7 @@ pub struct MethodKeyboardGrab derive(Hash, Show) {
     pub id: u32
 }
 
-pub let method_keyboard_grab_iface: u16 = 51
+pub let method_keyboard_grab_iface: u16 = 58
 pub let method_keyboard_grab_version: u32 = 1
 
 /// Requests of zwp_input_method_keyboard_grab_v2.
@@ -220,7 +220,7 @@ pub struct MethodManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let method_manager_iface: u16 = 52
+pub let method_manager_iface: u16 = 59
 pub let method_manager_version: u32 = 1
 
 /// Requests of zwp_input_method_manager_v2.

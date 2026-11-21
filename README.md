@@ -11,7 +11,7 @@ and its own loop. The design is in [docs/](docs/README.md) (Chinese).
 | Package | Role |
 |---------|------|
 | `luminaria` | `Display`: one event loop over everything below, layouts, input routing, manipulations |
-| `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, layer shell, session lock, seats and input methods, selections, outputs, buffers, timing; no GPU |
+| `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, layer shell, session lock, seats and input methods, selections and drag and drop, outputs and their configuration, capture, sandboxes, buffers, timing; no GPU |
 | `luminaria_compose` | Composition on `vk_compose`: placement diffs, client buffers as textures, fences, clock |
 | `luminaria_backend` | DRM/KMS, nested and headless outputs; libseat, libinput, xkb |
 | `luminaria_proto` | Interfaces generated from `protocols/*.xml` |
@@ -34,10 +34,10 @@ wlr-protocols. The server speaks:
 | Windows | xdg-decoration, xdg-activation, xdg-toplevel-icon, xdg-toplevel-tag, xdg-dialog, xdg-foreign v2, xdg-system-bell, ext-foreign-toplevel-list |
 | Desktop | wlr-layer-shell 5, ext-session-lock, xdg-output 3, ext-idle-notify 2, idle-inhibit |
 | Input | relative-pointer, pointer-constraints, pointer-gestures 3, cursor-shape 2, keyboard-shortcuts-inhibit, text-input-v3, input-method-v2, virtual-keyboard |
-| Selections | clipboard, primary selection, ext-data-control |
+| Selections | clipboard, primary selection, ext-data-control, drag and drop with actions |
+| Capture and control | ext-image-copy-capture with output sources (shm), wlr-output-management 4, security-context (sandboxed clients do not see privileged globals) |
 
-Not yet: drag and drop, screen capture, tablets, security-context, output
-management.
+Not yet: tablets, dmabuf and window capture.
 
 ## Writing a compositor
 
@@ -278,8 +278,10 @@ sheaf test    # luminaria: a libwayland xdg window (built with cc) and foot on a
               # displays, a nested window; protocols: layer surfaces, the
               # session lock, selections, input methods, decorations and
               # activation, the toplevel list, pointer locks, idle, single
-              # pixels; the shell on a headless output: panel zones, lock
-              # screen; wire, proto, sys as before
+              # pixels, drag and drop, capture, sandboxes, output
+              # configuration; the shell on a headless output: panel
+              # zones, lock screen, a captured frame, an applied output
+              # configuration; wire, proto, sys as before
 sheaf test --release -p luminaria_compose   # frame cost
 sheaf test --release -p luminaria           # hit testing
 sheaf test --release -p luminaria_proto     # wire throughput

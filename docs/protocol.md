@@ -103,7 +103,14 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 
 剪贴板（`wl_data_device_manager`）和主选区（primary selection，中键粘贴）按 seat 各存一个源。键盘焦点
 客户端收到 offer；它要哪种 MIME 就把管道 fd 直接转给源客户端，数据不经过合成器。ext-data-control
-（剪贴板管理器、wl-copy / wl-paste）不需要焦点，看得到也能设置两种选区。拖放目前拒绝（源被取消）。
+（剪贴板管理器、wl-copy / wl-paste）不需要焦点，看得到也能设置两种选区。
+
+拖放：`start_drag` 只在指针按着键、停在起点表面上时成立，否则源被取消。拖动期间起点收到指针
+`leave`，指针下的表面改收 `wl_data_device` 的 enter（带新 offer、源的 MIME 和动作）/ motion / leave；
+没有源的拖动只在本客户端内。目标 `accept` 一种类型、`set_actions` 给出动作后，按目标偏好、否则复制 /
+移动 / 询问的顺序选定动作，源和目标都收到。松开最后一个键时目标接受了就 `drop` 加
+`dnd_drop_performed`，否则取消；之后指针重新进入它下面的表面，目标 `finish` 时源收到
+`dnd_finished`。拖动图标是 `DragIcon` 角色，不接收输入，门面把它画在指针处、一切之上。
 
 ### 桌面外壳
 
@@ -153,6 +160,10 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 | idle-inhibit | 1 | 表面可见时阻止空闲（视频播放） |
 | ext-idle-notify | 2 | 空闲与恢复通知；普通通知被抑制器挡住，input-idle 通知不受影响 |
 | keyboard-shortcuts-inhibit | 1 | 焦点表面要求拿到合成器快捷键（远程桌面、虚拟机） |
+| ext-image-capture-source | 1 | 输出作为截屏源 |
+| ext-image-copy-capture | 1 | 截屏与录屏，见下 |
+| wlr-output-management | 4 | 输出配置，见下 |
+| security-context | 1 | 沙盒，见下 |
 | wl_fixes | 1 | 销毁 registry |
 
 核心协议的版本：`wl_compositor` 6、`wl_subcompositor` 1、`wl_shm` 2（ARGB/XRGB/ABGR/XBGR8888）、
@@ -161,5 +172,27 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 析构请求的 id 由解码层释放。处理函数没有清理的对象，在本次分派后按断开连接时的路径拆除，所以复用同一
 id 或同一客户端槽位的新对象不会继承旧记录。
 
-layer-shell、session-lock、input-method、virtual-keyboard、data-control、foreign-toplevel-list 是特权
-协议，目前对所有客户端公布（还没有 security-context）。
+### 截屏与录屏
+
+ext-image-copy-capture 的会话公布输出的物理像素尺寸和 shm 格式 ARGB8888 / XRGB8888（合成图像的
+BGRA8 正好是这种字节序）。会话的第一帧立即要（`Capture(o)`：门面让输出出一帧，即使没有损坏），之后
+的帧等输出真有新内容。有帧在等时门面不做直接扫描输出，合成完把图像读回（`dev.read_texture`，等这次
+GPU 提交）交给 `capture`，逐行拷进客户端的 shm 缓冲（池可写时才行，写入同样 SIGBUS 安全），发
+transform、整幅 damage、呈现时间和 `ready`；尺寸或格式不对发 `failed(buffer_constraints)`，输出消失
+发 `stopped`。硬件光标不在图像里；光标会话直接 `stopped`。还没有 dmabuf 缓冲和窗口源。
+
+### 输出配置
+
+wlr-output-management v4：每个绑定的管理器为每个输出建一个 head，带名字、描述、物理尺寸、厂商型号、
+模式列表（`OutputInfo.modes`，后端没给就用当前模式）、启用、当前模式、位置、变换、缩放和自适应同步，
+再发 `done(serial)`。输出的增删改都让 serial 加一并重发。按旧 serial 建的配置 `cancelled`，漏配 head
+是协议错误。`apply` / `test` 发 `OutputConfig(c, test)`，`output_config(c)` 读每个输出要的启用、模式、
+位置、变换、缩放、VRR，合成器用 `output_config_done(c, ok)` 回答。
+
+### 沙盒
+
+security-context：沙盒（Flatpak）交来一个监听 socket 和一个关闭 fd，`commit` 后发 `Listen(k)`，
+门面监听它，从这里连进来的客户端带上沙盒引擎、app id、实例 id（`sandbox(c)`）；关闭 fd 挂断时停止
+接受，已连上的客户端不受影响。沙盒客户端看不到也绑不了特权 global：security-context 本身（不能嵌套）、
+data-control、layer-shell、session-lock、input-method、virtual-keyboard、keyboard-shortcuts-inhibit、
+foreign-toplevel-list、截屏和输出配置。

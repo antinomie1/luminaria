@@ -43,11 +43,11 @@ fn shm(mut srv: server.Server, ci: u32, take req: wl.ShmRequest) {
                 srv.fail(ci, p.id, u32(wl.ShmError.InvalidStride), "pool size {size}")
                 return
             }
-            guard let Ok(map) = os.map(f.raw(), int(size), 0, false) else {
+            guard let Some((map, writable)) = map_pool(f.raw(), int(size)) else {
                 srv.fail(ci, p.id, u32(wl.ShmError.InvalidFd), "cannot map the pool")
                 return
             }
-            let id = srv.pools.add(state.PoolData { client: ci, obj: p.id, fd: Some(f), map: Some(map), size: int(size), refs: 1 })
+            let id = srv.pools.add(state.PoolData { client: ci, obj: p.id, fd: Some(f), map: Some(map), writable, size: int(size), refs: 1 })
             srv.bind(ci, p.id, id.index)
         }
         Release => {}
@@ -90,15 +90,28 @@ fn pool(mut srv: server.Server, ci: u32, p: wl.ShmPool, take req: wl.ShmPoolRequ
             if let Some(f) = srv.pools.items[i].fd {
                 fd = f.raw()
             }
-            match os.map(fd, int(size), 0, false) {
-                Ok(m) => {
+            match map_pool(fd, int(size)) {
+                Some((m, writable)) => {
                     srv.pools.items[i].map = Some(m)
+                    srv.pools.items[i].writable = writable
                     srv.pools.items[i].size = int(size)
                 }
-                Err => srv.fail(ci, p.id, u32(wl.ShmError.InvalidFd), "cannot remap the pool")
+                None => srv.fail(ci, p.id, u32(wl.ShmError.InvalidFd), "cannot remap the pool")
             }
         }
     }
+}
+
+/// Map a pool writable (screen captures fill client buffers), else
+/// read-only (the client sent a read-only or sealed descriptor).
+fn map_pool(fd: int, size: int) -> Option[(os.Map, bool)] {
+    if let Ok(m) = os.map(fd, size, 0, true) {
+        return Some((m, true))
+    }
+    if let Ok(m) = os.map(fd, size, 0, false) {
+        return Some((m, false))
+    }
+    return None
 }
 
 fn unref_pool(mut srv: server.Server, pi: u32) {

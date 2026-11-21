@@ -9,7 +9,7 @@ pub struct ControlManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let control_manager_iface: u16 = 86
+pub let control_manager_iface: u16 = 95
 pub let control_manager_version: u32 = 1
 
 pub enum ControlManagerError: u32 {
@@ -49,7 +49,7 @@ pub struct Control derive(Hash, Show) {
     pub id: u32
 }
 
-pub let control_iface: u16 = 87
+pub let control_iface: u16 = 96
 pub let control_version: u32 = 1
 
 /// presentation hint values

@@ -9,7 +9,7 @@ pub struct FifoManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let fifo_manager_iface: u16 = 43
+pub let fifo_manager_iface: u16 = 50
 pub let fifo_manager_version: u32 = 1
 
 /// fatal presentation error
@@ -50,7 +50,7 @@ pub struct Fifo derive(Hash, Show) {
     pub id: u32
 }
 
-pub let fifo_iface: u16 = 44
+pub let fifo_iface: u16 = 51
 pub let fifo_version: u32 = 1
 
 /// fatal error

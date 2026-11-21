@@ -5,6 +5,7 @@
 // activates the input method, which grabs the keyboard, shows its
 // candidate popup and commits text back.
 
+import std.math
 import std.os
 import luminaria_wire as wire
 import luminaria_proto.wayland as wl
@@ -388,7 +389,7 @@ fn keymap_hash(fd: int, size: u32) -> u64 {
     unsafe {
         let b = Ptr.slice(m.ptr, int(size))
         for x in b {
-            h = (h ^ u64(x)) * 0x100000001b3
+            h = math.wrap_mul(h ^ u64(x), 0x100000001b3)
         }
     }
     return h

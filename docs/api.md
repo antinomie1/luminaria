@@ -68,6 +68,7 @@ while true {
 | `Bell(w)` | 无 |
 | `Locked(locked)` | 无（锁屏期间库只显示锁屏表面、只把输入给它） |
 | `OutputArea(o)` | 无（面板改变了 `usable(o)`；最大化按它的尺寸 configure） |
+| `OutputConfig(c, test)` | `apply_output_config(c, test)` 后 `output_config_done`：模式须是当前模式或（DRM 下）输出自己的模式，不支持旋转；禁用即 `enable(o, false)` |
 | `DeviceAdded` / `DeviceRemoved` | 无 |
 | `Moved` / `Resized` / `Panned` | 无：操纵结束，合成器把结果并入自己的布局 |
 | `Session(active)` | 无（库已暂停或恢复设备） |
@@ -102,6 +103,7 @@ d.layout(fn(mut l) {
 | `focus(Option[Window])` / `focused()` | 键盘焦点；有弹出菜单抓取时焦点留在菜单上 |
 | `window_at(x, y)` | 全局坐标下的窗口（子表面和弹出菜单算作所属窗口） |
 | `title` / `app_id` / `parent` / `size` / `size_hints` / `client` / `credentials` | 查询 |
+| `sandbox(c)` | 客户端所在沙盒（security-context）：引擎、app id、实例 id |
 | `icon` / `tag` / `modal` / `content_type` | 图标、跨重启的标签、模态、内容类型（照片、视频、游戏） |
 | `decorate(w, server_side)` | 谁画标题栏：合成器（在布局里放图像）或客户端 |
 | `visible(w)` | 是否有任何部分在某个输出上可见 |
@@ -121,6 +123,8 @@ d.layout(fn(mut l) {
 - **空闲**：输入时通知恢复，到时间发空闲；可见表面上的 idle-inhibit 挡住普通通知。`idle_inhibited()`
   供合成器自己的熄屏策略参考。
 - **快捷键抑制**：`shortcuts_inhibited()` 为真时，焦点客户端要求拿到所有按键，绑定应放行。
+- **拖放**：拖动期间指针事件改走数据设备，拖动图标画在指针处；合成器不用做什么。
+- **截屏录屏**：有客户端等帧时库自己出帧、读回、拷给它。
 
 ## 布局事务
 
@@ -152,6 +156,7 @@ d.end(100)
 | `outputs()` / `output_rect(o)` / `output_desc(o)` / `output_under(x, y)` | 查询 |
 | `set_scale(o, s)` / `set_position(o, x, y)` / `set_mode(o, mode)` | 缩放（客户端按它渲染）、位置、模式 |
 | `enable(o, on)` / `set_vrr(o, on)` | 关屏省电、可变刷新率 |
+| `output_config(c)` / `apply_output_config(c, test)` / `output_config_done(c, ok)` | 输出配置工具（wlr-randr、kanshi）的请求 |
 | `pointer()` / `warp(x, y)` | 指针位置 |
 | `set_cursor_named(name)` / `hide_cursor()` | 主题光标 |
 | `configure_input(device, InputConfig)` | 轻触点击、自然滚动、加速、左手、禁用 |

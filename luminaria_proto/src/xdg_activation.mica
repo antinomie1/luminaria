@@ -9,7 +9,7 @@ pub struct Activation derive(Hash, Show) {
     pub id: u32
 }
 
-pub let activation_iface: u16 = 96
+pub let activation_iface: u16 = 110
 pub let activation_version: u32 = 1
 
 /// Requests of xdg_activation_v1.
@@ -51,7 +51,7 @@ pub struct ActivationToken derive(Hash, Show) {
     pub id: u32
 }
 
-pub let activation_token_iface: u16 = 97
+pub let activation_token_iface: u16 = 111
 pub let activation_token_version: u32 = 1
 
 pub enum ActivationTokenError: u32 {

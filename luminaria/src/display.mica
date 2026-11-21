@@ -164,6 +164,10 @@ pub enum Event {
     Locked(bool)
     /// Panels changed the output's free area: `usable`.
     OutputArea(server.Output)
+    /// A tool (wlr-randr, kanshi) asks for this configuration of the
+    /// outputs (`output_config`): only test it (true) or apply it, then
+    /// answer with `output_config_done` (`accept`: `apply_output_config`).
+    OutputConfig(server.OutputConfig, bool)
 }
 
 // --------------------------------------------------------------- state
@@ -199,6 +203,8 @@ let tok_fence = 1000000
 let tok_client = 2000000
 let tok_user = 3000000
 let tok_timer = 4000000
+/// Sandbox listeners: 2k accepts, 2k + 1 is the close descriptor.
+let tok_sandbox = 5000000
 
 struct Out {
     alive: bool = false
@@ -216,6 +222,7 @@ struct Out {
     /// Key of the client buffer scanned out (0: composing).
     scanned: u64 = 0
     vrr: bool = false
+    enabled: bool = true
     /// The area panels leave free (global logical).
     ux: f64 = 0.0
     uy: f64 = 0.0
@@ -539,6 +546,22 @@ fn Display.ready(mut self, t: int) -> Result[(), str] {
             }
             discard self.poll.add(fd, tok_client + int(c.id.index), true, false)
         }
+    } else if t >= tok_sandbox {
+        let k = u32((t - tok_sandbox) / 2)
+        if (t - tok_sandbox) % 2 == 0 {
+            while true {
+                guard let Some((c, fd)) = self.srv.accept_from(k) else {
+                    break
+                }
+                discard self.poll.add(fd, tok_client + int(c.id.index), true, false)
+            }
+        } else {
+            // The sandbox is done: no new clients from it.
+            let (lf, cf) = self.srv.listener_fds(k)
+            discard self.poll.remove(lf)
+            discard self.poll.remove(cf)
+            self.srv.close_listener(k)
+        }
     } else if t >= tok_timer {
         let k = t - tok_timer
         for i in 0..self.timers.len() {
@@ -669,6 +692,10 @@ fn Display.output_info(self, o: int) -> server.OutputInfo {
         width_mm: d.width_mm,
         height_mm: d.height_mm,
         scale120: i32(out.scale * 120.0 + 0.5),
+        modes: d.modes.map(fn(m) => (m.width, m.height, m.refresh_mhz, m.preferred)),
+        enabled: out.enabled,
+        vrr_capable: d.vrr,
+        vrr: out.vrr,
     }
 }
 
@@ -855,6 +882,20 @@ fn Display.server_events(mut self) {
             }
             ImeChanged => self.rebuild()
             IdleChanged => self.idle_tick()
+            Drag => self.rebuild()
+            Capture(so) => {
+                // The first frame of a capture is taken at once.
+                let o = self.out_index(so)
+                if o >= 0 {
+                    self.outs[o].dirty = true
+                }
+            }
+            Listen(k) => {
+                let (lf, cf) = self.srv.listener_fds(k)
+                discard self.poll.add(lf, tok_sandbox + int(k) * 2, true, false)
+                discard self.poll.add(cf, tok_sandbox + int(k) * 2 + 1, true, false)
+            }
+            OutputConfig(c, only_test) => self.emit(Event.OutputConfig(c, only_test))
         }
     }
 }
@@ -1443,6 +1484,12 @@ fn Display.rebuild(mut self) {
         shell.place_layers(mut self, 2, mut per, mut masks)
         shell.place_layers(mut self, 3, mut per, mut masks)
         shell.place_ime(mut self, mut per, mut masks)
+        // A drag's image follows the pointer.
+        if let Some(icon) = self.srv.drag_icon(self.seat) {
+            if self.srv.info(icon).mapped {
+                self.place_tree(icon, self.px, self.py, 1.0, layout.Style {}, 1.0, mut per, mut masks)
+            }
+        }
     }
     // A cursor the display does not show itself is drawn on top.
     if not self.cursor_hw and self.cursor.width > 0 {
@@ -1735,7 +1782,9 @@ fn Display.under(self, x: f64, y: f64) -> Option[(server.Surface, f64, f64)] {
 
 fn Display.deliver_motion(mut self, t: u32) {
     var target: Option[(server.Surface, f64, f64)] = None
-    if self.buttons > 0 {
+    // A drag goes to what is under the pointer, not to the grab.
+    let dragging = self.srv.dragging(self.seat)
+    if self.buttons > 0 and not dragging {
         if let Some(g) = self.grab {
             if let Some((gx, gy, sc)) = self.origins.get(g) {
                 target = Some((g, (self.px - gx) / sc, (self.py - gy) / sc))
@@ -1766,6 +1815,9 @@ fn Display.deliver_motion(mut self, t: u32) {
         }
     }
     self.update_constraint()
+    if dragging and self.srv.drag_icon(self.seat).is_some() {
+        self.rebuild()
+    }
 }
 
 /// Whether a pointer lock holds the pointer still.
@@ -2019,6 +2071,10 @@ pub fn Display.accept(mut self, e: Event) {
         }
         // The library draws no title bars: clients do.
         WindowDecoration(w, _) => self.decorate(w, false)
+        OutputConfig(c, only_test) => {
+            let ok = self.apply_output_config(c, only_test)
+            self.srv.output_config_done(c, ok)
+        }
         RequestActivate(w) => self.focus(Some(w))
         _ => {}
     }
@@ -2273,9 +2329,13 @@ fn Display.render(mut self, o: int) -> Result[(), str] {
     try self.upload_pending()
     if self.outs[o].dirty {
         var scanned = false
-        // Direct scanout: one client buffer fills the output as is.
-        if let Some(key) = self.comp.scanout(o) {
-            scanned = self.try_scanout(o, key)
+        // Direct scanout: one client buffer fills the output as is (not
+        // while a capture waits for a composed image).
+        let capturing = self.srv.capture_waiting(self.outs[o].sout)
+        if not capturing {
+            if let Some(key) = self.comp.scanout(o) {
+                scanned = self.try_scanout(o, key)
+            }
         }
         if not scanned {
             var be = mem.replace(mut self.be, backend.Backend.none())
@@ -2294,6 +2354,7 @@ fn Display.render(mut self, o: int) -> Result[(), str] {
                 return Err(drawn.unwrap_err())
             }
             let drew = drawn.unwrap()
+            let img = f.image()
             if drew {
                 var rects: List[(i32, i32, i32, i32)] = []
                 self.comp.changed(o, mut rects)
@@ -2305,6 +2366,12 @@ fn Display.render(mut self, o: int) -> Result[(), str] {
                 self.dev.cancel(take e)
             }
             self.outs[o].scanned = 0
+            if capturing {
+                // The image is whole (drawn by buffer age): read it back.
+                if let Ok(px) = self.dev.read_texture(img) {
+                    self.srv.capture(self.outs[o].sout, px, i32(img.width()), i32(img.height()), time.now_ns())
+                }
+            }
         }
         self.outs[o].dirty = false
     }
@@ -2792,6 +2859,12 @@ pub fn Display.credentials(self, c: server.Client) -> (int, int, int) {
     return self.srv.credentials(c)
 }
 
+/// The sandbox a client runs in (wp-security-context): engine
+/// ("flatpak"), app id, instance id; None outside one.
+pub fn Display.sandbox(self, c: server.Client) -> Option[(str, str, str)] {
+    return self.srv.sandbox(c)
+}
+
 /// Whether any of the window shows on some output.
 pub fn Display.visible(self, w: server.Window) -> bool {
     let s = self.srv.window_surface(w)
@@ -2876,15 +2949,98 @@ pub fn Display.enable(mut self, so: server.Output, on: bool) {
     if o >= 0 {
         self.be.enable(u32(o), on)
         self.outs[o].dirty = on
+        self.outs[o].enabled = on
+        let info = self.output_info(o)
+        self.srv.update_output(so, info)
     }
 }
 
 pub fn Display.set_vrr(mut self, so: server.Output, on: bool) {
     let o = self.out_index(so)
     if o >= 0 {
-        self.be.set_vrr(u32(o), on)
-        self.comp.outputs[o].clock.vrr = on
+        let v = on and self.be.output(u32(o)).vrr
+        self.be.set_vrr(u32(o), v)
+        self.comp.outputs[o].clock.vrr = v
+        self.outs[o].vrr = v
+        let info = self.output_info(o)
+        self.srv.update_output(so, info)
     }
+}
+
+/// What an output configuration asks of each output.
+pub fn Display.output_config(self, c: server.OutputConfig) -> List[server.HeadConfig] {
+    return self.srv.output_config(c)
+}
+
+/// Answer an output configuration: applied (or, for a test, it would
+/// apply), else failed and nothing changed.
+pub fn Display.output_config_done(mut self, c: server.OutputConfig, ok: bool) {
+    self.srv.output_config_done(c, ok)
+}
+
+/// Apply what configuration `c` asks (only check it when `only_test`):
+/// whether every output can do it. Modes are the output's own (any mode
+/// only nested or headless, where it must stay the current one); outputs
+/// are not rotated.
+pub fn Display.apply_output_config(mut self, c: server.OutputConfig, only_test: bool) -> bool {
+    let heads = self.srv.output_config(c)
+    for h in heads {
+        let o = self.out_index(h.output)
+        guard o >= 0 else {
+            return false
+        }
+        let d = self.be.output(u32(o))
+        if let Some((w, hh, mhz)) = h.mode {
+            let current = w == d.mode.width and hh == d.mode.height and (mhz == 0 or int(mhz - d.mode.refresh_mhz).abs() < 500)
+            let listed = self.be.kind() == backend.Kind.Drm and d.modes.any(fn(m) => m.width == w and m.height == hh and (mhz == 0 or int(mhz - m.refresh_mhz).abs() < 500))
+            guard current or listed else {
+                return false
+            }
+        }
+        guard h.transform.unwrap_or(0) == 0 else {
+            return false
+        }
+        if let Some(sc) = h.scale {
+            guard sc >= 0.5 and sc <= 4.0 else {
+                return false
+            }
+        }
+        guard not h.vrr.unwrap_or(false) or d.vrr else {
+            return false
+        }
+    }
+    guard not only_test else {
+        return true
+    }
+    for h in heads {
+        let so = h.output
+        let o = self.out_index(so)
+        if not h.enabled {
+            if self.outs[o].enabled {
+                self.enable(so, false)
+            }
+            continue
+        }
+        if not self.outs[o].enabled {
+            self.enable(so, true)
+        }
+        if let Some((w, hh, mhz)) = h.mode {
+            let d = self.be.output(u32(o))
+            if w != d.mode.width or hh != d.mode.height or (mhz != 0 and int(mhz - d.mode.refresh_mhz).abs() >= 500) {
+                self.set_mode(so, backend.Mode { width: w, height: hh, refresh_mhz: mhz })
+            }
+        }
+        if let Some((x, y)) = h.position {
+            self.set_position(so, f64(x), f64(y))
+        }
+        if let Some(sc) = h.scale {
+            self.set_scale(so, sc)
+        }
+        if let Some(v) = h.vrr {
+            self.set_vrr(so, v)
+        }
+    }
+    return true
 }
 
 /// The output under global `x, y`.

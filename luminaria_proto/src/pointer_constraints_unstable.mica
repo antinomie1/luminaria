@@ -9,7 +9,7 @@ pub struct PointerConstraints derive(Hash, Show) {
     pub id: u32
 }
 
-pub let pointer_constraints_iface: u16 = 61
+pub let pointer_constraints_iface: u16 = 68
 pub let pointer_constraints_version: u32 = 1
 
 /// wp_pointer_constraints error values
@@ -74,7 +74,7 @@ pub struct LockedPointer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let locked_pointer_iface: u16 = 62
+pub let locked_pointer_iface: u16 = 69
 pub let locked_pointer_version: u32 = 1
 
 /// Requests of zwp_locked_pointer_v1.
@@ -127,7 +127,7 @@ pub struct ConfinedPointer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let confined_pointer_iface: u16 = 63
+pub let confined_pointer_iface: u16 = 70
 pub let confined_pointer_version: u32 = 1
 
 /// Requests of zwp_confined_pointer_v1.
