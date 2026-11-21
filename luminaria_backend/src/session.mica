@@ -1,0 +1,123 @@
+// The seat session through libseat (seatd, logind or noop): devices are
+// opened through it so a VT switch revokes them, and the session's
+// enable / disable arrive as events. libseat calls back on its own
+// dispatch, so the callbacks only record what happened.
+
+import std.os
+import libseat_sys as seat
+
+static var active: bool = false
+static var changed: bool = false
+/// Open devices: fd + 1 (0 is free) and libseat device id.
+static var devices: [16]i32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+static var device_ids: [16]i32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+static var handle: Option[seat.Libseat] = None
+/// libseat keeps the listener's address.
+static var listener: seat.SeatListener = seat.SeatListener {}
+
+extern unsafe fn on_enable(s: seat.Libseat, data: Ptr[u8]) {
+    active = true
+    changed = true
+}
+
+extern unsafe fn on_disable(s: seat.Libseat, data: Ptr[u8]) {
+    active = false
+    changed = true
+    discard seat.disable_seat(s)
+}
+
+struct Session {
+    s: seat.Libseat
+}
+
+fn open() -> Result[Session, str] {
+    unsafe {
+        listener = seat.SeatListener { enable_seat: Some(on_enable), disable_seat: Some(on_disable) }
+        guard let Some(s) = seat.open_seat(Ptr.of(listener), Ptr.null()) else {
+            return Err("libseat_open_seat failed (no seatd or logind session?)")
+        }
+        handle = Some(s)
+        // Wait for the first enable (the seat is ours already or soon).
+        for _ in 0..100 {
+            discard seat.dispatch(s, 10)
+            if active {
+                break
+            }
+        }
+        changed = false
+        return Ok(Session { s })
+    }
+}
+
+fn Session.fd(self) -> int {
+    return int(seat.get_fd(self.s))
+}
+
+fn Session.name(self) -> str {
+    return seat.seat_name(self.s).unwrap_or("seat0")
+}
+
+fn Session.active(self) -> bool {
+    unsafe {
+        return active
+    }
+}
+
+/// Run libseat's callbacks: Some(active) when the session changed.
+fn Session.dispatch(mut self) -> Option[bool] {
+    discard seat.dispatch(self.s, 0)
+    unsafe {
+        guard changed else {
+            return None
+        }
+        changed = false
+        return Some(active)
+    }
+}
+
+/// Open a device node through the seat.
+fn open_device(path: str) -> Result[int, str] {
+    unsafe {
+        guard let Some(s) = handle else {
+            return os.open(path, true).map_err(fn(e) => "{e}")
+        }
+        var fd: i32 = -1
+        let id = seat.open_device(s, path, Ptr.of_mut(mut fd))
+        guard id >= 0 and fd >= 0 else {
+            return Err("libseat cannot open {path}")
+        }
+        for i in 0..16 {
+            if devices[i] == 0 {
+                devices[i] = fd + 1
+                device_ids[i] = id
+                break
+            }
+        }
+        return Ok(int(fd))
+    }
+}
+
+fn close_device(fd: int) {
+    unsafe {
+        if let Some(s) = handle {
+            for i in 0..16 {
+                if int(devices[i]) == fd + 1 {
+                    discard seat.close_device(s, device_ids[i])
+                    devices[i] = 0
+                }
+            }
+        }
+    }
+    os.close(fd)
+}
+
+fn Session.switch_vt(self, n: int) {
+    discard seat.switch_session(self.s, i32(n))
+}
+
+fn Session.drop(mut self) {
+    unsafe {
+        handle = None
+    }
+    discard seat.close_seat(self.s)
+}

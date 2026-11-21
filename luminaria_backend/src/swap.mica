@@ -1,0 +1,85 @@
+// Scanout buffers of an output: a few dmabuf-backed render targets the
+// compositor draws into and the display (KMS or a parent compositor)
+// shows. Buffer age follows each buffer, so redraws are partial.
+
+import vk_gpu as gpu
+
+struct Slot {
+    tex: gpu.Texture
+    buf: gpu.Dmabuf
+    /// KMS framebuffer id or parent wl_buffer id.
+    id: u32 = 0
+    /// On screen or queued to be.
+    busy: bool = false
+    /// Present number it was last drawn for (0: never).
+    drawn: u64 = 0
+}
+
+struct Swap {
+    slots: List[Slot] = []
+    /// Presents so far.
+    frame: u64 = 0
+    width: u32 = 0
+    height: u32 = 0
+    format: gpu.Format = gpu.Format.B8G8R8A8_UNORM
+}
+
+fn create(mut dev: gpu.Device, width: u32, height: u32, format: gpu.Format, modifiers: &[u64], count: int) -> Result[Swap, str] {
+    var s = Swap { width, height, format }
+    for _ in 0..count {
+        let (tex, buf) = try dev.export_dmabuf_with(gpu.TextureDesc { width, height, format }, modifiers)
+        s.slots.push(Slot { tex, buf })
+    }
+    return Ok(s)
+}
+
+/// A free buffer and its age (frames since its content was shown; 0
+/// undefined).
+fn Swap.acquire(self) -> Option[(int, u32)] {
+    var best = -1
+    for i in 0..self.slots.len() {
+        guard not self.slots[i].busy else {
+            continue
+        }
+        // The most recently drawn free buffer needs the least redraw.
+        if best < 0 or self.slots[i].drawn > self.slots[best].drawn {
+            best = i
+        }
+    }
+    guard best >= 0 else {
+        return None
+    }
+    let d = self.slots[best].drawn
+    let age: u32 = if d == 0 { 0 } else { u32(self.frame - d + 1) }
+    return Some((best, age))
+}
+
+/// Buffer `i` was drawn and handed to the display.
+fn Swap.queued(mut self, i: int) {
+    self.frame += 1
+    self.slots[i].drawn = self.frame
+    self.slots[i].busy = true
+}
+
+/// The display let go of buffer `i`.
+fn Swap.free(mut self, i: int) {
+    if i >= 0 and i < self.slots.len() {
+        self.slots[i].busy = false
+    }
+}
+
+fn Swap.find(self, id: u32) -> int {
+    for i in 0..self.slots.len() {
+        if self.slots[i].id == id {
+            return i
+        }
+    }
+    return -1
+}
+
+fn Swap.destroy(take self, mut dev: gpu.Device) {
+    var s = self
+    for sl in s.slots {
+        dev.destroy_texture(sl.tex)
+    }
+}

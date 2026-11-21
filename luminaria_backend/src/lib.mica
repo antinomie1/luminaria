@@ -2,4 +2,778 @@
 // commits, planes and their formats, page flips, hotplug), a nested Wayland
 // backend and a headless one; seat sessions through libseat, input devices
 // through libinput, keymaps through xkbcommon. Frames are requested, never
-// polled: an idle output costs no wakeups.
+// polled: an idle output costs no wakeups. Every backend presents through
+// the same calls: `acquire` a frame, draw, `present` it with the changed
+// rectangles (KMS FB_DAMAGE_CLIPS, a parent's damage), or `scanout` a
+// client's buffer directly.
+
+import std.env
+import std.os
+import vk_gpu as gpu
+import libudev_sys as udev
+import libdrm_sys.uapi as uapi
+pub import types
+pub import keyboard
+import session
+import input
+import drm
+import nested
+import headless
+import swap
+
+pub type Mode = types.Mode
+pub type OutputDesc = types.OutputDesc
+pub type Input = types.Input
+pub type Event = types.Event
+pub type AxisSource = types.AxisSource
+pub type DeviceDesc = types.DeviceDesc
+pub type Names = keyboard.Names
+pub type Mods = keyboard.Mods
+pub type InputConfig = input.Config
+
+pub let presented_vsync = types.presented_vsync
+pub let presented_hw_clock = types.presented_hw_clock
+pub let presented_hw_completion = types.presented_hw_completion
+pub let presented_zero_copy = types.presented_zero_copy
+
+pub enum Kind {
+    /// Nested when WAYLAND_DISPLAY is set, else DRM.
+    Auto
+    Drm
+    Nested
+    Headless
+}
+
+pub struct Options {
+    pub kind: Kind = Kind.Auto
+    /// Headless outputs (one 1920x1080 at 60 Hz when empty).
+    pub headless: List[Mode] = []
+    pub keymap: Names = Names {}
+    /// Scanout buffers per output: 2 is lighter, 3 absorbs a late frame.
+    pub buffers: int = 2
+    pub title: str = "luminaria"
+}
+
+/// A damaged rectangle in output pixels: x, y, w, h.
+pub type Rect = (i32, i32, i32, i32)
+
+/// Poller tokens of the backend's descriptors.
+pub let token_drm = 1
+pub let token_session = 2
+pub let token_input = 3
+pub let token_udev = 4
+pub let token_nested = 5
+/// Headless output `i` uses token_headless + i.
+pub let token_headless = 64
+
+pub struct Backend {
+    kind: Kind
+    session: Option[session.Session] = None
+    input: Option[input.Input] = None
+    drm: Option[drm.Drm] = None
+    nested: Option[nested.Nested] = None
+    headless: Option[headless.Headless] = None
+    kb: Option[keyboard.Keyboard] = None
+    monitor: Option[udev.Monitor] = None
+    udev: Option[udev.Udev] = None
+    descs: List[OutputDesc] = []
+    alive: List[bool] = []
+    events: List[Event] = []
+    head: int = 0
+    pending_inputs: List[Input] = []
+    buffers: int = 2
+    active: bool = true
+    /// Slot index each output's acquired frame uses.
+    acquired: List[int] = []
+}
+
+/// A backend with nothing behind it (a placeholder to move one out).
+pub fn Backend.none() -> Backend {
+    return Backend { kind: Kind.Headless }
+}
+
+pub fn Backend.open(o: Options) -> Result[Backend, str] {
+    var kind = o.kind
+    if kind == Kind.Auto {
+        kind = if env.get("WAYLAND_DISPLAY").is_some() { Kind.Nested } else { Kind.Drm }
+    }
+    var b = Backend { kind, buffers: max(o.buffers, 2) }
+    match kind {
+        Drm => try b.open_drm(o.keymap)
+        Nested => {
+            let n = try nested.open(o.title.clone())
+            let desc = n.desc()
+            b.nested = Some(n)
+            b.add_output(desc)
+        }
+        Headless => {
+            var modes = o.headless.clone()
+            if modes.is_empty() {
+                modes.push(Mode { width: 1920, height: 1080, refresh_mhz: 60000, preferred: true })
+            }
+            let h = try headless.create(modes)
+            for out in h.outs {
+                b.add_output(out.desc.clone())
+            }
+            b.headless = Some(h)
+        }
+        Auto => {}
+    }
+    return Ok(b)
+}
+
+fn Backend.add_output(mut self, take d: OutputDesc) {
+    self.descs.push(d)
+    self.alive.push(true)
+    self.acquired.push(-1)
+    self.push(Event.OutputAdded(u32(self.descs.len() - 1)))
+}
+
+fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
+    let s = try session.open()
+    let seat_name = s.name()
+    self.session = Some(s)
+    self.kb = Some(try keyboard.Keyboard.new(names))
+    let path = try drm.find_card()
+    var d = try drm.open(path)
+    var added: List[int] = []
+    d.connect(mut added)
+    for o in added {
+        let desc = d.desc(o)
+        while self.descs.len() < o {
+            self.descs.push(OutputDesc {})
+            self.alive.push(false)
+            self.acquired.push(-1)
+        }
+        self.add_output(desc)
+    }
+    self.drm = Some(d)
+    self.input = Some(try input.open(seat_name))
+    if let Some(u) = udev.new() {
+        if let Some(m) = udev.monitor_new_from_netlink(u, "udev") {
+            discard udev.monitor_filter_add_match_subsystem_devtype(m, "drm", "")
+            discard udev.monitor_enable_receiving(m)
+            self.monitor = Some(m)
+        }
+        self.udev = Some(u)
+    }
+    return Ok(())
+}
+
+fn Backend.push(mut self, take e: Event) {
+    self.events.push(e)
+}
+
+/// The next event, oldest first.
+pub fn Backend.next(mut self) -> Option[Event] {
+    guard self.head < self.events.len() else {
+        self.events.clear()
+        self.head = 0
+        return None
+    }
+    let e = self.events[self.head].clone()
+    self.head += 1
+    return Some(e)
+}
+
+pub fn Backend.kind(self) -> Kind {
+    return self.kind
+}
+
+/// Descriptors to poll for reading and their tokens.
+pub fn Backend.fds(self, mut out: List[(int, int)]) {
+    if let Some(d) = self.drm {
+        out.push((d.fd, token_drm))
+    }
+    if let Some(s) = self.session {
+        out.push((s.fd(), token_session))
+    }
+    if let Some(i) = self.input {
+        out.push((i.fd(), token_input))
+    }
+    if let Some(m) = self.monitor {
+        out.push((int(udev.monitor_get_fd(m)), token_udev))
+    }
+    if let Some(n) = self.nested {
+        out.push((n.fd(), token_nested))
+    }
+    if let Some(h) = self.headless {
+        for k in 0..h.outs.len() {
+            out.push((h.outs[k].timer, token_headless + k))
+        }
+    }
+}
+
+/// Handle what descriptor `token` has.
+pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
+    if token == token_drm {
+        var flips: List[(int, u64, int)] = []
+        if let Some(dd) = self.drm.take() {
+            var d = dd
+            d.read_events(mut flips)
+            for (o, seq, ns) in flips {
+                let direct = d.outputs[o].direct_queued != 0
+                d.flipped(o)
+                var flags = types.presented_vsync | types.presented_hw_clock | types.presented_hw_completion
+                if direct {
+                    flags |= types.presented_zero_copy
+                }
+                self.push(Event.Presented(u32(o), seq, ns, flags))
+                // A cursor move that waited for this flip.
+                if d.outputs[o].cursor_dirty and self.active {
+                    discard d.commit(o, 0, -1, drm.no_clips(), false, false)
+                }
+            }
+            self.drm = Some(d)
+        }
+    } else if token == token_session {
+        if let Some(ss) = self.session.take() {
+            var s = ss
+            let changed = s.dispatch()
+            self.session = Some(s)
+            if let Some(on) = changed {
+                self.set_active(on)
+            }
+        }
+    } else if token == token_input {
+        if let Some(ii) = self.input.take() {
+            var inp = ii
+            var got: List[Input] = []
+            if let Some(kk) = self.kb.take() {
+                var kb = kk
+                inp.dispatch(mut kb, mut got)
+                self.kb = Some(kb)
+            }
+            self.input = Some(inp)
+            for g in take got {
+                self.push(Event.Input(g))
+            }
+        }
+    } else if token == token_udev {
+        self.hotplug()
+    } else if token == token_nested {
+        if let Some(nn) = self.nested.take() {
+            var n = nn
+            var got: List[Event] = []
+            let r = n.dispatch(mut got)
+            if n.resized {
+                self.descs[0] = n.desc()
+            }
+            self.nested = Some(n)
+            for g in take got {
+                self.push(g)
+            }
+            try r
+        }
+    } else if token >= token_headless {
+        let k = token - token_headless
+        if let Some(hh) = self.headless.take() {
+            var h = hh
+            let t = h.tick(k)
+            self.headless = Some(h)
+            if let Some((seq, ns)) = t {
+                self.push(Event.Presented(u32(k), seq, ns, 0))
+            }
+        }
+    }
+    return Ok(())
+}
+
+fn Backend.set_active(mut self, on: bool) {
+    self.active = on
+    if let Some(ii) = self.input.take() {
+        var i = ii
+        if on {
+            i.resume()
+        } else {
+            i.suspend()
+        }
+        self.input = Some(i)
+    }
+    if on {
+        if let Some(dd) = self.drm.take() {
+            var d = dd
+            for o in 0..d.outputs.len() {
+                d.outputs[o].modeset = true
+                d.outputs[o].pending = false
+            }
+            self.drm = Some(d)
+        }
+    }
+    self.push(Event.Session(on))
+}
+
+fn Backend.hotplug(mut self) {
+    guard let Some(m) = self.monitor else {
+        return
+    }
+    if let Some(dev) = udev.monitor_receive_device(m) {
+        discard udev.device_unref(dev)
+    }
+    guard let Some(dd) = self.drm.take() else {
+        return
+    }
+    var d = dd
+    d.scan()
+    for o in d.disconnected() {
+        if o < self.alive.len() and self.alive[o] {
+            self.alive[o] = false
+            d.crtcs[d.outputs[o].crtc].used = false
+            d.outputs[o].conn = d.conns.len() + 1000
+            self.push(Event.OutputRemoved(u32(o)))
+        }
+    }
+    var added: List[int] = []
+    d.connect(mut added)
+    for o in added {
+        let desc = d.desc(o)
+        while self.descs.len() < o {
+            self.descs.push(OutputDesc {})
+            self.alive.push(false)
+            self.acquired.push(-1)
+        }
+        self.add_output(desc)
+    }
+    self.drm = Some(d)
+}
+
+// --------------------------------------------------------------- outputs
+
+pub fn Backend.output(self, o: u32) -> OutputDesc {
+    guard int(o) < self.descs.len() else {
+        return OutputDesc {}
+    }
+    return self.descs[int(o)].clone()
+}
+
+pub fn Backend.output_count(self) -> int {
+    return self.descs.len()
+}
+
+pub fn Backend.output_alive(self, o: u32) -> bool {
+    return int(o) < self.alive.len() and self.alive[int(o)]
+}
+
+/// Pick a mode (one of the output's) for output `o`.
+pub fn Backend.set_mode(mut self, o: u32, m: Mode) {
+    guard let Some(dd) = self.drm.take() else {
+        return
+    }
+    var d = dd
+    let ci = d.outputs[int(o)].conn
+    if ci < d.conns.len() {
+        for raw in d.conns[ci].modes.clone() {
+            let tm = drm.to_mode(raw)
+            if tm.width == m.width and tm.height == m.height and (m.refresh_mhz == 0 or int(tm.refresh_mhz - m.refresh_mhz).abs() < 500) {
+                d.outputs[int(o)].mode = raw
+                d.outputs[int(o)].mode_blob = 0
+                d.outputs[int(o)].modeset = true
+                self.descs[int(o)].mode = tm
+                self.push(Event.OutputChanged(o))
+                break
+            }
+        }
+    }
+    self.drm = Some(d)
+}
+
+/// Turn output `o` on or off (DPMS): an off output draws nothing.
+pub fn Backend.enable(mut self, o: u32, on: bool) {
+    guard let Some(dd) = self.drm.take() else {
+        return
+    }
+    var d = dd
+    d.outputs[int(o)].enabled = on
+    d.outputs[int(o)].modeset = true
+    if not on {
+        discard d.commit(int(o), 0, -1, drm.no_clips(), false, false)
+    }
+    self.drm = Some(d)
+}
+
+/// Variable refresh rate on outputs that support it.
+pub fn Backend.set_vrr(mut self, o: u32, on: bool) {
+    guard let Some(dd) = self.drm.take() else {
+        return
+    }
+    var d = dd
+    d.outputs[int(o)].vrr = on and self.descs[int(o)].vrr
+    d.outputs[int(o)].modeset = true
+    self.drm = Some(d)
+}
+
+/// Whether a frame may be presented on `o` now (none is pending).
+pub fn Backend.can_present(self, o: u32) -> bool {
+    guard self.active and self.output_alive(o) else {
+        return false
+    }
+    if let Some(d) = self.drm {
+        return not d.outputs[int(o)].pending and d.outputs[int(o)].enabled
+    }
+    if let Some(n) = self.nested {
+        return n.frame_cb == 0
+    }
+    if let Some(h) = self.headless {
+        return h.outs[int(o)].pending < 0
+    }
+    return false
+}
+
+/// The next image to draw output `o` into, or None when every buffer is
+/// in use.
+pub fn Backend.acquire(mut self, o: u32, mut dev: gpu.Device) -> Result[Option[gpu.Frame], str] {
+    let oi = int(o)
+    var pick: Option[(int, u32, gpu.Texture)] = None
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        let r = d.prepare(oi, mut dev, self.buffers)
+        if r.is_ok() {
+            if let Some(s) = d.outputs[oi].swap {
+                if let Some((i, age)) = s.acquire() {
+                    pick = Some((i, age, s.slots[i].tex))
+                }
+            }
+        }
+        self.drm = Some(d)
+        try r
+    } else if let Some(nn) = self.nested.take() {
+        var n = nn
+        let r = n.prepare(mut dev, self.buffers)
+        if r.is_ok() {
+            if let Some(s) = n.swap {
+                if let Some((i, age)) = s.acquire() {
+                    pick = Some((i, age, s.slots[i].tex))
+                }
+            }
+        }
+        self.nested = Some(n)
+        try r
+    } else if let Some(hh) = self.headless.take() {
+        var h = hh
+        let r = h.prepare(oi, mut dev, self.buffers)
+        if r.is_ok() {
+            if let Some((i, age)) = h.acquire(oi) {
+                pick = Some((i, age, h.outs[oi].slots[i]))
+            }
+        }
+        self.headless = Some(h)
+        try r
+    }
+    guard let Some((i, age, tex)) = pick else {
+        return Ok(None)
+    }
+    self.acquired[oi] = i
+    return Ok(Some(gpu.Frame.new(tex, age)))
+}
+
+fn to_clips(rects: &[Rect]) -> List[uapi.ModeRect] {
+    var out: List[uapi.ModeRect] = []
+    for r in rects {
+        out.push(uapi.ModeRect { x1: r.0, y1: r.1, x2: r.0 + r.2, y2: r.1 + r.3 })
+    }
+    return out
+}
+
+/// Submit the frame's drawing and show it; `rects` is what changed
+/// (empty: everything), `tear` lets a full-screen game flip immediately.
+pub fn Backend.present(mut self, o: u32, mut dev: gpu.Device, take e: gpu.Encoder, rects: &[Rect], tear: bool) -> Result[(), str] {
+    let oi = int(o)
+    let i = self.acquired[oi]
+    guard i >= 0 else {
+        dev.cancel(take e)
+        return Err("present without acquire")
+    }
+    self.acquired[oi] = -1
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        let (_, fence) = try dev.submit_sync_file(take e)
+        var fb: u32 = 0
+        if let Some(s) = d.outputs[oi].swap {
+            fb = s.slots[i].id
+        }
+        let clips = to_clips(rects)
+        let r = d.commit(oi, fb, fence, clips, false, tear)
+        if fence >= 0 {
+            os.close(fence)
+        }
+        if r.is_ok() {
+            if let Some(sw) = d.outputs[oi].swap.take() {
+                var s = sw
+                s.queued(i)
+                d.outputs[oi].swap = Some(s)
+            }
+            d.outputs[oi].queued = i
+            d.outputs[oi].direct_queued = 0
+        }
+        self.drm = Some(d)
+        return r
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        let r = dev.submit_sync_file(take e)
+        match r {
+            Ok((_, fence)) => n.present(i, fence, rects)
+            Err => {}
+        }
+        n.flush()
+        self.nested = Some(n)
+        discard try r
+        return Ok(())
+    }
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        let r = dev.submit(take e)
+        if r.is_ok() {
+            h.present(oi, i)
+        }
+        self.headless = Some(h)
+        discard try r
+        return Ok(())
+    }
+    dev.cancel(take e)
+    return Ok(())
+}
+
+/// A client's dmabuf to show on `o` as is (it fills the output, opaque,
+/// unscaled): framebuffer import, an atomic test, then the flip. False
+/// when the display cannot take it (compose instead).
+pub fn Backend.scanout(mut self, o: u32, key: u64, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32, rects: &[Rect], tear: bool) -> bool {
+    let oi = int(o)
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        var fb: u32 = 0
+        for (k, id) in d.outputs[oi].fbs {
+            if k == key {
+                fb = id
+            }
+        }
+        if fb == 0 {
+            if let Ok(id) = d.add_fb(fd, width, height, format, modifier, offset, stride) {
+                fb = id
+                d.outputs[oi].fbs.push((key, id))
+            }
+        }
+        var ok = false
+        if fb != 0 and not d.outputs[oi].modeset {
+            let clips = to_clips(rects)
+            if d.commit(oi, fb, -1, clips, true, false).is_ok() {
+                ok = d.commit(oi, fb, -1, clips, false, tear).is_ok()
+            }
+        }
+        if ok {
+            d.outputs[oi].direct_queued = fb
+            d.outputs[oi].queued = -1
+        }
+        self.drm = Some(d)
+        return ok
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        let ok = n.scanout(key, fd, width, height, format, modifier, offset, stride, rects)
+        n.flush()
+        self.nested = Some(n)
+        return ok
+    }
+    return false
+}
+
+/// Whether the display still reads client buffer `key` (scanned out).
+pub fn Backend.holds(self, key: u64) -> bool {
+    if let Some(d) = self.drm {
+        for o in d.outputs {
+            for (k, id) in o.fbs {
+                if k == key and (id == o.direct_queued or id == o.direct_shown) {
+                    return true
+                }
+            }
+        }
+    }
+    if let Some(n) = self.nested {
+        return n.holds(key)
+    }
+    return false
+}
+
+/// A client buffer goes away: drop what was made for it.
+pub fn Backend.forget(mut self, key: u64) {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        for o in 0..d.outputs.len() {
+            for (k, id) in d.outputs[o].fbs {
+                if k == key {
+                    d.rm_fb(id)
+                }
+            }
+            d.outputs[o].fbs.retain(fn(p) => p.0 != key)
+        }
+        self.drm = Some(d)
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        n.forget(key)
+        self.nested = Some(n)
+    }
+}
+
+/// What a headless output shows (tests, screenshots).
+pub fn Backend.shown(self, o: u32) -> Option[gpu.Texture] {
+    if let Some(h) = self.headless {
+        return h.shown(int(o))
+    }
+    return None
+}
+
+// ---------------------------------------------------------------- cursor
+
+/// A hardware cursor image (ARGB8888 premultiplied): true when the
+/// display shows it itself (a cursor plane, the parent's cursor); false
+/// means the compositor draws it.
+pub fn Backend.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        var ok = true
+        for o in 0..d.outputs.len() {
+            if d.outputs[o].cursor_fb == 0 {
+                discard d.make_cursor(o)
+            }
+            ok = ok and d.set_cursor_image(o, pixels, u32(width), u32(height))
+        }
+        self.drm = Some(d)
+        return ok
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        n.set_cursor(pixels, width, height, hot_x, hot_y)
+        n.flush()
+        self.nested = Some(n)
+        return true
+    }
+    return false
+}
+
+/// Put the hardware cursor's top left at output pixel `x, y` (None hides
+/// it). Commits at once when no flip is pending: the cursor moves at
+/// input rate, not frame rate.
+pub fn Backend.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
+    guard let Some(dd) = self.drm.take() else {
+        return
+    }
+    var d = dd
+    let oi = int(o)
+    if oi < d.outputs.len() and d.outputs[oi].cursor >= 0 {
+        match at {
+            Some((x, y)) => {
+                d.outputs[oi].cursor_x = x
+                d.outputs[oi].cursor_y = y
+                d.outputs[oi].cursor_shown = true
+            }
+            None => d.outputs[oi].cursor_shown = false
+        }
+        if not d.outputs[oi].pending and not d.outputs[oi].modeset and self.active {
+            discard d.commit(oi, 0, -1, drm.no_clips(), false, false)
+        } else {
+            d.outputs[oi].cursor_dirty = true
+        }
+    }
+    self.drm = Some(d)
+}
+
+// ----------------------------------------------------------------- input
+
+/// The keymap for clients: memfd and size (with its NUL).
+pub fn Backend.keymap(self) -> (int, u32) {
+    if let Some(k) = self.kb {
+        return (k.fd, k.size)
+    }
+    if let Some(n) = self.nested {
+        if let Some(k) = n.keyboard {
+            return (k.fd, k.size)
+        }
+    }
+    return (-1, 0)
+}
+
+/// Modifiers in effect now.
+pub fn Backend.mods(self) -> Mods {
+    if let Some(k) = self.kb {
+        return k.mods()
+    }
+    if let Some(n) = self.nested {
+        if let Some(k) = n.keyboard {
+            return k.mods()
+        }
+    }
+    return Mods {}
+}
+
+pub fn Backend.set_keymap(mut self, names: Names) -> Result[(), str] {
+    guard self.kb.is_some() else {
+        return Err("the keymap comes from the parent compositor")
+    }
+    self.kb = Some(try keyboard.Keyboard.new(names))
+    self.push(Event.Keymap)
+    return Ok(())
+}
+
+pub fn Backend.configure_input(mut self, device: u32, c: InputConfig) {
+    if let Some(ii) = self.input.take() {
+        var i = ii
+        i.configure(device, c)
+        self.input = Some(i)
+    }
+}
+
+/// Switch to virtual terminal `n` (DRM sessions).
+pub fn Backend.switch_vt(self, n: int) {
+    if let Some(s) = self.session {
+        s.switch_vt(n)
+    }
+}
+
+/// dev_t of the scanout device (for the dmabuf scanout tranche), 0 when
+/// there is none.
+pub fn Backend.scanout_device(self) -> u64 {
+    if let Some(d) = self.drm {
+        return d.devnum
+    }
+    return 0
+}
+
+/// XRGB8888 modifiers output `o`'s primary plane scans out.
+pub fn Backend.scanout_modifiers(self, o: u32) -> List[u64] {
+    if let Some(d) = self.drm {
+        if int(o) < d.outputs.len() {
+            return d.planes[d.outputs[int(o)].primary].xrgb.clone()
+        }
+    }
+    let none: List[u64] = []
+    return none
+}
+
+/// Release every GPU resource (before the device goes away).
+pub fn Backend.shutdown(mut self, mut dev: gpu.Device) {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        d.release(mut dev)
+        self.drm = Some(d)
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        n.release(mut dev)
+        self.nested = Some(n)
+    }
+}
+
+/// The displays connected to DRM card `path` ("" for the default card),
+/// without taking them over.
+pub fn probe(path: str) -> Result[List[OutputDesc], str] {
+    let p = if path.is_empty() { try drm.find_card() } else { path.clone() }
+    var d = try drm.open(p)
+    var added: List[int] = []
+    d.connect(mut added)
+    var out: List[OutputDesc] = []
+    for o in added {
+        out.push(d.desc(o))
+    }
+    return Ok(out)
+}

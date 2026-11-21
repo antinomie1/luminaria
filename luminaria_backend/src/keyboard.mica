@@ -1,0 +1,169 @@
+// A keyboard's xkb state: keymap from RMLVO names (or the text a parent
+// compositor sends), each key turned into its keysym, text and modifiers,
+// and the keymap shared with clients through one memfd.
+
+import std.os
+import std.utf8
+import xkbcommon_sys as xkb
+
+/// Rules, model, layout, variant and options, as XKB_DEFAULT_* names them;
+/// empty means the system default.
+pub struct Names {
+    pub rules: str = ""
+    pub model: str = ""
+    pub layout: str = ""
+    pub variant: str = ""
+    pub options: str = ""
+}
+
+/// Modifiers in effect.
+pub struct Mods {
+    pub shift: bool = false
+    pub ctrl: bool = false
+    pub alt: bool = false
+    pub logo: bool = false
+    pub caps: bool = false
+    pub num: bool = false
+}
+
+pub struct Keyboard {
+    ctx: xkb.Context
+    keymap: xkb.Keymap
+    state: xkb.State
+    /// The keymap as text in a memfd for clients, and its size with NUL.
+    pub fd: int = -1
+    pub size: u32 = 0
+    /// Serialized state for wl_keyboard.modifiers.
+    depressed: u32 = 0
+    latched: u32 = 0
+    locked: u32 = 0
+    group: u32 = 0
+}
+
+fn Keyboard.drop(mut self) {
+    xkb.state_unref(self.state)
+    xkb.keymap_unref(self.keymap)
+    xkb.context_unref(self.ctx)
+    if self.fd >= 0 {
+        os.close(self.fd)
+    }
+}
+
+fn cstr(s: &str) -> str {
+    return s.to_str() + "\0"
+}
+
+fn from_keymap(ctx: xkb.Context, km: xkb.Keymap) -> Result[Keyboard, str] {
+    guard let Some(st) = xkb.state_new(km) else {
+        xkb.keymap_unref(km)
+        xkb.context_unref(ctx)
+        return Err("xkb_state_new failed")
+    }
+    var kb = Keyboard { ctx, keymap: km, state: st }
+    guard let Some(text) = xkb.keymap_get_as_string(km, xkb.xkb_keymap_format_text_v1) else {
+        return Err("keymap has no text form")
+    }
+    let size = text.len() + 1
+    let fd = os.memfd("luminaria-keymap", size).map_err(fn(e) => "{e}")
+    kb.fd = try fd
+    var m = try os.map(kb.fd, size, 0, true).map_err(fn(e) => "{e}")
+    let b = m.bytes()
+    for i in 0..text.len() {
+        b[i] = text[i]
+    }
+    b[text.len()] = 0
+    kb.size = u32(size)
+    return Ok(kb)
+}
+
+pub fn Keyboard.new(n: Names) -> Result[Keyboard, str] {
+    guard let Some(ctx) = xkb.context_new(xkb.xkb_context_no_flags) else {
+        return Err("xkb_context_new failed")
+    }
+    let rules = cstr(n.rules)
+    let model = cstr(n.model)
+    let layout = cstr(n.layout)
+    let variant = cstr(n.variant)
+    let options = cstr(n.options)
+    unsafe {
+        let names = xkb.RuleNames {
+            rules: if n.rules.is_empty() { Ptr.null() } else { rules.as_cstr().cast[i8]() },
+            model: if n.model.is_empty() { Ptr.null() } else { model.as_cstr().cast[i8]() },
+            layout: if n.layout.is_empty() { Ptr.null() } else { layout.as_cstr().cast[i8]() },
+            variant: if n.variant.is_empty() { Ptr.null() } else { variant.as_cstr().cast[i8]() },
+            options: if n.options.is_empty() { Ptr.null() } else { options.as_cstr().cast[i8]() },
+        }
+        guard let Some(km) = xkb.keymap_new_from_names(ctx, Ptr.of(names), xkb.xkb_keymap_compile_no_flags) else {
+            xkb.context_unref(ctx)
+            return Err("no keymap for layout '{n.layout}'")
+        }
+        return from_keymap(ctx, km)
+    }
+}
+
+/// A keymap a parent compositor sent (text in a mapped fd).
+pub fn Keyboard.from_text(text: &str) -> Result[Keyboard, str] {
+    guard let Some(ctx) = xkb.context_new(xkb.xkb_context_no_flags) else {
+        return Err("xkb_context_new failed")
+    }
+    let t = text.to_str()
+    guard let Some(km) = xkb.keymap_new_from_string(ctx, t, xkb.xkb_keymap_format_text_v1, xkb.xkb_keymap_compile_no_flags) else {
+        xkb.context_unref(ctx)
+        return Err("cannot compile the keymap")
+    }
+    return from_keymap(ctx, km)
+}
+
+/// Key `code` (evdev) went down or up: its keysym and text before the
+/// change, and whether the serialized modifiers changed.
+pub fn Keyboard.key(mut self, code: u32, pressed: bool) -> (u32, str, bool) {
+    let kc = code + 8
+    let sym = xkb.state_key_get_one_sym(self.state, kc)
+    var text = ""
+    if pressed {
+        let cp = xkb.keysym_to_utf32(sym)
+        if cp >= 0x20 and cp != 0x7f {
+            utf8.push(mut text, cp)
+        }
+    }
+    discard xkb.state_update_key(self.state, kc, if pressed { xkb.xkb_key_down } else { xkb.xkb_key_up })
+    return (sym, text, self.serialize())
+}
+
+/// Read the state back; true when it changed.
+fn Keyboard.serialize(mut self) -> bool {
+    let d = xkb.state_serialize_mods(self.state, xkb.xkb_state_mods_depressed)
+    let l = xkb.state_serialize_mods(self.state, xkb.xkb_state_mods_latched)
+    let k = xkb.state_serialize_mods(self.state, xkb.xkb_state_mods_locked)
+    let g = xkb.state_serialize_layout(self.state, xkb.xkb_state_layout_effective)
+    guard d != self.depressed or l != self.latched or k != self.locked or g != self.group else {
+        return false
+    }
+    self.depressed = d
+    self.latched = l
+    self.locked = k
+    self.group = g
+    return true
+}
+
+/// Set the state from serialized modifiers (a parent compositor's).
+pub fn Keyboard.set_mods(mut self, d: u32, l: u32, k: u32, g: u32) {
+    discard xkb.state_update_mask(self.state, d, l, k, 0, 0, g)
+    discard self.serialize()
+}
+
+pub fn Keyboard.mods(self) -> Mods {
+    let eff = i32(xkb.xkb_state_mods_effective)
+    return Mods {
+        shift: xkb.state_mod_name_is_active(self.state, "Shift", eff) == 1,
+        ctrl: xkb.state_mod_name_is_active(self.state, "Control", eff) == 1,
+        alt: xkb.state_mod_name_is_active(self.state, "Mod1", eff) == 1,
+        logo: xkb.state_mod_name_is_active(self.state, "Mod4", eff) == 1,
+        caps: xkb.state_mod_name_is_active(self.state, "Lock", eff) == 1,
+        num: xkb.state_mod_name_is_active(self.state, "Mod2", eff) == 1,
+    }
+}
+
+pub fn Keyboard.repeats(self, code: u32) -> bool {
+    return xkb.keymap_key_repeats(self.keymap, code + 8) == 1
+}

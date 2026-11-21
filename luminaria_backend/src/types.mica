@@ -1,0 +1,98 @@
+// What every backend reports: outputs, frames, input. Plain data.
+
+import keyboard
+
+pub struct Mode {
+    pub width: i32 = 0
+    pub height: i32 = 0
+    pub refresh_mhz: i32 = 60000
+    pub preferred: bool = false
+}
+
+/// An output as the hardware (or parent compositor) describes it.
+pub struct OutputDesc {
+    /// Connector name ("DP-1", "eDP-1", "WL-1", "HEADLESS-1").
+    pub name: str = ""
+    pub make: str = ""
+    pub model: str = ""
+    pub width_mm: i32 = 0
+    pub height_mm: i32 = 0
+    pub modes: List[Mode] = []
+    pub mode: Mode = Mode {}
+    /// Supports variable refresh rate.
+    pub vrr: bool = false
+    /// Internal panel (laptop): lid and backlight belong to it.
+    pub internal: bool = false
+}
+
+pub enum AxisSource {
+    Wheel
+    Finger
+    Continuous
+    WheelTilt
+}
+
+/// A device's capabilities and identity.
+pub struct DeviceDesc {
+    pub name: str = ""
+    pub keyboard: bool = false
+    pub pointer: bool = false
+    pub touch: bool = false
+    pub touchpad: bool = false
+}
+
+/// Input, time in milliseconds of CLOCK_MONOTONIC.
+pub enum Input {
+    /// evdev code, pressed; keysym, text and modifiers after xkb.
+    Key(u32, u32, bool, u32, str)
+    /// The serialized modifiers changed: depressed, latched, locked, group.
+    Modifiers(u32, u32, u32, u32)
+    /// Relative motion: time, dx, dy (accelerated), dx, dy (raw).
+    Motion(u32, f64, f64, f64, f64)
+    /// Absolute motion on an output: time, output, x, y in 0..1.
+    MotionAbsolute(u32, u32, f64, f64)
+    /// time, evdev button code, pressed.
+    Button(u32, u32, bool)
+    /// time, source, dx, dy (pixels), wheel clicks x, y (120ths), inverted.
+    Axis(u32, AxisSource, f64, f64, i32, i32, bool)
+    /// time, touch id, output, x, y in 0..1.
+    TouchDown(u32, i32, u32, f64, f64)
+    TouchMotion(u32, i32, u32, f64, f64)
+    TouchUp(u32, i32)
+    TouchFrame
+    TouchCancel
+    /// Gestures: time, fingers; updates: dx, dy (and scale, rotation).
+    SwipeBegin(u32, i32)
+    SwipeUpdate(u32, f64, f64)
+    SwipeEnd(u32, bool)
+    PinchBegin(u32, i32)
+    PinchUpdate(u32, f64, f64, f64, f64)
+    PinchEnd(u32, bool)
+    HoldBegin(u32, i32)
+    HoldEnd(u32, bool)
+    DeviceAdded(u32, DeviceDesc)
+    DeviceRemoved(u32)
+}
+
+pub enum Event {
+    OutputAdded(u32)
+    OutputRemoved(u32)
+    /// The output's mode or size changed (a parent window resized).
+    OutputChanged(u32)
+    /// A frame reached the screen: output, sequence, CLOCK_MONOTONIC ns,
+    /// presentation flags (wp_presentation kinds).
+    Presented(u32, u64, int, u32)
+    Input(Input)
+    /// The session became active (true) or was switched away.
+    Session(bool)
+    /// The keymap changed: clients need the new memfd.
+    Keymap
+    /// The backend cannot go on (the parent compositor closed us).
+    Closed
+}
+
+/// wp_presentation_feedback kinds.
+pub let presented_vsync: u32 = 1
+pub let presented_hw_clock: u32 = 2
+pub let presented_hw_completion: u32 = 4
+pub let presented_zero_copy: u32 = 8

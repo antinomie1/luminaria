@@ -11,3 +11,5 @@ libudev_sys = { workspace = true }
 libseat_sys = { workspace = true }
 libinput_sys = { workspace = true }
 xkbcommon_sys = { workspace = true }
+vk_gpu = { workspace = true }
+luminaria_wire = { workspace = true }

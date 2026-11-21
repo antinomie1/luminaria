@@ -1,0 +1,430 @@
+// Nested: a window of a parent Wayland compositor is the output. Frames
+// are our dmabufs handed over by linux-dmabuf (no copy); the GPU fence is
+// attached to the dmabuf as its implicit fence, so the parent waits on the
+// GPU, never we. Only the changed rectangles are damaged. A client buffer
+// that fills the window goes to the parent as is (direct scanout through
+// the parent). Input comes from the parent's seat.
+
+import std.os
+import std.str as strs
+import std.time
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_shell as xdg
+import luminaria_proto.linux_dmabuf as dmabuf
+import vk_gpu as gpu
+import keyboard
+import swap
+import types
+
+/// DMA_BUF_IOCTL_IMPORT_SYNC_FILE: make `fence` the dmabuf's write fence.
+fn import_fence(dmabuf_fd: int, fence: int) -> bool {
+    // struct dma_buf_import_sync_file { __u32 flags; __s32 fd; }, DMA_BUF_SYNC_WRITE.
+    var arg: [2]u32 = [2, u32(fence)]
+    unsafe {
+        let r = os.ioctl(dmabuf_fd, os.iow(98, 3, 8), Ptr.of_mut(mut arg).cast[u8]())
+        return r.is_ok()
+    }
+}
+
+/// A client buffer shown in the window as is: our parent wl_buffer for it.
+struct Passed {
+    key: u64
+    buffer: u32
+    busy: bool = false
+}
+
+struct Nested {
+    c: wire.Conn
+    comp: wl.Compositor = wl.Compositor { id: 0 }
+    wm: xdg.WmBase = xdg.WmBase { id: 0 }
+    dm: dmabuf.Dmabuf = dmabuf.Dmabuf { id: 0 }
+    shm: wl.Shm = wl.Shm { id: 0 }
+    seat: wl.Seat = wl.Seat { id: 0 }
+    pointer: wl.Pointer = wl.Pointer { id: 0 }
+    kb: wl.Keyboard = wl.Keyboard { id: 0 }
+    surf: wl.Surface = wl.Surface { id: 0 }
+    xs: xdg.Surface = xdg.Surface { id: 0 }
+    top: xdg.Toplevel = xdg.Toplevel { id: 0 }
+    width: i32 = 1280
+    height: i32 = 720
+    /// A configure of another size arrived.
+    resized: bool = false
+    configured: bool = false
+    closed: bool = false
+    swap: Option[swap.Swap] = None
+    passed: List[Passed] = []
+    /// The window shows a passed client buffer (this one), not a slot.
+    showing: int = -1
+    frame_cb: u32 = 0
+    seq: u64 = 0
+    enter_serial: u32 = 0
+    keyboard: Option[keyboard.Keyboard] = None
+    cursor_surf: wl.Surface = wl.Surface { id: 0 }
+    cursor_buf: u32 = 0
+    hot_x: i32 = 0
+    hot_y: i32 = 0
+}
+
+fn open(title: str) -> Result[Nested, str] {
+    let c = try wire.connect("")
+    var n = Nested { c }
+    let reg = wl.Display { id: 1 }.get_registry(mut n.c)
+    try n.roundtrip()
+    discard reg
+    guard n.comp.id != 0 and n.wm.id != 0 and n.dm.id != 0 else {
+        return Err("the parent compositor lacks wl_compositor, xdg_wm_base or linux-dmabuf v3")
+    }
+    n.surf = n.comp.create_surface(mut n.c)
+    n.xs = n.wm.get_xdg_surface(mut n.c, n.surf)
+    n.top = n.xs.get_toplevel(mut n.c)
+    n.top.set_title(mut n.c, title)
+    n.top.set_app_id(mut n.c, "luminaria")
+    n.surf.commit(mut n.c)
+    for _ in 0..200 {
+        try n.roundtrip()
+        if n.configured {
+            break
+        }
+    }
+    n.resized = false
+    return Ok(n)
+}
+
+fn Nested.fd(self) -> int {
+    return self.c.fd
+}
+
+/// Flush, then wait (briefly) for and handle what the parent sends.
+fn Nested.roundtrip(mut self) -> Result[(), str] {
+    discard self.c.flush().map_err(fn(e) => "{e}")
+    for _ in 0..20 {
+        let got = self.c.read().map_err(fn(e) => "{e}")
+        if try got {
+            var ignored: List[types.Event] = []
+            try self.handle(mut ignored)
+            return Ok(())
+        }
+        time.sleep_ms(1)
+    }
+    return Ok(())
+}
+
+/// Read and handle what arrived; events into `out`.
+fn Nested.dispatch(mut self, mut out: List[types.Event]) -> Result[(), str] {
+    while true {
+        let got = self.c.read().map_err(fn(e) => "{e}")
+        guard try got else {
+            break
+        }
+        try self.handle(mut out)
+    }
+    if self.closed {
+        out.push(types.Event.Closed)
+    }
+    return Ok(())
+}
+
+fn Nested.flush(mut self) {
+    discard self.c.flush()
+}
+
+fn Nested.handle(mut self, mut out: List[types.Event]) -> Result[(), str] {
+    while true {
+        let e = proto.next_event(mut self.c).map_err(fn(e) => "{e}")
+        guard let Some(ev) = try e else {
+            break
+        }
+        self.event(ev, mut out)
+    }
+    return Ok(())
+}
+
+fn Nested.bind(mut self, name: u32, iface: str, version: u32) {
+    let reg = wl.Registry { id: 2 }
+    if iface == "wl_compositor" {
+        self.comp = wl.Compositor { id: reg.bind(mut self.c, name, wl.compositor_iface, min(version, 4)) }
+    } else if iface == "xdg_wm_base" {
+        self.wm = xdg.WmBase { id: reg.bind(mut self.c, name, xdg.wm_base_iface, 1) }
+    } else if iface == "zwp_linux_dmabuf_v1" and version >= 3 {
+        self.dm = dmabuf.Dmabuf { id: reg.bind(mut self.c, name, dmabuf.dmabuf_iface, 3) }
+    } else if iface == "wl_shm" {
+        self.shm = wl.Shm { id: reg.bind(mut self.c, name, wl.shm_iface, 1) }
+    } else if iface == "wl_seat" and self.seat.id == 0 {
+        self.seat = wl.Seat { id: reg.bind(mut self.c, name, wl.seat_iface, min(version, 8)) }
+    }
+}
+
+fn axis_ms() -> u32 {
+    return u32((time.now_ns() / 1000000) & 0xffffffff)
+}
+
+fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
+    match take ev {
+        WlRegistry(_, Global(name, iface, version)) => self.bind(name, iface, version)
+        XdgWmBase(w, Ping(serial)) => w.pong(mut self.c, serial)
+        XdgToplevel(_, Configure(w, h, _)) => {
+            if w > 0 and h > 0 and (w != self.width or h != self.height) {
+                self.width = w
+                self.height = h
+                self.resized = true
+            }
+        }
+        XdgToplevel(_, Close) => self.closed = true
+        XdgSurface(x, Configure(serial)) => {
+            x.ack_configure(mut self.c, serial)
+            self.configured = true
+            if self.resized {
+                out.push(types.Event.OutputChanged(0))
+            }
+        }
+        WlCallback(cb, Done(ms)) => {
+            if cb.id == self.frame_cb {
+                self.frame_cb = 0
+                self.seq += 1
+                out.push(types.Event.Presented(0, self.seq, time.now_ns(), 0))
+            }
+        }
+        WlBuffer(b, Release) => {
+            if let Some(sw) = self.swap.take() {
+                var s = sw
+                let i = s.find(b.id)
+                if i >= 0 {
+                    s.free(i)
+                }
+                self.swap = Some(s)
+            }
+            for mut p in self.passed {
+                if p.buffer == b.id {
+                    p.busy = false
+                }
+            }
+        }
+        WlSeat(s, Capabilities(caps)) => {
+            if caps.contains(wl.SeatCapability.Pointer) and self.pointer.id == 0 {
+                self.pointer = s.get_pointer(mut self.c)
+            }
+            if caps.contains(wl.SeatCapability.Keyboard) and self.kb.id == 0 {
+                self.kb = s.get_keyboard(mut self.c)
+            }
+        }
+        WlPointer(_, Enter(serial, _, x, y)) => {
+            self.enter_serial = serial
+            self.show_cursor()
+            out.push(self.motion(x, y))
+        }
+        WlPointer(_, Motion(t, x, y)) => out.push(self.motion(x, y))
+        WlPointer(_, Button(_, t, button, st)) => out.push(types.Event.Input(types.Input.Button(t, button, st == wl.PointerButtonState.Pressed)))
+        WlPointer(_, Axis(t, axis, v)) => {
+            let vertical = axis == wl.PointerAxis.VerticalScroll
+            let dx = if vertical { 0.0 } else { v }
+            let dy = if vertical { v } else { 0.0 }
+            out.push(types.Event.Input(types.Input.Axis(t, types.AxisSource.Finger, dx, dy, 0, 0, false)))
+        }
+        WlPointer(_, AxisValue120(axis, v120)) => {
+            let vertical = axis == wl.PointerAxis.VerticalScroll
+            out.push(types.Event.Input(types.Input.Axis(axis_ms(), types.AxisSource.Wheel, 0.0, 0.0, if vertical { 0 } else { v120 }, if vertical { v120 } else { 0 }, false)))
+        }
+        WlKeyboard(_, Keymap(_, f, size)) => {
+            if let Ok(m) = os.map(f.raw(), int(size), 0, false) {
+                unsafe {
+                    let text = Ptr.slice(m.ptr, max(int(size) - 1, 0))
+                    match keyboard.Keyboard.from_text(std_str(text)) {
+                        Ok(kb) => {
+                            self.keyboard = Some(kb)
+                            out.push(types.Event.Keymap)
+                        }
+                        Err => {}
+                    }
+                }
+            }
+        }
+        WlKeyboard(_, Key(_, t, code, st)) => {
+            let pressed = st == wl.KeyboardKeyState.Pressed
+            if let Some(k) = self.keyboard.take() {
+                var kb = k
+                let (sym, text, _) = kb.key(code, pressed)
+                self.keyboard = Some(kb)
+                out.push(types.Event.Input(types.Input.Key(t, code, pressed, sym, text)))
+            }
+        }
+        WlKeyboard(_, Modifiers(_, d, l, k, g)) => {
+            if let Some(kk) = self.keyboard.take() {
+                var kb = kk
+                kb.set_mods(d, l, k, g)
+                self.keyboard = Some(kb)
+            }
+            out.push(types.Event.Input(types.Input.Modifiers(d, l, k, g)))
+        }
+        _ => {}
+    }
+}
+
+fn std_str(b: &[u8]) -> str {
+    var n = 0
+    while n < b.len() and b[n] != 0 {
+        n += 1
+    }
+    return strs.from_bytes(b[0..n].to_list())
+}
+
+fn Nested.motion(self, x: f64, y: f64) -> types.Event {
+    return types.Event.Input(types.Input.MotionAbsolute(axis_ms(), 0, x / f64(max(self.width, 1)), y / f64(max(self.height, 1))))
+}
+
+fn Nested.desc(self) -> types.OutputDesc {
+    let m = types.Mode { width: self.width, height: self.height, refresh_mhz: 60000, preferred: true }
+    return types.OutputDesc { name: "WL-1", make: "luminaria", model: "nested", modes: [m], mode: m }
+}
+
+/// Wrap dmabuf `b` as a parent wl_buffer.
+fn Nested.wrap(mut self, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32) -> u32 {
+    let p = self.dm.create_params(mut self.c)
+    p.add_(mut self.c, fd, 0, offset, stride, u32(modifier >> 32), u32(modifier & 0xffffffff))
+    let b = p.create_immed(mut self.c, i32(width), i32(height), format, dmabuf.BufferParamsFlags(0))
+    p.destroy(mut self.c)
+    return b.id
+}
+
+fn Nested.prepare(mut self, mut dev: gpu.Device, count: int) -> Result[(), str] {
+    if self.resized {
+        if let Some(s) = self.swap.take() {
+            for sl in s.slots {
+                wl.Buffer { id: sl.id }.destroy(mut self.c)
+            }
+            s.destroy(mut dev)
+        }
+        self.resized = false
+    }
+    guard self.swap.is_none() else {
+        return Ok(())
+    }
+    let linear: [1]u64 = [0]
+    var s = try swap.create(mut dev, u32(self.width), u32(self.height), gpu.Format.B8G8R8A8_UNORM, linear, count)
+    for i in 0..s.slots.len() {
+        let b = s.slots[i].buf
+        s.slots[i].id = self.wrap(b.fd, b.width, b.height, 0x34325258, b.modifier, u32(b.offset), u32(b.stride))
+    }
+    self.swap = Some(s)
+    return Ok(())
+}
+
+fn Nested.damage(mut self, rects: &[(i32, i32, i32, i32)]) {
+    if rects.is_empty() {
+        self.surf.damage_buffer(mut self.c, 0, 0, self.width, self.height)
+    }
+    for r in rects {
+        self.surf.damage_buffer(mut self.c, r.0, r.1, r.2, r.3)
+    }
+}
+
+/// Show slot `i` of the swap (drawn, `fence` signals when done).
+fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) {
+    guard let Some(sw) = self.swap.take() else {
+        return
+    }
+    var s = sw
+    let buf = s.slots[i].id
+    if fence >= 0 {
+        discard import_fence(s.slots[i].buf.fd, fence)
+        os.close(fence)
+    }
+    s.queued(i)
+    self.swap = Some(s)
+    self.showing = -1
+    self.surf.attach(mut self.c, Some(wl.Buffer { id: buf }), 0, 0)
+    self.damage(rects)
+    self.frame_cb = self.surf.frame(mut self.c).id
+    self.surf.commit(mut self.c)
+}
+
+/// Show a client dmabuf directly; false when the parent cannot take it.
+fn Nested.scanout(mut self, key: u64, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+    guard i32(width) == self.width and i32(height) == self.height else {
+        return false
+    }
+    var k = -1
+    for j in 0..self.passed.len() {
+        if self.passed[j].key == key {
+            k = j
+        }
+    }
+    if k < 0 {
+        let b = self.wrap(fd, width, height, format, modifier, offset, stride)
+        self.passed.push(Passed { key, buffer: b })
+        k = self.passed.len() - 1
+    }
+    self.passed[k].busy = true
+    self.showing = k
+    self.surf.attach(mut self.c, Some(wl.Buffer { id: self.passed[k].buffer }), 0, 0)
+    self.damage(rects)
+    self.frame_cb = self.surf.frame(mut self.c).id
+    self.surf.commit(mut self.c)
+    return true
+}
+
+/// Whether the parent still holds client buffer `key` (it must not be
+/// released to the client yet).
+fn Nested.holds(self, key: u64) -> bool {
+    for p in self.passed {
+        if p.key == key and p.busy {
+            return true
+        }
+    }
+    return false
+}
+
+/// Forget a client buffer that is going away.
+fn Nested.forget(mut self, key: u64) {
+    for p in self.passed.clone() {
+        if p.key == key {
+            wl.Buffer { id: p.buffer }.destroy(mut self.c)
+        }
+    }
+    self.passed.retain(fn(p) => p.key != key)
+}
+
+/// The cursor image (ARGB8888 premultiplied) as the parent's cursor.
+fn Nested.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {
+    guard self.shm.id != 0 and width > 0 and height > 0 else {
+        return
+    }
+    let size = int(width) * int(height) * 4
+    guard let Ok(fd) = os.memfd("luminaria-cursor", size) else {
+        return
+    }
+    if let Ok(m) = os.map(fd, size, 0, true) {
+        unsafe Ptr.copy(m.ptr, pixels.as_ptr(), min(size, pixels.len()))
+    }
+    let pool = self.shm.create_pool(mut self.c, fd, i32(size))
+    os.close(fd)
+    if self.cursor_buf != 0 {
+        wl.Buffer { id: self.cursor_buf }.destroy(mut self.c)
+    }
+    self.cursor_buf = pool.create_buffer(mut self.c, 0, width, height, width * 4, wl.ShmFormat.Argb8888).id
+    pool.destroy(mut self.c)
+    if self.cursor_surf.id == 0 {
+        self.cursor_surf = self.comp.create_surface(mut self.c)
+    }
+    self.cursor_surf.attach(mut self.c, Some(wl.Buffer { id: self.cursor_buf }), 0, 0)
+    self.cursor_surf.damage_buffer(mut self.c, 0, 0, width, height)
+    self.cursor_surf.commit(mut self.c)
+    self.hot_x = hot_x
+    self.hot_y = hot_y
+    self.show_cursor()
+}
+
+fn Nested.show_cursor(mut self) {
+    guard self.pointer.id != 0 and self.enter_serial != 0 else {
+        return
+    }
+    let s: Option[wl.Surface] = if self.cursor_buf != 0 { Some(self.cursor_surf) } else { None }
+    self.pointer.set_cursor(mut self.c, self.enter_serial, s, self.hot_x, self.hot_y)
+}
+
+fn Nested.release(mut self, mut dev: gpu.Device) {
+    if let Some(s) = self.swap.take() {
+        s.destroy(mut dev)
+    }
+}

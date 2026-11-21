@@ -1,0 +1,293 @@
+// Input devices through libinput (udev seat), opened through the session.
+// Keys go through xkb here, so the compositor gets keysyms and text;
+// pointer, scroll, touch and gestures come out as plain data. A key is
+// reported once per seat (the first press and the last release over all
+// keyboards).
+
+import std.os
+import libinput_sys as li
+import libudev_sys as udev
+import session
+import keyboard
+import types
+
+extern unsafe fn open_restricted(path: str, flags: i32, data: Ptr[u8]) -> i32 {
+    match session.open_device(path) {
+        Ok(fd) => {
+            discard os.set_nonblocking(fd, true)
+            return i32(fd)
+        }
+        Err => {
+            return -13
+        }
+    }
+}
+
+extern unsafe fn close_restricted(fd: i32, data: Ptr[u8]) {
+    session.close_device(int(fd))
+}
+
+/// libinput keeps the interface's address.
+static var iface: li.Interface = li.Interface {}
+
+struct Device {
+    dev: li.Device
+    id: u32
+    desc: types.DeviceDesc
+}
+
+struct Input {
+    li: li.Libinput
+    udev: udev.Udev
+    devices: List[Device] = []
+    next: u32 = 1
+}
+
+fn open(seat_name: str) -> Result[Input, str] {
+    guard let Some(u) = udev.new() else {
+        return Err("udev_new failed")
+    }
+    unsafe {
+        iface = li.Interface { open_restricted: Some(open_restricted), close_restricted: Some(close_restricted) }
+        guard let Some(ctx) = li.udev_create_context(Ptr.of(iface), Ptr.null(), u) else {
+            discard udev.unref(u)
+            return Err("libinput_udev_create_context failed")
+        }
+        guard li.udev_assign_seat(ctx, seat_name) == 0 else {
+            discard li.unref(ctx)
+            discard udev.unref(u)
+            return Err("libinput cannot assign seat {seat_name}")
+        }
+        return Ok(Input { li: ctx, udev: u })
+    }
+}
+
+fn Input.fd(self) -> int {
+    return int(li.get_fd(self.li))
+}
+
+fn Input.drop(mut self) {
+    for d in self.devices {
+        discard li.device_unref(d.dev)
+    }
+    discard li.unref(self.li)
+    discard udev.unref(self.udev)
+}
+
+fn Input.suspend(mut self) {
+    li.suspend(self.li)
+}
+
+fn Input.resume(mut self) {
+    discard li.resume(self.li)
+}
+
+fn Input.id_of(self, d: li.Device) -> u32 {
+    for x in self.devices {
+        if x.dev == d {
+            return x.id
+        }
+    }
+    return 0
+}
+
+fn source(s: i32) -> types.AxisSource {
+    return match s {
+        2 => types.AxisSource.Finger
+        3 => types.AxisSource.Continuous
+        4 => types.AxisSource.WheelTilt
+        _ => types.AxisSource.Wheel
+    }
+}
+
+fn ms(us: u64) -> u32 {
+    return u32((us / 1000) & 0xffffffff)
+}
+
+/// Read what the devices sent into `out`, keys through `kb`.
+fn Input.dispatch(mut self, mut kb: keyboard.Keyboard, mut out: List[types.Input]) {
+    discard li.dispatch(self.li)
+    while true {
+        guard let Some(ev) = li.get_event(self.li) else {
+            break
+        }
+        self.event(ev, mut kb, mut out)
+        li.event_destroy(ev)
+    }
+}
+
+fn Input.event(mut self, ev: li.Event, mut kb: keyboard.Keyboard, mut out: List[types.Input]) {
+    let t = int(li.event_get_type(ev))
+    if t == li.libinput_event_device_added {
+        guard let Some(d) = li.event_get_device(ev) else {
+            return
+        }
+        let has = fn(c: int) => li.device_has_capability(d, i32(c)) == 1
+        let desc = types.DeviceDesc {
+            name: li.device_get_name(d).unwrap_or(""),
+            keyboard: has(li.libinput_device_cap_keyboard),
+            pointer: has(li.libinput_device_cap_pointer),
+            touch: has(li.libinput_device_cap_touch),
+            touchpad: has(li.libinput_device_cap_gesture),
+        }
+        discard li.device_ref(d)
+        let id = self.next
+        self.next += 1
+        out.push(types.Input.DeviceAdded(id, desc.clone()))
+        self.devices.push(Device { dev: d, id, desc })
+        return
+    }
+    if t == li.libinput_event_device_removed {
+        guard let Some(d) = li.event_get_device(ev) else {
+            return
+        }
+        let id = self.id_of(d)
+        self.devices.retain(fn(x) => x.id != id)
+        discard li.device_unref(d)
+        out.push(types.Input.DeviceRemoved(id))
+        return
+    }
+    if t == li.libinput_event_keyboard_key {
+        guard let Some(k) = li.event_get_keyboard_event(ev) else {
+            return
+        }
+        let pressed = li.event_keyboard_get_key_state(k) == i32(li.libinput_key_state_pressed)
+        let count = li.event_keyboard_get_seat_key_count(k)
+        guard (pressed and count == 1) or (not pressed and count == 0) else {
+            return
+        }
+        let code = li.event_keyboard_get_key(k)
+        let (sym, text, changed) = kb.key(code, pressed)
+        out.push(types.Input.Key(ms(li.event_keyboard_get_time_usec(k)), code, pressed, sym, text))
+        if changed {
+            out.push(types.Input.Modifiers(kb.depressed, kb.latched, kb.locked, kb.group))
+        }
+        return
+    }
+    if t >= li.libinput_event_pointer_motion and t <= li.libinput_event_pointer_scroll_continuous {
+        guard let Some(p) = li.event_get_pointer_event(ev) else {
+            return
+        }
+        let time = ms(li.event_pointer_get_time_usec(p))
+        if t == li.libinput_event_pointer_motion {
+            out.push(types.Input.Motion(time, li.event_pointer_get_dx(p), li.event_pointer_get_dy(p), li.event_pointer_get_dx_unaccelerated(p), li.event_pointer_get_dy_unaccelerated(p)))
+        } else if t == li.libinput_event_pointer_motion_absolute {
+            out.push(types.Input.MotionAbsolute(time, 0, li.event_pointer_get_absolute_x_transformed(p, 1), li.event_pointer_get_absolute_y_transformed(p, 1)))
+        } else if t == li.libinput_event_pointer_button {
+            let pressed = li.event_pointer_get_button_state(p) == i32(li.libinput_button_state_pressed)
+            let count = li.event_pointer_get_seat_button_count(p)
+            guard (pressed and count == 1) or (not pressed and count == 0) else {
+                return
+            }
+            out.push(types.Input.Button(time, li.event_pointer_get_button(p), pressed))
+        } else if t != li.libinput_event_pointer_axis {
+            // The scroll events (the legacy axis event repeats them).
+            let v = i32(li.libinput_pointer_axis_scroll_vertical)
+            let h = i32(li.libinput_pointer_axis_scroll_horizontal)
+            let has_v = li.event_pointer_has_axis(p, v) == 1
+            let has_h = li.event_pointer_has_axis(p, h) == 1
+            let dy = if has_v { li.event_pointer_get_scroll_value(p, v) } else { 0.0 }
+            let dx = if has_h { li.event_pointer_get_scroll_value(p, h) } else { 0.0 }
+            var cy: i32 = 0
+            var cx: i32 = 0
+            var src = types.AxisSource.Finger
+            if t == li.libinput_event_pointer_scroll_wheel {
+                src = types.AxisSource.Wheel
+                cy = if has_v { i32(li.event_pointer_get_scroll_value_v120(p, v)) } else { 0 }
+                cx = if has_h { i32(li.event_pointer_get_scroll_value_v120(p, h)) } else { 0 }
+            } else if t == li.libinput_event_pointer_scroll_continuous {
+                src = types.AxisSource.Continuous
+            }
+            let natural = false
+            out.push(types.Input.Axis(time, src, dx, dy, cx, cy, natural))
+        }
+        return
+    }
+    if t >= li.libinput_event_touch_down and t <= li.libinput_event_touch_frame {
+        guard let Some(tc) = li.event_get_touch_event(ev) else {
+            return
+        }
+        let time = ms(li.event_touch_get_time_usec(tc))
+        if t == li.libinput_event_touch_frame {
+            out.push(types.Input.TouchFrame)
+            return
+        }
+        if t == li.libinput_event_touch_cancel {
+            out.push(types.Input.TouchCancel)
+            return
+        }
+        let id = li.event_touch_get_seat_slot(tc)
+        if t == li.libinput_event_touch_up {
+            out.push(types.Input.TouchUp(time, id))
+            return
+        }
+        let x = li.event_touch_get_x_transformed(tc, 1)
+        let y = li.event_touch_get_y_transformed(tc, 1)
+        if t == li.libinput_event_touch_down {
+            out.push(types.Input.TouchDown(time, id, 0, x, y))
+        } else {
+            out.push(types.Input.TouchMotion(time, id, 0, x, y))
+        }
+        return
+    }
+    if t >= li.libinput_event_gesture_swipe_begin and t <= li.libinput_event_gesture_hold_end {
+        guard let Some(g) = li.event_get_gesture_event(ev) else {
+            return
+        }
+        let time = ms(li.event_gesture_get_time_usec(g))
+        let fingers = li.event_gesture_get_finger_count(g)
+        let cancelled = li.event_gesture_get_cancelled(g) == 1
+        let dx = li.event_gesture_get_dx(g)
+        let dy = li.event_gesture_get_dy(g)
+        if t == li.libinput_event_gesture_swipe_begin {
+            out.push(types.Input.SwipeBegin(time, fingers))
+        } else if t == li.libinput_event_gesture_swipe_update {
+            out.push(types.Input.SwipeUpdate(time, dx, dy))
+        } else if t == li.libinput_event_gesture_swipe_end {
+            out.push(types.Input.SwipeEnd(time, cancelled))
+        } else if t == li.libinput_event_gesture_pinch_begin {
+            out.push(types.Input.PinchBegin(time, fingers))
+        } else if t == li.libinput_event_gesture_pinch_update {
+            out.push(types.Input.PinchUpdate(time, dx, dy, li.event_gesture_get_scale(g), li.event_gesture_get_angle_delta(g)))
+        } else if t == li.libinput_event_gesture_pinch_end {
+            out.push(types.Input.PinchEnd(time, cancelled))
+        } else if t == li.libinput_event_gesture_hold_begin {
+            out.push(types.Input.HoldBegin(time, fingers))
+        } else {
+            out.push(types.Input.HoldEnd(time, cancelled))
+        }
+    }
+}
+
+/// Device settings the compositor chooses.
+pub struct Config {
+    pub tap: bool = true
+    pub natural_scroll: bool = false
+    /// -1..1, 0 is the default speed.
+    pub accel: f64 = 0.0
+    pub left_handed: bool = false
+    /// Disable the device (send no events).
+    pub disabled: bool = false
+}
+
+fn Input.configure(mut self, id: u32, c: Config) {
+    for x in self.devices {
+        guard x.id == id else {
+            continue
+        }
+        let d = x.dev
+        if li.device_config_tap_get_finger_count(d) > 0 {
+            discard li.device_config_tap_set_enabled(d, if c.tap { 1 } else { 0 })
+        }
+        if li.device_config_scroll_has_natural_scroll(d) == 1 {
+            discard li.device_config_scroll_set_natural_scroll_enabled(d, if c.natural_scroll { 1 } else { 0 })
+        }
+        if li.device_config_accel_is_available(d) == 1 {
+            discard li.device_config_accel_set_speed(d, c.accel)
+        }
+        if li.device_config_left_handed_is_available(d) == 1 {
+            discard li.device_config_left_handed_set(d, if c.left_handed { 1 } else { 0 })
+        }
+        discard li.device_config_send_events_set_mode(d, if c.disabled { 1 } else { 0 })
+    }
+}

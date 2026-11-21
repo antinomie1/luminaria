@@ -1,0 +1,96 @@
+// Headless: outputs that exist only in memory (tests, remote and
+// screenshot sessions). A present completes at the next tick of the
+// output's refresh, paced by a timer fd, so frame timing behaves like a
+// display's.
+
+import std.os
+import std.time
+import vk_gpu as gpu
+import types
+
+struct Out {
+    desc: types.OutputDesc
+    slots: List[gpu.Texture] = []
+    drawn: List[u64] = []
+    frame: u64 = 0
+    timer: int = -1
+    pending: int = -1
+    shown: int = -1
+    seq: u64 = 0
+}
+
+struct Headless {
+    outs: List[Out] = []
+}
+
+fn create(modes: &[types.Mode]) -> Result[Headless, str] {
+    var h = Headless {}
+    for k in 0..modes.len() {
+        let m = modes[k]
+        let t = try os.timerfd().map_err(fn(e) => "{e}")
+        h.outs.push(Out { desc: types.OutputDesc { name: "HEADLESS-{k + 1}", make: "luminaria", model: "headless", modes: [m], mode: m }, timer: t })
+    }
+    return Ok(h)
+}
+
+fn Headless.drop(mut self) {
+    for o in self.outs {
+        os.close(o.timer)
+    }
+}
+
+fn Headless.prepare(mut self, o: int, mut dev: gpu.Device, count: int) -> Result[(), str] {
+    guard self.outs[o].slots.is_empty() else {
+        return Ok(())
+    }
+    let m = self.outs[o].desc.mode
+    for _ in 0..count {
+        let t = try dev.texture(gpu.TextureDesc { width: u32(m.width), height: u32(m.height), format: gpu.Format.B8G8R8A8_UNORM, target: true })
+        self.outs[o].slots.push(t)
+        self.outs[o].drawn.push(0)
+    }
+    return Ok(())
+}
+
+fn Headless.acquire(self, o: int) -> Option[(int, u32)] {
+    var best = -1
+    for i in 0..self.outs[o].slots.len() {
+        guard i != self.outs[o].pending and i != self.outs[o].shown else {
+            continue
+        }
+        if best < 0 or self.outs[o].drawn[i] > self.outs[o].drawn[best] {
+            best = i
+        }
+    }
+    guard best >= 0 else {
+        return None
+    }
+    let d = self.outs[o].drawn[best]
+    return Some((best, if d == 0 { u32(0) } else { u32(self.outs[o].frame - d + 1) }))
+}
+
+fn Headless.present(mut self, o: int, i: int) {
+    self.outs[o].frame += 1
+    self.outs[o].drawn[i] = self.outs[o].frame
+    self.outs[o].pending = i
+    let refresh = max(self.outs[o].desc.mode.refresh_mhz, 1000)
+    discard os.timer_arm(self.outs[o].timer, 1000000000000 / int(refresh), 0)
+}
+
+/// Output `o`'s timer fired: the pending frame is shown.
+fn Headless.tick(mut self, o: int) -> Option[(u64, int)] {
+    discard os.count(self.outs[o].timer)
+    guard self.outs[o].pending >= 0 else {
+        return None
+    }
+    self.outs[o].shown = self.outs[o].pending
+    self.outs[o].pending = -1
+    self.outs[o].seq += 1
+    return Some((self.outs[o].seq, time.now_ns()))
+}
+
+/// What output `o` shows (for screenshots and tests).
+fn Headless.shown(self, o: int) -> Option[gpu.Texture] {
+    let s = self.outs[o].shown
+    return if s < 0 { None } else { Some(self.outs[o].slots[s]) }
+}

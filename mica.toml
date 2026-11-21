@@ -4,6 +4,7 @@ members = ["sys/*", "luminaria", "luminaria_wire", "luminaria_proto", "luminaria
 [workspace.dependencies]
 vk_gpu = { git = "https://github.com/antinomie1/vk.git", dir = "vk_gpu" }
 vk_draw2d = { git = "https://github.com/antinomie1/vk.git", dir = "vk_draw2d" }
+vk_compose = { git = "https://github.com/antinomie1/vk.git", dir = "vk_compose" }
 xkbcommon_sys = { path = "sys/xkbcommon_sys" }
 libinput_sys = { path = "sys/libinput_sys" }
 libseat_sys = { path = "sys/libseat_sys" }

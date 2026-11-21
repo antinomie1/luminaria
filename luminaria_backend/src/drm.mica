@@ -1,0 +1,765 @@
+// KMS through atomic commits. Each connected connector gets a CRTC, its
+// primary plane and (when there is one) a cursor plane. A frame is one
+// non-blocking atomic commit: the framebuffer, the GPU's sync_file as
+// IN_FENCE_FD (the kernel waits, not us), the changed rectangles as
+// FB_DAMAGE_CLIPS (panels with self refresh sleep through the rest), and
+// the cursor. Page-flip events carry the vblank time. A client's dmabuf
+// can be the framebuffer directly (scanout), tested first.
+
+import std.env
+import std.fs
+import std.os
+import std.str
+import vk_gpu as gpu
+import libdrm_sys as drm
+import libdrm_sys.uapi as uapi
+import libudev_sys as udev
+import session
+import swap
+import types
+
+struct Props {
+    names: List[str] = []
+    ids: List[u32] = []
+    values: List[u64] = []
+}
+
+fn Props.id(self, name: str) -> u32 {
+    for i in 0..self.names.len() {
+        if self.names[i] == name {
+            return self.ids[i]
+        }
+    }
+    return 0
+}
+
+fn Props.value(self, name: str) -> u64 {
+    for i in 0..self.names.len() {
+        if self.names[i] == name {
+            return self.values[i]
+        }
+    }
+    return 0
+}
+
+fn cname(a: [32]i8) -> str {
+    var out: List[u8] = []
+    for c in a {
+        guard c != 0 else {
+            break
+        }
+        out.push(u8(c))
+    }
+    return str.from_bytes(out)
+}
+
+fn props_of(fd: int, obj: u32, kind: u32) -> Props {
+    var p = Props {}
+    unsafe {
+        let op = drm.mode_object_get_properties(i32(fd), obj, kind)
+        guard not op.is_null() else {
+            return p
+        }
+        let o = op.read()
+        for i in 0..int(o.count_props) {
+            let id = o.props.offset(i).read()
+            let pr = drm.mode_get_property(i32(fd), id)
+            guard not pr.is_null() else {
+                continue
+            }
+            p.names.push(cname(pr.read().name))
+            p.ids.push(id)
+            p.values.push(o.prop_values.offset(i).read())
+            drm.mode_free_property(pr)
+        }
+        drm.mode_free_object_properties(op)
+    }
+    return p
+}
+
+/// The bytes of property blob `id`.
+fn blob(fd: int, id: u32) -> List[u8] {
+    var out: List[u8] = []
+    guard id != 0 else {
+        return out
+    }
+    unsafe {
+        let b = drm.mode_get_property_blob(i32(fd), id)
+        guard not b.is_null() else {
+            return out
+        }
+        let r = b.read()
+        for i in 0..int(r.length) {
+            out.push(r.data.offset(i).read())
+        }
+        drm.mode_free_property_blob(b)
+    }
+    return out
+}
+
+/// Manufacturer and model from an EDID.
+fn edid_names(e: List[u8]) -> (str, str) {
+    guard e.len() >= 128 else {
+        return ("", "")
+    }
+    let id = (u32(e[8]) << 8) | u32(e[9])
+    var make: List[u8] = []
+    for shift in [10, 5, 0] {
+        make.push(u8(((id >> u32(shift)) & 31) + 64))
+    }
+    var model = ""
+    for d in 0..4 {
+        let at = 54 + d * 18
+        if e[at] == 0 and e[at + 1] == 0 and e[at + 3] == 0xfc {
+            var name: List[u8] = []
+            for k in at + 5..at + 18 {
+                if e[k] == 0x0a {
+                    break
+                }
+                name.push(e[k])
+            }
+            model = str.from_bytes(name).trim()
+        }
+    }
+    return (str.from_bytes(make), model)
+}
+
+struct Crtc {
+    id: u32
+    props: Props
+    /// Taken by an output.
+    used: bool = false
+}
+
+struct Plane {
+    id: u32
+    /// 0 overlay, 1 primary, 2 cursor.
+    kind: u64
+    crtcs: u32
+    props: Props
+    /// Modifiers it scans XRGB8888 out with.
+    xrgb: List[u64] = []
+}
+
+struct Connector {
+    id: u32
+    name: str
+    connected: bool
+    modes: List[drm.ModeModeInfo] = []
+    width_mm: i32 = 0
+    height_mm: i32 = 0
+    crtcs: u32 = 0
+    props: Props = Props {}
+    make: str = ""
+    model: str = ""
+    internal: bool = false
+}
+
+struct Output {
+    conn: int
+    crtc: int
+    primary: int
+    cursor: int = -1
+    mode: drm.ModeModeInfo
+    mode_blob: u32 = 0
+    swap: Option[swap.Swap] = None
+    /// A commit waits for its page flip.
+    pending: bool = false
+    /// Slot queued and on screen (-1: none, or a client buffer).
+    queued: int = -1
+    shown: int = -1
+    /// Client framebuffers queued and shown when scanning out directly.
+    direct_queued: u32 = 0
+    direct_shown: u32 = 0
+    modeset: bool = true
+    enabled: bool = true
+    vrr: bool = false
+    cursor_fb: u32 = 0
+    cursor_handle: u32 = 0
+    cursor_map: Option[os.Map] = None
+    cursor_x: i32 = 0
+    cursor_y: i32 = 0
+    cursor_shown: bool = false
+    /// The cursor moved while a flip was pending: commit it after.
+    cursor_dirty: bool = false
+    /// Framebuffers kept for client buffers: buffer key, fb id.
+    fbs: List[(u64, u32)] = []
+}
+
+struct Drm {
+    fd: int
+    path: str
+    crtcs: List[Crtc] = []
+    planes: List[Plane] = []
+    conns: List[Connector] = []
+    outputs: List[Output] = []
+    cursor_w: u32 = 64
+    cursor_h: u32 = 64
+    modifiers: bool = false
+    async_flip: bool = false
+    /// dev_t of the card.
+    devnum: u64 = 0
+    rbuf: List[u8] = []
+}
+
+/// The card to drive: $LUMINARIA_DRM_DEVICE, else the first with a
+/// connected output.
+fn find_card() -> Result[str, str] {
+    if let Some(p) = env.get("LUMINARIA_DRM_DEVICE") {
+        return Ok(p)
+    }
+    var names = (try fs.list_dir("/dev/dri").map_err(fn(e) => "{e}")).filter(fn(n) => n.starts_with("card"))
+    names.sort()
+    guard not names.is_empty() else {
+        return Err("no DRM card")
+    }
+    return Ok("/dev/dri/" + names[0])
+}
+
+fn open(take path: str) -> Result[Drm, str] {
+    let fd = try session.open_device(path.clone())
+    var d = Drm { fd, path }
+    try d.probe()
+    return Ok(d)
+}
+
+fn Drm.drop(mut self) {
+    session.close_device(self.fd)
+}
+
+fn Drm.probe(mut self) -> Result[(), str] {
+    let f = i32(self.fd)
+    guard drm.set_client_cap(f, u64(uapi.drm_client_cap_universal_planes), 1) == 0 and drm.set_client_cap(f, u64(uapi.drm_client_cap_atomic), 1) == 0 else {
+        return Err("{self.path}: no atomic modesetting")
+    }
+    var v: u64 = 0
+    unsafe {
+        if drm.get_cap(f, u64(uapi.drm_cap_cursor_width), Ptr.of_mut(mut v)) == 0 and v > 0 {
+            self.cursor_w = u32(v)
+        }
+        if drm.get_cap(f, u64(uapi.drm_cap_cursor_height), Ptr.of_mut(mut v)) == 0 and v > 0 {
+            self.cursor_h = u32(v)
+        }
+        v = 0
+        self.modifiers = drm.get_cap(f, u64(uapi.drm_cap_addfb2_modifiers), Ptr.of_mut(mut v)) == 0 and v == 1
+        v = 0
+        self.async_flip = drm.get_cap(f, u64(uapi.drm_cap_atomic_async_page_flip), Ptr.of_mut(mut v)) == 0 and v == 1
+        let res = drm.mode_get_resources(f)
+        guard not res.is_null() else {
+            return Err("{self.path}: no KMS resources")
+        }
+        let r = res.read()
+        for i in 0..int(r.count_crtcs) {
+            let id = r.crtcs.offset(i).read()
+            self.crtcs.push(Crtc { id, props: props_of(self.fd, id, u32(uapi.drm_mode_object_crtc)) })
+        }
+        drm.mode_free_resources(res)
+        let pres = drm.mode_get_plane_resources(f)
+        if not pres.is_null() {
+            let pr = pres.read()
+            for i in 0..int(pr.count_planes) {
+                let id = pr.planes.offset(i).read()
+                let pp = drm.mode_get_plane(f, id)
+                guard not pp.is_null() else {
+                    continue
+                }
+                let crtcs = pp.read().possible_crtcs
+                drm.mode_free_plane(pp)
+                let props = props_of(self.fd, id, u32(uapi.drm_mode_object_plane))
+                var pl = Plane { id, kind: props.value("type"), crtcs, props }
+                pl.xrgb = self.plane_modifiers(pl.props.value("IN_FORMATS"))
+                self.planes.push(pl)
+            }
+            drm.mode_free_plane_resources(pres)
+        }
+    }
+    self.scan()
+    self.devnum = devnum(self.path)
+    return Ok(())
+}
+
+/// XRGB8888 modifiers of a plane's IN_FORMATS blob (linear without one).
+fn Drm.plane_modifiers(self, id: u64) -> List[u64] {
+    var out: List[u64] = []
+    guard id != 0 else {
+        out.push(0)
+        return out
+    }
+    unsafe {
+        let b = drm.mode_get_property_blob(i32(self.fd), u32(id))
+        guard not b.is_null() else {
+            out.push(0)
+            return out
+        }
+        var it = drm.ModeFormatModifierIterator {}
+        while drm.mode_format_modifier_blob_iter_next(b, Ptr.of_mut(mut it)) {
+            if it.fmt == u32(uapi.drm_format_xrgb8888) {
+                out.push(it.mod)
+            }
+        }
+        drm.mode_free_property_blob(b)
+    }
+    return out
+}
+
+/// Read every connector again (hotplug).
+fn Drm.scan(mut self) {
+    let f = i32(self.fd)
+    var conns: List[Connector] = []
+    unsafe {
+        let res = drm.mode_get_resources(f)
+        guard not res.is_null() else {
+            return
+        }
+        let r = res.read()
+        for i in 0..int(r.count_connectors) {
+            let id = r.connectors.offset(i).read()
+            let cp = drm.mode_get_connector(f, id)
+            guard not cp.is_null() else {
+                continue
+            }
+            let c = cp.read()
+            let tname = drm.mode_get_connector_type_name(c.connector_type).unwrap_or("Unknown")
+            var con = Connector { id, name: "{tname}-{c.connector_type_id}", connected: c.connection == 1, width_mm: i32(c.mmWidth), height_mm: i32(c.mmHeight) }
+            con.internal = tname == "eDP" or tname == "LVDS" or tname == "DSI"
+            for k in 0..int(c.count_modes) {
+                con.modes.push(c.modes.offset(k).read())
+            }
+            con.crtcs = drm.mode_connector_get_possible_crtcs(f, cp)
+            drm.mode_free_connector(cp)
+            con.props = props_of(self.fd, id, u32(uapi.drm_mode_object_connector))
+            let (make, model) = edid_names(blob(self.fd, u32(con.props.value("EDID"))))
+            con.make = make
+            con.model = model
+            conns.push(con)
+        }
+        drm.mode_free_resources(res)
+    }
+    self.conns = conns
+}
+
+fn devnum(path: str) -> u64 {
+    guard let Some(u) = udev.new() else {
+        return 0
+    }
+    var name = path.clone()
+    if let Some(i) = path.rfind("/") {
+        name = path.slice(i + 1, path.len())
+    }
+    var n: u64 = 0
+    if let Some(d) = udev.device_new_from_subsystem_sysname(u, "drm", name) {
+        n = udev.device_get_devnum(d)
+        discard udev.device_unref(d)
+    }
+    discard udev.unref(u)
+    return n
+}
+
+fn to_mode(m: drm.ModeModeInfo) -> types.Mode {
+    let refresh = if m.htotal > 0 and m.vtotal > 0 { i32(u64(m.clock) * 1000000 / (u64(m.htotal) * u64(m.vtotal))) } else { i32(m.vrefresh) * 1000 }
+    return types.Mode { width: i32(m.hdisplay), height: i32(m.vdisplay), refresh_mhz: refresh, preferred: m.r#type & u32(uapi.drm_mode_type_preferred) != 0 }
+}
+
+/// Outputs for connected connectors without one, each given a free CRTC
+/// with a primary plane: their indices.
+fn Drm.connect(mut self, mut added: List[int]) {
+    for ci in 0..self.conns.len() {
+        guard self.conns[ci].connected and not self.conns[ci].modes.is_empty() else {
+            continue
+        }
+        guard not self.outputs.any(fn(o) => o.conn == ci) else {
+            continue
+        }
+        var mode = self.conns[ci].modes[0]
+        for m in self.conns[ci].modes {
+            if m.r#type & u32(uapi.drm_mode_type_preferred) != 0 {
+                mode = m
+                break
+            }
+        }
+        for k in 0..self.crtcs.len() {
+            guard not self.crtcs[k].used and self.conns[ci].crtcs & (u32(1) << u32(k)) != 0 else {
+                continue
+            }
+            var primary = -1
+            var cursor = -1
+            for p in 0..self.planes.len() {
+                guard self.planes[p].crtcs & (u32(1) << u32(k)) != 0 else {
+                    continue
+                }
+                if self.planes[p].kind == 1 and primary < 0 and not self.outputs.any(fn(o) => o.primary == p) {
+                    primary = p
+                }
+                if self.planes[p].kind == 2 and cursor < 0 and not self.outputs.any(fn(o) => o.cursor == p) {
+                    cursor = p
+                }
+            }
+            guard primary >= 0 else {
+                continue
+            }
+            self.crtcs[k].used = true
+            self.outputs.push(Output { conn: ci, crtc: k, primary, cursor, mode })
+            added.push(self.outputs.len() - 1)
+            break
+        }
+    }
+}
+
+fn Drm.desc(self, o: int) -> types.OutputDesc {
+    let c = self.outputs[o].conn
+    var modes: List[types.Mode] = []
+    for m in self.conns[c].modes {
+        modes.push(to_mode(m))
+    }
+    return types.OutputDesc {
+        name: self.conns[c].name.clone(),
+        make: self.conns[c].make.clone(),
+        model: self.conns[c].model.clone(),
+        width_mm: self.conns[c].width_mm,
+        height_mm: self.conns[c].height_mm,
+        modes,
+        mode: to_mode(self.outputs[o].mode),
+        vrr: self.conns[c].props.value("vrr_capable") == 1,
+        internal: self.conns[c].internal,
+    }
+}
+
+/// Outputs whose connector went away: their indices (highest first).
+fn Drm.disconnected(self) -> List[int] {
+    var out: List[int] = []
+    var i = self.outputs.len() - 1
+    while i >= 0 {
+        let c = self.outputs[i].conn
+        if c >= self.conns.len() or not self.conns[c].connected {
+            out.push(i)
+        }
+        i -= 1
+    }
+    return out
+}
+
+/// A framebuffer for a dmabuf plane (prime import, then addfb2).
+fn Drm.add_fb(self, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32) -> Result[u32, str] {
+    let f = i32(self.fd)
+    var handle: u32 = 0
+    var id: u32 = 0
+    unsafe {
+        guard drm.prime_fd_to_handle(f, i32(fd), Ptr.of_mut(mut handle)) == 0 else {
+            return Err("prime import failed")
+        }
+        let handles: List[u32] = [handle, 0, 0, 0]
+        let pitches: List[u32] = [stride, 0, 0, 0]
+        let offsets: List[u32] = [offset, 0, 0, 0]
+        let mods: List[u64] = [modifier, 0, 0, 0]
+        let use_mods = self.modifiers and modifier != uapi.drm_format_mod_invalid
+        let r = drm.mode_add_fb2_with_modifiers(f, width, height, format, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), if use_mods { mods.as_ptr() } else { Ptr.null() }, Ptr.of_mut(mut id), if use_mods { u32(uapi.drm_mode_fb_modifiers) } else { 0 })
+        discard drm.close_buffer_handle(f, handle)
+        guard r == 0 else {
+            return Err("addfb2 failed ({r})")
+        }
+    }
+    return Ok(id)
+}
+
+fn Drm.rm_fb(self, id: u32) {
+    if id != 0 {
+        discard drm.mode_rm_fb(i32(self.fd), id)
+    }
+}
+
+/// Scanout buffers for output `o` laid out the way its primary plane and
+/// the GPU agree on.
+fn Drm.prepare(mut self, o: int, mut dev: gpu.Device, count: int) -> Result[(), str] {
+    let w = u32(self.outputs[o].mode.hdisplay)
+    let h = u32(self.outputs[o].mode.vdisplay)
+    // A new mode needs buffers of its size.
+    if let Some(old) = self.outputs[o].swap.take() {
+        if old.width == w and old.height == h {
+            self.outputs[o].swap = Some(old)
+            return Ok(())
+        }
+        for sl in old.slots {
+            self.rm_fb(sl.id)
+        }
+        old.destroy(mut dev)
+        self.outputs[o].shown = -1
+        self.outputs[o].queued = -1
+    }
+    let gpu_mods = dev.dmabuf_modifiers(gpu.Format.B8G8R8A8_UNORM, true)
+    let plane = self.outputs[o].primary
+    var mods: List[u64] = []
+    for m in self.planes[plane].xrgb {
+        if gpu_mods.contains(m) {
+            mods.push(m)
+        }
+    }
+    if mods.is_empty() {
+        mods.push(0)
+    }
+    var s = try swap.create(mut dev, w, h, gpu.Format.B8G8R8A8_UNORM, mods, count)
+    for i in 0..s.slots.len() {
+        let b = s.slots[i].buf
+        s.slots[i].id = try self.add_fb(b.fd, w, h, u32(uapi.drm_format_xrgb8888), b.modifier, u32(b.offset), u32(b.stride))
+    }
+    self.outputs[o].swap = Some(s)
+    try self.make_cursor(o)
+    return Ok(())
+}
+
+fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
+    guard self.outputs[o].cursor >= 0 and self.outputs[o].cursor_fb == 0 else {
+        return Ok(())
+    }
+    let f = i32(self.fd)
+    var handle: u32 = 0
+    var pitch: u32 = 0
+    var size: u64 = 0
+    var offset: u64 = 0
+    var fb: u32 = 0
+    unsafe {
+        guard drm.mode_create_dumb_buffer(f, self.cursor_w, self.cursor_h, 32, 0, Ptr.of_mut(mut handle), Ptr.of_mut(mut pitch), Ptr.of_mut(mut size)) == 0 else {
+            return Ok(())
+        }
+        let handles: List[u32] = [handle, 0, 0, 0]
+        let pitches: List[u32] = [pitch, 0, 0, 0]
+        let offsets: List[u32] = [0, 0, 0, 0]
+        guard drm.mode_add_fb2_with_modifiers(f, self.cursor_w, self.cursor_h, 0x34325241, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), Ptr.null(), Ptr.of_mut(mut fb), 0) == 0 else {
+            return Ok(())
+        }
+        guard drm.mode_map_dumb_buffer(f, handle, Ptr.of_mut(mut offset)) == 0 else {
+            return Ok(())
+        }
+    }
+    let m = try os.map(self.fd, int(size), int(offset), true).map_err(fn(e) => "{e}")
+    self.outputs[o].cursor_fb = fb
+    self.outputs[o].cursor_handle = handle
+    self.outputs[o].cursor_map = Some(m)
+    return Ok(())
+}
+
+/// Copy an ARGB8888 (premultiplied) cursor image into the cursor buffer;
+/// false when there is no cursor plane or the image is too large.
+fn Drm.set_cursor_image(mut self, o: int, pixels: &[u8], width: u32, height: u32) -> bool {
+    guard width <= self.cursor_w and height <= self.cursor_h else {
+        return false
+    }
+    let cw = int(self.cursor_w)
+    match self.outputs[o].cursor_map {
+        Some(m) => {
+            unsafe {
+                let dst = Ptr.slice_mut(m.ptr, m.len)
+                for i in 0..m.len {
+                    dst[i] = 0
+                }
+                for y in 0..int(height) {
+                    Ptr.copy(m.ptr.offset(y * cw * 4), pixels.as_ptr().offset(y * int(width) * 4), int(width) * 4)
+                }
+            }
+            return true
+        }
+        None => {
+            return false
+        }
+    }
+}
+
+struct Atomic {
+    req: drm.ModeAtomicReq
+}
+
+fn Atomic.add(self, obj: u32, prop: u32, value: u64) {
+    if prop != 0 {
+        discard drm.mode_atomic_add_property(self.req, obj, prop, value)
+    }
+}
+
+fn Atomic.drop(mut self) {
+    drm.mode_atomic_free(self.req)
+}
+
+fn Drm.pprop(self, p: int, name: str) -> u32 {
+    return self.planes[p].props.id(name)
+}
+
+/// Commit framebuffer `fb` (0: keep the plane as is) on output `o`, with
+/// GPU fence `fence` (-1: none) and damage `rects`; `only_test` only asks.
+fn Drm.commit(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], only_test: bool, tear: bool) -> Result[(), str] {
+    guard let Some(req) = drm.mode_atomic_alloc() else {
+        return Err("drmModeAtomicAlloc failed")
+    }
+    let a = Atomic { req }
+    let ci = self.outputs[o].conn
+    let ki = self.outputs[o].crtc
+    let primary = self.outputs[o].primary
+    let cursor = self.outputs[o].cursor
+    let mode = self.outputs[o].mode
+    let crtc = self.crtcs[ki].id
+    let w = u64(mode.hdisplay)
+    let h = u64(mode.vdisplay)
+    let modeset = self.outputs[o].modeset
+    var flags: u32 = 0
+    var damage_blob: u32 = 0
+    if modeset {
+        if self.outputs[o].mode_blob == 0 {
+            var id: u32 = 0
+            unsafe {
+                discard drm.mode_create_property_blob(i32(self.fd), Ptr.of(mode).cast[u8](), u64(size_of[drm.ModeModeInfo]()), Ptr.of_mut(mut id))
+            }
+            self.outputs[o].mode_blob = id
+        }
+        a.add(self.conns[ci].id, self.conns[ci].props.id("CRTC_ID"), u64(crtc))
+        a.add(crtc, self.crtcs[ki].props.id("MODE_ID"), u64(self.outputs[o].mode_blob))
+        a.add(crtc, self.crtcs[ki].props.id("ACTIVE"), if self.outputs[o].enabled { 1 } else { 0 })
+        a.add(crtc, self.crtcs[ki].props.id("VRR_ENABLED"), if self.outputs[o].vrr { 1 } else { 0 })
+        flags |= u32(uapi.drm_mode_atomic_allow_modeset)
+    }
+    let pid = self.planes[primary].id
+    if fb != 0 {
+        a.add(pid, self.pprop(primary, "FB_ID"), u64(fb))
+        a.add(pid, self.pprop(primary, "CRTC_ID"), u64(crtc))
+        if modeset or not tear {
+            a.add(pid, self.pprop(primary, "SRC_X"), 0)
+            a.add(pid, self.pprop(primary, "SRC_Y"), 0)
+            a.add(pid, self.pprop(primary, "SRC_W"), w << 16)
+            a.add(pid, self.pprop(primary, "SRC_H"), h << 16)
+            a.add(pid, self.pprop(primary, "CRTC_X"), 0)
+            a.add(pid, self.pprop(primary, "CRTC_Y"), 0)
+            a.add(pid, self.pprop(primary, "CRTC_W"), w)
+            a.add(pid, self.pprop(primary, "CRTC_H"), h)
+        }
+        if fence >= 0 {
+            a.add(pid, self.pprop(primary, "IN_FENCE_FD"), u64(fence))
+        }
+        let clips = self.pprop(primary, "FB_DAMAGE_CLIPS")
+        if not modeset and not rects.is_empty() and clips != 0 {
+            unsafe {
+                discard drm.mode_create_property_blob(i32(self.fd), rects.as_ptr().cast[u8](), u64(rects.len() * size_of[uapi.ModeRect]()), Ptr.of_mut(mut damage_blob))
+            }
+            a.add(pid, clips, u64(damage_blob))
+        }
+    }
+    if cursor >= 0 and not tear {
+        let cid = self.planes[cursor].id
+        if self.outputs[o].cursor_shown and self.outputs[o].cursor_fb != 0 {
+            a.add(cid, self.pprop(cursor, "FB_ID"), u64(self.outputs[o].cursor_fb))
+            a.add(cid, self.pprop(cursor, "CRTC_ID"), u64(crtc))
+            a.add(cid, self.pprop(cursor, "SRC_X"), 0)
+            a.add(cid, self.pprop(cursor, "SRC_Y"), 0)
+            a.add(cid, self.pprop(cursor, "SRC_W"), u64(self.cursor_w) << 16)
+            a.add(cid, self.pprop(cursor, "SRC_H"), u64(self.cursor_h) << 16)
+            a.add(cid, self.pprop(cursor, "CRTC_X"), u64(i64(self.outputs[o].cursor_x)))
+            a.add(cid, self.pprop(cursor, "CRTC_Y"), u64(i64(self.outputs[o].cursor_y)))
+            a.add(cid, self.pprop(cursor, "CRTC_W"), u64(self.cursor_w))
+            a.add(cid, self.pprop(cursor, "CRTC_H"), u64(self.cursor_h))
+        } else {
+            a.add(cid, self.pprop(cursor, "FB_ID"), 0)
+            a.add(cid, self.pprop(cursor, "CRTC_ID"), 0)
+        }
+    }
+    if only_test {
+        flags |= u32(uapi.drm_mode_atomic_test_only)
+    } else {
+        flags |= u32(uapi.drm_mode_page_flip_event) | u32(uapi.drm_mode_atomic_nonblock)
+        if tear and not modeset and self.async_flip {
+            flags |= u32(uapi.drm_mode_page_flip_async)
+        }
+    }
+    var r: i32 = 0
+    unsafe {
+        r = drm.mode_atomic_commit(i32(self.fd), req, flags, Ptr.from_addr(usize(crtc)))
+    }
+    if damage_blob != 0 {
+        discard drm.mode_destroy_property_blob(i32(self.fd), damage_blob)
+    }
+    guard r == 0 else {
+        return Err("atomic commit failed ({r})")
+    }
+    if not only_test {
+        self.outputs[o].pending = true
+        self.outputs[o].modeset = false
+        self.outputs[o].cursor_dirty = false
+    }
+    return Ok(())
+}
+
+/// Read page-flip events: (output, sequence, ns) per finished flip.
+fn Drm.read_events(mut self, mut out: List[(int, u64, int)]) {
+    if self.rbuf.len() < 1024 {
+        for _ in self.rbuf.len()..1024 {
+            self.rbuf.push(0)
+        }
+    }
+    let n = match os.read_into(self.fd, mut self.rbuf) {
+        Ok(n) => n
+        Err => 0
+    }
+    var at = 0
+    while at + 8 <= n {
+        let kind = rd32(self.rbuf, at)
+        let len = int(rd32(self.rbuf, at + 4))
+        guard len >= 8 and at + len <= n else {
+            break
+        }
+        if kind == u32(uapi.drm_event_flip_complete) and len >= 32 {
+            let sec = int(rd32(self.rbuf, at + 16))
+            let usec = int(rd32(self.rbuf, at + 20))
+            let seq = u64(rd32(self.rbuf, at + 24))
+            let crtc = rd32(self.rbuf, at + 28)
+            for o in 0..self.outputs.len() {
+                if self.crtcs[self.outputs[o].crtc].id == crtc {
+                    out.push((o, seq, sec * 1000000000 + usec * 1000))
+                }
+            }
+        }
+        at += len
+    }
+}
+
+fn no_clips() -> List[uapi.ModeRect] {
+    return []
+}
+
+fn rd32(b: List[u8], at: int) -> u32 {
+    return u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+}
+
+/// Output `o`'s flip finished: what was queued is on screen now.
+fn Drm.flipped(mut self, o: int) {
+    self.outputs[o].pending = false
+    let q = self.outputs[o].queued
+    let old = self.outputs[o].shown
+    if q >= 0 or self.outputs[o].direct_queued != 0 {
+        // The buffer that was on screen is free again.
+        if old >= 0 and old != q {
+            self.free_slot(o, old)
+        }
+        self.outputs[o].shown = q
+        self.outputs[o].queued = -1
+    }
+    self.outputs[o].direct_shown = self.outputs[o].direct_queued
+}
+
+fn Drm.free_slot(mut self, o: int, i: int) {
+    if let Some(sw) = self.outputs[o].swap.take() {
+        var s = sw
+        s.free(i)
+        self.outputs[o].swap = Some(s)
+    }
+}
+
+/// Turn every output off (the session ends or the compositor exits).
+fn Drm.release(mut self, mut dev: gpu.Device) {
+    for o in 0..self.outputs.len() {
+        if let Some(s) = self.outputs[o].swap.take() {
+            for sl in s.slots {
+                self.rm_fb(sl.id)
+            }
+            s.destroy(mut dev)
+        }
+        self.rm_fb(self.outputs[o].cursor_fb)
+        for (_, fb) in self.outputs[o].fbs {
+            self.rm_fb(fb)
+        }
+        self.outputs[o].fbs.clear()
+    }
+}

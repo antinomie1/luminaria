@@ -1,0 +1,147 @@
+// Backends on the real machine: xkb keys and modifiers, a headless frame
+// paced by its timer and read back, the connected displays of the DRM card
+// (probed, not taken over), and a frame in a window of the parent
+// compositor when there is one.
+
+import std.env
+import std.io
+import std.net
+import std.time
+import vk_gpu as gpu
+import luminaria_backend as backend
+
+test "keys go through xkb" {
+    guard let Ok(kb) = backend.keyboard.Keyboard.new(backend.Names { layout: "us" }) else {
+        io.eprint("skipped: no xkb data")
+        return
+    }
+    var k = kb
+    let (sym, text, _) = k.key(30, true)
+    assert_eq(sym, u32(0x61))
+    assert_eq(text, "a")
+    discard k.key(30, false)
+    let (_, _, changed) = k.key(42, true)
+    assert(changed)
+    assert(k.mods().shift)
+    let (big, shifted, _) = k.key(30, true)
+    assert_eq(big, u32(0x41))
+    assert_eq(shifted, "A")
+    assert(k.fd >= 0 and k.size > 100)
+}
+
+/// Wait for and return the next Presented of output `o`.
+fn presented(mut b: backend.Backend, o: u32) -> bool {
+    var p = net.poller().expect("poller")
+    var fds: List[(int, int)] = []
+    b.fds(mut fds)
+    for (fd, token) in fds {
+        discard p.add(fd, token, true, false)
+    }
+    var evs: List[net.Event] = []
+    let start = time.now_ns()
+    while time.now_ns() - start < 2000000000 {
+        discard p.wait(mut evs, 100)
+        for e in evs {
+            discard b.dispatch(e.token)
+        }
+        while true {
+            guard let Some(e) = b.next() else {
+                break
+            }
+            match e {
+                Presented(out, seq, ns, _) => {
+                    if out == o {
+                        return seq > 0 and ns > 0
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return false
+}
+
+test "a headless frame is presented at the next refresh" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    var b = backend.Backend.open(backend.Options { kind: backend.Kind.Headless, headless: [backend.Mode { width: 64, height: 48, refresh_mhz: 120000 }] }).expect("headless")
+    var added = false
+    while true {
+        guard let Some(e) = b.next() else {
+            break
+        }
+        match e {
+            OutputAdded(0) => added = true
+            _ => {}
+        }
+    }
+    assert(added)
+    assert_eq(b.output(0).mode.width, i32(64))
+    assert(b.can_present(0))
+    let f = b.acquire(0, mut dev).unwrap().expect("a frame")
+    assert_eq(f.age(), u32(0))
+    var e = dev.encoder().unwrap()
+    e.render(gpu.Pass { target: f.image(), clear: [0.0, 0.0, 1.0, 1.0] }, fn(mut r) {})
+    let none: List[backend.Rect] = []
+    b.present(0, mut dev, take e, none, false).unwrap()
+    assert(not b.can_present(0))
+    assert(presented(mut b, 0))
+    assert(b.can_present(0))
+    let px = dev.read_texture(b.shown(0).unwrap()).unwrap()
+    // B8G8R8A8: blue is the first byte.
+    assert_eq((px[0], px[1], px[2], px[3]), (u8(255), u8(0), u8(0), u8(255)))
+    // The next frame's buffer has not been shown: age 0, then 2.
+    let f2 = b.acquire(0, mut dev).unwrap().unwrap()
+    assert_eq(f2.age(), u32(0))
+    var e2 = dev.encoder().unwrap()
+    e2.render(gpu.Pass { target: f2.image() }, fn(mut r) {})
+    b.present(0, mut dev, take e2, none, false).unwrap()
+    assert(presented(mut b, 0))
+    let f3 = b.acquire(0, mut dev).unwrap().unwrap()
+    assert_eq(f3.age(), u32(2))
+    dev.cancel(dev.encoder().unwrap())
+}
+
+test "the DRM card's connected displays" {
+    match backend.probe("") {
+        Ok(outs) => {
+            // This machine runs a desktop: something is connected.
+            assert(not outs.is_empty())
+            io.eprint("connected: {outs[0].name} {outs[0].make} {outs[0].model} {outs[0].mode.width}x{outs[0].mode.height}@{outs[0].mode.refresh_mhz}")
+            for o in outs {
+                assert(not o.name.is_empty())
+                assert(o.mode.width > 0 and o.mode.height > 0 and o.mode.refresh_mhz > 1000)
+                assert(not o.modes.is_empty())
+            }
+        }
+        Err(e) => io.eprint("skipped: {e}")
+    }
+}
+
+test "a frame in a window of the parent compositor" {
+    guard env.get("WAYLAND_DISPLAY").is_some() else {
+        return
+    }
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true }) else {
+        return
+    }
+    var dev = d
+    guard let Ok(bb) = backend.Backend.open(backend.Options { kind: backend.Kind.Nested, title: "luminaria test" }) else {
+        io.eprint("skipped: no parent with linux-dmabuf")
+        return
+    }
+    var b = bb
+    assert(b.output(0).mode.width > 0)
+    let f = b.acquire(0, mut dev).unwrap().expect("a frame")
+    var e = dev.encoder().unwrap()
+    e.render(gpu.Pass { target: f.image(), clear: [0.2, 0.4, 0.6, 1.0] }, fn(mut r) {})
+    let rects: List[backend.Rect] = [(0, 0, 16, 16)]
+    b.present(0, mut dev, take e, rects, false).unwrap()
+    // Shown when the parent draws the window (it may hold back hidden ones).
+    if not presented(mut b, 0) {
+        io.eprint("note: the parent sent no frame callback")
+    }
+    b.shutdown(mut dev)
+}
