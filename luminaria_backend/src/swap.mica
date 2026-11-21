@@ -3,6 +3,7 @@
 // compositor) shows. Buffer age follows each buffer, so redraws are
 // partial.
 
+import std.os
 import luminaria_types as types
 
 struct Slot {
@@ -88,5 +89,29 @@ fn Swap.find(self, id: u32) -> int {
 fn Swap.keys(self, mut out: List[u64]) {
     for sl in self.slots {
         out.push(sl.key)
+    }
+}
+
+/// Close every exported dmabuf file descriptor owned by these swap slots
+/// (deduplicated per slot across planes).
+fn Swap.close_fds(mut self) {
+    for i in 0..self.slots.len() {
+        let n = min(self.slots[i].buf.planes, 4)
+        for p in 0..n {
+            let fd = self.slots[i].buf.plane[p].fd
+            if fd >= 0 {
+                var duped = false
+                for q in 0..p {
+                    if self.slots[i].buf.plane[q].fd == fd {
+                        duped = true
+                        break
+                    }
+                }
+                if not duped {
+                    os.close(fd)
+                }
+                self.slots[i].buf.plane[p].fd = -1
+            }
+        }
     }
 }

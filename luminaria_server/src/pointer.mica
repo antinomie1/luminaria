@@ -282,9 +282,12 @@ fn shape_device(mut srv: server.Server, ci: u32, d: cs.Device, take req: cs.Devi
             guard si != state.none else {
                 return
             }
+            guard srv.seats.used(int(si)) else {
+                return
+            }
             // Like set_cursor: only the client under the pointer, with its
             // enter serial.
-            guard seat.focused_client(srv, si) == ci and serial == srv.clients.items[int(ci)].enter_serial else {
+            guard seat.focused_client(srv, si) == ci and serial == srv.seats.items[int(si)].enter_serial else {
                 return
             }
             let n = u32(shape)

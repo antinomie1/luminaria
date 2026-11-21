@@ -1,6 +1,6 @@
 # 对外接口
 
-合成器只接触三样东西：`Display`、句柄（`Window`、`Output`、`Client`、`Surface`、`Image`，都是可复制、
+合成器只接触三样东西：`Display`、句柄（`Window`、`Output`、`Seat`、`Client`、`Surface`、`Image`，都是可复制、
 可作 `Map` 键的 id）和 `Event`。
 
 ## 事件循环
@@ -35,7 +35,7 @@ while true {
 | `next()` / `poll()` / `fd()` | 阻塞取事件 / 不阻塞取事件 / 嵌进别人的循环时要监听的 fd |
 | `watch(fd, token)` / `unwatch(fd)` | 合成器自己的 fd 进同一个循环，可读时产生 `Ready(token)` |
 | `timer(ms, token)` | `ms` 毫秒后产生 `Timer(token)` |
-| `inject(Input)` | 当作设备送来的输入（远程输入、测试） |
+| `inject(Input)` / `inject_on(Seat, Input)` | 当作设备送来的输入（默认 seat 或指定 seat；远程输入、测试） |
 | `quit()` | 让 `next` 返回 `None` |
 
 `Options` 的字段：`socket`、`backend`、`headless`（无头输出的模式）、`keymap`（RMLVO 名字）、
@@ -61,7 +61,7 @@ while true {
 | `RequestMinimize` / `RequestMenu` | 无 |
 | `Occluded(w, hidden)` | 重发上次的 configure，`suspended` 随 `hidden` |
 | `Key(k)` | 发给键盘焦点；Ctrl+Alt+Fn（`XF86Switch_VT_n`）切 VT |
-| `Modifiers` | 无（修饰键状态在库内已经发给焦点客户端） |
+| `Modifiers` / `ModifiersOn(Seat, Mods)` | 无（修饰键状态在库内已经发给焦点客户端；`Modifiers` 对应默认 seat0） |
 | `Motion` / `Button` / `Scroll` / `Touch` | 命中测试后发给对应表面，处理 enter/leave、隐式抓取、点外面关弹出菜单 |
 | `Gesture` | 发给指针下的客户端（pointer-gestures）；`manipulate_pan` 进行中则由库消费 |
 | `WindowDecoration(w, server_side)` | `decorate(w, false)`：库不画标题栏，客户端自己画 |
@@ -74,8 +74,10 @@ while true {
 | `DeviceAdded` / `DeviceRemoved` | 无 |
 | `Moved` / `Resized` / `Panned` | 无：操纵结束，合成器把结果并入自己的布局 |
 | `Session(active)` | 无（库已暂停或恢复设备） |
+| `GpuReset` | 无（GPU 设备丢失后库已重置目标与资源并重建布局） |
 | `Ready` / `Timer` | 无 |
 
+`Key`、`Pointer`、`Scroll`、`Touch`、`Gesture` 均携带 `seat: Seat` 字段。
 `Key` 带 `code`（evdev）、`sym`（xkb keysym，常量在 `lum.backend.keysym`）、`text`、`pressed`、`mods`。
 `Pointer` 带全局逻辑坐标 `x, y`、`dx, dy`（加速后）和 `raw_dx, raw_dy`。
 
@@ -103,7 +105,7 @@ d.layout(fn(mut l) {
 |---|---|
 | `configure(w, width, height, States)` | 尺寸（0 让客户端自定）与状态（maximized、fullscreen、resizing、activated、tiled_*、suspended），返回 serial |
 | `close(w)` | 请客户端关闭 |
-| `focus(Option[Window])` / `focused()` | 键盘焦点；有弹出菜单抓取时焦点留在菜单上 |
+| `focus(Option[Window])` / `focused()` | seat0 的键盘焦点；多 seat 版本为 `focus_on(Seat, ...)` / `focused_on(Seat)`（有弹出菜单抓取时焦点留在菜单上） |
 | `window_at(x, y)` | 全局坐标下的窗口（子表面和弹出菜单算作所属窗口） |
 | `title` / `app_id` / `parent` / `size` / `size_hints` / `client` / `credentials` | 查询 |
 | `sandbox(c)` | 客户端所在沙盒（security-context）：引擎、app id、实例 id |
@@ -125,9 +127,9 @@ d.layout(fn(mut l) {
 - **输入法**候选窗放在文本光标下方，在一切之上。
 - **空闲**：输入时通知恢复，到时间发空闲；可见表面上的 idle-inhibit 挡住普通通知。`idle_inhibited()`
   供合成器自己的熄屏策略参考。
-- **快捷键抑制**：`shortcuts_inhibited()` 为真时，焦点客户端要求拿到所有按键，绑定应放行。
-- **拖放**：拖动期间指针事件改走数据设备，拖动图标画在指针处；合成器不用做什么。
-- **截屏录屏**：有客户端等帧时库自己出帧、读回、拷给它。
+- **快捷键抑制**：`shortcuts_inhibited()`（或按 seat 查询 `shortcuts_inhibited_on(Seat)`）为真时，焦点客户端要求拿到所有按键，绑定应放行。
+- **拖放**：拖动期间指针事件改走数据设备，每个 seat 的拖动图标画在各自指针处；合成器不用做什么。
+- **截屏录屏**：有客户端等帧时（输出源与顶层窗口源，支持 shm 与零拷贝 dmabuf）库自己出帧、拷贝或离屏渲染并通知就绪。
 
 ## 布局事务
 
@@ -152,7 +154,7 @@ d.end(100)
 
 偏移一直叠加在布局上，直到收到结果后合成器的下一次 `layout`。
 
-## 输出、指针、输入设备
+## 输出、指针、多 seat 与输入设备
 
 | 接口 | 用途 |
 |---|---|
@@ -160,10 +162,12 @@ d.end(100)
 | `set_scale(o, s)` / `set_position(o, x, y)` / `set_mode(o, mode)` | 缩放（客户端按它渲染）、位置、模式 |
 | `enable(o, on)` / `set_vrr(o, on)` | 关屏省电、可变刷新率 |
 | `output_config(c)` / `apply_output_config(c, test)` / `output_config_done(c, ok)` | 输出配置工具（wlr-randr、kanshi）的请求 |
-| `pointer()` / `warp(x, y)` | 指针位置 |
+| `add_seat(name)` / `remove_seat(Seat)` / `seats()` / `seat_name(Seat)` | 增加、移除逻辑 seat 及查询（主 seat0 不可移除） |
+| `assign_device_seat(device, name)` | 把 libinput 设备绑定到指定逻辑 seat |
+| `pointer()` / `pointer_on(Seat)` / `warp(x, y)` / `warp_on(Seat, x, y)` | 指针位置 |
 | `set_cursor_named(name)` / `hide_cursor()` | 主题光标 |
 | `configure_input(device, InputConfig)` | 轻触点击、自然滚动、加速、左手、禁用 |
-| `set_keymap(Names)` / `mods()` | 键盘布局、当前修饰键 |
+| `set_keymap(Names)` / `set_keymap_on(Seat, Names)` / `mods()` / `mods_on(Seat)` | 键盘布局、当前修饰键 |
 | `read_output(o)` | 无头输出当前显示的像素（测试、截图） |
 | `stats(o)` / `reset_stats()` | 输出 `o` 测到的 `types.Stats`（见 [compose.md](compose.md#测量)）/ 重新开始计 |
 
@@ -186,8 +190,11 @@ d.end(100)
 `plug.Output` 和 `plug.Renderer` 是两个结构化 trait：类型有同名同签名的方法就满足，不用声明实现。
 `display.Display.with(o, output, renderer)` 用它们组装；`Display` 单态化，没有间接调用。必需的只有
 各自的核心方法（输出端：事件、fd、输出描述、取帧 / 给目标 / 呈现 / 退还目标；渲染器：输出、放置表、
-纹理、shm 上传、渲染目标、渲染、读回），其余是带默认实现的可选能力（直接扫描输出、光标平面、键盘、
-模式设置、dmabuf 导入、遮挡判断、设备计数 `stats`）。`tests/plug.mica` 是一个定时器驱动的输出端加一个软件渲染器。
+纹理、shm 上传、渲染目标、渲染、读回），其余是带默认实现的可选能力（直接扫描输出、硬件 overlay
+`test_overlays` / `clear_overlays` / `overlay_candidates` / `set_overlays`、光标平面、按 seat 的键盘与设备指派、
+模式设置、dmabuf 导入、离屏与 dmabuf 截屏 `capture_formats` / `copy_dmabuf` / `render_offscreen` /
+`render_offscreen_dmabuf`、GPU 恢复 `device_lost` / `recover` / `reset_targets`、遮挡判断、设备计数 `stats`）。
+`tests/plug.mica` 是一个定时器驱动的输出端加一个软件渲染器。
 
 ## 底层
 

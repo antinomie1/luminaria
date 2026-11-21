@@ -66,6 +66,7 @@ pub type Window = server.Window
 pub type Output = server.Output
 pub type Client = server.Client
 pub type Surface = server.Surface
+pub type Seat = server.Seat
 pub type States = server.States
 pub type Mode = types.Mode
 pub type Mods = types.Mods

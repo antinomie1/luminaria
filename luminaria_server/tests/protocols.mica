@@ -31,6 +31,7 @@ import luminaria_proto.ext_image_copy_capture as icc
 import luminaria_proto.security_context as sctx
 import luminaria_proto.wlr_output_management_unstable as wom
 import luminaria_proto.virtual_keyboard_unstable as vkb
+import luminaria_proto.linux_dmabuf as dmab
 import luminaria_server as server
 
 struct Fx {
@@ -903,4 +904,262 @@ test "a virtual keyboard keymap shorter than it claims is ignored" {
         }
     }
     assert_eq(code, i64(vkb.KeyboardError.NoKeymap))
+}
+
+test "multi-plane dmabuf handles out-of-order planes and validates plane_set" {
+    var f = setup()
+    f.srv.enable_dmabuf(server.Dmabuf { device: 1, formats: [(u32(0x34325241), u64(1))] }).unwrap()
+    let dm = dmab.Dmabuf { id: bind(mut f, dmab.dmabuf_iface, 4) }
+    let p = dm.create_params(mut f.c)
+    let fd0 = os.memfd("p0", 4096).expect("memfd")
+    let fd1 = os.memfd("p1", 4096).expect("memfd")
+    // Add plane 1 before plane 0 (out-of-order add allowed by protocol).
+    p.add_(mut f.c, fd1, 1, 4096, 64, 0, 1)
+    p.add_(mut f.c, fd0, 0, 0, 256, 0, 1)
+    os.close(fd0)
+    os.close(fd1)
+    discard p.create_immed(mut f.c, 16, 16, 0x34325241, dmab.BufferParamsFlags(0))
+    discard pump(mut f)
+    var got_buf: Option[server.Buffer] = None
+    for e in events(mut f) {
+        match e {
+            BufferNew(b) => got_buf = Some(b)
+            _ => {}
+        }
+    }
+    let buf = got_buf.expect("BufferNew")
+    let info = f.srv.buffer(buf)
+    assert_eq(info.planes, 2)
+    let db = f.srv.dmabuf(buf)
+    assert_eq(db.planes, 2)
+    assert_eq((db.plane[0].offset, db.plane[0].stride), (u32(0), u32(256)))
+    assert_eq((db.plane[1].offset, db.plane[1].stride), (u32(4096), u32(64)))
+
+    // Mismatched modifiers across planes must raise a protocol error.
+    let p_bad = dm.create_params(mut f.c)
+    let fa = os.memfd("pa", 4096).expect("memfd")
+    let fb = os.memfd("pb", 4096).expect("memfd")
+    p_bad.add_(mut f.c, fa, 0, 0, 256, 0, 1)
+    p_bad.add_(mut f.c, fb, 1, 0, 64, 0, 2)
+    os.close(fa)
+    os.close(fb)
+    discard f.c.flush()
+    discard f.srv.dispatch(f.client)
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    assert(gone.contains(f.client))
+    discard f.c.read()
+    var err_code: i64 = -1
+    while true {
+        match proto.next_event(mut f.c) {
+            Ok(Some(WlDisplay(_, Error(_, c, _)))) => err_code = i64(c)
+            Ok(Some) => {}
+            _ => {
+                break
+            }
+        }
+    }
+    assert_eq(err_code, i64(dmab.BufferParamsError.InvalidFormat))
+}
+
+test "window capture and async dmabuf capture" {
+    var f = setup()
+    f.srv.enable_dmabuf(server.Dmabuf { device: 42, formats: [(u32(0x34325241), u64(0))] }).unwrap()
+    let cap_fmts: List[(u32, u64)] = [(u32(0x34325241), u64(0))]
+    f.srv.set_capture_dmabuf(42, cap_fmts)
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 6) }
+    let dm = dmab.Dmabuf { id: bind(mut f, dmab.dmabuf_iface, 4) }
+    let surf = comp.create_surface(mut f.c)
+    let xs = wm.get_xdg_surface(mut f.c, surf)
+    let top = xs.get_toplevel(mut f.c)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var win: Option[server.Window] = None
+    for e in events(mut f) {
+        match e {
+            WindowNew(w) => win = Some(w)
+            _ => {}
+        }
+    }
+    let w = win.expect("WindowNew")
+    let serial = f.srv.configure(w, 10, 6, server.States {})
+    discard pump(mut f)
+    xs.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 10, 6)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    discard events(mut f)
+
+    let list = ftl.ToplevelList { id: bind(mut f, ftl.toplevel_list_iface, 1) }
+    discard list
+    var h: Option[ftl.Handle] = None
+    for e in pump(mut f) {
+        match e {
+            ExtForeignToplevelList(_, Toplevel(x)) => h = Some(x)
+            _ => {}
+        }
+    }
+    let handle = h.expect("toplevel handle")
+    let tsrcs = ics.ForeignToplevelImageCaptureSourceManager { id: bind(mut f, ics.foreign_toplevel_image_capture_source_manager_iface, 1) }
+    let mgr = icc.Manager { id: bind(mut f, icc.manager_iface, 1) }
+    let src = tsrcs.create_source(mut f.c, handle)
+    let sess = mgr.create_session(mut f.c, src, icc.ManagerOptions(0))
+    var size = (u32(0), u32(0))
+    var dmabuf_dev = false
+    var dmabuf_fmt = false
+    var done = false
+    for e in pump(mut f) {
+        match e {
+            ExtImageCopyCaptureSession(_, BufferSize(bw, bh)) => size = (bw, bh)
+            ExtImageCopyCaptureSession(_, DmabufDevice) => dmabuf_dev = true
+            ExtImageCopyCaptureSession(_, DmabufFormat) => dmabuf_fmt = true
+            ExtImageCopyCaptureSession(_, Done) => done = true
+            _ => {}
+        }
+    }
+    assert_eq(size, (u32(10), u32(6)))
+    assert(dmabuf_dev and dmabuf_fmt and done)
+
+    // Attach a dmabuf buffer to capture the window asynchronously.
+    let params = dm.create_params(mut f.c)
+    let fd = os.memfd("cap", 4096).expect("memfd")
+    params.add_(mut f.c, fd, 0, 0, 40, 0, 0)
+    os.close(fd)
+    let dbuf = params.create_immed(mut f.c, 10, 6, 0x34325241, dmab.BufferParamsFlags(0))
+    discard pump(mut f)
+    for e in events(mut f) {
+        match e {
+            BufferNew(b) => f.srv.imported(b, true)
+            _ => {}
+        }
+    }
+    let fr = sess.create_frame(mut f.c)
+    fr.attach_buffer(mut f.c, dbuf)
+    fr.capture(mut f.c)
+    discard pump(mut f)
+    assert(events(mut f).any(fn(e) => match e {
+        CaptureWindow(cw) => cw == w
+        _ => false
+    }))
+    var reqs: List[server.CaptureReq] = []
+    f.srv.capture_dmabuf_requests(mut reqs)
+    assert_eq(reqs.len(), 1)
+    assert_eq((reqs[0].width, reqs[0].height), (i32(10), i32(6)))
+    f.srv.capture_done(reqs[0].session, 2000000000)
+    f.srv.release(reqs[0].buffer)
+    assert(pump(mut f).any(fn(e) => match e {
+        ExtImageCopyCaptureFrame(_, Ready) => true
+        _ => false
+    }))
+
+    // Destroying the toplevel stops active window capture sessions.
+    top.destroy(mut f.c)
+    assert(pump(mut f).any(fn(e) => match e {
+        ExtImageCopyCaptureSession(_, Stopped) => true
+        _ => false
+    }))
+}
+
+test "multiple seats have independent focus, cursor serials, idle and remove_seat" {
+    var f = setup()
+    let seat0 = f.srv.add_seat("seat0")
+    let seat1 = f.srv.add_seat("seat1")
+    f.srv.set_capabilities(seat0, 3)
+    f.srv.set_capabilities(seat1, 3)
+    f.reg = wl.Display { id: 1 }.get_registry(mut f.c)
+    discard pump(mut f)
+    var seat_names: List[u32] = []
+    for (name, iface) in f.globals {
+        if iface == wl.seat_iface {
+            seat_names.push(name)
+        }
+    }
+    assert_eq(seat_names.len(), 2)
+    let ws0 = wl.Seat { id: f.reg.bind(mut f.c, seat_names[0], wl.seat_iface, 7) }
+    let ws1 = wl.Seat { id: f.reg.bind(mut f.c, seat_names[1], wl.seat_iface, 7) }
+    let p0 = ws0.get_pointer(mut f.c)
+    let p1 = ws1.get_pointer(mut f.c)
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let s1 = comp.create_surface(mut f.c)
+    let s2 = comp.create_surface(mut f.c)
+    s1.commit(mut f.c)
+    s2.commit(mut f.c)
+    discard pump(mut f)
+    var surfs: List[server.Surface] = []
+    for e in events(mut f) {
+        match e {
+            Applied(s) => surfs.push(s)
+            _ => {}
+        }
+    }
+    assert_eq(surfs.len(), 2)
+
+    f.srv.pointer_focus(seat0, Some(surfs[0]), 1.0, 2.0)
+    f.srv.pointer_focus(seat1, Some(surfs[1]), 3.0, 4.0)
+    var ser0: u32 = 0
+    var ser1: u32 = 0
+    for e in pump(mut f) {
+        match e {
+            WlPointer(pid, Enter(ser, _, _, _)) => {
+                if pid == p0 { ser0 = ser }
+                if pid == p1 { ser1 = ser }
+            }
+            _ => {}
+        }
+    }
+    assert(ser0 != 0 and ser1 != 0 and ser0 != ser1)
+
+    // Crossed serial (ser1 sent to seat0's pointer) must be ignored.
+    p0.set_cursor(mut f.c, ser1, None, 0, 0)
+    discard pump(mut f)
+    assert(events(mut f).is_empty())
+
+    // Matching serial on seat1 works independently of seat0's serial.
+    p1.set_cursor(mut f.c, ser1, None, 5, 6)
+    discard pump(mut f)
+    assert(events(mut f).any(fn(e) => match e {
+        Cursor(st, _, hx, hy) => st == seat1 and hx == 5 and hy == 6
+        _ => false
+    }))
+
+    // Per-seat idle notification and remove_seat global removal.
+    let notifier = idle.Notifier { id: bind(mut f, idle.notifier_iface, 2) }
+    let n0 = notifier.get_idle_notification(mut f.c, 100, ws0)
+    let n1 = notifier.get_idle_notification(mut f.c, 100, ws1)
+    discard pump(mut f)
+    f.srv.input_activity_on(seat0, 1000)
+    f.srv.input_activity_on(seat1, 1000)
+    discard f.srv.idle_check(1000 + 150 * 1000000, false)
+    var idled0 = false
+    var idled1 = false
+    for e in pump(mut f) {
+        match e {
+            ExtIdleNotification(id, Idled) => {
+                if id == n0 { idled0 = true }
+                if id == n1 { idled1 = true }
+            }
+            _ => {}
+        }
+    }
+    assert(idled0 and idled1)
+    f.srv.input_activity_on(seat1, 200000000)
+    var res0 = false
+    var res1 = false
+    for e in pump(mut f) {
+        match e {
+            ExtIdleNotification(id, Resumed) => {
+                if id == n0 { res0 = true }
+                if id == n1 { res1 = true }
+            }
+            _ => {}
+        }
+    }
+    assert(not res0 and res1)
+
+    f.srv.remove_seat(seat1)
+    assert(pump(mut f).any(fn(e) => match e {
+        WlRegistry(_, GlobalRemove(n)) => n == seat_names[1]
+        _ => false
+    }))
 }

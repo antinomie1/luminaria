@@ -82,6 +82,28 @@ pub trait Output {
     }
     /// Add the device's counters to `s` (commits, scheduling).
     fn stats(self, mut s: types.Stats) {}
+
+    /// Probe hardware overlay candidates against primary target `target_key`.
+    fn test_overlays(mut self, o: u32, target_key: u64, cands: &[types.Overlay]) -> List[u64] {
+        let none: List[u64] = []
+        return none
+    }
+    fn clear_overlays(mut self, o: u32) {}
+    /// Drop scanout targets so they can be recreated after a GPU reset.
+    fn reset_targets(mut self, mut retired: List[u64]) {}
+    /// Keymap for a named seat (memfd and size); defaults to `keymap`.
+    fn keymap_on(self, seat: str) -> (int, u32) {
+        return self.keymap()
+    }
+    fn mods_on(self, seat: str) -> types.Mods {
+        return self.mods()
+    }
+    fn set_keymap_on(mut self, seat: str, names: types.Names) -> Result[(), str] {
+        return self.set_keymap(names)
+    }
+    fn assign_device_seat(mut self, device: u32, seat: str) -> bool {
+        return false
+    }
 }
 
 pub trait Renderer {
@@ -138,4 +160,32 @@ pub trait Renderer {
     }
     /// What the last frame of `o` changed (empty: all of it).
     fn changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {}
+
+    /// Top-to-bottom hardware overlay candidates for output `o`.
+    fn overlay_candidates(self, o: int, max_count: int) -> List[types.OverlayCand] {
+        let none: List[types.OverlayCand] = []
+        return none
+    }
+    fn set_overlays(mut self, o: int, keys: &[u64]) {}
+    /// Writable (fourcc, modifier) pairs supported for dmabuf capture.
+    fn capture_formats(self) -> List[(u32, u64)] {
+        let none: List[(u32, u64)] = []
+        return none
+    }
+    fn copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, sx: i32, sy: i32, w: i32, h: i32) -> Result[int, str] {
+        return Err("dmabuf capture unsupported")
+    }
+    fn render_offscreen(mut self, width: u32, height: u32, ps: &[types.Placement]) -> Result[List[u8], str] {
+        return Err("offscreen render unsupported")
+    }
+    fn render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &[types.Placement]) -> Result[int, str] {
+        return Err("offscreen dmabuf capture unsupported")
+    }
+    fn device_lost(self) -> bool {
+        return false
+    }
+    fn recover(mut self) -> Result[(), str] {
+        return Err("recovery unsupported")
+    }
+    fn stats(self, mut s: types.Stats) {}
 }

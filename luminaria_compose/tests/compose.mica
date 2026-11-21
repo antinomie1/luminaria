@@ -2,6 +2,7 @@
 // into damage, restacking, shm damage uploads, client textures, render
 // targets and dmabuf formats.
 
+import std.net
 import std.os
 import vk_gpu as gpu
 import luminaria_types as types
@@ -143,10 +144,140 @@ test "exported render targets are dmabufs" {
     assert_eq(ts.len(), 2)
     assert(ts[0].key != ts[1].key)
     for x in ts {
-        assert_eq(x.buf.planes, 1)
-        assert(x.buf.plane[0].fd >= 0)
+        assert(x.buf.planes >= 1 and x.buf.planes <= 4)
+        for i in 0..x.buf.planes {
+            assert(x.buf.plane[i].fd >= 0)
+        }
         assert(x.buf.plane[0].stride >= 64 * 4)
+        // Importing the exported dmabuf (single or multi-plane) keeps caller fds valid.
+        assert(c.import_dmabuf(x.key + 1000, x.buf))
+        for i in 0..x.buf.planes {
+            let check = os.dup(x.buf.plane[i].fd)
+            assert(check.is_ok())
+            os.close(check.unwrap())
+            os.close(x.buf.plane[i].fd)
+        }
+        c.forget(x.key + 1000)
         c.drop_target(x.key)
     }
+    c.close()
+}
+
+fn wait_fence(fence: int) {
+    if fence >= 0 {
+        var poll = net.poller().unwrap()
+        var evs: List[net.Event] = []
+        discard poll.add(fence, 1, true, false)
+        discard poll.wait(mut evs, 1000)
+        discard poll.remove(fence)
+        os.close(fence)
+    }
+}
+
+test "overlay candidates exclude overlay from primary compose" {
+    guard let Some((cc, t)) = open(16) else {
+        return
+    }
+    var c = cc
+    guard let Ok(sd) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        c.close()
+        return
+    }
+    var src_dev = sd
+    let linear: [1]u64 = [0]
+    guard let Ok((src_t, src_buf)) = src_dev.export_dmabuf_with(gpu.TextureDesc { width: 8, height: 8, format: gpu.Format.B8G8R8A8_UNORM }, linear) else {
+        c.close()
+        return
+    }
+    var enc = src_dev.encoder().unwrap()
+    enc.render(gpu.Pass { target: src_t, clear: [0.0, 1.0, 0.0, 1.0] }, fn(mut r) {})
+    let (ticket, fence) = src_dev.submit_sync_file(take enc).unwrap()
+    wait_fence(int(fence))
+    src_dev.wait(ticket).unwrap()
+
+    let db = types.Dmabuf {
+        width: 8,
+        height: 8,
+        format: types.buffer.xrgb8888,
+        modifier: src_buf.modifier,
+        planes: 1,
+        plane: [types.Plane { fd: int(src_buf.fd), offset: u32(src_buf.offset), stride: u32(src_buf.stride) }, types.Plane {}, types.Plane {}, types.Plane {}],
+    }
+    assert(c.import_dmabuf(200, db))
+    os.close(int(src_buf.fd))
+    src_dev.destroy_texture(src_t)
+
+    c.layout(0, [types.Placement { key: 1, tex: 200, x: 0.0, y: 0.0, w: 8.0, h: 8.0 }])
+    let cands = c.overlay_candidates(0, 4)
+    assert_eq(cands.len(), 1)
+    assert_eq(cands[0].key, u64(1))
+    assert_eq(cands[0].tex, u64(200))
+
+    // Promoting placement 1 to an overlay skips drawing it onto primary target.
+    c.set_overlays(0, [u64(1)])
+    var img = draw(mut c, t)
+    assert_eq(px(img, 16, 2, 2), (u8(0), u8(0), u8(0)))
+    let empty: List[(i32, i32, i32, i32)] = []
+    c.commit(1, empty)
+    assert(c.idle(0))
+
+    // Demoting restores primary rendering.
+    let no_ov: List[u64] = []
+    c.set_overlays(0, no_ov)
+    img = draw(mut c, t)
+    assert_eq(px(img, 16, 2, 2), (u8(0), u8(255), u8(0)))
+    c.close()
+}
+
+test "gpu device lost recovery and offscreen dmabuf capture" {
+    guard let Some((cc, t)) = open(16) else {
+        return
+    }
+    var c = cc
+    let prio = c.gpu_priority()
+    assert(prio == 0 or prio == 256 or prio == 512 or prio == 1024)
+    assert_eq(c.resets(), 0)
+    assert(not c.device_lost())
+
+    assert(c.image(10, 8, 8, types.buffer.xbgr8888, fill([255, 0, 0, 255], 64), 32))
+    let p = types.Placement { key: 1, tex: 10, x: 2.0, y: 2.0, w: 8.0, h: 8.0 }
+    c.layout(0, [p])
+    discard draw(mut c, t)
+
+    // Offscreen window capture without altering output 0 scene.
+    let off = c.render_offscreen(8, 8, [types.Placement { key: 1, tex: 10, w: 8.0, h: 8.0 }]).unwrap()
+    assert_eq(px(off, 8, 2, 2), (u8(0), u8(0), u8(255)))
+
+    // Zero-copy dmabuf copy capture + offscreen dmabuf capture.
+    let cap_mods = c.capture_formats()
+    if not cap_mods.is_empty() {
+        let cap_t = c.targets(types.Want { width: 16, height: 16, format: types.buffer.argb8888, modifiers: [cap_mods[0].1], count: 1 }).unwrap()[0]
+        let f1 = c.copy_dmabuf(t, cap_t.buf, 0, 0, 16, 16).unwrap()
+        wait_fence(f1)
+        let cap_px = c.read(cap_t.key).unwrap()
+        assert_eq(px(cap_px, 16, 4, 4), (u8(0), u8(0), u8(255)))
+
+        let f2 = c.render_offscreen_dmabuf(cap_t.buf, [types.Placement { key: 1, tex: 10, x: 0.0, y: 0.0, w: 16.0, h: 16.0 }]).unwrap()
+        wait_fence(f2)
+        let cap_px2 = c.read(cap_t.key).unwrap()
+        assert_eq(px(cap_px2, 16, 12, 12), (u8(0), u8(0), u8(255)))
+        for i in 0..cap_t.buf.planes {
+            os.close(cap_t.buf.plane[i].fd)
+        }
+        c.drop_target(cap_t.key)
+    }
+
+    // Trigger device lost, recover, and resume rendering cleanly.
+    c.mark_lost()
+    assert(c.device_lost())
+    assert(c.render(0, t, 0).is_err())
+    c.recover().unwrap()
+    assert(not c.device_lost())
+    assert_eq(c.resets(), 1)
+    let t2 = c.targets(types.Want { width: 16, height: 16, count: 1, export: false }).unwrap()[0].key
+    assert(c.image(10, 8, 8, types.buffer.xbgr8888, fill([0, 255, 0, 255], 64), 32))
+    c.layout(0, [types.Placement { key: 1, tex: 10, x: 0.0, y: 0.0, w: 16.0, h: 16.0 }])
+    let recovered = draw(mut c, t2)
+    assert_eq(px(recovered, 16, 4, 4), (u8(0), u8(255), u8(0)))
     c.close()
 }

@@ -13,6 +13,7 @@ import state
 import server
 import positioner
 import toplevel as tl
+import capture
 
 /// xdg_toplevel states sent with a configure.
 pub struct States {
@@ -326,10 +327,8 @@ fn toplevel_applied(mut srv: server.Server, wi: u32, serial: u32) {
     let si = int(srv.windows.items[i].surface)
     let w = ids.Window { id: srv.windows.id(wi) }
     let got = acked(mut srv.windows.items[i].configures, serial)
-    if let Some((cw, ch)) = got {
+    if let Some((_, _)) = got {
         srv.windows.items[i].configured = true
-        srv.windows.items[i].acked_w = cw
-        srv.windows.items[i].acked_h = ch
     }
     let has_buffer = srv.surfaces.items[si].current.buffer.is_some()
     if not srv.windows.items[i].initial {
@@ -360,6 +359,7 @@ fn toplevel_applied(mut srv: server.Server, wi: u32, serial: u32) {
     if let Some((cw, ch)) = got {
         srv.push(server.Event.WindowAcked(w, cw, ch))
     }
+    capture.window_changed(mut srv, wi)
 }
 
 fn unmap_window(mut srv: server.Server, wi: u32) {
@@ -470,6 +470,7 @@ fn destroy_toplevel(mut srv: server.Server, wi: u32) {
             srv.windows.items[k].parent = state.none
         }
     }
+    capture.window_gone(mut srv, wi)
     tl.gone(mut srv, wi, true)
     srv.windows.remove(wi, state.WindowData {})
     srv.push(server.Event.WindowClosed(w))

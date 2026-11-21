@@ -9,7 +9,7 @@
 | 3 | Flip model + 帧统计 | KMS 原子翻转、wp_presentation | `Presented`、呈现反馈带 vblank 时间戳与零拷贝标志 | 已实现 |
 | 4 | Flip queue（内核里等 GPU，按 vsync 执行排队的翻转） | `IN_FENCE_FD`、提交线程 | GPU 的 sync_file 交给 KMS；嵌套时挂成隐式栅栏；提交线程在 vblank 前最后时刻提交、合并光标，每个 CRTC 自己的节奏 | 已实现 |
 | 5 | Independent Flip / DirectFlip | 客户端 dmabuf 直接扫描输出 | 原子测试后直接翻转；嵌套时交给父合成器 | 已实现 |
-| 6 | MPO | overlay、光标平面 | 光标平面 | overlay 平面未做 |
+| 6 | MPO | overlay、光标平面 | 主平面 + 通用 overlay 平面（`IN_FORMATS` + 原子 `TEST_ONLY` + z-order 遮挡剔除，主合成跳过已提升视图）+ 光标平面 | 已实现 |
 | 7 | Allow tearing | tearing-control-v1、异步翻转 | 直接扫描输出时按提示用 `PAGE_FLIP_ASYNC` | 已实现 |
 | 8 | 合成器时钟 | 预测 vblank | 每帧尽量晚开始，余量按迟到反馈自适应 | 已实现 |
 | 9 | 每显示器刷新率、Win11 DRR | 每输出时钟、VRR | 每输出时钟、VRR | 按内容降刷新未做 |
@@ -18,9 +18,9 @@
 | 12 | 不渲染看不见的 | 遮挡剔除 | 跳过被遮挡的形状；看不见的表面不收帧回调 | 已实现 |
 | 13 | 共享资源 | dmabuf | 每个缓冲只导入一次 | 已实现 |
 | 14 | 缩略图 / 重定向 | 一张纹理放多处 | 同一表面可以出现在多个放置、多个输出上（`Style.scale`） | 已实现 |
-| 15 | GPU 优先级与抢占 | `VK_EXT_global_priority` | — | 未做 |
+| 15 | GPU 优先级与抢占 | `VK_KHR/EXT_global_priority` | 按 `Realtime -> High -> Medium -> Default` 请求队列全局优先级，不支持时自动回退并记入 `Stats.gpu_priority` | 已实现 |
 | 16 | VidMM 显存驻留 | `VK_EXT_memory_budget` | — | 未做 |
-| 17 | TDR（超时检测与恢复） | 翻转看门狗、`VK_ERROR_DEVICE_LOST` | 翻转 1 s 未完成时 ping 事件循环，分出循环卡顿和驱动不翻转并计数 | 检测已实现，设备丢失恢复未做 |
+| 17 | TDR（超时检测与恢复） | 翻转看门狗、`VK_ERROR_DEVICE_LOST` | 翻转看门狗计数卡顿与驱动超时；设备丢失时 `reset_targets` + `recover` 重建设备/管线/纹理并发 `Event.GpuReset`（`Stats.gpu_resets`） | 检测与恢复已实现 |
 | 18 | DComp 事务 | configure / ack / commit | `begin` / `end` | 已实现 |
 | 19 | MMCSS（DWM 的线程按实时类调度） | `SCHED_FIFO` / `SCHED_RR`、`RLIMIT_RTPRIO`、`SCHED_RESET_ON_FORK` | 事件循环 50、提交线程 51，单核用 RR；无权限退到 nice −15；子进程回到普通调度 | 已实现 |
 | 20 | 输入时提升（输入唤醒的线程提优先级、电源管理按输入提频） | 调频守护进程 | 有输入时每 500 ms 至多一次写 `$XDG_RUNTIME_DIR/luminaria-input-boost` | 已实现 |
@@ -51,19 +51,18 @@
 | `export_dmabuf_with`：按修饰符列表导出 | 已加 |
 | `Frame.new`：vk_gpu 之外的目标（KMS、父合成器） | 已加 |
 | `dmabuf_modifiers`、`drm_node`：linux-dmabuf 格式表与主设备 | 已加 |
-| 设备丢失单独成为一种错误、`VK_EXT_global_priority`、`VK_EXT_memory_budget` | 未做 |
+| 设备丢失（`VK_ERROR_DEVICE_LOST` 状态与恢复）、`VK_KHR/EXT_global_priority` | 已加 |
+| `VK_EXT_memory_budget` | 未做 |
+| 1..4 平面 dmabuf（`statx` 去重与 `DISJOINT`）、可写 capture 目标与 `copy_texture` | 已加 |
 | GPU 时间戳查询 | 未做：时钟用迟到反馈自适应余量代替 |
-| `write_texture_rect` 按行紧凑暂存 | 未做：现在暂存从首行到末行的整段跨度（含行距），窄而高的损坏多拷了整行 |
+| `write_texture_rect` 按行紧凑暂存 | 已加（跨度小于整行时逐行紧凑暂存，避免多余行距拷贝） |
 | 绘制计数（实际画的像素、离屏 pass） | 未做：探针还算不出过度绘制率 |
 
 ## 尚未做的
 
-- overlay 平面（现在只用主平面和光标平面）、按内容降低刷新率（Q4）。做 overlay 时，平面分配要成为出帧的
-  一个阶段：从上往下给候选视图逐个试 `TEST_ONLY`，失败的那层和它下面的回退给 GPU 合成；探针的
-  `tests` 计数用来看试探的代价。
+- 按内容降低刷新率（Q4）、`VK_EXT_memory_budget` 显存驻留管理与挂起窗口低分辨率快照（Q5）。
 - 模糊（Q7 的前提）：加进 vk_draw2d 时，损坏要先按效果扩张再剔除：从上往下，模糊视图把下方需要重画的
-  范围按采样半径扩大，上方不透明区域再从下方的损坏和可见区域里扣掉，否则局部重画在边缘采到旧像素。
-- 设备丢失恢复、GPU 全局优先级、显存驻留与快照（Q5）、模糊缓存（Q7）。
-- 协议：数位板（tablet-v2）；截屏的 dmabuf 缓冲与窗口源（现在只有 shm 和输出，读回要等 GPU）。
+  范围按采样半径扩大，上方不透明区域再从下方的损坏和可见区域里扣掉，否则局部重画在边缘采到旧像素；并加上模糊缓存（Q7）。
+- 协议：数位板（`tablet-v2`）。
 - 输出配置的禁用只是关屏，输出仍在布局里；输出不能旋转。
-- 多个 seat（现在只有 seat0）。
+- 探针的过度绘制率与离屏 pass 计数。

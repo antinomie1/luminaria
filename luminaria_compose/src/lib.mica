@@ -1,12 +1,13 @@
 // luminaria_compose: the Vulkan renderer, on vk_compose. Each output is a
-// scene the placement list (back to front, output pixels) is diffed into:
-// what moved, appeared or changed becomes damage, opaque views hide what
-// is under them, and only the damage is redrawn, in one pass. The renderer
-// owns the device and every texture, each under the caller's key: client
+// scene the placement list (back to front, output pixels) is diffed into in
+// O(N) time: what moved, appeared or changed becomes damage, opaque views
+// and hardware overlay planes skip drawing into the primary target, and
+// only the primary damage is redrawn, in one pass. The renderer owns the
+// device and every texture, each under the caller's key: 1..4 plane client
 // dmabufs imported once, single-pixel buffers as one texel, one texture
-// per shm surface that commits upload their merged damage into once
-// before the next frame, the compositor's images, and the render targets
-// outputs show (exported as dmabufs, drawn with a sync_file fence out).
+// per shm surface that commits upload merged damage into once before the
+// next frame, compositor images, render targets (exported as multi-plane
+// dmabufs), and zero-copy dmabuf / offscreen captures.
 
 import std.collections.map
 import std.mem
@@ -21,13 +22,19 @@ pub type Rect = types.Rect
 
 struct Output {
     scene: vc.Scene
+    width: u32 = 1
+    height: u32 = 1
+    background: vec4 = zeroed()
     alive: bool = true
-    keys: List[u64] = []
-    ids: List[u32] = []
+    /// Placement key -> (scene view id, last seen generation, texture key).
+    by_key: map.Map[u64, (u32, u64, u64)]
+    /// Scene view id -> placement key.
+    by_id: map.Map[u32, u64]
+    gen: u64 = 0
 }
 
 fn blank() -> Output {
-    return Output { scene: vc.Scene.new(1, 1, vec4(0.0)), alive: false }
+    return Output { scene: vc.Scene.new(1, 1, vec4(0.0)), alive: false, by_key: map.Map.new(), by_id: map.Map.new() }
 }
 
 /// The damage of an shm texture still to upload (x0, y0 to x1, y1; none
@@ -42,7 +49,12 @@ struct Shm {
 
 pub struct Compositor {
     dev: gpu.Device
+    validation: bool = false
+    want_priority: gpu.Priority = gpu.Priority.Realtime
+    resets: int = 0
     canvas: Option[draw2d.Canvas] = None
+    /// Lazily built for R8G8B8A8_UNORM dmabuf capture targets.
+    canvas_rgba: Option[draw2d.Canvas] = None
     outputs: List[Output] = []
     /// Uploads waiting for the next frame (recorded once, before any draw).
     uploads: Option[gpu.Encoder] = None
@@ -52,20 +64,27 @@ pub struct Compositor {
     /// Render targets by key.
     targets: map.Map[u64, gpu.Texture]
     next_target: u64 = 1
-    /// The views of the placement list being laid out (kept: no
-    /// allocation in steady state).
-    views: List[(u64, vc.View)] = []
+    /// Reusable scratch lists for O(N) layout diff & overlay updates.
+    order: List[u32] = []
+    rm_keys: List[u64] = []
+    rm_ids: List[u32] = []
+    ov_ids: List[u32] = []
 }
 
 /// The renderer on a GPU of its own choosing (`validation` loads the
-/// Vulkan validation layer).
+/// Vulkan validation layer; requests `Realtime` global queue priority and
+/// falls back automatically if unsupported or unpermitted).
 pub fn Compositor.open(validation: bool) -> Result[Compositor, str] {
-    let dev = try gpu.Device.open(gpu.Options { headless: true, validation })
-    return Compositor.with(dev)
+    let dev = try gpu.Device.open(gpu.Options { headless: true, validation, priority: gpu.Priority.Realtime })
+    var c = try Compositor.with(dev)
+    c.validation = validation
+    c.want_priority = gpu.Priority.Realtime
+    return Ok(c)
 }
 
 pub fn Compositor.with(take dev: gpu.Device) -> Result[Compositor, str] {
-    var c = Compositor { dev, texs: map.Map.new(), shms: map.Map.new(), targets: map.Map.new() }
+    let prio = dev.priority()
+    var c = Compositor { dev, want_priority: prio, texs: map.Map.new(), shms: map.Map.new(), targets: map.Map.new() }
     c.canvas = Some(try draw2d.Canvas.create(mut c.dev, gpu.Format.B8G8R8A8_UNORM))
     return Ok(c)
 }
@@ -75,9 +94,77 @@ pub fn Compositor.formats(self) -> List[(u32, u64)] {
     return format.dmabuf_formats(self.dev)
 }
 
+/// Every fourcc and modifier writable as a GPU dmabuf capture target.
+pub fn Compositor.capture_formats(self) -> List[(u32, u64)] {
+    return format.capture_formats(self.dev)
+}
+
 /// The GPU's DRM node (major, minor), for linux-dmabuf and drm_syncobj.
 pub fn Compositor.render_node(self) -> Option[(i64, i64)] {
     return self.dev.drm_node()
+}
+
+/// Granted Vulkan global queue priority (`VK_QUEUE_GLOBAL_PRIORITY_*`, 0 if default).
+pub fn Compositor.gpu_priority(self) -> i32 {
+    return self.dev.priority().as_i32()
+}
+
+/// True if the Vulkan device reported `VK_ERROR_DEVICE_LOST`.
+pub fn Compositor.device_lost(self) -> bool {
+    return self.dev.lost()
+}
+
+/// Mark the GPU device lost (used by device-lost recovery tests).
+pub fn Compositor.mark_lost(mut self) {
+    self.dev.mark_lost()
+}
+
+/// Number of completed GPU device-lost recoveries.
+pub fn Compositor.resets(self) -> int {
+    return self.resets
+}
+
+/// Add the renderer's GPU priority and reset counters to `s`.
+pub fn Compositor.stats(self, mut s: types.Stats) {
+    s.gpu_priority = self.dev.priority().as_i32()
+    s.gpu_resets = self.resets
+}
+
+/// Rebuild the Vulkan device, canvases and output scenes after device loss.
+/// Caller (`Display`) re-imports client textures and re-acquires output targets.
+pub fn Compositor.recover(mut self) -> Result[(), str] {
+    var new_dev = try gpu.Device.open(gpu.Options { headless: true, validation: self.validation, priority: self.want_priority })
+    let new_canvas = try draw2d.Canvas.create(mut new_dev, gpu.Format.B8G8R8A8_UNORM)
+    if let Some(u) = self.uploads.take() {
+        var enc = u
+        self.dev.cancel(take enc)
+    }
+    if not self.dev.lost() {
+        discard self.dev.idle()
+    }
+    self.texs.clear()
+    self.shms.clear()
+    self.targets.clear()
+    discard self.canvas.take()
+    discard self.canvas_rgba.take()
+    self.dev = new_dev
+    self.canvas = Some(new_canvas)
+    for o in 0..self.outputs.len() {
+        let prev = mem.replace(mut self.outputs[o], blank())
+        if prev.alive {
+            self.outputs[o] = Output {
+                scene: vc.Scene.new(prev.width, prev.height, prev.background),
+                width: prev.width,
+                height: prev.height,
+                background: prev.background,
+                alive: true,
+                by_key: map.Map.new(),
+                by_id: map.Map.new(),
+            }
+        }
+    }
+    self.resets += 1
+    return Ok(())
 }
 
 /// Output `o` (the output's index) is `width` x `height`.
@@ -85,11 +172,21 @@ pub fn Compositor.add_output(mut self, o: int, width: u32, height: u32, backgrou
     while self.outputs.len() <= o {
         self.outputs.push(blank())
     }
-    self.outputs[o] = Output { scene: vc.Scene.new(width, height, background) }
+    self.outputs[o] = Output {
+        scene: vc.Scene.new(width, height, background),
+        width,
+        height,
+        background,
+        alive: true,
+        by_key: map.Map.new(),
+        by_id: map.Map.new(),
+    }
 }
 
 pub fn Compositor.resize(mut self, o: int, width: u32, height: u32) {
     if o < self.outputs.len() {
+        self.outputs[o].width = width
+        self.outputs[o].height = height
         self.outputs[o].scene.resize(width, height)
     }
 }
@@ -97,8 +194,8 @@ pub fn Compositor.resize(mut self, o: int, width: u32, height: u32) {
 pub fn Compositor.remove_output(mut self, o: int) {
     if o < self.outputs.len() {
         self.outputs[o].alive = false
-        self.outputs[o].keys.clear()
-        self.outputs[o].ids.clear()
+        self.outputs[o].by_key.clear()
+        self.outputs[o].by_id.clear()
     }
 }
 
@@ -109,83 +206,67 @@ fn view(p: Placement, t: gpu.Texture) -> vc.View {
 }
 
 /// Show `ps` (back to front) on output `o` from the next frame: views are
-/// added, changed, restacked and removed by key, and only that is damaged.
+/// added, changed, restacked and removed by key in O(N) time, and only what
+/// changed is damaged.
 pub fn Compositor.layout(mut self, o: int, placements: &[Placement]) {
     guard o < self.outputs.len() and self.outputs[o].alive else {
         return
     }
-    // Placements whose texture is not here (yet) are not shown.
-    var ps = mem.replace(mut self.views, [])
-    ps.clear()
-    for p in placements {
-        if let Some(t) = self.texs.get(p.tex) {
-            ps.push((p.key, view(p, t)))
-        }
-    }
     var out = mem.replace(mut self.outputs[o], blank())
-    // Gone keys.
-    var i = out.keys.len() - 1
-    while i >= 0 {
-        let k = out.keys[i]
-        var keep = false
-        for p in ps {
-            if p.0 == k {
-                keep = true
-                break
+    out.gen += 1
+    let gen = out.gen
+    var order = mem.replace(mut self.order, [])
+    order.clear()
+    for p in placements {
+        guard let Some(t) = self.texs.get(p.tex) else {
+            continue
+        }
+        let v = view(p, t)
+        if let Some((id, seen_gen, _)) = out.by_key.get(p.key) {
+            if seen_gen == gen {
+                continue
             }
-        }
-        if not keep {
-            out.scene.remove(out.ids[i])
-            discard out.keys.remove(i)
-            discard out.ids.remove(i)
-        }
-        i -= 1
-    }
-    // New and changed views; then the order.
-    var ordered = true
-    var n = 0
-    for (key, v) in ps {
-        let at = out.keys.position(fn(k) => k == key).unwrap_or(-1)
-        if at < 0 {
-            let id = out.scene.add(v)
-            out.keys.push(key)
-            out.ids.push(id)
-            ordered = ordered and n == out.keys.len() - 1
+            out.scene.set(id, v)
+            discard out.by_key.insert(p.key, (id, gen, p.tex))
+            order.push(id)
         } else {
-            out.scene.set(out.ids[at], v)
-            ordered = ordered and at == n
+            let id = out.scene.add(v)
+            discard out.by_key.insert(p.key, (id, gen, p.tex))
+            discard out.by_id.insert(id, p.key)
+            order.push(id)
         }
-        n += 1
     }
-    if not ordered {
-        var keys: List[u64] = []
-        var ids: List[u32] = []
-        var prev: u32 = 0
-        for (key, _) in ps {
-            let at = out.keys.position(fn(k) => k == key).unwrap_or(-1)
-            if at >= 0 {
-                let id = out.ids[at]
-                out.scene.place_above(id, prev)
-                prev = id
-                keys.push(key)
-                ids.push(id)
-            }
+    var rm_keys = mem.replace(mut self.rm_keys, [])
+    var rm_ids = mem.replace(mut self.rm_ids, [])
+    rm_keys.clear()
+    rm_ids.clear()
+    for e in out.by_key.entries() {
+        if e.val.1 != gen {
+            rm_keys.push(e.key)
+            rm_ids.push(e.val.0)
         }
-        out.keys = keys
-        out.ids = ids
     }
+    if not rm_keys.is_empty() {
+        for i in 0..rm_keys.len() {
+            discard out.by_key.remove(rm_keys[i])
+            discard out.by_id.remove(rm_ids[i])
+        }
+        out.scene.remove_many(rm_ids)
+    }
+    out.scene.reorder(order)
+    self.order = order
+    self.rm_keys = rm_keys
+    self.rm_ids = rm_ids
     self.outputs[o] = out
-    self.views = ps
 }
 
 /// The client drew into key `key`'s texture: `rects` in texture pixels
 /// (empty: all of it). Damages every output showing it.
 pub fn Compositor.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {
     for o in 0..self.outputs.len() {
-        guard let Some(at) = self.outputs[o].keys.position(fn(k) => k == key) else {
+        guard let Some((id, _, _)) = self.outputs[o].by_key.get(key) else {
             continue
         }
-        let id = self.outputs[o].ids[at]
         if rects.is_empty() {
             self.outputs[o].scene.commit(id, None)
         }
@@ -213,10 +294,10 @@ pub fn Compositor.visible(self, o: int, key: u64) -> bool {
     guard o < self.outputs.len() else {
         return false
     }
-    guard let Some(at) = self.outputs[o].keys.position(fn(k) => k == key) else {
+    guard let Some((id, _, _)) = self.outputs[o].by_key.get(key) else {
         return false
     }
-    return self.outputs[o].scene.visible(self.outputs[o].ids[at])
+    return self.outputs[o].scene.visible(id)
 }
 
 /// The key of the view that alone fills output `o` as it is, when one
@@ -228,8 +309,60 @@ pub fn Compositor.scanout(self, o: int) -> Option[u64] {
     guard let Some(id) = self.outputs[o].scene.scanout() else {
         return None
     }
-    let at = self.outputs[o].ids.position(fn(x) => x == id).unwrap_or(-1)
-    return if at < 0 { None } else { Some(self.outputs[o].keys[at]) }
+    return self.outputs[o].by_id.get(id)
+}
+
+/// Up to `max_count` placement candidates eligible for hardware overlay
+/// planes above the primary plane on output `o` (top to bottom).
+pub fn Compositor.overlay_candidates(self, o: int, max_count: int) -> List[types.OverlayCand] {
+    var out: List[types.OverlayCand] = []
+    guard o < self.outputs.len() and self.outputs[o].alive else {
+        return out
+    }
+    for id in self.outputs[o].scene.overlay_candidates(max_count) {
+        guard let Some(key) = self.outputs[o].by_id.get(id) else {
+            continue
+        }
+        guard let Some((_, _, tex)) = self.outputs[o].by_key.get(key) else {
+            continue
+        }
+        guard let Some(v) = self.outputs[o].scene.get(id) else {
+            continue
+        }
+        let w = if v.w > 0.0 { v.w } else if not v.src.is_empty() { v.src.w } else { f32(v.tex.width()) }
+        let h = if v.h > 0.0 { v.h } else if not v.src.is_empty() { v.src.h } else { f32(v.tex.height()) }
+        let src = types.Rect { x: v.src.x, y: v.src.y, w: v.src.w, h: v.src.h }
+        let opaque = v.tex.opaque() or (v.opaque.w >= w and v.opaque.h >= h)
+        out.push(types.OverlayCand {
+            key,
+            tex,
+            x: i32(v.x),
+            y: i32(v.y),
+            w: i32(w),
+            h: i32(h),
+            src,
+            transform: u32(v.transform),
+            opaque,
+        })
+    }
+    return out
+}
+
+/// Mark placements `keys` as hardware-promoted overlays on output `o` so
+/// primary composition skips them while damaging primary on transitions.
+pub fn Compositor.set_overlays(mut self, o: int, keys: &[u64]) {
+    guard o < self.outputs.len() and self.outputs[o].alive else {
+        return
+    }
+    var ids = mem.replace(mut self.ov_ids, [])
+    ids.clear()
+    for key in keys {
+        if let Some((id, _, _)) = self.outputs[o].by_key.get(key) {
+            ids.push(id)
+        }
+    }
+    self.outputs[o].scene.set_overlays(ids)
+    self.ov_ids = ids
 }
 
 // ------------------------------------------------------------- textures
@@ -260,14 +393,13 @@ pub fn Compositor.forget(mut self, key: u64) {
     discard self.shms.remove(key)
 }
 
-/// Texture `key` is a single-plane dmabuf (the descriptor stays the
+/// Texture `key` is a 1..4 plane dmabuf (the plane fds stay the
 /// caller's); false when the GPU cannot sample it.
 pub fn Compositor.import_dmabuf(mut self, key: u64, d: types.Dmabuf) -> bool {
-    guard d.planes == 1 else {
+    guard d.planes >= 1 and d.planes <= 4 else {
         return false
     }
-    let p = d.plane[0]
-    guard let Ok(t) = format.import_dmabuf(mut self.dev, p.fd, d.width, d.height, d.format, d.modifier, p.offset, p.stride) else {
+    guard let Ok(t) = format.import_dmabuf(mut self.dev, d) else {
         return false
     }
     self.put(key, t)
@@ -378,7 +510,15 @@ pub fn Compositor.shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> b
     return self.write(key, bytes, stride, rect)
 }
 
-// -------------------------------------------------------------- targets
+// -------------------------------------------------------------- targets & capture
+
+fn Compositor.flush_uploads(mut self) -> Result[(), str] {
+    if let Some(u) = self.uploads.take() {
+        var enc = u
+        discard try self.dev.submit(take enc)
+    }
+    return Ok(())
+}
 
 /// Render targets an output asked for.
 pub fn Compositor.targets(mut self, w: types.Want) -> Result[List[types.Target], str] {
@@ -405,8 +545,12 @@ pub fn Compositor.targets(mut self, w: types.Want) -> Result[List[types.Target],
         if w.export {
             let (t, b) = try self.dev.export_dmabuf_with(desc, mods)
             discard self.targets.insert(key, t)
-            var buf = types.Dmabuf { width: w.width, height: w.height, format: w.format, modifier: b.modifier, planes: 1 }
-            buf.plane[0] = types.Plane { fd: int(b.fd), offset: u32(b.offset), stride: u32(b.stride) }
+            let n = b.plane_count()
+            var buf = types.Dmabuf { width: w.width, height: w.height, format: w.format, modifier: b.modifier, planes: n }
+            for i in 0..n {
+                let p = b.plane(i)
+                buf.plane[i] = types.Plane { fd: int(p.fd), offset: u32(p.offset), stride: u32(p.stride) }
+            }
             out.push(types.Target { key, buf })
         } else {
             discard self.targets.insert(key, try self.dev.texture(desc))
@@ -427,10 +571,7 @@ pub fn Compositor.drop_target(mut self, key: u64) {
 /// frames old: the sync_file fence of the drawing, or None when the image
 /// is already up to date.
 pub fn Compositor.render(mut self, o: int, key: u64, age: u32) -> Result[Option[int], str] {
-    if let Some(u) = self.uploads.take() {
-        var enc = u
-        discard try self.dev.submit(take enc)
-    }
+    try self.flush_uploads()
     guard o < self.outputs.len() else {
         return Ok(None)
     }
@@ -466,6 +607,187 @@ pub fn Compositor.read(mut self, key: u64) -> Result[List[u8], str] {
     return self.dev.read_texture(t)
 }
 
+fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encoder, dst: gpu.Texture, ps: &[Placement]) -> Result[(), str] {
+    cv.clear()
+    let w = dst.width()
+    let h = dst.height()
+    cv.rect(draw2d.Rect { w: f32(w), h: f32(h) }, vec4(0.0))
+    for p in ps {
+        guard let Some(t) = self.texs.get(p.tex) else {
+            continue
+        }
+        let v = view(p, t)
+        let pw = if v.w > 0.0 { v.w } else if not v.src.is_empty() { v.src.w } else { f32(t.width()) }
+        let ph = if v.h > 0.0 { v.h } else if not v.src.is_empty() { v.src.h } else { f32(t.height()) }
+        let r = draw2d.Rect { x: v.x, y: v.y, w: pw, h: ph }
+        let src_rect = if v.src.is_empty() {
+            draw2d.Rect { w: 1.0, h: 1.0 }
+        } else {
+            let tw = f32(t.width())
+            let th = f32(t.height())
+            let pic = if v.transform.swaps() { vec2(th, tw) } else { vec2(tw, th) }
+            draw2d.Rect { x: v.src.x / pic.x, y: v.src.y / pic.y, w: v.src.w / pic.x, h: v.src.h / pic.y }
+        }
+        if v.shadow > 0.0 {
+            cv.shadow(r, vec4(0.0, 0.0, 0.0, 0.45 * v.opacity), v.radius, v.shadow)
+        }
+        cv.texture(t, r, src_rect, v.transform, vec4(1.0, 1.0, 1.0, v.opacity), v.radius)
+        e.acquire(t)
+    }
+    let none: List[draw2d.Rect] = []
+    try cv.draw(mut self.dev, mut e, gpu.Pass { target: dst, load: gpu.Load.Clear, clear: [0.0, 0.0, 0.0, 0.0] }, none)
+    for p in ps {
+        if let Some(t) = self.texs.get(p.tex) {
+            e.release(t)
+        }
+    }
+    return Ok(())
+}
+
+/// Zero-copy GPU copy from render target `target_key` into a client's capture
+/// dmabuf `dst_buf`, returning the completion sync_file fd (or -1 if already signaled).
+pub fn Compositor.copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, sx: i32, sy: i32, w: i32, h: i32) -> Result[int, str] {
+    try self.flush_uploads()
+    guard let Some(src) = self.targets.get(target_key) else {
+        return Err("no render target {target_key}")
+    }
+    guard w > 0 and h > 0 and w <= dst_buf.width and h <= dst_buf.height else {
+        return Err("invalid capture copy rect {w}x{h} into {dst_buf.width}x{dst_buf.height}")
+    }
+    let dst = try format.import_dmabuf_target(mut self.dev, dst_buf)
+    var e = match self.dev.encoder() {
+        Ok(e) => e
+        Err(err) => {
+            self.dev.destroy_texture(dst)
+            return Err(err)
+        }
+    }
+    e.acquire(dst)
+    e.copy_texture(src, dst, sx, sy, 0, 0, u32(w), u32(h))
+    e.release(dst)
+    let res = self.dev.submit_sync_file(take e)
+    self.dev.destroy_texture(dst)
+    let (_, fence) = try res
+    return Ok(int(fence))
+}
+
+/// Render `ps` into an offscreen `width` x `height` B8G8R8A8 target and return pixels.
+pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: &[Placement]) -> Result[List[u8], str] {
+    try self.flush_uploads()
+    guard width > 0 and height > 0 else {
+        return Err("invalid offscreen capture size {width}x{height}")
+    }
+    let dst = try self.dev.texture(gpu.TextureDesc { width, height, format: gpu.Format.B8G8R8A8_UNORM, target: true })
+    guard let Some(cv) = self.canvas.take() else {
+        self.dev.destroy_texture(dst)
+        return Err("no canvas")
+    }
+    var canvas = cv
+    var e = match self.dev.encoder() {
+        Ok(e) => e
+        Err(err) => {
+            self.canvas = Some(canvas)
+            self.dev.destroy_texture(dst)
+            return Err(err)
+        }
+    }
+    let r = self.draw_placements(mut canvas, mut e, dst, ps)
+    self.canvas = Some(canvas)
+    guard r.is_ok() else {
+        self.dev.cancel(take e)
+        self.dev.destroy_texture(dst)
+        return Err(r.unwrap_err())
+    }
+    let ticket = match self.dev.submit(take e) {
+        Ok(t) => t
+        Err(err) => {
+            self.dev.destroy_texture(dst)
+            return Err(err)
+        }
+    }
+    if let Err(err) = self.dev.wait(ticket) {
+        self.dev.destroy_texture(dst)
+        return Err(err)
+    }
+    let px = self.dev.read_texture(dst)
+    self.dev.destroy_texture(dst)
+    return px
+}
+
+/// Render `ps` directly into (or copy into) a client's capture dmabuf `dst_buf`,
+/// returning the completion sync_file fd (or -1 if already signaled).
+pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &[Placement]) -> Result[int, str] {
+    try self.flush_uploads()
+    guard let Some((vf, _)) = format.vk_format(dst_buf.format) else {
+        return Err("capture format {dst_buf.format:08x} is not supported")
+    }
+    let dst = try format.import_dmabuf_target(mut self.dev, dst_buf)
+    let is_rgba = vf == gpu.Format.R8G8B8A8_UNORM
+    if dst.can_target() and is_rgba and self.canvas_rgba.is_none() {
+        match draw2d.Canvas.create(mut self.dev, gpu.Format.R8G8B8A8_UNORM) {
+            Ok(c) => self.canvas_rgba = Some(c)
+            Err(err) => {
+                self.dev.destroy_texture(dst)
+                return Err(err)
+            }
+        }
+    }
+    guard let Some(got_cv) = if dst.can_target() and is_rgba { self.canvas_rgba.take() } else { self.canvas.take() } else {
+        self.dev.destroy_texture(dst)
+        return Err("no canvas")
+    }
+    var cv = got_cv
+    var e = match self.dev.encoder() {
+        Ok(e) => e
+        Err(err) => {
+            if dst.can_target() and is_rgba { self.canvas_rgba = Some(cv) } else { self.canvas = Some(cv) }
+            self.dev.destroy_texture(dst)
+            return Err(err)
+        }
+    }
+    if dst.can_target() {
+        e.acquire(dst)
+        let r = self.draw_placements(mut cv, mut e, dst, ps)
+        if is_rgba { self.canvas_rgba = Some(cv) } else { self.canvas = Some(cv) }
+        guard r.is_ok() else {
+            self.dev.cancel(take e)
+            self.dev.destroy_texture(dst)
+            return Err(r.unwrap_err())
+        }
+        e.release(dst)
+        let res = self.dev.submit_sync_file(take e)
+        self.dev.destroy_texture(dst)
+        let (_, fence) = try res
+        return Ok(int(fence))
+    }
+    // Modifier supports TRANSFER_DST only: render offscreen then copy/blit to dmabuf.
+    let tmp = match self.dev.texture(gpu.TextureDesc { width: dst.width(), height: dst.height(), format: gpu.Format.B8G8R8A8_UNORM, target: true }) {
+        Ok(t) => t
+        Err(err) => {
+            self.canvas = Some(cv)
+            self.dev.cancel(take e)
+            self.dev.destroy_texture(dst)
+            return Err(err)
+        }
+    }
+    let r = self.draw_placements(mut cv, mut e, tmp, ps)
+    self.canvas = Some(cv)
+    guard r.is_ok() else {
+        self.dev.cancel(take e)
+        self.dev.destroy_texture(tmp)
+        self.dev.destroy_texture(dst)
+        return Err(r.unwrap_err())
+    }
+    e.acquire(dst)
+    e.copy_texture(tmp, dst, 0, 0, 0, 0, dst.width(), dst.height())
+    e.release(dst)
+    let res = self.dev.submit_sync_file(take e)
+    self.dev.destroy_texture(tmp)
+    self.dev.destroy_texture(dst)
+    let (_, fence) = try res
+    return Ok(int(fence))
+}
+
 /// What the last frame of output `o` changed (damage for KMS and parents).
 pub fn Compositor.changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {
     guard o < self.outputs.len() else {
@@ -478,7 +800,9 @@ pub fn Compositor.changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {
 
 /// Free everything (after the outputs let go of their targets).
 pub fn Compositor.close(mut self) {
-    discard self.dev.idle()
+    if not self.dev.lost() {
+        discard self.dev.idle()
+    }
     if let Some(u) = self.uploads.take() {
         var enc = u
         self.dev.cancel(take enc)
@@ -497,6 +821,9 @@ pub fn Compositor.close(mut self) {
     self.targets.clear()
     self.shms.clear()
     if let Some(c) = self.canvas.take() {
+        c.destroy(mut self.dev)
+    }
+    if let Some(c) = self.canvas_rgba.take() {
         c.destroy(mut self.dev)
     }
 }

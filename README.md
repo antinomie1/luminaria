@@ -52,9 +52,9 @@ wlr-protocols. The server speaks:
 | Desktop | wlr-layer-shell 5, ext-session-lock, xdg-output 3, ext-idle-notify 2, idle-inhibit |
 | Input | relative-pointer, pointer-constraints, pointer-gestures 3, cursor-shape 2, keyboard-shortcuts-inhibit, text-input-v3, input-method-v2, virtual-keyboard |
 | Selections | clipboard, primary selection, ext-data-control, drag and drop with actions |
-| Capture and control | ext-image-copy-capture with output sources (shm), wlr-output-management 4, security-context (sandboxed clients do not see privileged globals) |
+| Capture and control | ext-image-copy-capture with output & toplevel window sources (shm and zero-copy dmabuf), wlr-output-management 4, security-context (sandboxed clients do not see privileged globals) |
 
-Not yet: tablets, dmabuf and window capture.
+Not yet: tablets (`tablet-v2`).
 
 ## Writing a compositor
 
@@ -93,6 +93,21 @@ while true {
   (one `sendmsg` each) and sleeps in epoll; an idle desktop has no timers
   armed. The compositor's own descriptors and timers join the loop
   (`watch`, `timer`); `fd` and `poll` embed it in another loop.
+- **`Display.layout` & `rebuild` scale cleanly.** Placement diffs run in
+  O(N) / O(N log N) (map index + patience-sorting LIS restack) without
+  per-frame scene/popup copies or O(Windows × Popups) scans, and shm uploads
+  are queued O(dirty surfaces) per frame.
+- **Multi-plane dmabuf & hardware overlays.** Client dmabufs support 1..4
+  planes (single-BO and `DISJOINT`). Eligible imported dmabufs are promoted to
+  hardware overlay planes (KMS `TEST_ONLY` with z-order blocking) and excluded
+  from primary GPU composition.
+- **GPU priority & device-lost recovery.** Vulkan queues request
+  `VK_KHR/EXT_global_priority` (`Realtime` -> `High` -> `Medium` -> `Default`),
+  and `VK_ERROR_DEVICE_LOST` resets targets, recreates GPU resources/textures,
+  and emits `Event.GpuReset`.
+- **Multiple seats.** Secondary logical seats (`add_seat`, `assign_device_seat`)
+  maintain independent pointer positions, keyboard focus, XKB keymaps, grabs,
+  idle tracking, and software cursors.
 - **`accept` is the default.** Input goes to the surface under the pointer
   (hit test with implicit grabs) or with keyboard focus, new windows get a
   configure, maximize and fullscreen requests are granted on the window's
@@ -165,19 +180,20 @@ sheaf run -p tiny -- -s foot    # on a VT, or as a window in your session
 ### Backends
 
 | Backend | Output | Input |
-|---------|--------|-------|
-| DRM | atomic KMS on a commit thread: primary and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat, xkb |
+|---|---|---|
+| DRM | atomic KMS on a commit thread: primary, overlay and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat (multi-seat), xkb |
 | Nested | a window of the parent compositor (its title bar and borders through xdg-decoration), dmabufs over linux-dmabuf with implicit fences | the parent's seat and keymap |
-| Headless | textures shown on a vblank grid at the mode's refresh | `inject` |
+| Headless | textures shown on a vblank grid at the mode's refresh | `inject` / `inject_on` |
 
 Release build, measured on this machine (`sheaf test --release`):
 
 | What | Time |
 |------|------|
-| A 1920x1080 frame, 50 rounded, shadowed windows, one moving: CPU to record and submit | 8 us |
-| The same, until the GPU is done | 46 us |
-| Hit test over 512 surfaces, worst case (integer SIMD, 8 per step) | 251 ns |
-| Gate (`tests/probe.mica`): 1280x720 at 240 Hz, 50 windows, one dragged by 1000 Hz input, 480 frames | no missed frame, interval p99 4.17 ms, frame time p50 67 us / p99 212 us, about 43k damaged px per frame (4.7% of the screen) |
+| A 1920x1080 frame, 50 rounded, shadowed windows, one moving: CPU to record and submit | 9 us |
+| The same, until the GPU is done | 45 us |
+| 1000 placements: `Compositor.layout` diff / `Display.rebuild` | 75 us / 160 us |
+| Hit test over 512 surfaces, worst case (integer SIMD, 8 per step) | 252 ns |
+| Gate (`tests/probe.mica`): 1280x720 at 240 Hz, 50 windows, one dragged by 1000 Hz input, 480 frames | no missed frame, interval p99 4.17 ms, frame time p50 67 us / p99 214 us, about 43k damaged px per frame (4.7% of the screen) |
 
 ## Wire and protocol
 
@@ -233,8 +249,8 @@ Release build, through a Unix socket, 128 messages per flush:
 
 | Direction | Per message |
 |-----------|-------------|
-| Request: encode, send, receive, decode | ~60 ns |
-| Event (`wl_pointer.motion`) | ~48 ns |
+| Request: encode, send, receive, decode | 39 ns |
+| Event (`wl_pointer.motion`) | 48 ns |
 
 ```sh
 sheaf run -p luminaria_scanner -- protocols luminaria_proto/src   # after editing protocols/
@@ -305,17 +321,16 @@ sheaf test    # luminaria: a libwayland xdg window (built with cc) and foot on a
               # headless output: configured, composited, read back, focused,
               # clicked; server: commits, transactions, toplevels,
               # subsurfaces, popups, focus, dmabuf waits, a run-time
-              # extension; compose: diffs, uploads, render targets; a custom
-              # output and software renderer; backend: xkb, headless frames, the DRM card's
-              # displays, a nested window; protocols: layer surfaces, the
-              # session lock, selections, input methods, decorations and
-              # activation, the toplevel list, pointer locks, idle, single
-              # pixels, drag and drop, capture, sandboxes, output
-              # configuration; the shell on a headless output: panel
-              # zones, lock screen, a captured frame, an applied output
-              # configuration; the performance gate (a dragged window
-              # over 50: frame interval, frame time and damage bounds);
-              # wire, proto, sys as before
+              # extension; compose: O(N) diffs, multi-plane dmabuf, overlays,
+              # GPU recovery, uploads, render targets; custom output/renderer,
+              # overlay promotion, GPU reset, multi-seat, 1000-placement
+              # rebuild; backend: xkb, headless frames, DRM displays, nested;
+              # protocols: layer surfaces, session lock, selections, input
+              # methods, decorations and activation, toplevel list, pointer
+              # locks, idle, single pixels, drag and drop, shm/dmabuf/window
+              # capture, sandboxes, output config; shell: panel zones, lock
+              # screen, output & window shm/dmabuf capture, output config;
+              # performance gate; wire, proto, sys
 sheaf test --release -p luminaria_compose   # frame cost
 sheaf test --release -p luminaria           # hit testing, the gate's numbers
 sheaf test --release -p luminaria_proto     # wire throughput

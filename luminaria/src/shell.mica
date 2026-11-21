@@ -54,7 +54,7 @@ fn layer_output[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
             return s.o
         }
     }
-    var o = d.output_at(d.px, d.py)
+    var o = if d.seats.is_empty() { -1 } else { d.output_at(d.seats[0].px, d.seats[0].py) }
     if o < 0 {
         for k in 0..d.outs.len() {
             if d.outs[k].alive {
@@ -70,6 +70,30 @@ fn layer_output[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
 /// sizes and positions; configure what changed. Outputs whose usable area
 /// changed report OutputArea.
 fn arrange[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    guard d.srv.has_layers() else {
+        guard d.had_layers else {
+            return
+        }
+        for o in 0..d.outs.len() {
+            guard d.outs[o].alive else {
+                continue
+            }
+            let ax = d.outs[o].x
+            let ay = d.outs[o].y
+            let aw = d.outs[o].lw()
+            let ah = d.outs[o].lh()
+            if ax != d.outs[o].ux or ay != d.outs[o].uy or aw != d.outs[o].uw or ah != d.outs[o].uh {
+                d.outs[o].ux = ax
+                d.outs[o].uy = ay
+                d.outs[o].uw = aw
+                d.outs[o].uh = ah
+                d.emit(display.Event.OutputArea(d.outs[o].sout))
+            }
+        }
+        d.had_layers = false
+        return
+    }
+    d.had_layers = true
     let ls = d.srv.layers()
     var areas: List[(f64, f64, f64, f64)] = []
     for o in 0..d.outs.len() {
@@ -148,7 +172,10 @@ fn arrange[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
 }
 
 /// Place the mapped layer surfaces of `layer` (and their popups).
-fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], layer: u32, mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
+fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], layer: u32, pmap: map.Map[server.Surface, List[server.Popup]], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    guard d.srv.has_layers() else {
+        return
+    }
     for l in d.srv.layers() {
         let info = d.srv.layer(l)
         guard info.mapped and info.state.layer == layer else {
@@ -157,27 +184,18 @@ fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         guard let Some(sp) = d.spots.get(l) else {
             continue
         }
-        d.place_tree(info.surface, sp.x, sp.y, 1.0, layout.Style {}, 1.0, mut per, mut masks)
-        place_popups(mut d, info.surface, mut per, mut masks)
+        d.place_tree(info.surface, sp.x, sp.y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
+        place_popups(mut d, info.surface, pmap, 1.0, None, mut per, mut masks)
     }
 }
 
-/// Popups whose chain of parents starts at `root` (placed already).
-fn place_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], root: server.Surface, mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
-    for pp in d.popups.clone() {
-        var top = d.srv.popup_parent(pp)
-        for _ in 0..16 {
-            guard let Some(t) = top else {
-                break
-            }
-            guard let Some(up) = d.srv.popup_of(t) else {
-                break
-            }
-            top = d.srv.popup_parent(up)
-        }
-        guard top == Some(root) else {
-            continue
-        }
+/// Popups whose chain of parents starts at `root` (placed already), using
+/// the pre-indexed popup map `pmap`.
+fn place_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], root: server.Surface, pmap: map.Map[server.Surface, List[server.Popup]], opacity: f32, owner: Option[server.Window], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    guard let Some(pops) = pmap.get(root) else {
+        return
+    }
+    for pp in pops {
         let ps = d.srv.popup_surface(pp)
         guard d.srv.info(ps).mapped else {
             continue
@@ -193,7 +211,7 @@ fn place_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         let own = d.srv.info(ps).geometry
         let ox = pgx + f64(pgeo.x + g.x - own.x) * psc
         let oy = pgy + f64(pgeo.y + g.y - own.y) * psc
-        d.place_tree(ps, ox, oy, psc, layout.Style {}, 1.0, mut per, mut masks)
+        d.place_tree(ps, ox, oy, psc, layout.Style {}, opacity, owner, mut per, mut masks)
     }
 }
 
@@ -211,20 +229,23 @@ fn place_lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], mu
         guard o >= 0 else {
             continue
         }
-        d.place_tree(s, d.outs[o].x, d.outs[o].y, 1.0, layout.Style {}, 1.0, mut per, mut masks)
+        d.place_tree(s, d.outs[o].x, d.outs[o].y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
     }
 }
 
 /// Input method popups, their top left under the text cursor.
 fn place_ime[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
-    guard let Some((ts, r)) = d.srv.text_cursor(d.seat) else {
-        return
-    }
-    guard let Some((gx, gy, sc)) = d.origins.get(ts) else {
-        return
-    }
-    for s in d.srv.ime_popups(d.seat) {
-        d.place_tree(s, gx + f64(r.x) * sc, gy + f64(r.y + r.h) * sc, sc, layout.Style {}, 1.0, mut per, mut masks)
+    for si in 0..d.seats.len() {
+        let st = d.seats[si].seat
+        guard let Some((ts, r)) = d.srv.text_cursor(st) else {
+            continue
+        }
+        guard let Some((gx, gy, sc)) = d.origins.get(ts) else {
+            continue
+        }
+        for s in d.srv.ime_popups(st) {
+            d.place_tree(s, gx + f64(r.x) * sc, gy + f64(r.y + r.h) * sc, sc, layout.Style {}, 1.0, None, mut per, mut masks)
+        }
     }
 }
 
@@ -253,7 +274,7 @@ fn lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             d.lock_wait.push(o)
         }
     }
-    d.dismiss_popups()
+    d.dismiss_popups_all()
     d.rebuild()
     update_keyboard(mut d)
     if was or d.lock_wait.is_empty() {
@@ -287,12 +308,15 @@ fn presented[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: 
     }
 }
 
-/// Who gets the keyboard: the lock screen, an exclusive layer surface,
-/// a grabbing popup, a layer surface clicked on, else the focused window.
-fn keyboard_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R]) -> Option[server.Surface] {
+/// Who gets the keyboard on seat `si`: the lock screen, an exclusive layer
+/// surface, a grabbing popup, a layer surface clicked on, else the focused window.
+fn keyboard_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: int) -> Option[server.Surface] {
+    guard si >= 0 and si < d.seats.len() else {
+        return None
+    }
     if d.locked {
         var any: Option[server.Surface] = None
-        let here = d.output_at(d.px, d.py)
+        let here = d.output_at(d.seats[si].px, d.seats[si].py)
         for k in d.srv.lock_surfaces() {
             let (s, so, mapped) = d.srv.lock_surface(k)
             guard mapped else {
@@ -322,47 +346,61 @@ fn keyboard_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R]) -
     if best.is_some() {
         return best
     }
-    if let Some(p) = d.grabs.last() {
+    if let Some(p) = d.seats[si].grabs.last() {
         return Some(d.srv.popup_surface(p))
     }
-    if let Some(s) = d.layer_focus {
+    if let Some(s) = d.seats[si].layer_focus {
         return Some(s)
     }
-    return d.focus
+    return d.seats[si].focus
+}
+
+fn update_keyboard_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let t = keyboard_target(d, si)
+    d.srv.keyboard_focus(d.seats[si].seat, t)
+    d.update_constraint_on(si)
 }
 
 fn update_keyboard[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
-    let t = keyboard_target(d)
-    d.srv.keyboard_focus(d.seat, t)
-    d.update_constraint()
+    for si in 0..d.seats.len() {
+        update_keyboard_on(mut d, si)
+    }
 }
 
 /// A click on a layer surface that takes the keyboard on demand.
-fn clicked[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
+fn clicked_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, s: server.Surface) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
     // A popup keeps the focus of what it pops up from.
     guard d.srv.popup_of(s).is_none() else {
         return
     }
     guard let Some(l) = d.srv.layer_of(s) else {
-        if d.layer_focus.is_some() {
-            d.layer_focus = None
-            update_keyboard(mut d)
+        if d.seats[si].layer_focus.is_some() {
+            d.seats[si].layer_focus = None
+            update_keyboard_on(mut d, si)
         }
         return
     }
     let info = d.srv.layer(l)
     if info.state.keyboard != 0 {
-        d.layer_focus = Some(s)
-        update_keyboard(mut d)
+        d.seats[si].layer_focus = Some(s)
+        update_keyboard_on(mut d, si)
     }
 }
 
 /// A layer surface went away.
 fn layer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], l: server.Layer) {
     discard d.spots.remove(l)
-    if let Some(s) = d.layer_focus {
-        if not d.srv.surface_alive(s) or d.srv.layer_of(s).is_none() {
-            d.layer_focus = None
+    for si in 0..d.seats.len() {
+        if let Some(s) = d.seats[si].layer_focus {
+            if not d.srv.surface_alive(s) or d.srv.layer_of(s).is_none() {
+                d.seats[si].layer_focus = None
+            }
         }
     }
 }

@@ -41,7 +41,7 @@ fn Nested.give(mut self, ts: &[types.Target]) {}
 
 fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) {}
 
-fn Nested.scanout(mut self, key: u64, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+fn Nested.scanout(mut self, key: u64, b: types.Dmabuf, rects: &[(i32, i32, i32, i32)]) -> bool {
     return false
 }
 

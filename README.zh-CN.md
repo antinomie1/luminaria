@@ -43,9 +43,9 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 | 桌面 | wlr-layer-shell 5、ext-session-lock、xdg-output 3、ext-idle-notify 2、idle-inhibit |
 | 输入 | relative-pointer、pointer-constraints、pointer-gestures 3、cursor-shape 2、keyboard-shortcuts-inhibit、text-input-v3、input-method-v2、virtual-keyboard |
 | 选区 | 剪贴板、主选区、ext-data-control、带动作协商的拖放 |
-| 截屏与管控 | ext-image-copy-capture（输出源，shm）、wlr-output-management 4、security-context（沙盒客户端看不到特权 global） |
+| 截屏与管控 | ext-image-copy-capture（输出源与窗口源，shm 及零拷贝 dmabuf）、wlr-output-management 4、security-context（沙盒客户端看不到特权 global） |
 
-尚未支持：数位板、dmabuf 截屏和窗口截屏。
+尚未支持：数位板（`tablet-v2`）。
 
 ## 写一个合成器
 
@@ -85,6 +85,16 @@ while true {
 - **`accept` 是默认动作。** 输入发给指针下的表面（命中测试与隐式抓取）或键盘焦点；新窗口得到
   configure；最大化和全屏请求在窗口所在的输出上批准；移动和缩放在库内进行；弹出菜单按 positioner
   定位、点外面就关；被遮住的窗口收到 suspended；Ctrl+Alt+Fn 切 VT。想改的自己处理，其余交给它。
+- **`Display.layout` 与 `rebuild` 可扩展。** 放置表 diff 按索引表 + 耐心排序 LIS 重排以
+  O(N) / O(N log N) 完成，稳态不拷贝放置表或弹出菜单表（避免 O(窗口 × 弹出菜单) 遍历），
+  shm 上传按脏表面队列 O(脏表面) 合并提交。
+- **多平面 dmabuf 与硬件 overlay。** 客户端 dmabuf 支持 1..4 平面（单 BO 与 `DISJOINT`）；符合条件的
+  dmabuf 在通过 KMS `TEST_ONLY` 与 z-order 遮挡检查后提升为硬件 overlay 平面，主合成跳过对应图层。
+- **GPU 优先级与设备丢失恢复。** Vulkan 队列请求 `VK_KHR/EXT_global_priority`（`Realtime` -> `High` ->
+  `Medium` -> `Default` 回退）；遇到 `VK_ERROR_DEVICE_LOST` 时自动重置扫描目标、重建设备与纹理并
+  发出 `Event.GpuReset`。
+- **多 seat。** 支持多个逻辑 seat（`add_seat`、`assign_device_seat`），各自维护独立指针、焦点、
+  keymap、抓取、空闲状态及辅助软件光标。
 - **是布局，不是场景树。** `layout` 接收整张放置表（窗口连同子表面和弹出菜单、合成器自己的图像）；
   每个输出拿到它显示的部分，只重绘变化的部分。`transition_ms` 让库把放置动画到新位置。
 - **操纵按输入速率进行。** `manipulate_move`、`manipulate_resize` 和 `manipulate_pan`（滑动手势，
@@ -128,18 +138,19 @@ sheaf run -p tiny -- -s foot    # 在 VT 上，或作为当前桌面里的一个
 
 | 后端 | 输出 | 输入 |
 |------|------|------|
-| DRM | 原子 KMS（提交线程）：主平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、热插拔 | libinput（经 libseat）、xkb |
+| DRM | 原子 KMS（提交线程）：主平面、overlay 平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、热插拔 | libinput（经 libseat，支持多 seat）、xkb |
 | 嵌套 | 父合成器里的一个窗口（标题栏和边框经 xdg-decoration 由父合成器画），dmabuf 经 linux-dmabuf 交出，带隐式栅栏 | 父合成器的 seat 和 keymap |
-| 无头 | 按模式刷新率的 vblank 网格显示的纹理 | `inject` |
+| 无头 | 按模式刷新率的 vblank 网格显示的纹理 | `inject` / `inject_on` |
 
 release 构建，本机实测（`sheaf test --release`）：
 
 | 项目 | 时间 |
 |------|------|
-| 1920x1080 一帧，50 个圆角带阴影的窗口、一个在动：CPU 录制并提交 | 8 µs |
-| 同上，直到 GPU 完成 | 46 µs |
-| 命中测试，512 个表面，最坏情况（整数 SIMD，一步 8 个） | 251 ns |
-| 门禁（`tests/probe.mica`）：1280x720@240 Hz，50 个窗口、输入按 1000 Hz 拖动一个，480 帧 | 0 漏帧，间隔 P99 4.17 ms，帧耗时 P50 67 µs / P99 212 µs，每帧损坏约 4.3 万像素（全屏的 4.7%） |
+| 1920x1080 一帧，50 个圆角带阴影的窗口、一个在动：CPU 录制并提交 | 9 µs |
+| 同上，直到 GPU 完成 | 45 µs |
+| 1000 个放置项：`Compositor.layout` diff / `Display.rebuild` | 75 µs / 160 µs |
+| 命中测试，512 个表面，最坏情况（整数 SIMD，一步 8 个） | 252 ns |
+| 门禁（`tests/probe.mica`）：1280x720@240 Hz，50 个窗口、输入按 1000 Hz 拖动一个，480 帧 | 0 漏帧，间隔 P99 4.17 ms，帧耗时 P50 67 µs / P99 214 µs，每帧损坏约 4.3 万像素（全屏的 4.7%） |
 
 ## 线协议与协议
 
@@ -186,8 +197,8 @@ release 构建，经 Unix socket，每次 flush 128 条消息：
 
 | 方向 | 每条消息 |
 |------|----------|
-| 请求：编码、发送、接收、解码 | 约 60 ns |
-| 事件（`wl_pointer.motion`） | 约 48 ns |
+| 请求：编码、发送、接收、解码 | 39 ns |
+| 事件（`wl_pointer.motion`） | 48 ns |
 
 ```sh
 sheaf run -p luminaria_scanner -- protocols luminaria_proto/src   # 修改 protocols/ 之后
@@ -245,14 +256,13 @@ MICA=/path/to/mica sys/gen.sh    # 默认 INC=/usr/include
 ```sh
 sheaf test    # luminaria：libwayland xdg 窗口（用 cc 编译）和 foot 在无头输出上：
               # configure、合成、读回、焦点、点击；server：提交、事务、toplevel、
-              # 子表面、弹出菜单、焦点、dmabuf 等待、运行时扩展协议；compose：比对、
-              # 上传、渲染目标；自定义输出端与软件渲染器；
-              # backend：xkb、无头帧、DRM 卡上已连接的显示器、嵌套窗口；
-              # protocols：layer 表面、锁屏、选区、输入法、装饰与激活、
-              # 窗口列表、指针锁定、空闲、单像素缓冲、拖放、截屏、沙盒、
-              # 输出配置；无头输出上的外壳：面板独占区、锁屏、截一帧、
-              # 应用输出配置；性能门禁（50 个窗口上拖动一个：帧间隔、
-              # 帧耗时、损坏的上界）；wire、proto、sys 同前
+              # 子表面、弹出菜单、焦点、dmabuf 等待、运行时扩展协议；compose：O(N)
+              # 比对、多平面 dmabuf、overlay、GPU 恢复、上传、渲染目标；自定义输出端
+              # 与软件渲染器、overlay 提升、GPU 重置、多 seat、千窗口重建基准；
+              # backend：xkb、无头帧、DRM 显示器、嵌套窗口；protocols 与 shell：
+              # layer 表面、锁屏、选区、输入法、装饰与激活、窗口列表、指针锁定、
+              # 空闲、单像素缓冲、拖放、shm/dmabuf/窗口截屏、沙盒、输出配置；
+              # 性能门禁；wire、proto、sys 同前
 sheaf test --release -p luminaria_compose   # 帧开销
 sheaf test --release -p luminaria           # 命中测试、门禁的数字
 sheaf test --release -p luminaria_proto     # 线协议吞吐

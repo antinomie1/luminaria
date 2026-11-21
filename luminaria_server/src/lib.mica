@@ -18,6 +18,8 @@ pub import ext
 
 pub type Server = server.Server
 pub type Event = server.Event
+pub type CaptureTarget = server.CaptureTarget
+pub type CaptureReq = server.CaptureReq
 pub type Request = server.Request
 pub type Dmabuf = server.Dmabuf
 pub type SurfaceInfo = server.SurfaceInfo

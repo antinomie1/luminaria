@@ -39,14 +39,20 @@ fn inhibitor(mut srv: server.Server, ci: u32, i: ii.Inhibitor, take req: ii.Inhi
 
 fn notifier(mut srv: server.Server, ci: u32, take req: idle.NotifierRequest) {
     match req {
-        GetIdleNotification(n, timeout, st) => add(mut srv, ci, n.id, timeout, false)
-        GetInputIdleNotification(n, timeout, st) => add(mut srv, ci, n.id, timeout, true)
+        GetIdleNotification(n, timeout, st) => {
+            let si = srv.slot(ci, st.id)
+            add(mut srv, ci, n.id, timeout, false, si)
+        }
+        GetInputIdleNotification(n, timeout, st) => {
+            let si = srv.slot(ci, st.id)
+            add(mut srv, ci, n.id, timeout, true, si)
+        }
         Destroy => {}
     }
 }
 
-fn add(mut srv: server.Server, ci: u32, id: u32, timeout: u32, input_only: bool) {
-    let k = srv.idles.add(state.IdleData { client: ci, obj: id, timeout_ms: int(timeout), input_only })
+fn add(mut srv: server.Server, ci: u32, id: u32, timeout: u32, input_only: bool, seat: u32) {
+    let k = srv.idles.add(state.IdleData { client: ci, obj: id, seat, timeout_ms: int(timeout), input_only })
     srv.bind(ci, id, k.index)
     srv.push(server.Event.IdleChanged)
 }
@@ -63,15 +69,33 @@ fn notification(mut srv: server.Server, ci: u32, n: idle.Notification, take req:
     }
 }
 
-/// Input arrived at `now`: idle notifications resume.
-fn activity(mut srv: server.Server, now: int) {
+/// Input arrived on `seat` (`state.none` for default/all seats) at `now`: idle notifications resume.
+fn activity_seat(mut srv: server.Server, seat: u32, now: int) {
     srv.last_input = now
+    if seat != state.none and srv.seats.used(int(seat)) {
+        srv.seats.items[int(seat)].last_input = now
+    }
     for k in 0..srv.idles.items.len() {
-        if srv.idles.used(k) and srv.idles.items[k].idle {
+        guard srv.idles.used(k) else {
+            continue
+        }
+        let target_seat = srv.idles.items[k].seat
+        let matches = seat == state.none or target_seat == state.none or target_seat == seat
+        if matches and srv.idles.items[k].idle {
             srv.idles.items[k].idle = false
             idle.Notification { id: srv.idles.items[k].obj }.resumed(mut srv.conns[int(srv.idles.items[k].client)])
         }
     }
+}
+
+/// Input arrived at `now`: idle notifications resume.
+fn activity(mut srv: server.Server, now: int) {
+    for s in 0..srv.seats.items.len() {
+        if srv.seats.used(s) {
+            srv.seats.items[s].last_input = now
+        }
+    }
+    activity_seat(mut srv, state.none, now)
 }
 
 /// Fire the notifications whose timeout passed (those inhibitors hold
@@ -88,7 +112,15 @@ fn check(mut srv: server.Server, now: int, inhibited: bool) -> int {
             held = true
             continue
         }
-        let due = srv.last_input + srv.idles.items[k].timeout_ms * 1000000
+        let target_seat = srv.idles.items[k].seat
+        var last = srv.last_input
+        if target_seat != state.none and srv.seats.used(int(target_seat)) {
+            let sl = srv.seats.items[int(target_seat)].last_input
+            if sl > 0 {
+                last = sl
+            }
+        }
+        let due = last + srv.idles.items[k].timeout_ms * 1000000
         if due <= now {
             srv.idles.items[k].idle = true
             idle.Notification { id: srv.idles.items[k].obj }.idled(mut srv.conns[int(srv.idles.items[k].client)])

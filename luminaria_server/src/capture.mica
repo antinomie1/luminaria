@@ -1,10 +1,6 @@
-// Screen capture: ext-image-capture-source (outputs as sources) and
-// ext-image-copy-capture (screenshots and recording). A session offers
-// the output's size and the shm formats; each frame the client attaches a
-// buffer and asks for the next image. The first frame of a session is
-// taken at once, later ones when the output shows something new. The
-// compositor hands the pixels over with `Server.capture`; they are copied
-// straight into the client's shm buffer. Cursor sessions stop at once.
+// Screen and window capture: ext-image-capture-source (outputs and
+// foreign toplevel windows as sources) and ext-image-copy-capture
+// (shm copy and zero-copy dmabuf capture with async GPU sync_file).
 
 import luminaria_types.pixels as pixels
 import luminaria_proto.wayland as wl
@@ -17,10 +13,63 @@ import server
 fn source_manager(mut srv: server.Server, ci: u32, take req: ics.OutputImageCaptureSourceManagerRequest) {
     match req {
         CreateSource(src, o) => {
-            // The source names its output's slot.
-            srv.bind(ci, src.id, srv.slot(ci, o.id))
+            let oi = srv.slot(ci, o.id)
+            let kind = if oi != state.none and srv.outputs.used(int(oi)) { state.CaptureTargetKind.Output } else { state.CaptureTargetKind.None }
+            let id = srv.capture_sources.add(state.CaptureSourceData { kind, target: oi })
+            srv.bind(ci, src.id, id.index)
         }
         Destroy => {}
+    }
+}
+
+fn toplevel_source_manager(mut srv: server.Server, ci: u32, take req: ics.ForeignToplevelImageCaptureSourceManagerRequest) {
+    match req {
+        CreateSource(src, handle) => {
+            let wi = srv.slot(ci, handle.id)
+            let kind = if wi != state.none and srv.windows.used(int(wi)) { state.CaptureTargetKind.Window } else { state.CaptureTargetKind.None }
+            let id = srv.capture_sources.add(state.CaptureSourceData { kind, target: wi })
+            srv.bind(ci, src.id, id.index)
+        }
+        Destroy => {}
+    }
+}
+
+fn source_destroy(mut srv: server.Server, ci: u32, id: u32) {
+    let k = srv.slot(ci, id)
+    srv.unbind(ci, id)
+    if k != state.none and srv.capture_sources.used(int(k)) {
+        srv.capture_sources.remove(k, state.CaptureSourceData {})
+    }
+}
+
+fn target_alive(srv: server.Server, kind: state.CaptureTargetKind, target: u32) -> bool {
+    return match kind {
+        Output => target != state.none and srv.outputs.used(int(target))
+        Window => target != state.none and srv.windows.used(int(target))
+        None => false
+    }
+}
+
+fn target_size(srv: server.Server, kind: state.CaptureTargetKind, target: u32) -> (i32, i32) {
+    return match kind {
+        Output => {
+            let inf = srv.outputs.items[int(target)].info.clone()
+            (inf.width, inf.height)
+        }
+        Window => {
+            let si = int(srv.windows.items[int(target)].surface)
+            guard srv.surfaces.used(si) else {
+                return (0, 0)
+            }
+            if srv.surfaces.items[si].current.geometry_set {
+                let g = srv.surfaces.items[si].current.geometry
+                if g.w > 0 and g.h > 0 {
+                    return (g.w, g.h)
+                }
+            }
+            (srv.surfaces.items[si].width, srv.surfaces.items[si].height)
+        }
+        None => (0, 0)
     }
 }
 
@@ -31,16 +80,25 @@ fn manager(mut srv: server.Server, ci: u32, take req: icc.ManagerRequest) {
                 srv.fail(ci, sess.id, u32(icc.ManagerError.InvalidOption), "capture options {u32(options)}")
                 return
             }
-            let oi = srv.slot(ci, src.id)
-            let k = srv.captures.add(state.CaptureData { client: ci, obj: sess.id, output: oi })
+            let sid = srv.slot(ci, src.id)
+            var kind = state.CaptureTargetKind.None
+            var target = state.none
+            if sid != state.none and srv.capture_sources.used(int(sid)) {
+                kind = srv.capture_sources.items[int(sid)].kind
+                target = srv.capture_sources.items[int(sid)].target
+            }
+            let paint_cursors = (u32(options) & 1) != 0
+            let k = srv.captures.add(state.CaptureData { client: ci, obj: sess.id, kind, target, paint_cursors })
             srv.bind(ci, sess.id, k.index)
-            guard oi != state.none and srv.outputs.used(int(oi)) else {
+            guard target_alive(srv, kind, target) else {
                 sess.stopped(mut srv.conns[int(ci)])
+                srv.captures.items[int(k.index)].kind = state.CaptureTargetKind.None
+                srv.captures.items[int(k.index)].target = state.none
                 return
             }
             constraints(mut srv, k.index)
         }
-        CreatePointerCursorSession(c, src, p) => {
+        CreatePointerCursorSession(c, _, _) => {
             srv.bind(ci, c.id, state.none)
         }
         Destroy => {}
@@ -63,19 +121,47 @@ fn cursor_session(mut srv: server.Server, ci: u32, c: icc.CursorSession, take re
 /// Buffer size and formats of session `k`, then done.
 fn constraints(mut srv: server.Server, k: u32) {
     let i = int(k)
-    let oi = int(srv.captures.items[i].output)
+    let kind = srv.captures.items[i].kind
+    let target = srv.captures.items[i].target
+    guard target_alive(srv, kind, target) else {
+        return
+    }
+    let (w, h) = target_size(srv, kind, target)
+    guard w > 0 and h > 0 else {
+        return
+    }
+    srv.captures.items[i].width = w
+    srv.captures.items[i].height = h
     let c = int(srv.captures.items[i].client)
     let s = icc.Session { id: srv.captures.items[i].obj }
-    let inf = srv.outputs.items[oi].info.clone()
-    s.buffer_size(mut srv.conns[c], u32(inf.width), u32(inf.height))
+    s.buffer_size(mut srv.conns[c], u32(w), u32(h))
     s.shm_format(mut srv.conns[c], wl.ShmFormat.Argb8888)
     s.shm_format(mut srv.conns[c], wl.ShmFormat.Xrgb8888)
+    if srv.capture_device != 0 and not srv.capture_formats.is_empty() {
+        let dev = srv.capture_device
+        s.dmabuf_device(mut srv.conns[c], bytes_of(dev))
+        var fourccs: List[u32] = []
+        for (fmt, _) in srv.capture_formats {
+            if not fourccs.contains(fmt) {
+                fourccs.push(fmt)
+            }
+        }
+        for fmt in fourccs {
+            var mods: List[u64] = []
+            for (f2, m) in srv.capture_formats {
+                if f2 == fmt {
+                    mods.push(m)
+                }
+            }
+            s.dmabuf_format(mut srv.conns[c], fmt, bytes_of(mods))
+        }
+    }
     s.done(mut srv.conns[c])
 }
 
 fn session(mut srv: server.Server, ci: u32, sess: icc.Session, take req: icc.SessionRequest) {
     let k = srv.slot(ci, sess.id)
-    guard k != state.none else {
+    guard k != state.none and srv.captures.used(int(k)) else {
         return
     }
     match req {
@@ -87,6 +173,7 @@ fn session(mut srv: server.Server, ci: u32, sess: icc.Session, take req: icc.Ses
             srv.captures.items[int(k)].frame = f.id
             srv.captures.items[int(k)].buffer = state.none
             srv.captures.items[int(k)].waiting = false
+            srv.captures.items[int(k)].in_flight = false
             srv.bind(ci, f.id, k)
         }
         Destroy => {
@@ -104,7 +191,7 @@ fn frame(mut srv: server.Server, ci: u32, f: icc.Frame, take req: icc.FrameReque
     let i = int(k)
     match req {
         AttachBuffer(b) => {
-            guard not srv.captures.items[i].waiting else {
+            guard not srv.captures.items[i].waiting and not srv.captures.items[i].in_flight else {
                 srv.fail(ci, f.id, u32(icc.FrameError.AlreadyCaptured), "attach after capture")
                 return
             }
@@ -117,7 +204,7 @@ fn frame(mut srv: server.Server, ci: u32, f: icc.Frame, take req: icc.FrameReque
             }
         }
         Capture => {
-            guard not srv.captures.items[i].waiting else {
+            guard not srv.captures.items[i].waiting and not srv.captures.items[i].in_flight else {
                 srv.fail(ci, f.id, u32(icc.FrameError.AlreadyCaptured), "capture sent twice")
                 return
             }
@@ -125,20 +212,26 @@ fn frame(mut srv: server.Server, ci: u32, f: icc.Frame, take req: icc.FrameReque
                 srv.fail(ci, f.id, u32(icc.FrameError.NoBuffer), "capture without a buffer")
                 return
             }
-            let oi = srv.captures.items[i].output
-            guard oi != state.none and srv.outputs.used(int(oi)) else {
+            let kind = srv.captures.items[i].kind
+            let target = srv.captures.items[i].target
+            guard target_alive(srv, kind, target) else {
                 f.failed(mut srv.conns[int(ci)], icc.FrameFailureReason.Stopped)
                 return
             }
             srv.captures.items[i].waiting = true
             if not srv.captures.items[i].shot {
-                srv.push(server.Event.Capture(ids.Output { id: srv.outputs.id(oi) }))
+                match kind {
+                    Output => srv.push(server.Event.Capture(ids.Output { id: srv.outputs.id(target) }))
+                    Window => srv.push(server.Event.CaptureWindow(ids.Window { id: srv.windows.id(target) }))
+                    None => {}
+                }
             }
         }
         Destroy => {
             srv.unbind(ci, f.id)
             srv.captures.items[i].frame = 0
             srv.captures.items[i].waiting = false
+            srv.captures.items[i].in_flight = false
         }
     }
 }
@@ -150,44 +243,158 @@ fn drop_session(mut srv: server.Server, k: u32) {
     let ci = srv.captures.items[int(k)].client
     let f = srv.captures.items[int(k)].frame
     if f != 0 {
-        // The frame outlives its session, inert.
         srv.unbind(ci, f)
         icc.Frame { id: f }.failed(mut srv.conns[int(ci)], icc.FrameFailureReason.Stopped)
     }
     srv.captures.remove(k, state.CaptureData {})
 }
 
-/// Whether a frame of output `oi` waits for an image.
-fn waiting(srv: server.Server, oi: u32) -> bool {
+fn send_ready(mut srv: server.Server, ci: int, frame_id: u32, w: i32, h: i32, ns: int) {
+    let f = icc.Frame { id: frame_id }
+    f.transform(mut srv.conns[ci], wl.OutputTransform.Normal)
+    f.damage(mut srv.conns[ci], 0, 0, w, h)
+    let sec = u64(ns / 1000000000)
+    f.presentation_time(mut srv.conns[ci], u32(sec >> 32), u32(sec & 0xffffffff), u32(ns % 1000000000))
+    f.ready(mut srv.conns[ci])
+}
+
+/// Whether an shm capture frame for `(kind, target)` waits for an image.
+fn waiting_kind(srv: server.Server, kind: state.CaptureTargetKind, target: u32) -> bool {
     for k in 0..srv.captures.items.len() {
-        if srv.captures.used(k) and srv.captures.items[k].output == oi and srv.captures.items[k].waiting {
+        guard srv.captures.used(k) and srv.captures.items[k].kind == kind and srv.captures.items[k].target == target and srv.captures.items[k].waiting else {
+            continue
+        }
+        let bi = srv.captures.items[k].buffer
+        if bi != state.none and srv.buffers.used(int(bi)) and srv.buffers.items[int(bi)].kind == state.BufferKind.Shm {
             return true
         }
     }
     return false
 }
 
-/// The image output `oi` shows: `pixels` (BGRA8, rows packed) of
-/// `width` x `height`, shown at `ns`. Every waiting frame gets a copy.
-fn deliver(mut srv: server.Server, oi: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+/// Deliver `pixels` (BGRA8, rows packed) to all waiting shm capture frames
+/// matching `(kind, target)`.
+fn deliver_kind(mut srv: server.Server, kind: state.CaptureTargetKind, target: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
     for k in 0..srv.captures.items.len() {
-        guard srv.captures.used(k) and srv.captures.items[k].output == oi and srv.captures.items[k].waiting else {
+        guard srv.captures.used(k) and srv.captures.items[k].kind == kind and srv.captures.items[k].target == target and srv.captures.items[k].waiting else {
+            continue
+        }
+        let bi = srv.captures.items[k].buffer
+        guard bi != state.none and srv.buffers.used(int(bi)) and srv.buffers.items[int(bi)].kind == state.BufferKind.Shm else {
             continue
         }
         let c = int(srv.captures.items[k].client)
-        let f = icc.Frame { id: srv.captures.items[k].frame }
+        let fid = srv.captures.items[k].frame
         srv.captures.items[k].waiting = false
-        guard copy(mut srv, srv.captures.items[k].buffer, pixels, width, height) else {
-            f.failed(mut srv.conns[c], icc.FrameFailureReason.BufferConstraints)
+        guard copy(mut srv, bi, pixels, width, height) else {
+            icc.Frame { id: fid }.failed(mut srv.conns[c], icc.FrameFailureReason.BufferConstraints)
             continue
         }
         srv.captures.items[k].shot = true
-        f.transform(mut srv.conns[c], wl.OutputTransform.Normal)
-        f.damage(mut srv.conns[c], 0, 0, width, height)
-        let sec = u64(ns / 1000000000)
-        f.presentation_time(mut srv.conns[c], u32(sec >> 32), u32(sec & 0xffffffff), u32(ns % 1000000000))
-        f.ready(mut srv.conns[c])
+        send_ready(mut srv, c, fid, width, height, ns)
     }
+}
+
+fn waiting(srv: server.Server, oi: u32) -> bool {
+    return waiting_kind(srv, state.CaptureTargetKind.Output, oi)
+}
+
+fn deliver(mut srv: server.Server, oi: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+    deliver_kind(mut srv, state.CaptureTargetKind.Output, oi, pixels, width, height, ns)
+}
+
+fn window_waiting(srv: server.Server, wi: u32) -> bool {
+    return waiting_kind(srv, state.CaptureTargetKind.Window, wi)
+}
+
+fn window_deliver(mut srv: server.Server, wi: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+    deliver_kind(mut srv, state.CaptureTargetKind.Window, wi, pixels, width, height, ns)
+}
+
+/// Collect waiting dmabuf capture frames and mark them in flight until the
+/// compositor finishes GPU execution and calls `done_async` / `fail_async`.
+fn dmabuf_requests(mut srv: server.Server, mut out: List[server.CaptureReq]) {
+    for k in 0..srv.captures.items.len() {
+        guard srv.captures.used(k) and srv.captures.items[k].waiting and not srv.captures.items[k].in_flight else {
+            continue
+        }
+        let bi = srv.captures.items[k].buffer
+        guard bi != state.none and srv.buffers.used(int(bi)) else {
+            let c = int(srv.captures.items[k].client)
+            let fid = srv.captures.items[k].frame
+            srv.captures.items[k].waiting = false
+            icc.Frame { id: fid }.failed(mut srv.conns[c], icc.FrameFailureReason.BufferConstraints)
+            continue
+        }
+        guard srv.buffers.items[int(bi)].kind == state.BufferKind.Dmabuf else {
+            continue
+        }
+        let kind = srv.captures.items[k].kind
+        let target = srv.captures.items[k].target
+        let c = int(srv.captures.items[k].client)
+        let fid = srv.captures.items[k].frame
+        guard target_alive(srv, kind, target) else {
+            srv.captures.items[k].waiting = false
+            icc.Frame { id: fid }.failed(mut srv.conns[c], icc.FrameFailureReason.Stopped)
+            continue
+        }
+        let (tw, th) = target_size(srv, kind, target)
+        let b = srv.buffers.items[int(bi)].width
+        let bh = srv.buffers.items[int(bi)].height
+        let fmt = srv.buffers.items[int(bi)].format
+        let md = srv.buffers.items[int(bi)].modifier
+        let valid_fmt = srv.capture_formats.any(fn(p) => p.0 == fmt and p.1 == md)
+        guard tw > 0 and th > 0 and b == tw and bh == th and valid_fmt else {
+            srv.captures.items[k].waiting = false
+            icc.Frame { id: fid }.failed(mut srv.conns[c], icc.FrameFailureReason.BufferConstraints)
+            continue
+        }
+        srv.captures.items[k].waiting = false
+        srv.captures.items[k].in_flight = true
+        srv.captures.items[k].width = tw
+        srv.captures.items[k].height = th
+        srv.buffers.items[int(bi)].busy = true
+        let tgt = match kind {
+            Output => server.CaptureTarget.Output(ids.Output { id: srv.outputs.id(target) })
+            Window => server.CaptureTarget.Window(ids.Window { id: srv.windows.id(target) })
+            None => {
+                continue
+            }
+        }
+        out.push(server.CaptureReq {
+            session: u32(k),
+            target: tgt,
+            buffer: ids.Buffer { id: srv.buffers.id(bi) },
+            paint_cursors: srv.captures.items[k].paint_cursors,
+            width: tw,
+            height: th,
+        })
+    }
+}
+
+fn done_async(mut srv: server.Server, session: u32, ns: int) {
+    let k = int(session)
+    guard srv.captures.used(k) and srv.captures.items[k].in_flight and srv.captures.items[k].frame != 0 else {
+        return
+    }
+    srv.captures.items[k].in_flight = false
+    srv.captures.items[k].shot = true
+    let c = int(srv.captures.items[k].client)
+    let fid = srv.captures.items[k].frame
+    let w = srv.captures.items[k].width
+    let h = srv.captures.items[k].height
+    send_ready(mut srv, c, fid, w, h, ns)
+}
+
+fn fail_async(mut srv: server.Server, session: u32, reason: u32) {
+    let k = int(session)
+    guard srv.captures.used(k) and srv.captures.items[k].in_flight and srv.captures.items[k].frame != 0 else {
+        return
+    }
+    srv.captures.items[k].in_flight = false
+    let c = int(srv.captures.items[k].client)
+    let fid = srv.captures.items[k].frame
+    icc.Frame { id: fid }.failed(mut srv.conns[c], icc.FrameFailureReason(reason))
 }
 
 /// Copy `px` into shm buffer `bi`; false when it is not a writable
@@ -228,26 +435,55 @@ fn copy(mut srv: server.Server, bi: u32, px: &[u8], width: i32, height: i32) -> 
 /// Output `oi` changed size: sessions on it learn the new constraints.
 fn output_changed(mut srv: server.Server, oi: u32) {
     for k in 0..srv.captures.items.len() {
-        if srv.captures.used(k) and srv.captures.items[k].output == oi {
+        if srv.captures.used(k) and srv.captures.items[k].kind == state.CaptureTargetKind.Output and srv.captures.items[k].target == oi {
             constraints(mut srv, u32(k))
         }
     }
 }
 
-/// Output `oi` is gone: its sessions stop.
-fn output_gone(mut srv: server.Server, oi: u32) {
+/// Window `wi` changed size: sessions on it learn the new constraints if resized.
+fn window_changed(mut srv: server.Server, wi: u32) {
+    guard target_alive(srv, state.CaptureTargetKind.Window, wi) else {
+        return
+    }
+    let (w, h) = target_size(srv, state.CaptureTargetKind.Window, wi)
+    guard w > 0 and h > 0 else {
+        return
+    }
     for k in 0..srv.captures.items.len() {
-        guard srv.captures.used(k) and srv.captures.items[k].output == oi else {
+        if srv.captures.used(k) and srv.captures.items[k].kind == state.CaptureTargetKind.Window and srv.captures.items[k].target == wi {
+            if srv.captures.items[k].width != w or srv.captures.items[k].height != h {
+                constraints(mut srv, u32(k))
+            }
+        }
+    }
+}
+
+fn target_gone(mut srv: server.Server, kind: state.CaptureTargetKind, target: u32) {
+    for k in 0..srv.captures.items.len() {
+        guard srv.captures.used(k) and srv.captures.items[k].kind == kind and srv.captures.items[k].target == target else {
             continue
         }
         let c = int(srv.captures.items[k].client)
-        if srv.captures.items[k].waiting {
+        if srv.captures.items[k].waiting or srv.captures.items[k].in_flight {
             icc.Frame { id: srv.captures.items[k].frame }.failed(mut srv.conns[c], icc.FrameFailureReason.Stopped)
             srv.captures.items[k].waiting = false
+            srv.captures.items[k].in_flight = false
         }
         icc.Session { id: srv.captures.items[k].obj }.stopped(mut srv.conns[c])
-        srv.captures.items[k].output = state.none
+        srv.captures.items[k].kind = state.CaptureTargetKind.None
+        srv.captures.items[k].target = state.none
     }
+}
+
+/// Output `oi` is gone: its sessions stop.
+fn output_gone(mut srv: server.Server, oi: u32) {
+    target_gone(mut srv, state.CaptureTargetKind.Output, oi)
+}
+
+/// Window `wi` is gone: its sessions stop.
+fn window_gone(mut srv: server.Server, wi: u32) {
+    target_gone(mut srv, state.CaptureTargetKind.Window, wi)
 }
 
 fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
@@ -257,8 +493,13 @@ fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) ->
         if srv.captures.used(int(slot)) and srv.captures.items[int(slot)].frame == id {
             srv.captures.items[int(slot)].frame = 0
             srv.captures.items[int(slot)].waiting = false
+            srv.captures.items[int(slot)].in_flight = false
         }
-    } else if iface == ics.image_capture_source_iface or iface == icc.cursor_session_iface {
+    } else if iface == ics.image_capture_source_iface {
+        if slot != state.none and srv.capture_sources.used(int(slot)) {
+            srv.capture_sources.remove(slot, state.CaptureSourceData {})
+        }
+    } else if iface == icc.cursor_session_iface {
         return true
     } else {
         return false

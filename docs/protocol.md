@@ -77,11 +77,12 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 
 ### seat
 
-- 每个 seat 记住键盘焦点、指针焦点和触点所在的表面；事件只发给焦点客户端的对象。
-- 键盘：keymap memfd 共享给所有客户端；enter 带已按下的键；修饰键变化才发 `modifiers`。
+- 每个 seat 记住键盘焦点、指针焦点、`enter_serial`、修饰键、快捷键抑制、空闲时间 (`input_activity_on`)
+  和触点所在的表面；支持多 seat 增删（`add_seat`、`remove_seat`）；事件只发给焦点客户端的对象。
+- 键盘：每个 seat 维护共享 keymap memfd；enter 带已按下的键；修饰键变化才发 `modifiers`。
 - 指针：enter / leave 配对；每组事件后发 `frame`（v5+）；滚轮按版本发 `axis_value120`（v8+）或
   `axis_discrete`，手指滚动结束发 `axis_stop`。
-- `set_cursor` 和 cursor-shape 的 `set_shape` 只接受指针所在客户端、带最近 enter serial 的请求，以
+- `set_cursor` 和 cursor-shape 的 `set_shape` 只接受指针所在客户端、带该 seat 最近 `enter_serial` 的请求，以
   `Cursor` / `CursorShape` 事件交给门面；形状按 CSS 名字（`text`、`pointer`、`ew-resize` ……）取主题光标。
 - 指针扩展只发给指针焦点客户端：相对运动（加速前后两组增量，微秒时间戳）、滑动 / 捏合 / 长按手势
   （开始时的焦点表面收到整组）、指针锁定与限定（锁定时指针不动只有相对运动；限定时夹在区域内；只在
@@ -145,7 +146,7 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 
 | 协议 | 版本 | 作用 |
 |---|---|---|
-| linux-dmabuf | 4 | 共享格式表（sealed memfd）、主设备、扫描输出分组优先 |
+| linux-dmabuf | 4 | 共享格式表（sealed memfd）、主设备、扫描输出分组优先；支持 1..4 平面、乱序 `add` 与 `PlaneSet`/修饰符校验 |
 | linux-drm-syncobj | 1 | 获取点与释放点（GPU 支持时间线 syncobj 才公布） |
 | presentation-time | 1 | CLOCK_MONOTONIC 时间戳、刷新间隔、vblank 序号、零拷贝标志 |
 | viewporter | 1 | 源矩形与目标尺寸 |
@@ -160,7 +161,7 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 | idle-inhibit | 1 | 表面可见时阻止空闲（视频播放） |
 | ext-idle-notify | 2 | 空闲与恢复通知；普通通知被抑制器挡住，input-idle 通知不受影响 |
 | keyboard-shortcuts-inhibit | 1 | 焦点表面要求拿到合成器快捷键（远程桌面、虚拟机） |
-| ext-image-capture-source | 1 | 输出作为截屏源 |
+| ext-image-capture-source | 1 | 输出源与顶层窗口（foreign toplevel）作为截屏源 |
 | ext-image-copy-capture | 1 | 截屏与录屏，见下 |
 | wlr-output-management | 4 | 输出配置，见下 |
 | security-context | 1 | 沙盒，见下 |
@@ -183,12 +184,19 @@ id 或同一客户端槽位的新对象不会继承旧记录。
 
 ### 截屏与录屏
 
-ext-image-copy-capture 的会话公布输出的物理像素尺寸和 shm 格式 ARGB8888 / XRGB8888（合成图像的
-BGRA8 正好是这种字节序）。会话的第一帧立即要（`Capture(o)`：门面让输出出一帧，即使没有损坏），之后
-的帧等输出真有新内容。有帧在等时门面不做直接扫描输出，合成完把图像读回（`dev.read_texture`，等这次
-GPU 提交）交给 `capture`，逐行拷进客户端的 shm 缓冲（池可写时才行，写入同样 SIGBUS 安全），发
-transform、整幅 damage、呈现时间和 `ready`；尺寸或格式不对发 `failed(buffer_constraints)`，输出消失
-发 `stopped`。硬件光标不在图像里；光标会话直接 `stopped`。还没有 dmabuf 缓冲和窗口源。
+ext-image-capture-source 支持输出源（`ext_output_image_capture_source_manager_v1`）与顶层窗口源
+（`ext_foreign_toplevel_image_capture_source_manager_v1`）；ext-image-copy-capture 的会话公布源的
+像素尺寸、shm 格式（ARGB8888 / XRGB8888）以及渲染器支持的 `dmabuf_device` 与 `dmabuf_format` 列表。
+
+- **输出源**：会话第一帧立即触发 `Capture(o)`，之后的帧等输出有新内容；支持 shm 读回与 GPU `copy_dmabuf`
+  零拷贝复制，等候输出截屏时跳过直接扫描输出和硬件 overlay 提升。
+- **窗口源**：窗口几何或映射变化触发 `CaptureWindow(w)` / `window_changed` / `window_gone`；
+  由 `render_offscreen`（shm 逐行拷入）或 `render_offscreen_dmabuf`（dmabuf 离屏渲染/复制）单独绘制
+  窗口及其子表面树，不改动主输出场景。
+- **异步完成**：dmabuf 截屏标记缓冲忙并发起 GPU 提交后把 `sync_file` 放进 epoll，就绪后才调用
+  `capture_done`（发 transform、damage、呈现时间与 `ready`）并经 `release` 归还 `wl_buffer`；
+  尺寸、格式不匹配或目标消失分别发 `failed(buffer_constraints)` / `stopped`。硬件光标不强制包含在
+  单独会话里；光标会话直接 `stopped`。
 
 ### 输出配置
 

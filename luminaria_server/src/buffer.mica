@@ -287,12 +287,24 @@ fn params(mut srv: server.Server, ci: u32, p: dmabuf_p.BufferParams, take req: d
                 srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.AlreadyUsed), "params already used")
                 return
             }
-            guard plane == u32(srv.params.items[i].planes.len()) and plane < 4 else {
-                srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.PlaneIdx), "plane {plane} out of order")
+            guard plane < 4 else {
+                srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.PlaneIdx), "plane {plane} out of bounds")
                 return
             }
-            srv.params.items[i].modifier = (u64(hi) << 32) | u64(lo)
-            srv.params.items[i].planes.push(state.Plane { fd: f, offset, stride })
+            let bit = u8(1 << int(plane))
+            guard (srv.params.items[i].seen & bit) == 0 else {
+                srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.PlaneSet), "plane {plane} already set")
+                return
+            }
+            let md = (u64(hi) << 32) | u64(lo)
+            if srv.params.items[i].has_mod and srv.params.items[i].modifier != md {
+                srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.InvalidFormat), "inconsistent plane modifiers")
+                return
+            }
+            srv.params.items[i].modifier = md
+            srv.params.items[i].has_mod = true
+            srv.params.items[i].seen |= bit
+            srv.params.items[i].planes[int(plane)] = Some(state.Plane { fd: f, offset, stride })
         }
         Create(w, h, format, flags) => {
             create(mut srv, ci, p.id, pi, 0, w, h, format)
@@ -313,15 +325,26 @@ fn create(mut srv: server.Server, ci: u32, pobj: u32, pi: u32, obj: u32, w: i32,
         return
     }
     srv.params.items[i].used = true
-    guard not srv.params.items[i].planes.is_empty() else {
-        srv.fail(ci, pobj, u32(dmabuf_p.BufferParamsError.Incomplete), "no planes")
+    let seen = srv.params.items[i].seen
+    var count = 0
+    for k in 0..4 {
+        if (seen & u8(1 << k)) != 0 {
+            count = k + 1
+        }
+    }
+    guard count >= 1 and seen == u8((1 << count) - 1) else {
+        srv.fail(ci, pobj, u32(dmabuf_p.BufferParamsError.Incomplete), "incomplete or sparse dmabuf planes")
         return
     }
     guard w > 0 and h > 0 else {
         srv.fail(ci, pobj, u32(dmabuf_p.BufferParamsError.InvalidDimensions), "buffer {w}x{h}")
         return
     }
-    let planes = mem.replace(mut srv.params.items[i].planes, [])
+    var planes: List[state.Plane] = []
+    for k in 0..count {
+        planes.push(srv.params.items[i].planes[k].take().unwrap())
+    }
+    srv.params.items[i].seen = 0
     let md = srv.params.items[i].modifier
     let id = srv.buffers.add(state.BufferData { client: ci, obj, kind: state.BufferKind.Dmabuf, width: w, height: h, format, planes, modifier: md, params_obj: if obj == 0 { pobj } else { 0 } })
     if obj != 0 {

@@ -10,6 +10,7 @@
 
 import std.env
 import std.fs
+import std.mem
 import std.os
 import std.str
 import libdrm_sys as drm
@@ -140,8 +141,27 @@ struct Plane {
     kind: u64
     crtcs: u32
     props: Props
+    /// Supported DRM fourccs on this plane.
+    formats: List[u32] = []
+    /// Supported (fourcc, modifier) pairs from IN_FORMATS.
+    fmt_mods: List[(u32, u64)] = []
     /// Modifiers it scans XRGB8888 out with.
     xrgb: List[u64] = []
+}
+
+struct OverlaySlot {
+    plane: int = 0
+    fb: u32 = 0
+    buf_key: u64 = 0
+    key: u64 = 0
+    x: i32 = 0
+    y: i32 = 0
+    w: i32 = 0
+    h: i32 = 0
+    src_x: u64 = 0
+    src_y: u64 = 0
+    src_w: u64 = 0
+    src_h: u64 = 0
 }
 
 struct Connector {
@@ -163,6 +183,7 @@ struct Output {
     crtc: int
     primary: int
     cursor: int = -1
+    overlay_planes: List[int] = []
     mode: drm.ModeModeInfo
     mode_blob: u32 = 0
     swap: Option[swap.Swap] = None
@@ -174,6 +195,10 @@ struct Output {
     /// Client framebuffers queued and shown when scanning out directly.
     direct_queued: u32 = 0
     direct_shown: u32 = 0
+    /// Hardware overlay plane assignments (queued -> pending -> current).
+    queued_overlays: List[OverlaySlot] = []
+    pend_overlays: List[OverlaySlot] = []
+    cur_overlays: List[OverlaySlot] = []
     modeset: bool = true
     enabled: bool = true
     vrr: bool = false
@@ -202,8 +227,9 @@ struct Drm {
     rbuf: List[u8] = []
     /// The commit thread (none when only probing).
     thread: Option[commit.Thread] = None
-    /// TEST_ONLY commits asked.
+    /// TEST_ONLY commits asked, and presented frames using overlay planes.
     tests: int = 0
+    overlay_frames: int = 0
 }
 
 /// The card to drive: $LUMINARIA_DRM_DEVICE, else the first with a
@@ -276,11 +302,16 @@ fn Drm.probe(mut self) -> Result[(), str] {
                 guard not pp.is_null() else {
                     continue
                 }
-                let crtcs = pp.read().possible_crtcs
+                let pinfo = pp.read()
+                let crtcs = pinfo.possible_crtcs
+                var formats: List[u32] = []
+                for k in 0..int(pinfo.count_formats) {
+                    formats.push(pinfo.formats.offset(k).read())
+                }
                 drm.mode_free_plane(pp)
                 let props = props_of(self.fd, id, u32(uapi.drm_mode_object_plane))
-                var pl = Plane { id, kind: props.value("type"), crtcs, props }
-                pl.xrgb = self.plane_modifiers(pl.props.value("IN_FORMATS"))
+                var pl = Plane { id, kind: props.value("type"), crtcs, props, formats }
+                self.read_plane_formats(pl.props.value("IN_FORMATS"), mut pl)
                 self.planes.push(pl)
             }
             drm.mode_free_plane_resources(pres)
@@ -291,28 +322,45 @@ fn Drm.probe(mut self) -> Result[(), str] {
     return Ok(())
 }
 
-/// XRGB8888 modifiers of a plane's IN_FORMATS blob (linear without one).
-fn Drm.plane_modifiers(self, id: u64) -> List[u64] {
-    var out: List[u64] = []
+/// Populate supported (fourcc, modifier) pairs from a plane's IN_FORMATS blob.
+fn Drm.read_plane_formats(self, id: u64, mut pl: Plane) {
     guard id != 0 else {
-        out.push(0)
-        return out
+        pl.xrgb.push(0)
+        return
     }
     unsafe {
         let b = drm.mode_get_property_blob(i32(self.fd), u32(id))
         guard not b.is_null() else {
-            out.push(0)
-            return out
+            pl.xrgb.push(0)
+            return
         }
         var it = drm.ModeFormatModifierIterator {}
         while drm.mode_format_modifier_blob_iter_next(b, Ptr.of_mut(mut it)) {
+            pl.fmt_mods.push((it.fmt, it.mod))
             if it.fmt == u32(uapi.drm_format_xrgb8888) {
-                out.push(it.mod)
+                pl.xrgb.push(it.mod)
             }
         }
         drm.mode_free_property_blob(b)
     }
-    return out
+    if pl.xrgb.is_empty() and pl.formats.contains(u32(uapi.drm_format_xrgb8888)) {
+        pl.xrgb.push(0)
+    }
+}
+
+fn Drm.plane_supports(self, p: int, fmt: u32, modifier: u64) -> bool {
+    guard self.planes[p].formats.is_empty() or self.planes[p].formats.contains(fmt) else {
+        return false
+    }
+    if self.planes[p].fmt_mods.is_empty() {
+        return modifier == 0 or not self.modifiers
+    }
+    for (f, m) in self.planes[p].fmt_mods {
+        if f == fmt and m == modifier {
+            return true
+        }
+    }
+    return false
 }
 
 /// Read every connector again (hotplug).
@@ -396,6 +444,7 @@ fn Drm.connect(mut self, mut added: List[int]) {
             }
             var primary = -1
             var cursor = -1
+            var overlay_planes: List[int] = []
             for p in 0..self.planes.len() {
                 guard self.planes[p].crtcs & (u32(1) << u32(k)) != 0 else {
                     continue
@@ -406,12 +455,15 @@ fn Drm.connect(mut self, mut added: List[int]) {
                 if self.planes[p].kind == 2 and cursor < 0 and not self.outputs.any(fn(o) => o.cursor == p) {
                     cursor = p
                 }
+                if self.planes[p].kind == 0 and not self.outputs.any(fn(o) => o.overlay_planes.contains(p)) {
+                    overlay_planes.push(p)
+                }
             }
             guard primary >= 0 else {
                 continue
             }
             self.crtcs[k].used = true
-            self.outputs.push(Output { conn: ci, crtc: k, primary, cursor, mode })
+            self.outputs.push(Output { conn: ci, crtc: k, primary, cursor, overlay_planes, mode })
             added.push(self.outputs.len() - 1)
             break
         }
@@ -451,26 +503,78 @@ fn Drm.disconnected(self) -> List[int] {
     return out
 }
 
-/// A framebuffer for a dmabuf plane (prime import, then addfb2).
-fn Drm.add_fb(self, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32) -> Result[u32, str] {
+/// Import a 1..4 plane dmabuf into a KMS framebuffer, deduplicating shared
+/// GEM buffer handles before closing them so shared BOs are never double-closed.
+fn Drm.add_fb(self, d: types.Dmabuf) -> Result[u32, str] {
+    let n = d.planes
+    guard d.width > 0 and d.height > 0 and n >= 1 and n <= 4 else {
+        return Err("add_fb: invalid dmabuf {d.width}x{d.height} planes {n}")
+    }
     let f = i32(self.fd)
-    var handle: u32 = 0
+    var handles: [4]u32 = [0, 0, 0, 0]
+    var pitches: [4]u32 = [0, 0, 0, 0]
+    var offsets: [4]u32 = [0, 0, 0, 0]
+    var mods: [4]u64 = [0, 0, 0, 0]
     var id: u32 = 0
+    var r: i32 = -1
     unsafe {
-        guard drm.prime_fd_to_handle(f, i32(fd), Ptr.of_mut(mut handle)) == 0 else {
-            return Err("prime import failed")
+        for i in 0..n {
+            var h: u32 = 0
+            guard drm.prime_fd_to_handle(f, i32(d.plane[i].fd), Ptr.of_mut(mut h)) == 0 else {
+                for j in 0..i {
+                    var seen = false
+                    for k in 0..j {
+                        if handles[k] == handles[j] {
+                            seen = true
+                            break
+                        }
+                    }
+                    if not seen {
+                        discard drm.close_buffer_handle(f, handles[j])
+                    }
+                }
+                return Err("prime import failed on plane {i}")
+            }
+            handles[i] = h
+            pitches[i] = d.plane[i].stride
+            offsets[i] = d.plane[i].offset
+            mods[i] = d.modifier
         }
-        let handles: List[u32] = [handle, 0, 0, 0]
-        let pitches: List[u32] = [stride, 0, 0, 0]
-        let offsets: List[u32] = [offset, 0, 0, 0]
-        let mods: List[u64] = [modifier, 0, 0, 0]
-        let use_mods = self.modifiers and modifier != uapi.drm_format_mod_invalid
-        let r = drm.mode_add_fb2_with_modifiers(f, width, height, format, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), if use_mods { mods.as_ptr() } else { Ptr.null() }, Ptr.of_mut(mut id), if use_mods { u32(uapi.drm_mode_fb_modifiers) } else { 0 })
-        discard drm.close_buffer_handle(f, handle)
-        guard r == 0 else {
-            return Err("addfb2 failed ({r})")
+        let use_mods = self.modifiers and d.modifier != uapi.drm_format_mod_invalid
+        r = drm.mode_add_fb2_with_modifiers(
+            f, u32(d.width), u32(d.height), d.format,
+            Ptr.of(handles).cast[u32](), Ptr.of(pitches).cast[u32](), Ptr.of(offsets).cast[u32](),
+            if use_mods { Ptr.of(mods).cast[u64]() } else { Ptr.null() },
+            Ptr.of_mut(mut id),
+            if use_mods { u32(uapi.drm_mode_fb_modifiers) } else { 0 },
+        )
+        for i in 0..n {
+            var seen = false
+            for j in 0..i {
+                if handles[j] == handles[i] {
+                    seen = true
+                    break
+                }
+            }
+            if not seen {
+                discard drm.close_buffer_handle(f, handles[i])
+            }
         }
     }
+    guard r == 0 else {
+        return Err("addfb2 failed ({r})")
+    }
+    return Ok(id)
+}
+
+fn Drm.get_or_add_fb(mut self, o: int, buf_key: u64, d: types.Dmabuf) -> Result[u32, str] {
+    for (k, id) in self.outputs[o].fbs {
+        if k == buf_key {
+            return Ok(id)
+        }
+    }
+    let id = try self.add_fb(d)
+    self.outputs[o].fbs.push((buf_key, id))
     return Ok(id)
 }
 
@@ -488,7 +592,8 @@ fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[t
     let w = i32(self.outputs[o].mode.hdisplay)
     let h = i32(self.outputs[o].mode.vdisplay)
     // A new mode needs buffers of its size.
-    if let Some(old) = self.outputs[o].swap.take() {
+    if let Some(sw) = self.outputs[o].swap.take() {
+        var old = sw
         if old.width == w and old.height == h {
             self.outputs[o].swap = Some(old)
             return None
@@ -496,6 +601,7 @@ fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[t
         for sl in old.slots {
             self.rm_fb(sl.id)
         }
+        old.close_fds()
         old.keys(mut retired)
         self.outputs[o].shown = -1
         self.outputs[o].queued = -1
@@ -510,8 +616,8 @@ fn Drm.give(mut self, o: int, ts: &[types.Target]) -> Result[(), str] {
     let h = i32(self.outputs[o].mode.vdisplay)
     var s = swap.create(w, h, ts)
     for i in 0..s.slots.len() {
-        let b = s.slots[i].buf
-        s.slots[i].id = try self.add_fb(b.plane[0].fd, u32(w), u32(h), u32(uapi.drm_format_xrgb8888), b.modifier, b.plane[0].offset, b.plane[0].stride)
+        let b = types.Dmabuf { format: u32(uapi.drm_format_xrgb8888), ..s.slots[i].buf }
+        s.slots[i].id = try self.add_fb(b)
     }
     self.outputs[o].swap = Some(s)
     try self.make_cursor(o)
@@ -580,6 +686,11 @@ fn Drm.pprop(self, p: int, name: str) -> u32 {
 /// plane) on output `o` with GPU fence `fence` (-1: none; the request owns
 /// it) and damage `rects`, plus the cursor, and the mode when it changed.
 fn Drm.request(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], tear: bool) -> commit.Req {
+    let ovs = self.outputs[o].queued_overlays.clone()
+    return self.request_with_overlays(o, fb, fence, rects, tear, ovs)
+}
+
+fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], tear: bool, ovs: &[OverlaySlot]) -> commit.Req {
     let ci = self.outputs[o].conn
     let ki = self.outputs[o].crtc
     let primary = self.outputs[o].primary
@@ -634,6 +745,33 @@ fn Drm.request(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], t
                 r.blobs.push(blob)
             }
         }
+        for sl in ovs {
+            let oid = self.planes[sl.plane].id
+            r.add(oid, self.pprop(sl.plane, "FB_ID"), u64(sl.fb))
+            r.add(oid, self.pprop(sl.plane, "CRTC_ID"), u64(crtc))
+            r.add(oid, self.pprop(sl.plane, "SRC_X"), sl.src_x)
+            r.add(oid, self.pprop(sl.plane, "SRC_Y"), sl.src_y)
+            r.add(oid, self.pprop(sl.plane, "SRC_W"), sl.src_w)
+            r.add(oid, self.pprop(sl.plane, "SRC_H"), sl.src_h)
+            r.add(oid, self.pprop(sl.plane, "CRTC_X"), u64(i64(sl.x)))
+            r.add(oid, self.pprop(sl.plane, "CRTC_Y"), u64(i64(sl.y)))
+            r.add(oid, self.pprop(sl.plane, "CRTC_W"), u64(sl.w))
+            r.add(oid, self.pprop(sl.plane, "CRTC_H"), u64(sl.h))
+        }
+        for cur in self.outputs[o].cur_overlays {
+            var kept = false
+            for s in ovs {
+                if s.plane == cur.plane {
+                    kept = true
+                    break
+                }
+            }
+            if not kept {
+                let oid = self.planes[cur.plane].id
+                r.add(oid, self.pprop(cur.plane, "FB_ID"), 0)
+                r.add(oid, self.pprop(cur.plane, "CRTC_ID"), 0)
+            }
+        }
     }
     if fence >= 0 {
         r.fences.push(fence)
@@ -662,6 +800,96 @@ fn Drm.request(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], t
     return r
 }
 
+fn overlaps(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    return a.0 < b.0 + b.2 and a.0 + a.2 > b.0 and a.1 < b.1 + b.3 and a.1 + a.3 > b.1
+}
+
+/// Probe hardware overlay candidates top-to-bottom on output `o` against
+/// `primary_fb` using atomic TEST_ONLY commits; stores accepted slots for
+/// the next `present` and returns their placement keys.
+fn Drm.test_overlays(mut self, o: int, primary_fb: u32, cands: &[types.Overlay]) -> List[u64] {
+    var out: List[u64] = []
+    guard o >= 0 and o < self.outputs.len() else {
+        return out
+    }
+    self.outputs[o].queued_overlays.clear()
+    guard not self.outputs[o].modeset and not self.outputs[o].overlay_planes.is_empty() and primary_fb != 0 and not cands.is_empty() else {
+        return out
+    }
+    let mw = i32(self.outputs[o].mode.hdisplay)
+    let mh = i32(self.outputs[o].mode.vdisplay)
+    var blocked: List[(i32, i32, i32, i32)] = []
+    var accepted: List[OverlaySlot] = []
+    var pcur = 0
+    for c in cands {
+        if pcur >= self.outputs[o].overlay_planes.len() {
+            break
+        }
+        let rect = (c.x, c.y, c.w, c.h)
+        var skip = c.w <= 0 or c.h <= 0 or c.x < 0 or c.y < 0 or c.x + c.w > mw or c.y + c.h > mh
+        if not skip {
+            for b in blocked {
+                if overlaps(b, rect) {
+                    skip = true
+                    break
+                }
+            }
+        }
+        if skip {
+            blocked.push(rect)
+            continue
+        }
+        let plane = self.outputs[o].overlay_planes[pcur]
+        guard self.plane_supports(plane, c.buf.format, c.buf.modifier) else {
+            blocked.push(rect)
+            continue
+        }
+        guard let Ok(fb) = self.get_or_add_fb(o, c.buf_key, c.buf) else {
+            blocked.push(rect)
+            continue
+        }
+        let has_src = c.src.w > 0.0 and c.src.h > 0.0
+        let src_x = if has_src { u64(max(i64(c.src.x * 65536.0), 0)) } else { 0 }
+        let src_y = if has_src { u64(max(i64(c.src.y * 65536.0), 0)) } else { 0 }
+        let src_w = if has_src { u64(max(i64(c.src.w * 65536.0), 1)) } else { u64(c.buf.width) << 16 }
+        let src_h = if has_src { u64(max(i64(c.src.h * 65536.0), 1)) } else { u64(c.buf.height) << 16 }
+        accepted.push(OverlaySlot {
+            plane,
+            fb,
+            buf_key: c.buf_key,
+            key: c.key,
+            x: c.x,
+            y: c.y,
+            w: c.w,
+            h: c.h,
+            src_x,
+            src_y,
+            src_w,
+            src_h,
+        })
+        let empty_clips: List[uapi.ModeRect] = []
+        let r = self.request_with_overlays(o, primary_fb, -1, empty_clips, false, accepted)
+        let ok = self.probe_commit(r)
+        r.release(self.fd)
+        if ok {
+            pcur += 1
+            out.push(c.key)
+            blocked.push(rect)
+        } else {
+            discard accepted.pop()
+            blocked.push(rect)
+        }
+    }
+    self.outputs[o].queued_overlays = accepted
+    return out
+}
+
+fn Drm.clear_overlays(mut self, o: int) {
+    if o >= 0 and o < self.outputs.len() {
+        self.outputs[o].queued_overlays.clear()
+    }
+}
+
 /// Whether the display takes `r` now (TEST_ONLY, on this thread).
 fn Drm.probe_commit(mut self, r: commit.Req) -> bool {
     self.tests += 1
@@ -674,6 +902,8 @@ fn Drm.send(mut self, take r: commit.Req) {
     let o = r.out
     if r.frame {
         self.outputs[o].pending = true
+        let qov = mem.replace(mut self.outputs[o].queued_overlays, [])
+        self.outputs[o].pend_overlays = qov
     }
     self.outputs[o].modeset = false
     match self.thread {
@@ -745,6 +975,11 @@ fn Drm.flipped(mut self, o: int) {
         }
         self.outputs[o].shown = q
         self.outputs[o].queued = -1
+        let pov = mem.replace(mut self.outputs[o].pend_overlays, [])
+        self.outputs[o].cur_overlays = pov
+        if not self.outputs[o].cur_overlays.is_empty() {
+            self.overlay_frames += 1
+        }
     }
     self.outputs[o].direct_shown = self.outputs[o].direct_queued
 }
@@ -762,6 +997,7 @@ fn Drm.failed(mut self, o: int, frame: bool, modeset: bool) {
         return
     }
     self.outputs[o].pending = false
+    self.outputs[o].pend_overlays.clear()
     let q = self.outputs[o].queued
     if q >= 0 and q != self.outputs[o].shown {
         self.free_slot(o, q)
@@ -783,19 +1019,37 @@ fn Drm.free_slot(mut self, o: int, i: int) {
     }
 }
 
-/// Turn every output off (the session ends or the compositor exits).
-fn Drm.release(mut self, mut retired: List[u64]) {
+/// Release render targets and cached FBs without tearing down modes/outputs
+/// (used on GPU reset).
+fn Drm.reset_targets(mut self, mut retired: List[u64]) {
     for o in 0..self.outputs.len() {
-        if let Some(s) = self.outputs[o].swap.take() {
+        self.outputs[o].queued_overlays.clear()
+        self.outputs[o].pend_overlays.clear()
+        self.outputs[o].cur_overlays.clear()
+        self.outputs[o].direct_queued = 0
+        self.outputs[o].direct_shown = 0
+        self.outputs[o].queued = -1
+        self.outputs[o].shown = -1
+        if let Some(sw) = self.outputs[o].swap.take() {
+            var s = sw
             for sl in s.slots {
                 self.rm_fb(sl.id)
             }
+            s.close_fds()
             s.keys(mut retired)
         }
-        self.rm_fb(self.outputs[o].cursor_fb)
         for (_, fb) in self.outputs[o].fbs {
             self.rm_fb(fb)
         }
         self.outputs[o].fbs.clear()
+    }
+}
+
+/// Turn every output off (the session ends or the compositor exits).
+fn Drm.release(mut self, mut retired: List[u64]) {
+    self.reset_targets(mut retired)
+    for o in 0..self.outputs.len() {
+        self.rm_fb(self.outputs[o].cursor_fb)
+        self.outputs[o].cursor_fb = 0
     }
 }

@@ -51,3 +51,36 @@ test "frame cost with damage and occlusion" {
     io.print("frame, 50 windows, one moving: {cpu / frames / 1000} us CPU, {total / frames / 1000} us until the GPU is done")
     c.close()
 }
+
+test "1000 placements O(N) layout diff" {
+    guard let Ok(cc) = compose.Compositor.open(false) else {
+        return
+    }
+    var c = cc
+    c.add_output(0, 1920, 1080, vec4(0.1, 0.1, 0.1, 1.0))
+    let t = c.targets(types.Want { width: 1920, height: 1080, count: 1, export: false }).unwrap()[0].key
+    var px: List[u8] = []
+    for _ in 0..16 * 16 {
+        for b in [u8(200), 100, 50, 255] {
+            px.push(b)
+        }
+    }
+    assert(c.image(9, 16, 16, types.buffer.xrgb8888, px, 64))
+    var ps: List[types.Placement] = []
+    for i in 0..1000 {
+        ps.push(types.Placement { key: u64(i + 1), tex: 9, x: f32((i * 19) % 1800), y: f32((i * 23) % 1000), w: 16.0, h: 16.0 })
+    }
+    c.layout(0, ps)
+    discard c.render(0, t, 0).unwrap()
+    let t0 = time.now_ns()
+    for k in 0..50 {
+        // Move bottom item to top & tweak one position every iteration.
+        let moved = ps.remove(0)
+        ps.push(types.Placement { x: f32(k * 4), ..moved })
+        c.layout(0, ps)
+    }
+    let dt = (time.now_ns() - t0) / 50
+    io.print("1000 placements raise+move layout diff: {dt / 1000} us/iter")
+    assert(dt < 5000000)
+    c.close()
+}

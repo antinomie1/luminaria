@@ -130,10 +130,14 @@ pub enum Event {
     /// the output again.
     Dropped(u32)
     Input(Input)
+    /// Input targeted at a named seat (multi-seat backends).
+    InputOn(str, Input)
     /// The session became active (true) or was switched away.
     Session(bool)
     /// The keymap changed: clients need the new memfd.
     Keymap
+    /// The keymap on a named seat changed.
+    KeymapOn(str)
     /// The backend cannot go on (the parent compositor closed us).
     Closed
 }

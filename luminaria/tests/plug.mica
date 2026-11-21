@@ -6,18 +6,37 @@
 import std.collections.map
 import std.env
 import std.fs
+import std.io
 import std.os
+import std.sync
 import std.time
 import luminaria as lum
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_shell as xdg
+import luminaria_proto.linux_dmabuf as dmab
+
+struct Trace {
+    overlay_calls: List[List[u64]] = []
+    set_overlays_calls: List[List[u64]] = []
+    clear_overlays_count: int = 0
+    reset_targets_count: int = 0
+    recover_count: int = 0
+    last_layout: List[lum.types.Placement] = []
+}
 
 struct TestOut {
     timer: int
+    width: i32 = 32
+    height: i32 = 24
     events: List[lum.types.Event] = [lum.types.Event.OutputAdded(0)]
     targets: List[u64] = []
     drawing: int = -1
     pending: int = -1
     shown: int = -1
     seq: u64 = 0
+    trace: Option[sync.Mutex[Trace]] = None
 }
 
 pub fn TestOut.next(mut self) -> Option[lum.types.Event] {
@@ -43,7 +62,7 @@ pub fn TestOut.dispatch(mut self, token: int) -> Result[(), str] {
 }
 
 pub fn TestOut.output(self, o: u32) -> lum.types.OutputDesc {
-    let m = lum.types.Mode { width: 32, height: 24, refresh_mhz: 60000, preferred: true }
+    let m = lum.types.Mode { width: self.width, height: self.height, refresh_mhz: 60000, preferred: true }
     return lum.types.OutputDesc { name: "TEST-1", modes: [m], mode: m }
 }
 
@@ -53,7 +72,7 @@ pub fn TestOut.can_present(self, o: u32) -> bool {
 
 pub fn TestOut.acquire(mut self, o: u32) -> lum.types.Acquire {
     guard not self.targets.is_empty() else {
-        return lum.types.Acquire.Need(lum.types.Want { width: 32, height: 24, count: 2, export: false })
+        return lum.types.Acquire.Need(lum.types.Want { width: self.width, height: self.height, count: 2, export: false })
     }
     self.drawing = if self.shown == 0 { 1 } else { 0 }
     return lum.types.Acquire.Draw(self.targets[self.drawing], 0)
@@ -88,6 +107,43 @@ pub fn TestOut.shown(self, o: u32) -> Option[u64] {
     return if self.shown < 0 { None } else { Some(self.targets[self.shown]) }
 }
 
+pub fn TestOut.test_overlays(mut self, o: u32, target_key: u64, cands: &[lum.types.Overlay]) -> List[u64] {
+    var keys: List[u64] = []
+    for c in cands {
+        keys.push(c.key)
+    }
+    if let Some(tr) = self.trace {
+        let kc = keys.clone()
+        tr.write(fn(mut t: Trace) {
+            t.overlay_calls.push(kc.clone())
+        })
+    }
+    return keys
+}
+
+pub fn TestOut.clear_overlays(mut self, o: u32) {
+    if let Some(tr) = self.trace {
+        tr.write(fn(mut t: Trace) {
+            t.clear_overlays_count += 1
+        })
+    }
+}
+
+pub fn TestOut.reset_targets(mut self, mut retired: List[u64]) {
+    for k in self.targets {
+        retired.push(k)
+    }
+    self.targets.clear()
+    self.drawing = -1
+    self.pending = -1
+    self.shown = -1
+    if let Some(tr) = self.trace {
+        tr.write(fn(mut t: Trace) {
+            t.reset_targets_count += 1
+        })
+    }
+}
+
 /// A texture: size and BGRA pixels.
 struct Tex {
     w: i32
@@ -101,6 +157,11 @@ struct SoftRen {
     lists: List[List[lum.types.Placement]] = []
     bg: [4]u8 = [0, 0, 0, 255]
     next_key: u64 = 1
+    advertise_dmabuf: bool = false
+    fail_on_render: int = 0
+    render_calls: int = 0
+    lost: bool = false
+    trace: Option[sync.Mutex[Trace]] = None
 }
 
 pub fn SoftRen.add_output(mut self, o: int, width: u32, height: u32, background: vec4) {
@@ -116,6 +177,12 @@ pub fn SoftRen.remove_output(mut self, o: int) {}
 
 pub fn SoftRen.layout(mut self, o: int, ps: &[lum.types.Placement]) {
     self.lists[o] = ps.to_list()
+    if let Some(tr) = self.trace {
+        let copy = ps.to_list()
+        tr.write(fn(mut t: Trace) {
+            t.last_layout = copy.clone()
+        })
+    }
 }
 
 pub fn SoftRen.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {}
@@ -130,6 +197,26 @@ pub fn SoftRen.has(self, key: u64) -> bool {
 
 pub fn SoftRen.forget(mut self, key: u64) {
     discard self.texs.remove(key)
+}
+
+pub fn SoftRen.formats(self) -> List[(u32, u64)] {
+    guard self.advertise_dmabuf else {
+        let none: List[(u32, u64)] = []
+        return none
+    }
+    return [(lum.types.buffer.xrgb8888, u64(0)), (lum.types.buffer.argb8888, u64(0))]
+}
+
+pub fn SoftRen.import_dmabuf(mut self, key: u64, d: lum.types.Dmabuf) -> bool {
+    var px: List[u8] = []
+    for _ in 0..int(d.width * d.height) {
+        px.push(0)
+        px.push(255)
+        px.push(0)
+        px.push(255)
+    }
+    discard self.texs.insert(key, Tex { w: d.width, h: d.height, px })
+    return true
 }
 
 pub fn SoftRen.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool {
@@ -160,11 +247,16 @@ pub fn SoftRen.update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(
 }
 
 pub fn SoftRen.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
-    return false
+    var px: List[u8] = []
+    for _ in 0..int(width * height * 4) {
+        px.push(255)
+    }
+    discard self.texs.insert(key, Tex { w: width, h: height, px })
+    return true
 }
 
 pub fn SoftRen.shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool {
-    return false
+    return true
 }
 
 pub fn SoftRen.targets(mut self, w: lum.types.Want) -> Result[List[lum.types.Target], str] {
@@ -188,6 +280,12 @@ pub fn SoftRen.drop_target(mut self, key: u64) {
 
 /// Background, then each placement's texture, unscaled, back to front.
 pub fn SoftRen.render(mut self, o: int, key: u64, age: u32) -> Result[Option[int], str] {
+    self.render_calls += 1
+    if self.fail_on_render > 0 and self.render_calls == self.fail_on_render {
+        self.fail_on_render = 0
+        self.lost = true
+        return Err("VK_ERROR_DEVICE_LOST")
+    }
     guard let Some(t) = self.targets.remove(key) else {
         return Err("no target {key}")
     }
@@ -215,6 +313,44 @@ pub fn SoftRen.render(mut self, o: int, key: u64, age: u32) -> Result[Option[int
     }
     discard self.targets.insert(key, dst)
     return Ok(Some(-1))
+}
+
+pub fn SoftRen.overlay_candidates(self, o: int, max_count: int) -> List[lum.types.OverlayCand] {
+    var out: List[lum.types.OverlayCand] = []
+    var i = self.lists[o].len() - 1
+    while i >= 0 and out.len() < max_count {
+        let p = self.lists[o][i]
+        out.push(lum.types.OverlayCand { key: p.key, tex: p.tex, x: i32(p.x), y: i32(p.y), w: i32(p.w), h: i32(p.h), src: p.src })
+        i -= 1
+    }
+    return out
+}
+
+pub fn SoftRen.set_overlays(mut self, o: int, keys: &[u64]) {
+    if not keys.is_empty() {
+        if let Some(tr) = self.trace {
+            let copy = keys.to_list()
+            tr.write(fn(mut t: Trace) {
+                t.set_overlays_calls.push(copy.clone())
+            })
+        }
+    }
+}
+
+pub fn SoftRen.device_lost(self) -> bool {
+    return self.lost
+}
+
+pub fn SoftRen.recover(mut self) -> Result[(), str] {
+    self.lost = false
+    self.texs.clear()
+    self.targets.clear()
+    if let Some(tr) = self.trace {
+        tr.write(fn(mut t: Trace) {
+            t.recover_count += 1
+        })
+    }
+    return Ok(())
 }
 
 pub fn SoftRen.read(mut self, key: u64) -> Result[List[u8], str] {
@@ -277,4 +413,322 @@ test "a display on an output and a renderer of its own" {
     // BGRA: the blue background, the red image at 8, 4.
     assert_eq(at(0, 0), (u8(255), u8(0), u8(0)))
     assert_eq(at(9, 5), (u8(0), u8(0), u8(255)))
+}
+
+struct PlugFx {
+    d: lum.display.Display[TestOut, SoftRen]
+    c: wire.Conn
+    reg: wl.Registry = wl.Registry { id: 0 }
+    globals: List[(u32, u16)] = []
+    wins: List[lum.Window] = []
+}
+
+fn plug_pump(mut fx: PlugFx, ms: int) {
+    let end = time.now_ns() + ms * 1000000
+    while time.now_ns() < end {
+        discard fx.c.flush()
+        while true {
+            guard let Some(e) = fx.d.poll().expect("poll") else {
+                break
+            }
+            match e {
+                WindowMapped(w) => fx.wins.push(w)
+                _ => {}
+            }
+            fx.d.accept(e)
+        }
+        discard fx.c.read()
+        while true {
+            match proto.next_event(mut fx.c) {
+                Ok(Some(ev)) => {
+                    match ev {
+                        WlRegistry(_, Global(n, i, _)) => fx.globals.push((n, proto.ifaces.by_name(i)))
+                        XdgSurface(xs, Configure(serial)) => xs.ack_configure(mut fx.c, serial)
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(err) => panic("client: {err}")
+            }
+        }
+        time.sleep_ms(2)
+    }
+}
+
+fn bind_global(mut fx: PlugFx, iface: u16, version: u32) -> u32 {
+    if fx.reg.id == 0 {
+        fx.reg = wl.Display { id: 1 }.get_registry(mut fx.c)
+        plug_pump(mut fx, 40)
+    }
+    for (n, i) in fx.globals.clone() {
+        if i == iface {
+            return fx.reg.bind(mut fx.c, n, iface, version)
+        }
+    }
+    panic("no global {proto.ifaces.name(iface)}")
+}
+
+fn make_dmabuf_win(mut fx: PlugFx, comp: wl.Compositor, wm: xdg.WmBase, dma: dmab.Dmabuf, w: i32, h: i32) {
+    let s = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, s)
+    discard xs.get_toplevel(mut fx.c)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let fd = os.memfd("dma", int(w * h * 4)).expect("memfd")
+    let params = dma.create_params(mut fx.c)
+    params.add_(mut fx.c, fd, 0, 0, u32(w * 4), 0, 0)
+    os.close(fd)
+    let buf = params.create_immed(mut fx.c, w, h, lum.types.buffer.xrgb8888, dmab.BufferParamsFlags(0))
+    params.destroy(mut fx.c)
+    s.attach(mut fx.c, Some(buf), 0, 0)
+    s.commit(mut fx.c)
+}
+
+test "overlay promotion passes non-overlapping dmabuf candidates and blocks shm-occluded lower planes" {
+    let dir = fs.create_temp_dir("luminaria-plug-overlay").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true, trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let shm = wl.Shm { id: bind_global(mut fx, wl.shm_iface, 1) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let dma = dmab.Dmabuf { id: bind_global(mut fx, dmab.dmabuf_iface, 4) }
+
+    // Create 3 windows: bottom dmabuf (0,0 12x12), middle shm overlapping (4,4 12x12),
+    // top non-overlapping dmabuf (18,2 10x10).
+    make_dmabuf_win(mut fx, comp, wm, dma, 12, 12)
+    // Middle SHM window
+    let s_shm = comp.create_surface(mut fx.c)
+    let xs_shm = wm.get_xdg_surface(mut fx.c, s_shm)
+    discard xs_shm.get_toplevel(mut fx.c)
+    s_shm.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let shm_fd = os.memfd("shm", 12 * 12 * 4).expect("memfd")
+    let pool = shm.create_pool(mut fx.c, shm_fd, 12 * 12 * 4)
+    os.close(shm_fd)
+    let shm_buf = pool.create_buffer(mut fx.c, 0, 12, 12, 12 * 4, wl.ShmFormat.Argb8888)
+    s_shm.attach(mut fx.c, Some(shm_buf), 0, 0)
+    s_shm.commit(mut fx.c)
+
+    make_dmabuf_win(mut fx, comp, wm, dma, 10, 10)
+    plug_pump(mut fx, 50)
+    assert_eq(fx.wins.len(), 3)
+    let w_bottom = fx.wins[0]
+    let w_shm = fx.wins[1]
+    let w_top = fx.wins[2]
+    fx.d.layout(fn(mut l) {
+        l.window(w_bottom, 0.0, 0.0, lum.Style {})
+        l.window(w_shm, 4.0, 4.0, lum.Style {})
+        l.window(w_top, 18.0, 2.0, lum.Style {})
+    })
+    plug_pump(mut fx, 80)
+    var top_key: u64 = 0
+    var bot_key: u64 = 0
+    var promoted_top = false
+    var blocked_bottom = true
+    tr.read(fn(t: Trace) {
+        for p in t.last_layout {
+            if p.x == 18.0 {
+                top_key = p.key
+            } else if p.x == 0.0 {
+                bot_key = p.key
+            }
+        }
+        assert(top_key != 0 and bot_key != 0)
+        for call in t.overlay_calls {
+            if call.contains(top_key) {
+                promoted_top = true
+            }
+            if call.contains(bot_key) {
+                blocked_bottom = false
+            }
+        }
+        assert(not t.set_overlays_calls.is_empty())
+    })
+    assert(promoted_top)
+    assert(blocked_bottom)
+}
+
+test "GPU device-lost triggers reset_targets, recover, Event.GpuReset, and recovers output" {
+    let dir = fs.create_temp_dir("luminaria-plug-recover").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), fail_on_render: 1, trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options { background: [0.0, 0.0, 1.0, 1.0] }, out, ren).expect("display")
+    let outs = d.outputs()
+    d.hide_cursor()
+    var reset_events = 0
+    var frames = 0
+    d.timer(2000, 1)
+    while frames < 3 {
+        guard let Some(e) = d.next().expect("next") else {
+            break
+        }
+        match e {
+            Frame => frames += 1
+            GpuReset => reset_events += 1
+            Timer(1) => {
+                break
+            }
+            _ => d.accept(e)
+        }
+    }
+    var resets = 0
+    var recovs = 0
+    tr.read(fn(t: Trace) {
+        resets = t.reset_targets_count
+        recovs = t.recover_count
+    })
+    assert_eq(reset_events, 1)
+    assert_eq(resets, 1)
+    assert_eq(recovs, 1)
+    // Recovered targets still render blue background properly.
+    var px: List[u8] = []
+    for _ in 0..100 {
+        if let Ok(got) = d.read_output(outs[0]) {
+            px = got
+            break
+        }
+        discard d.poll()
+        time.sleep_ms(2)
+    }
+    assert_eq(px.len(), 32 * 24 * 4)
+    assert_eq((px[0], px[1], px[2], px[3]), (u8(255), u8(0), u8(0), u8(255)))
+}
+
+test "multi-seat routes independent pointers, keys, and software cursors" {
+    let dir = fs.create_temp_dir("luminaria-plug-multiseat").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    let s1 = d.seats()[0]
+    let s2 = d.add_seat("seat1")
+    assert_eq(d.seats().len(), 2)
+    assert_eq(d.seat_name(s1), "seat0")
+    assert_eq(d.seat_name(s2), "seat1")
+    // Removing primary seat is a no-op.
+    d.remove_seat(s1)
+    assert_eq(d.seats().len(), 2)
+
+    // Two wl_seat globals are advertised to clients.
+    var c = wire.connect(d.socket()).expect("connect")
+    discard wl.Display { id: 1 }.get_registry(mut c)
+    var seat_globals = 0
+    let end = time.now_ns() + 60 * 1000000
+    while time.now_ns() < end {
+        discard c.flush()
+        while true {
+            guard let Some(ev) = d.poll().expect("poll") else {
+                break
+            }
+            d.accept(ev)
+        }
+        discard c.read()
+        while true {
+            match proto.next_event(mut c) {
+                Ok(Some(ev)) => {
+                    match ev {
+                        WlRegistry(_, Global(_, iface, _)) => {
+                            if iface == "wl_seat" {
+                                seat_globals += 1
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    break
+                }
+            }
+        }
+        if seat_globals >= 2 {
+            break
+        }
+        time.sleep_ms(2)
+    }
+    assert_eq(seat_globals, 2)
+
+    // Independent pointer warps and injected motion + key events per seat.
+    d.warp_on(s1, 4.0, 4.0)
+    d.warp_on(s2, 20.0, 16.0)
+    d.inject_on(s2, lum.types.Input.Motion(10, 2.0, -3.0, 2.0, -3.0))
+    d.inject_on(s2, lum.types.Input.Key(11, 30, true, u32(0x61), "a"))
+    var saw_motion = false
+    var saw_key = false
+    for _ in 0..20 {
+        while true {
+            guard let Some(ev) = d.poll().expect("poll") else {
+                break
+            }
+            match ev {
+                Motion(p) => {
+                    if p.seat == s2 {
+                        saw_motion = true
+                        assert_eq((p.x, p.y), (22.0, 13.0))
+                    }
+                }
+                Key(k) => {
+                    if k.seat == s2 {
+                        saw_key = true
+                        assert_eq(k.sym, u32(0x61))
+                    }
+                }
+                _ => {}
+            }
+            d.accept(ev)
+        }
+        if saw_motion and saw_key {
+            break
+        }
+        time.sleep_ms(2)
+    }
+    assert(saw_motion and saw_key)
+    assert_eq(d.pointer_on(s1), (4.0, 4.0))
+    assert_eq(d.pointer_on(s2), (22.0, 13.0))
+    d.remove_seat(s2)
+    assert_eq(d.seats().len(), 1)
+}
+
+test "1000-placement Display.rebuild throughput" {
+    let dir = fs.create_temp_dir("luminaria-plug-bench").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), width: 256, height: 256, trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    let px: List[u8] = [u8(255), 0, 0, 255]
+    let img = d.image(1, 1, px, true).expect("image")
+    // Warmup + 100 iterations rebuilding 1000 visible placements.
+    let rounds = 100
+    d.layout(fn(mut l) {
+        for i in 0..1000 {
+            l.image(img, f64((i % 50) * 4), f64((i / 50) * 4), 2.0, 2.0, lum.Style {})
+        }
+    })
+    let t0 = time.now_ns()
+    for r in 0..rounds {
+        let shift = f64(r % 5)
+        d.layout(fn(mut l) {
+            for i in 0..1000 {
+                l.image(img, f64((i % 50) * 4) + shift, f64((i / 50) * 4), 2.0, 2.0, lum.Style {})
+            }
+        })
+    }
+    let us = (time.now_ns() - t0) / (rounds * 1000)
+    io.print("display rebuild, 1000 placements: {us} us/iter")
+    var count = 0
+    tr.read(fn(t: Trace) {
+        count = t.last_layout.len()
+    })
+    assert(count >= 1000)
 }

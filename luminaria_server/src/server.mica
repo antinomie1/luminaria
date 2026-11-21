@@ -101,6 +101,8 @@ pub enum Event {
     /// A screen capture of the output waits: draw a frame now, even
     /// without damage, and hand it to `capture`.
     Capture(ids.Output)
+    /// A capture of the window waits (`capture_window` / `capture_dmabuf_requests`).
+    CaptureWindow(ids.Window)
     /// A sandbox listener is ready: poll `listener_fds(k)` and accept
     /// with `accept_from`, close with `close_listener` when the second
     /// one hangs up.
@@ -119,6 +121,22 @@ pub enum Request {
     Fullscreen(bool, Option[ids.Output])
     Minimize
     Menu(ids.Seat, i32, i32)
+}
+
+/// Target of an async dmabuf capture request.
+pub enum CaptureTarget {
+    Output(ids.Output)
+    Window(ids.Window)
+}
+
+/// Pending dmabuf capture frame awaiting GPU copy/render and `capture_done`.
+pub struct CaptureReq {
+    pub session: u32 = 0
+    pub target: CaptureTarget = CaptureTarget.Output(ids.Output { id: ids.Id {} })
+    pub buffer: ids.Buffer = ids.Buffer { id: ids.Id {} }
+    pub paint_cursors: bool = false
+    pub width: i32 = 0
+    pub height: i32 = 0
 }
 
 /// linux-dmabuf setup: what the GPU imports, which device it is.
@@ -160,7 +178,10 @@ pub struct Server {
     constraints: ids.Slab[state.ConstraintData] = ids.Slab {}
     idles: ids.Slab[state.IdleData] = ids.Slab {}
     vkeys: ids.Slab[state.VirtualKeyboardData] = ids.Slab {}
+    capture_sources: ids.Slab[state.CaptureSourceData] = ids.Slab {}
     captures: ids.Slab[state.CaptureData] = ids.Slab {}
+    capture_device: u64 = 0
+    capture_formats: List[(u32, u64)] = []
     contexts: ids.Slab[state.ContextData] = ids.Slab {}
     outmans: ids.Slab[state.OutmanData] = ids.Slab {}
     configs: ids.Slab[state.ConfigData] = ids.Slab {}
@@ -244,6 +265,7 @@ pub fn Server.open(name: str) -> Result[Server, str] {
     s.add_global(proto.alpha_modifier.modifier_iface, 1)
     s.add_global(proto.content_type.type_manager_iface, 1)
     s.add_global(proto.ext_image_capture_source.output_image_capture_source_manager_iface, 1)
+    s.add_global(proto.ext_image_capture_source.foreign_toplevel_image_capture_source_manager_iface, 1)
     s.add_global(proto.ext_image_copy_capture.manager_iface, 1)
     s.add_global(proto.security_context.context_manager_iface, 1)
     s.add_global(proto.wlr_output_management_unstable.manager_iface, 4)
@@ -1084,6 +1106,12 @@ pub fn Server.add_seat(mut self, take name: str) -> ids.Seat {
     return seat.add(mut self, name)
 }
 
+pub fn Server.remove_seat(mut self, s: ids.Seat) {
+    if self.seats.live(s.id) {
+        seat.remove(mut self, s.id.index)
+    }
+}
+
 /// Pointer 1, keyboard 2, touch 4.
 pub fn Server.set_capabilities(mut self, s: ids.Seat, caps: u32) {
     if self.seats.live(s.id) {
@@ -1279,6 +1307,10 @@ pub struct LayerInfo {
     pub height: i32 = 0
 }
 
+pub fn Server.has_layers(self) -> bool {
+    return shell.has_layers(self)
+}
+
 pub fn Server.layers(self) -> List[ids.Layer] {
     var out: List[ids.Layer] = []
     for k in 0..self.layers.items.len() {
@@ -1460,6 +1492,13 @@ pub fn Server.input_activity(mut self, now: int) {
     inhibit.activity(mut self, now)
 }
 
+/// Named seat `s` saw input at `now` (CLOCK_MONOTONIC ns).
+pub fn Server.input_activity_on(mut self, s: ids.Seat, now: int) {
+    if self.seats.live(s.id) {
+        inhibit.activity_seat(mut self, s.id.index, now)
+    }
+}
+
 /// Send the idle notifications that are due; the next deadline (0:
 /// none, -1: some wait for the inhibitors to go). While `inhibited` only
 /// input-idle notifications fire.
@@ -1484,8 +1523,9 @@ pub fn Server.shortcuts_inhibited(self, st: ids.Seat) -> bool {
     guard self.seats.live(st.id) else {
         return false
     }
-    let f = self.seats.items[int(st.id.index)].kb_focus
-    return f != state.none and self.shortcut_inhibitors.any(fn(x) => x.2 == f and x.4)
+    let si = st.id.index
+    let f = self.seats.items[int(si)].kb_focus
+    return f != state.none and self.shortcut_inhibitors.any(fn(x) => x.2 == f and x.3 == si and x.4)
 }
 
 // --------------------------------------------------------------- drag
@@ -1505,17 +1545,55 @@ pub fn Server.drag_icon(self, st: ids.Seat) -> Option[ids.Surface] {
 
 // ------------------------------------------------------------ capture
 
-/// Whether a screen capture waits for the output's next image.
+/// Advertise dmabuf device (`dev_t`) and writable (fourcc, modifier) pairs
+/// for ext-image-copy-capture sessions.
+pub fn Server.set_capture_dmabuf(mut self, dev: u64, formats: &[(u32, u64)]) {
+    self.capture_device = dev
+    self.capture_formats.clear()
+    for p in formats {
+        self.capture_formats.push(p)
+    }
+}
+
+/// Whether a screen capture waits for the output's next shm image.
 pub fn Server.capture_waiting(self, o: ids.Output) -> bool {
     return self.outputs.live(o.id) and capture.waiting(self, o.id.index)
 }
 
 /// What the output shows (BGRA8, rows packed), shown at `ns`
-/// (CLOCK_MONOTONIC): the waiting captures get it.
+/// (CLOCK_MONOTONIC): the waiting shm captures get it.
 pub fn Server.capture(mut self, o: ids.Output, pixels: &[u8], width: i32, height: i32, ns: int) {
     if self.outputs.live(o.id) {
         capture.deliver(mut self, o.id.index, pixels, width, height, ns)
     }
+}
+
+/// Whether an shm capture waits for window `w`.
+pub fn Server.capture_window_waiting(self, w: ids.Window) -> bool {
+    return self.windows.live(w.id) and capture.window_waiting(self, w.id.index)
+}
+
+/// Deliver rendered window pixels (BGRA8, rows packed) to waiting shm captures.
+pub fn Server.capture_window(mut self, w: ids.Window, pixels: &[u8], width: i32, height: i32, ns: int) {
+    if self.windows.live(w.id) {
+        capture.window_deliver(mut self, w.id.index, pixels, width, height, ns)
+    }
+}
+
+/// Claim pending dmabuf capture frames into `out` (returns them once and
+/// marks their buffers busy until `capture_done` / `capture_fail` + `release`).
+pub fn Server.capture_dmabuf_requests(mut self, mut out: List[CaptureReq]) {
+    capture.dmabuf_requests(mut self, mut out)
+}
+
+/// Complete an in-flight dmabuf capture frame claimed from `capture_dmabuf_requests`.
+pub fn Server.capture_done(mut self, session: u32, ns: int) {
+    capture.done_async(mut self, session, ns)
+}
+
+/// Fail an in-flight dmabuf capture frame (`ext_image_copy_capture_frame_v1.failure_reason`).
+pub fn Server.capture_fail(mut self, session: u32, reason: u32) {
+    capture.fail_async(mut self, session, reason)
 }
 
 // ------------------------------------------------- output configuration

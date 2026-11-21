@@ -24,10 +24,25 @@ fn bound(mut srv: server.Server, ci: u32, si: u32, id: u32, version: u32) {
 }
 
 fn add(mut srv: server.Server, take name: str) -> ids.Seat {
-    let id = srv.seats.add(state.SeatData { name })
+    let id = srv.seats.add(state.SeatData { name, last_input: srv.last_input })
     let g = srv.add_dynamic(wl.seat_iface, 9, state.GlobalKind.Seat(id.index))
     srv.seats.items[int(id.index)].global = g
     return ids.Seat { id }
+}
+
+fn remove(mut srv: server.Server, si: u32) {
+    guard srv.seats.used(int(si)) else {
+        return
+    }
+    keyboard_focus(mut srv, si, state.none)
+    pointer_focus(mut srv, si, state.none, 0.0, 0.0)
+    touch_frame(mut srv, si, true)
+    let g = srv.seats.items[int(si)].global
+    if g != 0 {
+        srv.remove_global(g)
+    }
+    srv.shortcut_inhibitors.retain(fn(x) => x.3 != si)
+    srv.seats.remove(si, state.SeatData {})
 }
 
 /// Which devices the seat has (pointer 1, keyboard 2, touch 4).
@@ -45,7 +60,7 @@ fn set_caps(mut srv: server.Server, si: u32, caps: u32) {
 
 fn request(mut srv: server.Server, ci: u32, st: wl.Seat, take req: wl.SeatRequest) {
     let si = srv.slot(ci, st.id)
-    guard si != state.none else {
+    guard si != state.none and srv.seats.used(int(si)) else {
         return
     }
     let i = int(si)
@@ -79,17 +94,17 @@ fn request(mut srv: server.Server, ci: u32, st: wl.Seat, take req: wl.SeatReques
 
 fn pointer_request(mut srv: server.Server, ci: u32, p: wl.Pointer, take req: wl.PointerRequest) {
     let si = srv.slot(ci, p.id)
-    guard si != state.none else {
+    guard si != state.none and srv.seats.used(int(si)) else {
         return
     }
     match req {
         SetCursor(serial, s, hx, hy) => {
-            // Only the client the pointer is over, with its enter serial.
+            // Only the client the pointer is over, with this seat's enter serial.
             let f = srv.seats.items[int(si)].ptr_focus
             guard f != state.none and srv.surfaces.used(int(f)) and srv.surfaces.items[int(f)].client == ci else {
                 return
             }
-            guard serial == srv.clients.items[int(ci)].enter_serial else {
+            guard serial == srv.seats.items[int(si)].enter_serial else {
                 return
             }
             var surf: Option[ids.Surface] = None
@@ -324,7 +339,7 @@ fn pointer_focus(mut srv: server.Server, si: u32, surf: u32, x: f64, y: f64) {
     if surf != state.none and srv.surfaces.used(int(surf)) {
         let nc = srv.surfaces.items[int(surf)].client
         let obj = srv.surfaces.items[int(surf)].obj
-        srv.clients.items[int(nc)].enter_serial = serial
+        srv.seats.items[i].enter_serial = serial
         for k in 0..srv.seats.items[i].pointers.len() {
             let r = srv.seats.items[i].pointers[k]
             if r.client == nc {

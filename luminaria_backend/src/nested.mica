@@ -60,8 +60,6 @@ struct Nested {
     closed: bool = false
     swap: Option[swap.Swap] = None
     passed: List[Passed] = []
-    /// The window shows a passed client buffer (this one), not a slot.
-    showing: int = -1
     frame_cb: u32 = 0
     seq: u64 = 0
     enter_serial: u32 = 0
@@ -292,13 +290,19 @@ fn Nested.desc(self) -> types.OutputDesc {
     return types.OutputDesc { name: "WL-1", make: "luminaria", model: "nested", modes: [m], mode: m }
 }
 
-/// Wrap dmabuf `b` as a parent wl_buffer.
-fn Nested.wrap(mut self, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32) -> u32 {
+/// Wrap 1..4 plane dmabuf `b` as a parent wl_buffer.
+fn Nested.wrap(mut self, b: types.Dmabuf, format: u32) -> u32 {
     let p = self.dm.create_params(mut self.c)
-    p.add_(mut self.c, fd, 0, offset, stride, u32(modifier >> 32), u32(modifier & 0xffffffff))
-    let b = p.create_immed(mut self.c, i32(width), i32(height), format, dmabuf.BufferParamsFlags(0))
+    let hi = u32(b.modifier >> 32)
+    let lo = u32(b.modifier & 0xffffffff)
+    let n = min(max(b.planes, 1), 4)
+    for idx in 0..n {
+        let pl = b.plane[idx]
+        p.add_(mut self.c, pl.fd, u32(idx), pl.offset, pl.stride, hi, lo)
+    }
+    let buf = p.create_immed(mut self.c, b.width, b.height, format, dmabuf.BufferParamsFlags(0))
     p.destroy(mut self.c)
-    return b.id
+    return buf.id
 }
 
 /// Render targets the window needs before it can draw (None: it has
@@ -306,10 +310,12 @@ fn Nested.wrap(mut self, fd: int, width: u32, height: u32, format: u32, modifier
 /// keys go to `retired`.
 fn Nested.prepare(mut self, count: int, mut retired: List[u64]) -> Option[types.Want] {
     if self.resized {
-        if let Some(s) = self.swap.take() {
+        if let Some(sw) = self.swap.take() {
+            var s = sw
             for sl in s.slots {
                 wl.Buffer { id: sl.id }.destroy(mut self.c)
             }
+            s.close_fds()
             s.keys(mut retired)
         }
         self.resized = false
@@ -324,7 +330,7 @@ fn Nested.give(mut self, ts: &[types.Target]) {
     var s = swap.create(self.width, self.height, ts)
     for i in 0..s.slots.len() {
         let b = s.slots[i].buf
-        s.slots[i].id = self.wrap(b.plane[0].fd, u32(b.width), u32(b.height), types.buffer.xrgb8888, b.modifier, b.plane[0].offset, b.plane[0].stride)
+        s.slots[i].id = self.wrap(b, types.buffer.xrgb8888)
     }
     self.swap = Some(s)
 }
@@ -351,7 +357,6 @@ fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) 
     }
     s.queued(i)
     self.swap = Some(s)
-    self.showing = -1
     self.surf.attach(mut self.c, Some(wl.Buffer { id: buf }), 0, 0)
     self.damage(rects)
     self.frame_cb = self.surf.frame(mut self.c).id
@@ -359,8 +364,8 @@ fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) 
 }
 
 /// Show a client dmabuf directly; false when the parent cannot take it.
-fn Nested.scanout(mut self, key: u64, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
-    guard i32(width) == self.width and i32(height) == self.height else {
+fn Nested.scanout(mut self, key: u64, b: types.Dmabuf, rects: &[(i32, i32, i32, i32)]) -> bool {
+    guard b.width == self.width and b.height == self.height and b.planes >= 1 and b.planes <= 4 else {
         return false
     }
     var k = -1
@@ -370,12 +375,11 @@ fn Nested.scanout(mut self, key: u64, fd: int, width: u32, height: u32, format: 
         }
     }
     if k < 0 {
-        let b = self.wrap(fd, width, height, format, modifier, offset, stride)
-        self.passed.push(Passed { key, buffer: b })
+        let buf = self.wrap(b, b.format)
+        self.passed.push(Passed { key, buffer: buf })
         k = self.passed.len() - 1
     }
     self.passed[k].busy = true
-    self.showing = k
     self.surf.attach(mut self.c, Some(wl.Buffer { id: self.passed[k].buffer }), 0, 0)
     self.damage(rects)
     self.frame_cb = self.surf.frame(mut self.c).id
@@ -443,7 +447,12 @@ fn Nested.show_cursor(mut self) {
 }
 
 fn Nested.release(mut self, mut retired: List[u64]) {
-    if let Some(s) = self.swap.take() {
+    if let Some(sw) = self.swap.take() {
+        var s = sw
+        for sl in s.slots {
+            wl.Buffer { id: sl.id }.destroy(mut self.c)
+        }
+        s.close_fds()
         s.keys(mut retired)
     }
 }

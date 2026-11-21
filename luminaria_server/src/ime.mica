@@ -166,7 +166,6 @@ fn send_state(mut srv: server.Server, si: u32, k: u32) {
     m.text_change_cause(mut srv.conns[c], ti.InputChangeCause(st.cause))
     m.content_type(mut srv.conns[c], ti.InputContentHint(st.hint), ti.InputContentPurpose(st.purpose))
     m.done(mut srv.conns[c])
-    srv.seats.items[int(si)].im_dones += 1
 }
 
 fn deactivate(mut srv: server.Server, si: u32) {
@@ -180,7 +179,6 @@ fn deactivate(mut srv: server.Server, si: u32) {
     let (c, m) = method(srv, si)
     m.deactivate(mut srv.conns[c])
     m.done(mut srv.conns[c])
-    srv.seats.items[int(si)].im_dones += 1
 }
 
 fn method_manager(mut srv: server.Server, ci: u32, take req: im.MethodManagerRequest) {
@@ -197,7 +195,6 @@ fn method_manager(mut srv: server.Server, ci: u32, take req: im.MethodManagerReq
             }
             srv.seats.items[i].im_client = ci
             srv.seats.items[i].im = m.id
-            srv.seats.items[i].im_version = srv.conns[int(ci)].version(m.id)
             srv.bind(ci, m.id, si)
             // A text field already waits for it.
             let a = srv.seats.items[i].im_active

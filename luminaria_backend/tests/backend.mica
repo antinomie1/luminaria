@@ -180,3 +180,68 @@ test "a frame in a window of the parent compositor" {
     }
     r.close()
 }
+
+test "reset_targets retires headless targets and re-acquires cleanly" {
+    guard let Ok(rr) = compose.Compositor.open(false) else {
+        return
+    }
+    var r = rr
+    var b = backend.Backend.open(backend.Options { kind: backend.Kind.Headless, headless: [backend.Mode { width: 32, height: 24, refresh_mhz: 60000 }] }).expect("headless")
+    while b.next().is_some() {}
+    r.add_output(0, 32, 24, vec4(0.1, 0.2, 0.3, 1.0))
+    let (k1, _) = frame(mut b, mut r, 0)
+    let none: List[backend.Rect] = []
+    show(mut b, mut r, 0, k1, 0, none)
+    assert(presented(mut b, 0))
+    var retired: List[u64] = []
+    b.reset_targets(mut retired)
+    assert_eq(retired.len(), 2)
+    for k in retired {
+        r.drop_target(k)
+    }
+    // Can re-acquire and render again cleanly after reset_targets.
+    assert(b.can_present(0))
+    let (k2, age2) = frame(mut b, mut r, 0)
+    assert_eq(age2, u32(0))
+    assert(not retired.contains(k2))
+    show(mut b, mut r, 0, k2, age2, none)
+    assert(presented(mut b, 0))
+    var gone: List[u64] = []
+    b.shutdown(mut gone)
+    for k in gone {
+        r.drop_target(k)
+    }
+    r.close()
+}
+
+test "set_keymap_on stores independent keymap for a second seat" {
+    var b = backend.Backend.open(backend.Options { kind: backend.Kind.Headless }).expect("headless")
+    while b.next().is_some() {}
+    let (fd0, sz0) = b.keymap_on("seat1")
+    assert_eq(fd0, -1)
+    assert_eq(sz0, u32(0))
+    match b.set_keymap_on("seat1", backend.Names { layout: "us" }) {
+        Ok => {
+            let (fd1, sz1) = b.keymap_on("seat1")
+            assert(fd1 >= 0 and sz1 > 100)
+            var got_ev = false
+            while true {
+                guard let Some(e) = b.next() else {
+                    break
+                }
+                match e {
+                    KeymapOn(s) => {
+                        if s == "seat1" {
+                            got_ev = true
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert(got_ev)
+        }
+        Err(e) => io.eprint("skipped: {e}")
+    }
+    var gone: List[u64] = []
+    b.shutdown(mut gone)
+}

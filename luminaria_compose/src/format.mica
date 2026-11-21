@@ -1,8 +1,10 @@
 // Buffer formats: DRM fourcc formats mapped to Vulkan formats (X formats
-// read alpha as 1), the dmabuf format table, and the import and upload
-// steps the compositor's client textures are made with.
+// read alpha as 1), the dmabuf format tables, and safe 1..4 plane import
+// and shm upload helpers for client textures and capture targets.
 
+import std.os
 import vk_gpu as gpu
+import luminaria_types as types
 import luminaria_types.buffer as fourcc
 
 pub let argb8888 = fourcc.argb8888
@@ -35,13 +37,93 @@ pub fn dmabuf_formats(dev: gpu.Device) -> List[(u32, u64)] {
     return out
 }
 
-/// Import a single-plane dmabuf (the fd stays the caller's).
-pub fn import_dmabuf(mut dev: gpu.Device, fd: int, width: i32, height: i32, fourcc: u32, modifier: u64, offset: u32, stride: u32) -> Result[gpu.Texture, str] {
-    guard let Some((vf, opaque)) = vk_format(fourcc) else {
-        return Err("dmabuf format {fourcc:08x} is not supported")
+/// Every fourcc and modifier writable as a GPU dmabuf capture destination.
+pub fn capture_formats(dev: gpu.Device) -> List[(u32, u64)] {
+    var out: List[(u32, u64)] = []
+    for f in [argb8888, xrgb8888, abgr8888, xbgr8888] {
+        if let Some((vf, _)) = vk_format(f) {
+            for m in dev.dmabuf_capture_modifiers(vf) {
+                out.push((f, m))
+            }
+        }
     }
-    let d = gpu.Dmabuf { fd: i32(fd), width: u32(width), height: u32(height), format: vf, modifier, offset: u64(offset), stride: u64(stride), opaque }
-    return dev.import_dmabuf(d)
+    return out
+}
+
+fn to_gpu_dmabuf(d: types.Dmabuf, vf: gpu.Format, opaque: bool, mut dup_fds: List[i32]) -> Result[gpu.Dmabuf, str] {
+    guard d.width > 0 and d.height > 0 and d.planes >= 1 and d.planes <= 4 else {
+        return Err("dmabuf {d.width}x{d.height} planes {d.planes}")
+    }
+    var planes: [4]gpu.Plane = [gpu.Plane {}, gpu.Plane {}, gpu.Plane {}, gpu.Plane {}]
+    for i in 0..d.planes {
+        let p = d.plane[i]
+        guard p.fd >= 0 else {
+            for fd in dup_fds {
+                os.close(int(fd))
+            }
+            dup_fds.clear()
+            return Err("dmabuf plane {i} has negative fd")
+        }
+        guard let Ok(dup_fd) = os.dup(p.fd) else {
+            for fd in dup_fds {
+                os.close(int(fd))
+            }
+            dup_fds.clear()
+            return Err("dup dmabuf plane {i} fd failed")
+        }
+        dup_fds.push(i32(dup_fd))
+        planes[i] = gpu.Plane { fd: i32(dup_fd), offset: u64(p.offset), stride: u64(p.stride) }
+    }
+    return Ok(gpu.Dmabuf {
+        fd: planes[0].fd,
+        width: u32(d.width),
+        height: u32(d.height),
+        format: vf,
+        modifier: d.modifier,
+        offset: planes[0].offset,
+        stride: planes[0].stride,
+        opaque,
+        num_planes: d.planes,
+        planes,
+    })
+}
+
+/// Import a 1..4 plane dmabuf for sampling; the caller keeps ownership of all
+/// plane file descriptors (every descriptor passed to Vulkan is duplicated).
+pub fn import_dmabuf(mut dev: gpu.Device, d: types.Dmabuf) -> Result[gpu.Texture, str] {
+    guard let Some((vf, opaque)) = vk_format(d.format) else {
+        return Err("dmabuf format {d.format:08x} is not supported")
+    }
+    var dup_fds: List[i32] = []
+    let gd = try to_gpu_dmabuf(d, vf, opaque, mut dup_fds)
+    return match dev.import_dmabuf(gd) {
+        Ok(t) => Ok(t)
+        Err(e) => {
+            for fd in dup_fds {
+                os.close(int(fd))
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Import a 1..4 plane dmabuf as a writable capture target; the caller keeps
+/// ownership of all plane file descriptors.
+pub fn import_dmabuf_target(mut dev: gpu.Device, d: types.Dmabuf) -> Result[gpu.Texture, str] {
+    guard let Some((vf, _)) = vk_format(d.format) else {
+        return Err("dmabuf capture format {d.format:08x} is not supported")
+    }
+    var dup_fds: List[i32] = []
+    let gd = try to_gpu_dmabuf(d, vf, false, mut dup_fds)
+    return match dev.import_dmabuf_target(gd) {
+        Ok(t) => Ok(t)
+        Err(e) => {
+            for fd in dup_fds {
+                os.close(int(fd))
+            }
+            Err(e)
+        }
+    }
 }
 
 /// A texture for an shm surface of this size and format.

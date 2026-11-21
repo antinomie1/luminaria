@@ -20,9 +20,6 @@ struct ClientData {
     registries: List[u32] = []
     /// Transactions of this client, oldest first: applied in order.
     txns: List[u32] = []
-    /// Pointer enter serial last sent to this client (cursor requests
-    /// must name it).
-    enter_serial: u32 = 0
     /// Connected through a wp_security_context_v1 listener: privileged
     /// globals are hidden; what the sandbox said about it.
     sandboxed: bool = false
@@ -230,8 +227,6 @@ struct BufferData {
     stride: int = 0
     planes: List[Plane] = []
     modifier: u64 = 0
-    /// Surfaces that hold it as their current buffer.
-    users: int = 0
     /// The facade still needs it (until `release_buffer`).
     busy: bool = false
     /// zwp_linux_buffer_params id awaiting created / failed (dmabuf `create`).
@@ -276,9 +271,6 @@ struct WindowData {
     configured: bool = false
     mapped: bool = false
     configures: List[Configure] = []
-    /// Size of the last acked configure.
-    acked_w: i32 = 0
-    acked_h: i32 = 0
     /// zxdg_toplevel_decoration_v1 id (0: none) and the mode the client
     /// wants (0 none, 1 client side, 2 server side), the mode granted.
     decoration: u32 = 0
@@ -289,8 +281,6 @@ struct WindowData {
     description: str = ""
     dialog: u32 = 0
     modal: bool = false
-    /// xdg-foreign handles exported for it.
-    exports: List[str] = []
     /// ext_foreign_toplevel_handle_v1 objects: client slot, id.
     handles: List[(u32, u32)] = []
     /// ext-foreign-toplevel-list identifier.
@@ -393,6 +383,10 @@ struct SeatData {
     devices: List[Res] = []
     kb_focus: u32 = 0xFFFFFFFF
     ptr_focus: u32 = 0xFFFFFFFF
+    /// Pointer enter serial last sent on this seat (cursor requests must name it).
+    enter_serial: u32 = 0
+    /// Last input timestamp on this seat (CLOCK_MONOTONIC ns).
+    last_input: int = 0
     keymap: Option[wire.Fd] = None
     keymap_size: u32 = 0
     rate: i32 = 25
@@ -403,8 +397,6 @@ struct SeatData {
     selection: u32 = 0xFFFFFFFF
     /// Touch points down: id and surface slot.
     touch_points: List[(i32, u32)] = []
-    /// Popups grabbing this seat, innermost last.
-    grabs: List[u32] = []
     /// Primary selection source slot, its devices; data-control devices
     /// (see every selection, any client).
     primary: u32 = 0xFFFFFFFF
@@ -422,7 +414,6 @@ struct SeatData {
     /// its keyboard grab and popup surfaces.
     im_client: u32 = 0
     im: u32 = 0
-    im_version: u32 = 1
     grab_client: u32 = 0
     grab: u32 = 0
     /// What the input method committed, applied on its commit.
@@ -432,7 +423,6 @@ struct SeatData {
     im_commit: str = ""
     im_delete_before: u32 = 0
     im_delete_after: u32 = 0
-    im_dones: u32 = 0
     /// The text input the input method serves (slot), or none.
     im_active: u32 = 0xFFFFFFFF
     /// Input method popups: client, id, surface slot.
@@ -548,6 +538,7 @@ struct ConstraintData {
 struct IdleData {
     client: u32 = 0
     obj: u32 = 0
+    seat: u32 = 0xFFFFFFFF
     timeout_ms: int = 0
     /// get_input_idle_notification: inhibitors do not hold it back.
     input_only: bool = false
@@ -588,16 +579,33 @@ struct OfferData {
     accepted: bool = false
 }
 
-/// ext_image_copy_capture_session_v1 on an output, and its frame.
+enum CaptureTargetKind {
+    None
+    Output
+    Window
+}
+
+/// ext_image_capture_source_v1 backing target (output or toplevel window).
+struct CaptureSourceData {
+    kind: CaptureTargetKind = CaptureTargetKind.None
+    target: u32 = 0xFFFFFFFF
+}
+
+/// ext_image_copy_capture_session_v1 on an output or window, and its frame.
 struct CaptureData {
     client: u32 = 0
     obj: u32 = 0
-    output: u32 = 0xFFFFFFFF
+    kind: CaptureTargetKind = CaptureTargetKind.None
+    target: u32 = 0xFFFFFFFF
+    paint_cursors: bool = false
+    width: i32 = 0
+    height: i32 = 0
     /// The frame (0: none), the buffer attached to it, and whether it
-    /// waits for the next image.
+    /// waits for the next image or has a dmabuf capture in flight on GPU.
     frame: u32 = 0
     buffer: u32 = 0xFFFFFFFF
     waiting: bool = false
+    in_flight: bool = false
     /// A frame was delivered: later ones wait for new content.
     shot: bool = false
 }
@@ -655,8 +663,10 @@ struct ConfigData {
 
 struct ParamsData {
     client: u32 = 0
-    planes: List[Plane] = []
+    planes: [4]Option[Plane] = [None, None, None, None]
+    seen: u8 = 0
     modifier: u64 = 0
+    has_mod: bool = false
     used: bool = false
 }
 

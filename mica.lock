@@ -70,7 +70,7 @@ source = "path+luminaria_wire"
 [[package]]
 name = "raw_window_handle"
 version = "0.1.0"
-source = "git+https://github.com/antinomie1/vk.git?dir=raw_window_handle#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+source = "git+https://github.com/antinomie1/vk.git?dir=raw_window_handle#c4332f1f31131568448fc4457e4b5724b1d59b05"
 
 [[package]]
 name = "tiny"
@@ -81,30 +81,30 @@ dependencies = ["luminaria"]
 [[package]]
 name = "vk"
 version = "0.1.0"
-source = "git+https://github.com/antinomie1/vk.git?dir=vk#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+source = "git+https://github.com/antinomie1/vk.git?dir=vk#c4332f1f31131568448fc4457e4b5724b1d59b05"
 
 [[package]]
 name = "vk_compose"
 version = "0.1.0"
-source = "git+https://github.com/antinomie1/vk.git?dir=vk_compose#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+source = "git+https://github.com/antinomie1/vk.git?dir=vk_compose#c4332f1f31131568448fc4457e4b5724b1d59b05"
 dependencies = ["vk_draw2d", "vk_gpu"]
 
 [[package]]
 name = "vk_draw2d"
 version = "0.1.0"
-source = "git+https://github.com/antinomie1/vk.git?dir=vk_draw2d#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+source = "git+https://github.com/antinomie1/vk.git?dir=vk_draw2d#c4332f1f31131568448fc4457e4b5724b1d59b05"
 dependencies = ["vk_gpu"]
 
 [[package]]
 name = "vk_gpu"
 version = "0.1.0"
-source = "git+https://github.com/antinomie1/vk.git?dir=vk_gpu#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+source = "git+https://github.com/antinomie1/vk.git?dir=vk_gpu#c4332f1f31131568448fc4457e4b5724b1d59b05"
 dependencies = ["raw_window_handle", "vk", "vk_window"]
 
 [[package]]
 name = "vk_window"
 version = "0.1.0"
-source = "git+https://github.com/antinomie1/vk.git?dir=vk_window#87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+source = "git+https://github.com/antinomie1/vk.git?dir=vk_window#c4332f1f31131568448fc4457e4b5724b1d59b05"
 dependencies = ["raw_window_handle", "vk"]
 
 [[package]]
@@ -113,4 +113,4 @@ version = "0.1.0"
 source = "path+sys/xkbcommon_sys"
 
 [git]
-"https://github.com/antinomie1/vk.git" = "87352ba3a8b5c47cfd8ba3d8f2fc6d72ad4faf4d"
+"https://github.com/antinomie1/vk.git" = "c4332f1f31131568448fc4457e4b5724b1d59b05"

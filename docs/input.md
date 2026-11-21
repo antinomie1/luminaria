@@ -6,7 +6,7 @@
 设备 ──▶ backend（libinput + xkb / 父合成器 / inject）──▶ Display
     指针移动：先夹在输出范围内，立即移动光标（光标平面在下一个 vblank 前提交，帧先到就并进帧）
     操纵进行中：直接移动或缩放窗口，不产生事件
-    其余：Key / Modifiers / Motion / Button / Scroll / Touch / Gesture 事件 ──▶ 合成器
+    其余：Key / Modifiers / ModifiersOn / Motion / Button / Scroll / Touch / Gesture 事件 ──▶ 合成器
           ──▶ 合成器自己处理（快捷键），或 accept(e) ──▶ 路由给客户端
 ```
 
@@ -23,10 +23,15 @@ SIMD：
   四次逐通道减法、三次或、一次 `bitmask()`。
 - 从最上面一组往下找，组内从最高位往下逐个用表面的输入区域确认。
 
-512 个表面最坏情况 251 ns。浮点 `vec8` 加 `[8]bool` 逐通道检查的写法反而比标量慢（1473 ns 对
+512 个表面最坏情况 252 ns。浮点 `vec8` 加 `[8]bool` 逐通道检查的写法反而比标量慢（1473 ns 对
 323 ns），所以没有用。
 
-## `accept` 的路由
+## `accept` 的路由与多 seat
+
+每个 seat（主 `seat0` 与 `add_seat` 创建的次级 seat）各自独立维护指针坐标、命中聚焦表面、
+按住按钮时的隐式抓取、触摸点表面映射、弹出菜单抓取栈、`focus_on` 窗口焦点、XKB 状态与光标纹理
+（`seat0` 优先硬件光标平面，次级 seat 由渲染器合成软件光标）；输入法弹出窗放置在活跃 seat 的文本
+光标下，on-demand layer 表面按席位点击获焦（`clicked_on`）。
 
 - **指针**：按住按钮时目标固定为按下时的表面（隐式抓取），否则取命中测试结果；目标变化时发 leave /
   enter（带表面坐标），否则发 motion。指针离开所有客户端时恢复默认光标。

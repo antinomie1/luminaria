@@ -65,6 +65,8 @@ fn Headless.release(mut self, mut retired: List[u64]) {
         }
         self.outs[o].slots.clear()
         self.outs[o].drawn.clear()
+        self.outs[o].pending = -1
+        self.outs[o].shown = -1
     }
 }
 

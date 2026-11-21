@@ -12,6 +12,7 @@
 // that thread run in the real-time class (sched.mica).
 
 import std.env
+import std.mem
 import std.os
 import std.time
 import libudev_sys as udev
@@ -86,7 +87,9 @@ pub struct Backend {
     alive: List[bool] = []
     events: List[Event] = []
     head: int = 0
-    pending_inputs: List[Input] = []
+    default_seat: str = "seat0"
+    keymap_names: Names = Names {}
+    extra_kbs: List[(str, keyboard.Keyboard)] = []
     buffers: int = 2
     active: bool = true
     /// Slot index each output's acquired frame uses.
@@ -140,6 +143,8 @@ fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
     let s = try session.open()
     let seat_name = s.name()
     self.session = Some(s)
+    self.default_seat = seat_name.clone()
+    self.keymap_names = names.clone()
     self.kb = Some(try keyboard.Keyboard.new(names))
     let path = try drm.find_card()
     var d = try drm.open(path)
@@ -236,18 +241,28 @@ pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
     } else if token == token_input {
         if let Some(ii) = self.input.take() {
             var inp = ii
-            var got: List[Input] = []
+            var extra = mem.replace(mut self.extra_kbs, [])
+            let prev_extra = extra.len()
+            var got: List[(str, Input)] = []
             if let Some(kk) = self.kb.take() {
                 var kb = kk
-                inp.dispatch(mut kb, mut got)
+                inp.dispatch(mut kb, mut extra, self.keymap_names.clone(), mut got)
                 self.kb = Some(kb)
             }
+            for k in prev_extra..extra.len() {
+                self.push(Event.KeymapOn(extra[k].0.clone()))
+            }
+            self.extra_kbs = extra
             self.input = Some(inp)
             if not got.is_empty() {
                 self.boost.pulse(time.now_ns())
             }
-            for g in take got {
-                self.push(Event.Input(g))
+            for (seat, g) in take got {
+                if seat.is_empty() {
+                    self.push(Event.Input(g))
+                } else {
+                    self.push(Event.InputOn(seat, g))
+                }
             }
         }
     } else if token == token_udev {
@@ -625,30 +640,16 @@ pub fn Backend.present(mut self, o: u32, fence: int, rects: &[Rect], tear: bool)
 /// unscaled): framebuffer import, an atomic test, then the flip. False
 /// when the display cannot take it (compose instead).
 pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rect], tear: bool) -> bool {
-    guard b.planes == 1 else {
+    guard b.planes >= 1 and b.planes <= 4 else {
         return false
     }
     let oi = int(o)
-    let fd = b.plane[0].fd
-    let width = u32(b.width)
-    let height = u32(b.height)
-    let format = b.format
-    let modifier = b.modifier
-    let offset = b.plane[0].offset
-    let stride = b.plane[0].stride
     if let Some(dd) = self.drm.take() {
         var d = dd
+        d.outputs[oi].queued_overlays.clear()
         var fb: u32 = 0
-        for (k, id) in d.outputs[oi].fbs {
-            if k == key {
-                fb = id
-            }
-        }
-        if fb == 0 {
-            if let Ok(id) = d.add_fb(fd, width, height, format, modifier, offset, stride) {
-                fb = id
-                d.outputs[oi].fbs.push((key, id))
-            }
+        if let Ok(id) = d.get_or_add_fb(oi, key, b) {
+            fb = id
         }
         var ok = false
         if fb != 0 and not d.outputs[oi].modeset {
@@ -669,7 +670,7 @@ pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rec
     }
     if let Some(nn) = self.nested.take() {
         var n = nn
-        let ok = n.scanout(key, fd, width, height, format, modifier, offset, stride, rects)
+        let ok = n.scanout(key, b, rects)
         n.flush()
         self.nested = Some(n)
         return ok
@@ -677,12 +678,61 @@ pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rec
     return false
 }
 
-/// Whether the display still reads client buffer `key` (scanned out).
+/// Probe hardware overlay candidates top-to-bottom on output `o` against
+/// primary render target `target_key`; returns promoted placement keys.
+pub fn Backend.test_overlays(mut self, o: u32, target_key: u64, cands: &[types.Overlay]) -> List[u64] {
+    guard let Some(dd) = self.drm.take() else {
+        let none: List[u64] = []
+        return none
+    }
+    var d = dd
+    let oi = int(o)
+    var primary_fb: u32 = 0
+    if oi < d.outputs.len() {
+        if let Some(s) = d.outputs[oi].swap {
+            for sl in s.slots {
+                if sl.key == target_key {
+                    primary_fb = sl.id
+                    break
+                }
+            }
+        }
+    }
+    let promoted = d.test_overlays(oi, primary_fb, cands)
+    self.drm = Some(d)
+    return promoted
+}
+
+/// Drop any queued overlay promotion on output `o`.
+pub fn Backend.clear_overlays(mut self, o: u32) {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        d.clear_overlays(int(o))
+        self.drm = Some(d)
+    }
+}
+
+/// Whether the display still reads client buffer `key` (scanned out or overlay).
 pub fn Backend.holds(self, key: u64) -> bool {
     if let Some(d) = self.drm {
         for o in d.outputs {
             for (k, id) in o.fbs {
                 if k == key and (id == o.direct_queued or id == o.direct_shown) {
+                    return true
+                }
+            }
+            for sl in o.cur_overlays {
+                if sl.buf_key == key {
+                    return true
+                }
+            }
+            for sl in o.pend_overlays {
+                if sl.buf_key == key {
+                    return true
+                }
+            }
+            for sl in o.queued_overlays {
+                if sl.buf_key == key {
                     return true
                 }
             }
@@ -814,6 +864,58 @@ pub fn Backend.set_keymap(mut self, names: Names) -> Result[(), str] {
     return Ok(())
 }
 
+/// Keymap for `seat` (memfd and size); falls back to the default keymap.
+pub fn Backend.keymap_on(self, seat: str) -> (int, u32) {
+    for x in self.extra_kbs {
+        if x.0 == seat {
+            return (x.1.fd, x.1.size)
+        }
+    }
+    return self.keymap()
+}
+
+/// Active modifiers on `seat`; falls back to the default seat's modifiers.
+pub fn Backend.mods_on(self, seat: str) -> Mods {
+    for x in self.extra_kbs {
+        if x.0 == seat {
+            return x.1.mods()
+        }
+    }
+    return self.mods()
+}
+
+/// Set a per-seat keymap on `seat`.
+pub fn Backend.set_keymap_on(mut self, seat: str, names: Names) -> Result[(), str] {
+    if seat.is_empty() or seat == "seat0" or seat == "default" or seat == self.default_seat {
+        return self.set_keymap(names)
+    }
+    guard self.kind != Kind.Nested else {
+        return Err("the keymap comes from the parent compositor")
+    }
+    let nkb = try keyboard.Keyboard.new(names)
+    for i in 0..self.extra_kbs.len() {
+        if self.extra_kbs[i].0 == seat {
+            self.extra_kbs[i].1 = nkb
+            self.push(Event.KeymapOn(seat.clone()))
+            return Ok(())
+        }
+    }
+    self.extra_kbs.push((seat.clone(), nkb))
+    self.push(Event.KeymapOn(seat.clone()))
+    return Ok(())
+}
+
+/// Reassign input device `device` to logical seat `seat`.
+pub fn Backend.assign_device_seat(mut self, device: u32, seat: str) -> bool {
+    guard let Some(ii) = self.input.take() else {
+        return false
+    }
+    var i = ii
+    let ok = i.assign_seat(device, seat)
+    self.input = Some(i)
+    return ok
+}
+
 pub fn Backend.configure_input(mut self, device: u32, c: InputConfig) {
     if let Some(ii) = self.input.take() {
         var i = ii
@@ -849,6 +951,29 @@ pub fn Backend.scanout_modifiers(self, o: u32) -> List[u64] {
     return none
 }
 
+/// Release every render target so they can be recreated after a GPU reset.
+pub fn Backend.reset_targets(mut self, mut retired: List[u64]) {
+    self.retired(mut retired)
+    for i in 0..self.acquired.len() {
+        self.acquired[i] = -1
+    }
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        d.reset_targets(mut retired)
+        self.drm = Some(d)
+    }
+    if let Some(nn) = self.nested.take() {
+        var n = nn
+        n.release(mut retired)
+        self.nested = Some(n)
+    }
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        h.release(mut retired)
+        self.headless = Some(h)
+    }
+}
+
 /// Let go of every render target (their keys go to `retired`, for the
 /// renderer to free) before the renderer goes away.
 pub fn Backend.shutdown(mut self, mut retired: List[u64]) {
@@ -878,6 +1003,7 @@ pub fn Backend.stats(self, mut s: types.Stats) {
         return
     }
     s.tests = d.tests
+    s.overlays = d.overlay_frames
     if let Some(t) = d.thread {
         t.counts.read(fn(c: commit.Counts) {
             s.commits = c.commits

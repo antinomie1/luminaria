@@ -194,6 +194,15 @@ fn destroy_layer(mut srv: server.Server, li: u32) {
     srv.layers.remove(li, state.LayerData {})
 }
 
+fn has_layers(srv: server.Server) -> bool {
+    for i in 0..srv.layers.items.len() {
+        if srv.layers.used(i) {
+            return true
+        }
+    }
+    return false
+}
+
 // ----------------------------------------------------------------- lock
 
 fn lock_manager(mut srv: server.Server, ci: u32, take req: sl.LockManagerRequest) {

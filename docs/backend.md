@@ -25,23 +25,29 @@
 
 - **选卡**：`LUMINARIA_DRM_DEVICE`，否则 `/dev/dri` 下第一个 card；经 libseat 打开，要求原子模式设置
   和通用平面。
-- **连接器**：每个已连接的连接器配一个空闲 CRTC、它的主平面和光标平面（有的话）；名字来自类型和
-  编号（`DP-3`），厂商和型号从 EDID 解析。
+- **连接器**：每个已连接的连接器配一个空闲 CRTC、它的主平面、通用 overlay 平面（`kind == 0`，支持
+  多个）和光标平面（有的话）；名字来自类型和编号（`DP-3`），厂商和型号从 EDID 解析，同时解析各平面的
+  `IN_FORMATS` blob（支持的 `(fourcc, modifier)` 列表）。
 - **缓冲布局**：主平面 `IN_FORMATS` 里 XRGB8888 的修饰符与 GPU 可渲染的修饰符求交，交给驱动挑选；
-  平铺、压缩布局比线性省显存带宽。每个缓冲导入成 framebuffer（`prime_fd_to_handle` +
-  `AddFB2WithModifiers`）。
+  平铺、压缩布局比线性省显存带宽。每个 1..4 平面 dmabuf 导入成 framebuffer（按 fd / 句柄去重做
+  `prime_fd_to_handle` + `drmModeAddFB2WithModifiers`）。
 - **提交**：一次非阻塞原子提交，带 `PAGE_FLIP_EVENT`：
   - 首帧或模式变化时设 CRTC 的 `MODE_ID`、`ACTIVE`、`VRR_ENABLED` 和连接器的 `CRTC_ID`；
   - 主平面的 `FB_ID`、源与目标矩形、`IN_FENCE_FD`（GPU 的 sync_file，内核等，CPU 不等）、
     `FB_DAMAGE_CLIPS`（变化的矩形）；
+  - 已分配 overlay 平面的 `FB_ID`、源（16.16 定点）与目标矩形（支持 `IN_FORMATS` 检查与原子
+    `TEST_ONLY`，退下时清除对应平面的 `FB_ID`/`CRTC_ID`）；
   - 光标平面的位置或隐藏。
 
   事件循环只把请求拼成纯数据（对象、属性、值，加上要关的栅栏 fd 和要销毁的损坏 blob），交给提交线程。
 - **翻转事件**：直接读 DRM fd 解析 `drm_event_vblank`，得到序号和 CLOCK_MONOTONIC 时间戳；用户数据
-  标出这次提交是否带帧。带帧的翻转让排队的缓冲变成显示中，之前显示的缓冲空出来，并报 `Presented`；
-  只有光标的翻转只通知提交线程。
-- **直接扫描输出**：客户端 dmabuf 按缓冲缓存 framebuffer，先 `TEST_ONLY`（在事件循环里同步问）再交给
-  提交线程；客户端允许撕裂且驱动支持时用 `PAGE_FLIP_ASYNC`。
+  标出这次提交是否带帧。带帧的翻转让排队的缓冲（含 overlay 缓冲与主缓冲）变成显示中，之前显示的
+  缓冲空出来，并报 `Presented`；只有光标的翻转只通知提交线程。
+- **直接扫描输出与 overlay 提升**：客户端 dmabuf 按缓冲缓存 framebuffer，全屏直接扫描输出先做
+  `TEST_ONLY`（在事件循环里同步问）再交给提交线程，客户要求撕裂且驱动支持时用 `PAGE_FLIP_ASYNC`；
+  `test_overlays` 按从上到下顺序试探候选表面（`TEST_ONLY`）并将通过的加入下一次原子提交。
+- **重置目标**：`reset_targets` 在 GPU 设备丢失恢复前释放现存全部显示端扫描目标、framebuffer 缓存与
+  overlay 状态。
 - **光标**：光标平面上一个 dumb buffer（尺寸取 `DRM_CAP_CURSOR_WIDTH/HEIGHT`），换图像时整行拷贝、
   只清图像没盖到的部分。指针移动产生一个只含光标的请求，由提交线程在下一个 vblank 前提交；帧先到就并进
   帧的提交。光标显示的是 vblank 前最后的位置，而不是帧开始时的位置。
@@ -79,11 +85,14 @@ open），让它在输入引起的那一帧之前提频。
 
 - **libseat**（seatd、logind 或 noop）：设备经它打开，切 VT 时被收回。禁用时停止提交、暂停 libinput；
   恢复时重新模式设置、恢复 libinput，发 `Session`。
-- **libinput**：udev seat 上下文，设备的打开和关闭走 libseat。键和按钮按 seat 计数，只报第一次按下和
+- **libinput**：udev seat 上下文，设备的打开和关闭走 libseat。识别设备的逻辑 seat 名字（libinput 的
+  `"default"` 规范化为 `""` 走默认 seat），支持 `assign_device_seat` 动态把设备指派到次级逻辑 seat，
+  并将非空 seat 的输入包装成 `Event.InputOn(seat, input)`。键和按钮按 seat 计数，只报第一次按下和
   最后一次抬起。指针（相对、绝对）、滚动（滚轮 v120、手指、连续）、触摸、滑动 / 捏合 / 按住手势、
   设备增删都变成纯数据的 `Input`。`configure_input` 设置轻触点击、自然滚动、加速、左手、禁用。
-- **xkb**：按 RMLVO 名字编译 keymap，键在这里就算出 keysym 和文字；序列化的修饰键变化时单独报出。
-  keymap 文本放进一个 memfd，所有客户端共享。
+- **xkb**：按 RMLVO 名字编译 keymap，支持主 seat 与 `extra_kbs` 辅助 seat（`keymap_on`、`mods_on`、
+  `set_keymap_on` 及 `Event.KeymapOn(seat)`）；键在这里就算出 keysym 和文字；序列化的修饰键变化时
+  按 seat 单独报出。每个 seat 各自维护一块共享只读 keymap memfd 给客户端映射。
 
 ## 嵌套
 

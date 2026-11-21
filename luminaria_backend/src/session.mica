@@ -57,12 +57,6 @@ fn Session.name(self) -> str {
     return seat.seat_name(self.s).unwrap_or("seat0")
 }
 
-fn Session.active(self) -> bool {
-    unsafe {
-        return active
-    }
-}
-
 /// Run libseat's callbacks: Some(active) when the session changed.
 fn Session.dispatch(mut self) -> Option[bool] {
     discard seat.dispatch(self.s, 0)

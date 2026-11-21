@@ -13,7 +13,7 @@ import server
 
 /// Globals a sandboxed client cannot see or bind.
 fn privileged(iface: u16) -> bool {
-    let hidden: [11]u16 = [
+    let hidden: [12]u16 = [
         sc.context_manager_iface,
         proto.ext_data_control.manager_iface,
         proto.wlr_layer_shell_unstable.shell_iface,
@@ -23,6 +23,7 @@ fn privileged(iface: u16) -> bool {
         proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface,
         proto.ext_foreign_toplevel_list.toplevel_list_iface,
         proto.ext_image_capture_source.output_image_capture_source_manager_iface,
+        proto.ext_image_capture_source.foreign_toplevel_image_capture_source_manager_iface,
         proto.ext_image_copy_capture.manager_iface,
         proto.wlr_output_management_unstable.manager_iface,
     ]

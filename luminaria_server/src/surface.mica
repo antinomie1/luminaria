@@ -363,16 +363,10 @@ fn apply_state(mut srv: server.Server, si: u32, take st: state.State) {
     let i = int(si)
     var changed: u32 = 0
     if s.attached {
-        if let Some(o) = srv.surfaces.items[i].current.buffer {
-            if srv.buffers.live(o) {
-                srv.buffers.items[int(o.index)].users -= 1
-            }
-        }
         var bw: i32 = 0
         var bh: i32 = 0
         if let Some(nb) = s.buffer {
             if srv.buffers.live(nb) {
-                srv.buffers.items[int(nb.index)].users += 1
                 srv.buffers.items[int(nb.index)].busy = true
                 bw = srv.buffers.items[int(nb.index)].width
                 bh = srv.buffers.items[int(nb.index)].height
@@ -647,11 +641,6 @@ fn destroy(mut srv: server.Server, si: u32) {
         if c != si and srv.surfaces.used(int(c)) {
             srv.surfaces.items[int(c)].parent = state.none
             srv.surfaces.items[int(c)].role = state.Role.Plain
-        }
-    }
-    if let Some(b) = srv.surfaces.items[i].current.buffer {
-        if srv.buffers.live(b) {
-            srv.buffers.items[int(b.index)].users -= 1
         }
     }
     extra.discard_feedbacks(mut srv, si)

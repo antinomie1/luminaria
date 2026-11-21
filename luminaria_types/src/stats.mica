@@ -40,6 +40,12 @@ pub struct Stats {
     pub priority: int = 0
     /// The renderer has no DRM node: a CPU rasterizer (lavapipe) or none.
     pub software: bool = false
+    /// Frames that promoted at least one surface to a hardware overlay plane.
+    pub overlays: int = 0
+    /// Vulkan queue global priority granted (0 when unsupported/default).
+    pub gpu_priority: i32 = 0
+    /// Count of GPU device-lost recoveries performed.
+    pub gpu_resets: int = 0
     next_interval: int = 0
     next_frame: int = 0
 }
@@ -78,11 +84,11 @@ pub fn percentile(xs: &[int], p: int) -> int {
 
 /// One line per measure, for logs and benchmark output.
 pub fn Stats.report(self) -> str {
-    var out = "frames {self.frames} (scanned out {self.scanned_out}, missed {self.missed})\n"
+    var out = "frames {self.frames} (scanned out {self.scanned_out}, overlays {self.overlays}, missed {self.missed})\n"
     out += "interval us p50 {percentile(self.intervals, 50) / 1000} p95 {percentile(self.intervals, 95) / 1000} p99 {percentile(self.intervals, 99) / 1000} max {percentile(self.intervals, 100) / 1000}\n"
     out += "frame us p50 {percentile(self.frame_ns, 50) / 1000} p95 {percentile(self.frame_ns, 95) / 1000} p99 {percentile(self.frame_ns, 99) / 1000} max {percentile(self.frame_ns, 100) / 1000}\n"
     out += "damage {self.damage_rects} rects, {self.damage_pixels} px\n"
     out += "commits {self.commits} (test {self.tests}, merged {self.merged}, failed {self.failed}, late {self.late}), stalls {self.stalls}, flip timeouts {self.flip_timeouts}\n"
-    out += "policy {self.policy} priority {self.priority} software {self.software}"
+    out += "policy {self.policy} priority {self.priority} software {self.software} gpu_priority {self.gpu_priority} gpu_resets {self.gpu_resets}"
     return out
 }
