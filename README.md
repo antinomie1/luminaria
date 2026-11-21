@@ -8,9 +8,9 @@ and its own loop.
 
 | Package | Role |
 |---------|------|
-| `luminaria` | Facade over the packages below |
-| `luminaria_server` | Protocol state: surfaces, xdg-shell, seats, outputs, buffers, timing; no GPU |
-| `luminaria_compose` | Composition on `vk_gpu`: placements, damage, occlusion, planes, clock, transactions |
+| `luminaria` | `Display`: one event loop over everything below, layouts, input routing, manipulations |
+| `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, seats, outputs, buffers, timing; no GPU |
+| `luminaria_compose` | Composition on `vk_compose`: placement diffs, client buffers as textures, fences, clock |
 | `luminaria_backend` | DRM/KMS, nested and headless outputs; libseat, libinput, xkb |
 | `luminaria_proto` | Interfaces generated from `protocols/*.xml` |
 | `luminaria_wire` | Wire protocol: sockets, fd passing, encoding, object maps |
@@ -18,13 +18,108 @@ and its own loop.
 
 ```
 luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_wire
-           ├─ luminaria_compose ── vk_gpu, vk_draw2d (github.com/antinomie1/vk)
-           └─ luminaria_backend ── luminaria_proto, sys/*
+           ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu (github.com/antinomie1/vk)
+           └─ luminaria_backend ── luminaria_proto, vk_gpu, sys/*
 ```
 
 `protocols/` holds the XML from wayland 1.26 and wayland-protocols 1.50:
 core, xdg-shell, linux-dmabuf, linux-drm-syncobj, presentation-time,
 viewporter, fractional-scale, fifo, commit-timing and tearing-control.
+
+## Writing a compositor
+
+```mica
+import luminaria as lum
+
+var d = try lum.Display.open(lum.Options {})   // DRM, or nested under WAYLAND_DISPLAY
+var wins: List[lum.Window] = []
+while true {
+    guard let Some(e) = try d.next() else {
+        break
+    }
+    match e {
+        WindowMapped(w) => {
+            wins.push(w)
+            d.focus(Some(w))
+            d.layout(fn(mut l) {
+                for i, x in wins {
+                    l.window(x, f64(40 * i), f64(40 * i), lum.Style { radius: 8.0, shadow: 16.0, transition_ms: 150 })
+                }
+            })
+        }
+        Key(k) => {
+            if k.pressed and k.mods.logo and k.sym == lum.keysym.key_q {
+                break
+            }
+            d.accept(e)
+        }
+        _ => d.accept(e)
+    }
+}
+```
+
+- **One loop, no callbacks.** `next` returns events as values. When none
+  is queued it finishes the frames that are due, flushes every client
+  (one `sendmsg` each) and sleeps in epoll; an idle desktop has no timers
+  armed. The compositor's own descriptors and timers join the loop
+  (`watch`, `timer`); `fd` and `poll` embed it in another loop.
+- **`accept` is the default.** Input goes to the surface under the pointer
+  (hit test with implicit grabs) or with keyboard focus, new windows get a
+  configure, maximize and fullscreen requests are granted on the window's
+  output, moves and resizes run inside the library, popups are placed by
+  their positioners and dismissed by clicks outside, hidden windows are
+  told they are suspended, Ctrl+Alt+Fn switches VTs. Handle what you want
+  differently and pass the rest on.
+- **Layouts, not scene trees.** `layout` takes the whole placement list
+  (windows with their subsurfaces and popups, the compositor's images);
+  each output gets the part it shows and only what changed is redrawn.
+  `transition_ms` animates a placement to its new position in the library.
+- **Manipulations run at input rate.** `manipulate_move`,
+  `manipulate_resize` and `manipulate_pan` (a swipe, with inertia) move
+  windows on each pointer or gesture event without a round trip through
+  the compositor; the cursor plane moves at once. `Moved`, `Resized` and
+  `Panned` report the result.
+- **Transactions.** Configures between `begin` and `end` show together
+  with the layout given meanwhile, once every window drew its new size,
+  or at the timeout with what arrived.
+
+### Frames
+
+- Each output keeps a compositor clock: a frame starts as late as the
+  next vblank allows (the margin grows after a late frame and shrinks
+  back), or as soon as there is something to show with variable refresh.
+- Commits wait for their buffers in the event loop, never in the render
+  path: a dmabuf's implicit fence is exported as a sync_file, a syncobj
+  point becomes an eventfd, fifo barriers and commit-timing targets wait
+  for presentation. A client's commits apply in order; a slow client
+  holds back only itself.
+- shm commits are coalesced: the buffer is uploaded once per frame, only
+  the damaged rectangles, then released; a buffer replaced before the
+  frame is released without a copy.
+- A client buffer that fills an output unscaled and opaque is shown
+  directly: a KMS framebuffer after an atomic test (zero copy, its damage
+  as `FB_DAMAGE_CLIPS`), or handed to the parent compositor when nested.
+- Composed frames redraw only the damage, skip what opaque windows hide,
+  pass the GPU's sync_file as `IN_FENCE_FD` (the CPU never waits) and
+  send the changed rectangles as `FB_DAMAGE_CLIPS` or parent damage.
+- Frame callbacks and presentation feedback go only to surfaces the frame
+  showed; hidden clients stop drawing.
+
+### Backends
+
+| Backend | Output | Input |
+|---------|--------|-------|
+| DRM | atomic KMS: primary and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat, xkb |
+| Nested | a window of the parent compositor, dmabufs over linux-dmabuf with implicit fences | the parent's seat and keymap |
+| Headless | textures paced by a timer at the mode's refresh | `inject` |
+
+Release build, measured on this machine (`sheaf test --release`):
+
+| What | Time |
+|------|------|
+| A 1920x1080 frame, 50 rounded, shadowed windows, one moving: CPU to record and submit | 8 us |
+| The same, until the GPU is done | 46 us |
+| Hit test over 512 surfaces, worst case (integer SIMD, 8 per step) | 251 ns |
 
 ## Wire and protocol
 
@@ -146,12 +241,15 @@ MICA=/path/to/mica sys/gen.sh    # INC=/usr/include by default
 ## Test
 
 ```sh
-sheaf test    # wire: every argument kind, more than 28 fds, delete_id,
-              # protocol errors, a peer that stops reading;
-              # proto: a libwayland client (built with cc) against generated
-              # server code, generated client against server, throughput;
-              # sys: the real libraries (DRM tests skipped without /dev/dri)
-sheaf test --release -p luminaria_proto   # throughput numbers
+sheaf test    # luminaria: a libwayland xdg window (built with cc) and foot on a
+              # headless output: configured, composited, read back, focused,
+              # clicked; server: commits, transactions, toplevels,
+              # subsurfaces, popups, focus, dmabuf waits; compose: diffs,
+              # uploads, clock; backend: xkb, headless frames, the DRM card's
+              # displays, a nested window; wire, proto, sys as before
+sheaf test --release -p luminaria_compose   # frame cost
+sheaf test --release -p luminaria           # hit testing
+sheaf test --release -p luminaria_proto     # wire throughput
 ```
 
 ## License

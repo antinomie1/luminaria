@@ -1,0 +1,149 @@
+// Cursor images from the XCursor theme (XCURSOR_THEME / XCURSOR_SIZE, the
+// usual icon directories, inherited themes), with a built-in arrow when
+// none is installed. Images are ARGB8888 premultiplied, as XCursor stores
+// them and cursor planes take them.
+
+import std.env
+import std.fs
+
+pub struct Image {
+    pub width: i32 = 0
+    pub height: i32 = 0
+    pub hot_x: i32 = 0
+    pub hot_y: i32 = 0
+    pub pixels: List[u8] = []
+}
+
+fn le32(b: str, at: int) -> u32 {
+    return u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+}
+
+/// The image of an XCursor file closest to `size` pixels.
+fn parse(b: str, size: int) -> Option[Image] {
+    guard b.len() >= 16 and b.starts_with("Xcur") else {
+        return None
+    }
+    let ntoc = int(le32(b, 12))
+    var best = -1
+    var best_d = 1 << 30
+    for i in 0..ntoc {
+        let at = 16 + i * 12
+        guard at + 12 <= b.len() else {
+            break
+        }
+        guard le32(b, at) == 0xfffd0002 else {
+            continue
+        }
+        let d = (int(le32(b, at + 4)) - size).abs()
+        if d < best_d {
+            best_d = d
+            best = int(le32(b, at + 8))
+        }
+    }
+    guard best >= 0 and best + 36 <= b.len() else {
+        return None
+    }
+    let w = int(le32(b, best + 16))
+    let h = int(le32(b, best + 20))
+    let px = best + 36
+    guard w > 0 and h > 0 and w <= 256 and h <= 256 and px + w * h * 4 <= b.len() else {
+        return None
+    }
+    var pixels: List[u8] = List.with_cap(w * h * 4)
+    for k in px..px + w * h * 4 {
+        pixels.push(b[k])
+    }
+    return Some(Image { width: i32(w), height: i32(h), hot_x: i32(le32(b, best + 24)), hot_y: i32(le32(b, best + 28)), pixels })
+}
+
+fn dirs() -> List[str] {
+    var out: List[str] = []
+    if let Some(p) = env.get("XCURSOR_PATH") {
+        for d in p.split(":") {
+            out.push(d)
+        }
+        return out
+    }
+    if let Some(h) = env.get("HOME") {
+        out.push(h.clone() + "/.local/share/icons")
+        out.push(h + "/.icons")
+    }
+    out.push("/usr/share/icons")
+    out.push("/usr/share/pixmaps")
+    return out
+}
+
+/// The theme `theme` inherits (index.theme), "" for none.
+fn inherits(dir: str, theme: str) -> str {
+    guard let Ok(t) = fs.read_to_str("{dir}/{theme}/index.theme") else {
+        return ""
+    }
+    for line in t.lines() {
+        let l = line.trim()
+        if l.starts_with("Inherits") {
+            if let Some(kv) = l.split_once("=") {
+                return kv.right.split(",")[0].trim()
+            }
+        }
+    }
+    return ""
+}
+
+/// Cursor `name` of the user's theme at `size` pixels.
+pub fn load(name: str, size: int) -> Image {
+    var themes: List[str] = []
+    themes.push(env.get("XCURSOR_THEME").unwrap_or("default"))
+    var k = 0
+    while k < themes.len() and k < 8 {
+        let theme = themes[k].clone()
+        for d in dirs() {
+            if let Ok(b) = fs.read_to_str("{d}/{theme}/cursors/{name}") {
+                if let Some(img) = parse(b, size) {
+                    return img
+                }
+            }
+            let parent = inherits(d, theme.clone())
+            if not parent.is_empty() and not themes.contains(parent) {
+                themes.push(parent)
+            }
+        }
+        k += 1
+    }
+    if not themes.contains("Adwaita") and k < 8 {
+        for d in dirs() {
+            if let Ok(b) = fs.read_to_str("{d}/Adwaita/cursors/{name}") {
+                if let Some(img) = parse(b, size) {
+                    return img
+                }
+            }
+        }
+    }
+    return arrow(size)
+}
+
+/// A plain arrow: white with a black outline.
+fn arrow(size: int) -> Image {
+    let n = max(size, 16)
+    var px: List[u8] = []
+    for y in 0..n {
+        for x in 0..n {
+            // Inside the triangle x <= y/2 + ... : a classic left arrow.
+            let inside = x <= y * 2 / 3 and y < n * 3 / 4
+            let edge = inside and (x == 0 or x == y * 2 / 3 or y == n * 3 / 4 - 1)
+            if edge {
+                for c in [u8(0), 0, 0, 255] {
+                    px.push(c)
+                }
+            } else if inside {
+                for c in [u8(255), 255, 255, 255] {
+                    px.push(c)
+                }
+            } else {
+                for _ in 0..4 {
+                    px.push(0)
+                }
+            }
+        }
+    }
+    return Image { width: i32(n), height: i32(n), pixels: px }
+}

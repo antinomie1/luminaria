@@ -168,4 +168,3 @@ fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.Regi
         }
     }
 }
-

@@ -2,3 +2,50 @@
 // mechanism (protocol state, composition, devices); the compositor keeps
 // the policy and its own loop: where windows go, who gets focus, what keys
 // do, what each frame shows.
+//
+//     var d = try lum.Display.open(lum.Options {})
+//     while true {
+//         guard let Some(e) = try d.next() else {
+//             break
+//         }
+//         match e {
+//             WindowMapped(w) => d.layout(fn(mut l) { l.window(w, 100.0, 100.0, lum.Style {}) })
+//             _ => d.accept(e)
+//         }
+//     }
+
+pub import display
+pub import layout
+pub import cursor
+pub import hit
+pub import luminaria_server as server
+pub import luminaria_backend as backend
+pub import luminaria_compose as compose
+pub import luminaria_proto as proto
+pub import luminaria_wire as wire
+pub import xkbcommon_sys as keysym
+
+pub type Display = display.Display
+pub type Options = display.Options
+pub type Event = display.Event
+pub type Key = display.Key
+pub type Pointer = display.Pointer
+pub type Scroll = display.Scroll
+pub type Touch = display.Touch
+pub type TouchKind = display.TouchKind
+pub type Gesture = display.Gesture
+pub type GestureKind = display.GestureKind
+pub type Layout = layout.Layout
+pub type Style = layout.Style
+pub type Image = layout.Image
+pub type Window = server.Window
+pub type Output = server.Output
+pub type Client = server.Client
+pub type Surface = server.Surface
+pub type States = server.States
+pub type Mode = backend.Mode
+pub type Mods = backend.Mods
+pub type Names = backend.Names
+pub type AxisSource = backend.AxisSource
+pub type InputConfig = backend.InputConfig
+pub type Kind = backend.Kind

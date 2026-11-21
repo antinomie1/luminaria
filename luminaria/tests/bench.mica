@@ -1,0 +1,32 @@
+// Hit testing 512 surfaces, eight rectangles per vec8 step: ns per lookup
+// at the bottom of the stack (the worst case). Run with --release.
+
+import std.env
+import std.fs
+import std.io
+import std.time
+import luminaria as lum
+
+test "hit testing throughput" {
+    let dir = fs.create_temp_dir("luminaria-bench").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let srv = lum.server.Server.open("").expect("server")
+    var h = lum.hit.Hits.new()
+    for i in 0..512 {
+        let x = f64(i % 32) * 60.0
+        let y = f64(i / 32) * 60.0
+        h.add(lum.Surface { id: lum.server.ids.Id { index: u32(i), gen: 1 } }, x, y, 50.0, 50.0, 1.0)
+    }
+    let rounds = 200000
+    let t0 = time.now_ns()
+    var found = 0
+    for r in 0..rounds {
+        // The first surface added is the bottom one: every block is tested.
+        if h.find(srv, 10.0 + f64(r % 7), 10.0).is_some() {
+            found += 1
+        }
+    }
+    let ns = (time.now_ns() - t0) / rounds
+    io.print("hit test, 512 surfaces: {ns} ns")
+    assert_eq(found, 0)
+}

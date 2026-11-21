@@ -1,0 +1,141 @@
+// The whole library on a headless output with real clients: a libwayland
+// xdg-shell window (built with cc) is configured, laid out, composited and
+// read back, gets pointer focus from injected input and its frame
+// callback; foot, when installed, maps a terminal window. Skipped without
+// a Vulkan device, cc or libwayland-client.
+
+import std.env
+import std.fs
+import std.io
+import std.process
+import luminaria as lum
+
+fn build_client(dir: str) -> Option[str] {
+    let root = if fs.exists("luminaria/tests/c/window.c") { "." } else { ".." }
+    let proto = "{root}/protocols/xdg-shell.xml"
+    let ok1 = process.status("wayland-scanner", ["client-header", proto.clone(), "{dir}/xdg-shell-client-protocol.h"])
+    let ok2 = process.status("wayland-scanner", ["private-code", proto, "{dir}/xdg-shell.c"])
+    guard ok1 == Ok(0) and ok2 == Ok(0) else {
+        return None
+    }
+    let bin = "{dir}/window"
+    let st = process.status("cc", ["{root}/luminaria/tests/c/window.c", "{dir}/xdg-shell.c", "-I", dir.clone(), "-o", bin.clone(), "-lwayland-client"])
+    guard st == Ok(0) else {
+        return None
+    }
+    return Some(bin)
+}
+
+fn display(dir: str) -> Option[lum.Display] {
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    match lum.Display.open(lum.Options { backend: lum.Kind.Headless, headless: [lum.Mode { width: 128, height: 96, refresh_mhz: 60000 }], background: [0.0, 0.0, 1.0, 1.0] }) {
+        Ok(d) => {
+            return Some(d)
+        }
+        Err(e) => {
+            io.eprint("skipped: {e}")
+            return None
+        }
+    }
+}
+
+test "a client window is composited, focused and shown" {
+    let dir = fs.create_temp_dir("luminaria-display").expect("temp dir")
+    guard let Some(bin) = build_client(dir.clone()) else {
+        io.eprint("skipped: no cc, wayland-scanner or libwayland-client")
+        return
+    }
+    guard let Some(dd) = display(dir.clone()) else {
+        return
+    }
+    var d = dd
+    var child = process.command(bin).env("WAYLAND_DISPLAY", d.socket()).env("XDG_RUNTIME_DIR", dir).pipe_stdout().spawn().expect("spawn")
+    d.timer(5000, 99)
+    var mapped = false
+    var frames = 0
+    var title = ""
+    var red = false
+    var blue = false
+    var gone = false
+    while not gone {
+        guard let Some(e) = d.next().expect("next") else {
+            break
+        }
+        match e {
+            WindowMapped(w) => {
+                mapped = true
+                title = d.title(w)
+                d.layout(fn(mut l) {
+                    l.window(w, 10.0, 10.0, lum.Style {})
+                })
+                // The pointer over the window: it gets enter.
+                d.inject(lum.backend.Input.MotionAbsolute(1, 0, 30.0 / 128.0, 30.0 / 96.0))
+                // Idle outputs draw nothing more: look once this one is shown.
+                d.timer(200, 1)
+            }
+            Frame => frames += 1
+            Timer(1) => {
+                let o = d.outputs()[0]
+                let px = d.read_output(o).expect("pixels")
+                let at = fn(x: int, y: int) => (px[(y * 128 + x) * 4], px[(y * 128 + x) * 4 + 1], px[(y * 128 + x) * 4 + 2])
+                // Inside the window, away from the (software) cursor.
+                red = at(70, 15) == (u8(0), u8(0), u8(255))
+                blue = at(100, 90) == (u8(255), u8(0), u8(0))
+                // A click: the client is done.
+                d.inject(lum.backend.Input.Button(2, 272, true))
+                d.inject(lum.backend.Input.Button(3, 272, false))
+            }
+            ClientGone => gone = true
+            Timer(99) => {
+                break
+            }
+            _ => d.accept(e)
+        }
+    }
+    assert(mapped)
+    assert(frames >= 2)
+    assert_eq(title, "red")
+    assert(red)
+    assert(blue)
+    assert(gone)
+    assert_eq(child.wait().expect("wait"), 0)
+    assert_eq(child.read_stdout().expect("stdout").trim(), "ok")
+}
+
+test "foot maps a terminal window" {
+    guard process.status("foot", ["--version"]) == Ok(0) else {
+        io.eprint("skipped: no foot")
+        return
+    }
+    let dir = fs.create_temp_dir("luminaria-foot").expect("temp dir")
+    guard let Some(dd) = display(dir.clone()) else {
+        return
+    }
+    var d = dd
+    var child = process.command("foot").args(["sh", "-c", "sleep 3"]).env("WAYLAND_DISPLAY", d.socket()).env("XDG_RUNTIME_DIR", dir).spawn().expect("spawn foot")
+    d.timer(8000, 99)
+    var app = ""
+    var done = false
+    while not done {
+        guard let Some(e) = d.next().expect("next") else {
+            break
+        }
+        match e {
+            WindowMapped(w) => {
+                app = d.app_id(w)
+                d.layout(fn(mut l) {
+                    l.window(w, 0.0, 0.0, lum.Style {})
+                })
+                d.timer(300, 1)
+            }
+            Timer(1) => done = true
+            Timer(99) => {
+                break
+            }
+            _ => d.accept(e)
+        }
+    }
+    discard child.kill()
+    discard child.wait()
+    assert_eq(app, "foot")
+}

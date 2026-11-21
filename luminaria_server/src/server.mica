@@ -241,6 +241,15 @@ pub fn Server.accept(mut self) -> Result[Option[(ids.Client, int)], str] {
     return Ok(Some((c, fd)))
 }
 
+/// The generation of client slot `index` (to rebuild a handle from a
+/// poller token).
+pub fn Server.client_gen(self, index: u32) -> u32 {
+    guard int(index) < self.clients.gens.len() else {
+        return 0
+    }
+    return self.clients.gens[int(index)]
+}
+
 pub fn Server.client_fd(self, c: ids.Client) -> int {
     guard self.clients.live(c.id) else {
         return -1
@@ -609,6 +618,55 @@ pub fn Server.with_shm(self, b: ids.Buffer, f: fn(&[u8], int)) -> bool {
         return false
     }
     return buffer.with_shm(self, b.id.index, f)
+}
+
+/// Reading an shm buffer: its bytes from the first pixel and row stride,
+/// valid until `shm_end`.
+pub unsafe struct Shm {
+    ptr: Ptr[u8]
+    len: int
+    pub stride: int
+    pool: u32
+}
+
+pub fn Shm.bytes(self) -> &[u8] {
+    unsafe {
+        return Ptr.slice(self.ptr, self.len)
+    }
+}
+
+/// Start reading shm buffer `b` (a client shrinking the pool meanwhile
+/// cannot crash us); None when it is not an intact shm buffer.
+pub fn Server.shm_begin(self, b: ids.Buffer) -> Option[Shm] {
+    guard self.buffers.live(b.id) and self.buffers.items[int(b.id.index)].kind == state.BufferKind.Shm else {
+        return None
+    }
+    let i = int(b.id.index)
+    let pi = self.buffers.items[i].pool
+    let off = self.buffers.items[i].offset
+    let stride = self.buffers.items[i].stride
+    let len = stride * int(self.buffers.items[i].height)
+    if let Some(m) = self.pools.items[int(pi)].map {
+        guard off + len <= m.len else {
+            return None
+        }
+        discard m.begin_access()
+        unsafe {
+            return Some(Shm { ptr: m.ptr.offset(off), len, stride, pool: pi })
+        }
+    }
+    return None
+}
+
+/// Done reading: false when the client truncated the pool meanwhile (what
+/// was read is zeros).
+pub fn Server.shm_end(self, s: Shm) -> bool {
+    if self.pools.used(int(s.pool)) {
+        if let Some(m) = self.pools.items[int(s.pool)].map {
+            return not m.end_access()
+        }
+    }
+    return false
 }
 
 /// The compositor is done reading the buffer: wl_buffer.release once no

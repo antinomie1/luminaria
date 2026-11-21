@@ -20,20 +20,12 @@ pub let abgr8888: u32 = 0x34324241
 pub let xbgr8888: u32 = 0x34324258
 
 /// wl_shm's code for a fourcc (0 and 1 are special).
-fn shm_code(fourcc: u32) -> u32 {
-    return match fourcc {
-        0x34325241 => 0
-        0x34325258 => 1
-        _ => fourcc
-    }
+fn shm_code(f: u32) -> u32 {
+    return if f == argb8888 { 0 } else if f == xrgb8888 { 1 } else { f }
 }
 
 fn fourcc(code: u32) -> u32 {
-    return match code {
-        0 => argb8888
-        1 => xrgb8888
-        _ => code
-    }
+    return if code == 0 { argb8888 } else if code == 1 { xrgb8888 } else { code }
 }
 
 fn shm_bound(mut srv: server.Server, ci: u32, id: u32) {

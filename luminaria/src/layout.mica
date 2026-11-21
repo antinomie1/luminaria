@@ -1,0 +1,57 @@
+// The placement list: what the compositor shows, back to front, in global
+// logical coordinates. A window brings its subsurfaces and popups along;
+// images are the compositor's own textures (wallpapers, decorations).
+
+import std.collections.map
+import luminaria_server as server
+
+pub struct Style {
+    pub opacity: f32 = 1.0
+    pub radius: f32 = 0.0
+    /// Drop shadow blur in logical pixels; 0 for none.
+    pub shadow: f32 = 0.0
+    /// Shown at this size (an overview's thumbnails: 0.25); input scales too.
+    pub scale: f32 = 1.0
+    /// Move and fade from the previous placement over this many
+    /// milliseconds instead of jumping (the library animates it).
+    pub transition_ms: int = 0
+}
+
+/// A texture the compositor owns.
+pub struct Image derive(Hash, Show) {
+    pub index: u32 = 0
+    pub gen: u32 = 0
+}
+
+enum What {
+    Window(server.Window)
+    Image(Image)
+}
+
+struct Place {
+    what: What
+    x: f64
+    y: f64
+    /// Image size (windows use their own).
+    w: f64 = 0.0
+    h: f64 = 0.0
+    style: Style
+}
+
+pub struct Layout {
+    places: List[Place] = []
+}
+
+/// Window `w` with its window geometry's top left at `x, y`.
+pub fn Layout.window(mut self, w: server.Window, x: f64, y: f64, style: Style) {
+    self.places.push(Place { what: What.Window(w), x, y, style })
+}
+
+/// Image `img` stretched over `x, y, w, h`.
+pub fn Layout.image(mut self, img: Image, x: f64, y: f64, w: f64, h: f64, style: Style) {
+    self.places.push(Place { what: What.Image(img), x, y, w, h, style })
+}
+
+pub fn Layout.len(self) -> int {
+    return self.places.len()
+}
