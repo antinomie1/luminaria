@@ -143,17 +143,17 @@ fn Tiny.bind(mut self, k: lum.Key) -> bool {
     guard k.pressed and k.mods.alt and not self.d.shortcuts_inhibited() else {
         return false
     }
-    if k.sym == lum.keysym.key_Escape {
+    if k.sym == lum.backend.keysym.key_Escape {
         self.d.quit()
         return true
     }
-    if k.sym == lum.keysym.key_q {
+    if k.sym == lum.backend.keysym.key_q {
         if let Some(w) = self.d.focused() {
             self.d.close(w)
         }
         return true
     }
-    if k.sym == lum.keysym.key_F1 {
+    if k.sym == lum.backend.keysym.key_F1 {
         if self.views.len() > 1 {
             let v = self.views.pop().unwrap()
             self.views.insert(0, v)

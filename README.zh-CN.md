@@ -10,7 +10,7 @@
 |----|------|
 | `luminaria` | `Display`：一个事件循环接起下面所有的包，加上布局、输入路由、操纵 |
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、layer shell、锁屏、seat 与输入法、选区与拖放、输出及其配置、截屏、沙盒、缓冲、时序；不碰 GPU |
-| `luminaria_compose` | 基于 `vk_compose` 的合成：放置表比对、客户端缓冲变纹理、栅栏、时钟 |
+| `luminaria_compose` | 基于 `vk_compose` 的合成：放置表比对、客户端缓冲的纹理（归它所有）、栅栏、时钟 |
 | `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的接口 |
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 |
@@ -19,8 +19,11 @@
 ```
 luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_wire
            ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu (github.com/antinomie1/vk)
-           └─ luminaria_backend ── luminaria_proto, vk_gpu, sys/*
+           └─ luminaria_backend ── vk_gpu, sys/*；luminaria_proto（仅嵌套）
 ```
+
+构建特性：`nested`（默认开启）是嵌套后端，`luminaria_backend` 只因它才依赖 `luminaria_proto` 和
+`luminaria_wire`。关掉它（`--no-default-features`）后端只有 DRM 和无头两种输出，`Kind.Auto` 总选 DRM。
 
 `protocols/` 是 wayland 1.26、wayland-protocols 1.50 和 wlr-protocols 的 XML。服务端支持：
 
@@ -58,7 +61,7 @@ while true {
             })
         }
         Key(k) => {
-            if k.pressed and k.mods.logo and k.sym == lum.keysym.key_q {
+            if k.pressed and k.mods.logo and k.sym == lum.backend.keysym.key_q {
                 break
             }
             d.accept(e)
@@ -191,8 +194,8 @@ sheaf run -p luminaria_scanner -- protocols luminaria_proto/src   # 修改 proto
 
 - 名字去掉库前缀：`libinput_get_event` 是 `get_event`，`struct xkb_state` 是 `State`。结构体字段是
   `pub`，其他 bundle 可以构造和读取。
-- keysym 保留大小写，因为 `bind` 会把 `XKB_KEY_a` 和 `XKB_KEY_A` 折叠成同一个名字：`xkb.key_a`、
-  `xkb.key_A`、`xkb.key_Escape`。
+- keysym 保留大小写，因为 `bind` 会把 `XKB_KEY_a` 和 `XKB_KEY_A` 折叠成同一个名字。它们是单独模块里的
+  纯常量：`xkb.keysym.key_a`、`xkb.keysym.key_A`，由 `luminaria_backend.keysym` 再导出。
 - 由函数式宏构成的宏用 `cc` 求值。这覆盖了所有 `DRM_FORMAT_*` 和 `*_FORMAT_MOD_*` 常量，以及配合
   `uapi` 结构体做裸 `drm.ioctl` 调用所需的 `DRM_IOCTL_*` 编号。
 - libdrm 自己的类型（`drmVersion`、`drmModeCrtc`）和内核的类型（`drm_version`、`drm_mode_crtc`）会

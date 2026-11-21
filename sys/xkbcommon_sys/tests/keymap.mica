@@ -28,9 +28,9 @@ test "a us keymap" {
         let a: u32 = 38
         let shift: u32 = 50
         assert_eq(xkb.keymap_key_by_name(km, "AC01"), a)
-        assert_eq(xkb.state_key_get_one_sym(st, a), xkb.key_a)
+        assert_eq(xkb.state_key_get_one_sym(st, a), xkb.keysym.key_a)
         discard xkb.state_update_key(st, shift, xkb.xkb_key_down)
-        assert_eq(xkb.state_key_get_one_sym(st, a), xkb.key_A)
+        assert_eq(xkb.state_key_get_one_sym(st, a), xkb.keysym.key_A)
         assert_eq(xkb.state_mod_name_is_active(st, "Shift", xkb.xkb_state_mods_effective), 1)
         var buf: List[i8] = [0, 0, 0, 0, 0, 0, 0, 0]
         assert_eq(xkb.state_key_get_utf8(st, a, buf, 8), 1)
@@ -39,10 +39,10 @@ test "a us keymap" {
 }
 
 test "keysym names keep their case" {
-    assert_eq(xkb.keysym_from_name("Escape", xkb.xkb_keysym_no_flags), xkb.key_Escape)
-    assert_eq(xkb.keysym_from_name("a", xkb.xkb_keysym_no_flags), xkb.key_a)
-    assert_eq(xkb.keysym_from_name("A", xkb.xkb_keysym_no_flags), xkb.key_A)
-    assert_eq(xkb.keysym_to_utf32(xkb.key_eacute), u32(0xe9))
+    assert_eq(xkb.keysym_from_name("Escape", xkb.xkb_keysym_no_flags), xkb.keysym.key_Escape)
+    assert_eq(xkb.keysym_from_name("a", xkb.xkb_keysym_no_flags), xkb.keysym.key_a)
+    assert_eq(xkb.keysym_from_name("A", xkb.xkb_keysym_no_flags), xkb.keysym.key_A)
+    assert_eq(xkb.keysym_to_utf32(xkb.keysym.key_eacute), u32(0xe9))
 }
 
 test "log messages reach the handler" {

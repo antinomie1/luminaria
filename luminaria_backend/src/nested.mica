@@ -20,6 +20,9 @@ import keyboard
 import swap
 import types
 
+/// Built in (nested_off.mica stands in without the `nested` feature).
+let available = true
+
 /// DMA_BUF_IOCTL_IMPORT_SYNC_FILE: make `fence` the dmabuf's write fence.
 fn import_fence(dmabuf_fd: int, fence: int) -> bool {
     // struct dma_buf_import_sync_file { __u32 flags; __s32 fd; }, DMA_BUF_SYNC_WRITE.

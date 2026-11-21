@@ -5,11 +5,17 @@ description = "Outputs and input devices: DRM/KMS, nested Wayland, headless; sea
 license = "Apache-2.0 OR BSD-2-Clause"
 
 [dependencies]
-luminaria_proto = { workspace = true }
+luminaria_proto = { workspace = true, optional = true }
 libdrm_sys = { workspace = true }
 libudev_sys = { workspace = true }
 libseat_sys = { workspace = true }
 libinput_sys = { workspace = true }
 xkbcommon_sys = { workspace = true }
 vk_gpu = { workspace = true }
-luminaria_wire = { workspace = true }
+luminaria_wire = { workspace = true, optional = true }
+
+[features]
+default = ["nested"]
+# A window of a parent Wayland compositor as the output (a Wayland client:
+# needs the protocol bundles).
+nested = ["dep:luminaria_proto", "dep:luminaria_wire"]

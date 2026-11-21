@@ -14,10 +14,17 @@ import libudev_sys as udev
 import libdrm_sys.uapi as uapi
 pub import types
 pub import keyboard
+pub import xkbcommon_sys.keysym as keysym
 import session
 import input
 import drm
-import nested
+
+when feature == "nested" {
+    import nested
+} else {
+    import nested_off as nested
+}
+
 import headless
 import swap
 
@@ -95,7 +102,7 @@ pub fn Backend.none() -> Backend {
 pub fn Backend.open(o: Options) -> Result[Backend, str] {
     var kind = o.kind
     if kind == Kind.Auto {
-        kind = if env.get("WAYLAND_DISPLAY").is_some() { Kind.Nested } else { Kind.Drm }
+        kind = if nested.available and env.get("WAYLAND_DISPLAY").is_some() { Kind.Nested } else { Kind.Drm }
     }
     var b = Backend { kind, buffers: max(o.buffers, 2) }
     match kind {

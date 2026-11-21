@@ -1,6 +1,6 @@
 // Composition on the real device: placement lists diffed by key into
-// damage, restacking, shm damage uploads, dmabuf formats, and the clock's
-// deadlines.
+// damage, restacking, shm damage uploads, client textures, dmabuf formats,
+// and the clock's deadlines.
 
 import vk_gpu as gpu
 import luminaria_compose as compose
@@ -48,6 +48,16 @@ fn draw(mut dev: gpu.Device, mut c: compose.Compositor, mut out: gpu.Offscreen) 
     discard c.render(0, mut dev, mut e, f).unwrap()
     discard out.present(mut dev, f, take e).unwrap()
     return dev.read_texture(out.texture()).unwrap()
+}
+
+fn fill(rgba: [4]u8) -> List[u8] {
+    var px: List[u8] = []
+    for _ in 0..64 {
+        for b in rgba {
+            px.push(b)
+        }
+    }
+    return px
 }
 
 fn px(img: List[u8], x: int, y: int) -> (u8, u8, u8) {
@@ -113,4 +123,45 @@ test "shm damage uploads only the rectangles" {
     assert(compose.format.vk_format(0x30303030).is_none())
     assert_eq(compose.format.vk_format(compose.format.xrgb8888), Some((gpu.Format.B8G8R8A8_UNORM, true)))
     assert(not compose.format.dmabuf_formats(dev).is_empty())
+}
+
+test "client textures: shm damage merges until uploaded, single pixels" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    var c = compose.Compositor.new(mut dev).unwrap()
+    let fmt = compose.format.abgr8888
+    let all: List[(i32, i32, i32, i32)] = []
+    let t = c.shm_commit(mut dev, 7, 8, 8, fmt, all).unwrap()
+    let black = fill([0, 0, 0, 255])
+    c.shm_upload(mut dev, 7, black, 32).unwrap()
+    // Two commits before the next frame: their damage is uploaded once,
+    // from the newest pixels, into the same texture.
+    let a: List[(i32, i32, i32, i32)] = [(1, 1, 1, 1)]
+    let b: List[(i32, i32, i32, i32)] = [(3, 3, 1, 1)]
+    assert_eq(c.shm_commit(mut dev, 7, 8, 8, fmt, a), Some(t))
+    assert_eq(c.shm_commit(mut dev, 7, 8, 8, fmt, b), Some(t))
+    let white = fill([255, 255, 255, 255])
+    c.shm_upload(mut dev, 7, white, 32).unwrap()
+    c.flush_uploads(mut dev).unwrap()
+    let got = dev.read_texture(t).unwrap()
+    let at = fn(x: int, y: int) => got[(y * 8 + x) * 4]
+    assert_eq(at(1, 1), u8(255))
+    assert_eq(at(2, 2), u8(255))
+    assert_eq(at(3, 3), u8(255))
+    assert_eq(at(0, 0), u8(0))
+    assert_eq(at(5, 5), u8(0))
+    // A new size is a new texture; an unknown format none.
+    assert(c.shm_commit(mut dev, 7, 4, 4, fmt, all) != Some(t))
+    assert(c.shm_commit(mut dev, 8, 4, 4, 0x30303030, all).is_none())
+    c.drop_surface(mut dev, 7)
+    // One premultiplied pixel, 32 bits a channel.
+    assert(c.solid(mut dev, 1, [0xFFFFFFFF, 0, 0x80000000, 0xFFFFFFFF]))
+    c.flush_uploads(mut dev).unwrap()
+    let s = dev.read_texture(c.buffer(1).unwrap()).unwrap()
+    assert_eq((s[0], s[1], s[2], s[3]), (u8(255), u8(0), u8(128), u8(255)))
+    c.drop_buffer(mut dev, 1)
+    assert(c.buffer(1).is_none())
+    c.destroy(mut dev)
 }

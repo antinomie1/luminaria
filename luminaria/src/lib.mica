@@ -23,7 +23,6 @@ pub import luminaria_backend as backend
 pub import luminaria_compose as compose
 pub import luminaria_proto as proto
 pub import luminaria_wire as wire
-pub import xkbcommon_sys as keysym
 
 pub type Display = display.Display
 pub type Options = display.Options

@@ -2,11 +2,14 @@
 // compositor's placement list (back to front, output pixels) is diffed
 // into: what moved, appeared or changed becomes damage, opaque views hide
 // what is under them, and only the damage is redrawn, in one pass. Client
-// buffers become textures here (dmabufs imported once, shm damage
-// uploaded), their fences become descriptors to poll, and each output
-// keeps a compositor clock that starts frames as late as the next vblank
-// allows.
+// buffers become textures here and live here: a dmabuf is imported once
+// and a single-pixel buffer becomes one texel, each under its buffer's
+// key; an shm surface has one texture under its surface's key that
+// commits upload their damage into, merged and recorded once before the
+// next frame. Fences become descriptors to poll, and each output keeps a
+// compositor clock that starts frames as late as the next vblank allows.
 
+import std.collections.map
 import std.mem
 import vk_gpu as gpu
 import vk_draw2d as draw2d
@@ -52,21 +55,35 @@ pub struct Output {
     ids: List[u32] = []
 }
 
+/// An shm surface's texture and the damage still to upload (x0, y0 to
+/// x1, y1; none when x0 >= x1).
+struct Shm {
+    tex: gpu.Texture
+    format: u32
+    x0: i32 = 0
+    y0: i32 = 0
+    x1: i32 = 0
+    y1: i32 = 0
+}
+
 pub struct Compositor {
     canvas: Option[draw2d.Canvas] = None
     pub outputs: List[Output] = []
     /// Uploads waiting for the next frame (recorded once, before any draw).
     uploads: Option[gpu.Encoder] = None
+    /// Client buffers' textures by buffer key; shm surfaces' by surface key.
+    bufs: map.Map[u64, gpu.Texture]
+    shms: map.Map[u64, Shm]
 }
 
 pub fn Compositor.new(mut dev: gpu.Device) -> Result[Compositor, str] {
     let canvas = try draw2d.Canvas.create(mut dev, gpu.Format.B8G8R8A8_UNORM)
-    return Ok(Compositor { canvas: Some(canvas) })
+    return Ok(Compositor { canvas: Some(canvas), bufs: map.Map.new(), shms: map.Map.new() })
 }
 
 /// A compositor with nothing behind it (a placeholder to move one out).
 pub fn Compositor.none() -> Compositor {
-    return Compositor {}
+    return Compositor { bufs: map.Map.new(), shms: map.Map.new() }
 }
 
 /// Output `o` (the backend's index) is `width` x `height` at `refresh_mhz`.
@@ -236,6 +253,122 @@ pub fn Compositor.flush_uploads(mut self, mut dev: gpu.Device) -> Result[(), str
     return Ok(())
 }
 
+// ------------------------------------------------------- client buffers
+
+/// Buffer `key` is a single-plane dmabuf: import it (the fd stays the
+/// caller's). False when the GPU cannot sample it.
+pub fn Compositor.import_dmabuf(mut self, mut dev: gpu.Device, key: u64, fd: int, width: i32, height: i32, fourcc: u32, modifier: u64, offset: u32, stride: u32) -> bool {
+    guard let Ok(t) = format.import_dmabuf(mut dev, fd, width, height, fourcc, modifier, offset, stride) else {
+        return false
+    }
+    discard self.bufs.insert(key, t)
+    return true
+}
+
+/// Buffer `key` is one premultiplied pixel (32 bits a channel), stretched
+/// by its viewport.
+pub fn Compositor.solid(mut self, mut dev: gpu.Device, key: u64, rgba: [4]u32) -> bool {
+    let px: List[u8] = [u8(rgba[0] >> 24), u8(rgba[1] >> 24), u8(rgba[2] >> 24), u8(rgba[3] >> 24)]
+    guard let Ok(t) = dev.texture(gpu.TextureDesc { width: 1, height: 1, format: gpu.Format.R8G8B8A8_UNORM, opaque: rgba[3] == 0xFFFFFFFF }) else {
+        return false
+    }
+    guard let Ok(got) = self.uploads(mut dev) else {
+        dev.destroy_texture(t)
+        return false
+    }
+    var e = got
+    let ok = dev.write_texture_rect(mut e, t, 0, 0, 1, 1, px, 4).is_ok()
+    self.uploads = Some(e)
+    if not ok {
+        dev.destroy_texture(t)
+        return false
+    }
+    discard self.bufs.insert(key, t)
+    return true
+}
+
+/// Buffer `key`'s texture.
+pub fn Compositor.buffer(self, key: u64) -> Option[gpu.Texture] {
+    return self.bufs.get(key)
+}
+
+/// Free buffer `key`'s texture (nothing shows it any more).
+pub fn Compositor.drop_buffer(mut self, mut dev: gpu.Device, key: u64) {
+    if let Some(t) = self.bufs.remove(key) {
+        dev.destroy_texture(t)
+    }
+}
+
+/// Surface `key` committed a `width` x `height` shm buffer of `fourcc`
+/// with `rects` damaged (buffer pixels; empty: all). Its texture, made
+/// again when the size or format changed; None when the format is not
+/// supported. The damage waits for `shm_upload`.
+pub fn Compositor.shm_commit(mut self, mut dev: gpu.Device, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> Option[gpu.Texture] {
+    var sh = self.shms.get(key)
+    if let Some(old) = sh {
+        if i32(old.tex.width()) != width or i32(old.tex.height()) != height or old.format != fourcc {
+            dev.destroy_texture(old.tex)
+            discard self.shms.remove(key)
+            sh = None
+        }
+    }
+    var fresh = false
+    if sh.is_none() {
+        guard let Ok(t) = format.shm_texture(mut dev, width, height, fourcc) else {
+            return None
+        }
+        sh = Some(Shm { tex: t, format: fourcc })
+        fresh = true
+    }
+    var s = sh.unwrap()
+    if fresh or rects.is_empty() {
+        s.x0 = 0
+        s.y0 = 0
+        s.x1 = width
+        s.y1 = height
+    } else {
+        for r in rects {
+            if s.x0 >= s.x1 {
+                s.x0 = r.0
+                s.y0 = r.1
+                s.x1 = r.0 + r.2
+                s.y1 = r.1 + r.3
+            } else {
+                s.x0 = min(s.x0, r.0)
+                s.y0 = min(s.y0, r.1)
+                s.x1 = max(s.x1, r.0 + r.2)
+                s.y1 = max(s.y1, r.1 + r.3)
+            }
+        }
+    }
+    discard self.shms.insert(key, s)
+    return Some(s.tex)
+}
+
+/// Record surface `key`'s pending damage from the shm pixels `bytes` into
+/// the uploads; the bytes may go back to the client after this returns.
+pub fn Compositor.shm_upload(mut self, mut dev: gpu.Device, key: u64, bytes: &[u8], stride: int) -> Result[(), str] {
+    guard let Some(s) = self.shms.get(key) else {
+        return Ok(())
+    }
+    guard s.x0 < s.x1 and s.y0 < s.y1 else {
+        return Ok(())
+    }
+    var e = try self.uploads(mut dev)
+    let rect: List[(i32, i32, i32, i32)] = [(s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0)]
+    let r = format.upload(mut dev, mut e, s.tex, bytes, stride, rect)
+    self.uploads = Some(e)
+    discard self.shms.insert(key, Shm { x0: 0, y0: 0, x1: 0, y1: 0, ..s })
+    return r
+}
+
+/// Surface `key` is gone: free its shm texture.
+pub fn Compositor.drop_surface(mut self, mut dev: gpu.Device, key: u64) {
+    if let Some(s) = self.shms.remove(key) {
+        dev.destroy_texture(s.tex)
+    }
+}
+
 /// Draw what frame `f` of output `o` needs into encoder `e`; false when
 /// the image is already up to date.
 pub fn Compositor.render(mut self, o: int, mut dev: gpu.Device, mut e: gpu.Encoder, f: gpu.Frame) -> Result[bool, str] {
@@ -266,6 +399,12 @@ pub fn Compositor.changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {
 }
 
 pub fn Compositor.destroy(self, mut dev: gpu.Device) {
+    self.bufs.each(fn(_, t) {
+        dev.destroy_texture(t)
+    })
+    self.shms.each(fn(_, s) {
+        dev.destroy_texture(s.tex)
+    })
     if let Some(c) = self.canvas {
         c.destroy(mut dev)
     }

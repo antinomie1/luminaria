@@ -26,7 +26,7 @@ pub struct Key {
     pub time: u32 = 0
     /// evdev code (KEY_A is 30).
     pub code: u32 = 0
-    /// xkb keysym (xkbcommon_sys.key_a ...).
+    /// xkb keysym (backend.keysym.key_a ...).
     pub sym: u32 = 0
     /// Text the key types, "" for none.
     pub text: str = ""
@@ -240,18 +240,12 @@ fn Out.lh(self) -> f64 {
 
 /// Composition state of a client surface.
 struct Surf {
+    /// The texture shown: the buffer's, or the surface's shm texture.
     tex: Option[gpu.Texture] = None
-    /// The per-surface texture shm commits upload into.
-    shm_tex: Option[gpu.Texture] = None
-    shm_format: u32 = 0
     buffer: Option[server.Buffer] = None
     /// An shm buffer waiting for the next frame to upload (coalesced:
     /// a newer commit replaces it without a copy).
     pending: Option[server.Buffer] = None
-    px0: i32 = 0
-    py0: i32 = 0
-    px1: i32 = 0
-    py1: i32 = 0
     /// Release point of the current buffer: timeline fd, point.
     rel_fd: int = -1
     rel_point: u64 = 0
@@ -333,7 +327,6 @@ pub struct Display {
     origins: map.Map[server.Surface, (f64, f64, f64)]
     anims: map.Map[u64, Anim]
     animating: bool = false
-    dmabufs: map.Map[server.Buffer, gpu.Texture]
     popups: List[server.Popup] = []
     grabs: List[server.Popup] = []
     focus: Option[server.Surface] = None
@@ -407,13 +400,12 @@ pub fn Display.open(o: Options) -> Result[Display, str] {
     let comp = try compose.Compositor.new(mut dev)
     let poll = try net.poller().map_err(fn(e) => "{e}")
     // linux-dmabuf: what the GPU samples, from its render node.
-    var main: u64 = 0
+    let main = compose.format.device_id(dev)
     var sync = compose.Syncobj {}
     if let Some((major, minor)) = dev.drm_node() {
-        main = u64(major) << 8 | u64(minor & 0xff) | (u64(minor & ~0xff) << 12)
         sync = compose.Syncobj.open(major, minor)
     }
-    var d = Display { srv, be, dev, comp, poll, sync, background: vec4(0.0), surfs: map.Map.new(), wins: map.Map.new(), origins: map.Map.new(), anims: map.Map.new(), dmabufs: map.Map.new(), left: map.Map.new(), spots: map.Map.new() }
+    var d = Display { srv, be, dev, comp, poll, sync, background: vec4(0.0), surfs: map.Map.new(), wins: map.Map.new(), origins: map.Map.new(), anims: map.Map.new(), left: map.Map.new(), spots: map.Map.new() }
     let formats = compose.format.dmabuf_formats(d.dev)
     if not formats.is_empty() {
         var scanout: List[(u32, u64)] = []
@@ -943,47 +935,38 @@ fn Display.acked(mut self, w: server.Window, aw: i32, ah: i32) {
     self.rebuild()
 }
 
+/// Lend the compositor and the device to `f` together (one call cannot
+/// take two mutable parts of `self`).
+fn Display.with_gpu(mut self, f: fn(mut compose.Compositor, mut gpu.Device)) {
+    var comp = mem.replace(mut self.comp, compose.Compositor.none())
+    f(mut comp, mut self.dev)
+    self.comp = comp
+}
+
 fn Display.buffer_new(mut self, b: server.Buffer) {
     let info = self.srv.buffer(b)
     if info.kind == server.BufferKind.SinglePixel {
-        // One texel, stretched by the viewport.
-        let c = info.color
-        let px: List[u8] = [u8(c[0] >> 24), u8(c[1] >> 24), u8(c[2] >> 24), u8(c[3] >> 24)]
-        if let Ok(t) = self.dev.texture(gpu.TextureDesc { width: 1, height: 1, format: gpu.Format.R8G8B8A8_UNORM, opaque: c[3] == 0xFFFFFFFF }) {
-            if let Ok(e) = self.dev.encoder() {
-                var enc = e
-                if self.dev.write_texture_rect(mut enc, t, 0, 0, 1, 1, px, 4).is_ok() {
-                    self.comp.put_uploads(enc)
-                    discard self.dmabufs.insert(b, t)
-                    return
-                }
-                self.dev.cancel(take enc)
-            }
-            self.dev.destroy_texture(t)
-        }
+        self.with_gpu(fn(mut c, mut dev) {
+            discard c.solid(mut dev, bkey(b), info.color)
+        })
         return
     }
     guard info.kind == server.BufferKind.Dmabuf else {
         return
     }
     let (fd, offset, stride) = self.srv.plane(b, 0)
-    let ok = info.planes == 1 and fd >= 0
-    if ok {
-        match compose.format.import_dmabuf(mut self.dev, fd, info.width, info.height, info.format, info.modifier, offset, stride) {
-            Ok(t) => {
-                discard self.dmabufs.insert(b, t)
-                self.srv.imported(b, true)
-                return
-            }
-            Err => {}
-        }
+    var ok = false
+    if info.planes == 1 and fd >= 0 {
+        self.with_gpu(fn(mut c, mut dev) {
+            ok = c.import_dmabuf(mut dev, bkey(b), fd, info.width, info.height, info.format, info.modifier, offset, stride)
+        })
     }
-    self.srv.imported(b, false)
+    self.srv.imported(b, ok)
 }
 
 fn Display.buffer_gone(mut self, b: server.Buffer) {
     self.be.forget(bkey(b))
-    guard let Some(t) = self.dmabufs.get(b) else {
+    guard self.comp.buffer(bkey(b)).is_some() else {
         return
     }
     // Still shown: the texture lives until the surface moves on.
@@ -992,8 +975,9 @@ fn Display.buffer_gone(mut self, b: server.Buffer) {
         used = used or sf.buffer == Some(b)
     })
     if not used {
-        self.dev.destroy_texture(t)
-        discard self.dmabufs.remove(b)
+        self.with_gpu(fn(mut c, mut dev) {
+            c.drop_buffer(mut dev, bkey(b))
+        })
     }
 }
 
@@ -1025,9 +1009,9 @@ fn Display.drop_orphan(mut self, b: server.Buffer) {
     guard not self.srv.buffer_alive(b) else {
         return
     }
-    if let Some(t) = self.dmabufs.remove(b) {
-        self.dev.destroy_texture(t)
-    }
+    self.with_gpu(fn(mut c, mut dev) {
+        c.drop_buffer(mut dev, bkey(b))
+    })
 }
 
 fn Display.applied(mut self, s: server.Surface) {
@@ -1072,51 +1056,21 @@ fn Display.applied(mut self, s: server.Surface) {
             Some(b) => {
                 let bi = self.srv.buffer(b)
                 if bi.kind != server.BufferKind.Shm {
-                    sf.tex = self.dmabufs.get(b)
+                    sf.tex = self.comp.buffer(bkey(b))
                     if sf.tex.is_none() {
                         sf.buffer = None
                     }
                 } else {
-                    var fresh = false
-                    var t = sf.shm_tex
-                    let mismatch = match t {
-                        Some(tx) => i32(tx.width()) != bi.width or i32(tx.height()) != bi.height or sf.shm_format != bi.format
-                        None => true
-                    }
-                    if mismatch {
-                        if let Some(tx) = t {
-                            self.dev.destroy_texture(tx)
-                        }
-                        t = compose.format.shm_texture(mut self.dev, bi.width, bi.height, bi.format).ok()
-                        sf.shm_format = bi.format
-                        fresh = true
-                    }
-                    sf.shm_tex = t
-                    sf.tex = t
+                    self.with_gpu(fn(mut c, mut dev) {
+                        sf.tex = c.shm_commit(mut dev, skey(s), bi.width, bi.height, bi.format, rects)
+                    })
                     // Coalesce: a buffer not uploaded yet is replaced uncopied.
                     if let Some(p) = sf.pending {
                         if p != b {
                             self.srv.release(p)
                         }
-                    } else {
-                        sf.px0 = 1 << 30
-                        sf.py0 = 1 << 30
-                        sf.px1 = -(1 << 30)
-                        sf.py1 = -(1 << 30)
                     }
                     sf.pending = Some(b)
-                    if fresh or rects.is_empty() {
-                        sf.px0 = 0
-                        sf.py0 = 0
-                        sf.px1 = bi.width
-                        sf.py1 = bi.height
-                    }
-                    for r in rects {
-                        sf.px0 = min(sf.px0, r.0)
-                        sf.py0 = min(sf.py0, r.1)
-                        sf.px1 = max(sf.px1, r.0 + r.2)
-                        sf.py1 = max(sf.py1, r.1 + r.3)
-                    }
                 }
             }
         }
@@ -1168,10 +1122,10 @@ fn Display.mark_dirty_for(mut self, s: server.Surface) {
 }
 
 fn Display.surface_gone(mut self, s: server.Surface) {
+    self.with_gpu(fn(mut c, mut dev) {
+        c.drop_surface(mut dev, skey(s))
+    })
     if let Some(sf) = self.surfs.remove(s) {
-        if let Some(t) = sf.shm_tex {
-            self.dev.destroy_texture(t)
-        }
         if let Some(p) = sf.pending {
             self.srv.release(p)
         }
@@ -2290,13 +2244,10 @@ fn Display.frame_due(mut self, o: int) {
 
 /// Upload what shm commits left for this frame (once per buffer, whatever
 /// the number of commits), then hand the buffers back.
-fn Display.upload_pending(mut self) -> Result[(), str] {
-    var comp = mem.replace(mut self.comp, compose.Compositor.none())
-    let got = comp.uploads(mut self.dev)
-    self.comp = comp
-    var e = try got
+fn Display.upload_pending(mut self) {
     // The server lends each buffer's bytes while the device records them.
     var srv = mem.replace(mut self.srv, server.Server.none())
+    var comp = mem.replace(mut self.comp, compose.Compositor.none())
     for s in self.surfs.keys() {
         guard let Some(sf) = self.surfs.get(s) else {
             continue
@@ -2304,18 +2255,14 @@ fn Display.upload_pending(mut self) -> Result[(), str] {
         guard let Some(b) = sf.pending else {
             continue
         }
-        if let Some(t) = sf.shm_tex {
-            let rect: List[(i32, i32, i32, i32)] = [(sf.px0, sf.py0, sf.px1 - sf.px0, sf.py1 - sf.py0)]
-            discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
-                discard compose.format.upload(mut self.dev, mut e, t, bytes, stride, rect)
-            })
-        }
+        discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+            discard comp.shm_upload(mut self.dev, skey(s), bytes, stride)
+        })
         srv.release(b)
         discard self.surfs.insert(s, Surf { pending: None, ..sf })
     }
+    self.comp = comp
     self.srv = srv
-    self.comp.put_uploads(e)
-    return Ok(())
 }
 
 fn Display.render(mut self, o: int) -> Result[(), str] {
@@ -2327,7 +2274,7 @@ fn Display.render(mut self, o: int) -> Result[(), str] {
     if self.animating {
         self.rebuild()
     }
-    try self.upload_pending()
+    self.upload_pending()
     if self.outs[o].dirty {
         var scanned = false
         // Direct scanout: one client buffer fills the output as is (not

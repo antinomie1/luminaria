@@ -9,7 +9,8 @@
 | 嵌套 | 父合成器里的一个窗口 | 父合成器的 seat 和 keymap |
 | 无头 | 按刷新率定时的纹理 | `inject` |
 
-`Kind.Auto`：设置了 `WAYLAND_DISPLAY` 就嵌套，否则 DRM。
+`Kind.Auto`：设置了 `WAYLAND_DISPLAY` 就嵌套，否则 DRM。嵌套后端是特性 `nested`（默认开）；关掉时
+`nested_off.mica` 顶替它（打开即报错），后端不再依赖 `luminaria_proto` 和 `luminaria_wire`，`Auto` 总选 DRM。
 
 ## 扫描输出缓冲
 

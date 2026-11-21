@@ -74,7 +74,7 @@ while true {
 | `Session(active)` | 无（库已暂停或恢复设备） |
 | `Ready` / `Timer` | 无 |
 
-`Key` 带 `code`（evdev）、`sym`（xkb keysym，常量在 `lum.keysym`）、`text`、`pressed`、`mods`。
+`Key` 带 `code`（evdev）、`sym`（xkb keysym，常量在 `lum.backend.keysym`）、`text`、`pressed`、`mods`。
 `Pointer` 带全局逻辑坐标 `x, y`、`dx, dy`（加速后）和 `raw_dx, raw_dy`。
 
 ## 布局
@@ -165,5 +165,5 @@ d.end(100)
 
 ## 底层
 
-`luminaria` 同时导出 `server`、`backend`、`compose`、`proto`、`wire`、`keysym`。要自己写协议扩展、
+`luminaria` 同时导出 `server`、`backend`、`compose`、`proto`、`wire`。要自己写协议扩展、
 自己做渲染，或只用协议层，可以绕过 `Display` 直接用下层包。

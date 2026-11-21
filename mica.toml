@@ -14,5 +14,5 @@ luminaria = { path = "luminaria" }
 luminaria_wire = { path = "luminaria_wire" }
 luminaria_proto = { path = "luminaria_proto" }
 luminaria_server = { path = "luminaria_server" }
-luminaria_backend = { path = "luminaria_backend" }
+luminaria_backend = { path = "luminaria_backend", default-features = false }
 luminaria_compose = { path = "luminaria_compose" }

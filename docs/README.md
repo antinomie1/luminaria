@@ -19,7 +19,7 @@ luminaria 是用来写 Wayland 合成器的库：协议状态、合成、设备�
 ```
 luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_wire
            ├─ luminaria_compose ── vk_compose, vk_draw2d, vk_gpu
-           └─ luminaria_backend ── luminaria_proto, vk_gpu, sys/*
+           └─ luminaria_backend ── vk_gpu, sys/*；luminaria_proto（仅嵌套）
 ```
 
 | 包 | 负责 | 不碰 |
@@ -27,8 +27,8 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 | 协议语义 |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的类型化接口 | 状态 |
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、seat、输出、缓冲、时序 | GPU、策略 |
-| `luminaria_compose` | 放置表比对成场景、客户端缓冲变纹理、栅栏、合成器时钟 | 协议、设备 |
-| `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb | 协议、合成 |
+| `luminaria_compose` | 放置表比对成场景、客户端缓冲的纹理（导入、上传、释放都在这里）、栅栏、合成器时钟 | 协议、设备 |
+| `luminaria_backend` | DRM/KMS、嵌套（特性 `nested`，默认开）、无头三种输出；libseat、libinput、xkb、keysym 常量 | 协议、合成 |
 | `luminaria` | `Display`：一个事件循环把以上接起来，加上布局、输入路由、操纵快速路径 | 策略 |
 
 server、compose、backend 之间互不依赖，只交换纯数据，由门面 `luminaria` 接线。所以每一层都能单独

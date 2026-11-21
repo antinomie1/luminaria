@@ -11,4 +11,7 @@ luminaria_compose = { workspace = true }
 luminaria_proto = { workspace = true }
 luminaria_wire = { workspace = true }
 vk_gpu = { workspace = true }
-xkbcommon_sys = { workspace = true }
+
+[features]
+default = ["nested"]
+nested = ["luminaria_backend/nested"]

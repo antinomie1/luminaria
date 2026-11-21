@@ -1,0 +1,55 @@
+// The nested backend when built without the `nested` feature: the shape
+// lib.mica uses, never opened, so luminaria_proto and luminaria_wire stay
+// out of the build.
+
+import vk_gpu as gpu
+import keyboard
+import swap
+import types
+
+let available = false
+
+struct Nested {
+    resized: bool = false
+    frame_cb: u32 = 0
+    swap: Option[swap.Swap] = None
+    keyboard: Option[keyboard.Keyboard] = None
+}
+
+fn open(title: str) -> Result[Nested, str] {
+    return Err("built without the nested backend (feature `nested`)")
+}
+
+fn Nested.fd(self) -> int {
+    return -1
+}
+
+fn Nested.dispatch(mut self, mut out: List[types.Event]) -> Result[(), str] {
+    return Ok(())
+}
+
+fn Nested.flush(mut self) {}
+
+fn Nested.desc(self) -> types.OutputDesc {
+    return types.OutputDesc {}
+}
+
+fn Nested.prepare(mut self, mut dev: gpu.Device, count: int) -> Result[(), str] {
+    return Ok(())
+}
+
+fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) {}
+
+fn Nested.scanout(mut self, key: u64, fd: int, width: u32, height: u32, format: u32, modifier: u64, offset: u32, stride: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+    return false
+}
+
+fn Nested.holds(self, key: u64) -> bool {
+    return false
+}
+
+fn Nested.forget(mut self, key: u64) {}
+
+fn Nested.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {}
+
+fn Nested.release(mut self, mut dev: gpu.Device) {}

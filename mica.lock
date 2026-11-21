@@ -26,7 +26,7 @@ source = "path+sys/libudev_sys"
 name = "luminaria"
 version = "0.1.0"
 source = "path+luminaria"
-dependencies = ["luminaria_backend", "luminaria_compose", "luminaria_proto", "luminaria_server", "luminaria_wire", "vk_gpu", "xkbcommon_sys"]
+dependencies = ["luminaria_backend", "luminaria_compose", "luminaria_proto", "luminaria_server", "luminaria_wire", "vk_gpu"]
 
 [[package]]
 name = "luminaria_backend"
