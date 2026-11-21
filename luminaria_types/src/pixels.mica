@@ -1,0 +1,81 @@
+// CPU pixel copies (cursor images, screen capture into client memory,
+// icons): whole rows through memcpy (one call when both sides are
+// contiguous), never byte loops, and alpha forced a cache line at a time:
+// scalar up to the destination's first 64-byte boundary, then two 32-byte
+// vectors per line, so no store straddles a line.
+
+extern fn memset(dst: Ptr[u8], c: i32, n: u64) -> Ptr[u8]
+
+/// Copy `rows` rows of `row` bytes from `src` (rows `src_stride` apart,
+/// from `src_at`) to `dst` (rows `dst_stride` apart, from `dst_at`); false
+/// when either side is too short.
+pub fn copy_rows(mut dst: &mut [u8], dst_at: int, dst_stride: int, src: &[u8], src_at: int, src_stride: int, row: int, rows: int) -> bool {
+    guard rows > 0 and row > 0 else {
+        return true
+    }
+    guard row <= dst_stride and row <= src_stride and dst_at >= 0 and src_at >= 0 else {
+        return false
+    }
+    guard dst_at + (rows - 1) * dst_stride + row <= dst.len() and src_at + (rows - 1) * src_stride + row <= src.len() else {
+        return false
+    }
+    unsafe {
+        let d = dst.as_ptr().offset(dst_at)
+        let s = src.as_ptr().offset(src_at)
+        if dst_stride == row and src_stride == row {
+            Ptr.copy(d, s, row * rows)
+        } else {
+            for y in 0..rows {
+                Ptr.copy(d.offset(y * dst_stride), s.offset(y * src_stride), row)
+            }
+        }
+    }
+    return true
+}
+
+/// Rows of `row` bytes, `stride` apart, as one tightly packed list.
+pub fn pack(src: &[u8], stride: int, row: int, rows: int) -> List[u8] {
+    let n = max(row, 0) * max(rows, 0)
+    var out: List[u8] = List.with_cap(n)
+    unsafe {
+        out.set_len(n)
+    }
+    if not copy_rows(mut out, 0, row, src, 0, stride, row, rows) {
+        out.clear()
+    }
+    return out
+}
+
+/// Zero `px`.
+pub fn clear(mut px: &mut [u8]) {
+    if not px.is_empty() {
+        unsafe {
+            discard memset(px.as_ptr(), 0, u64(px.len()))
+        }
+    }
+}
+
+/// Make every 32-bit little-endian pixel of `px` opaque (its top byte
+/// 0xff): an X format read as A.
+pub fn opaque(mut px: &mut [u8]) {
+    let n = px.len() / 4 * 4
+    unsafe {
+        let p = px.as_ptr()
+        var i = 0
+        while i < n and (p.addr() + usize(i)) % 64 != 0 {
+            p.offset(i + 3).write(0xff)
+            i += 4
+        }
+        let a = u32x8(0xff000000)
+        while i + 64 <= n {
+            let q = p.offset(i).cast[u32]()
+            u32x8.store(q, u32x8.load(q) | a)
+            u32x8.store(q.offset(8), u32x8.load(q.offset(8)) | a)
+            i += 64
+        }
+        while i < n {
+            p.offset(i + 3).write(0xff)
+            i += 4
+        }
+    }
+}

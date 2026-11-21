@@ -68,6 +68,13 @@ fn Swap.free(mut self, i: int) {
     }
 }
 
+/// No buffer's content is known any more (a frame was lost).
+fn Swap.forget(mut self) {
+    for i in 0..self.slots.len() {
+        self.slots[i].drawn = 0
+    }
+}
+
 fn Swap.find(self, id: u32) -> int {
     for i in 0..self.slots.len() {
         if self.slots[i].id == id {

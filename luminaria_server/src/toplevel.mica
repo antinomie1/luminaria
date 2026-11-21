@@ -4,6 +4,7 @@
 // ext-foreign-toplevel-list (taskbars, docks) and the system bell.
 
 import std.time
+import luminaria_types.pixels as pixels
 import luminaria_proto.wayland as wl
 import luminaria_proto.xdg_decoration_unstable as xd
 import luminaria_proto.xdg_toplevel_icon as ic
@@ -144,9 +145,7 @@ fn icon(mut srv: server.Server, ci: u32, i: ic.Icon, take req: ic.IconRequest) {
             // Copied now: the client may reuse the buffer.
             var px: List[u8] = []
             discard buffer.with_shm(srv, bi, fn(bytes, stride) {
-                for y in 0..int(h) {
-                    px.extend(bytes[y * stride..y * stride + int(w) * 4].to_list())
-                }
+                px = pixels.pack(bytes, stride, int(w) * 4, int(h))
             })
             srv.icons.items[int(k)].icon.images.push(state.IconImage { size: w, scale: max(scale, 1), pixels: px })
         }

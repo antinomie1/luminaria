@@ -4,7 +4,7 @@
 
 ```
 设备 ──▶ backend（libinput + xkb / 父合成器 / inject）──▶ Display
-    指针移动：先夹在输出范围内，立即移动光标（光标平面按输入速率）
+    指针移动：先夹在输出范围内，立即移动光标（光标平面在下一个 vblank 前提交，帧先到就并进帧）
     操纵进行中：直接移动或缩放窗口，不产生事件
     其余：Key / Modifiers / Motion / Button / Scroll / Touch / Gesture 事件 ──▶ 合成器
           ──▶ 合成器自己处理（快捷键），或 accept(e) ──▶ 路由给客户端

@@ -80,6 +80,8 @@ pub trait Output {
     fn sets_modes(self) -> bool {
         return false
     }
+    /// Add the device's counters to `s` (commits, scheduling).
+    fn stats(self, mut s: types.Stats) {}
 }
 
 pub trait Renderer {

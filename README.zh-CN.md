@@ -12,7 +12,7 @@
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、layer shell、锁屏、seat 与输入法、选区与拖放、输出及其配置、截屏、沙盒、缓冲、时序；不碰 GPU |
 | `luminaria_compose` | 基于 `vk_compose` 的 Vulkan 渲染器：放置表比对、所有纹理、渲染目标 |
 | `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb；不碰 GPU |
-| `luminaria_types` | 各层交换的纯数据：dmabuf、放置、输出、输入、渲染目标 |
+| `luminaria_types` | 各层交换的纯数据：dmabuf、放置、输出、输入、渲染目标、测量；共用的 CPU 像素拷贝 |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的接口 |
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 |
 | `luminaria_scanner` | 生成 `luminaria_proto`（开发工具） |
@@ -117,14 +117,20 @@ sheaf run -p tiny -- -s foot    # 在 VT 上，或作为当前桌面里的一个
 - 合成出来的帧只重绘损坏、跳过被不透明窗口挡住的部分，把 GPU 的 sync_file 作为 `IN_FENCE_FD` 交给
   内核（CPU 从不等待），把变化的矩形作为 `FB_DAMAGE_CLIPS` 或父合成器的 damage 传下去。
 - 帧回调和呈现反馈只发给这一帧显示了的表面；看不见的客户端停止绘制。
+- DRM 时原子提交在提交线程上发出，每个 CRTC 一个队列，在瞄准的 vblank 允许的最晚时刻提交（减去垂直
+  消隐和按提交耗时学到的余量）；光标移动并进帧的提交，显示的是最后的位置。看门狗区分事件循环卡顿和
+  驱动不完成的翻转。
+- 事件循环和提交线程用 `SCHED_FIFO`（单核 `SCHED_RR`，无权限时 nice −15），启动的客户端不继承；
+  有输入时每 500 ms 至多一次写 `$XDG_RUNTIME_DIR/luminaria-input-boost`，供调频守护进程提频。
+- `d.stats(o)` 测量运行中的显示：帧间隔和帧耗时的分位数、漏帧、损坏、提交、卡顿、调度。
 
 ### 后端
 
 | 后端 | 输出 | 输入 |
 |------|------|------|
-| DRM | 原子 KMS：主平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、热插拔 | libinput（经 libseat）、xkb |
+| DRM | 原子 KMS（提交线程）：主平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、热插拔 | libinput（经 libseat）、xkb |
 | 嵌套 | 父合成器里的一个窗口（标题栏和边框经 xdg-decoration 由父合成器画），dmabuf 经 linux-dmabuf 交出，带隐式栅栏 | 父合成器的 seat 和 keymap |
-| 无头 | 按模式刷新率定时的纹理 | `inject` |
+| 无头 | 按模式刷新率的 vblank 网格显示的纹理 | `inject` |
 
 release 构建，本机实测（`sheaf test --release`）：
 
@@ -133,6 +139,7 @@ release 构建，本机实测（`sheaf test --release`）：
 | 1920x1080 一帧，50 个圆角带阴影的窗口、一个在动：CPU 录制并提交 | 8 µs |
 | 同上，直到 GPU 完成 | 46 µs |
 | 命中测试，512 个表面，最坏情况（整数 SIMD，一步 8 个） | 251 ns |
+| 门禁（`tests/probe.mica`）：1280x720@240 Hz，50 个窗口、输入按 1000 Hz 拖动一个，480 帧 | 0 漏帧，间隔 P99 4.17 ms，帧耗时 P50 67 µs / P99 212 µs，每帧损坏约 4.3 万像素（全屏的 4.7%） |
 
 ## 线协议与协议
 
@@ -244,9 +251,10 @@ sheaf test    # luminaria：libwayland xdg 窗口（用 cc 编译）和 foot 在
               # protocols：layer 表面、锁屏、选区、输入法、装饰与激活、
               # 窗口列表、指针锁定、空闲、单像素缓冲、拖放、截屏、沙盒、
               # 输出配置；无头输出上的外壳：面板独占区、锁屏、截一帧、
-              # 应用输出配置；wire、proto、sys 同前
+              # 应用输出配置；性能门禁（50 个窗口上拖动一个：帧间隔、
+              # 帧耗时、损坏的上界）；wire、proto、sys 同前
 sheaf test --release -p luminaria_compose   # 帧开销
-sheaf test --release -p luminaria           # 命中测试
+sheaf test --release -p luminaria           # 命中测试、门禁的数字
 sheaf test --release -p luminaria_proto     # 线协议吞吐
 ```
 

@@ -7,12 +7,12 @@ luminaria 是用来写 Wayland 合成器的库：协议状态、合成、设备�
 
 | 目标 | 落到实处 |
 |---|---|
-| 低延迟 | 帧在下一个 vblank 前尽量晚地开始；光标平面按输入速率移动；移动、缩放、平移在库内按输入事件驱动；GPU 栅栏交给内核（`IN_FENCE_FD`），CPU 不等 |
+| 低延迟 | 帧在下一个 vblank 前尽量晚地开始，提交线程在 vblank 前最后时刻提交、光标并进同一次提交；事件循环和提交线程实时调度；移动、缩放、平移在库内按输入事件驱动；GPU 栅栏交给内核（`IN_FENCE_FD`），CPU 不等 |
 | 零开销 | 事件是值，没有回调网和引用计数；句柄是可复制的 id；稳态不分配；没用到的协议代码被链接器剔除 |
 | 高性能 | 一个 pass 只画损坏区域、跳过被遮挡的内容；一次 `sendmsg` 发完一个客户端的事件；命中测试用整数 SIMD |
 | 轻量 | 合成器只接触 `Display`、句柄和 `Event`；依赖只有 libdrm、libinput、libseat、libudev、xkbcommon 和 Vulkan |
 | 低功耗 | 空闲时零唤醒；看不见的客户端停帧并收到 suspended；能直接扫描输出就不合成；`FB_DAMAGE_CLIPS` 让带自刷新的面板省电 |
-| 边缘设备友好 | 一个线程；交换缓冲数可选（2 省内存）；平铺 / 压缩修饰符省显存带宽；GPU 只需 Vulkan 1.3 |
+| 边缘设备友好 | 一个事件循环线程（DRM 时另有一个提交线程）；交换缓冲数可选（2 省内存）；平铺 / 压缩修饰符省显存带宽；GPU 只需 Vulkan 1.3 |
 
 ## 分层
 
@@ -28,7 +28,7 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 | 协议语义 |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的类型化接口 | 状态 |
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、seat、输出、缓冲、时序 | GPU、策略 |
-| `luminaria_types` | 各层交换的纯数据：dmabuf、fourcc、放置、输出描述、输入、渲染目标 | 一切行为 |
+| `luminaria_types` | 各层交换的纯数据：dmabuf、fourcc、放置、输出描述、输入、渲染目标、测量；共用的 CPU 像素拷贝（整行 memcpy，alpha 按 64 字节缓存行对齐的向量写） | 其他行为 |
 | `luminaria_compose` | Vulkan 渲染器：持有设备和所有纹理（客户端缓冲、合成器图像、渲染目标），放置表比对成场景、只画损坏 | 协议、显示 |
 | `luminaria_backend` | DRM/KMS、嵌套（特性 `nested`，默认开）、无头三种输出；libseat、libinput、xkb、keysym 常量 | 协议、GPU |
 | `luminaria` | `Display[O, R]`：一个事件循环把服务端、输出端 `O`、渲染器 `R` 接起来，加上布局、输入路由、操纵快速路径、帧时钟、栅栏 | 策略 |
@@ -49,7 +49,7 @@ server、compose、backend 之间互不依赖，只交换 `luminaria_types` 里�
 | 出帧方式 | 库来选：不出帧 → 直接扫描输出 → 合成 | 对策略层不可见，总选最省的 |
 | 帧驱动 | 有东西要显示才按时钟定时 | 空闲零唤醒 |
 | 可插拔 | 输出端、渲染器是结构化 trait，`Display` 单态化；两者只交换渲染目标和栅栏 | 换层不付运行时代价；后端不碰 GPU |
-| 线程 | 一个线程 | 边缘设备上最省；放置表与帧数据都是纯数据，需要时再拆出合成线程不改接口 |
+| 线程 | 一个事件循环线程；DRM 时加一个提交线程，两者实时调度（`SCHED_FIFO`，子进程不继承） | KMS ioctl 不卡协议处理和录制，满载 CPU 下帧不抖；放置表与帧数据都是纯数据，需要时再拆出合成线程不改接口 |
 
 ## 一帧和一次输入
 
@@ -85,5 +85,6 @@ release 构建，本机（`sheaf test --release`）：
 | 1920x1080 一帧，50 个圆角带阴影的窗口、一个在动：CPU 录制并提交 | 8 µs |
 | 同上，直到 GPU 完成 | 46 µs |
 | 命中测试，512 个表面，最坏情况 | 251 ns |
+| 门禁 `tests/probe.mica`：1280x720@240 Hz，50 个窗口、输入按 1000 Hz 拖动一个，480 帧 | 0 漏帧，间隔 P99 4.17 ms，帧耗时 P50 67 µs / P99 212 µs，每帧损坏约 4.3 万像素（全屏的 4.7%） |
 | 请求：编码、发送、接收、解码 | 约 60 ns / 条 |
 | 事件（`wl_pointer.motion`） | 约 48 ns / 条 |

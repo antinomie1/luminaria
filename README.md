@@ -14,7 +14,7 @@ and its own loop. The design is in [docs/](docs/README.md) (Chinese).
 | `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, layer shell, session lock, seats and input methods, selections and drag and drop, outputs and their configuration, capture, sandboxes, buffers, timing; no GPU |
 | `luminaria_compose` | The Vulkan renderer on `vk_compose`: placement diffs, every texture, render targets |
 | `luminaria_backend` | DRM/KMS, nested and headless outputs; libseat, libinput, xkb; no GPU |
-| `luminaria_types` | Plain data the layers trade: dmabufs, placements, outputs, input, render targets |
+| `luminaria_types` | Plain data the layers trade: dmabufs, placements, outputs, input, render targets, measurements; shared CPU pixel copies |
 | `luminaria_proto` | Interfaces generated from `protocols/*.xml` |
 | `luminaria_wire` | Wire protocol: sockets, fd passing, encoding, object maps |
 | `luminaria_scanner` | Writes `luminaria_proto` (dev tool) |
@@ -150,14 +150,25 @@ sheaf run -p tiny -- -s foot    # on a VT, or as a window in your session
   send the changed rectangles as `FB_DAMAGE_CLIPS` or parent damage.
 - Frame callbacks and presentation feedback go only to surfaces the frame
   showed; hidden clients stop drawing.
+- On DRM, atomic commits go out on a commit thread, one queue per CRTC, as
+  late as the aimed-at vblank allows (minus the vertical blank and a
+  margin learned from commit times); a cursor move is folded into the
+  frame's commit, so the cursor shows where it last was. A watchdog tells
+  a stalled event loop from a page flip the driver never completes.
+- The event loop and the commit thread run `SCHED_FIFO` (`SCHED_RR` on one
+  CPU, nice -15 without the right), never inherited by spawned clients;
+  input pulses `$XDG_RUNTIME_DIR/luminaria-input-boost` for a frequency
+  governor, at most every 500 ms.
+- `d.stats(o)` measures a running display: frame interval and frame time
+  percentiles, missed frames, damage, commits, stalls, scheduling.
 
 ### Backends
 
 | Backend | Output | Input |
 |---------|--------|-------|
-| DRM | atomic KMS: primary and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat, xkb |
+| DRM | atomic KMS on a commit thread: primary and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat, xkb |
 | Nested | a window of the parent compositor (its title bar and borders through xdg-decoration), dmabufs over linux-dmabuf with implicit fences | the parent's seat and keymap |
-| Headless | textures paced by a timer at the mode's refresh | `inject` |
+| Headless | textures shown on a vblank grid at the mode's refresh | `inject` |
 
 Release build, measured on this machine (`sheaf test --release`):
 
@@ -166,6 +177,7 @@ Release build, measured on this machine (`sheaf test --release`):
 | A 1920x1080 frame, 50 rounded, shadowed windows, one moving: CPU to record and submit | 8 us |
 | The same, until the GPU is done | 46 us |
 | Hit test over 512 surfaces, worst case (integer SIMD, 8 per step) | 251 ns |
+| Gate (`tests/probe.mica`): 1280x720 at 240 Hz, 50 windows, one dragged by 1000 Hz input, 480 frames | no missed frame, interval p99 4.17 ms, frame time p50 67 us / p99 212 us, about 43k damaged px per frame (4.7% of the screen) |
 
 ## Wire and protocol
 
@@ -301,9 +313,11 @@ sheaf test    # luminaria: a libwayland xdg window (built with cc) and foot on a
               # pixels, drag and drop, capture, sandboxes, output
               # configuration; the shell on a headless output: panel
               # zones, lock screen, a captured frame, an applied output
-              # configuration; wire, proto, sys as before
+              # configuration; the performance gate (a dragged window
+              # over 50: frame interval, frame time and damage bounds);
+              # wire, proto, sys as before
 sheaf test --release -p luminaria_compose   # frame cost
-sheaf test --release -p luminaria           # hit testing
+sheaf test --release -p luminaria           # hit testing, the gate's numbers
 sheaf test --release -p luminaria_proto     # wire throughput
 ```
 

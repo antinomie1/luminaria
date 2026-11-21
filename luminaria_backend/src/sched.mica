@@ -1,0 +1,141 @@
+// Thread scheduling. On a DRM session the event loop and the commit
+// thread run in the real-time class, as DWM's threads do under MMCSS, so a
+// desktop under full CPU load still makes its vblanks: SCHED_FIFO, or
+// SCHED_RR on one CPU (equal-priority FIFO threads would never share it),
+// clamped to RLIMIT_RTPRIO; without the right, nice -15. Children never
+// inherit either: SCHED_RESET_ON_FORK puts them back to SCHED_OTHER at
+// nice 0, so a client the compositor spawns is an ordinary process.
+//
+// Input boost: on input, at most every 500 ms, the time is written to
+// $XDG_RUNTIME_DIR/luminaria-input-boost when that file exists, for a
+// frequency governor to raise clocks before the frame the input causes.
+// Without the file it costs one failed open per 500 ms of input.
+
+import std.env
+import std.os
+
+// Resolved at run time: the C headers the build includes declare these
+// with types Mica does not spell.
+extern table Libc {
+    fn sched_setscheduler(pid: i32, policy: i32, param: Ptr[i32]) -> i32 = "sched_setscheduler"
+    fn sched_getscheduler(pid: i32) -> i32 = "sched_getscheduler"
+    fn sched_getparam(pid: i32, param: Ptr[i32]) -> i32 = "sched_getparam"
+    fn sched_get_priority_min(policy: i32) -> i32 = "sched_get_priority_min"
+    fn sched_get_priority_max(policy: i32) -> i32 = "sched_get_priority_max"
+    fn getrlimit(resource: i32, r: Ptr[u64]) -> i32 = "getrlimit"
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32 = "setpriority"
+    fn getpriority(which: i32, who: u32) -> i32 = "getpriority"
+    fn sysconf(name: i32) -> i64 = "sysconf"
+    fn open(path: Ptr[u8], flags: i32) -> i32 = "open"
+    fn pwrite(fd: i32, buf: Ptr[u8], n: u64, off: i64) -> i64 = "pwrite"
+}
+
+fn libc() -> Option[Libc] {
+    return Libc.open("libc.so.6").ok()
+}
+
+let sched_other = 0
+let sched_fifo = 1
+let sched_rr = 2
+let reset_on_fork = 0x40000000
+let rlimit_rtprio = 14
+let sc_nprocessors_onln = 84
+
+/// The event loop's priority; the commit thread runs just above it, since
+/// it sleeps to the last moment before a vblank and must wake on time.
+pub let loop_priority = 50
+pub let commit_priority = 51
+
+/// Put the calling thread in the real-time class at `priority` (or as
+/// close as RLIMIT_RTPRIO allows), else at nice -15: (policy, priority or
+/// nice) it got.
+pub fn realtime(priority: int) -> (int, int) {
+    guard let Some(c) = libc() else {
+        return (0, 0)
+    }
+    let order: [2]int = if c.sysconf(i32(sc_nprocessors_onln)) <= 1 { [sched_rr, sched_fifo] } else { [sched_fifo, sched_rr] }
+    for policy in order {
+        let lo = int(c.sched_get_priority_min(i32(policy)))
+        var hi = int(c.sched_get_priority_max(i32(policy)))
+        var lim: [2]u64 = [0, 0]
+        unsafe {
+            if c.getrlimit(i32(rlimit_rtprio), Ptr.of_mut(mut lim).cast[u64]()) == 0 and lim[0] != ~u64(0) {
+                hi = min(hi, int(lim[0]))
+            }
+        }
+        guard lo >= 0 and hi >= lo else {
+            continue
+        }
+        var p = i32(priority.clamp(lo, hi))
+        unsafe {
+            if c.sched_setscheduler(0, i32(policy | reset_on_fork), Ptr.of_mut(mut p)) == 0 {
+                return (policy, int(p))
+            }
+        }
+    }
+    discard c.setpriority(0, 0, -15)
+    // Keeps SCHED_OTHER; children start at nice 0 again.
+    var zero: i32 = 0
+    unsafe {
+        discard c.sched_setscheduler(0, i32(sched_other | reset_on_fork), Ptr.of_mut(mut zero))
+    }
+    return current()
+}
+
+/// The calling thread's (policy, real-time priority or nice).
+pub fn current() -> (int, int) {
+    guard let Some(c) = libc() else {
+        return (0, 0)
+    }
+    let policy = int(c.sched_getscheduler(0)) & ~reset_on_fork
+    guard policy != sched_other else {
+        return (policy, int(c.getpriority(0, 0)))
+    }
+    var p: i32 = 0
+    unsafe {
+        discard c.sched_getparam(0, Ptr.of_mut(mut p))
+    }
+    return (policy, int(p))
+}
+
+pub struct Boost {
+    fd: int = -1
+    /// When the last pulse went out (or the file was looked for).
+    last: int = 0
+}
+
+/// Input happened at `now` (CLOCK_MONOTONIC ns).
+pub fn Boost.pulse(mut self, now: int) {
+    guard now - self.last >= 500000000 else {
+        return
+    }
+    self.last = now
+    guard let Some(c) = libc() else {
+        return
+    }
+    if self.fd < 0 {
+        guard let Some(dir) = env.get("XDG_RUNTIME_DIR") else {
+            return
+        }
+        let path = "{dir}/luminaria-input-boost"
+        unsafe {
+            // O_WRONLY | O_NONBLOCK | O_CLOEXEC, never O_CREAT: the
+            // governor makes the file.
+            self.fd = int(c.open(path.as_cstr(), 0x80801))
+        }
+        guard self.fd >= 0 else {
+            return
+        }
+    }
+    let line = "{now / 1000000}\n"
+    if c.pwrite(i32(self.fd), line, u64(line.len()), 0) < 0 {
+        os.close(self.fd)
+        self.fd = -1
+    }
+}
+
+fn Boost.drop(mut self) {
+    if self.fd >= 0 {
+        os.close(self.fd)
+    }
+}

@@ -1,0 +1,103 @@
+// The performance gate: a fixed interactive script on a headless output,
+// measured by the display's own probes rather than a single-frame
+// benchmark. 50 rounded, shadowed windows (compositor images); the top one
+// is dragged by input at 1000 Hz with the pointer on it. Damage has exact
+// bounds (a broken partial redraw fails at once); timing bounds are loose
+// by default and tighten with LUMINARIA_GATE_INTERVAL_US and LUMINARIA_GATE_FRAME_US (p99 frame interval and time) and
+// LUMINARIA_GATE_MISSED (missed frames, percent). Skipped without a Vulkan
+// device. Run with --release on the target device for real numbers.
+
+import std.env
+import std.fs
+import std.io
+import luminaria as lum
+import luminaria_types.stats as stats
+
+fn gate(name: str, default: int) -> int {
+    guard let Some(v) = env.get(name) else {
+        return default
+    }
+    return v.to_int().unwrap_or(default)
+}
+
+test "a dragged window over 50 others stays within the gate" {
+    let dir = fs.create_temp_dir("luminaria-probe").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let mode = lum.Mode { width: 1280, height: 720, refresh_mhz: 240000 }
+    guard let Ok(dd) = lum.open(lum.Options { backend: lum.Kind.Headless, headless: [mode] }) else {
+        io.eprint("skipped: no Vulkan device")
+        return
+    }
+    var d = dd
+    var px: List[u8] = []
+    for _ in 0..200 * 150 {
+        for b in [u8(40), 80, 120, 255] {
+            px.push(b)
+        }
+    }
+    // One image per window: placements are keyed by what they show.
+    var imgs: List[lum.Image] = []
+    for _ in 0..50 {
+        imgs.push(d.image(200, 150, px, true).expect("image"))
+    }
+    let so = d.outputs()[0]
+    let warm = 20
+    let frames = 480
+    var n = 0
+    var step = 0
+    // The drag: input at 1000 Hz moves the window, frames follow at the
+    // output's rate. A hang fails the gate instead of stalling the run.
+    d.timer(1, 0)
+    d.timer(10000, 1)
+    var timed_out = false
+    while n < warm + frames and not timed_out {
+        guard let Some(e) = d.next().expect("next") else {
+            break
+        }
+        match e {
+            Frame => {
+                n += 1
+                if n == warm {
+                    d.reset_stats()
+                }
+            }
+            Timer(k) => {
+                if k == 1 {
+                    timed_out = true
+                } else {
+                    step += 1
+                    let x = f64(step % 1000)
+                    d.layout(fn(mut l) {
+                        for i in 0..49 {
+                            l.image(imgs[i], f64((i % 10) * 120), f64((i / 10) * 140), 200.0, 150.0, lum.Style { radius: 8.0, shadow: 16.0 })
+                        }
+                        l.image(imgs[49], x, 300.0, 200.0, 150.0, lum.Style { radius: 8.0, shadow: 16.0 })
+                    })
+                    d.inject(lum.types.Input.MotionAbsolute(u32(step), 0, (x + 100.0) / 1280.0, 375.0 / 720.0))
+                    d.timer(1, 0)
+                }
+            }
+            _ => d.accept(e)
+        }
+    }
+    io.print("probe: {n} frames, {step} steps, timed out {timed_out}")
+    let s = d.stats(so)
+    io.print(s.report())
+    assert(not timed_out)
+    // Every frame reached the screen (a few may be in flight at the end).
+    assert(s.frames >= frames - 2)
+    assert_eq(s.failed, 0)
+    // Partial redraw: per frame the window's old and new place with
+    // shadow (232 x 182 at most each, a few px apart) plus the cursor; never
+    // the whole 1280 x 720.
+    let per_frame = s.damage_pixels / max(s.frames, 1)
+    assert(per_frame < 2 * 232 * 182 + 64 * 64)
+    assert(per_frame > 0)
+    // Frame intervals: the 240 Hz beat (4.17 ms), p99 within three periods.
+    assert(stats.percentile(s.intervals, 99) < gate("LUMINARIA_GATE_INTERVAL_US", 12500) * 1000)
+    assert(stats.percentile(s.frame_ns, 99) < gate("LUMINARIA_GATE_FRAME_US", 20000) * 1000)
+    assert(s.missed * 100 <= gate("LUMINARIA_GATE_MISSED", 10) * s.frames)
+    for img in imgs {
+        d.drop_image(img)
+    }
+}

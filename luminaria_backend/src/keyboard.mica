@@ -147,7 +147,3 @@ pub fn Keyboard.mods(self) -> Mods {
         num: xkb.state_mod_name_is_active(self.state, "Mod2", eff) == 1,
     }
 }
-
-pub fn Keyboard.repeats(self, code: u32) -> bool {
-    return xkb.keymap_key_repeats(self.keymap, code + 8) == 1
-}

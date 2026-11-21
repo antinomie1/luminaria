@@ -6,6 +6,7 @@
 // compositor hands the pixels over with `Server.capture`; they are copied
 // straight into the client's shm buffer. Cursor sessions stop at once.
 
+import luminaria_types.pixels as pixels
 import luminaria_proto.wayland as wl
 import luminaria_proto.ext_image_capture_source as ics
 import luminaria_proto.ext_image_copy_capture as icc
@@ -189,9 +190,9 @@ fn deliver(mut srv: server.Server, oi: u32, pixels: &[u8], width: i32, height: i
     }
 }
 
-/// Copy `pixels` into shm buffer `bi`; false when it is not a writable
+/// Copy `px` into shm buffer `bi`; false when it is not a writable
 /// argb8888 / xrgb8888 buffer of this size.
-fn copy(mut srv: server.Server, bi: u32, pixels: &[u8], width: i32, height: i32) -> bool {
+fn copy(mut srv: server.Server, bi: u32, px: &[u8], width: i32, height: i32) -> bool {
     guard bi != state.none and srv.buffers.used(int(bi)) else {
         return false
     }
@@ -204,7 +205,7 @@ fn copy(mut srv: server.Server, bi: u32, pixels: &[u8], width: i32, height: i32)
         return false
     }
     let row = int(width) * 4
-    guard pixels.len() >= row * int(height) else {
+    guard px.len() >= row * int(height) else {
         return false
     }
     let pi = int(srv.buffers.items[b].pool)
@@ -213,19 +214,15 @@ fn copy(mut srv: server.Server, bi: u32, pixels: &[u8], width: i32, height: i32)
     }
     let off = srv.buffers.items[b].offset
     let stride = srv.buffers.items[b].stride
-    guard let Some(m) = srv.pools.items[pi].map else {
+    guard let Some(mm) = srv.pools.items[pi].map.take() else {
         return false
     }
-    guard off + stride * int(height) <= m.len else {
-        return false
-    }
+    var m = mm
     discard m.begin_access()
-    unsafe {
-        for y in 0..int(height) {
-            Ptr.copy(m.ptr.offset(off + y * stride), pixels.as_ptr().offset(y * row), row)
-        }
-    }
-    return not m.end_access()
+    let ok = pixels.copy_rows(mut m.bytes(), off, stride, px, 0, row, row, int(height))
+    let cut = m.end_access()
+    srv.pools.items[pi].map = Some(m)
+    return ok and not cut
 }
 
 /// Output `oi` changed size: sessions on it learn the new constraints.

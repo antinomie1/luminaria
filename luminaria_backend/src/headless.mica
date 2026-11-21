@@ -1,7 +1,8 @@
 // Headless: outputs that exist only in memory (tests, remote and
-// screenshot sessions). A present completes at the next tick of the
-// output's refresh, paced by a timer fd, so frame timing behaves like a
-// display's.
+// screenshot sessions). Vblanks fall on a fixed grid of the output's
+// refresh; a present completes at the next one, paced by a timer fd, and
+// reports that vblank's number and time, so frame timing (idle gaps
+// included) behaves like a display's.
 
 import std.os
 import std.time
@@ -16,7 +17,9 @@ struct Out {
     timer: int = -1
     pending: int = -1
     shown: int = -1
-    seq: u64 = 0
+    /// The vblank grid's origin and the vblank the pending frame shows at.
+    t0: int = 0
+    at: int = 0
 }
 
 struct Headless {
@@ -86,8 +89,14 @@ fn Headless.present(mut self, o: int, i: int) {
     self.outs[o].frame += 1
     self.outs[o].drawn[i] = self.outs[o].frame
     self.outs[o].pending = i
-    let refresh = max(self.outs[o].desc.mode.refresh_mhz, 1000)
-    discard os.timer_arm(self.outs[o].timer, 1000000000000 / int(refresh), 0)
+    let period = 1000000000000 / int(max(self.outs[o].desc.mode.refresh_mhz, 1000))
+    let now = time.now_ns()
+    if self.outs[o].t0 == 0 {
+        self.outs[o].t0 = now
+    }
+    let t0 = self.outs[o].t0
+    self.outs[o].at = t0 + ((now - t0) / period + 1) * period
+    discard os.timer_arm(self.outs[o].timer, max(self.outs[o].at - now, 1), 0)
 }
 
 /// Output `o`'s timer fired: the pending frame is shown.
@@ -98,8 +107,9 @@ fn Headless.tick(mut self, o: int) -> Option[(u64, int)] {
     }
     self.outs[o].shown = self.outs[o].pending
     self.outs[o].pending = -1
-    self.outs[o].seq += 1
-    return Some((self.outs[o].seq, time.now_ns()))
+    let period = 1000000000000 / int(max(self.outs[o].desc.mode.refresh_mhz, 1000))
+    let at = self.outs[o].at
+    return Some((u64((at - self.outs[o].t0) / period), at))
 }
 
 /// The renderer's key of what output `o` shows (screenshots, tests).

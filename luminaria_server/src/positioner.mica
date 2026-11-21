@@ -5,14 +5,6 @@
 import ids
 
 pub let anchor_none: u32 = 0
-let edge_top: u32 = 1
-let edge_bottom: u32 = 2
-let edge_left: u32 = 3
-let edge_right: u32 = 4
-let edge_top_left: u32 = 5
-let edge_bottom_left: u32 = 6
-let edge_top_right: u32 = 7
-let edge_bottom_right: u32 = 8
 
 let slide_x: u32 = 1
 let slide_y: u32 = 2
@@ -48,21 +40,6 @@ fn vertical(e: u32) -> int {
         1 or 5 or 7 => -1
         2 or 6 or 8 => 1
         _ => 0
-    }
-}
-
-/// The edge value with the given sides.
-fn edge(h: int, v: int) -> u32 {
-    return match (h, v) {
-        (0, -1) => edge_top
-        (0, 1) => edge_bottom
-        (-1, 0) => edge_left
-        (1, 0) => edge_right
-        (-1, -1) => edge_top_left
-        (-1, 1) => edge_bottom_left
-        (1, -1) => edge_top_right
-        (1, 1) => edge_bottom_right
-        _ => anchor_none
     }
 }
 

@@ -12,6 +12,7 @@ import std.net
 import std.os
 import std.time
 import luminaria_types as types
+import luminaria_types.pixels as pixels
 import luminaria_server as server
 import layout
 import hit
@@ -197,6 +198,9 @@ pub struct Options {
     pub title: str = "luminaria"
     /// Load the Vulkan validation layer.
     pub validation: bool = false
+    /// On DRM, run the event loop (the calling thread) and the commit
+    /// thread in the real-time class.
+    pub realtime: bool = true
 }
 
 /// Tokens: what a readable descriptor belongs to.
@@ -229,6 +233,8 @@ struct Out {
     dirty: bool = false
     /// Key of the client buffer scanned out (0: composing).
     scanned: u64 = 0
+    /// When the last frame reached the screen (stats).
+    shown_ns: int = 0
     vrr: bool = false
     enabled: bool = true
     /// The area panels leave free (global logical).
@@ -328,6 +334,8 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     drawn: List[List[server.Surface]] = []
     releases: List[List[server.Buffer]] = []
     points: List[List[(int, u64)]] = []
+    /// Per output: what it measured (`stats`).
+    probes: List[types.Stats] = []
     lay: layout.Layout = layout.Layout {}
     hits: hit.Hits = hit.Hits {}
     surfs: map.Map[server.Surface, Surf]
@@ -656,6 +664,13 @@ fn Display[O, R].backend_events(mut self) {
             OutputChanged(o) => self.output_changed(int(o))
             Presented(o, seq, ns, flags) => self.presented(int(o), seq, ns, flags)
             Released(o) => self.schedule(int(o))
+            Dropped(o) => {
+                if int(o) < self.outs.len() {
+                    self.outs[int(o)].dirty = true
+                    self.comp.damage_all()
+                    self.schedule(int(o))
+                }
+            }
             Input(i) => self.input(i)
             Session(on) => {
                 if on {
@@ -702,6 +717,7 @@ fn Display[O, R].output_added(mut self, o: int) {
         self.drawn.push([])
         self.releases.push([])
         self.points.push([])
+        self.probes.push(types.Stats.new())
     }
     // To the right of the others.
     var x: f64 = 0.0
@@ -2265,6 +2281,7 @@ fn Display[O, R].render(mut self, o: int) -> Result[(), str] {
     guard self.outs[o].alive and self.be.can_present(u32(o)) else {
         return Ok(())
     }
+    let t0 = time.now_ns()
     self.coast()
     if self.animating {
         self.rebuild()
@@ -2288,7 +2305,9 @@ fn Display[O, R].render(mut self, o: int) -> Result[(), str] {
             if let Some(fence) = try self.comp.render(o, key, age) {
                 var rects: List[(i32, i32, i32, i32)] = []
                 self.comp.changed(o, mut rects)
+                self.count_damage(o, rects)
                 try self.be.present(u32(o), fence, rects, false)
+                self.probes[o].frame(time.now_ns() - t0)
             }
             self.outs[o].scanned = 0
             if capturing {
@@ -2372,18 +2391,43 @@ fn Display[O, R].try_scanout(mut self, o: int, key: u64) -> bool {
     }
     let rects: List[(i32, i32, i32, i32)] = [sf.dmg]
     let tear = self.srv.info(s).tearing
+    let t0 = time.now_ns()
     guard self.be.scanout(u32(o), bkey(b), self.srv.dmabuf(b), rects, tear) else {
         return false
     }
+    self.count_damage(o, rects)
+    self.probes[o].frame(time.now_ns() - t0)
     self.outs[o].scanned = key
     return true
+}
+
+fn Display[O, R].count_damage(mut self, o: int, rects: &[(i32, i32, i32, i32)]) {
+    if rects.is_empty() {
+        self.probes[o].damage_rects += 1
+        self.probes[o].damage_pixels += int(self.outs[o].width) * int(self.outs[o].height)
+    }
+    for r in rects {
+        self.probes[o].damage_rects += 1
+        self.probes[o].damage_pixels += int(r.2) * int(r.3)
+    }
 }
 
 fn Display[O, R].presented(mut self, o: int, seq: u64, ns: int, flags: u32) {
     guard o < self.outs.len() and self.outs[o].alive else {
         return
     }
-    self.outs[o].clock.presented(seq, ns)
+    if self.outs[o].clock.presented(seq, ns) {
+        self.probes[o].missed += 1
+    }
+    self.probes[o].frames += 1
+    if flags & types.presented_zero_copy != 0 {
+        self.probes[o].scanned_out += 1
+    }
+    let gap = ns - self.outs[o].shown_ns
+    if self.outs[o].shown_ns > 0 and gap > 0 and gap < 500000000 {
+        self.probes[o].interval(gap)
+    }
+    self.outs[o].shown_ns = ns
     let refresh = self.outs[o].clock.refresh_ns
     let so = self.outs[o].sout
     let drawn = self.drawn[o].clone()
@@ -2510,12 +2554,11 @@ fn Display[O, R].client_cursor(mut self, s: server.Surface) {
     }
     var img = cursor.Image { width: bi.width, height: bi.height, hot_x: self.cursor_hx * info.scale, hot_y: self.cursor_hy * info.scale }
     discard self.srv.with_shm(b, fn(bytes: &[u8], stride: int) {
-        for y in 0..int(bi.height) {
-            for x in 0..int(bi.width) * 4 {
-                img.pixels.push(bytes[y * stride + x])
-            }
-        }
+        img.pixels = pixels.pack(bytes, stride, int(bi.width) * 4, int(bi.height))
     })
+    if bi.format == types.buffer.xrgb8888 {
+        pixels.opaque(mut img.pixels)
+    }
     self.srv.release(b)
     let ms = u32((time.now_ns() / 1000000) & 0xffffffff)
     self.srv.frame_done(s, ms)
@@ -3115,6 +3158,24 @@ pub fn Display[O, R].mods(self) -> types.Mods {
 }
 
 /// The pixels a headless output shows (BGRA8): tests and screenshots.
+/// What output `so` measured since the last `reset_stats` (frames,
+/// intervals, frame times, damage), with the device's counters (commits,
+/// stalls, scheduling) and whether the renderer is a CPU one.
+pub fn Display[O, R].stats(self, so: server.Output) -> types.Stats {
+    let o = self.out_index(so)
+    var s = if o >= 0 { self.probes[o].clone() } else { types.Stats.new() }
+    self.be.stats(mut s)
+    s.software = self.comp.render_node().is_none()
+    return s
+}
+
+/// Start measuring again.
+pub fn Display[O, R].reset_stats(mut self) {
+    for o in 0..self.probes.len() {
+        self.probes[o] = types.Stats.new()
+    }
+}
+
 pub fn Display[O, R].read_output(mut self, so: server.Output) -> Result[List[u8], str] {
     let o = self.out_index(so)
     guard o >= 0 else {

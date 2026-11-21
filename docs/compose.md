@@ -91,6 +91,25 @@ DRM 节点；DRM 后端时把主平面能直接扫描输出的组合放在单独
 6. 翻转完成（`Presented`）：给这些表面发呈现反馈、解除 fifo 屏障，释放到期的缓冲和释放点，更新时钟，
    再看是否还要调度下一帧。
 
+## 测量
+
+`Display.stats(o)` 给出输出 `o` 自上次 `reset_stats` 以来测到的（每帧几次整数加法，样本是 1024 个的环）：
+
+| 量 | 含义 |
+|---|---|
+| `frames` / `scanned_out` / `missed` | 上屏的帧、其中直接扫描输出的、比瞄准的晚一个 vblank 的 |
+| `intervals` | 相邻两帧上屏的间隔（超过 500 ms 的空闲不算），`stats.percentile` 取 P50 / P95 / P99 / 最大 |
+| `frame_ns` | 一帧从开始到交给显示端：上传、录制、提交 |
+| `damage_rects` / `damage_pixels` | 交给显示端的损坏 |
+| `commits` / `tests` / `merged` / `failed` / `late` | 原子提交、`TEST_ONLY`、并进别的提交的、失败的、晚于余量的 |
+| `stalls` / `flip_timeouts` | 事件循环卡顿、驱动不翻转（提交线程的看门狗） |
+| `policy` / `priority` / `software` | 事件循环的调度策略与优先级（或 nice）、渲染器没有 DRM 节点（CPU 光栅化） |
+
+`tests/probe.mica` 是性能门禁：无头 1280x720@240 Hz，50 个圆角带阴影的窗口，输入按 1000 Hz 拖动最上面
+一个，指针跟着。损坏有精确上界（每帧不超过新旧两处位置加光标，局部重画坏了立刻失败）；时间上界默认
+宽松，用 `LUMINARIA_GATE_INTERVAL_US`、`LUMINARIA_GATE_FRAME_US`、`LUMINARIA_GATE_MISSED` 在目标设备上
+收紧。
+
 ## 遮挡报告
 
 每次出帧后检查窗口是否还有可见部分。连续 500 ms 不可见发 `Occluded(w, true)`，重新可见发

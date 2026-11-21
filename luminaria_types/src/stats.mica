@@ -1,0 +1,88 @@
+// What a running display measured, for benchmarks and regression gates
+// under a real interactive load (not single-frame micro benchmarks):
+// frame intervals and frame times as percentiles, damage, how many atomic
+// commits the display took and whether the threads got the real-time class.
+// Counting costs a few integer adds per frame; the samples are fixed rings.
+
+/// Samples kept per series (the most recent ones).
+pub let samples = 1024
+
+pub struct Stats {
+    /// Frames that reached the screen, composed or scanned out directly.
+    pub frames: int = 0
+    pub scanned_out: int = 0
+    /// Frames that reached the screen a vblank later than aimed at.
+    pub missed: int = 0
+    /// ns between consecutive presented frames (gaps over 500 ms, when
+    /// nothing changed, are left out).
+    pub intervals: List[int] = []
+    /// ns from a frame's start to its hand-off to the display (uploads,
+    /// recording, submission).
+    pub frame_ns: List[int] = []
+    /// Damage handed to the display: rectangles and pixels.
+    pub damage_rects: int = 0
+    pub damage_pixels: int = 0
+    /// Atomic commits submitted, TEST_ONLY probes, commits folded into
+    /// another before submission (a cursor move into the frame), failures,
+    /// and commits that finished later than the safety margin wanted.
+    pub commits: int = 0
+    pub tests: int = 0
+    pub merged: int = 0
+    pub failed: int = 0
+    pub late: int = 0
+    /// Page flips overdue because the event loop stalled, and flips the
+    /// driver never completed.
+    pub stalls: int = 0
+    pub flip_timeouts: int = 0
+    /// The event loop's scheduling: SCHED_* policy, and its real-time
+    /// priority (or nice value under SCHED_OTHER).
+    pub policy: int = 0
+    pub priority: int = 0
+    /// The renderer has no DRM node: a CPU rasterizer (lavapipe) or none.
+    pub software: bool = false
+    next_interval: int = 0
+    next_frame: int = 0
+}
+
+pub fn Stats.new() -> Stats {
+    return Stats {}
+}
+
+/// Write `v` at `at` of a ring of `samples`; the next place.
+fn push_ring(mut xs: List[int], at: int, v: int) -> int {
+    if xs.len() < samples {
+        xs.push(v)
+    } else {
+        xs[at] = v
+    }
+    return (at + 1) % samples
+}
+
+pub fn Stats.interval(mut self, ns: int) {
+    self.next_interval = push_ring(mut self.intervals, self.next_interval, ns)
+}
+
+pub fn Stats.frame(mut self, ns: int) {
+    self.next_frame = push_ring(mut self.frame_ns, self.next_frame, ns)
+}
+
+/// The `p`th percentile (0..100) of `xs`, 0 when empty.
+pub fn percentile(xs: &[int], p: int) -> int {
+    guard not xs.is_empty() else {
+        return 0
+    }
+    var s = xs.to_list()
+    s.sort()
+    return s[min(s.len() - 1, s.len() * p / 100)]
+}
+
+/// One line per measure, for logs and benchmark output.
+pub fn Stats.report(self) -> str {
+    var out = "frames {self.frames} (scanned out {self.scanned_out}, missed {self.missed})\n"
+    out += "interval us p50 {percentile(self.intervals, 50) / 1000} p95 {percentile(self.intervals, 95) / 1000} p99 {percentile(self.intervals, 99) / 1000} max {percentile(self.intervals, 100) / 1000}\n"
+    out += "frame us p50 {percentile(self.frame_ns, 50) / 1000} p95 {percentile(self.frame_ns, 95) / 1000} p99 {percentile(self.frame_ns, 99) / 1000} max {percentile(self.frame_ns, 100) / 1000}\n"
+    out += "damage {self.damage_rects} rects, {self.damage_pixels} px\n"
+    out += "commits {self.commits} (test {self.tests}, merged {self.merged}, failed {self.failed}, late {self.late}), stalls {self.stalls}, flip timeouts {self.flip_timeouts}\n"
+    out += "policy {self.policy} priority {self.priority} software {self.software}"
+    return out
+}

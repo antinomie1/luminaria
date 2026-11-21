@@ -1,11 +1,14 @@
 // luminaria_types: the plain data the layers exchange, so each layer can
 // be replaced on its own. Buffers (dmabufs, fourccs), what a renderer
 // shows (placements), and what an output reports (modes, input, frames)
-// and trades with a renderer (render targets).
+// and trades with a renderer (render targets); what a display measured;
+// the CPU pixel copies the layers share.
 
 pub import buffer
 pub import scene
 pub import device
+pub import stats
+pub import pixels
 
 pub type Plane = buffer.Plane
 pub type Dmabuf = buffer.Dmabuf
@@ -24,6 +27,7 @@ pub type Event = device.Event
 pub type Want = device.Want
 pub type Target = device.Target
 pub type Acquire = device.Acquire
+pub type Stats = stats.Stats
 
 pub let presented_vsync = device.presented_vsync
 pub let presented_hw_clock = device.presented_hw_clock

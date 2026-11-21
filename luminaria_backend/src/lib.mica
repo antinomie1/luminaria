@@ -7,10 +7,13 @@
 // render targets the output needs first, which `give` hands back), and
 // `present` shows it with the renderer's fence and the changed rectangles
 // (KMS IN_FENCE_FD and FB_DAMAGE_CLIPS, a parent's implicit fence and
-// damage); `scanout` shows a client's dmabuf directly.
+// damage); `scanout` shows a client's dmabuf directly. On DRM, commits go
+// out on a commit thread just before each vblank, and the event loop and
+// that thread run in the real-time class (sched.mica).
 
 import std.env
 import std.os
+import std.time
 import libudev_sys as udev
 import libdrm_sys.uapi as uapi
 import luminaria_types as types
@@ -19,6 +22,8 @@ pub import xkbcommon_sys.keysym as keysym
 import session
 import input
 import drm
+import commit
+import sched
 
 when feature == "nested" {
     import nested
@@ -49,6 +54,9 @@ pub struct Options {
     /// Scanout buffers per output: 2 is lighter, 3 absorbs a late frame.
     pub buffers: int = 2
     pub title: str = "luminaria"
+    /// On DRM, run the calling thread (the event loop) and the commit
+    /// thread in the real-time class.
+    pub realtime: bool = true
 }
 
 /// A damaged rectangle in output pixels: x, y, w, h.
@@ -60,6 +68,7 @@ pub let token_session = 2
 pub let token_input = 3
 pub let token_udev = 4
 pub let token_nested = 5
+pub let token_commit = 6
 /// Headless output `i` uses token_headless + i.
 pub let token_headless = 64
 
@@ -84,6 +93,10 @@ pub struct Backend {
     acquired: List[int] = []
     /// Render targets let go of, for the renderer to free.
     retired: List[u64] = []
+    realtime: bool = true
+    /// The event loop's scheduling (policy, priority or nice).
+    sched: (int, int) = (0, 0)
+    boost: sched.Boost = sched.Boost {}
 }
 
 pub fn Backend.open(o: Options) -> Result[Backend, str] {
@@ -91,7 +104,7 @@ pub fn Backend.open(o: Options) -> Result[Backend, str] {
     if kind == Kind.Auto {
         kind = if nested.available and env.get("WAYLAND_DISPLAY").is_some() { Kind.Nested } else { Kind.Drm }
     }
-    var b = Backend { kind, buffers: max(o.buffers, 2) }
+    var b = Backend { kind, buffers: max(o.buffers, 2), realtime: o.realtime, sched: sched.current() }
     match kind {
         Drm => try b.open_drm(o.keymap)
         Nested => {
@@ -130,6 +143,10 @@ fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
     self.kb = Some(try keyboard.Keyboard.new(names))
     let path = try drm.find_card()
     var d = try drm.open(path)
+    if self.realtime {
+        self.sched = sched.realtime(sched.loop_priority)
+    }
+    try d.start(self.realtime)
     var added: List[int] = []
     d.connect(mut added)
     for o in added {
@@ -178,6 +195,9 @@ pub fn Backend.kind(self) -> Kind {
 pub fn Backend.fds(self, mut out: List[(int, int)]) {
     if let Some(d) = self.drm {
         out.push((d.fd, token_drm))
+        if let Some(t) = d.thread {
+            out.push((t.wake, token_commit))
+        }
     }
     if let Some(s) = self.session {
         out.push((s.fd(), token_session))
@@ -201,25 +221,9 @@ pub fn Backend.fds(self, mut out: List[(int, int)]) {
 /// Handle what descriptor `token` has.
 pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
     if token == token_drm {
-        var flips: List[(int, u64, int)] = []
-        if let Some(dd) = self.drm.take() {
-            var d = dd
-            d.read_events(mut flips)
-            for (o, seq, ns) in flips {
-                let direct = d.outputs[o].direct_queued != 0
-                d.flipped(o)
-                var flags = types.presented_vsync | types.presented_hw_clock | types.presented_hw_completion
-                if direct {
-                    flags |= types.presented_zero_copy
-                }
-                self.push(Event.Presented(u32(o), seq, ns, flags))
-                // A cursor move that waited for this flip.
-                if d.outputs[o].cursor_dirty and self.active {
-                    discard d.commit(o, 0, -1, drm.no_clips(), false, false)
-                }
-            }
-            self.drm = Some(d)
-        }
+        self.flips()
+    } else if token == token_commit {
+        self.notes()
     } else if token == token_session {
         if let Some(ss) = self.session.take() {
             var s = ss
@@ -239,6 +243,9 @@ pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
                 self.kb = Some(kb)
             }
             self.input = Some(inp)
+            if not got.is_empty() {
+                self.boost.pulse(time.now_ns())
+            }
             for g in take got {
                 self.push(Event.Input(g))
             }
@@ -273,6 +280,69 @@ pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
     return Ok(())
 }
 
+/// Finished page flips: frames are presented (cursor-only flips only
+/// free the commit thread).
+fn Backend.flips(mut self) {
+    guard let Some(dd) = self.drm.take() else {
+        return
+    }
+    var d = dd
+    var flips: List[(int, u64, int, bool)] = []
+    d.read_events(mut flips)
+    for (o, seq, ns, frame) in flips {
+        guard frame else {
+            continue
+        }
+        let direct = d.outputs[o].direct_queued != 0
+        d.flipped(o)
+        var flags = types.presented_vsync | types.presented_hw_clock | types.presented_hw_completion
+        if direct {
+            flags |= types.presented_zero_copy
+        }
+        self.push(Event.Presented(u32(o), seq, ns, flags))
+    }
+    self.drm = Some(d)
+}
+
+/// What the commit thread reports: failed commits, and its watchdog's
+/// ping (answered once the flips that arrived are read).
+fn Backend.notes(mut self) {
+    var got: List[commit.Note] = []
+    if let Some(d) = self.drm {
+        if let Some(t) = d.thread {
+            discard os.count(t.wake)
+            while true {
+                guard let Some(n) = t.notes.try_recv() else {
+                    break
+                }
+                got.push(n)
+            }
+        }
+    }
+    for n in take got {
+        match n {
+            Ping => {
+                self.flips()
+                if let Some(d) = self.drm {
+                    if let Some(t) = d.thread {
+                        t.send(commit.Job.Pong)
+                    }
+                }
+            }
+            Failed(o, frame, modeset) => {
+                if let Some(dd) = self.drm.take() {
+                    var d = dd
+                    d.failed(o, frame, modeset)
+                    self.drm = Some(d)
+                }
+                if frame {
+                    self.push(Event.Dropped(u32(o)))
+                }
+            }
+        }
+    }
+}
+
 fn Backend.set_active(mut self, on: bool) {
     self.active = on
     if let Some(ii) = self.input.take() {
@@ -284,15 +354,20 @@ fn Backend.set_active(mut self, on: bool) {
         }
         self.input = Some(i)
     }
-    if on {
-        if let Some(dd) = self.drm.take() {
-            var d = dd
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        // Queued commits would fail without the device, and flips
+        // outstanding at the switch never report.
+        if let Some(t) = d.thread {
+            t.send(commit.Job.Reset)
+        }
+        if on {
             for o in 0..d.outputs.len() {
                 d.outputs[o].modeset = true
-                d.outputs[o].pending = false
+                d.failed(o, true, true)
             }
-            self.drm = Some(d)
         }
+        self.drm = Some(d)
     }
     self.push(Event.Session(on))
 }
@@ -340,10 +415,6 @@ pub fn Backend.output(self, o: u32) -> OutputDesc {
     return self.descs[int(o)].clone()
 }
 
-pub fn Backend.output_count(self) -> int {
-    return self.descs.len()
-}
-
 pub fn Backend.output_alive(self, o: u32) -> bool {
     return int(o) < self.alive.len() and self.alive[int(o)]
 }
@@ -380,7 +451,7 @@ pub fn Backend.enable(mut self, o: u32, on: bool) {
     d.outputs[int(o)].enabled = on
     d.outputs[int(o)].modeset = true
     if not on {
-        discard d.commit(int(o), 0, -1, drm.no_clips(), false, false)
+        d.update(int(o))
     }
     self.drm = Some(d)
 }
@@ -520,22 +591,17 @@ pub fn Backend.present(mut self, o: u32, fence: int, rects: &[Rect], tear: bool)
         if let Some(s) = d.outputs[oi].swap {
             fb = s.slots[i].id
         }
-        let clips = to_clips(rects)
-        let r = d.commit(oi, fb, fence, clips, false, tear)
-        if fence >= 0 {
-            os.close(fence)
+        let r = d.request(oi, fb, fence, to_clips(rects), tear)
+        d.send(r)
+        if let Some(sw) = d.outputs[oi].swap.take() {
+            var s = sw
+            s.queued(i)
+            d.outputs[oi].swap = Some(s)
         }
-        if r.is_ok() {
-            if let Some(sw) = d.outputs[oi].swap.take() {
-                var s = sw
-                s.queued(i)
-                d.outputs[oi].swap = Some(s)
-            }
-            d.outputs[oi].queued = i
-            d.outputs[oi].direct_queued = 0
-        }
+        d.outputs[oi].queued = i
+        d.outputs[oi].direct_queued = 0
         self.drm = Some(d)
-        return r
+        return Ok(())
     }
     if let Some(nn) = self.nested.take() {
         var n = nn
@@ -586,9 +652,12 @@ pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rec
         }
         var ok = false
         if fb != 0 and not d.outputs[oi].modeset {
-            let clips = to_clips(rects)
-            if d.commit(oi, fb, -1, clips, true, false).is_ok() {
-                ok = d.commit(oi, fb, -1, clips, false, tear).is_ok()
+            let r = d.request(oi, fb, -1, to_clips(rects), tear)
+            ok = d.probe_commit(r)
+            if ok {
+                d.send(r)
+            } else {
+                r.release(d.fd)
             }
         }
         if ok {
@@ -683,8 +752,9 @@ pub fn Backend.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_
 }
 
 /// Put the hardware cursor's top left at output pixel `x, y` (None hides
-/// it). Commits at once when no flip is pending: the cursor moves at
-/// input rate, not frame rate.
+/// it). The commit thread submits it just before the next vblank, folded
+/// into the frame when one comes first: the cursor shows where it is last,
+/// not where it was when the frame began.
 pub fn Backend.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
     guard let Some(dd) = self.drm.take() else {
         return
@@ -700,10 +770,8 @@ pub fn Backend.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
             }
             None => d.outputs[oi].cursor_shown = false
         }
-        if not d.outputs[oi].pending and not d.outputs[oi].modeset and self.active {
-            discard d.commit(oi, 0, -1, drm.no_clips(), false, false)
-        } else {
-            d.outputs[oi].cursor_dirty = true
+        if not d.outputs[oi].modeset and self.active {
+            d.update(oi)
         }
     }
     self.drm = Some(d)
@@ -799,6 +867,26 @@ pub fn Backend.shutdown(mut self, mut retired: List[u64]) {
         var h = hh
         h.release(mut retired)
         self.headless = Some(h)
+    }
+}
+
+/// Add what the devices counted to `s`: commits, scheduling.
+pub fn Backend.stats(self, mut s: types.Stats) {
+    s.policy = self.sched.0
+    s.priority = self.sched.1
+    guard let Some(d) = self.drm else {
+        return
+    }
+    s.tests = d.tests
+    if let Some(t) = d.thread {
+        t.counts.read(fn(c: commit.Counts) {
+            s.commits = c.commits
+            s.merged = c.merged
+            s.failed = c.failed
+            s.late = c.late
+            s.stalls = c.stalls
+            s.flip_timeouts = c.timeouts
+        })
     }
 }
 

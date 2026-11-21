@@ -45,7 +45,7 @@ when feature == "backend" and feature == "vulkan" {
 
     pub fn open(o: Options) -> Result[Display, str] {
         let comp = try compose.Compositor.open(o.validation)
-        let be = try backend.Backend.open(backend.Options { kind: o.backend, headless: o.headless.clone(), keymap: o.keymap.clone(), buffers: o.buffers, title: o.title.clone() })
+        let be = try backend.Backend.open(backend.Options { kind: o.backend, headless: o.headless.clone(), keymap: o.keymap.clone(), buffers: o.buffers, title: o.title.clone(), realtime: o.realtime })
         return Display.with(o, be, comp)
     }
 }

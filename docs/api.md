@@ -40,7 +40,8 @@ while true {
 
 `Options` 的字段：`socket`、`backend`、`headless`（无头输出的模式）、`keymap`（RMLVO 名字）、
 `repeat_rate` / `repeat_delay`、`buffers`（每个输出的扫描输出缓冲数，2 或 3）、`background`、
-`cursor_theme_size`、`title`（嵌套窗口标题）、`validation`。
+`cursor_theme_size`、`title`（嵌套窗口标题）、`validation`、`realtime`（DRM 时事件循环和提交线程用
+实时调度，默认开）。
 
 ## 事件与 `accept`
 
@@ -164,6 +165,7 @@ d.end(100)
 | `configure_input(device, InputConfig)` | 轻触点击、自然滚动、加速、左手、禁用 |
 | `set_keymap(Names)` / `mods()` | 键盘布局、当前修饰键 |
 | `read_output(o)` | 无头输出当前显示的像素（测试、截图） |
+| `stats(o)` / `reset_stats()` | 输出 `o` 测到的 `types.Stats`（见 [compose.md](compose.md#测量)）/ 重新开始计 |
 
 ## 扩展协议
 
@@ -185,7 +187,7 @@ d.end(100)
 `display.Display.with(o, output, renderer)` 用它们组装；`Display` 单态化，没有间接调用。必需的只有
 各自的核心方法（输出端：事件、fd、输出描述、取帧 / 给目标 / 呈现 / 退还目标；渲染器：输出、放置表、
 纹理、shm 上传、渲染目标、渲染、读回），其余是带默认实现的可选能力（直接扫描输出、光标平面、键盘、
-模式设置、dmabuf 导入、遮挡判断）。`tests/plug.mica` 是一个定时器驱动的输出端加一个软件渲染器。
+模式设置、dmabuf 导入、遮挡判断、设备计数 `stats`）。`tests/plug.mica` 是一个定时器驱动的输出端加一个软件渲染器。
 
 ## 底层
 

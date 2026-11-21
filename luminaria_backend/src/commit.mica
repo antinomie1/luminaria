@@ -1,0 +1,360 @@
+// The commit thread: atomic commits leave the event loop. The loop builds
+// each request as plain data and queues it; this thread submits it as
+// late as still makes the vblank aimed at (that vblank minus the mode's
+// vertical blank, minus a margin that adapts to how long commits take),
+// one queue per CRTC, so outputs at different refresh rates keep their own
+// beat and a KMS ioctl never stalls protocol handling or recording. A
+// request queued while an earlier one waits (a cursor move before its
+// frame) is folded into it: the latest values win, one commit per vblank.
+// A request never goes in while the CRTC's last flip is outstanding, so
+// commits do not fail with EBUSY.
+//
+// Watchdog: a flip that has not completed within a second makes the
+// thread ping the loop, which reads the DRM events first and then answers.
+// A flip that arrived in between means the loop had stalled; one still
+// outstanding is the driver's (counted, and checked again each second).
+
+import std.os
+import std.sync
+import std.time
+import libdrm_sys as drm
+import libdrm_sys.uapi as uapi
+import sched
+
+/// Set in a flip event's user data when the commit carried a frame.
+pub let frame_bit: u64 = u64(1) << 32
+
+let base_margin_ns = 1500000
+let flip_timeout_ns = 1000000000
+
+/// One atomic request, as plain data so it can cross threads.
+struct Req {
+    crtc: u32
+    /// The output (flip events carry it, and frame_bit).
+    out: int
+    props: List[(u32, u32, u64)] = []
+    /// ALLOW_MODESET and PAGE_FLIP_ASYNC; the event and NONBLOCK are added.
+    flags: u32 = 0
+    /// Carries a framebuffer; sets the mode.
+    frame: bool = false
+    modeset: bool = false
+    /// Submit at once (modesets, tearing, VRR), not just before a vblank.
+    now: bool = false
+    /// The mode's refresh period and vertical blank, ns.
+    refresh: int = 0
+    vblank: int = 0
+    /// IN_FENCE_FDs to close and damage blobs to destroy once submitted.
+    fences: List[int] = []
+    blobs: List[u32] = []
+    /// Set by the thread: when to submit, and the vblank aimed at (0: none).
+    at: int = 0
+    target: int = 0
+}
+
+fn Req.add(mut self, obj: u32, prop: u32, value: u64) {
+    if prop != 0 {
+        self.props.push((obj, prop, value))
+    }
+}
+
+/// Fold newer request `n` in: its values win.
+fn Req.merge(mut self, take n: Req) {
+    for (o, p, v) in n.props {
+        var found = false
+        for i in 0..self.props.len() {
+            if self.props[i].0 == o and self.props[i].1 == p {
+                self.props[i] = (o, p, v)
+                found = true
+                break
+            }
+        }
+        if not found {
+            self.props.push((o, p, v))
+        }
+    }
+    self.flags |= n.flags
+    self.frame = self.frame or n.frame
+    self.modeset = self.modeset or n.modeset
+    self.now = self.now or n.now
+    for f in n.fences {
+        self.fences.push(f)
+    }
+    for b in n.blobs {
+        self.blobs.push(b)
+    }
+    if self.now {
+        self.at = 0
+    }
+}
+
+fn Req.release(self, fd: int) {
+    for f in self.fences {
+        os.close(f)
+    }
+    for b in self.blobs {
+        discard drm.mode_destroy_property_blob(i32(fd), b)
+    }
+}
+
+/// Submit `r` with `flags`: 0, or the negative errno.
+fn apply(fd: int, r: Req, flags: u32) -> int {
+    guard let Some(req) = drm.mode_atomic_alloc() else {
+        return -12
+    }
+    for (o, p, v) in r.props {
+        discard drm.mode_atomic_add_property(req, o, p, v)
+    }
+    let data = u64(r.out) | (if r.frame { frame_bit } else { 0 })
+    var res: i32 = 0
+    unsafe {
+        res = drm.mode_atomic_commit(i32(fd), req, flags, Ptr.from_addr(usize(data)))
+    }
+    drm.mode_atomic_free(req)
+    return int(res)
+}
+
+/// Whether the display would take `r` (asked now, on the caller's thread).
+fn probe(fd: int, r: Req) -> bool {
+    let keep = u32(uapi.drm_mode_atomic_allow_modeset)
+    return apply(fd, r, (r.flags & keep) | u32(uapi.drm_mode_atomic_test_only)) == 0
+}
+
+enum Job {
+    Commit(Req)
+    /// A CRTC's flip completed at CLOCK_MONOTONIC ns.
+    Flipped(u32, int)
+    Pong
+    /// The session went away or came back: drop what is queued, forget
+    /// outstanding flips.
+    Reset
+    Quit
+}
+
+enum Note {
+    /// The commit failed: output, whether it carried a frame, a mode.
+    Failed(int, bool, bool)
+    /// Answer with Pong once the DRM events are read.
+    Ping
+}
+
+/// What the thread counts (Stats).
+struct Counts {
+    commits: int = 0
+    merged: int = 0
+    failed: int = 0
+    late: int = 0
+    stalls: int = 0
+    timeouts: int = 0
+}
+
+/// A CRTC as the thread sees it.
+struct Pipe {
+    crtc: u32
+    queue: List[Req] = []
+    /// A submitted commit waits for its flip (since when).
+    inflight: bool = false
+    since: int = 0
+    /// The last vblank.
+    last: int = 0
+    /// Margin learned on top of the base one.
+    extra: int = 1000000
+}
+
+/// The last moment to submit `r` for its vblank (0: at once) and that
+/// vblank.
+fn Pipe.plan(self, r: Req, now: int) -> (int, int) {
+    guard not r.now and self.last > 0 and r.refresh > 0 else {
+        return (0, 0)
+    }
+    let margin = r.vblank + base_margin_ns + self.extra
+    let t = now + margin
+    let target = if t <= self.last { self.last } else { self.last + (t - self.last + r.refresh - 1) / r.refresh * r.refresh }
+    return (target - margin, target)
+}
+
+fn pipe_of(mut ps: List[Pipe], crtc: u32) -> int {
+    for i in 0..ps.len() {
+        if ps[i].crtc == crtc {
+            return i
+        }
+    }
+    ps.push(Pipe { crtc })
+    return ps.len() - 1
+}
+
+/// The thread: `wake` (an eventfd) tells the loop a note is waiting.
+fn run(fd: int, jobs: sync.Chan[Job], notes: sync.Chan[Note], wake: int, counts: sync.Mutex[Counts], realtime: bool) {
+    if realtime {
+        discard sched.realtime(sched.commit_priority)
+    }
+    var ps: List[Pipe] = []
+    var pinged = false
+    while true {
+        // Sleep until the next submission or flip deadline, or a job.
+        var until = -1
+        for p in ps {
+            var t = -1
+            if p.inflight {
+                t = if pinged { -1 } else { p.since + flip_timeout_ns }
+            } else if not p.queue.is_empty() {
+                t = p.queue[0].at
+            }
+            if t >= 0 and (until < 0 or t < until) {
+                until = t
+            }
+        }
+        let now = time.now_ns()
+        var job: Option[Job] = None
+        if until < 0 {
+            job = jobs.recv()
+            if job.is_none() {
+                return
+            }
+        } else if until - now >= 1000000 {
+            job = jobs.recv_timeout((until - now) / 1000000)
+        } else {
+            if until > now {
+                time.sleep_ns(until - now)
+            }
+            job = jobs.try_recv()
+        }
+        if let Some(jj) = take job {
+            var j = jj
+            match take j {
+                Commit(r) => {
+                    var req = r
+                    let k = pipe_of(mut ps, req.crtc)
+                    let (at, target) = ps[k].plan(req, time.now_ns())
+                    req.at = at
+                    req.target = target
+                    let async = u32(uapi.drm_mode_page_flip_async)
+                    var last: Option[Req] = ps[k].queue.pop()
+                    if let Some(prev) = take last {
+                        var q = prev
+                        if q.flags & async == 0 and req.flags & async == 0 {
+                            q.merge(req)
+                            ps[k].queue.push(q)
+                            counts.write(fn(mut c: Counts) { c.merged += 1 })
+                        } else {
+                            ps[k].queue.push(q)
+                            ps[k].queue.push(req)
+                        }
+                    } else {
+                        ps[k].queue.push(req)
+                    }
+                }
+                Flipped(crtc, ns) => {
+                    let k = pipe_of(mut ps, crtc)
+                    ps[k].inflight = false
+                    ps[k].last = ns
+                }
+                Pong => {
+                    pinged = false
+                    let t = time.now_ns()
+                    var stuck = 0
+                    for i in 0..ps.len() {
+                        if ps[i].inflight and t - ps[i].since >= flip_timeout_ns {
+                            stuck += 1
+                            ps[i].since = t
+                        }
+                    }
+                    counts.write(fn(mut c: Counts) {
+                        if stuck > 0 {
+                            c.timeouts += stuck
+                        } else {
+                            c.stalls += 1
+                        }
+                    })
+                }
+                Reset => {
+                    for i in 0..ps.len() {
+                        for r in ps[i].queue {
+                            r.release(fd)
+                        }
+                        ps[i].queue.clear()
+                        ps[i].inflight = false
+                    }
+                    pinged = false
+                }
+                Quit => {
+                    for p in ps {
+                        for r in p.queue {
+                            r.release(fd)
+                        }
+                    }
+                    return
+                }
+            }
+        }
+        let t = time.now_ns()
+        for i in 0..ps.len() {
+            if ps[i].inflight and not pinged and t - ps[i].since >= flip_timeout_ns {
+                pinged = true
+                notes.send(Note.Ping)
+                os.notify(wake, 1)
+            }
+            guard not ps[i].inflight and not ps[i].queue.is_empty() and ps[i].queue[0].at <= t else {
+                continue
+            }
+            let r = ps[i].queue.remove(0)
+            let res = apply(fd, r, r.flags | u32(uapi.drm_mode_page_flip_event) | u32(uapi.drm_mode_atomic_nonblock))
+            let done = time.now_ns()
+            r.release(fd)
+            if res == 0 {
+                ps[i].inflight = true
+                ps[i].since = done
+                var late = false
+                if r.target > 0 {
+                    // How far from finishing a base margin before the
+                    // vblank: late grows the margin at once, early shrinks
+                    // it slowly (latency stays low).
+                    let diff = r.target - r.vblank - base_margin_ns - done
+                    late = diff < 0
+                    ps[i].extra = if late { ps[i].extra - diff } else { ps[i].extra - diff / 10 }
+                    ps[i].extra = ps[i].extra.clamp(0, min(3000000, r.refresh / 2))
+                }
+                counts.write(fn(mut c: Counts) {
+                    c.commits += 1
+                    if late {
+                        c.late += 1
+                    }
+                })
+            } else {
+                counts.write(fn(mut c: Counts) { c.failed += 1 })
+                notes.send(Note.Failed(r.out, r.frame, r.modeset))
+                os.notify(wake, 1)
+            }
+        }
+    }
+}
+
+/// The loop's end of the thread.
+struct Thread {
+    jobs: sync.Chan[Job]
+    notes: sync.Chan[Note]
+    /// Readable when a note waits.
+    wake: int
+    counts: sync.Mutex[Counts]
+    worker: Option[sync.JoinHandle[()]] = None
+}
+
+fn start(fd: int, realtime: bool) -> Result[Thread, str] {
+    let wake = try os.eventfd(0).map_err(fn(e) => "{e}")
+    let jobs: sync.Chan[Job] = sync.chan(64)
+    let notes: sync.Chan[Note] = sync.chan(64)
+    let counts = sync.mutex(Counts {})
+    let h = go run(fd, jobs.clone(), notes.clone(), wake, counts.clone(), realtime)
+    return Ok(Thread { jobs, notes, wake, counts, worker: Some(h) })
+}
+
+fn Thread.send(self, take j: Job) {
+    self.jobs.send(j)
+}
+
+fn Thread.drop(mut self) {
+    if let Some(h) = self.worker.take() {
+        self.jobs.send(Job.Quit)
+        h.join()
+    }
+    os.close(self.wake)
+}

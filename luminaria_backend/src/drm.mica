@@ -3,8 +3,10 @@
 // non-blocking atomic commit: the framebuffer, the GPU's sync_file as
 // IN_FENCE_FD (the kernel waits, not us), the changed rectangles as
 // FB_DAMAGE_CLIPS (panels with self refresh sleep through the rest), and
-// the cursor. Page-flip events carry the vblank time. A client's dmabuf
-// can be the framebuffer directly (scanout), tested first.
+// the cursor. Requests are built here and submitted by the commit thread
+// (commit.mica); TEST_ONLY probes stay synchronous. Page-flip events carry
+// the vblank time. A client's dmabuf can be the framebuffer directly
+// (scanout), tested first.
 
 import std.env
 import std.fs
@@ -13,6 +15,8 @@ import std.str
 import libdrm_sys as drm
 import libdrm_sys.uapi as uapi
 import libudev_sys as udev
+import luminaria_types.pixels as pixels
+import commit
 import session
 import swap
 import luminaria_types as types
@@ -174,13 +178,10 @@ struct Output {
     enabled: bool = true
     vrr: bool = false
     cursor_fb: u32 = 0
-    cursor_handle: u32 = 0
     cursor_map: Option[os.Map] = None
     cursor_x: i32 = 0
     cursor_y: i32 = 0
     cursor_shown: bool = false
-    /// The cursor moved while a flip was pending: commit it after.
-    cursor_dirty: bool = false
     /// Framebuffers kept for client buffers: buffer key, fb id.
     fbs: List[(u64, u32)] = []
 }
@@ -199,6 +200,10 @@ struct Drm {
     /// dev_t of the card.
     devnum: u64 = 0
     rbuf: List[u8] = []
+    /// The commit thread (none when only probing).
+    thread: Option[commit.Thread] = None
+    /// TEST_ONLY commits asked.
+    tests: int = 0
 }
 
 /// The card to drive: $LUMINARIA_DRM_DEVICE, else the first with a
@@ -223,7 +228,16 @@ fn open(take path: str) -> Result[Drm, str] {
 }
 
 fn Drm.drop(mut self) {
+    // The thread commits on the fd: it goes first.
+    discard self.thread.take()
     session.close_device(self.fd)
+}
+
+/// Start the commit thread (and put it in the real-time class).
+fn Drm.start(mut self, realtime: bool) -> Result[(), str] {
+    discard os.set_nonblocking(self.fd, true)
+    self.thread = Some(try commit.start(self.fd, realtime))
+    return Ok(())
 }
 
 fn Drm.probe(mut self) -> Result[(), str] {
@@ -530,62 +544,42 @@ fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
     }
     let m = try os.map(self.fd, int(size), int(offset), true).map_err(fn(e) => "{e}")
     self.outputs[o].cursor_fb = fb
-    self.outputs[o].cursor_handle = handle
     self.outputs[o].cursor_map = Some(m)
     return Ok(())
 }
 
 /// Copy an ARGB8888 (premultiplied) cursor image into the cursor buffer;
 /// false when there is no cursor plane or the image is too large.
-fn Drm.set_cursor_image(mut self, o: int, pixels: &[u8], width: u32, height: u32) -> bool {
+fn Drm.set_cursor_image(mut self, o: int, px: &[u8], width: u32, height: u32) -> bool {
     guard width <= self.cursor_w and height <= self.cursor_h else {
         return false
     }
-    let cw = int(self.cursor_w)
-    match self.outputs[o].cursor_map {
-        Some(m) => {
-            unsafe {
-                let dst = Ptr.slice_mut(m.ptr, m.len)
-                for i in 0..m.len {
-                    dst[i] = 0
-                }
-                for y in 0..int(height) {
-                    Ptr.copy(m.ptr.offset(y * cw * 4), pixels.as_ptr().offset(y * int(width) * 4), int(width) * 4)
-                }
-            }
-            return true
-        }
-        None => {
-            return false
+    guard let Some(mm) = self.outputs[o].cursor_map.take() else {
+        return false
+    }
+    var m = mm
+    let cw = int(self.cursor_w) * 4
+    let row = int(width) * 4
+    let ok = pixels.copy_rows(mut m.bytes(), 0, cw, px, 0, row, row, int(height))
+    // Clear only what the image does not cover.
+    if row < cw {
+        for y in 0..int(height) {
+            pixels.clear(mut m.bytes()[y * cw + row..(y + 1) * cw])
         }
     }
-}
-
-struct Atomic {
-    req: drm.ModeAtomicReq
-}
-
-fn Atomic.add(self, obj: u32, prop: u32, value: u64) {
-    if prop != 0 {
-        discard drm.mode_atomic_add_property(self.req, obj, prop, value)
-    }
-}
-
-fn Atomic.drop(mut self) {
-    drm.mode_atomic_free(self.req)
+    pixels.clear(mut m.bytes()[int(height) * cw..m.len])
+    self.outputs[o].cursor_map = Some(m)
+    return ok
 }
 
 fn Drm.pprop(self, p: int, name: str) -> u32 {
     return self.planes[p].props.id(name)
 }
 
-/// Commit framebuffer `fb` (0: keep the plane as is) on output `o`, with
-/// GPU fence `fence` (-1: none) and damage `rects`; `only_test` only asks.
-fn Drm.commit(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], only_test: bool, tear: bool) -> Result[(), str] {
-    guard let Some(req) = drm.mode_atomic_alloc() else {
-        return Err("drmModeAtomicAlloc failed")
-    }
-    let a = Atomic { req }
+/// The atomic request that shows framebuffer `fb` (0: keeps the primary
+/// plane) on output `o` with GPU fence `fence` (-1: none; the request owns
+/// it) and damage `rects`, plus the cursor, and the mode when it changed.
+fn Drm.request(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], tear: bool) -> commit.Req {
     let ci = self.outputs[o].conn
     let ki = self.outputs[o].crtc
     let primary = self.outputs[o].primary
@@ -595,8 +589,9 @@ fn Drm.commit(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], on
     let w = u64(mode.hdisplay)
     let h = u64(mode.vdisplay)
     let modeset = self.outputs[o].modeset
-    var flags: u32 = 0
-    var damage_blob: u32 = 0
+    let line_ns = if mode.clock > 0 { i64(mode.htotal) * 1000000 / i64(mode.clock) } else { 0 }
+    let refresh = to_mode(mode).refresh_mhz
+    var r = commit.Req { crtc, out: o, frame: fb != 0, modeset, now: modeset or tear or self.outputs[o].vrr, refresh: if refresh > 0 { 1000000000000 / int(refresh) } else { 0 }, vblank: int(line_ns) * int(mode.vtotal - mode.vdisplay) }
     if modeset {
         if self.outputs[o].mode_blob == 0 {
             var id: u32 = 0
@@ -605,83 +600,99 @@ fn Drm.commit(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], on
             }
             self.outputs[o].mode_blob = id
         }
-        a.add(self.conns[ci].id, self.conns[ci].props.id("CRTC_ID"), u64(crtc))
-        a.add(crtc, self.crtcs[ki].props.id("MODE_ID"), u64(self.outputs[o].mode_blob))
-        a.add(crtc, self.crtcs[ki].props.id("ACTIVE"), if self.outputs[o].enabled { 1 } else { 0 })
-        a.add(crtc, self.crtcs[ki].props.id("VRR_ENABLED"), if self.outputs[o].vrr { 1 } else { 0 })
-        flags |= u32(uapi.drm_mode_atomic_allow_modeset)
+        r.add(self.conns[ci].id, self.conns[ci].props.id("CRTC_ID"), u64(crtc))
+        r.add(crtc, self.crtcs[ki].props.id("MODE_ID"), u64(self.outputs[o].mode_blob))
+        r.add(crtc, self.crtcs[ki].props.id("ACTIVE"), if self.outputs[o].enabled { 1 } else { 0 })
+        r.add(crtc, self.crtcs[ki].props.id("VRR_ENABLED"), if self.outputs[o].vrr { 1 } else { 0 })
+        r.flags |= u32(uapi.drm_mode_atomic_allow_modeset)
     }
     let pid = self.planes[primary].id
     if fb != 0 {
-        a.add(pid, self.pprop(primary, "FB_ID"), u64(fb))
-        a.add(pid, self.pprop(primary, "CRTC_ID"), u64(crtc))
+        r.add(pid, self.pprop(primary, "FB_ID"), u64(fb))
+        r.add(pid, self.pprop(primary, "CRTC_ID"), u64(crtc))
         if modeset or not tear {
-            a.add(pid, self.pprop(primary, "SRC_X"), 0)
-            a.add(pid, self.pprop(primary, "SRC_Y"), 0)
-            a.add(pid, self.pprop(primary, "SRC_W"), w << 16)
-            a.add(pid, self.pprop(primary, "SRC_H"), h << 16)
-            a.add(pid, self.pprop(primary, "CRTC_X"), 0)
-            a.add(pid, self.pprop(primary, "CRTC_Y"), 0)
-            a.add(pid, self.pprop(primary, "CRTC_W"), w)
-            a.add(pid, self.pprop(primary, "CRTC_H"), h)
+            r.add(pid, self.pprop(primary, "SRC_X"), 0)
+            r.add(pid, self.pprop(primary, "SRC_Y"), 0)
+            r.add(pid, self.pprop(primary, "SRC_W"), w << 16)
+            r.add(pid, self.pprop(primary, "SRC_H"), h << 16)
+            r.add(pid, self.pprop(primary, "CRTC_X"), 0)
+            r.add(pid, self.pprop(primary, "CRTC_Y"), 0)
+            r.add(pid, self.pprop(primary, "CRTC_W"), w)
+            r.add(pid, self.pprop(primary, "CRTC_H"), h)
         }
         if fence >= 0 {
-            a.add(pid, self.pprop(primary, "IN_FENCE_FD"), u64(fence))
+            r.add(pid, self.pprop(primary, "IN_FENCE_FD"), u64(fence))
         }
         let clips = self.pprop(primary, "FB_DAMAGE_CLIPS")
         if not modeset and not rects.is_empty() and clips != 0 {
+            var blob: u32 = 0
             unsafe {
-                discard drm.mode_create_property_blob(i32(self.fd), rects.as_ptr().cast[u8](), u64(rects.len() * size_of[uapi.ModeRect]()), Ptr.of_mut(mut damage_blob))
+                discard drm.mode_create_property_blob(i32(self.fd), rects.as_ptr().cast[u8](), u64(rects.len() * size_of[uapi.ModeRect]()), Ptr.of_mut(mut blob))
             }
-            a.add(pid, clips, u64(damage_blob))
+            if blob != 0 {
+                r.add(pid, clips, u64(blob))
+                r.blobs.push(blob)
+            }
         }
+    }
+    if fence >= 0 {
+        r.fences.push(fence)
     }
     if cursor >= 0 and not tear {
         let cid = self.planes[cursor].id
         if self.outputs[o].cursor_shown and self.outputs[o].cursor_fb != 0 {
-            a.add(cid, self.pprop(cursor, "FB_ID"), u64(self.outputs[o].cursor_fb))
-            a.add(cid, self.pprop(cursor, "CRTC_ID"), u64(crtc))
-            a.add(cid, self.pprop(cursor, "SRC_X"), 0)
-            a.add(cid, self.pprop(cursor, "SRC_Y"), 0)
-            a.add(cid, self.pprop(cursor, "SRC_W"), u64(self.cursor_w) << 16)
-            a.add(cid, self.pprop(cursor, "SRC_H"), u64(self.cursor_h) << 16)
-            a.add(cid, self.pprop(cursor, "CRTC_X"), u64(i64(self.outputs[o].cursor_x)))
-            a.add(cid, self.pprop(cursor, "CRTC_Y"), u64(i64(self.outputs[o].cursor_y)))
-            a.add(cid, self.pprop(cursor, "CRTC_W"), u64(self.cursor_w))
-            a.add(cid, self.pprop(cursor, "CRTC_H"), u64(self.cursor_h))
+            r.add(cid, self.pprop(cursor, "FB_ID"), u64(self.outputs[o].cursor_fb))
+            r.add(cid, self.pprop(cursor, "CRTC_ID"), u64(crtc))
+            r.add(cid, self.pprop(cursor, "SRC_X"), 0)
+            r.add(cid, self.pprop(cursor, "SRC_Y"), 0)
+            r.add(cid, self.pprop(cursor, "SRC_W"), u64(self.cursor_w) << 16)
+            r.add(cid, self.pprop(cursor, "SRC_H"), u64(self.cursor_h) << 16)
+            r.add(cid, self.pprop(cursor, "CRTC_X"), u64(i64(self.outputs[o].cursor_x)))
+            r.add(cid, self.pprop(cursor, "CRTC_Y"), u64(i64(self.outputs[o].cursor_y)))
+            r.add(cid, self.pprop(cursor, "CRTC_W"), u64(self.cursor_w))
+            r.add(cid, self.pprop(cursor, "CRTC_H"), u64(self.cursor_h))
         } else {
-            a.add(cid, self.pprop(cursor, "FB_ID"), 0)
-            a.add(cid, self.pprop(cursor, "CRTC_ID"), 0)
+            r.add(cid, self.pprop(cursor, "FB_ID"), 0)
+            r.add(cid, self.pprop(cursor, "CRTC_ID"), 0)
         }
     }
-    if only_test {
-        flags |= u32(uapi.drm_mode_atomic_test_only)
-    } else {
-        flags |= u32(uapi.drm_mode_page_flip_event) | u32(uapi.drm_mode_atomic_nonblock)
-        if tear and not modeset and self.async_flip {
-            flags |= u32(uapi.drm_mode_page_flip_async)
-        }
+    if tear and not modeset and self.async_flip {
+        r.flags |= u32(uapi.drm_mode_page_flip_async)
     }
-    var r: i32 = 0
-    unsafe {
-        r = drm.mode_atomic_commit(i32(self.fd), req, flags, Ptr.from_addr(usize(crtc)))
-    }
-    if damage_blob != 0 {
-        discard drm.mode_destroy_property_blob(i32(self.fd), damage_blob)
-    }
-    guard r == 0 else {
-        return Err("atomic commit failed ({r})")
-    }
-    if not only_test {
-        self.outputs[o].pending = true
-        self.outputs[o].modeset = false
-        self.outputs[o].cursor_dirty = false
-    }
-    return Ok(())
+    return r
 }
 
-/// Read page-flip events: (output, sequence, ns) per finished flip.
-fn Drm.read_events(mut self, mut out: List[(int, u64, int)]) {
+/// Whether the display takes `r` now (TEST_ONLY, on this thread).
+fn Drm.probe_commit(mut self, r: commit.Req) -> bool {
+    self.tests += 1
+    return commit.probe(self.fd, r)
+}
+
+/// Queue `r` for the commit thread. A frame holds the output until it
+/// flips (or its commit fails).
+fn Drm.send(mut self, take r: commit.Req) {
+    let o = r.out
+    if r.frame {
+        self.outputs[o].pending = true
+    }
+    self.outputs[o].modeset = false
+    match self.thread {
+        Some(t) => t.send(commit.Job.Commit(r))
+        None => r.release(self.fd)
+    }
+}
+
+/// A cursor or CRTC change on its own (no frame), folded into the next
+/// frame when one comes before its vblank.
+fn Drm.update(mut self, o: int) {
+    let none: List[uapi.ModeRect] = []
+    let r = self.request(o, 0, -1, none, false)
+    self.send(r)
+}
+
+/// Read page-flip events: (output, sequence, ns, whether it was a frame)
+/// per finished flip; the commit thread hears of each.
+fn Drm.read_events(mut self, mut out: List[(int, u64, int, bool)]) {
     if self.rbuf.len() < 1024 {
         for _ in self.rbuf.len()..1024 {
             self.rbuf.push(0)
@@ -701,11 +712,16 @@ fn Drm.read_events(mut self, mut out: List[(int, u64, int)]) {
         if kind == u32(uapi.drm_event_flip_complete) and len >= 32 {
             let sec = int(rd32(self.rbuf, at + 16))
             let usec = int(rd32(self.rbuf, at + 20))
+            let frame = (u64(rd32(self.rbuf, at + 12)) << 32) & commit.frame_bit != 0
             let seq = u64(rd32(self.rbuf, at + 24))
             let crtc = rd32(self.rbuf, at + 28)
+            let ns = sec * 1000000000 + usec * 1000
+            if let Some(t) = self.thread {
+                t.send(commit.Job.Flipped(crtc, ns))
+            }
             for o in 0..self.outputs.len() {
                 if self.crtcs[self.outputs[o].crtc].id == crtc {
-                    out.push((o, seq, sec * 1000000000 + usec * 1000))
+                    out.push((o, seq, ns, frame))
                 }
             }
         }
@@ -713,15 +729,11 @@ fn Drm.read_events(mut self, mut out: List[(int, u64, int)]) {
     }
 }
 
-fn no_clips() -> List[uapi.ModeRect] {
-    return []
-}
-
 fn rd32(b: List[u8], at: int) -> u32 {
     return u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
 }
 
-/// Output `o`'s flip finished: what was queued is on screen now.
+/// Output `o`'s frame flipped: what was queued is on screen now.
 fn Drm.flipped(mut self, o: int) {
     self.outputs[o].pending = false
     let q = self.outputs[o].queued
@@ -735,6 +747,32 @@ fn Drm.flipped(mut self, o: int) {
         self.outputs[o].queued = -1
     }
     self.outputs[o].direct_shown = self.outputs[o].direct_queued
+}
+
+/// Output `o`'s commit failed: a frame in it never shows, so its buffer
+/// is free and every buffer's content is unknown (drawn whole next).
+fn Drm.failed(mut self, o: int, frame: bool, modeset: bool) {
+    guard o < self.outputs.len() else {
+        return
+    }
+    if modeset {
+        self.outputs[o].modeset = true
+    }
+    guard frame else {
+        return
+    }
+    self.outputs[o].pending = false
+    let q = self.outputs[o].queued
+    if q >= 0 and q != self.outputs[o].shown {
+        self.free_slot(o, q)
+    }
+    self.outputs[o].queued = -1
+    self.outputs[o].direct_queued = self.outputs[o].direct_shown
+    if let Some(sw) = self.outputs[o].swap.take() {
+        var s = sw
+        s.forget()
+        self.outputs[o].swap = Some(s)
+    }
 }
 
 fn Drm.free_slot(mut self, o: int, i: int) {

@@ -58,14 +58,14 @@ pub fn Clock.begin(mut self, now: int) -> int {
     return self.target
 }
 
-/// A frame reached the screen at `ns` (vblank `seq`).
-pub fn Clock.presented(mut self, seq: u64, ns: int) {
-    if self.last > 0 and seq > self.seq + 1 and not self.vrr {
-        // Vblanks passed without a frame: idle, or a frame was late.
-    }
+/// A frame reached the screen at `ns` (vblank `seq`): whether it was a
+/// vblank late.
+pub fn Clock.presented(mut self, seq: u64, ns: int) -> bool {
+    var late = false
     if self.target > 0 {
-        if ns > self.target + self.refresh_ns / 2 {
-            // Late: start earlier from now on.
+        late = ns > self.target + self.refresh_ns / 2
+        if late {
+            // Start earlier from now on.
             self.margin_ns = min(self.margin_ns + 1000000, self.refresh_ns / 2)
         } else {
             self.margin_ns = max(self.margin_ns - 100000, min_margin_ns)
@@ -81,4 +81,5 @@ pub fn Clock.presented(mut self, seq: u64, ns: int) {
     }
     self.last = ns
     self.seq = seq
+    return late
 }
