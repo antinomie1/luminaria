@@ -42,8 +42,8 @@ fn region(mut srv: server.Server, ci: u32, r: wl.Region, take req: wl.RegionRequ
             srv.regions.remove(ri, state.RegionData {})
             srv.unbind(ci, r.id)
         }
-        Add(x, y, w, h) => ids.region_add(mut srv.regions.items[int(ri)].rects, ids.Rect { x, y, w, h })
-        Subtract(x, y, w, h) => ids.region_sub(mut srv.regions.items[int(ri)].rects, ids.Rect { x, y, w, h })
+        Add(x, y, w, h) => ids.region_add(mut srv.regions.items[int(ri)].rects, ids.rect(x, y, w, h))
+        Subtract(x, y, w, h) => ids.region_sub(mut srv.regions.items[int(ri)].rects, ids.rect(x, y, w, h))
     }
 }
 
@@ -81,11 +81,11 @@ fn request(mut srv: server.Server, ci: u32, s: wl.Surface, take req: wl.SurfaceR
             }
             srv.surfaces.items[i].pending.attached = true
             srv.surfaces.items[i].pending.buffer = buf
-            srv.surfaces.items[i].pending.dx = x
-            srv.surfaces.items[i].pending.dy = y
+            srv.surfaces.items[i].pending.dx = ids.clamp(x)
+            srv.surfaces.items[i].pending.dy = ids.clamp(y)
         }
-        Damage(x, y, w, h) => ids.add_damage(mut srv.surfaces.items[i].pending.damage, ids.Rect { x, y, w, h })
-        DamageBuffer(x, y, w, h) => ids.add_damage(mut srv.surfaces.items[i].pending.bdamage, ids.Rect { x, y, w, h })
+        Damage(x, y, w, h) => ids.add_damage(mut srv.surfaces.items[i].pending.damage, ids.rect(x, y, w, h))
+        DamageBuffer(x, y, w, h) => ids.add_damage(mut srv.surfaces.items[i].pending.bdamage, ids.rect(x, y, w, h))
         Frame(cb) => srv.surfaces.items[i].pending.frames.push(cb.id)
         SetOpaqueRegion(r) => {
             let rects = match r {
@@ -120,8 +120,8 @@ fn request(mut srv: server.Server, ci: u32, s: wl.Surface, take req: wl.SurfaceR
             srv.surfaces.items[i].pending.scale = n
         }
         Offset(x, y) => {
-            srv.surfaces.items[i].pending.dx = x
-            srv.surfaces.items[i].pending.dy = y
+            srv.surfaces.items[i].pending.dx = ids.clamp(x)
+            srv.surfaces.items[i].pending.dy = ids.clamp(y)
         }
         Commit => commit(mut srv, si)
         GetRelease => {}
@@ -569,7 +569,7 @@ fn subsurface(mut srv: server.Server, ci: u32, sub: wl.Subsurface, take req: wl.
             guard pi != state.none else {
                 return
             }
-            srv.surfaces.items[int(pi)].pending.moves.push((si, x, y))
+            srv.surfaces.items[int(pi)].pending.moves.push((si, ids.clamp(x), ids.clamp(y)))
         }
         PlaceAbove(other) => restack(mut srv, ci, sub.id, si, other.id, true)
         PlaceBelow(other) => restack(mut srv, ci, sub.id, si, other.id, false)

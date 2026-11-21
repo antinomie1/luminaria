@@ -1,0 +1,488 @@
+// Hostile clients against the server, seeded so a failure repeats. Random
+// requests follow the signatures in protocols/*.xml, so most of them
+// decode and reach deep into protocol state: any live object, any request
+// of its version, arguments from edge values, objects of the right
+// interface, new ids, strings, arrays and descriptors, now and then wrong.
+// Random bytes break the framing. The server must not crash, must close
+// what those clients opened, and must still serve a well-behaved client.
+// FUZZ_SEED and FUZZ_ROUNDS (clients per test) run it longer.
+
+import std.collections.map
+import std.env
+import std.fs
+import std.net
+import std.os
+import std.rand
+import std.xml
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.commit_timing as ct
+import luminaria_proto.security_context as sc
+import luminaria_proto.wlr_layer_shell_unstable as ls
+import luminaria_server as server
+
+fn knob(name: str, default: int) -> int {
+    return env.get(name).and_then(fn(v) => v.to_int()).unwrap_or(default)
+}
+
+fn open_server(tag: str) -> server.Server {
+    let dir = fs.create_temp_dir(tag).expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    return server.Server.open("").expect("listen")
+}
+
+fn accept(mut srv: server.Server) -> server.Client {
+    for _ in 0..100 {
+        if let Ok(Some((c, _))) = srv.accept() {
+            return c
+        }
+    }
+    panic("accept")
+}
+
+/// Run the server for client `c` until it has nothing to do: false once
+/// the server dropped it.
+fn serve(mut srv: server.Server, c: server.Client) -> bool {
+    var alive = true
+    for _ in 0..3 {
+        if not srv.dispatch(c) {
+            alive = false
+            break
+        }
+    }
+    var gone: List[server.Client] = []
+    srv.flush(mut gone)
+    if not gone.is_empty() {
+        alive = false
+    }
+    while srv.next().is_some() {}
+    if not alive {
+        srv.disconnect(c)
+    }
+    return alive
+}
+
+fn open_fds() -> int {
+    return fs.list_dir("/proc/self/fd").map(fn(l) => l.len()).unwrap_or(0)
+}
+
+struct Arg {
+    kind: str
+    iface: u16 = 0
+    null: bool = false
+}
+
+struct Req {
+    since: u32 = 1
+    dtor: bool = false
+    args: List[Arg] = []
+}
+
+/// Requests of every interface, by interface number, from the XML.
+fn signatures() -> map.Map[u16, List[Req]] {
+    let root = if fs.exists("protocols") { "protocols" } else { "../protocols" }
+    var out: map.Map[u16, List[Req]] = map.Map.new()
+    for f in fs.list_dir(root).expect("protocols") {
+        guard f.ends_with(".xml") else {
+            continue
+        }
+        let d = xml.parse(fs.read_to_str("{root}/{f}").expect("read")).expect("parse")
+        for i in d.children(xml.root, "interface") {
+            let k = proto.ifaces.by_name(d.attr_or(i, "name", ""))
+            var reqs: List[Req] = []
+            for r in d.children(i, "request") {
+                var q = Req { since: u32(d.attr_or(r, "since", "1").to_int().unwrap_or(1)), dtor: d.attr_or(r, "type", "") == "destructor" }
+                for a in d.children(r, "arg") {
+                    q.args.push(Arg { kind: d.attr_or(a, "type", ""), iface: proto.ifaces.by_name(d.attr_or(a, "interface", "")), null: d.attr_or(a, "allow-null", "") == "true" })
+                }
+                reqs.push(q)
+            }
+            discard out.insert(k, reqs)
+        }
+    }
+    return out
+}
+
+struct Obj {
+    id: u32
+    iface: u16
+    version: u32
+}
+
+/// Bind every global the server advertises.
+fn bind_all(mut srv: server.Server, sc: server.Client, mut c: wire.Conn, mut objs: List[Obj]) {
+    let reg = wl.Display { id: 1 }.get_registry(mut c)
+    discard c.flush()
+    discard serve(mut srv, sc)
+    var globals: List[(u32, u16, u32)] = []
+    for _ in 0..3 {
+        discard c.read()
+        while true {
+            match proto.next_event(mut c) {
+                Ok(Some(e)) => {
+                    match e {
+                        WlRegistry(_, Global(n, i, v)) => {
+                            let k = proto.ifaces.by_name(i)
+                            if k != 0 {
+                                globals.push((n, k, v))
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    break
+                }
+            }
+        }
+    }
+    assert(globals.len() > 20)
+    objs.push(Obj { id: 1, iface: 1, version: 1 })
+    objs.push(Obj { id: reg.id, iface: 2, version: 1 })
+    for (n, k, v) in globals {
+        objs.push(Obj { id: reg.bind(mut c, n, k, v), iface: k, version: v })
+    }
+}
+
+/// A string argument as words (length with NUL, bytes, padding); one in
+/// forty lies about its length.
+fn string(mut r: rand.Rng, mut out: List[u32]) {
+    let n = r.range(0, 40)
+    let lie = r.range(0, 40) == 0
+    out.push(if lie { u32(r.range(0, 200)) } else { u32(n + 1) })
+    var w: u32 = 0
+    var k = 0
+    for i in 0..n + 1 {
+        let b = if i == n { u32(0) } else { u32(r.range(32, 127)) }
+        w |= b << u32(8 * k)
+        k += 1
+        if k == 4 {
+            out.push(w)
+            w = 0
+            k = 0
+        }
+    }
+    if k > 0 {
+        out.push(w)
+    }
+}
+
+/// Mostly small values (counts, enums, sizes), sometimes an edge.
+fn int_word(mut r: rand.Rng) -> u32 {
+    return match r.range(0, 12) {
+        0 => 0xffffffff
+        1 => 0x7fffffff
+        2 => 0x80000000
+        3 => u32(r.next_u64() & 0xffffffff)
+        4 => u32(r.range(0, 300))
+        _ => u32(r.range(0, 5))
+    }
+}
+
+/// A live object of interface `iface`, 0 when there is none.
+fn pick(mut r: rand.Rng, objs: &[Obj], iface: u16) -> u32 {
+    var n = 0
+    for x in objs {
+        if iface == 0 or x.iface == iface {
+            n += 1
+        }
+    }
+    guard n > 0 else {
+        return 0
+    }
+    var k = r.range(0, n)
+    for x in objs {
+        if iface == 0 or x.iface == iface {
+            if k == 0 {
+                return x.id
+            }
+            k -= 1
+        }
+    }
+    return 0
+}
+
+/// An object and a request of it that makes an `iface`.
+fn maker(mut r: rand.Rng, sigs: map.Map[u16, List[Req]], objs: &[Obj], iface: u16) -> Option[(int, int)] {
+    var found: List[(int, int)] = []
+    for i, o in objs {
+        let reqs = sigs.get(o.iface).unwrap_or([])
+        for k, q in reqs {
+            if q.since <= o.version and q.args.any(fn(a) => a.kind == "new_id" and a.iface == iface) {
+                found.push((i, k))
+            }
+        }
+    }
+    guard not found.is_empty() else {
+        return None
+    }
+    return Some(found[r.range(0, found.len())])
+}
+
+/// A random request to a live object, by its signature; one in thirty is
+/// noise.
+fn request(mut r: rand.Rng, mut c: wire.Conn, sigs: map.Map[u16, List[Req]], mut objs: List[Obj]) {
+    let i = r.range(0, objs.len())
+    let reqs = sigs.get(objs[i].iface).unwrap_or([])
+    if reqs.is_empty() or r.range(0, 30) == 0 {
+        let n = r.range(0, 4)
+        var w = c.begin(objs[i].id, u16(r.range(0, 16)), 8 + 4 * n)
+        for _ in 0..n {
+            w.u32(mut c, int_word(mut r))
+        }
+        return
+    }
+    send(mut r, mut c, sigs, mut objs, i, r.range(0, reqs.len()), 0)
+}
+
+/// Whether an `iface` lives, after making it (and what it is made from)
+/// when it does not.
+fn ensure(mut r: rand.Rng, mut c: wire.Conn, sigs: map.Map[u16, List[Req]], mut objs: List[Obj], iface: u16, depth: int) -> bool {
+    guard pick(mut r, objs, iface) == 0 else {
+        return true
+    }
+    guard depth < 4 else {
+        return false
+    }
+    if maker(mut r, sigs, objs, iface).is_none() {
+        // Make something that makes it.
+        for y in sigs.keys() {
+            let makes = sigs.get(y).unwrap_or([]).any(fn(q) => q.args.any(fn(a) => a.kind == "new_id" and a.iface == iface))
+            if y != iface and makes and ensure(mut r, mut c, sigs, mut objs, y, depth + 1) {
+                break
+            }
+        }
+    }
+    guard let Some((i, k)) = maker(mut r, sigs, objs, iface) else {
+        return false
+    }
+    send(mut r, mut c, sigs, mut objs, i, k, depth + 1)
+    return pick(mut r, objs, iface) != 0
+}
+
+/// Request `k` of object `objs[i]`, making the objects it needs first.
+fn send(mut r: rand.Rng, mut c: wire.Conn, sigs: map.Map[u16, List[Req]], mut objs: List[Obj], i: int, k: int, depth: int) {
+    let o = objs[i]
+    let q = sigs.get(o.iface).unwrap_or([])[k].clone()
+    guard q.since <= o.version else {
+        return
+    }
+    // Objects it needs: made first, or the request is not sent.
+    for a in q.args {
+        if a.kind == "object" and a.iface != 0 and not a.null and not ensure(mut r, mut c, sigs, mut objs, a.iface, depth) {
+            return
+        }
+    }
+    var words: List[u32] = []
+    var fds = 0
+    var made: List[Obj] = []
+    for a in q.args {
+        match a.kind {
+            "int" => words.push(int_word(mut r))
+            "uint" => words.push(int_word(mut r))
+            "fixed" => words.push(int_word(mut r))
+            "string" => string(mut r, mut words)
+            "array" => {
+                let n = r.range(0, 16)
+                words.push(u32(4 * n))
+                for _ in 0..n {
+                    words.push(int_word(mut r))
+                }
+            }
+            "fd" => fds += 1
+            "object" => words.push(if a.null and r.range(0, 3) == 0 { u32(0) } else { pick(mut r, objs, a.iface) })
+            "new_id" => {
+                guard a.iface != 0 else {
+                    return
+                }
+                let id = c.alloc(a.iface, o.version)
+                made.push(Obj { id, iface: a.iface, version: o.version })
+                words.push(id)
+            }
+            _ => {}
+        }
+    }
+    var w = c.begin(o.id, u16(k), 8 + 4 * words.len())
+    for x in words {
+        w.u32(mut c, x)
+    }
+    for _ in 0..fds {
+        if let Ok(fd) = os.memfd("fuzz", r.range(0, 70000)) {
+            c.put_fd(fd)
+            os.close(fd)
+        }
+    }
+    if q.dtor {
+        objs.retain(fn(x) => x.id != o.id)
+    }
+    for m in made {
+        objs.push(m)
+    }
+}
+
+test "random requests to every global do not crash or leak" {
+    var srv = open_server("luminaria-fuzz")
+    let before = open_fds()
+    let sigs = signatures()
+    var r = rand.Rng.new(knob("FUZZ_SEED", 20261122))
+    let rounds = knob("FUZZ_ROUNDS", 150)
+    var dropped = 0
+    var sent = 0
+    for _ in 0..rounds {
+        var c = wire.connect(srv.name()).expect("connect")
+        let sc = accept(mut srv)
+        var objs: List[Obj] = []
+        bind_all(mut srv, sc, mut c, mut objs)
+        var alive = true
+        for _ in 0..40 {
+            for _ in 0..r.range(1, 8) {
+                request(mut r, mut c, sigs, mut objs)
+                sent += 1
+            }
+            discard c.flush()
+            alive = serve(mut srv, sc)
+            guard alive else {
+                break
+            }
+            discard c.read()
+            while c.next().unwrap_or(None).is_some() {}
+        }
+        if alive {
+            srv.disconnect(sc)
+        } else {
+            dropped += 1
+        }
+    }
+    // Deep enough: each client gets many requests in before it breaks the
+    // protocol and is dropped with an error.
+    assert(sent > rounds * 10)
+    assert(dropped > rounds / 10)
+    assert(open_fds() <= before + 2)
+    healthy(mut srv)
+}
+
+fn first(objs: &[Obj], iface: u16) -> u32 {
+    for o in objs {
+        if o.iface == iface {
+            return o.id
+        }
+    }
+    panic("no global {iface}")
+}
+
+test "edge values the fuzzing found are refused or clamped" {
+    var srv = open_server("luminaria-fuzz-edges")
+    let before = open_fds()
+    let big: i32 = 0x7fffffff
+    // Huge rectangles are clamped; a buffer wider than its stride, a
+    // timestamp past 2^63 ns and a listener that is no socket are errors.
+    let survives = [true, false, true, false, false]
+    for case, want in survives {
+        var c = wire.connect(srv.name()).expect("connect")
+        let client = accept(mut srv)
+        var objs: List[Obj] = []
+        bind_all(mut srv, client, mut c, mut objs)
+        let comp = wl.Compositor { id: first(objs, wl.compositor_iface) }
+        let s = comp.create_surface(mut c)
+        if case == 0 {
+            let rg = comp.create_region(mut c)
+            rg.add_(mut c, big, big, big, big)
+            s.set_input_region(mut c, Some(rg))
+            s.damage(mut c, big, big, big, big)
+            s.commit(mut c)
+        } else if case == 1 {
+            let fd = os.memfd("t", 64).expect("memfd")
+            let pool = wl.Shm { id: first(objs, wl.shm_iface) }.create_pool(mut c, fd, 64)
+            os.close(fd)
+            discard pool.create_buffer(mut c, 0, 0x40000000, 1, 4, wl.ShmFormat.Argb8888)
+        } else if case == 2 {
+            let l = ls.Shell { id: first(objs, ls.shell_iface) }.get_layer_surface(mut c, s, None, ls.ShellLayer.Top, "edge")
+            l.set_size(mut c, 0xffffffff, 0xffffffff)
+            s.commit(mut c)
+        } else if case == 3 {
+            let t = ct.TimingManager { id: first(objs, ct.timing_manager_iface) }.get_timer(mut c, s)
+            t.set_timestamp(mut c, 0xffffffff, 0xffffffff, 0)
+            s.commit(mut c)
+        } else {
+            let fd = os.memfd("t", 64).expect("memfd")
+            discard sc.ContextManager { id: first(objs, sc.context_manager_iface) }.create_listener(mut c, fd, fd)
+            os.close(fd)
+        }
+        discard c.flush()
+        let alive = serve(mut srv, client)
+        assert_eq(alive, want)
+        if alive {
+            srv.disconnect(client)
+        }
+    }
+    assert(open_fds() <= before + 2)
+    healthy(mut srv)
+}
+
+test "broken framing is refused, not read past" {
+    var srv = open_server("luminaria-fuzz-raw")
+    let before = open_fds()
+    let dir = env.get("XDG_RUNTIME_DIR").unwrap()
+    let path = "{dir}/{srv.name()}"
+    var r = rand.Rng.new(knob("FUZZ_SEED", 7))
+    for _ in 0..knob("FUZZ_ROUNDS", 200) {
+        let raw = net.unix_connect(path).expect("connect")
+        let sc = accept(mut srv)
+        var bytes: List[u8] = []
+        // A plausible header now and then, so some messages get decoded.
+        if r.bool() {
+            for b in [u8(1), 0, 0, 0, 1, 0, 12, 0, 2, 0, 0, 0] {
+                bytes.push(b)
+            }
+        }
+        for _ in 0..r.range(1, 9000) {
+            bytes.push(u8(r.range(0, 256)))
+        }
+        discard raw.write_bytes(bytes)
+        for _ in 0..4 {
+            guard serve(mut srv, sc) else {
+                break
+            }
+        }
+        raw.close()
+        discard serve(mut srv, sc)
+    }
+    assert(open_fds() <= before + 2)
+    healthy(mut srv)
+}
+
+/// A well-behaved client still gets its surface shown.
+fn healthy(mut srv: server.Server) {
+    var c = wire.connect(srv.name()).expect("connect")
+    let sc = accept(mut srv)
+    let reg = wl.Display { id: 1 }.get_registry(mut c)
+    discard c.flush()
+    discard serve(mut srv, sc)
+    var comp_name: u32 = 0
+    discard c.read()
+    while true {
+        match proto.next_event(mut c) {
+            Ok(Some(e)) => {
+                match e {
+                    WlRegistry(_, Global(n, i, _)) => {
+                        if i == "wl_compositor" {
+                            comp_name = n
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                break
+            }
+        }
+    }
+    assert(comp_name != 0)
+    let comp = wl.Compositor { id: reg.bind(mut c, comp_name, wl.compositor_iface, 6) }
+    let surf = comp.create_surface(mut c)
+    surf.commit(mut c)
+    discard c.flush()
+    assert(serve(mut srv, sc))
+    srv.disconnect(sc)
+}

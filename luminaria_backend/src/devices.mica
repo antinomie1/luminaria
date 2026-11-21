@@ -1,0 +1,210 @@
+// Local input without a display: the seat session (libseat), input devices
+// (libinput) and keymaps (xkb), with a keymap per logical seat. The DRM
+// backend runs on one; an output of your own embeds one to read the local
+// keyboards and pointers: add its `fds`, pass their tokens to `dispatch`,
+// drain `next` and forward the plug.Input calls to it.
+
+import std.time
+import luminaria_types as types
+import session
+import input
+import keyboard
+import sched
+
+/// Poller tokens of its descriptors.
+pub let token_session = 2
+pub let token_input = 3
+
+pub struct Devices {
+    session: Option[session.Session] = None
+    input: Option[input.Input] = None
+    kb: Option[keyboard.Keyboard] = None
+    names: types.Names = types.Names {}
+    seat: str = "seat0"
+    /// Keymaps of the other logical seats.
+    extra: List[(str, keyboard.Keyboard)] = []
+    events: List[types.Event] = []
+    head: int = 0
+    boost: sched.Boost = sched.Boost {}
+}
+
+/// The session, its input devices and keymap `names`.
+pub fn Devices.open(names: types.Names) -> Result[Devices, str] {
+    let s = try session.open()
+    let seat = s.name()
+    let kb = try keyboard.Keyboard.new(names)
+    let i = try input.open(seat)
+    return Ok(Devices { session: Some(s), input: Some(i), kb: Some(kb), names: names.clone(), seat })
+}
+
+/// Keymaps only: no session, no devices (input is injected).
+pub fn Devices.none() -> Devices {
+    return Devices {}
+}
+
+/// The session's seat ("seat0" without one).
+pub fn Devices.seat_name(self) -> str {
+    return self.seat.clone()
+}
+
+pub fn Devices.fds(self, mut out: List[(int, int)]) {
+    if let Some(s) = self.session {
+        out.push((s.fd(), token_session))
+    }
+    if let Some(i) = self.input {
+        out.push((i.fd(), token_input))
+    }
+}
+
+/// Handle what descriptor `token` has. Some(on) when the session became
+/// active or was switched away (devices are suspended meanwhile).
+pub fn Devices.dispatch(mut self, token: int) -> Option[bool] {
+    if token == token_session {
+        guard let Some(ss) = self.session.take() else {
+            return None
+        }
+        var s = ss
+        let changed = s.dispatch()
+        self.session = Some(s)
+        if let Some(on) = changed {
+            if let Some(ii) = self.input.take() {
+                var i = ii
+                if on {
+                    i.resume()
+                } else {
+                    i.suspend()
+                }
+                self.input = Some(i)
+            }
+            self.events.push(types.Event.Session(on))
+        }
+        return changed
+    }
+    guard token == token_input else {
+        return None
+    }
+    guard let Some(ii) = self.input.take() else {
+        return None
+    }
+    var inp = ii
+    let before = self.extra.len()
+    var got: List[(str, types.Input)] = []
+    if let Some(kk) = self.kb.take() {
+        var kb = kk
+        inp.dispatch(mut kb, mut self.extra, self.names.clone(), mut got)
+        self.kb = Some(kb)
+    }
+    self.input = Some(inp)
+    for k in before..self.extra.len() {
+        self.events.push(types.Event.KeymapOn(self.extra[k].0.clone()))
+    }
+    if not got.is_empty() {
+        self.boost.pulse(time.now_ns())
+    }
+    for (seat, g) in take got {
+        if seat.is_empty() {
+            self.events.push(types.Event.Input(g))
+        } else {
+            self.events.push(types.Event.InputOn(seat, g))
+        }
+    }
+    return None
+}
+
+/// The next event, oldest first.
+pub fn Devices.next(mut self) -> Option[types.Event] {
+    guard self.head < self.events.len() else {
+        self.events.clear()
+        self.head = 0
+        return None
+    }
+    let e = self.events[self.head].clone()
+    self.head += 1
+    return Some(e)
+}
+
+/// The keymap for clients: memfd and size (with its NUL); -1: none.
+pub fn Devices.keymap(self) -> (int, u32) {
+    if let Some(k) = self.kb {
+        return (k.fd, k.size)
+    }
+    return (-1, 0)
+}
+
+pub fn Devices.mods(self) -> types.Mods {
+    if let Some(k) = self.kb {
+        return k.mods()
+    }
+    return types.Mods {}
+}
+
+pub fn Devices.set_keymap(mut self, names: types.Names) -> Result[(), str] {
+    guard self.kb.is_some() else {
+        return Err("no keyboard here")
+    }
+    self.kb = Some(try keyboard.Keyboard.new(names))
+    self.names = names.clone()
+    self.events.push(types.Event.Keymap)
+    return Ok(())
+}
+
+/// Keymap for `seat`; the default keymap when it has none of its own.
+pub fn Devices.keymap_on(self, seat: str) -> (int, u32) {
+    for x in self.extra {
+        if x.0 == seat {
+            return (x.1.fd, x.1.size)
+        }
+    }
+    return self.keymap()
+}
+
+pub fn Devices.mods_on(self, seat: str) -> types.Mods {
+    for x in self.extra {
+        if x.0 == seat {
+            return x.1.mods()
+        }
+    }
+    return self.mods()
+}
+
+pub fn Devices.set_keymap_on(mut self, seat: str, names: types.Names) -> Result[(), str] {
+    if seat.is_empty() or seat == "seat0" or seat == "default" or seat == self.seat {
+        return self.set_keymap(names)
+    }
+    let kb = try keyboard.Keyboard.new(names)
+    self.events.push(types.Event.KeymapOn(seat.clone()))
+    for i in 0..self.extra.len() {
+        if self.extra[i].0 == seat {
+            self.extra[i].1 = kb
+            return Ok(())
+        }
+    }
+    self.extra.push((seat.clone(), kb))
+    return Ok(())
+}
+
+/// Move input device `device` to logical seat `seat`.
+pub fn Devices.assign_device_seat(mut self, device: u32, seat: str) -> bool {
+    guard let Some(ii) = self.input.take() else {
+        return false
+    }
+    var i = ii
+    let ok = i.assign_seat(device, seat)
+    self.input = Some(i)
+    return ok
+}
+
+pub fn Devices.configure_input(mut self, device: u32, c: types.InputConfig) {
+    if let Some(ii) = self.input.take() {
+        var i = ii
+        i.configure(device, c)
+        self.input = Some(i)
+    }
+}
+
+/// Switch to virtual terminal `n` (with a session).
+pub fn Devices.switch_vt(self, n: int) {
+    if let Some(s) = self.session {
+        s.switch_vt(n)
+    }
+}

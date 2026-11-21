@@ -79,8 +79,8 @@ fn viewport(mut srv: server.Server, ci: u32, v: vp.Viewport, take req: vp.Viewpo
                 srv.surfaces.items[i].pending.src = srv.surfaces.items[i].current.src
             }
             srv.surfaces.items[i].pending.viewport_set = true
-            srv.surfaces.items[i].pending.dst_w = w
-            srv.surfaces.items[i].pending.dst_h = h
+            srv.surfaces.items[i].pending.dst_w = ids.clamp(w)
+            srv.surfaces.items[i].pending.dst_h = ids.clamp(h)
         }
     }
 }
@@ -194,6 +194,11 @@ fn timer(mut srv: server.Server, ci: u32, t: ct.Timer, take req: ct.TimerRequest
     match req {
         SetTimestamp(hi, lo, nsec) => {
             let secs = (u64(hi) << 32) | u64(lo)
+            // Past 2^63 ns (292 years of uptime) it is not a time.
+            guard nsec < 1000000000 and secs < 9000000000 else {
+                srv.fail(ci, t.id, u32(ct.TimerError.InvalidTimestamp), "timestamp {secs} s {nsec} ns")
+                return
+            }
             srv.surfaces.items[int(si)].pending.target_ns = int(secs) * 1000000000 + int(nsec)
         }
         Destroy => {

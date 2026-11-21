@@ -37,13 +37,27 @@ struct TestOut {
     shown: int = -1
     seq: u64 = 0
     trace: Option[sync.Mutex[Trace]] = None
+    /// Keymaps from the built-in Devices (no session, no libinput here).
+    devices: lum.backend.Devices
 }
 
 pub fn TestOut.next(mut self) -> Option[lum.types.Event] {
     guard not self.events.is_empty() else {
-        return None
+        return self.devices.next()
     }
     return Some(self.events.remove(0))
+}
+
+pub fn TestOut.keymap_on(self, seat: str) -> (int, u32) {
+    return self.devices.keymap_on(seat)
+}
+
+pub fn TestOut.mods_on(self, seat: str) -> lum.types.Mods {
+    return self.devices.mods_on(seat)
+}
+
+pub fn TestOut.set_keymap_on(mut self, seat: str, names: lum.types.Names) -> Result[(), str] {
+    return self.devices.set_keymap_on(seat, names)
 }
 
 pub fn TestOut.fds(self, mut out: List[(int, int)]) {
@@ -368,7 +382,7 @@ pub fn SoftRen.close(mut self) {
 test "a display on an output and a renderer of its own" {
     let dir = fs.create_temp_dir("luminaria-plug").expect("temp dir")
     discard env.set("XDG_RUNTIME_DIR", dir)
-    let out = TestOut { timer: os.timerfd().unwrap() }
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none() }
     let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new() }
     var d = lum.display.Display.with(lum.Options { background: [0.0, 0.0, 1.0, 1.0] }, out, ren).expect("display")
     let outs = d.outputs()
@@ -490,7 +504,7 @@ test "overlay promotion passes non-overlapping dmabuf candidates and blocks shm-
     let dir = fs.create_temp_dir("luminaria-plug-overlay").expect("temp dir")
     discard env.set("XDG_RUNTIME_DIR", dir)
     let tr = sync.mutex(Trace {})
-    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()) }
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), trace: Some(tr.clone()) }
     let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true, trace: Some(tr.clone()) }
     var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
     d.hide_cursor()
@@ -560,7 +574,7 @@ test "GPU device-lost triggers reset_targets, recover, Event.GpuReset, and recov
     let dir = fs.create_temp_dir("luminaria-plug-recover").expect("temp dir")
     discard env.set("XDG_RUNTIME_DIR", dir)
     let tr = sync.mutex(Trace {})
-    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()) }
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), trace: Some(tr.clone()) }
     let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), fail_on_render: 1, trace: Some(tr.clone()) }
     var d = lum.display.Display.with(lum.Options { background: [0.0, 0.0, 1.0, 1.0] }, out, ren).expect("display")
     let outs = d.outputs()
@@ -608,7 +622,7 @@ test "multi-seat routes independent pointers, keys, and software cursors" {
     let dir = fs.create_temp_dir("luminaria-plug-multiseat").expect("temp dir")
     discard env.set("XDG_RUNTIME_DIR", dir)
     let tr = sync.mutex(Trace {})
-    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()) }
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), trace: Some(tr.clone()) }
     let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), trace: Some(tr.clone()) }
     var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
     let s1 = d.seats()[0]
@@ -703,7 +717,7 @@ test "1000-placement Display.rebuild throughput" {
     let dir = fs.create_temp_dir("luminaria-plug-bench").expect("temp dir")
     discard env.set("XDG_RUNTIME_DIR", dir)
     let tr = sync.mutex(Trace {})
-    let out = TestOut { timer: os.timerfd().unwrap(), width: 256, height: 256, trace: Some(tr.clone()) }
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 256, height: 256, trace: Some(tr.clone()) }
     let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), trace: Some(tr.clone()) }
     var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
     let px: List[u8] = [u8(255), 0, 0, 255]
@@ -731,4 +745,16 @@ test "1000-placement Display.rebuild throughput" {
         count = t.last_layout.len()
     })
     assert(count >= 1000)
+}
+
+test "an output of its own takes seat keymaps from an embedded Devices" {
+    let dir = fs.create_temp_dir("luminaria-plug-devices").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none() }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new() }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    let s2 = d.add_seat("seat1")
+    d.set_keymap_on(s2, lum.Names { layout: "us" }).expect("seat keymap")
+    // The default seat has no keyboard: Devices.none() has no keymap.
+    assert(d.set_keymap(lum.Names { layout: "us" }).is_err())
 }

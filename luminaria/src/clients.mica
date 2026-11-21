@@ -1,0 +1,468 @@
+// What clients do: server events, buffers, surfaces and popups.
+
+import luminaria_types.pixels as pixels
+import luminaria_server as server
+import shell
+import plug
+import display
+import outputs
+import waits
+import place
+import seats
+
+fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    while true {
+        guard let Some(got) = d.srv.next() else {
+            break
+        }
+        var e = got
+        match take e {
+            ClientNew(c) => d.emit(display.Event.ClientNew(c))
+            ClientGone(c) => d.emit(display.Event.ClientGone(c))
+            ExtBound(o, v) => d.emit(display.Event.ExtensionBound(o, v))
+            ExtRequest(o, op, args) => d.emit(display.Event.ExtensionRequest(o, op, args))
+            BufferNew(b) => buffer_new(mut d, b)
+            BufferGone(b) => buffer_gone(mut d, b)
+            Committed(t) => waits.start(mut d, t)
+            Applied(s) => applied(mut d, s)
+            SurfaceGone(s) => surface_gone(mut d, s)
+            WindowNew(w) => {
+                discard d.wins.insert(w, display.Win {})
+                d.emit(display.Event.WindowNew(w))
+            }
+            WindowMapped(w) => {
+                d.emit(display.Event.WindowMapped(w))
+                place.rebuild(mut d)
+            }
+            WindowUnmapped(w) => {
+                if let Some(cur) = d.wins.get(w) {
+                    discard d.wins.insert(w, display.Win { width: cur.width, height: cur.height, states: cur.states })
+                }
+                d.emit(display.Event.WindowUnmapped(w))
+                place.rebuild(mut d)
+            }
+            WindowClosed(w) => {
+                discard d.wins.remove(w)
+                d.waits.txn_wins.retain(fn(x) => x != w)
+                d.caps.windows.retain(fn(x) => x != w)
+                d.emit(display.Event.WindowClosed(w))
+                place.rebuild(mut d)
+            }
+            WindowTitle(w) => d.emit(display.Event.WindowTitle(w))
+            WindowAppId(w) => d.emit(display.Event.WindowAppId(w))
+            WindowParent(w) => d.emit(display.Event.WindowParent(w))
+            WindowRequest(w, r) => request(mut d, w, r)
+            WindowAcked(w, aw, ah) => acked(mut d, w, aw, ah)
+            PopupNew(p) => {
+                d.popups.push(p)
+                configure_popup(mut d, p)
+            }
+            PopupMapped => place.rebuild(mut d)
+            PopupGone(p) => {
+                d.popups.retain(fn(x) => x != p)
+                var had_grab = false
+                for si in 0..d.seats.len() {
+                    if d.seats[si].grabs.contains(p) {
+                        d.seats[si].grabs.retain(fn(x) => x != p)
+                        had_grab = true
+                    }
+                }
+                if had_grab {
+                    refocus(mut d)
+                }
+                place.rebuild(mut d)
+            }
+            PopupGrab(p, st) => {
+                let si = seats.seat_index(d, st)
+                if si >= 0 {
+                    d.seats[si].grabs.push(p)
+                    shell.update_keyboard_on(mut d, si)
+                }
+            }
+            PopupReposition(p) => configure_popup(mut d, p)
+            Cursor(st, s, hx, hy) => {
+                let si = seats.seat_index(d, st)
+                if si >= 0 {
+                    d.seats[si].cursor_surface = s
+                    d.seats[si].cursor_hx = hx
+                    d.seats[si].cursor_hy = hy
+                    match s {
+                        Some(cs) => seats.client_cursor_on(mut d, si, cs)
+                        None => seats.hide_cursor_on(mut d, si)
+                    }
+                }
+            }
+            CursorShape(st, shape) => {
+                let si = seats.seat_index(d, st)
+                if si >= 0 {
+                    d.seats[si].cursor_surface = None
+                    seats.set_cursor_named_on(mut d, si, server.server.cursor_name(shape))
+                }
+            }
+            LayerNew => place.rebuild(mut d)
+            LayerChanged => {
+                place.rebuild(mut d)
+                shell.update_keyboard(mut d)
+            }
+            LayerGone(l) => {
+                shell.layer_gone(mut d, l)
+                place.rebuild(mut d)
+                shell.update_keyboard(mut d)
+            }
+            LockRequest => shell.lock(mut d)
+            Unlock => shell.unlock(mut d)
+            LockSurfaceNew(k) => shell.configure_lock(mut d, k)
+            LockSurfaceChanged => {
+                place.rebuild(mut d)
+                shell.update_keyboard(mut d)
+            }
+            WindowDecoration(w) => d.emit(display.Event.WindowDecoration(w, d.srv.decoration(w) == 2))
+            WindowIcon(w) => d.emit(display.Event.WindowIcon(w))
+            Activate(w) => d.emit(display.Event.RequestActivate(w))
+            Bell(s) => {
+                let w = match s {
+                    Some(x) => d.srv.window_of(x)
+                    None => None
+                }
+                d.emit(display.Event.Bell(w))
+            }
+            ImeChanged => place.rebuild(mut d)
+            IdleChanged => d.idle_tick()
+            Drag => place.rebuild(mut d)
+            Capture(so) => {
+                // The first frame of a capture is taken at once.
+                let o = outputs.out_index(d, so)
+                if o >= 0 {
+                    d.outs[o].dirty = true
+                }
+            }
+            CaptureWindow(w) => {
+                if not d.caps.windows.contains(w) {
+                    d.caps.windows.push(w)
+                }
+            }
+            Listen(k) => {
+                let (lf, cf) = d.srv.listener_fds(k)
+                discard d.poll.add(lf, display.tok_sandbox + int(k) * 2, true, false)
+                discard d.poll.add(cf, display.tok_sandbox + int(k) * 2 + 1, true, false)
+            }
+            OutputConfig(c, only_test) => d.emit(display.Event.OutputConfig(c, only_test))
+        }
+    }
+}
+
+fn request[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, r: server.Request) {
+    match r {
+        Move => d.emit(display.Event.RequestMove(w))
+        Resize(_, _, edges) => d.emit(display.Event.RequestResize(w, edges))
+        Maximize(on) => d.emit(display.Event.RequestMaximize(w, on))
+        Fullscreen(on, o) => d.emit(display.Event.RequestFullscreen(w, o, on))
+        Minimize => d.emit(display.Event.RequestMinimize(w))
+        Menu(_, x, y) => d.emit(display.Event.RequestMenu(w, f64(x), f64(y)))
+    }
+}
+
+fn acked[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, aw: i32, ah: i32) {
+    guard let Some(cur) = d.wins.get(w) else {
+        return
+    }
+    var win = cur
+    win.inflight = false
+    let resized = aw != win.width or ah != win.height
+    // A resize from the left or top keeps the opposite edge in place.
+    match d.manip.active {
+        Resize(mw, edges, _, _, w0, h0, ox, oy) => {
+            if mw == w {
+                if edges & 4 != 0 and aw > 0 {
+                    win.off_x = ox + f64(w0 - aw)
+                }
+                if edges & 1 != 0 and ah > 0 {
+                    win.off_y = oy + f64(h0 - ah)
+                }
+            }
+        }
+        _ => {}
+    }
+    discard d.wins.insert(w, win)
+    if d.waits.txn_open or d.waits.txn_layout.is_some() {
+        d.waits.txn_wins.retain(fn(x) => x != w)
+        waits.try_finish(mut d)
+    }
+    if resized and aw > 0 {
+        d.emit(display.Event.WindowResized(w, aw, ah))
+    }
+    place.rebuild(mut d)
+}
+
+fn buffer_new[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer) {
+    let info = d.srv.buffer(b)
+    if info.kind == server.BufferKind.SinglePixel {
+        discard d.comp.solid(display.bkey(b), info.color)
+        return
+    }
+    guard info.kind == server.BufferKind.Dmabuf else {
+        return
+    }
+    let ok = d.comp.import_dmabuf(display.bkey(b), d.srv.dmabuf(b))
+    d.srv.imported(b, ok)
+}
+
+fn buffer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer) {
+    let bk = display.bkey(b)
+    guard not d.be.holds(bk) else {
+        return
+    }
+    // Still shown: the texture lives until the surface moves on.
+    var used = false
+    d.surfs.each(fn(s, sf) {
+        used = used or sf.buffer == Some(b)
+    })
+    if not used {
+        d.be.forget(bk)
+        if d.comp.has(bk) {
+            d.comp.forget(bk)
+        }
+    }
+}
+
+/// Release `b` once every output that may still read it has shown a newer
+/// frame (now when none does).
+fn release_later[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer, s: server.Surface, rel_fd: int, rel_point: u64) {
+    var held = false
+    for o in 0..d.outs.len() {
+        if d.outs[o].alive and (d.drawn[o].contains(s) or d.be.holds(display.bkey(b))) {
+            d.releases[o].push(b)
+            if rel_fd >= 0 {
+                d.points[o].push((rel_fd, rel_point))
+            }
+            held = true
+            break
+        }
+    }
+    if not held {
+        d.srv.release(b)
+        if rel_fd >= 0 {
+            d.sync.signal(rel_fd, rel_point)
+        }
+        drop_orphan(mut d, b)
+    }
+}
+
+/// A dmabuf the client destroyed while shown: free it now.
+fn drop_orphan[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer) {
+    let bk = display.bkey(b)
+    guard not d.srv.buffer_alive(b) and not d.be.holds(bk) else {
+        return
+    }
+    d.be.forget(bk)
+    if d.comp.has(bk) {
+        d.comp.forget(bk)
+    }
+}
+
+fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
+    if d.waits.txn_layout.is_some() and waits.held_window(d, s) {
+        if not d.waits.held.contains(s) {
+            d.waits.held.push(s)
+        }
+        return
+    }
+    let info = d.srv.info(s)
+    var dmg: List[server.Rect] = []
+    var bdmg: List[server.Rect] = []
+    let changed = d.srv.take_changes(s, mut dmg, mut bdmg)
+    var sf = d.surfs.get(s).unwrap_or(display.Surf {})
+    // Damage in buffer pixels.
+    var rects: List[(i32, i32, i32, i32)] = []
+    for r in bdmg {
+        rects.push((r.x, r.y, r.w, r.h))
+    }
+    for r in dmg {
+        if info.transform == 0 and info.src[2] < 0.0 {
+            let k = info.scale
+            rects.push((r.x * k, r.y * k, r.w * k, r.h * k))
+        } else {
+            rects.clear()
+            break
+        }
+    }
+    if changed & server.changed_buffer != 0 {
+        let old = sf.buffer
+        let new = info.buffer
+        if old != new {
+            if let Some(ob) = old {
+                if d.srv.buffer(ob).kind != server.BufferKind.Shm or not d.srv.buffer_alive(ob) {
+                    release_later(mut d, ob, s, sf.rel_fd, sf.rel_point)
+                }
+            }
+        }
+        sf.buffer = new
+        match new {
+            None => sf.tex = 0
+            Some(b) => {
+                let bi = d.srv.buffer(b)
+                if bi.kind != server.BufferKind.Shm {
+                    sf.tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
+                    if sf.tex == 0 {
+                        sf.buffer = None
+                    }
+                } else {
+                    sf.tex = if d.comp.shm_commit(display.skey(s), bi.width, bi.height, bi.format, rects) { display.skey(s) } else { 0 }
+                    // Coalesce: a buffer not uploaded yet is replaced uncopied.
+                    if let Some(p) = sf.pending {
+                        if p != b {
+                            d.srv.release(p)
+                        }
+                    }
+                    sf.pending = Some(b)
+                    if not d.pending_shm.contains(s) {
+                        d.pending_shm.push(s)
+                    }
+                }
+            }
+        }
+        match d.srv.release_point(s) {
+            Some((fd, point)) => {
+                sf.rel_fd = fd
+                sf.rel_point = point
+            }
+            None => sf.rel_fd = -1
+        }
+    }
+    if not rects.is_empty() {
+        var bb = (rects[0].0, rects[0].1, rects[0].0 + rects[0].2, rects[0].1 + rects[0].3)
+        for r in rects {
+            bb = (min(bb.0, r.0), min(bb.1, r.1), max(bb.2, r.0 + r.2), max(bb.3, r.1 + r.3))
+        }
+        sf.dmg = (bb.0, bb.1, bb.2 - bb.0, bb.3 - bb.1)
+    } else {
+        sf.dmg = (0, 0, info.buffer_width, info.buffer_height)
+    }
+    discard d.surfs.insert(s, sf)
+    if changed & (server.changed_damage | server.changed_buffer) != 0 {
+        d.comp.commit(display.skey(s), rects)
+        mark_dirty_for(mut d, s)
+    }
+    for si in 0..d.seats.len() {
+        if d.seats[si].cursor_surface == Some(s) {
+            seats.client_cursor_on(mut d, si, s)
+        }
+    }
+    if changed & (server.changed_buffer | server.changed_geometry | server.changed_tree | server.changed_opaque) != 0 {
+        place.rebuild(mut d)
+    }
+}
+
+/// Outputs showing `s` have something to draw.
+fn mark_dirty_for[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
+    guard let Some((gx, gy, sc)) = d.origins.get(s) else {
+        return
+    }
+    let info = d.srv.info(s)
+    for o in 0..d.outs.len() {
+        guard d.outs[o].alive else {
+            continue
+        }
+        let out = d.outs[o]
+        if gx < out.x + out.lw() and gy < out.y + out.lh() and gx + f64(info.width) * sc > out.x and gy + f64(info.height) * sc > out.y {
+            d.outs[o].dirty = true
+        }
+    }
+}
+
+fn surface_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
+    d.comp.forget(display.skey(s))
+    d.pending_shm.retain(fn(x) => x != s)
+    if let Some(sf) = d.surfs.remove(s) {
+        if let Some(p) = sf.pending {
+            d.srv.release(p)
+        }
+        if let Some(b) = sf.buffer {
+            var used = false
+            d.surfs.each(fn(_, other) {
+                used = used or other.buffer == Some(b)
+            })
+            if not used {
+                drop_orphan(mut d, b)
+            }
+        }
+    }
+    discard d.origins.remove(s)
+    discard d.surf_keys.remove(display.skey(s))
+    discard d.surf_window.remove(s)
+    for si in 0..d.seats.len() {
+        if d.seats[si].focus == Some(s) {
+            d.seats[si].focus = None
+        }
+        if d.seats[si].layer_focus == Some(s) {
+            d.seats[si].layer_focus = None
+        }
+        if d.seats[si].grab == Some(s) {
+            d.seats[si].grab = None
+        }
+        if d.seats[si].pointer_on == Some(s) {
+            d.seats[si].pointer_on = None
+        }
+        if d.seats[si].constrained == Some(s) {
+            d.seats[si].constrained = None
+        }
+        if d.seats[si].cursor_surface == Some(s) {
+            d.seats[si].cursor_surface = None
+            seats.set_cursor_named_on(mut d, si, "default")
+        }
+    }
+    for o in 0..d.outs.len() {
+        d.drawn[o].retain(fn(x) => x != s)
+    }
+    d.waits.fifo.retain(fn(f) => f.0 != s)
+    place.rebuild(mut d)
+}
+
+/// Configure a popup inside the output under its parent.
+fn configure_popup[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], p: server.Popup) {
+    var bounds = server.Rect {}
+    if let Some(parent) = d.srv.popup_parent(p) {
+        if let Some((gx, gy, sc)) = d.origins.get(parent) {
+            let geo = d.srv.info(parent).geometry
+            let ax = gx + f64(geo.x) * sc
+            let ay = gy + f64(geo.y) * sc
+            let o = place.output_at(d, ax, ay)
+            if o >= 0 {
+                let out = d.outs[o]
+                bounds = server.Rect { x: i32((out.x - ax) / sc), y: i32((out.y - ay) / sc), w: i32(out.lw() / sc), h: i32(out.lh() / sc) }
+            }
+        }
+    }
+    discard d.srv.configure_popup(p, bounds)
+}
+
+/// Dismiss grabbing popups on seat `si`.
+fn dismiss_popups_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    var k = d.seats[si].grabs.len() - 1
+    while k >= 0 {
+        d.srv.dismiss(d.seats[si].grabs[k])
+        k -= 1
+    }
+    d.seats[si].grabs.clear()
+    shell.update_keyboard_on(mut d, si)
+}
+
+/// Dismiss every grabbing popup across all seats (used by screen lock).
+fn dismiss_popups_all[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    for si in 0..d.seats.len() {
+        dismiss_popups_on(mut d, si)
+    }
+}
+
+/// Dismiss every grabbing popup on seat 0.
+fn dismiss_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    dismiss_popups_on(mut d, 0)
+}
+
+/// Keyboard focus back to the window after popups go.
+fn refocus[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    shell.update_keyboard(mut d)
+}

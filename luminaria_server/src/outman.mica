@@ -316,7 +316,7 @@ fn config_head(mut srv: server.Server, ci: u32, ch: wom.ConfigurationHead, take 
             }
             srv.configs.items[i].heads[at].mode = Some((w, h, mhz))
         }
-        SetPosition(px, py) => srv.configs.items[i].heads[at].position = Some((px, py))
+        SetPosition(px, py) => srv.configs.items[i].heads[at].position = Some((ids.clamp(px), ids.clamp(py)))
         SetTransform(t) => srv.configs.items[i].heads[at].transform = Some(u32(t))
         SetScale(sc) => {
             guard sc > 0.0 else {

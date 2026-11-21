@@ -1,0 +1,173 @@
+// Screen and window capture: copies into client buffers.
+
+import std.mem
+import std.time
+import luminaria_types as types
+import luminaria_server as server
+import plug
+import display
+import outputs
+import frames
+
+/// Captures in progress.
+struct Captures {
+    fences: List[CapFence] = []
+    /// Output captures waiting for the next frame of their output.
+    outputs: List[server.CaptureReq] = []
+    /// Windows whose captures wait for the next frame.
+    windows: List[server.Window] = []
+}
+
+struct CapFence {
+    session: u32
+    buf: server.Buffer
+    fd: int
+    ns: int
+    used: bool = true
+}
+
+fn add_cap_fence[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], session: u32, buf: server.Buffer, fd: int, ns: int) {
+    var k = -1
+    for i in 0..d.caps.fences.len() {
+        if not d.caps.fences[i].used {
+            k = i
+            break
+        }
+    }
+    if k < 0 {
+        d.caps.fences.push(CapFence { session, buf, fd, ns })
+        k = d.caps.fences.len() - 1
+    } else {
+        d.caps.fences[k] = CapFence { session, buf, fd, ns }
+    }
+    discard d.poll.add(fd, display.tok_cap + k, true, false)
+}
+
+fn has_pending_output_dmabuf[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], so: server.Output) -> bool {
+    for req in d.caps.outputs {
+        match req.target {
+            Output(o) => {
+                if o == so {
+                    return true
+                }
+            }
+            _ => {}
+        }
+    }
+    return false
+}
+
+fn window_placements[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window, mut out: List[types.Placement]) -> (i32, i32) {
+    out.clear()
+    guard d.srv.window_alive(w) and d.srv.mapped(w) else {
+        return (0, 0)
+    }
+    let s = d.srv.window_surface(w)
+    let info = d.srv.info(s)
+    let geo = info.geometry
+    let gw = if geo.w > 0 and geo.h > 0 { geo.w } else { info.width }
+    let gh = if geo.w > 0 and geo.h > 0 { geo.h } else { info.height }
+    guard gw > 0 and gh > 0 else {
+        return (0, 0)
+    }
+    let ox = if geo.w > 0 and geo.h > 0 { geo.x } else { 0 }
+    let oy = if geo.w > 0 and geo.h > 0 { geo.y } else { 0 }
+    var tree: List[(server.Surface, i32, i32)] = []
+    d.srv.tree(s, mut tree)
+    for (ts, dx, dy) in tree {
+        guard let Some(sf) = d.surfs.get(ts) else {
+            continue
+        }
+        guard sf.tex != 0 else {
+            continue
+        }
+        let tinfo = d.srv.info(ts)
+        let opq = if tinfo.alpha < 1.0 { server.Rect {} } else { d.srv.opaque(ts) }
+        var src = types.Rect {}
+        if tinfo.src[2] > 0.0 {
+            let bs = f64(tinfo.scale)
+            src = types.Rect { x: f32(tinfo.src[0] * bs), y: f32(tinfo.src[1] * bs), w: f32(tinfo.src[2] * bs), h: f32(tinfo.src[3] * bs) }
+        }
+        out.push(types.Placement {
+            key: display.skey(ts),
+            tex: sf.tex,
+            x: f32(dx - ox),
+            y: f32(dy - oy),
+            w: f32(tinfo.width),
+            h: f32(tinfo.height),
+            src,
+            transform: tinfo.transform,
+            opacity: tinfo.alpha,
+            opaque: types.Rect { x: f32(opq.x), y: f32(opq.y), w: f32(opq.w), h: f32(opq.h) },
+        })
+    }
+    return (gw, gh)
+}
+
+/// Process pending window shm captures and dmabuf capture requests.
+fn finish_captures[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    var reqs: List[server.CaptureReq] = []
+    d.srv.capture_dmabuf_requests(mut reqs)
+    if not reqs.is_empty() or not d.caps.windows.is_empty() {
+        frames.upload_pending(mut d)
+    }
+    var ps: List[types.Placement] = []
+    for req in reqs {
+        match req.target {
+            Output(so) => {
+                let oi = outputs.out_index(d, so)
+                if oi >= 0 {
+                    d.caps.outputs.push(req)
+                    d.outs[oi].dirty = true
+                } else {
+                    d.srv.capture_fail(req.session, 3)
+                    d.srv.release(req.buffer)
+                }
+            }
+            Window(w) => {
+                let (gw, gh) = window_placements(d, w, mut ps)
+                guard gw > 0 and gh > 0 and gw == req.width and gh == req.height else {
+                    d.srv.capture_fail(req.session, 2)
+                    d.srv.release(req.buffer)
+                    continue
+                }
+                let dbuf = d.srv.dmabuf(req.buffer)
+                let r = d.comp.render_offscreen_dmabuf(dbuf, ps)
+                match r {
+                    Ok(fd) => {
+                        if fd >= 0 {
+                            add_cap_fence(mut d, req.session, req.buffer, fd, time.now_ns())
+                        } else {
+                            d.srv.capture_done(req.session, time.now_ns())
+                            d.srv.release(req.buffer)
+                        }
+                    }
+                    Err => {
+                        if d.comp.device_lost() {
+                            discard frames.recover_gpu(mut d)
+                        }
+                        d.srv.capture_fail(req.session, 1)
+                        d.srv.release(req.buffer)
+                    }
+                }
+            }
+        }
+    }
+    for w in mem.replace(mut d.caps.windows, []) {
+        guard d.srv.capture_window_waiting(w) else {
+            continue
+        }
+        let (gw, gh) = window_placements(d, w, mut ps)
+        guard gw > 0 and gh > 0 else {
+            continue
+        }
+        match d.comp.render_offscreen(u32(gw), u32(gh), ps) {
+            Ok(px) => d.srv.capture_window(w, px, gw, gh, time.now_ns())
+            Err => {
+                if d.comp.device_lost() {
+                    discard frames.recover_gpu(mut d)
+                }
+            }
+        }
+    }
+}

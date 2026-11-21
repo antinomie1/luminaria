@@ -51,6 +51,8 @@
 - **光标**：光标平面上一个 dumb buffer（尺寸取 `DRM_CAP_CURSOR_WIDTH/HEIGHT`），换图像时整行拷贝、
   只清图像没盖到的部分。指针移动产生一个只含光标的请求，由提交线程在下一个 vblank 前提交；帧先到就并进
   帧的提交。光标显示的是 vblank 前最后的位置，而不是帧开始时的位置。
+- **其他**：`set_mode` 换模式（下一帧按新尺寸重建缓冲）、`enable` 关屏（`ACTIVE` 0）、`set_vrr`、
+  udev 热插拔（重扫连接器，增删输出）、`probe` 只读列出已连接的显示器而不接管。
 
 ## 提交线程
 
@@ -78,10 +80,11 @@ DRM 会话里事件循环（调用 `lum.open` 的线程）优先级 50、提交�
 输入提速：有 libinput 事件时，每 500 ms 至多一次把 CLOCK_MONOTONIC 毫秒数写进
 `$XDG_RUNTIME_DIR/luminaria-input-boost`（文件由调频守护进程创建；不存在时只是每 500 ms 一次失败的
 open），让它在输入引起的那一帧之前提频。
-- **其他**：`set_mode` 换模式（下一帧按新尺寸重建缓冲）、`enable` 关屏（`ACTIVE` 0）、`set_vrr`、
-  udev 热插拔（重扫连接器，增删输出）、`probe` 只读列出已连接的显示器而不接管。
 
 ## 会话与输入设备
+
+都在 `devices.mica` 的 `Devices` 里：DRM 后端用 `Devices.open`，无头后端用 `Devices.none()`（只有按 seat 的
+keymap），自己的输出端也可以内嵌它（见 [api.md](api.md#换输出端和渲染器)）。
 
 - **libseat**（seatd、logind 或 noop）：设备经它打开，切 VT 时被收回。禁用时停止提交、暂停 libinput；
   恢复时重新模式设置、恢复 libinput，发 `Session`。
@@ -90,7 +93,7 @@ open），让它在输入引起的那一帧之前提频。
   并将非空 seat 的输入包装成 `Event.InputOn(seat, input)`。键和按钮按 seat 计数，只报第一次按下和
   最后一次抬起。指针（相对、绝对）、滚动（滚轮 v120、手指、连续）、触摸、滑动 / 捏合 / 按住手势、
   设备增删都变成纯数据的 `Input`。`configure_input` 设置轻触点击、自然滚动、加速、左手、禁用。
-- **xkb**：按 RMLVO 名字编译 keymap，支持主 seat 与 `extra_kbs` 辅助 seat（`keymap_on`、`mods_on`、
+- **xkb**：按 RMLVO 名字编译 keymap，主 seat 一份，其他逻辑 seat 各一份（`keymap_on`、`mods_on`、
   `set_keymap_on` 及 `Event.KeymapOn(seat)`）；键在这里就算出 keysym 和文字；序列化的修饰键变化时
   按 seat 单独报出。每个 seat 各自维护一块共享只读 keymap memfd 给客户端映射。
 

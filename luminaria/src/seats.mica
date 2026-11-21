@@ -1,0 +1,170 @@
+// Seats: their keymaps and cursors.
+
+import std.os
+import std.time
+import luminaria_types as types
+import luminaria_types.pixels as pixels
+import luminaria_server as server
+import cursor
+import plug
+import display
+import place
+
+struct SeatState {
+    name: str = "seat0"
+    seat: server.Seat = server.Seat { id: server.ids.Id {} }
+    focus: Option[server.Surface] = None
+    layer_focus: Option[server.Surface] = None
+    grabs: List[server.Popup] = []
+    px: f64 = 0.0
+    py: f64 = 0.0
+    buttons: int = 0
+    grab: Option[server.Surface] = None
+    pointer_on: Option[server.Surface] = None
+    constrained: Option[server.Surface] = None
+    cursor: cursor.Image = cursor.Image {}
+    /// The cursor is shown by the backend (hardware plane / parent);
+    /// secondary seats always draw via renderer textures.
+    cursor_hw: bool = false
+    cursor_surface: Option[server.Surface] = None
+    cursor_hx: i32 = 0
+    cursor_hy: i32 = 0
+    cursor_key: u64 = 0x7fffffffffffffff
+    repeat_rate: i32 = 25
+    repeat_delay: i32 = 600
+}
+
+fn seat_index[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], s: server.Seat) -> int {
+    if s.id.gen == 0 {
+        return if d.seats.is_empty() { -1 } else { 0 }
+    }
+    for i in 0..d.seats.len() {
+        if d.seats[i].seat == s {
+            return i
+        }
+    }
+    return -1
+}
+
+fn seat_by_name[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], name: str) -> int {
+    if name.is_empty() or name == "seat0" or name == "default" {
+        return if d.seats.is_empty() { -1 } else { 0 }
+    }
+    for i in 0..d.seats.len() {
+        if d.seats[i].name == name {
+            return i
+        }
+    }
+    return -1
+}
+
+fn ensure_seat[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], name: str) -> int {
+    let i = seat_by_name(d, name)
+    if i >= 0 {
+        return i
+    }
+    discard d.add_seat(name)
+    return d.seats.len() - 1
+}
+
+fn send_keymap_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let (fd, size) = d.be.keymap_on(d.seats[si].name)
+    if fd >= 0 {
+        if let Ok(dup) = os.dup(fd) {
+            d.srv.set_keymap(d.seats[si].seat, dup, size)
+        }
+    }
+}
+
+fn send_keymap[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    send_keymap_on(mut d, 0)
+}
+
+fn set_cursor_image_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, take img: cursor.Image) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let hw = si == 0 and d.be.set_cursor(img.pixels, img.width, img.height, img.hot_x, img.hot_y)
+    let ckey = d.seats[si].cursor_key
+    d.seats[si].cursor_hw = hw
+    if hw or img.width == 0 {
+        d.comp.forget(ckey)
+    } else {
+        discard d.comp.image(ckey, img.width, img.height, types.buffer.argb8888, img.pixels, int(img.width) * 4)
+        let all: List[(i32, i32, i32, i32)] = []
+        d.comp.commit(ckey, all)
+    }
+    d.seats[si].cursor = img
+    move_cursor_on(mut d, si)
+    if not hw {
+        place.rebuild(mut d)
+    }
+}
+
+/// Show cursor `name` of the theme on seat `si`.
+fn set_cursor_named_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, name: str) {
+    let img = cursor.load(name, d.cursor_size)
+    set_cursor_image_on(mut d, si, img)
+}
+
+fn hide_cursor_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    set_cursor_image_on(mut d, si, cursor.Image {})
+    if si == 0 {
+        for o in 0..d.outs.len() {
+            d.be.move_cursor(u32(o), None)
+        }
+    }
+}
+
+/// A client's cursor surface (shm) on seat `si`: its pixels become the cursor.
+fn client_cursor_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, s: server.Surface) {
+    let info = d.srv.info(s)
+    guard let Some(b) = info.buffer else {
+        hide_cursor_on(mut d, si)
+        return
+    }
+    let bi = d.srv.buffer(b)
+    guard bi.kind == server.BufferKind.Shm else {
+        return
+    }
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    var img = cursor.Image { width: bi.width, height: bi.height, hot_x: d.seats[si].cursor_hx * info.scale, hot_y: d.seats[si].cursor_hy * info.scale }
+    discard d.srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+        img.pixels = pixels.pack(bytes, stride, int(bi.width) * 4, int(bi.height))
+    })
+    if bi.format == types.buffer.xrgb8888 {
+        pixels.opaque(mut img.pixels)
+    }
+    d.srv.release(b)
+    let ms = u32((time.now_ns() / 1000000) & 0xffffffff)
+    d.srv.frame_done(s, ms)
+    set_cursor_image_on(mut d, si, img)
+}
+
+/// Put seat `si`'s cursor where its pointer is, on every output.
+fn move_cursor_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    if not d.seats[si].cursor_hw or si != 0 {
+        if d.comp.has(d.seats[si].cursor_key) {
+            place.rebuild(mut d)
+        }
+        return
+    }
+    for o in 0..d.outs.len() {
+        let out = d.outs[o]
+        guard out.alive else {
+            continue
+        }
+        let x = i32((d.seats[si].px - out.x) * out.scale) - d.seats[si].cursor.hot_x
+        let y = i32((d.seats[si].py - out.y) * out.scale) - d.seats[si].cursor.hot_y
+        let inside = x < out.width and y < out.height and x + d.seats[si].cursor.width > 0 and y + d.seats[si].cursor.height > 0
+        d.be.move_cursor(u32(o), if inside and d.seats[si].cursor.width > 0 { Some((x, y)) } else { None })
+    }
+}

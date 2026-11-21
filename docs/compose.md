@@ -37,9 +37,8 @@ DRM 节点；DRM 后端时把主平面能直接扫描输出的组合放在单独
 
 ## 放置表落地
 
-合成器给的是一张全局逻辑坐标的放置表。每次布局、表面树或尺寸变化、动画推进时重建；重建过程复用
-`per_scratch`、`masks_scratch`、`tree_scratch`、`popups_by_root` 等缓冲，稳态不拷贝整个放置表或弹出菜单表，
-不分配临时 `Map`/`List`，并按表面 key 建立 O(1) 索引：
+合成器给的是一张全局逻辑坐标的放置表。每次布局、表面树或尺寸变化、动画推进时重建；重建过程（`place.mica`）复用
+上一次的暂存缓冲，稳态不拷贝整个放置表或弹出菜单表，不分配临时 `Map`/`List`，并按表面 key 建立 O(1) 索引：
 
 1. 先将弹出菜单按根表面预索引到 `popups_by_root`，并在没有 layer 表面时走快速路径跳过遍历；
 2. 对每个窗口：取表面树（子表面按叠放顺序，带偏移），窗口几何原点对齐到布局位置，乘上 `scale`；
@@ -99,18 +98,20 @@ DRM 节点；DRM 后端时把主平面能直接扫描输出的组合放在单独
    图像交给客户端；输出 dmabuf 截屏由 `copy_dmabuf` 在 GPU 上零拷贝复制目标像素并返回 `sync_file`，
    窗口截屏由 `render_offscreen` / `render_offscreen_dmabuf` 独立渲染窗口表面树而不污染主输出场景，
    `sync_file` 进入 epoll 就绪后才发 `ready` 并触发 `wl_buffer.release`。
+5. 给这一帧可见的表面发帧回调；看不见的表面不发，它们自然停帧。
+6. 翻转完成（`Presented`）：给这些表面发呈现反馈、解除 fifo 屏障，释放到期的缓冲和释放点，更新时钟，
+   再看是否还要调度下一帧。
 
-## GPU 优先级与设备丢失恢复
+## 设备内存、GPU 优先级与设备丢失恢复
 
+- 设备内存按内存类型分块：块从 4 MiB 起、每新开一块翻倍，到 64 MiB（小堆的 1/8）为止；超过最大块一半的
+  请求单独分配；空出的块除每类最后一块外立即释放。嵌套运行一个 foot 时显存约 17 MB、GTT 约 20 MB。
 - 打开 Vulkan 设备时按 `Realtime` -> `High` -> `Medium` -> `Default` 尝试请求 `VK_KHR/EXT_global_priority`，
   不受特权许可或扩展缺失时静默回退，实际授予值记入 `Stats.gpu_priority`。
 - 遇到 `VK_ERROR_DEVICE_LOST`（提交、等待或取得目标失败时）：`Display` 调用 `be.reset_targets`
   回收显示端持有的目标，`comp.recover` 在保持相同 `dev.id` 与对外句柄的同时重建 `vk.Device` 与管线，
   `Display` 随后为活跃窗口、shm 表面、单像素、dmabuf、合成器图像和软件光标重新上传或导入纹理并重建
   场景，最后发出 `Event.GpuReset`，计入 `Stats.gpu_resets`。
-5. 给这一帧可见的表面发帧回调；看不见的表面不发，它们自然停帧。
-6. 翻转完成（`Presented`）：给这些表面发呈现反馈、解除 fifo 屏障，释放到期的缓冲和释放点，更新时钟，
-   再看是否还要调度下一帧。
 
 ## 测量
 

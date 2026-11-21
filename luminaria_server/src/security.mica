@@ -11,6 +11,26 @@ import luminaria_proto.security_context as sc
 import state
 import server
 
+// Resolved at run time: the build's C headers declare it with types Mica
+// does not spell.
+extern table Libc {
+    fn getsockopt(fd: i32, level: i32, name: i32, val: Ptr[i32], len: Ptr[u32]) -> i32 = "getsockopt"
+}
+
+/// Whether `fd` is a socket that listens (SO_ACCEPTCONN): anything else
+/// would never take a client, nor hang up.
+fn listening(fd: int) -> bool {
+    guard let Ok(c) = Libc.open("libc.so.6") else {
+        return false
+    }
+    var on: i32 = 0
+    var len: u32 = 4
+    unsafe {
+        let r = c.getsockopt(i32(fd), 1, 30, Ptr.of_mut(mut on), Ptr.of_mut(mut len))
+        return r == 0 and on != 0
+    }
+}
+
 /// Globals a sandboxed client cannot see or bind.
 fn privileged(iface: u16) -> bool {
     let hidden: [12]u16 = [
@@ -42,7 +62,7 @@ fn manager(mut srv: server.Server, ci: u32, take req: sc.ContextManagerRequest) 
                 srv.fail(ci, ctx.id, u32(sc.ContextManagerError.Nested), "a sandboxed client cannot make sandboxes")
                 return
             }
-            guard (net.Listener { fd: listen.raw() }).set_nonblocking(true).is_ok() else {
+            guard listening(listen.raw()) and (net.Listener { fd: listen.raw() }).set_nonblocking(true).is_ok() else {
                 srv.fail(ci, ctx.id, u32(sc.ContextManagerError.InvalidListenFd), "not a listening socket")
                 return
             }

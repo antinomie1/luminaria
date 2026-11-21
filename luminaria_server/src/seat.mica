@@ -120,7 +120,7 @@ fn pointer_request(mut srv: server.Server, ci: u32, p: wl.Pointer, take req: wl.
                     surf = Some(ids.Surface { id: srv.surfaces.id(c) })
                 }
             }
-            srv.push(server.Event.Cursor(ids.Seat { id: srv.seats.id(si) }, surf, hx, hy))
+            srv.push(server.Event.Cursor(ids.Seat { id: srv.seats.id(si) }, surf, ids.clamp(hx), ids.clamp(hy)))
         }
         Release => {
             srv.unbind(ci, p.id)

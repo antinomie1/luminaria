@@ -1,15 +1,49 @@
-// The two seams of a Display: where frames go and input comes from (an
-// Output) and what draws the frames (a Renderer). luminaria_backend's
-// Backend and luminaria_compose's Compositor are the built-in ones; a type
-// with the same methods plugs in instead (traits are structural, and
-// Display is monomorphized: no indirection). They meet only through
-// luminaria_types: an output asks for render targets, the renderer makes
-// them (dmabufs to show), draws into one and hands back a fence. Methods
-// with bodies are optional capabilities.
+// The seams of a Display: where frames go (an Output, which is also the
+// Input its keyboards and devices come through) and what draws the frames
+// (a Renderer). luminaria_backend's Backend and luminaria_compose's
+// Compositor are the built-in ones; a type with the same methods plugs in
+// instead (traits are structural, and Display is monomorphized: no
+// indirection). They meet only through luminaria_types: an output asks for
+// render targets, the renderer makes them (dmabufs to show), draws into one
+// and hands back a fence. Methods with bodies are optional capabilities.
 
 import luminaria_types as types
 
-pub trait Output {
+/// Keyboards and input devices behind an output, all optional: an output
+/// without them gets input through `Display.inject`. Its input events come
+/// out of the output's `next`. luminaria_backend's `Devices` (libseat,
+/// libinput, xkb) is one to embed in an output of your own.
+pub trait Input {
+    /// The keymap for clients: memfd and size (-1: none yet).
+    fn keymap(self) -> (int, u32) {
+        return (-1, 0)
+    }
+    fn mods(self) -> types.Mods {
+        return types.Mods {}
+    }
+    fn set_keymap(mut self, names: types.Names) -> Result[(), str] {
+        return Err("this output has no keyboard")
+    }
+    /// Keymap for a named seat (memfd and size); defaults to `keymap`.
+    fn keymap_on(self, seat: str) -> (int, u32) {
+        return self.keymap()
+    }
+    fn mods_on(self, seat: str) -> types.Mods {
+        return self.mods()
+    }
+    fn set_keymap_on(mut self, seat: str, names: types.Names) -> Result[(), str] {
+        return self.set_keymap(names)
+    }
+    fn assign_device_seat(mut self, device: u32, seat: str) -> bool {
+        return false
+    }
+    fn configure_input(mut self, device: u32, c: types.InputConfig) {}
+    fn switch_vt(self, n: int) {}
+}
+
+/// Where frames go. Every output is also an Input (with nothing to do by
+/// default).
+pub trait Output: Input {
     /// Its next event (outputs added and removed, frames presented,
     /// input, the session), None when there is none.
     fn next(mut self) -> Option[types.Event]
@@ -48,18 +82,6 @@ pub trait Output {
         return false
     }
     fn move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {}
-    /// The keymap for clients: memfd and size (-1: none yet).
-    fn keymap(self) -> (int, u32) {
-        return (-1, 0)
-    }
-    fn mods(self) -> types.Mods {
-        return types.Mods {}
-    }
-    fn set_keymap(mut self, names: types.Names) -> Result[(), str] {
-        return Err("this output has no keyboard")
-    }
-    fn configure_input(mut self, device: u32, c: types.InputConfig) {}
-    fn switch_vt(self, n: int) {}
     /// The display's DRM device (dev_t) and the modifiers output `o` can
     /// scan out (linux-dmabuf feedback).
     fn scanout_device(self) -> u64 {
@@ -91,19 +113,6 @@ pub trait Output {
     fn clear_overlays(mut self, o: u32) {}
     /// Drop scanout targets so they can be recreated after a GPU reset.
     fn reset_targets(mut self, mut retired: List[u64]) {}
-    /// Keymap for a named seat (memfd and size); defaults to `keymap`.
-    fn keymap_on(self, seat: str) -> (int, u32) {
-        return self.keymap()
-    }
-    fn mods_on(self, seat: str) -> types.Mods {
-        return self.mods()
-    }
-    fn set_keymap_on(mut self, seat: str, names: types.Names) -> Result[(), str] {
-        return self.set_keymap(names)
-    }
-    fn assign_device_seat(mut self, device: u32, seat: str) -> bool {
-        return false
-    }
 }
 
 pub trait Renderer {

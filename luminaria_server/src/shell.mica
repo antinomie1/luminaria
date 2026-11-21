@@ -61,8 +61,8 @@ fn layer_surface(mut srv: server.Server, ci: u32, l: ls.Surface, take req: ls.Su
     match req {
         SetSize(w, h) => {
             let si = pending(mut srv, li)
-            srv.surfaces.items[si].pending.layer.width = i32(w)
-            srv.surfaces.items[si].pending.layer.height = i32(h)
+            srv.surfaces.items[si].pending.layer.width = i32(min(w, u32(ids.limit)))
+            srv.surfaces.items[si].pending.layer.height = i32(min(h, u32(ids.limit)))
         }
         SetAnchor(a) => {
             let si = pending(mut srv, li)
@@ -70,11 +70,11 @@ fn layer_surface(mut srv: server.Server, ci: u32, l: ls.Surface, take req: ls.Su
         }
         SetExclusiveZone(z) => {
             let si = pending(mut srv, li)
-            srv.surfaces.items[si].pending.layer.exclusive = z
+            srv.surfaces.items[si].pending.layer.exclusive = ids.clamp(z)
         }
         SetMargin(t, r, b, lm) => {
             let si = pending(mut srv, li)
-            srv.surfaces.items[si].pending.layer.margin = [t, r, b, lm]
+            srv.surfaces.items[si].pending.layer.margin = [ids.clamp(t), ids.clamp(r), ids.clamp(b), ids.clamp(lm)]
         }
         SetKeyboardInteractivity(k) => {
             guard u32(k) <= 2 else {

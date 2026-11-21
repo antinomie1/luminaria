@@ -68,7 +68,7 @@ fn pool(mut srv: server.Server, ci: u32, p: wl.ShmPool, take req: wl.ShmPoolRequ
                 return
             }
             let size = srv.pools.items[i].size
-            guard w > 0 and h > 0 and offset >= 0 and stride >= w * 4 and int(offset) + int(stride) * int(h) <= size else {
+            guard w > 0 and h > 0 and offset >= 0 and int(stride) >= int(w) * 4 and int(offset) + int(stride) * int(h) <= size else {
                 srv.fail(ci, p.id, u32(wl.ShmError.InvalidStride), "buffer {w}x{h} stride {stride} at {offset} in a {size}-byte pool")
                 return
             }

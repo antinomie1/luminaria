@@ -1,0 +1,594 @@
+// Input routing: pointer, keyboard, touch and gestures to clients, with
+// grabs, constraints and the default actions of `accept`.
+
+import std.os
+import std.time
+import luminaria_types as types
+import luminaria_server as server
+import shell
+import plug
+import display
+import outputs
+import clients
+import place
+import seats
+import manipulation
+
+fn source_code(s: types.AxisSource) -> u32 {
+    return match s {
+        Wheel => 0
+        Finger => 1
+        Continuous => 2
+        WheelTilt => 3
+    }
+}
+
+/// Keep seat `si`'s pointer on some output.
+fn clamp_pointer_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let px = d.seats[si].px
+    let py = d.seats[si].py
+    guard place.output_at(d, px, py) < 0 else {
+        return
+    }
+    var best = -1
+    var bd: f64 = 1.0e18
+    for o in 0..d.outs.len() {
+        let out = d.outs[o]
+        guard out.alive else {
+            continue
+        }
+        let cx = px.clamp(out.x, out.x + out.lw() - 1.0)
+        let cy = py.clamp(out.y, out.y + out.lh() - 1.0)
+        let desc = (cx - px) * (cx - px) + (cy - py) * (cy - py)
+        if desc < bd {
+            bd = desc
+            best = o
+        }
+    }
+    if best >= 0 {
+        let out = d.outs[best]
+        d.seats[si].px = px.clamp(out.x, out.x + out.lw() - 1.0)
+        d.seats[si].py = py.clamp(out.y, out.y + out.lh() - 1.0)
+    }
+}
+
+fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, take i: types.Input) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let st = d.seats[si].seat
+    let sname = d.seats[si].name.clone()
+    d.srv.input_activity_on(st, time.now_ns())
+    match take i {
+        Key(t, code, pressed, sym, text) => {
+            let mods = d.be.mods_on(sname)
+            d.emit(display.Event.Key(display.Key { seat: st, time: t, code, sym, text, pressed, mods }))
+        }
+        Modifiers(desc, l, k, g) => {
+            // Clients always see the modifier state, bindings or not.
+            d.srv.modifiers(st, desc, l, k, g)
+            let m = d.be.mods_on(sname)
+            if si == 0 {
+                d.emit(display.Event.Modifiers(m))
+            } else {
+                d.emit(display.Event.ModifiersOn(st, m))
+            }
+        }
+        Motion(t, dx, dy, rdx, rdy) => {
+            let (x, y) = constrain_on(d, si, d.seats[si].px + dx, d.seats[si].py + dy)
+            d.seats[si].px = x
+            d.seats[si].py = y
+            moved_on(mut d, si, t, dx, dy, rdx, rdy)
+        }
+        MotionAbsolute(t, o, nx, ny) => {
+            let oi = int(o)
+            guard oi < d.outs.len() and d.outs[oi].alive else {
+                return
+            }
+            let x = d.outs[oi].x + nx * d.outs[oi].lw()
+            let y = d.outs[oi].y + ny * d.outs[oi].lh()
+            let dx = x - d.seats[si].px
+            let dy = y - d.seats[si].py
+            let (cx, cy) = constrain_on(d, si, x, y)
+            d.seats[si].px = cx
+            d.seats[si].py = cy
+            moved_on(mut d, si, t, dx, dy, dx, dy)
+        }
+        Button(t, button, pressed) => {
+            if pressed {
+                d.seats[si].buttons += 1
+            } else {
+                d.seats[si].buttons = max(d.seats[si].buttons - 1, 0)
+            }
+            let p = display.Pointer { seat: st, time: t, x: d.seats[si].px, y: d.seats[si].py, button, pressed }
+            if si == 0 {
+                match d.manip.active {
+                    Move or Resize => {
+                        if not pressed and d.seats[0].buttons == 0 {
+                            manipulation.end_manipulation(mut d)
+                        }
+                        return
+                    }
+                    _ => {}
+                }
+            }
+            d.emit(display.Event.Button(p))
+        }
+        Axis(t, src, dx, dy, cx, cy, inv) => {
+            d.emit(display.Event.Scroll(display.Scroll { seat: st, time: t, x: d.seats[si].px, y: d.seats[si].py, dx, dy, v120x: cx, v120y: cy, source: src }))
+        }
+        TouchDown(t, id, o, nx, ny) => {
+            let (x, y) = touch_point(d, int(o), nx, ny)
+            d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Down, id, x, y }))
+        }
+        TouchMotion(t, id, o, nx, ny) => {
+            let (x, y) = touch_point(d, int(o), nx, ny)
+            d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Motion, id, x, y }))
+        }
+        TouchUp(t, id) => d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Up, id }))
+        TouchFrame => d.emit(display.Event.Touch(display.Touch { seat: st, kind: display.TouchKind.Frame }))
+        TouchCancel => d.emit(display.Event.Touch(display.Touch { seat: st, kind: display.TouchKind.Cancel }))
+        SwipeBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeBegin, fingers: f })
+        SwipeUpdate(t, dx, dy) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeUpdate, dx, dy })
+        SwipeEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeEnd, cancelled: c })
+        PinchBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchBegin, fingers: f })
+        PinchUpdate(t, dx, dy, sc, rot) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchUpdate, dx, dy, scale: sc, rotation: rot })
+        PinchEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchEnd, cancelled: c })
+        HoldBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.HoldBegin, fingers: f })
+        HoldEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.HoldEnd, cancelled: c })
+        DeviceAdded(id, desc) => d.emit(display.Event.DeviceAdded(id, desc))
+        DeviceRemoved(id) => d.emit(display.Event.DeviceRemoved(id))
+    }
+}
+
+fn touch_point[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: int, nx: f64, ny: f64) -> (f64, f64) {
+    guard o < d.outs.len() and d.outs[o].alive else {
+        return (nx, ny)
+    }
+    return (d.outs[o].x + nx * d.outs[o].lw(), d.outs[o].y + ny * d.outs[o].lh())
+}
+
+/// The pointer moved on seat `si`: the cursor follows at once, a running
+/// manipulation on seat 0 moves its window, else the compositor hears of it.
+fn moved_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, t: u32, dx: f64, dy: f64, rdx: f64, rdy: f64) {
+    clamp_pointer_on(mut d, si)
+    seats.move_cursor_on(mut d, si)
+    let px = d.seats[si].px
+    let py = d.seats[si].py
+    if si == 0 {
+        match d.manip.active {
+            Move(w, sx, sy, bx, by) => {
+                if let Some(cur) = d.wins.get(w) {
+                    discard d.wins.insert(w, display.Win { off_x: bx + px - sx, off_y: by + py - sy, ..cur })
+                }
+                place.rebuild(mut d)
+                return
+            }
+            Resize(w, edges, sx, sy, w0, h0, ox, oy) => {
+                manipulation.resize_step(mut d, w, edges, sx, sy, w0, h0)
+                return
+            }
+            _ => {}
+        }
+    }
+    d.emit(display.Event.Motion(display.Pointer { seat: d.seats[si].seat, time: t, x: px, y: py, dx, dy, raw_dx: rdx, raw_dy: rdy }))
+}
+
+fn gesture_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, g: display.Gesture) {
+    if si == 0 {
+        match d.manip.active {
+            Pan(vx, vy, last) => {
+                match g.kind {
+                    SwipeUpdate => {
+                        d.manip.pan_x += g.dx
+                        d.manip.pan_y += g.dy
+                        let dt = f64(max(g.time - last, 1))
+                        // Velocity, smoothed over the last updates.
+                        d.manip.active = manipulation.Manip.Pan(vx * 0.5 + g.dx / dt * 0.5, vy * 0.5 + g.dy / dt * 0.5, g.time)
+                        place.rebuild(mut d)
+                    }
+                    SwipeEnd => {
+                        // Inertia runs in `render` until it slows down.
+                        d.animating = true
+                        d.manip.inertia_t = time.now_ns()
+                        for o in 0..d.outs.len() {
+                            d.outs[o].dirty = true
+                        }
+                        d.manip.coasting = not g.cancelled
+                        if g.cancelled {
+                            manipulation.end_manipulation(mut d)
+                        }
+                    }
+                    _ => {}
+                }
+                return
+            }
+            _ => {}
+        }
+    }
+    d.emit(display.Event.Gesture(g))
+}
+
+/// The surface under global `x, y` and the point in its coordinates.
+fn under[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], x: f64, y: f64) -> Option[(server.Surface, f64, f64)] {
+    return d.hits.find(d.srv, x, y)
+}
+
+fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, t: u32) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let st = d.seats[si].seat
+    let px = d.seats[si].px
+    let py = d.seats[si].py
+    var target: Option[(server.Surface, f64, f64)] = None
+    // A drag goes to what is under the pointer, not to the grab.
+    let dragging = d.srv.dragging(st)
+    if d.seats[si].buttons > 0 and not dragging {
+        if let Some(g) = d.seats[si].grab {
+            if let Some((gx, gy, sc)) = d.origins.get(g) {
+                target = Some((g, (px - gx) / sc, (py - gy) / sc))
+            }
+        }
+    }
+    if target.is_none() {
+        target = under(d, px, py)
+    }
+    match target {
+        Some((s, lx, ly)) => {
+            if d.seats[si].pointer_on != Some(s) {
+                d.seats[si].pointer_on = Some(s)
+                d.srv.pointer_focus(st, Some(s), lx, ly)
+            } else if not pointer_locked_on(d, si) {
+                d.srv.pointer_motion(st, t, lx, ly)
+            }
+        }
+        None => {
+            if d.seats[si].pointer_on.is_some() {
+                d.seats[si].pointer_on = None
+                d.srv.pointer_focus(st, None, 0.0, 0.0)
+                if d.seats[si].cursor_surface.is_some() {
+                    d.seats[si].cursor_surface = None
+                    seats.set_cursor_named_on(mut d, si, "default")
+                }
+            }
+        }
+    }
+    update_constraint_on(mut d, si)
+    if dragging and d.srv.drag_icon(st).is_some() {
+        place.rebuild(mut d)
+    }
+}
+
+/// Whether a pointer lock holds seat `si`'s pointer still.
+fn pointer_locked_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: int) -> bool {
+    guard si >= 0 and si < d.seats.len() else {
+        return false
+    }
+    guard let Some(s) = d.seats[si].constrained else {
+        return false
+    }
+    return match d.srv.constraint(d.seats[si].seat, s) {
+        Some(c) => c.active and c.lock
+        None => false
+    }
+}
+
+/// Where seat `si`'s pointer may go on its way to `x, y`.
+fn constrain_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: int, x: f64, y: f64) -> (f64, f64) {
+    guard si >= 0 and si < d.seats.len() else {
+        return (x, y)
+    }
+    guard let Some(s) = d.seats[si].constrained else {
+        return (x, y)
+    }
+    guard let Some(c) = d.srv.constraint(d.seats[si].seat, s) else {
+        return (x, y)
+    }
+    guard c.active else {
+        return (x, y)
+    }
+    let px = d.seats[si].px
+    let py = d.seats[si].py
+    if c.lock {
+        return (px, py)
+    }
+    guard let Some((gx, gy, sc)) = d.origins.get(s) else {
+        return (x, y)
+    }
+    let info = d.srv.info(s)
+    let rects = c.region.clone().unwrap_or([server.Rect { w: info.width, h: info.height }])
+    let lx = (x - gx) / sc
+    let ly = (y - gy) / sc
+    for r in rects {
+        if lx >= f64(r.x) and ly >= f64(r.y) and lx < f64(r.x + r.w) and ly < f64(r.y + r.h) {
+            return (x, y)
+        }
+    }
+    // Outside: clamp into the rectangle the pointer is in now.
+    let cx = (px - gx) / sc
+    let cy = (py - gy) / sc
+    var r = rects.first().unwrap_or(server.Rect {})
+    for q in rects {
+        if cx >= f64(q.x) and cy >= f64(q.y) and cx < f64(q.x + q.w) and cy < f64(q.y + q.h) {
+            r = q
+        }
+    }
+    let nx = min(max(lx, f64(r.x)), f64(r.x + r.w) - 0.01)
+    let ny = min(max(ly, f64(r.y)), f64(r.y + r.h) - 0.01)
+    return (gx + nx * sc, gy + ny * sc)
+}
+
+/// Turn pointer constraints on and off for seat `si`.
+fn update_constraint_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() else {
+        return
+    }
+    let st = d.seats[si].seat
+    let kb = d.srv.keyboard_focused(st)
+    let kb_client = match kb {
+        Some(k) => Some(d.srv.client_of(k))
+        None => None
+    }
+    if let Some(s) = d.seats[si].constrained {
+        let keep = d.seats[si].pointer_on == Some(s) and kb_client == Some(d.srv.client_of(s)) and d.srv.surface_alive(s)
+        if not keep {
+            if let Some(c) = d.srv.constraint(st, s) {
+                // A lock ends where the client says the cursor is.
+                if c.lock {
+                    if let Some((hx, hy)) = c.hint {
+                        if let Some((gx, gy, sc)) = d.origins.get(s) {
+                            d.seats[si].px = gx + hx * sc
+                            d.seats[si].py = gy + hy * sc
+                            seats.move_cursor_on(mut d, si)
+                        }
+                    }
+                }
+            }
+            d.srv.set_constraint(st, s, false)
+            d.seats[si].constrained = None
+        }
+    }
+    guard d.seats[si].constrained.is_none() else {
+        return
+    }
+    guard let Some(s) = d.seats[si].pointer_on else {
+        return
+    }
+    guard kb_client == Some(d.srv.client_of(s)) else {
+        return
+    }
+    guard let Some(c) = d.srv.constraint(st, s) else {
+        return
+    }
+    guard let Some((gx, gy, sc)) = d.origins.get(s) else {
+        return
+    }
+    let lx = (d.seats[si].px - gx) / sc
+    let ly = (d.seats[si].py - gy) / sc
+    let inside = match c.region.clone() {
+        Some(rs) => rs.any(fn(r) => lx >= f64(r.x) and ly >= f64(r.y) and lx < f64(r.x + r.w) and ly < f64(r.y + r.h))
+        None => d.srv.accepts(s, lx, ly)
+    }
+    if inside {
+        d.srv.set_constraint(st, s, true)
+        d.seats[si].constrained = Some(s)
+    }
+}
+
+/// Whether `s` is a grabbing popup's surface (or under one) on seat `si`.
+fn in_grab_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: int, s: server.Surface) -> bool {
+    guard si >= 0 and si < d.seats.len() else {
+        return false
+    }
+    for p in d.seats[si].grabs {
+        if d.srv.popup_surface(p) == s {
+            return true
+        }
+        var tree: List[(server.Surface, i32, i32)] = []
+        d.srv.tree(d.srv.popup_surface(p), mut tree)
+        for (ts, _, _) in tree {
+            if ts == s {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: display.Event) {
+    match e {
+        ExtensionRequest(_, _, args) => {
+            for a in args {
+                match a {
+                    Fd(f) => {
+                        if f >= 0 {
+                            os.close(f)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        WindowNew(w) => {
+            discard d.configure(w, 0, 0, server.States {})
+        }
+        RequestMove(w) => d.manipulate_move(w)
+        RequestResize(w, edges) => d.manipulate_resize(w, edges)
+        RequestMaximize(w, on) => {
+            let cur = d.wins.get(w).unwrap_or(display.Win {})
+            var st = cur.states
+            st.maximized = on
+            // Maximized windows stay clear of panels.
+            let (ww, hh) = window_output_size(d, w, true)
+            if on {
+                discard d.configure(w, ww, hh, st)
+            } else {
+                discard d.configure(w, 0, 0, st)
+            }
+        }
+        RequestFullscreen(w, o, on) => {
+            let cur = d.wins.get(w).unwrap_or(display.Win {})
+            var st = cur.states
+            st.fullscreen = on
+            var (ww, hh) = window_output_size(d, w, false)
+            if let Some(so) = o {
+                let oi = outputs.out_index(d, so)
+                if oi >= 0 {
+                    ww = i32(d.outs[oi].lw())
+                    hh = i32(d.outs[oi].lh())
+                }
+            }
+            if on {
+                discard d.configure(w, ww, hh, st)
+            } else {
+                discard d.configure(w, 0, 0, st)
+            }
+        }
+        Occluded(w, hidden) => {
+            let cur = d.wins.get(w).unwrap_or(display.Win {})
+            if cur.configured {
+                var st = cur.states
+                st.suspended = hidden
+                discard d.configure(w, cur.width, cur.height, st)
+            }
+        }
+        Key(k) => {
+            // Ctrl+Alt+Fn arrives as XF86Switch_VT_n.
+            if k.pressed and k.sym >= 0x1008FE01 and k.sym <= 0x1008FE0C {
+                d.be.switch_vt(int(k.sym - 0x1008FE00))
+                return
+            }
+            let si = seats.seat_index(d, k.seat)
+            if si >= 0 {
+                discard d.srv.key(d.seats[si].seat, k.time, k.code, k.pressed)
+            }
+        }
+        Modifiers => {}
+        ModifiersOn => {}
+        Motion(p) => {
+            let si = seats.seat_index(d, p.seat)
+            if si >= 0 {
+                d.srv.relative_motion(d.seats[si].seat, u64(time.now_ns() / 1000), p.dx, p.dy, p.raw_dx, p.raw_dy)
+                deliver_motion_on(mut d, si, p.time)
+            }
+        }
+        Button(p) => {
+            let si = seats.seat_index(d, p.seat)
+            guard si >= 0 else {
+                return
+            }
+            let px = d.seats[si].px
+            let py = d.seats[si].py
+            if p.pressed {
+                if let Some((s, _, _)) = under(d, px, py) {
+                    shell.clicked_on(mut d, si, s)
+                }
+            }
+            if p.pressed and not d.seats[si].grabs.is_empty() {
+                let under = under(d, px, py)
+                let inside = match under {
+                    Some((s, _, _)) => in_grab_on(d, si, s)
+                    None => false
+                }
+                if not inside {
+                    clients.dismiss_popups_on(mut d, si)
+                }
+            }
+            deliver_motion_on(mut d, si, p.time)
+            if p.pressed and d.seats[si].buttons == 1 {
+                d.seats[si].grab = d.seats[si].pointer_on
+            }
+            discard d.srv.pointer_button(d.seats[si].seat, p.time, p.button, p.pressed)
+            if d.seats[si].buttons == 0 {
+                d.seats[si].grab = None
+            }
+        }
+        Scroll(s) => {
+            let si = seats.seat_index(d, s.seat)
+            if si >= 0 {
+                deliver_motion_on(mut d, si, s.time)
+                d.srv.pointer_axis(d.seats[si].seat, s.time, source_code(s.source), s.dx, s.dy, s.v120x, s.v120y, false)
+            }
+        }
+        Touch(t) => {
+            let si = seats.seat_index(d, t.seat)
+            guard si >= 0 else {
+                return
+            }
+            let st = d.seats[si].seat
+            match t.kind {
+                Down => {
+                    if let Some((s, lx, ly)) = under(d, t.x, t.y) {
+                        discard d.srv.touch_down(st, s, t.time, t.id, lx, ly)
+                    }
+                }
+                Motion => {
+                    if let Some(s) = d.srv.touch_target(st, t.id) {
+                        if let Some((gx, gy, sc)) = d.origins.get(s) {
+                            d.srv.touch_motion(st, t.time, t.id, (t.x - gx) / sc, (t.y - gy) / sc)
+                        }
+                    }
+                }
+                Up => {
+                    discard d.srv.touch_up(st, t.time, t.id)
+                }
+                Frame => d.srv.touch_frame(st)
+                Cancel => d.srv.touch_cancel(st)
+            }
+        }
+        Gesture(g) => {
+            let si = seats.seat_index(d, g.seat)
+            guard si >= 0 else {
+                return
+            }
+            let (kind, phase) = match g.kind {
+                SwipeBegin => (0, 0)
+                SwipeUpdate => (0, 1)
+                SwipeEnd => (0, 2)
+                PinchBegin => (1, 0)
+                PinchUpdate => (1, 1)
+                PinchEnd => (1, 2)
+                HoldBegin => (2, 0)
+                HoldEnd => (2, 2)
+            }
+            d.srv.gesture(d.seats[si].seat, kind, phase, g.time, u32(max(g.fingers, 0)), g.dx, g.dy, g.scale, g.rotation, g.cancelled)
+        }
+        // The library draws no title bars: clients do.
+        WindowDecoration(w, _) => d.decorate(w, false)
+        OutputConfig(c, only_test) => {
+            let ok = d.apply_output_config(c, only_test)
+            d.srv.output_config_done(c, ok)
+        }
+        RequestActivate(w) => d.focus(Some(w))
+        _ => {}
+    }
+}
+
+/// Logical size of the output the window is (mostly) on; `usable`: the
+/// part panels leave free.
+fn window_output_size[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window, usable: bool) -> (i32, i32) {
+    let s = d.srv.window_surface(w)
+    var o = 0
+    if let Some((gx, gy, _)) = d.origins.get(s) {
+        let k = place.output_at(d, gx + 1.0, gy + 1.0)
+        if k >= 0 {
+            o = k
+        }
+    } else if not d.seats.is_empty() {
+        let k = place.output_at(d, d.seats[0].px, d.seats[0].py)
+        if k >= 0 {
+            o = k
+        }
+    }
+    guard o < d.outs.len() and d.outs[o].alive else {
+        return (0, 0)
+    }
+    if usable and d.outs[o].uw > 0.0 and d.outs[o].uh > 0.0 {
+        return (i32(d.outs[o].uw), i32(d.outs[o].uh))
+    }
+    return (i32(d.outs[o].lw()), i32(d.outs[o].lh()))
+}

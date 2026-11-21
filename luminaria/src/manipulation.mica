@@ -1,0 +1,117 @@
+// Moves, resizes and pans the library runs at input rate.
+
+import std.time
+import luminaria_server as server
+import plug
+import display
+import place
+
+/// The manipulation running, and the pan's inertia.
+struct State {
+    active: Manip = Manip.Idle
+    coasting: bool = false
+    inertia_t: int = 0
+    pan_x: f64 = 0.0
+    pan_y: f64 = 0.0
+    /// Offsets wait for the compositor's next layout after a Moved.
+    offsets_done: bool = false
+}
+
+enum Manip {
+    Idle
+    /// Window, pointer start, offset at start.
+    Move(server.Window, f64, f64, f64, f64)
+    /// Window, edges, pointer start, size at start, offset at start.
+    Resize(server.Window, u32, f64, f64, i32, i32, f64, f64)
+    /// Pan by gesture: velocity (logical px per ms), last update time.
+    Pan(f64, f64, u32)
+}
+
+fn resize_step[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, edges: u32, sx: f64, sy: f64, w0: i32, h0: i32) {
+    guard let Some(cur) = d.wins.get(w) else {
+        return
+    }
+    guard not cur.inflight else {
+        return
+    }
+    let dx = i32(d.seats[0].px - sx)
+    let dy = i32(d.seats[0].py - sy)
+    var nw = w0
+    var nh = h0
+    if edges & 8 != 0 {
+        nw = w0 + dx
+    } else if edges & 4 != 0 {
+        nw = w0 - dx
+    }
+    if edges & 2 != 0 {
+        nh = h0 + dy
+    } else if edges & 1 != 0 {
+        nh = h0 - dy
+    }
+    let (minw, minh, maxw, maxh) = d.srv.size_hints(w)
+    nw = max(nw, max(minw, 32))
+    nh = max(nh, max(minh, 32))
+    if maxw > 0 {
+        nw = min(nw, maxw)
+    }
+    if maxh > 0 {
+        nh = min(nh, maxh)
+    }
+    guard nw != cur.width or nh != cur.height else {
+        return
+    }
+    var st = cur.states
+    st.resizing = true
+    discard d.configure(w, nw, nh, st)
+}
+
+fn end_manipulation[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    match d.manip.active {
+        Move(w, _, _, _, _) => {
+            let cur = d.wins.get(w).unwrap_or(display.Win {})
+            d.emit(display.Event.Moved(w, cur.off_x, cur.off_y))
+        }
+        Resize(w, _, _, _, _, _, _, _) => {
+            let cur = d.wins.get(w).unwrap_or(display.Win {})
+            var st = cur.states
+            st.resizing = false
+            discard d.configure(w, cur.width, cur.height, st)
+            d.emit(display.Event.Resized(w, cur.off_x, cur.off_y, cur.width, cur.height))
+        }
+        Pan => d.emit(display.Event.Panned(d.manip.pan_x, d.manip.pan_y))
+        Idle => {}
+    }
+    d.manip.active = Manip.Idle
+    d.manip.coasting = false
+    d.manip.offsets_done = true
+    if not d.seats.is_empty() and d.seats[0].cursor_surface.is_none() {
+        d.set_cursor_named("default")
+    }
+}
+
+/// Inertia after a pan: velocity decays by e every 300 ms.
+fn coast[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    guard d.manip.coasting else {
+        return
+    }
+    match d.manip.active {
+        Pan(vx, vy, last) => {
+            let now = time.now_ns()
+            let dt = f64(now - d.manip.inertia_t) / 1000000.0
+            d.manip.inertia_t = now
+            d.manip.pan_x += vx * dt
+            d.manip.pan_y += vy * dt
+            let k = (-dt / 300.0).exp()
+            let nvx = vx * k
+            let nvy = vy * k
+            if nvx.abs() + nvy.abs() < 0.02 {
+                end_manipulation(mut d)
+            } else {
+                d.manip.active = Manip.Pan(nvx, nvy, last)
+                d.animating = true
+            }
+            place.rebuild(mut d)
+        }
+        _ => {}
+    }
+}

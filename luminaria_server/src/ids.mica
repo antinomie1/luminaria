@@ -102,6 +102,19 @@ fn Slab[T].used(self, i: int) -> bool {
     return i >= 0 and i < self.gens.len() and self.gens[i] % 2 == 1
 }
 
+/// Client coordinates and sizes are kept within ±2^24 px: no surface is
+/// that large, and sums of a few of them stay inside i32.
+pub let limit: i32 = 16777216
+
+pub fn clamp(v: i32) -> i32 {
+    return max(-limit, min(v, limit))
+}
+
+/// A client's rectangle, clamped.
+pub fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+    return Rect { x: clamp(x), y: clamp(y), w: clamp(w), h: clamp(h) }
+}
+
 /// A rectangle in integer coordinates (surface-local or buffer pixels).
 pub struct Rect derive(Show) {
     pub x: i32 = 0

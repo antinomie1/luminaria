@@ -187,14 +187,18 @@ d.end(100)
 
 ## 换输出端和渲染器
 
-`plug.Output` 和 `plug.Renderer` 是两个结构化 trait：类型有同名同签名的方法就满足，不用声明实现。
+`plug.Output`（继承 `plug.Input`）和 `plug.Renderer` 是结构化 trait：类型有同名同签名的方法就满足，不用声明实现。
 `display.Display.with(o, output, renderer)` 用它们组装；`Display` 单态化，没有间接调用。必需的只有
 各自的核心方法（输出端：事件、fd、输出描述、取帧 / 给目标 / 呈现 / 退还目标；渲染器：输出、放置表、
 纹理、shm 上传、渲染目标、渲染、读回），其余是带默认实现的可选能力（直接扫描输出、硬件 overlay
-`test_overlays` / `clear_overlays` / `overlay_candidates` / `set_overlays`、光标平面、按 seat 的键盘与设备指派、
-模式设置、dmabuf 导入、离屏与 dmabuf 截屏 `capture_formats` / `copy_dmabuf` / `render_offscreen` /
+`test_overlays` / `clear_overlays` / `overlay_candidates` / `set_overlays`、光标平面、模式设置、dmabuf 导入、离屏与 dmabuf 截屏 `capture_formats` / `copy_dmabuf` / `render_offscreen` /
 `render_offscreen_dmabuf`、GPU 恢复 `device_lost` / `recover` / `reset_targets`、遮挡判断、设备计数 `stats`）。
-`tests/plug.mica` 是一个定时器驱动的输出端加一个软件渲染器。
+`plug.Input` 是键盘与输入设备：`keymap(_on)`、`mods(_on)`、`set_keymap(_on)`、`assign_device_seat`、
+`configure_input`、`switch_vt`，全部可选（没有时输入经 `inject` 进来），输入事件仍从输出端的 `next` 出来。
+只换显示、要用本机键盘鼠标时，在输出端里内嵌 `backend.Devices`（`Devices.open(names)` 打开会话、libinput 和
+keymap；`Devices.none()` 只管按 seat 的 keymap）：把它的 `fds` 加进自己的、对应 token 交给它的 `dispatch`、
+`next` 里取空它的事件，再把 `plug.Input` 的方法转给它。
+`tests/plug.mica` 是一个定时器驱动的输出端（内嵌 `Devices.none()`）加一个软件渲染器。
 
 ## 底层
 

@@ -11,7 +11,7 @@
 | `luminaria` | `Display`：一个事件循环接起输出端、渲染器和服务端；布局、输入路由、操纵、帧时钟、栅栏 |
 | `luminaria_server` | 协议状态：表面、事务、xdg-shell、layer shell、锁屏、seat 与输入法、选区与拖放、输出及其配置、截屏、沙盒、缓冲、时序；不碰 GPU |
 | `luminaria_compose` | 基于 `vk_compose` 的 Vulkan 渲染器：放置表比对、所有纹理、渲染目标 |
-| `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb；不碰 GPU |
+| `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；`Devices`（libseat、libinput、xkb），也能放在自己的输出端下；不碰 GPU |
 | `luminaria_types` | 各层交换的纯数据：dmabuf、放置、输出、输入、渲染目标、测量；共用的 CPU 像素拷贝 |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的接口 |
 | `luminaria_wire` | 线协议：socket、fd 传递、编解码、对象表 |
@@ -24,11 +24,12 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
                   它们都依赖 ──── luminaria_types
 ```
 
-`Display` 通过两个结构化 trait（`plug.Output`、`plug.Renderer`）接起一个输出端和一个渲染器；
-`Display` 单态化，换上自己的类型没有间接调用。两者只交换 `luminaria_types`：输出端要渲染目标，
-渲染器造出来（要显示的 dmabuf）、画进其中一个、交回栅栏。可选能力（直接扫描输出、光标平面、dmabuf
-导入、遮挡）带默认实现。`lum.open` 用内置的两个；`display.Display.with(o, output, renderer)` 接任意
-别的。服务端不懂的协议可在运行时按消息签名加上（`d.extend`）。
+`Display` 通过结构化 trait 接起一个输出端和一个渲染器：`plug.Output`（它同时是键盘和输入设备所经的
+`plug.Input`）和 `plug.Renderer`；`Display` 单态化，换上自己的类型没有间接调用。两者只交换
+`luminaria_types`：输出端要渲染目标，渲染器造出来（要显示的 dmabuf）、画进其中一个、交回栅栏。可选能力
+（直接扫描输出、光标平面、dmabuf 导入、遮挡、keymap）带默认实现。`lum.open` 用内置的两个；
+`display.Display.with(o, output, renderer)` 接任意别的，自己的输出端可以内嵌 `backend.Devices` 复用本机的
+会话、libinput 和 keymap。服务端不懂的协议可在运行时按消息签名加上（`d.extend`）。
 
 `luminaria` 的构建特性：`backend`（内置输出端）、`vulkan`（内置渲染器）、`nested`（嵌套输出；后端
 只因它才依赖 `luminaria_proto` 和 `luminaria_wire`），默认全开。关掉 `nested` 时 `Kind.Auto` 总选 DRM。
@@ -142,7 +143,7 @@ sheaf run -p tiny -- -s foot    # 在 VT 上，或作为当前桌面里的一个
 | 嵌套 | 父合成器里的一个窗口（标题栏和边框经 xdg-decoration 由父合成器画），dmabuf 经 linux-dmabuf 交出，带隐式栅栏 | 父合成器的 seat 和 keymap |
 | 无头 | 按模式刷新率的 vblank 网格显示的纹理 | `inject` / `inject_on` |
 
-release 构建，本机实测（`sheaf test --release`）：
+release 构建，i5-13600KF + Radeon RX 6800（`sheaf test --release`）：
 
 | 项目 | 时间 |
 |------|------|
@@ -151,6 +152,9 @@ release 构建，本机实测（`sheaf test --release`）：
 | 1000 个放置项：`Compositor.layout` diff / `Display.rebuild` | 75 µs / 160 µs |
 | 命中测试，512 个表面，最坏情况（整数 SIMD，一步 8 个） | 252 ns |
 | 门禁（`tests/probe.mica`）：1280x720@240 Hz，50 个窗口、输入按 1000 Hz 拖动一个，480 帧 | 0 漏帧，间隔 P99 4.17 ms，帧耗时 P50 67 µs / P99 214 µs，每帧损坏约 4.3 万像素（全屏的 4.7%） |
+
+`tiny` 嵌套在 1080p60 桌面里、开一个 foot：strip 后的二进制 1.3 MB，PSS 12 MB（私有 5 MB），3 个线程，
+显存 17 MB、GTT 20 MB；空闲 0% CPU，foot 每帧重绘时占一个核的 1.1%。
 
 ## 线协议与协议
 
@@ -167,6 +171,10 @@ release 构建，本机实测（`sheaf test --release`）：
   - 参数检查接口、空值、长度和 `since` 版本。失败时发 `wl_display.error` 并关闭客户端。
   - 析构自动释放 id 并发 `delete_id`。
   - 高于对象版本的事件被跳过。
+  - 客户端给的坐标和尺寸在请求入口夹到 ±2^24 px，几何运算不会溢出；长期持有的 fd 先验证（沙盒的
+    监听 fd 必须是在监听的 socket）。
+- **模糊测试。** 带种子的恶意客户端按协议 XML 生成随机请求（活着的对象、边界值、新 id、fd），以及
+  破坏帧格式的随机字节；服务端不能崩溃、要关掉它们打开的一切，并且仍能服务正常客户端。
 
 `luminaria_proto` 由 `luminaria_scanner` 生成。每个协议文件是一个模块（`wayland`、`xdg_shell` ……），
 包含：
@@ -254,18 +262,12 @@ MICA=/path/to/mica sys/gen.sh    # 默认 INC=/usr/include
 ## 测试
 
 ```sh
-sheaf test    # luminaria：libwayland xdg 窗口（用 cc 编译）和 foot 在无头输出上：
-              # configure、合成、读回、焦点、点击；server：提交、事务、toplevel、
-              # 子表面、弹出菜单、焦点、dmabuf 等待、运行时扩展协议；compose：O(N)
-              # 比对、多平面 dmabuf、overlay、GPU 恢复、上传、渲染目标；自定义输出端
-              # 与软件渲染器、overlay 提升、GPU 重置、多 seat、千窗口重建基准；
-              # backend：xkb、无头帧、DRM 显示器、嵌套窗口；protocols 与 shell：
-              # layer 表面、锁屏、选区、输入法、装饰与激活、窗口列表、指针锁定、
-              # 空闲、单像素缓冲、拖放、shm/dmabuf/窗口截屏、沙盒、输出配置；
-              # 性能门禁；wire、proto、sys 同前
+sheaf test    # libwayland 与 foot 客户端在无头输出上、各协议、自定义输出端与渲染器、
+              # 多 seat、GPU 重置、性能门禁、模糊测试；wire、proto、sys
 sheaf test --release -p luminaria_compose   # 帧开销
 sheaf test --release -p luminaria           # 命中测试、门禁的数字
 sheaf test --release -p luminaria_proto     # 线协议吞吐
+FUZZ_SEED=3 FUZZ_ROUNDS=2000 sheaf test -p luminaria_server   # 更长的模糊测试
 ```
 
 ## 许可证

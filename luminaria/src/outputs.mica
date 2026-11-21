@@ -1,0 +1,187 @@
+// Outputs coming and going: their clocks, server globals and frames.
+
+import std.mem
+import std.os
+import luminaria_types as types
+import luminaria_server as server
+import shell
+import plug
+import clock
+import display
+import place
+import seats
+import input
+import frames
+
+fn backend_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    while true {
+        guard let Some(got) = d.be.next() else {
+            break
+        }
+        var e = got
+        match take e {
+            OutputAdded(o) => output_added(mut d, int(o))
+            OutputRemoved(o) => output_removed(mut d, int(o))
+            OutputChanged(o) => output_changed(mut d, int(o))
+            Presented(o, seq, ns, flags) => frames.presented(mut d, int(o), seq, ns, flags)
+            Released(o) => frames.schedule(mut d, int(o))
+            Dropped(o) => {
+                if int(o) < d.outs.len() {
+                    d.outs[int(o)].dirty = true
+                    d.comp.damage_all()
+                    frames.schedule(mut d, int(o))
+                }
+            }
+            Input(i) => input.input_on(mut d, 0, i)
+            InputOn(seat, i) => {
+                let si = seats.ensure_seat(mut d, seat)
+                input.input_on(mut d, si, i)
+            }
+            Session(on) => {
+                if on {
+                    for o in 0..d.outs.len() {
+                        d.outs[o].dirty = true
+                    }
+                    d.comp.damage_all()
+                }
+                d.emit(display.Event.Session(on))
+            }
+            Keymap => seats.send_keymap_on(mut d, 0)
+            KeymapOn(seat) => {
+                let si = seats.ensure_seat(mut d, seat)
+                seats.send_keymap_on(mut d, si)
+            }
+            Closed => d.quit = true
+        }
+    }
+}
+
+fn output_info[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: int) -> server.OutputInfo {
+    let desc = d.be.output(u32(o))
+    let out = d.outs[o]
+    return server.OutputInfo {
+        name: desc.name.clone(),
+        description: "{desc.make} {desc.model}".trim(),
+        make: desc.make.clone(),
+        model: desc.model.clone(),
+        x: i32(out.x),
+        y: i32(out.y),
+        width: desc.mode.width,
+        height: desc.mode.height,
+        refresh_mhz: desc.mode.refresh_mhz,
+        width_mm: desc.width_mm,
+        height_mm: desc.height_mm,
+        scale120: i32(out.scale * 120.0 + 0.5),
+        modes: desc.modes.map(fn(m) => (m.width, m.height, m.refresh_mhz, m.preferred)),
+        enabled: out.enabled,
+        vrr_capable: desc.vrr,
+        vrr: out.vrr,
+    }
+}
+
+fn output_added[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    let desc = d.be.output(u32(o))
+    while d.outs.len() <= o {
+        d.outs.push(display.Out {})
+        d.drawn.push([])
+        d.releases.push([])
+        d.points.push([])
+        d.probes.push(types.Stats.new())
+    }
+    // To the right of the others.
+    var x: f64 = 0.0
+    for k in 0..d.outs.len() {
+        if d.outs[k].alive {
+            x = max(x, d.outs[k].x + d.outs[k].lw())
+        }
+    }
+    let timer = os.timerfd().unwrap_or(-1)
+    d.outs[o] = display.Out { alive: true, clock: clock.Clock.new(int(desc.mode.refresh_mhz)), x, width: desc.mode.width, height: desc.mode.height, refresh_mhz: desc.mode.refresh_mhz, timer, dirty: true }
+    if timer >= 0 {
+        discard d.poll.add(timer, display.tok_output + o, true, false)
+    }
+    let info = output_info(d, o)
+    let so0 = d.srv.add_output(info)
+    d.outs[o].sout = so0
+    let bg = d.background
+    d.comp.add_output(o, u32(desc.mode.width), u32(desc.mode.height), bg)
+    let so = d.outs[o].sout
+    d.emit(display.Event.OutputAdded(so))
+    if not d.seats.is_empty() and d.seats[0].px == 0.0 and d.seats[0].py == 0.0 {
+        d.seats[0].px = x + d.outs[o].lw() / 2.0
+        d.seats[0].py = d.outs[o].lh() / 2.0
+    }
+    place.rebuild(mut d)
+}
+
+fn output_removed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    guard o < d.outs.len() and d.outs[o].alive else {
+        return
+    }
+    shell.output_gone(mut d, o)
+    d.outs[o].alive = false
+    let so = d.outs[o].sout
+    var kept_caps: List[server.CaptureReq] = []
+    for req in mem.replace(mut d.caps.outputs, []) {
+        match req.target {
+            Output(target_so) => {
+                if target_so == so {
+                    d.srv.capture_fail(req.session, 3)
+                    d.srv.release(req.buffer)
+                } else {
+                    kept_caps.push(req)
+                }
+            }
+            _ => kept_caps.push(req)
+        }
+    }
+    d.caps.outputs = kept_caps
+    d.srv.remove_output(so)
+    d.comp.remove_output(o)
+    if d.outs[o].timer >= 0 {
+        discard d.poll.remove(d.outs[o].timer)
+        os.close(d.outs[o].timer)
+        d.outs[o].timer = -1
+    }
+    for b in mem.replace(mut d.releases[o], []) {
+        d.srv.release(b)
+    }
+    d.emit(display.Event.OutputRemoved(so))
+    place.rebuild(mut d)
+}
+
+fn output_changed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    guard o < d.outs.len() and d.outs[o].alive else {
+        return
+    }
+    let desc = d.be.output(u32(o))
+    d.outs[o].width = desc.mode.width
+    d.outs[o].height = desc.mode.height
+    d.outs[o].refresh_mhz = desc.mode.refresh_mhz
+    d.outs[o].dirty = true
+    d.comp.resize(o, u32(desc.mode.width), u32(desc.mode.height))
+    d.outs[o].clock.refresh_ns = 1000000000000 / max(int(desc.mode.refresh_mhz), 1000)
+    let info = output_info(d, o)
+    let so = d.outs[o].sout
+    d.srv.update_output(so, info)
+    d.emit(display.Event.OutputChanged(so))
+    place.rebuild(mut d)
+}
+
+/// The backend index of a server output.
+fn out_index[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], so: server.Output) -> int {
+    for o in 0..d.outs.len() {
+        if d.outs[o].alive and d.outs[o].sout == so {
+            return o
+        }
+    }
+    return -1
+}
+
+fn output_moved[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    let info = output_info(d, o)
+    let so = d.outs[o].sout
+    d.srv.update_output(so, info)
+    d.comp.damage_all()
+    place.rebuild(mut d)
+}

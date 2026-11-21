@@ -9,6 +9,10 @@ import luminaria_server as server
 import luminaria_types as types
 import layout
 import display
+import input
+import place
+import clients
+import outputs
 import plug
 
 /// Where a layer surface goes: output index, global logical position.
@@ -44,7 +48,7 @@ fn zone_edge(st: server.LayerState) -> u32 {
 /// it was given when it appeared.
 fn layer_output[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], l: server.Layer, info: server.LayerInfo) -> int {
     if let Some(so) = info.output {
-        let o = d.out_index(so)
+        let o = outputs.out_index(d, so)
         if o >= 0 {
             return o
         }
@@ -54,7 +58,7 @@ fn layer_output[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
             return s.o
         }
     }
-    var o = if d.seats.is_empty() { -1 } else { d.output_at(d.seats[0].px, d.seats[0].py) }
+    var o = if d.seats.is_empty() { -1 } else { place.output_at(d, d.seats[0].px, d.seats[0].py) }
     if o < 0 {
         for k in 0..d.outs.len() {
             if d.outs[k].alive {
@@ -184,7 +188,7 @@ fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         guard let Some(sp) = d.spots.get(l) else {
             continue
         }
-        d.place_tree(info.surface, sp.x, sp.y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
+        place.place_tree(mut d, info.surface, sp.x, sp.y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
         place_popups(mut d, info.surface, pmap, 1.0, None, mut per, mut masks)
     }
 }
@@ -211,7 +215,7 @@ fn place_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         let own = d.srv.info(ps).geometry
         let ox = pgx + f64(pgeo.x + g.x - own.x) * psc
         let oy = pgy + f64(pgeo.y + g.y - own.y) * psc
-        d.place_tree(ps, ox, oy, psc, layout.Style {}, opacity, owner, mut per, mut masks)
+        place.place_tree(mut d, ps, ox, oy, psc, layout.Style {}, opacity, owner, mut per, mut masks)
     }
 }
 
@@ -225,11 +229,11 @@ fn place_lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], mu
         guard let Some(out) = so else {
             continue
         }
-        let o = d.out_index(out)
+        let o = outputs.out_index(d, out)
         guard o >= 0 else {
             continue
         }
-        d.place_tree(s, d.outs[o].x, d.outs[o].y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
+        place.place_tree(mut d, s, d.outs[o].x, d.outs[o].y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
     }
 }
 
@@ -244,7 +248,7 @@ fn place_ime[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], mut
             continue
         }
         for s in d.srv.ime_popups(st) {
-            d.place_tree(s, gx + f64(r.x) * sc, gy + f64(r.y + r.h) * sc, sc, layout.Style {}, 1.0, None, mut per, mut masks)
+            place.place_tree(mut d, s, gx + f64(r.x) * sc, gy + f64(r.y + r.h) * sc, sc, layout.Style {}, 1.0, None, mut per, mut masks)
         }
     }
 }
@@ -255,7 +259,7 @@ fn configure_lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
     guard let Some(out) = so else {
         return
     }
-    let o = d.out_index(out)
+    let o = outputs.out_index(d, out)
     guard o >= 0 else {
         return
     }
@@ -274,8 +278,8 @@ fn lock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             d.lock_wait.push(o)
         }
     }
-    d.dismiss_popups_all()
-    d.rebuild()
+    clients.dismiss_popups_all(mut d)
+    place.rebuild(mut d)
     update_keyboard(mut d)
     if was or d.lock_wait.is_empty() {
         d.lock_wait.clear()
@@ -292,7 +296,7 @@ fn unlock[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     for o in 0..d.outs.len() {
         d.outs[o].dirty = true
     }
-    d.rebuild()
+    place.rebuild(mut d)
     update_keyboard(mut d)
     d.emit(display.Event.Locked(false))
 }
@@ -316,14 +320,14 @@ fn keyboard_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], s
     }
     if d.locked {
         var any: Option[server.Surface] = None
-        let here = d.output_at(d.seats[si].px, d.seats[si].py)
+        let here = place.output_at(d, d.seats[si].px, d.seats[si].py)
         for k in d.srv.lock_surfaces() {
             let (s, so, mapped) = d.srv.lock_surface(k)
             guard mapped else {
                 continue
             }
             if let Some(out) = so {
-                if d.out_index(out) == here {
+                if outputs.out_index(d, out) == here {
                     return Some(s)
                 }
             }
@@ -361,7 +365,7 @@ fn update_keyboard_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O
     }
     let t = keyboard_target(d, si)
     d.srv.keyboard_focus(d.seats[si].seat, t)
-    d.update_constraint_on(si)
+    input.update_constraint_on(mut d, si)
 }
 
 fn update_keyboard[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {

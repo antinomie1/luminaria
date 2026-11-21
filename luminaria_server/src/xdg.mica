@@ -111,22 +111,22 @@ fn positioner_request(mut srv: server.Server, ci: u32, p: x.Positioner, take req
                 srv.fail(ci, p.id, u32(x.PositionerError.InvalidInput), "positioner size {w}x{h}")
                 return
             }
-            srv.positioners.items[i].pos.width = w
-            srv.positioners.items[i].pos.height = h
+            srv.positioners.items[i].pos.width = ids.clamp(w)
+            srv.positioners.items[i].pos.height = ids.clamp(h)
         }
         SetAnchorRect(ax, ay, w, h) => {
             guard w >= 0 and h >= 0 else {
                 srv.fail(ci, p.id, u32(x.PositionerError.InvalidInput), "anchor rect {w}x{h}")
                 return
             }
-            srv.positioners.items[i].pos.anchor_rect = ids.Rect { x: ax, y: ay, w, h }
+            srv.positioners.items[i].pos.anchor_rect = ids.rect(ax, ay, w, h)
         }
         SetAnchor(a) => srv.positioners.items[i].pos.anchor = u32(a)
         SetGravity(g) => srv.positioners.items[i].pos.gravity = u32(g)
         SetConstraintAdjustment(c) => srv.positioners.items[i].pos.adjust = c.bits()
         SetOffset(ox, oy) => {
-            srv.positioners.items[i].pos.off_x = ox
-            srv.positioners.items[i].pos.off_y = oy
+            srv.positioners.items[i].pos.off_x = ids.clamp(ox)
+            srv.positioners.items[i].pos.off_y = ids.clamp(oy)
         }
         SetReactive => srv.positioners.items[i].pos.reactive = true
         SetParentSize => {}
@@ -184,7 +184,7 @@ fn surface_request(mut srv: server.Server, ci: u32, xs: x.Surface, take req: x.S
                 return
             }
             srv.surfaces.items[i].pending.geometry_set = true
-            srv.surfaces.items[i].pending.geometry = ids.Rect { x: gx, y: gy, w, h }
+            srv.surfaces.items[i].pending.geometry = ids.rect(gx, gy, w, h)
         }
         AckConfigure(serial) => srv.surfaces.items[i].pending.acked = serial
     }
@@ -227,7 +227,7 @@ fn toplevel(mut srv: server.Server, ci: u32, t: x.Toplevel, take req: x.Toplevel
         }
         ShowWindowMenu(st, serial, mx, my) => {
             let seat = seat_of(srv, ci, st.id)
-            srv.push(server.Event.WindowRequest(w, server.Request.Menu(seat, mx, my)))
+            srv.push(server.Event.WindowRequest(w, server.Request.Menu(seat, ids.clamp(mx), ids.clamp(my))))
         }
         Move(st, serial) => {
             let seat = seat_of(srv, ci, st.id)
@@ -243,8 +243,8 @@ fn toplevel(mut srv: server.Server, ci: u32, t: x.Toplevel, take req: x.Toplevel
                 return
             }
             srv.surfaces.items[si].pending.max_set = true
-            srv.surfaces.items[si].pending.max_w = mw
-            srv.surfaces.items[si].pending.max_h = mh
+            srv.surfaces.items[si].pending.max_w = ids.clamp(mw)
+            srv.surfaces.items[si].pending.max_h = ids.clamp(mh)
         }
         SetMinSize(mw, mh) => {
             guard mw >= 0 and mh >= 0 else {
@@ -252,8 +252,8 @@ fn toplevel(mut srv: server.Server, ci: u32, t: x.Toplevel, take req: x.Toplevel
                 return
             }
             srv.surfaces.items[si].pending.min_set = true
-            srv.surfaces.items[si].pending.min_w = mw
-            srv.surfaces.items[si].pending.min_h = mh
+            srv.surfaces.items[si].pending.min_w = ids.clamp(mw)
+            srv.surfaces.items[si].pending.min_h = ids.clamp(mh)
         }
         SetMaximized => srv.push(server.Event.WindowRequest(w, server.Request.Maximize(true)))
         UnsetMaximized => srv.push(server.Event.WindowRequest(w, server.Request.Maximize(false)))

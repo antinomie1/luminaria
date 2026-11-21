@@ -1,7 +1,8 @@
 // luminaria_backend: where pixels go and input comes from. DRM/KMS (atomic
 // commits, planes and their formats, page flips, hotplug), a nested Wayland
 // backend and a headless one; seat sessions through libseat, input devices
-// through libinput, keymaps through xkbcommon. Frames are requested, never
+// through libinput, keymaps through xkbcommon (devices.mica, usable on its
+// own under an output of your own). Frames are requested, never
 // polled: an idle output costs no wakeups. No GPU here: the renderer makes
 // the images outputs show. `acquire` names the image to draw into (or the
 // render targets the output needs first, which `give` hands back), and
@@ -20,8 +21,7 @@ import libdrm_sys.uapi as uapi
 import luminaria_types as types
 pub import keyboard
 pub import xkbcommon_sys.keysym as keysym
-import session
-import input
+pub import devices
 import drm
 import commit
 import sched
@@ -46,6 +46,8 @@ pub type Mods = types.Mods
 pub type InputConfig = types.InputConfig
 
 pub type Kind = types.OutputKind
+/// Session, libinput and keymaps (devices.mica).
+pub type Devices = devices.Devices
 
 pub struct Options {
     pub kind: Kind = Kind.Auto
@@ -65,8 +67,8 @@ pub type Rect = (i32, i32, i32, i32)
 
 /// Poller tokens of the backend's descriptors.
 pub let token_drm = 1
-pub let token_session = 2
-pub let token_input = 3
+pub let token_session = devices.token_session
+pub let token_input = devices.token_input
 pub let token_udev = 4
 pub let token_nested = 5
 pub let token_commit = 6
@@ -75,21 +77,17 @@ pub let token_headless = 64
 
 pub struct Backend {
     kind: Kind
-    session: Option[session.Session] = None
-    input: Option[input.Input] = None
+    /// The session, libinput and keymaps (keymaps only when not DRM).
+    devices: devices.Devices = devices.Devices {}
     drm: Option[drm.Drm] = None
     nested: Option[nested.Nested] = None
     headless: Option[headless.Headless] = None
-    kb: Option[keyboard.Keyboard] = None
     monitor: Option[udev.Monitor] = None
     udev: Option[udev.Udev] = None
     descs: List[OutputDesc] = []
     alive: List[bool] = []
     events: List[Event] = []
     head: int = 0
-    default_seat: str = "seat0"
-    keymap_names: Names = Names {}
-    extra_kbs: List[(str, keyboard.Keyboard)] = []
     buffers: int = 2
     active: bool = true
     /// Slot index each output's acquired frame uses.
@@ -99,7 +97,6 @@ pub struct Backend {
     realtime: bool = true
     /// The event loop's scheduling (policy, priority or nice).
     sched: (int, int) = (0, 0)
-    boost: sched.Boost = sched.Boost {}
 }
 
 pub fn Backend.open(o: Options) -> Result[Backend, str] {
@@ -140,12 +137,7 @@ fn Backend.add_output(mut self, take d: OutputDesc) {
 }
 
 fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
-    let s = try session.open()
-    let seat_name = s.name()
-    self.session = Some(s)
-    self.default_seat = seat_name.clone()
-    self.keymap_names = names.clone()
-    self.kb = Some(try keyboard.Keyboard.new(names))
+    self.devices = try devices.Devices.open(names)
     let path = try drm.find_card()
     var d = try drm.open(path)
     if self.realtime {
@@ -164,7 +156,6 @@ fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
         self.add_output(desc)
     }
     self.drm = Some(d)
-    self.input = Some(try input.open(seat_name))
     if let Some(u) = udev.new() {
         if let Some(m) = udev.monitor_new_from_netlink(u, "udev") {
             discard udev.monitor_filter_add_match_subsystem_devtype(m, "drm", "")
@@ -185,7 +176,7 @@ pub fn Backend.next(mut self) -> Option[Event] {
     guard self.head < self.events.len() else {
         self.events.clear()
         self.head = 0
-        return None
+        return self.devices.next()
     }
     let e = self.events[self.head].clone()
     self.head += 1
@@ -204,12 +195,7 @@ pub fn Backend.fds(self, mut out: List[(int, int)]) {
             out.push((t.wake, token_commit))
         }
     }
-    if let Some(s) = self.session {
-        out.push((s.fd(), token_session))
-    }
-    if let Some(i) = self.input {
-        out.push((i.fd(), token_input))
-    }
+    self.devices.fds(mut out)
     if let Some(m) = self.monitor {
         out.push((int(udev.monitor_get_fd(m)), token_udev))
     }
@@ -229,41 +215,9 @@ pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
         self.flips()
     } else if token == token_commit {
         self.notes()
-    } else if token == token_session {
-        if let Some(ss) = self.session.take() {
-            var s = ss
-            let changed = s.dispatch()
-            self.session = Some(s)
-            if let Some(on) = changed {
-                self.set_active(on)
-            }
-        }
-    } else if token == token_input {
-        if let Some(ii) = self.input.take() {
-            var inp = ii
-            var extra = mem.replace(mut self.extra_kbs, [])
-            let prev_extra = extra.len()
-            var got: List[(str, Input)] = []
-            if let Some(kk) = self.kb.take() {
-                var kb = kk
-                inp.dispatch(mut kb, mut extra, self.keymap_names.clone(), mut got)
-                self.kb = Some(kb)
-            }
-            for k in prev_extra..extra.len() {
-                self.push(Event.KeymapOn(extra[k].0.clone()))
-            }
-            self.extra_kbs = extra
-            self.input = Some(inp)
-            if not got.is_empty() {
-                self.boost.pulse(time.now_ns())
-            }
-            for (seat, g) in take got {
-                if seat.is_empty() {
-                    self.push(Event.Input(g))
-                } else {
-                    self.push(Event.InputOn(seat, g))
-                }
-            }
+    } else if token == token_session or token == token_input {
+        if let Some(on) = self.devices.dispatch(token) {
+            self.set_active(on)
         }
     } else if token == token_udev {
         self.hotplug()
@@ -360,15 +314,6 @@ fn Backend.notes(mut self) {
 
 fn Backend.set_active(mut self, on: bool) {
     self.active = on
-    if let Some(ii) = self.input.take() {
-        var i = ii
-        if on {
-            i.resume()
-        } else {
-            i.suspend()
-        }
-        self.input = Some(i)
-    }
     if let Some(dd) = self.drm.take() {
         var d = dd
         // Queued commits would fail without the device, and flips
@@ -384,7 +329,6 @@ fn Backend.set_active(mut self, on: bool) {
         }
         self.drm = Some(d)
     }
-    self.push(Event.Session(on))
 }
 
 fn Backend.hotplug(mut self) {
@@ -831,104 +775,65 @@ pub fn Backend.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
 
 /// The keymap for clients: memfd and size (with its NUL).
 pub fn Backend.keymap(self) -> (int, u32) {
-    if let Some(k) = self.kb {
-        return (k.fd, k.size)
-    }
     if let Some(n) = self.nested {
         if let Some(k) = n.keyboard {
             return (k.fd, k.size)
         }
     }
-    return (-1, 0)
+    return self.devices.keymap()
 }
 
 /// Modifiers in effect now.
 pub fn Backend.mods(self) -> Mods {
-    if let Some(k) = self.kb {
-        return k.mods()
-    }
     if let Some(n) = self.nested {
         if let Some(k) = n.keyboard {
             return k.mods()
         }
     }
-    return Mods {}
+    return self.devices.mods()
 }
 
 pub fn Backend.set_keymap(mut self, names: Names) -> Result[(), str] {
-    guard self.kb.is_some() else {
+    guard self.kind == Kind.Drm else {
         return Err("the keymap comes from the parent compositor")
     }
-    self.kb = Some(try keyboard.Keyboard.new(names))
-    self.push(Event.Keymap)
-    return Ok(())
+    return self.devices.set_keymap(names)
 }
 
 /// Keymap for `seat` (memfd and size); falls back to the default keymap.
 pub fn Backend.keymap_on(self, seat: str) -> (int, u32) {
-    for x in self.extra_kbs {
-        if x.0 == seat {
-            return (x.1.fd, x.1.size)
-        }
-    }
-    return self.keymap()
+    let k = self.devices.keymap_on(seat)
+    return if k.0 >= 0 { k } else { self.keymap() }
 }
 
 /// Active modifiers on `seat`; falls back to the default seat's modifiers.
 pub fn Backend.mods_on(self, seat: str) -> Mods {
-    for x in self.extra_kbs {
-        if x.0 == seat {
-            return x.1.mods()
-        }
+    guard self.kind != Kind.Nested else {
+        return self.mods()
     }
-    return self.mods()
+    return self.devices.mods_on(seat)
 }
 
 /// Set a per-seat keymap on `seat`.
 pub fn Backend.set_keymap_on(mut self, seat: str, names: Names) -> Result[(), str] {
-    if seat.is_empty() or seat == "seat0" or seat == "default" or seat == self.default_seat {
-        return self.set_keymap(names)
-    }
     guard self.kind != Kind.Nested else {
         return Err("the keymap comes from the parent compositor")
     }
-    let nkb = try keyboard.Keyboard.new(names)
-    for i in 0..self.extra_kbs.len() {
-        if self.extra_kbs[i].0 == seat {
-            self.extra_kbs[i].1 = nkb
-            self.push(Event.KeymapOn(seat.clone()))
-            return Ok(())
-        }
-    }
-    self.extra_kbs.push((seat.clone(), nkb))
-    self.push(Event.KeymapOn(seat.clone()))
-    return Ok(())
+    return self.devices.set_keymap_on(seat, names)
 }
 
 /// Reassign input device `device` to logical seat `seat`.
 pub fn Backend.assign_device_seat(mut self, device: u32, seat: str) -> bool {
-    guard let Some(ii) = self.input.take() else {
-        return false
-    }
-    var i = ii
-    let ok = i.assign_seat(device, seat)
-    self.input = Some(i)
-    return ok
+    return self.devices.assign_device_seat(device, seat)
 }
 
 pub fn Backend.configure_input(mut self, device: u32, c: InputConfig) {
-    if let Some(ii) = self.input.take() {
-        var i = ii
-        i.configure(device, c)
-        self.input = Some(i)
-    }
+    self.devices.configure_input(device, c)
 }
 
 /// Switch to virtual terminal `n` (DRM sessions).
 pub fn Backend.switch_vt(self, n: int) {
-    if let Some(s) = self.session {
-        s.switch_vt(n)
-    }
+    self.devices.switch_vt(n)
 }
 
 /// dev_t of the scanout device (for the dmabuf scanout tranche), 0 when

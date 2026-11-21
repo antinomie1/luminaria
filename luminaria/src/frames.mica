@@ -1,0 +1,447 @@
+// Frames: when they start, what they show, how they reach the screen.
+
+import std.mem
+import std.os
+import std.time
+import luminaria_types as types
+import luminaria_server as server
+import shell
+import plug
+import display
+import clients
+import waits
+import place
+import manipulation
+import capture
+
+/// Arm output `o`'s frame for its clock's deadline when it has something
+/// to show; nothing is armed when idle (no wakeups).
+fn schedule[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    guard d.outs[o].alive and not d.outs[o].armed and not d.outs[o].due else {
+        return
+    }
+    var wants = d.outs[o].dirty or d.animating
+    if not wants {
+        for s in d.drawn[o] {
+            if d.srv.wants_frame(s) {
+                wants = true
+                break
+            }
+        }
+    }
+    guard wants and d.be.can_present(u32(o)) else {
+        return
+    }
+    let now = time.now_ns()
+    // Nested, the parent's frame callback already says when to draw: a
+    // second, predicted deadline would only miss the parent's.
+    let start = if d.be.paced() { now } else { d.outs[o].clock.start(now) }
+    if start <= now + 200000 {
+        frame_due(mut d, o)
+        return
+    }
+    discard os.timer_arm(d.outs[o].timer, start - now, 0)
+    d.outs[o].armed = true
+}
+
+fn frame_due[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    guard d.outs[o].alive and not d.outs[o].due else {
+        return
+    }
+    d.outs[o].due = true
+    let target = d.outs[o].clock.begin(time.now_ns())
+    let so = d.outs[o].sout
+    d.emit(display.Event.Frame(so, target))
+}
+
+/// Upload what shm commits left for this frame (once per surface, whatever
+/// the number of commits), then hand the buffers back.
+fn upload_pending[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    let pending = mem.replace(mut d.pending_shm, [])
+    guard not pending.is_empty() else {
+        return
+    }
+    // The server lends each buffer's bytes while the device records them.
+    var srv = mem.replace(mut d.srv, server.Server.none())
+    for s in pending {
+        guard let Some(sf) = d.surfs.get(s) else {
+            continue
+        }
+        guard let Some(b) = sf.pending else {
+            continue
+        }
+        discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+            discard d.comp.shm_upload(display.skey(s), bytes, stride)
+        })
+        srv.release(b)
+        discard d.surfs.insert(s, display.Surf { pending: None, ..sf })
+    }
+    d.srv = srv
+}
+
+/// Recover after a GPU device-lost error: reset scanout targets, reopen GPU
+/// device and re-upload live buffers/cursors, then emit display.Event.GpuReset.
+fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -> Result[(), str] {
+    var retired: List[u64] = []
+    d.be.reset_targets(mut retired)
+    try d.comp.recover()
+    for o in 0..d.outs.len() {
+        if d.outs[o].alive {
+            d.comp.add_output(o, u32(d.outs[o].width), u32(d.outs[o].height), d.background)
+            d.outs[o].dirty = true
+        }
+    }
+    var cur_surfs: List[(server.Surface, display.Surf)] = []
+    d.surfs.each(fn(s, sf) {
+        cur_surfs.push((s, sf))
+    })
+    d.pending_shm.clear()
+    var srv = mem.replace(mut d.srv, server.Server.none())
+    let all: List[(i32, i32, i32, i32)] = []
+    for (s, cur_sf) in cur_surfs {
+        var sf = cur_sf
+        guard let Some(b) = sf.buffer else {
+            continue
+        }
+        if not srv.buffer_alive(b) {
+            sf.buffer = None
+            sf.tex = 0
+            sf.pending = None
+            discard d.surfs.insert(s, sf)
+            continue
+        }
+        let bi = srv.buffer(b)
+        if bi.kind == server.BufferKind.SinglePixel {
+            if not d.comp.has(display.bkey(b)) {
+                discard d.comp.solid(display.bkey(b), bi.color)
+            }
+            sf.tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
+        } else if bi.kind == server.BufferKind.Dmabuf {
+            if not d.comp.has(display.bkey(b)) {
+                discard d.comp.import_dmabuf(display.bkey(b), srv.dmabuf(b))
+            }
+            sf.tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
+        } else {
+            if d.comp.shm_commit(display.skey(s), bi.width, bi.height, bi.format, all) {
+                var ok = false
+                discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+                    ok = d.comp.shm_upload(display.skey(s), bytes, stride)
+                })
+                sf.tex = if ok { display.skey(s) } else { 0 }
+                if sf.pending == Some(b) and ok {
+                    srv.release(b)
+                    sf.pending = None
+                }
+            } else {
+                sf.tex = 0
+            }
+        }
+        discard d.surfs.insert(s, sf)
+    }
+    d.srv = srv
+    for si in 0..d.seats.len() {
+        if not d.seats[si].cursor_hw and d.seats[si].cursor.width > 0 {
+            let cw = d.seats[si].cursor.width
+            let ch = d.seats[si].cursor.height
+            let ckey = d.seats[si].cursor_key
+            let cpx = d.seats[si].cursor.pixels.clone()
+            discard d.comp.image(ckey, cw, ch, types.buffer.argb8888, cpx, int(cw) * 4)
+            d.comp.commit(ckey, all)
+        }
+    }
+    place.rebuild(mut d)
+    d.emit(display.Event.GpuReset)
+    return Ok(())
+}
+
+fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) -> Result[(), str] {
+    d.outs[o].due = false
+    guard d.outs[o].alive and d.be.can_present(u32(o)) else {
+        return Ok(())
+    }
+    let t0 = time.now_ns()
+    manipulation.coast(mut d)
+    if d.animating {
+        place.rebuild(mut d)
+    }
+    upload_pending(mut d)
+    if d.outs[o].dirty {
+        var scanned = false
+        let so = d.outs[o].sout
+        // Direct scanout and overlay promotion yield to active screen captures.
+        let cap_shm = d.srv.capture_waiting(so)
+        let cap_dma = capture.has_pending_output_dmabuf(d, so)
+        let capturing = cap_shm or cap_dma
+        if not capturing {
+            if let Some(key) = d.comp.scanout(o) {
+                scanned = try_scanout(mut d, o, key)
+            }
+        } else {
+            d.comp.damage_all()
+        }
+        if not scanned {
+            guard let Some((key, age)) = try acquire(mut d, o) else {
+                // Every target is on screen (or GPU reset ran): try again on the next cycle.
+                return Ok(())
+            }
+            var promoted: List[u64] = []
+            if not capturing {
+                let cands = d.comp.overlay_candidates(o, 8)
+                if not cands.is_empty() {
+                    var blocked: List[(i32, i32, i32, i32)] = []
+                    var ov_cands: List[types.Overlay] = []
+                    for c in cands {
+                        let rect = (c.x, c.y, c.w, c.h)
+                        var overlap = false
+                        for b in blocked {
+                            if rect.0 < b.0 + b.2 and rect.0 + rect.2 > b.0 and rect.1 < b.1 + b.3 and rect.1 + rect.3 > b.1 {
+                                overlap = true
+                                break
+                            }
+                        }
+                        if overlap {
+                            blocked.push(rect)
+                            continue
+                        }
+                        if let Some(s) = d.surf_keys.get(c.key) {
+                            if let Some(sf) = d.surfs.get(s) {
+                                if let Some(b) = sf.buffer {
+                                    let bi = d.srv.buffer(b)
+                                    if bi.kind == server.BufferKind.Dmabuf and display.bkey(b) == c.tex {
+                                        ov_cands.push(types.Overlay { key: c.key, buf_key: display.bkey(b), buf: d.srv.dmabuf(b), x: c.x, y: c.y, w: c.w, h: c.h, src: c.src })
+                                    }
+                                }
+                            }
+                        }
+                        blocked.push(rect)
+                    }
+                    if not ov_cands.is_empty() {
+                        promoted = d.be.test_overlays(u32(o), key, ov_cands)
+                        d.comp.set_overlays(o, promoted)
+                    } else {
+                        d.be.clear_overlays(u32(o))
+                        let empty: List[u64] = []
+                        d.comp.set_overlays(o, empty)
+                    }
+                } else {
+                    d.be.clear_overlays(u32(o))
+                    let empty: List[u64] = []
+                    d.comp.set_overlays(o, empty)
+                }
+            } else {
+                d.be.clear_overlays(u32(o))
+                let empty: List[u64] = []
+                d.comp.set_overlays(o, empty)
+            }
+            let r = d.comp.render(o, key, age)
+            guard let Ok(maybe_fence) = r else {
+                if d.comp.device_lost() {
+                    try recover_gpu(mut d)
+                    return Ok(())
+                }
+                return Err(r.unwrap_err())
+            }
+            if let Some(fence) = maybe_fence {
+                var rects: List[(i32, i32, i32, i32)] = []
+                d.comp.changed(o, mut rects)
+                count_damage(mut d, o, rects)
+                try d.be.present(u32(o), fence, rects, false)
+                d.probes[o].frame(time.now_ns() - t0)
+            } else if not promoted.is_empty() {
+                let empty: List[(i32, i32, i32, i32)] = []
+                try d.be.present(u32(o), -1, empty, false)
+                d.probes[o].frame(time.now_ns() - t0)
+            }
+            if cap_dma {
+                var rest_caps: List[server.CaptureReq] = []
+                for req in mem.replace(mut d.caps.outputs, []) {
+                    match req.target {
+                        Output(target_so) => {
+                            if target_so == so {
+                                let dbuf = d.srv.dmabuf(req.buffer)
+                                match d.comp.copy_dmabuf(key, dbuf, 0, 0, req.width, req.height) {
+                                    Ok(fd) => {
+                                        if fd >= 0 {
+                                            capture.add_cap_fence(mut d, req.session, req.buffer, fd, time.now_ns())
+                                        } else {
+                                            d.srv.capture_done(req.session, time.now_ns())
+                                            d.srv.release(req.buffer)
+                                        }
+                                    }
+                                    Err => {
+                                        if d.comp.device_lost() {
+                                            discard recover_gpu(mut d)
+                                        }
+                                        d.srv.capture_fail(req.session, 1)
+                                        d.srv.release(req.buffer)
+                                    }
+                                }
+                            } else {
+                                rest_caps.push(req)
+                            }
+                        }
+                        _ => rest_caps.push(req)
+                    }
+                }
+                d.caps.outputs = rest_caps
+            }
+            if cap_shm {
+                // The image is whole (drawn by buffer age): read it back.
+                if let Ok(px) = d.comp.read(key) {
+                    d.srv.capture(so, px, d.outs[o].width, d.outs[o].height, time.now_ns())
+                }
+            }
+        }
+        d.outs[o].dirty = false
+    }
+    // What this frame shows: its clients hear of it.
+    var drawn: List[server.Surface] = []
+    d.origins.each(fn(s, _) {
+        if d.comp.visible(o, display.skey(s)) {
+            drawn.push(s)
+        }
+    })
+    let ms = u32((time.now_ns() / 1000000) & 0xffffffff)
+    for s in drawn {
+        d.srv.frame_done(s, ms)
+    }
+    d.drawn[o] = drawn
+    if d.animating {
+        d.outs[o].dirty = true
+    }
+    place.occlusion(mut d)
+    return Ok(())
+}
+
+/// The target to draw output `o` into and its age: the output asks for
+/// targets first when it has none (of its size), the renderer makes them.
+fn acquire[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) -> Result[Option[(u64, u32)], str] {
+    for _ in 0..2 {
+        match d.be.acquire(u32(o)) {
+            Draw(key, age) => {
+                free_targets(mut d)
+                return Ok(Some((key, age)))
+            }
+            Need(w) => {
+                free_targets(mut d)
+                let tr = d.comp.targets(w)
+                guard let Ok(ts) = tr else {
+                    if d.comp.device_lost() {
+                        try recover_gpu(mut d)
+                        return Ok(None)
+                    }
+                    return Err(tr.unwrap_err())
+                }
+                try d.be.give(u32(o), ts)
+            }
+            Busy => {
+                return Ok(None)
+            }
+        }
+    }
+    return Ok(None)
+}
+
+/// Free the render targets the output let go of.
+fn free_targets[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    var gone: List[u64] = []
+    d.be.retired(mut gone)
+    for k in gone {
+        d.comp.drop_target(k)
+    }
+}
+
+fn try_scanout[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, key: u64) -> bool {
+    guard let Some(s) = d.surf_keys.get(key) else {
+        return false
+    }
+    guard let Some(sf) = d.surfs.get(s) else {
+        return false
+    }
+    guard let Some(b) = sf.buffer else {
+        return false
+    }
+    let bi = d.srv.buffer(b)
+    guard bi.kind == server.BufferKind.Dmabuf and bi.planes >= 1 and bi.planes <= 4 else {
+        return false
+    }
+    let rects: List[(i32, i32, i32, i32)] = [sf.dmg]
+    let tear = d.srv.info(s).tearing
+    let t0 = time.now_ns()
+    guard d.be.scanout(u32(o), display.bkey(b), d.srv.dmabuf(b), rects, tear) else {
+        return false
+    }
+    count_damage(mut d, o, rects)
+    d.probes[o].frame(time.now_ns() - t0)
+    return true
+}
+
+fn count_damage[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, rects: &[(i32, i32, i32, i32)]) {
+    if rects.is_empty() {
+        d.probes[o].damage_rects += 1
+        d.probes[o].damage_pixels += int(d.outs[o].width) * int(d.outs[o].height)
+    }
+    for r in rects {
+        d.probes[o].damage_rects += 1
+        d.probes[o].damage_pixels += int(r.2) * int(r.3)
+    }
+}
+
+fn presented[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, seq: u64, ns: int, flags: u32) {
+    guard o < d.outs.len() and d.outs[o].alive else {
+        return
+    }
+    if d.outs[o].clock.presented(seq, ns) {
+        d.probes[o].missed += 1
+    }
+    d.probes[o].frames += 1
+    if flags & types.presented_zero_copy != 0 {
+        d.probes[o].scanned_out += 1
+    }
+    let gap = ns - d.outs[o].shown_ns
+    if d.outs[o].shown_ns > 0 and gap > 0 and gap < 500000000 {
+        d.probes[o].interval(gap)
+    }
+    d.outs[o].shown_ns = ns
+    let refresh = d.outs[o].clock.refresh_ns
+    let so = d.outs[o].sout
+    let drawn = mem.replace(mut d.drawn[o], [])
+    for s in drawn {
+        d.srv.presented(s, so, ns, refresh, seq, flags)
+        d.srv.latch(s)
+        var done: List[server.Txn] = []
+        for (fs, t) in d.waits.fifo {
+            if fs == s {
+                done.push(t)
+            }
+        }
+        d.waits.fifo.retain(fn(f) => f.0 != s)
+        for t in done {
+            waits.resolve(mut d, t)
+        }
+    }
+    d.drawn[o] = drawn
+    // Buffers the GPU and display are done with.
+    let rel = mem.replace(mut d.releases[o], [])
+    for b in rel {
+        if d.be.holds(display.bkey(b)) {
+            d.releases[o].push(b)
+        } else {
+            d.srv.release(b)
+            clients.drop_orphan(mut d, b)
+        }
+    }
+    for (fd, point) in mem.replace(mut d.points[o], []) {
+        d.sync.signal(fd, point)
+    }
+    shell.presented(mut d, o)
+    schedule(mut d, o)
+}
+
+fn housekeeping[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    place.occlusion(mut d)
+    if d.waits.txn_layout.is_some() and time.now_ns() >= d.waits.txn_deadline {
+        d.waits.txn_wins.clear()
+        waits.try_finish(mut d)
+    }
+}

@@ -36,10 +36,9 @@
 | Q1 | Core Animation 渲染服务器插值动画声明 | `Style.transition_ms`：合成器只给目标，库按时间插值，动画期间不唤醒策略层 | 已实现 |
 | Q2 | NSWindowOcclusionState、App Nap | 连续 500 ms 不可见发 `Occluded`，`accept` 发 xdg_toplevel `suspended` | 已实现 |
 | Q3 | Coalesced Updates | shm 每帧只上传一次，一帧内被替换的缓冲不拷贝直接释放 | 已实现 |
-| Q4 | ProMotion / LTPO、CADisplayLink 帧率范围 | 按内容节奏降低刷新率，空闲时最低或面板自刷新 | 未做 |
+| Q4 | ProMotion、CADisplayLink 帧率范围 | VRR 下按内容节奏拉长帧间隔 | 未做 |
 | Q5 | IOSurface purgeable | 驱逐挂起窗口的 shm 纹理、留低分辨率快照，取消挂起时请客户端重画 | 未做 |
 | Q6 | 定时器合并 | 每个输出一个帧定时器，空闲时一个都不挂 | 部分 |
-| Q7 | vibrancy 模糊缓存 | 模糊结果按下方区域缓存，下方有损坏才重算 | 未做（vk_draw2d 还没有模糊） |
 
 不借鉴：保留式 CALayer 树 API、2× 渲染再缩小（fractional-scale-v1 让客户端按目标尺寸渲染，更省）、
 轮询 IOSurface 使用计数（`wl_buffer.release` 加显式同步已覆盖）、由 WindowServer 管层级和装饰（策略）。
@@ -52,6 +51,7 @@
 | `Frame.new`：vk_gpu 之外的目标（KMS、父合成器） | 已加 |
 | `dmabuf_modifiers`、`drm_node`：linux-dmabuf 格式表与主设备 | 已加 |
 | 设备丢失（`VK_ERROR_DEVICE_LOST` 状态与恢复）、`VK_KHR/EXT_global_priority` | 已加 |
+| 设备内存按需分块（4 MiB 起倍增，空块释放） | 已加 |
 | `VK_EXT_memory_budget` | 未做 |
 | 1..4 平面 dmabuf（`statx` 去重与 `DISJOINT`）、可写 capture 目标与 `copy_texture` | 已加 |
 | GPU 时间戳查询 | 未做：时钟用迟到反馈自适应余量代替 |
@@ -61,8 +61,6 @@
 ## 尚未做的
 
 - 按内容降低刷新率（Q4）、`VK_EXT_memory_budget` 显存驻留管理与挂起窗口低分辨率快照（Q5）。
-- 模糊（Q7 的前提）：加进 vk_draw2d 时，损坏要先按效果扩张再剔除：从上往下，模糊视图把下方需要重画的
-  范围按采样半径扩大，上方不透明区域再从下方的损坏和可见区域里扣掉，否则局部重画在边缘采到旧像素；并加上模糊缓存（Q7）。
 - 协议：数位板（`tablet-v2`）。
 - 输出配置的禁用只是关屏，输出仍在布局里；输出不能旋转。
 - 探针的过度绘制率与离屏 pass 计数。

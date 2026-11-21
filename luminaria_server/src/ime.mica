@@ -55,7 +55,7 @@ fn text_input(mut srv: server.Server, ci: u32, t: ti.Input, take req: ti.InputRe
             srv.text_inputs.items[i].pending.hint = u32(hint)
             srv.text_inputs.items[i].pending.purpose = u32(purpose)
         }
-        SetCursorRectangle(x, y, w, h) => srv.text_inputs.items[i].pending.rect = ids.Rect { x, y, w, h }
+        SetCursorRectangle(x, y, w, h) => srv.text_inputs.items[i].pending.rect = ids.rect(x, y, w, h)
         Commit => commit(mut srv, k)
         Destroy => {
             srv.unbind(ci, t.id)

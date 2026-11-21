@@ -15,6 +15,18 @@
 - **检查**：参数的接口、空值、长度、`since` 版本都检查，失败发 `wl_display.error` 并断开。
   高于对象版本的事件不发。
 
+## 恶意客户端
+
+- **数值**：坐标、尺寸、偏移、外边距、独占区在请求入口用 `ids.clamp` / `ids.rect` 夹到 ±2^24 px，此后
+  几个值相加也不出 i32；`u32` 尺寸先截到 `ids.limit` 再转 `i32`；越界的时间戳、shm 缓冲（行距按 64 位
+  比较）、池大小按协议报错。
+- **fd**：解码失败或断开时收到的 fd 全部关掉；服务端长期持有的 fd 先验证类型（沙盒监听 fd 用
+  `SO_ACCEPTCONN` 确认在监听，否则 `invalid_listen_fd`）。
+- **模糊测试**（`luminaria_server/tests/fuzz.mica`）：读 `protocols/*.xml` 得到每个请求的签名，带种子地给
+  活着的对象发随机请求：参数取边界值、同接口的对象、新 id、字符串、数组、memfd，缺的对象先按签名造出来，
+  偶尔夹杂乱码；另有破坏帧格式的随机字节。要求服务端不崩溃、断开后 fd 数回到原值、之后正常客户端照常
+  工作。`FUZZ_SEED`、`FUZZ_ROUNDS` 调种子和客户端数；整数溢出在 debug 构建里 panic，所以长跑用 debug。
+
 ## 生成的接口（`luminaria_proto`）
 
 `luminaria_scanner` 从 `protocols/*.xml` 生成，每个协议文件一个模块：
@@ -210,6 +222,6 @@ wlr-output-management v4：每个绑定的管理器为每个输出建一个 head
 
 security-context：沙盒（Flatpak）交来一个监听 socket 和一个关闭 fd，`commit` 后发 `Listen(k)`，
 门面监听它，从这里连进来的客户端带上沙盒引擎、app id、实例 id（`sandbox(c)`）；关闭 fd 挂断时停止
-接受，已连上的客户端不受影响。沙盒客户端看不到也绑不了特权 global：security-context 本身（不能嵌套）、
+接受，已连上的客户端不受影响。监听 fd 必须是在监听的 socket。沙盒客户端看不到也绑不了特权 global：security-context 本身（不能嵌套）、
 data-control、layer-shell、session-lock、input-method、virtual-keyboard、keyboard-shortcuts-inhibit、
 foreign-toplevel-list、截屏和输出配置。
