@@ -1,0 +1,484 @@
+// Toplevel extensions: decorations (who draws the title bar), icons,
+// tags and descriptions, modal dialogs, activation tokens (focus
+// stealing prevention), xdg-foreign (parents across clients: portals),
+// ext-foreign-toplevel-list (taskbars, docks) and the system bell.
+
+import std.time
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_decoration_unstable as xd
+import luminaria_proto.xdg_toplevel_icon as ic
+import luminaria_proto.xdg_toplevel_tag as tg
+import luminaria_proto.xdg_dialog as dg
+import luminaria_proto.xdg_activation as act
+import luminaria_proto.xdg_foreign_unstable as xf
+import luminaria_proto.ext_foreign_toplevel_list as ftl
+import luminaria_proto.xdg_system_bell as bell
+import ids
+import state
+import server
+import buffer
+
+fn window(srv: server.Server, ci: u32, toplevel: u32) -> u32 {
+    let wi = srv.slot(ci, toplevel)
+    return if wi != state.none and srv.windows.used(int(wi)) { wi } else { state.none }
+}
+
+fn handle(srv: server.Server, wi: u32) -> ids.Window {
+    return ids.Window { id: srv.windows.id(wi) }
+}
+
+// ------------------------------------------------------- decoration
+
+fn decoration_manager(mut srv: server.Server, ci: u32, take req: xd.DecorationManagerRequest) {
+    match req {
+        GetToplevelDecoration(d, t) => {
+            let wi = window(srv, ci, t.id)
+            guard wi != state.none else {
+                return
+            }
+            guard srv.windows.items[int(wi)].decoration == 0 else {
+                srv.fail(ci, d.id, u32(xd.ToplevelDecorationError.AlreadyConstructed), "the toplevel has a decoration object")
+                return
+            }
+            srv.windows.items[int(wi)].decoration = d.id
+            srv.bind(ci, d.id, wi)
+        }
+        Destroy => {}
+    }
+}
+
+fn decoration(mut srv: server.Server, ci: u32, d: xd.ToplevelDecoration, take req: xd.ToplevelDecorationRequest) {
+    let wi = srv.slot(ci, d.id)
+    guard wi != state.none and srv.windows.used(int(wi)) else {
+        return
+    }
+    match req {
+        SetMode(m) => {
+            srv.windows.items[int(wi)].deco_wanted = u32(m)
+            srv.push(server.Event.WindowDecoration(handle(srv, wi)))
+        }
+        UnsetMode => {
+            srv.windows.items[int(wi)].deco_wanted = 0
+            srv.push(server.Event.WindowDecoration(handle(srv, wi)))
+        }
+        Destroy => {
+            srv.unbind(ci, d.id)
+            srv.windows.items[int(wi)].decoration = 0
+        }
+    }
+}
+
+/// Part of every toplevel configure: the decoration mode first.
+fn configure(mut srv: server.Server, wi: u32) {
+    let d = srv.windows.items[int(wi)].decoration
+    guard d != 0 else {
+        return
+    }
+    let ci = srv.windows.items[int(wi)].client
+    let mode = if srv.windows.items[int(wi)].deco_mode == 2 { xd.ToplevelDecorationMode.ServerSide } else { xd.ToplevelDecorationMode.ClientSide }
+    xd.ToplevelDecoration { id: d }.configure(mut srv.conns[int(ci)], mode)
+}
+
+// ------------------------------------------------------------- icon
+
+fn icon_manager_bound(mut srv: server.Server, ci: u32, id: u32) {
+    // No size preference.
+    ic.IconManager { id }.done(mut srv.conns[int(ci)])
+}
+
+fn icon_manager(mut srv: server.Server, ci: u32, take req: ic.IconManagerRequest) {
+    match req {
+        CreateIcon(icon) => {
+            let k = srv.icons.add(state.IconData { client: ci })
+            srv.bind(ci, icon.id, k.index)
+        }
+        SetIcon(t, icon) => {
+            let wi = window(srv, ci, t.id)
+            guard wi != state.none else {
+                return
+            }
+            var got = state.Icon {}
+            if let Some(i) = icon {
+                let k = srv.slot(ci, i.id)
+                if k != state.none {
+                    srv.icons.items[int(k)].used = true
+                    got = srv.icons.items[int(k)].icon.clone()
+                }
+            }
+            srv.windows.items[int(wi)].icon = got
+            srv.push(server.Event.WindowIcon(handle(srv, wi)))
+        }
+        Destroy => {}
+    }
+}
+
+fn icon(mut srv: server.Server, ci: u32, i: ic.Icon, take req: ic.IconRequest) {
+    let k = srv.slot(ci, i.id)
+    guard k != state.none else {
+        return
+    }
+    match take req {
+        SetName(name) => {
+            guard not srv.icons.items[int(k)].used else {
+                srv.fail(ci, i.id, u32(ic.IconError.Immutable), "the icon is in use")
+                return
+            }
+            srv.icons.items[int(k)].icon.name = name
+        }
+        AddBuffer(b, scale) => {
+            guard not srv.icons.items[int(k)].used else {
+                srv.fail(ci, i.id, u32(ic.IconError.Immutable), "the icon is in use")
+                return
+            }
+            let bi = srv.slot(ci, b.id)
+            guard bi != state.none and srv.buffers.items[int(bi)].kind == state.BufferKind.Shm else {
+                srv.fail(ci, i.id, u32(ic.IconError.InvalidBuffer), "icons are shm buffers")
+                return
+            }
+            let w = srv.buffers.items[int(bi)].width
+            let h = srv.buffers.items[int(bi)].height
+            guard w == h and srv.buffers.items[int(bi)].format == buffer.argb8888 else {
+                srv.fail(ci, i.id, u32(ic.IconError.InvalidBuffer), "icons are square ARGB8888")
+                return
+            }
+            // Copied now: the client may reuse the buffer.
+            var px: List[u8] = []
+            discard buffer.with_shm(srv, bi, fn(bytes, stride) {
+                for y in 0..int(h) {
+                    px.extend(bytes[y * stride..y * stride + int(w) * 4].to_list())
+                }
+            })
+            srv.icons.items[int(k)].icon.images.push(state.IconImage { size: w, scale: max(scale, 1), pixels: px })
+        }
+        Destroy => {
+            srv.unbind(ci, i.id)
+            srv.icons.remove(k, state.IconData {})
+        }
+    }
+}
+
+// ------------------------------------------------------ tag, dialog
+
+fn tag_manager(mut srv: server.Server, ci: u32, take req: tg.ToplevelTagManagerRequest) {
+    match take req {
+        SetToplevelTag(t, tag) => {
+            let wi = window(srv, ci, t.id)
+            if wi != state.none {
+                srv.windows.items[int(wi)].tag = tag
+            }
+        }
+        SetToplevelDescription(t, d) => {
+            let wi = window(srv, ci, t.id)
+            if wi != state.none {
+                srv.windows.items[int(wi)].description = d
+            }
+        }
+        Destroy => {}
+    }
+}
+
+fn dialog_manager(mut srv: server.Server, ci: u32, take req: dg.WmDialogRequest) {
+    match req {
+        GetXdgDialog(d, t) => {
+            let wi = window(srv, ci, t.id)
+            guard wi != state.none else {
+                return
+            }
+            guard srv.windows.items[int(wi)].dialog == 0 else {
+                srv.fail(ci, d.id, u32(dg.WmDialogError.AlreadyUsed), "the toplevel has a dialog object")
+                return
+            }
+            srv.windows.items[int(wi)].dialog = d.id
+            srv.bind(ci, d.id, wi)
+        }
+        Destroy => {}
+    }
+}
+
+fn dialog(mut srv: server.Server, ci: u32, d: dg.Dialog, take req: dg.DialogRequest) {
+    let wi = srv.slot(ci, d.id)
+    guard wi != state.none and srv.windows.used(int(wi)) else {
+        return
+    }
+    match req {
+        SetModal => {
+            srv.windows.items[int(wi)].modal = true
+            srv.push(server.Event.WindowParent(handle(srv, wi)))
+        }
+        UnsetModal => {
+            srv.windows.items[int(wi)].modal = false
+            srv.push(server.Event.WindowParent(handle(srv, wi)))
+        }
+        Destroy => {
+            srv.unbind(ci, d.id)
+            srv.windows.items[int(wi)].dialog = 0
+            srv.windows.items[int(wi)].modal = false
+        }
+    }
+}
+
+// ------------------------------------------------------- activation
+
+/// A fresh activation token (also for apps the compositor launches:
+/// XDG_ACTIVATION_TOKEN).
+fn new_token(mut srv: server.Server, ci: u32) -> str {
+    srv.token_count += 1
+    let t = "luminaria-{srv.token_count}-{time.now_ns() & 0xffffffff}"
+    srv.tokens.push((t.clone(), ci))
+    // Old tokens expire.
+    if srv.tokens.len() > 64 {
+        discard srv.tokens.remove(0)
+    }
+    return t
+}
+
+fn activation(mut srv: server.Server, ci: u32, take req: act.ActivationRequest) {
+    match take req {
+        GetActivationToken(t) => srv.bind(ci, t.id, 0)
+        Activate(token, s) => {
+            guard let Some(k) = srv.tokens.position(fn(t) => t.0 == token) else {
+                return
+            }
+            discard srv.tokens.remove(k)
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            match srv.surfaces.items[int(si)].role {
+                Toplevel(wi) => srv.push(server.Event.Activate(handle(srv, wi)))
+                _ => {}
+            }
+        }
+        Destroy => {}
+    }
+}
+
+fn activation_token(mut srv: server.Server, ci: u32, t: act.ActivationToken, take req: act.ActivationTokenRequest) {
+    match req {
+        Commit => {
+            let tok = new_token(mut srv, ci)
+            t.done(mut srv.conns[int(ci)], tok)
+        }
+        Destroy => srv.unbind(ci, t.id)
+        _ => {}
+    }
+}
+
+// ----------------------------------------------------------- foreign
+
+fn exporter(mut srv: server.Server, ci: u32, take req: xf.ExporterRequest) {
+    match req {
+        ExportToplevel(e, s) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            guard let Toplevel(wi) = srv.surfaces.items[int(si)].role else {
+                srv.fail(ci, e.id, u32(xf.ExporterError.InvalidSurface), "only toplevels are exported")
+                return
+            }
+            srv.token_count += 1
+            let h = "luminaria-export-{srv.token_count}-{time.now_ns() & 0xffffffff}"
+            srv.exported.push((h.clone(), wi, ci, e.id))
+            srv.bind(ci, e.id, wi)
+            e.handle(mut srv.conns[int(ci)], h)
+        }
+        Destroy => {}
+    }
+}
+
+fn exported(mut srv: server.Server, ci: u32, e: xf.Exported, take req: xf.ExportedRequest) {
+    match req {
+        Destroy => {
+            srv.unbind(ci, e.id)
+            unexport(mut srv, fn(x) => x.2 == ci and x.3 == e.id)
+        }
+    }
+}
+
+/// Withdraw the exports matching `f`: their imports are destroyed.
+fn unexport(mut srv: server.Server, f: fn((str, u32, u32, u32)) -> bool) {
+    for x in srv.exported.clone() {
+        guard f(x) else {
+            continue
+        }
+        for (c, id, h) in srv.imported.clone() {
+            if h == x.0 {
+                xf.Imported { id }.destroyed(mut srv.conns[int(c)])
+            }
+        }
+        srv.imported.retain(fn(i) => i.2 != x.0)
+    }
+    srv.exported.retain(fn(x) => not f(x))
+}
+
+fn importer(mut srv: server.Server, ci: u32, take req: xf.ImporterRequest) {
+    match take req {
+        ImportToplevel(im, h) => {
+            srv.bind(ci, im.id, 0)
+            guard srv.exported.any(fn(x) => x.0 == h) else {
+                im.destroyed(mut srv.conns[int(ci)])
+                return
+            }
+            srv.imported.push((ci, im.id, h))
+        }
+        Destroy => {}
+    }
+}
+
+fn imported(mut srv: server.Server, ci: u32, im: xf.Imported, take req: xf.ImportedRequest) {
+    match req {
+        SetParentOf(s) => {
+            guard let Some(k) = srv.imported.position(fn(i) => i.0 == ci and i.1 == im.id) else {
+                return
+            }
+            let h = srv.imported[k].2.clone()
+            guard let Some(e) = srv.exported.position(fn(x) => x.0 == h) else {
+                return
+            }
+            let parent = srv.exported[e].1
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            guard let Toplevel(wi) = srv.surfaces.items[int(si)].role else {
+                srv.fail(ci, im.id, u32(xf.ImportedError.InvalidSurface), "only toplevels get parents")
+                return
+            }
+            guard wi != parent else {
+                return
+            }
+            srv.windows.items[int(wi)].parent = parent
+            srv.push(server.Event.WindowParent(handle(srv, wi)))
+        }
+        Destroy => {
+            srv.unbind(ci, im.id)
+            srv.imported.retain(fn(i) => not (i.0 == ci and i.1 == im.id))
+        }
+    }
+}
+
+// --------------------------------------------- foreign toplevel list
+
+fn list_bound(mut srv: server.Server, ci: u32, id: u32, version: u32) {
+    let r = state.Res { client: ci, id, version }
+    srv.toplevel_lists.push(r)
+    for wi in 0..srv.windows.items.len() {
+        if srv.windows.used(wi) and srv.windows.items[wi].mapped {
+            announce(mut srv, u32(wi), r)
+        }
+    }
+}
+
+fn announce(mut srv: server.Server, wi: u32, r: state.Res) {
+    let i = int(wi)
+    if srv.windows.items[i].identifier.is_empty() {
+        srv.token_count += 1
+        srv.windows.items[i].identifier = "{srv.token_count}-{time.now_ns() & 0xffffffff}"
+    }
+    let c = int(r.client)
+    let h = ftl.ToplevelList { id: r.id }.toplevel(mut srv.conns[c])
+    srv.windows.items[i].handles.push((r.client, h.id))
+    srv.bind(r.client, h.id, wi)
+    h.identifier(mut srv.conns[c], srv.windows.items[i].identifier.clone())
+    h.title(mut srv.conns[c], srv.windows.items[i].title.clone())
+    h.app_id(mut srv.conns[c], srv.windows.items[i].app_id.clone())
+    h.done(mut srv.conns[c])
+}
+
+/// Window `wi` was mapped: every list hears of it.
+fn mapped(mut srv: server.Server, wi: u32) {
+    for r in srv.toplevel_lists.clone() {
+        announce(mut srv, wi, r)
+    }
+}
+
+/// Its title or app id changed.
+fn retitled(mut srv: server.Server, wi: u32) {
+    let i = int(wi)
+    for (c, id) in srv.windows.items[i].handles.clone() {
+        let h = ftl.Handle { id }
+        h.title(mut srv.conns[int(c)], srv.windows.items[i].title.clone())
+        h.app_id(mut srv.conns[int(c)], srv.windows.items[i].app_id.clone())
+        h.done(mut srv.conns[int(c)])
+    }
+}
+
+/// Unmapped or destroyed: the handles close; exports end with it.
+fn gone(mut srv: server.Server, wi: u32, destroyed: bool) {
+    let i = int(wi)
+    for (c, id) in srv.windows.items[i].handles.clone() {
+        ftl.Handle { id }.closed(mut srv.conns[int(c)])
+        srv.unbind(c, id)
+    }
+    srv.windows.items[i].handles.clear()
+    if destroyed {
+        unexport(mut srv, fn(x) => x.1 == wi)
+    }
+}
+
+fn toplevel_list(mut srv: server.Server, ci: u32, l: ftl.ToplevelList, take req: ftl.ToplevelListRequest) {
+    match req {
+        Stop => {
+            srv.toplevel_lists.retain(fn(r) => not (r.client == ci and r.id == l.id))
+            l.finished(mut srv.conns[int(ci)])
+        }
+        Destroy => srv.toplevel_lists.retain(fn(r) => not (r.client == ci and r.id == l.id))
+    }
+}
+
+fn toplevel_handle(mut srv: server.Server, ci: u32, h: ftl.Handle, take req: ftl.HandleRequest) {
+    match req {
+        Destroy => {
+            let wi = srv.slot(ci, h.id)
+            srv.unbind(ci, h.id)
+            if wi != state.none and srv.windows.used(int(wi)) {
+                srv.windows.items[int(wi)].handles.retain(fn(x) => not (x.0 == ci and x.1 == h.id))
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------- bell
+
+fn system_bell(mut srv: server.Server, ci: u32, take req: bell.SystemBellRequest) {
+    match req {
+        Ring(s) => {
+            var surf: Option[ids.Surface] = None
+            if let Some(x) = s {
+                let si = srv.slot(ci, x.id)
+                if si != state.none {
+                    surf = Some(ids.Surface { id: srv.surfaces.id(si) })
+                }
+            }
+            srv.push(server.Event.Bell(surf))
+        }
+        Destroy => {}
+    }
+}
+
+/// Teardown of a toplevel extension object.
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == xd.toplevel_decoration_iface {
+        if srv.windows.used(int(slot)) and srv.windows.items[int(slot)].decoration == id {
+            srv.windows.items[int(slot)].decoration = 0
+        }
+    } else if iface == dg.dialog_iface {
+        if srv.windows.used(int(slot)) and srv.windows.items[int(slot)].dialog == id {
+            srv.windows.items[int(slot)].dialog = 0
+        }
+    } else if iface == ic.icon_iface {
+        srv.icons.remove(slot, state.IconData {})
+    } else if iface == xf.exported_iface {
+        unexport(mut srv, fn(x) => x.2 == ci and x.3 == id)
+    } else if iface == xf.imported_iface {
+        srv.imported.retain(fn(i) => not (i.0 == ci and i.1 == id))
+    } else if iface == ftl.handle_iface {
+        if srv.windows.used(int(slot)) {
+            srv.windows.items[int(slot)].handles.retain(fn(x) => not (x.0 == ci and x.1 == id))
+        }
+    } else {
+        return false
+    }
+    return true
+}

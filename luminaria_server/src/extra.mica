@@ -12,10 +12,14 @@ import luminaria_proto.fifo as fifo_p
 import luminaria_proto.commit_timing as ct
 import luminaria_proto.tearing_control as tc
 import luminaria_proto.linux_drm_syncobj as so
+import luminaria_proto.alpha_modifier as am
+import luminaria_proto.content_type as cty
 import ids
 import state
 import server
 import seat
+import pointer
+import inhibit
 
 /// Bind extension object `id` to surface `s`, failing when it has one.
 fn attach(mut srv: server.Server, ci: u32, id: u32, s: wl.Surface) -> u32 {
@@ -270,6 +274,82 @@ fn syncobj_surface(mut srv: server.Server, ci: u32, o: so.Surface, take req: so.
     }
 }
 
+fn alpha_manager(mut srv: server.Server, ci: u32, take req: am.ModifierRequest) {
+    match req {
+        GetSurface(m, s) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            guard srv.surfaces.items[int(si)].alpha_obj == 0 else {
+                srv.fail(ci, m.id, u32(am.ModifierError.AlreadyConstructed), "the surface has an alpha modifier")
+                return
+            }
+            srv.surfaces.items[int(si)].alpha_obj = m.id
+            srv.bind(ci, m.id, si)
+        }
+        Destroy => {}
+    }
+}
+
+fn alpha_surface(mut srv: server.Server, ci: u32, m: am.ModifierSurface, take req: am.ModifierSurfaceRequest) {
+    let si = srv.slot(ci, m.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    match req {
+        SetMultiplier(f) => {
+            srv.surfaces.items[i].pending.alpha_set = true
+            srv.surfaces.items[i].pending.alpha = f
+        }
+        Destroy => {
+            srv.unbind(ci, m.id)
+            srv.surfaces.items[i].alpha_obj = 0
+            srv.surfaces.items[i].pending.alpha_set = true
+            srv.surfaces.items[i].pending.alpha = 0xFFFFFFFF
+        }
+    }
+}
+
+fn content_manager(mut srv: server.Server, ci: u32, take req: cty.TypeManagerRequest) {
+    match req {
+        GetSurfaceContentType(t, s) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            guard srv.surfaces.items[int(si)].content_obj == 0 else {
+                srv.fail(ci, t.id, u32(cty.TypeManagerError.AlreadyConstructed), "the surface has a content type")
+                return
+            }
+            srv.surfaces.items[int(si)].content_obj = t.id
+            srv.bind(ci, t.id, si)
+        }
+        Destroy => {}
+    }
+}
+
+fn content(mut srv: server.Server, ci: u32, t: cty.Type, take req: cty.TypeRequest) {
+    let si = srv.slot(ci, t.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    match req {
+        SetContentType(c) => {
+            srv.surfaces.items[i].pending.content_set = true
+            srv.surfaces.items[i].pending.content = u32(c)
+        }
+        Destroy => {
+            srv.unbind(ci, t.id)
+            srv.surfaces.items[i].content_obj = 0
+            srv.surfaces.items[i].pending.content_set = true
+            srv.surfaces.items[i].pending.content = 0
+        }
+    }
+}
+
 /// An extension object of a disconnecting client went away.
 fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16) {
     guard srv.surfaces.used(int(slot)) else {
@@ -288,10 +368,16 @@ fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16) {
         srv.surfaces.items[i].tearing = 0
     } else if iface == so.surface_iface {
         srv.surfaces.items[i].syncobj = 0
+    } else if iface == am.modifier_surface_iface {
+        srv.surfaces.items[i].alpha_obj = 0
+    } else if iface == cty.type_iface {
+        srv.surfaces.items[i].content_obj = 0
     }
 }
 
-/// Surface `si` is going: forget it in every seat.
+/// Surface `si` is going: forget it in every seat and extension.
 fn surface_gone(mut srv: server.Server, si: u32) {
     seat.surface_gone(mut srv, si)
+    pointer.surface_gone(mut srv, si)
+    inhibit.surface_gone(mut srv, si)
 }

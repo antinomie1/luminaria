@@ -18,6 +18,7 @@ import luminaria_compose as compose
 import layout
 import hit
 import cursor
+import shell
 
 // ------------------------------------------------------------- events
 
@@ -148,6 +149,21 @@ pub enum Event {
     Ready(int)
     /// A `timer` expired.
     Timer(int)
+    /// The client prefers server-side decorations (true) or drawing its
+    /// own; answer with `decorate` (`accept`: the client draws them).
+    WindowDecoration(server.Window, bool)
+    /// The window's icon changed: `icon`.
+    WindowIcon(server.Window)
+    /// A window asks for focus with a valid activation token (`accept`
+    /// focuses it).
+    RequestActivate(server.Window)
+    /// A client rang the bell (from this window, if any).
+    Bell(Option[server.Window])
+    /// The session was locked (only the lock screen shows and gets input)
+    /// or unlocked.
+    Locked(bool)
+    /// Panels changed the output's free area: `usable`.
+    OutputArea(server.Output)
 }
 
 // --------------------------------------------------------------- state
@@ -178,6 +194,7 @@ let tok_backend = 1000
 let tok_output = 2000
 let tok_house = 3000
 let tok_time = 3001
+let tok_idle = 3002
 let tok_fence = 1000000
 let tok_client = 2000000
 let tok_user = 3000000
@@ -199,6 +216,11 @@ struct Out {
     /// Key of the client buffer scanned out (0: composing).
     scanned: u64 = 0
     vrr: bool = false
+    /// The area panels leave free (global logical).
+    ux: f64 = 0.0
+    uy: f64 = 0.0
+    uw: f64 = 0.0
+    uh: f64 = 0.0
 }
 
 fn Out.lw(self) -> f64 {
@@ -346,6 +368,15 @@ pub struct Display {
     held: List[server.Surface] = []
     quit: bool = false
     t0: int = 0
+    /// Layer surface positions.
+    spots: map.Map[server.Layer, shell.Spot]
+    layer_focus: Option[server.Surface] = None
+    locked: bool = false
+    /// Outputs still to show a frame before the locker hears `locked`.
+    lock_wait: List[int] = []
+    /// The surface whose pointer constraint is on.
+    constrained: Option[server.Surface] = None
+    idle_fd: int = -1
 }
 
 fn skey(s: server.Surface) -> u64 {
@@ -375,7 +406,7 @@ pub fn Display.open(o: Options) -> Result[Display, str] {
         main = u64(major) << 8 | u64(minor & 0xff) | (u64(minor & ~0xff) << 12)
         sync = compose.Syncobj.open(major, minor)
     }
-    var d = Display { srv, be, dev, comp, poll, sync, background: vec4(0.0), surfs: map.Map.new(), wins: map.Map.new(), origins: map.Map.new(), anims: map.Map.new(), dmabufs: map.Map.new(), left: map.Map.new() }
+    var d = Display { srv, be, dev, comp, poll, sync, background: vec4(0.0), surfs: map.Map.new(), wins: map.Map.new(), origins: map.Map.new(), anims: map.Map.new(), dmabufs: map.Map.new(), left: map.Map.new(), spots: map.Map.new() }
     let formats = compose.format.dmabuf_formats(d.dev)
     if not formats.is_empty() {
         var scanout: List[(u32, u64)] = []
@@ -405,6 +436,8 @@ pub fn Display.open(o: Options) -> Result[Display, str] {
     d.house_fd = try os.timerfd().map_err(fn(e) => "{e}")
     discard d.poll.add(d.time_fd, tok_time, true, false)
     discard d.poll.add(d.house_fd, tok_house, true, false)
+    d.idle_fd = try os.timerfd().map_err(fn(e) => "{e}")
+    discard d.poll.add(d.idle_fd, tok_idle, true, false)
     discard d.poll.add(d.srv.listener.fd, tok_listener, true, false)
     var fds: List[(int, int)] = []
     d.be.fds(mut fds)
@@ -543,6 +576,9 @@ fn Display.ready(mut self, t: int) -> Result[(), str] {
     } else if t == tok_house {
         discard os.count(self.house_fd)
         self.housekeeping()
+    } else if t == tok_idle {
+        discard os.count(self.idle_fd)
+        self.idle_tick()
     } else if t >= tok_output {
         let o = t - tok_output
         if o < self.outs.len() {
@@ -674,6 +710,7 @@ fn Display.output_removed(mut self, o: int) {
     guard o < self.outs.len() and self.outs[o].alive else {
         return
     }
+    shell.output_gone(mut self, o)
     self.outs[o].alive = false
     let so = self.outs[o].sout
     self.srv.remove_output(so)
@@ -773,8 +810,7 @@ fn Display.server_events(mut self) {
             }
             PopupGrab(p, st) => {
                 self.grabs.push(p)
-                let s = self.srv.popup_surface(p)
-                self.srv.keyboard_focus(self.seat, Some(s))
+                shell.update_keyboard(mut self)
             }
             PopupReposition(p) => self.configure_popup(p)
             Cursor(st, s, hx, hy) => {
@@ -786,6 +822,39 @@ fn Display.server_events(mut self) {
                     None => self.hide_cursor()
                 }
             }
+            CursorShape(st, shape) => {
+                self.cursor_surface = None
+                self.set_cursor_named(server.server.cursor_name(shape))
+            }
+            LayerNew => self.rebuild()
+            LayerChanged => {
+                self.rebuild()
+                shell.update_keyboard(mut self)
+            }
+            LayerGone(l) => {
+                shell.layer_gone(mut self, l)
+                self.rebuild()
+                shell.update_keyboard(mut self)
+            }
+            LockRequest => shell.lock(mut self)
+            Unlock => shell.unlock(mut self)
+            LockSurfaceNew(k) => shell.configure_lock(mut self, k)
+            LockSurfaceChanged => {
+                self.rebuild()
+                shell.update_keyboard(mut self)
+            }
+            WindowDecoration(w) => self.emit(Event.WindowDecoration(w, self.srv.decoration(w) == 2))
+            WindowIcon(w) => self.emit(Event.WindowIcon(w))
+            Activate(w) => self.emit(Event.RequestActivate(w))
+            Bell(s) => {
+                let w = match s {
+                    Some(x) => self.srv.window_of(x)
+                    None => None
+                }
+                self.emit(Event.Bell(w))
+            }
+            ImeChanged => self.rebuild()
+            IdleChanged => self.idle_tick()
         }
     }
 }
@@ -835,6 +904,24 @@ fn Display.acked(mut self, w: server.Window, aw: i32, ah: i32) {
 
 fn Display.buffer_new(mut self, b: server.Buffer) {
     let info = self.srv.buffer(b)
+    if info.kind == server.BufferKind.SinglePixel {
+        // One texel, stretched by the viewport.
+        let c = info.color
+        let px: List[u8] = [u8(c[0] >> 24), u8(c[1] >> 24), u8(c[2] >> 24), u8(c[3] >> 24)]
+        if let Ok(t) = self.dev.texture(gpu.TextureDesc { width: 1, height: 1, format: gpu.Format.R8G8B8A8_UNORM, opaque: c[3] == 0xFFFFFFFF }) {
+            if let Ok(e) = self.dev.encoder() {
+                var enc = e
+                if self.dev.write_texture_rect(mut enc, t, 0, 0, 1, 1, px, 4).is_ok() {
+                    self.comp.put_uploads(enc)
+                    discard self.dmabufs.insert(b, t)
+                    return
+                }
+                self.dev.cancel(take enc)
+            }
+            self.dev.destroy_texture(t)
+        }
+        return
+    }
     guard info.kind == server.BufferKind.Dmabuf else {
         return
     }
@@ -933,7 +1020,7 @@ fn Display.applied(mut self, s: server.Surface) {
         let new = info.buffer
         if old != new {
             if let Some(ob) = old {
-                if self.srv.buffer(ob).kind == server.BufferKind.Dmabuf or not self.srv.buffer_alive(ob) {
+                if self.srv.buffer(ob).kind != server.BufferKind.Shm or not self.srv.buffer_alive(ob) {
                     self.release_later(ob, s, sf.rel_fd, sf.rel_point)
                 }
             }
@@ -943,7 +1030,7 @@ fn Display.applied(mut self, s: server.Surface) {
             None => sf.tex = None
             Some(b) => {
                 let bi = self.srv.buffer(b)
-                if bi.kind == server.BufferKind.Dmabuf {
+                if bi.kind != server.BufferKind.Shm {
                     sf.tex = self.dmabufs.get(b)
                     if sf.tex.is_none() {
                         sf.buffer = None
@@ -1120,12 +1207,7 @@ fn Display.dismiss_popups(mut self) {
 
 /// Keyboard focus back to the window after popups go.
 fn Display.refocus(mut self) {
-    if let Some(p) = self.grabs.last() {
-        let s = self.srv.popup_surface(p)
-        self.srv.keyboard_focus(self.seat, Some(s))
-        return
-    }
-    self.srv.keyboard_focus(self.seat, self.focus)
+    shell.update_keyboard(mut self)
 }
 
 // --------------------------------------------------------------- waits
@@ -1289,7 +1371,18 @@ fn Display.rebuild(mut self) {
         per.push([])
     }
     var masks: map.Map[server.Surface, u64] = map.Map.new()
-    let places = self.lay.places.clone()
+    shell.arrange(mut self)
+    // Locked: the lock screen alone.
+    var places = self.lay.places.clone()
+    if self.locked {
+        places.clear()
+    }
+    if self.locked {
+        shell.place_lock(mut self, mut per, mut masks)
+    } else {
+        shell.place_layers(mut self, 0, mut per, mut masks)
+        shell.place_layers(mut self, 1, mut per, mut masks)
+    }
     for p in places {
         match p.what {
             Window(w) => {
@@ -1345,6 +1438,11 @@ fn Display.rebuild(mut self) {
                 }
             }
         }
+    }
+    if not self.locked {
+        shell.place_layers(mut self, 2, mut per, mut masks)
+        shell.place_layers(mut self, 3, mut per, mut masks)
+        shell.place_ime(mut self, mut per, mut masks)
     }
     // A cursor the display does not show itself is drawn on top.
     if not self.cursor_hw and self.cursor.width > 0 {
@@ -1416,7 +1514,8 @@ fn Display.place_tree(mut self, s: server.Surface, ox: f64, oy: f64, sc: f64, st
             continue
         }
         let root = ts == s
-        let opq = self.srv.opaque(ts)
+        let opq = if info.alpha < 1.0 { server.Rect {} } else { self.srv.opaque(ts) }
+        let alpha = opacity * info.alpha
         var mask: u64 = 0
         for o in 0..self.outs.len() {
             let out = self.outs[o]
@@ -1439,7 +1538,7 @@ fn Display.place_tree(mut self, s: server.Surface, ox: f64, oy: f64, sc: f64, st
                 h: f32((gh * k).round()),
                 src,
                 transform: info.transform,
-                opacity,
+                opacity: alpha,
                 radius: if root { style.radius * f32(f) } else { 0.0 },
                 shadow: if root { style.shadow * f32(k) } else { 0.0 },
                 opaque: compose.Rect { x: f32(f64(opq.x) * f), y: f32(f64(opq.y) * f), w: f32(f64(opq.w) * f), h: f32(f64(opq.h) * f) },
@@ -1490,6 +1589,7 @@ fn Display.clamp_pointer(mut self) {
 }
 
 fn Display.input(mut self, take i: backend.Input) {
+    self.srv.input_activity(time.now_ns())
     match take i {
         Key(t, code, pressed, sym, text) => {
             let mods = self.be.mods()
@@ -1501,8 +1601,9 @@ fn Display.input(mut self, take i: backend.Input) {
             self.emit(Event.Modifiers(self.be.mods()))
         }
         Motion(t, dx, dy, rdx, rdy) => {
-            self.px += dx
-            self.py += dy
+            let (x, y) = self.constrain(self.px + dx, self.py + dy)
+            self.px = x
+            self.py = y
             self.moved(t, dx, dy, rdx, rdy)
         }
         MotionAbsolute(t, o, nx, ny) => {
@@ -1514,8 +1615,9 @@ fn Display.input(mut self, take i: backend.Input) {
             let y = self.outs[oi].y + ny * self.outs[oi].lh()
             let dx = x - self.px
             let dy = y - self.py
-            self.px = x
-            self.py = y
+            let (cx, cy) = self.constrain(x, y)
+            self.px = cx
+            self.py = cy
             self.moved(t, dx, dy, dx, dy)
         }
         Button(t, button, pressed) => {
@@ -1648,7 +1750,7 @@ fn Display.deliver_motion(mut self, t: u32) {
             if self.pointer_on != Some(s) {
                 self.pointer_on = Some(s)
                 self.srv.pointer_focus(self.seat, Some(s), lx, ly)
-            } else {
+            } else if not self.pointer_locked() {
                 self.srv.pointer_motion(self.seat, t, lx, ly)
             }
         }
@@ -1662,6 +1764,113 @@ fn Display.deliver_motion(mut self, t: u32) {
                 }
             }
         }
+    }
+    self.update_constraint()
+}
+
+/// Whether a pointer lock holds the pointer still.
+fn Display.pointer_locked(self) -> bool {
+    guard let Some(s) = self.constrained else {
+        return false
+    }
+    return match self.srv.constraint(self.seat, s) {
+        Some(c) => c.active and c.lock
+        None => false
+    }
+}
+
+/// Where the pointer may go on its way to `x, y`: nowhere while locked,
+/// inside the region while confined.
+fn Display.constrain(self, x: f64, y: f64) -> (f64, f64) {
+    guard let Some(s) = self.constrained else {
+        return (x, y)
+    }
+    guard let Some(c) = self.srv.constraint(self.seat, s) else {
+        return (x, y)
+    }
+    guard c.active else {
+        return (x, y)
+    }
+    if c.lock {
+        return (self.px, self.py)
+    }
+    guard let Some((gx, gy, sc)) = self.origins.get(s) else {
+        return (x, y)
+    }
+    let info = self.srv.info(s)
+    let rects = c.region.clone().unwrap_or([server.Rect { w: info.width, h: info.height }])
+    let lx = (x - gx) / sc
+    let ly = (y - gy) / sc
+    for r in rects {
+        if lx >= f64(r.x) and ly >= f64(r.y) and lx < f64(r.x + r.w) and ly < f64(r.y + r.h) {
+            return (x, y)
+        }
+    }
+    // Outside: clamp into the rectangle the pointer is in now.
+    let cx = (self.px - gx) / sc
+    let cy = (self.py - gy) / sc
+    var r = rects.first().unwrap_or(server.Rect {})
+    for q in rects {
+        if cx >= f64(q.x) and cy >= f64(q.y) and cx < f64(q.x + q.w) and cy < f64(q.y + q.h) {
+            r = q
+        }
+    }
+    let nx = min(max(lx, f64(r.x)), f64(r.x + r.w) - 0.01)
+    let ny = min(max(ly, f64(r.y)), f64(r.y + r.h) - 0.01)
+    return (gx + nx * sc, gy + ny * sc)
+}
+
+/// Turn pointer constraints on and off: one applies while the pointer is
+/// inside its region on a surface of the client with the keyboard.
+fn Display.update_constraint(mut self) {
+    let kb = self.srv.keyboard_focused(self.seat)
+    let kb_client = match kb {
+        Some(k) => Some(self.srv.client_of(k))
+        None => None
+    }
+    if let Some(s) = self.constrained {
+        let keep = self.pointer_on == Some(s) and kb_client == Some(self.srv.client_of(s)) and self.srv.surface_alive(s)
+        if not keep {
+            if let Some(c) = self.srv.constraint(self.seat, s) {
+                // A lock ends where the client says the cursor is.
+                if c.lock {
+                    if let Some((hx, hy)) = c.hint {
+                        if let Some((gx, gy, sc)) = self.origins.get(s) {
+                            self.px = gx + hx * sc
+                            self.py = gy + hy * sc
+                            self.move_cursor()
+                        }
+                    }
+                }
+            }
+            self.srv.set_constraint(self.seat, s, false)
+            self.constrained = None
+        }
+    }
+    guard self.constrained.is_none() else {
+        return
+    }
+    guard let Some(s) = self.pointer_on else {
+        return
+    }
+    guard kb_client == Some(self.srv.client_of(s)) else {
+        return
+    }
+    guard let Some(c) = self.srv.constraint(self.seat, s) else {
+        return
+    }
+    guard let Some((gx, gy, sc)) = self.origins.get(s) else {
+        return
+    }
+    let lx = (self.px - gx) / sc
+    let ly = (self.py - gy) / sc
+    let inside = match c.region.clone() {
+        Some(rs) => rs.any(fn(r) => lx >= f64(r.x) and ly >= f64(r.y) and lx < f64(r.x + r.w) and ly < f64(r.y + r.h))
+        None => self.srv.accepts(s, lx, ly)
+    }
+    if inside {
+        self.srv.set_constraint(self.seat, s, true)
+        self.constrained = Some(s)
     }
 }
 
@@ -1698,7 +1907,8 @@ pub fn Display.accept(mut self, e: Event) {
             let cur = self.wins.get(w).unwrap_or(Win {})
             var st = cur.states
             st.maximized = on
-            let (ww, hh) = self.window_output_size(w)
+            // Maximized windows stay clear of panels.
+            let (ww, hh) = self.window_output_size(w, true)
             if on {
                 discard self.configure(w, ww, hh, st)
             } else {
@@ -1709,7 +1919,7 @@ pub fn Display.accept(mut self, e: Event) {
             let cur = self.wins.get(w).unwrap_or(Win {})
             var st = cur.states
             st.fullscreen = on
-            var (ww, hh) = self.window_output_size(w)
+            var (ww, hh) = self.window_output_size(w, false)
             if let Some(so) = o {
                 let oi = self.out_index(so)
                 if oi >= 0 {
@@ -1740,8 +1950,16 @@ pub fn Display.accept(mut self, e: Event) {
             discard self.srv.key(self.seat, k.time, k.code, k.pressed)
         }
         Modifiers => {}
-        Motion(p) => self.deliver_motion(p.time)
+        Motion(p) => {
+            self.srv.relative_motion(self.seat, u64(time.now_ns() / 1000), p.dx, p.dy, p.raw_dx, p.raw_dy)
+            self.deliver_motion(p.time)
+        }
         Button(p) => {
+            if p.pressed {
+                if let Some((s, _, _)) = self.under(self.px, self.py) {
+                    shell.clicked(mut self, s)
+                }
+            }
             if p.pressed and not self.grabs.is_empty() {
                 let under = self.under(self.px, self.py)
                 let inside = match under {
@@ -1786,12 +2004,30 @@ pub fn Display.accept(mut self, e: Event) {
                 Cancel => self.srv.touch_cancel(self.seat)
             }
         }
+        Gesture(g) => {
+            let (kind, phase) = match g.kind {
+                SwipeBegin => (0, 0)
+                SwipeUpdate => (0, 1)
+                SwipeEnd => (0, 2)
+                PinchBegin => (1, 0)
+                PinchUpdate => (1, 1)
+                PinchEnd => (1, 2)
+                HoldBegin => (2, 0)
+                HoldEnd => (2, 2)
+            }
+            self.srv.gesture(self.seat, kind, phase, g.time, u32(max(g.fingers, 0)), g.dx, g.dy, g.scale, g.rotation, g.cancelled)
+        }
+        // The library draws no title bars: clients do.
+        WindowDecoration(w, _) => self.decorate(w, false)
+        RequestActivate(w) => self.focus(Some(w))
         _ => {}
     }
 }
 
 /// Logical size of the output the window is (mostly) on.
-fn Display.window_output_size(self, w: server.Window) -> (i32, i32) {
+/// Logical size of the output the window is (mostly) on; `usable`: the
+/// part panels leave free.
+fn Display.window_output_size(self, w: server.Window, usable: bool) -> (i32, i32) {
     let s = self.srv.window_surface(w)
     var o = 0
     if let Some((gx, gy, _)) = self.origins.get(s) {
@@ -1807,6 +2043,9 @@ fn Display.window_output_size(self, w: server.Window) -> (i32, i32) {
     }
     guard o < self.outs.len() and self.outs[o].alive else {
         return (0, 0)
+    }
+    if usable and self.outs[o].uw > 0.0 and self.outs[o].uh > 0.0 {
+        return (i32(self.outs[o].uw), i32(self.outs[o].uh))
     }
     return (i32(self.outs[o].lw()), i32(self.outs[o].lh()))
 }
@@ -2153,6 +2392,7 @@ fn Display.presented(mut self, o: int, seq: u64, ns: int, flags: u32) {
     for (fd, point) in mem.replace(mut self.points[o], []) {
         self.sync.signal(fd, point)
     }
+    shell.presented(mut self, o)
     self.schedule(o)
 }
 
@@ -2378,6 +2618,91 @@ fn Display.try_finish(mut self) {
     self.rebuild()
 }
 
+/// Who draws window `w`'s title bar: the compositor (`server_side`, with
+/// images in the layout) or the client.
+pub fn Display.decorate(mut self, w: server.Window, server_side: bool) {
+    self.srv.set_decoration(w, server_side)
+    let cur = self.wins.get(w).unwrap_or(Win {})
+    if cur.configured {
+        discard self.configure(w, cur.width, cur.height, cur.states)
+    }
+}
+
+/// The window's icon: a theme name and/or images.
+pub fn Display.icon(self, w: server.Window) -> server.Icon {
+    return self.srv.icon(w)
+}
+
+/// A name for the window that stays the same across restarts (to
+/// remember its place), and a description of it.
+pub fn Display.tag(self, w: server.Window) -> (str, str) {
+    return self.srv.tag(w)
+}
+
+/// The window is a modal dialog of its parent.
+pub fn Display.modal(self, w: server.Window) -> bool {
+    return self.srv.modal(w)
+}
+
+/// What the window shows: none 0, photo 1, video 2, game 3.
+pub fn Display.content_type(self, w: server.Window) -> u32 {
+    return self.srv.info(self.srv.window_surface(w)).content
+}
+
+/// A token for a program the compositor starts (put it in
+/// XDG_ACTIVATION_TOKEN): its window may then take focus.
+pub fn Display.activation_token(mut self) -> str {
+    return self.srv.activation_token()
+}
+
+/// The part of output `o` panels leave free: x, y, width, height.
+pub fn Display.usable(self, so: server.Output) -> (f64, f64, f64, f64) {
+    let o = self.out_index(so)
+    guard o >= 0 else {
+        return (0.0, 0.0, 0.0, 0.0)
+    }
+    let out = self.outs[o]
+    if out.uw <= 0.0 or out.uh <= 0.0 {
+        return (out.x, out.y, out.lw(), out.lh())
+    }
+    return (out.ux, out.uy, out.uw, out.uh)
+}
+
+/// The session is locked: only the lock screen shows.
+pub fn Display.locked(self) -> bool {
+    return self.locked
+}
+
+/// The focused client asked for the compositor's shortcuts (a remote
+/// desktop, a VM): let keys through to it.
+pub fn Display.shortcuts_inhibited(self) -> bool {
+    return self.srv.shortcuts_inhibited(self.seat)
+}
+
+/// A visible client wants the screen kept on (a video playing).
+pub fn Display.idle_inhibited(self) -> bool {
+    for s in self.srv.idle_inhibitors() {
+        for o in 0..self.outs.len() {
+            if self.outs[o].alive and self.comp.visible(o, skey(s)) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/// Idle notifications that are due go out; arm for the next one.
+fn Display.idle_tick(mut self) {
+    let now = time.now_ns()
+    let next = self.srv.idle_check(now, self.idle_inhibited())
+    if next > 0 {
+        discard os.timer_arm(self.idle_fd, max(next - now, 1000000), 0)
+    } else if next < 0 {
+        // Held back by an inhibitor: look again in a while.
+        discard os.timer_arm(self.idle_fd, 5000000000, 0)
+    }
+}
+
 /// Ask window `w` to close.
 pub fn Display.close(mut self, w: server.Window) {
     self.srv.close(w)
@@ -2390,9 +2715,9 @@ pub fn Display.focus(mut self, w: Option[server.Window]) {
         Some(x) => Some(self.srv.window_surface(x))
         None => None
     }
-    if self.grabs.is_empty() {
-        self.srv.keyboard_focus(self.seat, self.focus)
-    }
+    // A window taking focus ends a layer surface's on-demand focus.
+    self.layer_focus = None
+    shell.update_keyboard(mut self)
 }
 
 pub fn Display.focused(self) -> Option[server.Window] {

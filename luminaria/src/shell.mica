@@ -1,0 +1,379 @@
+// The desktop shell around the compositor's layout: layer surfaces
+// (arranged by their anchors, margins and exclusive zones, drawn below
+// and above the layout), the session lock (only lock surfaces show and
+// get input), input method popups (under the text cursor) and who has
+// the keyboard.
+
+import std.collections.map
+import luminaria_server as server
+import luminaria_compose as compose
+import layout
+import display
+
+/// Where a layer surface goes: output index, global logical position.
+struct Spot {
+    o: int = -1
+    x: f64 = 0.0
+    y: f64 = 0.0
+}
+
+/// The edge an exclusive zone is taken from (0: none).
+fn zone_edge(st: server.LayerState) -> u32 {
+    if st.exclusive_edge != 0 {
+        return st.exclusive_edge
+    }
+    let a = st.anchor
+    // One edge, or one edge and both perpendicular ones.
+    if a == 1 or a == 13 {
+        return 1
+    }
+    if a == 2 or a == 14 {
+        return 2
+    }
+    if a == 4 or a == 7 {
+        return 4
+    }
+    if a == 8 or a == 11 {
+        return 8
+    }
+    return 0
+}
+
+/// The output a layer surface is on: the one it asked for, else the one
+/// it was given when it appeared.
+fn layer_output(mut d: display.Display, l: server.Layer, info: server.LayerInfo) -> int {
+    if let Some(so) = info.output {
+        let o = d.out_index(so)
+        if o >= 0 {
+            return o
+        }
+    }
+    if let Some(s) = d.spots.get(l) {
+        if s.o >= 0 and s.o < d.outs.len() and d.outs[s.o].alive {
+            return s.o
+        }
+    }
+    var o = d.output_at(d.px, d.py)
+    if o < 0 {
+        for k in 0..d.outs.len() {
+            if d.outs[k].alive {
+                o = k
+                break
+            }
+        }
+    }
+    return o
+}
+
+/// Lay out every layer surface: zones first (overlay to background), then
+/// sizes and positions; configure what changed. Outputs whose usable area
+/// changed report OutputArea.
+fn arrange(mut d: display.Display) {
+    let ls = d.srv.layers()
+    var areas: List[(f64, f64, f64, f64)] = []
+    for o in 0..d.outs.len() {
+        areas.push((d.outs[o].x, d.outs[o].y, d.outs[o].lw(), d.outs[o].lh()))
+    }
+    var bounds: map.Map[server.Layer, (f64, f64, f64, f64)] = map.Map.new()
+    var outs: map.Map[server.Layer, int] = map.Map.new()
+    var layer = 3
+    while layer >= 0 {
+        for l in ls {
+            let info = d.srv.layer(l)
+            guard int(info.state.layer) == layer else {
+                continue
+            }
+            let o = layer_output(mut d, l, info)
+            guard o >= 0 else {
+                continue
+            }
+            discard outs.insert(l, o)
+            let st = info.state
+            let full = (d.outs[o].x, d.outs[o].y, d.outs[o].lw(), d.outs[o].lh())
+            discard bounds.insert(l, if st.exclusive < 0 { full } else { areas[o] })
+            guard st.exclusive > 0 else {
+                continue
+            }
+            let (ax, ay, aw, ah) = areas[o]
+            let m = st.margin
+            let edge = zone_edge(st)
+            let z = f64(st.exclusive)
+            if edge == 1 {
+                areas[o] = (ax, ay + z + f64(m[0]), aw, ah - z - f64(m[0]))
+            } else if edge == 2 {
+                areas[o] = (ax, ay, aw, ah - z - f64(m[2]))
+            } else if edge == 4 {
+                areas[o] = (ax + z + f64(m[3]), ay, aw - z - f64(m[3]), ah)
+            } else if edge == 8 {
+                areas[o] = (ax, ay, aw - z - f64(m[1]), ah)
+            }
+        }
+        layer -= 1
+    }
+    for l in ls {
+        let info = d.srv.layer(l)
+        guard let Some(o) = outs.get(l) else {
+            continue
+        }
+        let st = info.state
+        // Zero-zone surfaces stay clear of the others' zones.
+        let (bx, by, bw, bh) = if st.exclusive == 0 { areas[o] } else { bounds.get(l).unwrap_or(areas[o]) }
+        let m = st.margin
+        let a = st.anchor
+        let w = if st.width > 0 { f64(st.width) } else { max(bw - f64(m[3] + m[1]), 1.0) }
+        let h = if st.height > 0 { f64(st.height) } else { max(bh - f64(m[0] + m[2]), 1.0) }
+        let x = if a & 4 != 0 and a & 8 == 0 { bx + f64(m[3]) } else if a & 8 != 0 and a & 4 == 0 { bx + bw - f64(m[1]) - w } else { bx + (bw - w) / 2.0 }
+        let y = if a & 1 != 0 and a & 2 == 0 { by + f64(m[0]) } else if a & 2 != 0 and a & 1 == 0 { by + bh - f64(m[2]) - h } else { by + (bh - h) / 2.0 }
+        discard d.spots.insert(l, Spot { o, x: x.round(), y: y.round() })
+        let iw = i32(w.round())
+        let ih = i32(h.round())
+        if iw != info.width or ih != info.height {
+            discard d.srv.configure_layer(l, iw, ih)
+        }
+    }
+    for o in 0..d.outs.len() {
+        guard d.outs[o].alive else {
+            continue
+        }
+        let (ax, ay, aw, ah) = areas[o]
+        if ax != d.outs[o].ux or ay != d.outs[o].uy or aw != d.outs[o].uw or ah != d.outs[o].uh {
+            d.outs[o].ux = ax
+            d.outs[o].uy = ay
+            d.outs[o].uw = aw
+            d.outs[o].uh = ah
+            d.emit(display.Event.OutputArea(d.outs[o].sout))
+        }
+    }
+}
+
+/// Place the mapped layer surfaces of `layer` (and their popups).
+fn place_layers(mut d: display.Display, layer: u32, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    for l in d.srv.layers() {
+        let info = d.srv.layer(l)
+        guard info.mapped and info.state.layer == layer else {
+            continue
+        }
+        guard let Some(sp) = d.spots.get(l) else {
+            continue
+        }
+        d.place_tree(info.surface, sp.x, sp.y, 1.0, layout.Style {}, 1.0, mut per, mut masks)
+        place_popups(mut d, info.surface, mut per, mut masks)
+    }
+}
+
+/// Popups whose chain of parents starts at `root` (placed already).
+fn place_popups(mut d: display.Display, root: server.Surface, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    for pp in d.popups.clone() {
+        var top = d.srv.popup_parent(pp)
+        for _ in 0..16 {
+            guard let Some(t) = top else {
+                break
+            }
+            guard let Some(up) = d.srv.popup_of(t) else {
+                break
+            }
+            top = d.srv.popup_parent(up)
+        }
+        guard top == Some(root) else {
+            continue
+        }
+        let ps = d.srv.popup_surface(pp)
+        guard d.srv.info(ps).mapped else {
+            continue
+        }
+        guard let Some(parent) = d.srv.popup_parent(pp) else {
+            continue
+        }
+        guard let Some((pgx, pgy, psc)) = d.origins.get(parent) else {
+            continue
+        }
+        let pgeo = d.srv.info(parent).geometry
+        let g = d.srv.popup_geometry(pp)
+        let own = d.srv.info(ps).geometry
+        let ox = pgx + f64(pgeo.x + g.x - own.x) * psc
+        let oy = pgy + f64(pgeo.y + g.y - own.y) * psc
+        d.place_tree(ps, ox, oy, psc, layout.Style {}, 1.0, mut per, mut masks)
+    }
+}
+
+/// While locked: each output shows its lock surface, nothing else.
+fn place_lock(mut d: display.Display, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    for k in d.srv.lock_surfaces() {
+        let (s, so, mapped) = d.srv.lock_surface(k)
+        guard mapped else {
+            continue
+        }
+        guard let Some(out) = so else {
+            continue
+        }
+        let o = d.out_index(out)
+        guard o >= 0 else {
+            continue
+        }
+        d.place_tree(s, d.outs[o].x, d.outs[o].y, 1.0, layout.Style {}, 1.0, mut per, mut masks)
+    }
+}
+
+/// Input method popups, their top left under the text cursor.
+fn place_ime(mut d: display.Display, mut per: List[List[compose.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    guard let Some((ts, r)) = d.srv.text_cursor(d.seat) else {
+        return
+    }
+    guard let Some((gx, gy, sc)) = d.origins.get(ts) else {
+        return
+    }
+    for s in d.srv.ime_popups(d.seat) {
+        d.place_tree(s, gx + f64(r.x) * sc, gy + f64(r.y + r.h) * sc, sc, layout.Style {}, 1.0, mut per, mut masks)
+    }
+}
+
+/// Configure a lock surface to its output's size.
+fn configure_lock(mut d: display.Display, k: server.LockSurface) {
+    let (_, so, _) = d.srv.lock_surface(k)
+    guard let Some(out) = so else {
+        return
+    }
+    let o = d.out_index(out)
+    guard o >= 0 else {
+        return
+    }
+    discard d.srv.configure_lock(k, i32(d.outs[o].lw()), i32(d.outs[o].lh()))
+}
+
+/// A client asked to lock: hide the session at once; the locker hears
+/// `locked` once every output showed a frame without it.
+fn lock(mut d: display.Display) {
+    let was = d.locked
+    d.locked = true
+    d.lock_wait.clear()
+    for o in 0..d.outs.len() {
+        if d.outs[o].alive {
+            d.outs[o].dirty = true
+            d.lock_wait.push(o)
+        }
+    }
+    d.dismiss_popups()
+    d.rebuild()
+    update_keyboard(mut d)
+    if was or d.lock_wait.is_empty() {
+        d.lock_wait.clear()
+        d.srv.lock_done()
+    }
+    if not was {
+        d.emit(display.Event.Locked(true))
+    }
+}
+
+fn unlock(mut d: display.Display) {
+    d.locked = false
+    d.lock_wait.clear()
+    for o in 0..d.outs.len() {
+        d.outs[o].dirty = true
+    }
+    d.rebuild()
+    update_keyboard(mut d)
+    d.emit(display.Event.Locked(false))
+}
+
+/// Output `o` presented a frame: part of a pending lock.
+fn presented(mut d: display.Display, o: int) {
+    guard not d.lock_wait.is_empty() else {
+        return
+    }
+    d.lock_wait.retain(fn(k) => k != o)
+    if d.lock_wait.is_empty() {
+        d.srv.lock_done()
+    }
+}
+
+/// Who gets the keyboard: the lock screen, an exclusive layer surface,
+/// a grabbing popup, a layer surface clicked on, else the focused window.
+fn keyboard_target(d: display.Display) -> Option[server.Surface] {
+    if d.locked {
+        var any: Option[server.Surface] = None
+        let here = d.output_at(d.px, d.py)
+        for k in d.srv.lock_surfaces() {
+            let (s, so, mapped) = d.srv.lock_surface(k)
+            guard mapped else {
+                continue
+            }
+            if let Some(out) = so {
+                if d.out_index(out) == here {
+                    return Some(s)
+                }
+            }
+            if any.is_none() {
+                any = Some(s)
+            }
+        }
+        return any
+    }
+    // The topmost exclusive layer surface (top and overlay layers).
+    var best: Option[server.Surface] = None
+    var best_layer: u32 = 0
+    for l in d.srv.layers() {
+        let info = d.srv.layer(l)
+        if info.mapped and info.state.keyboard == 1 and info.state.layer >= 2 and (best.is_none() or info.state.layer >= best_layer) {
+            best = Some(info.surface)
+            best_layer = info.state.layer
+        }
+    }
+    if best.is_some() {
+        return best
+    }
+    if let Some(p) = d.grabs.last() {
+        return Some(d.srv.popup_surface(p))
+    }
+    if let Some(s) = d.layer_focus {
+        return Some(s)
+    }
+    return d.focus
+}
+
+fn update_keyboard(mut d: display.Display) {
+    let t = keyboard_target(d)
+    d.srv.keyboard_focus(d.seat, t)
+    d.update_constraint()
+}
+
+/// A click on a layer surface that takes the keyboard on demand.
+fn clicked(mut d: display.Display, s: server.Surface) {
+    // A popup keeps the focus of what it pops up from.
+    guard d.srv.popup_of(s).is_none() else {
+        return
+    }
+    guard let Some(l) = d.srv.layer_of(s) else {
+        if d.layer_focus.is_some() {
+            d.layer_focus = None
+            update_keyboard(mut d)
+        }
+        return
+    }
+    let info = d.srv.layer(l)
+    if info.state.keyboard != 0 {
+        d.layer_focus = Some(s)
+        update_keyboard(mut d)
+    }
+}
+
+/// A layer surface went away.
+fn layer_gone(mut d: display.Display, l: server.Layer) {
+    discard d.spots.remove(l)
+    if let Some(s) = d.layer_focus {
+        if not d.srv.surface_alive(s) or d.srv.layer_of(s).is_none() {
+            d.layer_focus = None
+        }
+    }
+}
+
+/// Output `o` goes: its layer surfaces are closed.
+fn output_gone(mut d: display.Display, o: int) {
+    for l in d.srv.layers() {
+        if let Some(sp) = d.spots.get(l) {
+            if sp.o == o {
+                d.srv.close_layer(l)
+                discard d.spots.remove(l)
+            }
+        }
+    }
+}

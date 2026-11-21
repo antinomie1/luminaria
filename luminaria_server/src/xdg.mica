@@ -12,6 +12,7 @@ import ids
 import state
 import server
 import positioner
+import toplevel as tl
 
 /// xdg_toplevel states sent with a configure.
 pub struct States {
@@ -215,10 +216,12 @@ fn toplevel(mut srv: server.Server, ci: u32, t: x.Toplevel, take req: x.Toplevel
         }
         SetTitle(s) => {
             srv.windows.items[i].title = s
+            tl.retitled(mut srv, wi)
             srv.push(server.Event.WindowTitle(w))
         }
         SetAppId(s) => {
             srv.windows.items[i].app_id = s
+            tl.retitled(mut srv, wi)
             srv.push(server.Event.WindowAppId(w))
         }
         ShowWindowMenu(st, serial, mx, my) => {
@@ -349,6 +352,7 @@ fn toplevel_applied(mut srv: server.Server, wi: u32, serial: u32) {
         }
         srv.windows.items[i].mapped = true
         srv.surfaces.items[si].mapped = true
+        tl.mapped(mut srv, wi)
         srv.push(server.Event.WindowMapped(w))
     } else if not has_buffer and srv.windows.items[i].mapped {
         unmap_window(mut srv, wi)
@@ -366,6 +370,7 @@ fn unmap_window(mut srv: server.Server, wi: u32) {
     srv.windows.items[i].configured = false
     srv.windows.items[i].configures.clear()
     srv.surfaces.items[si].mapped = false
+    tl.gone(mut srv, wi, false)
     srv.push(server.Event.WindowUnmapped(ids.Window { id: srv.windows.id(wi) }))
 }
 
@@ -405,6 +410,7 @@ fn configure_toplevel(mut srv: server.Server, wi: u32, width: i32, height: i32, 
     let version = srv.conns[int(ci)].version(obj)
     let states = st.bytes(version)
     t.configure(mut srv.conns[int(ci)], width, height, states)
+    tl.configure(mut srv, wi)
     x.Surface { id: xobj }.configure(mut srv.conns[int(ci)], serial)
     srv.windows.items[i].configures.push(state.Configure { serial, width, height })
     return serial
@@ -464,6 +470,7 @@ fn destroy_toplevel(mut srv: server.Server, wi: u32) {
             srv.windows.items[k].parent = state.none
         }
     }
+    tl.gone(mut srv, wi, true)
     srv.windows.remove(wi, state.WindowData {})
     srv.push(server.Event.WindowClosed(w))
 }

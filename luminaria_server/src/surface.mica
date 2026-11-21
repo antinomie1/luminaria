@@ -14,6 +14,8 @@ import state
 import server
 import xdg
 import extra
+import shell
+import ime
 
 fn compositor(mut srv: server.Server, ci: u32, take req: wl.CompositorRequest) {
     match req {
@@ -205,6 +207,18 @@ fn merge(mut dst: state.State, take src: state.State) {
     if s.order_set {
         dst.order_set = true
         dst.order = mem.replace(mut s.order, [])
+    }
+    if s.alpha_set {
+        dst.alpha_set = true
+        dst.alpha = s.alpha
+    }
+    if s.content_set {
+        dst.content_set = true
+        dst.content = s.content
+    }
+    if s.layer_set {
+        dst.layer_set = true
+        dst.layer = s.layer
     }
 }
 
@@ -451,11 +465,28 @@ fn apply_state(mut srv: server.Server, si: u32, take st: state.State) {
         srv.surfaces.items[i].stack = order
         changed |= state.changed_tree
     }
+    if s.alpha_set {
+        srv.surfaces.items[i].current.alpha = s.alpha
+        changed |= state.changed_opaque
+    }
+    if s.content_set {
+        srv.surfaces.items[i].current.content = s.content
+    }
     resize(mut srv, si)
     let role = srv.surfaces.items[i].role
     match role {
         Toplevel(w) => xdg.toplevel_applied(mut srv, w, s.acked)
         Popup(p) => xdg.popup_applied(mut srv, p, s.acked)
+        Layer(l) => shell.layer_applied(mut srv, l, s.acked, s.layer_set, s.layer)
+        Lock(k) => shell.lock_applied(mut srv, k, s.acked)
+        ImePopup(seat) => {
+            let was = srv.surfaces.items[i].mapped
+            srv.surfaces.items[i].mapped = srv.surfaces.items[i].current.buffer.is_some()
+            if was != srv.surfaces.items[i].mapped {
+                srv.push(server.Event.ImeChanged(ids.Seat { id: srv.seats.id(seat) }))
+            }
+        }
+        Icon => {}
         _ => srv.surfaces.items[i].mapped = srv.surfaces.items[i].current.buffer.is_some()
     }
     srv.surfaces.items[i].changed |= changed
@@ -603,6 +634,9 @@ fn destroy(mut srv: server.Server, si: u32) {
     match role {
         Toplevel(w) => xdg.destroy_toplevel(mut srv, w)
         Popup(p) => xdg.destroy_popup(mut srv, p)
+        Layer(l) => shell.destroy_layer(mut srv, l)
+        Lock(k) => shell.destroy_lock_surface(mut srv, k)
+        ImePopup => ime.popup_gone(mut srv, si)
         _ => {}
     }
     if srv.surfaces.items[i].parent != state.none {

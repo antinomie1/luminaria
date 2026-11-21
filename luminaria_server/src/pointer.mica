@@ -1,0 +1,349 @@
+// Pointer extensions: relative motion (games, 3D), pointer locks and
+// confinement, touchpad gestures and cursor shapes. Objects bind to the
+// seat of the wl_pointer they extend; events go to the client with
+// pointer focus only.
+
+import luminaria_proto.wayland as wl
+import luminaria_proto.relative_pointer_unstable as rp
+import luminaria_proto.pointer_constraints_unstable as pc
+import luminaria_proto.pointer_gestures_unstable as pg
+import luminaria_proto.cursor_shape as cs
+import ids
+import state
+import server
+import surface
+import seat
+
+fn res(srv: server.Server, ci: u32, id: u32) -> state.Res {
+    return state.Res { client: ci, id, version: srv.conns[int(ci)].version(id) }
+}
+
+fn drop_res(mut srv: server.Server, ci: u32, id: u32) {
+    let si = srv.slot(ci, id)
+    srv.unbind(ci, id)
+    guard si != state.none and srv.seats.used(int(si)) else {
+        return
+    }
+    let i = int(si)
+    srv.seats.items[i].relatives.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].swipes.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].pinches.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].holds.retain(fn(r) => not (r.client == ci and r.id == id))
+}
+
+// -------------------------------------------------------- relative
+
+fn relative_manager(mut srv: server.Server, ci: u32, take req: rp.PointerManagerRequest) {
+    match req {
+        GetRelativePointer(r, p) => {
+            let si = srv.slot(ci, p.id)
+            guard si != state.none else {
+                return
+            }
+            srv.seats.items[int(si)].relatives.push(res(srv, ci, r.id))
+            srv.bind(ci, r.id, si)
+        }
+        Destroy => {}
+    }
+}
+
+fn relative(mut srv: server.Server, ci: u32, r: rp.Pointer, take req: rp.PointerRequest) {
+    match req {
+        Destroy => drop_res(mut srv, ci, r.id)
+    }
+}
+
+/// Motion before acceleration and clamping (and while locked).
+fn relative_motion(mut srv: server.Server, si: u32, time_us: u64, dx: f64, dy: f64, rdx: f64, rdy: f64) {
+    let fc = seat.focused_client(srv, si)
+    guard fc != state.none else {
+        return
+    }
+    for r in srv.seats.items[int(si)].relatives.clone() {
+        if r.client == fc {
+            rp.Pointer { id: r.id }.relative_motion(mut srv.conns[int(fc)], u32(time_us >> 32), u32(time_us & 0xffffffff), dx, dy, rdx, rdy)
+        }
+    }
+}
+
+// ----------------------------------------------------- constraints
+
+fn constraints(mut srv: server.Server, ci: u32, take req: pc.PointerConstraintsRequest) {
+    match req {
+        LockPointer(l, s, p, region, lifetime) => add_constraint(mut srv, ci, l.id, s.id, p.id, region, lifetime, true)
+        ConfinePointer(c, s, p, region, lifetime) => add_constraint(mut srv, ci, c.id, s.id, p.id, region, lifetime, false)
+        Destroy => {}
+    }
+}
+
+fn add_constraint(mut srv: server.Server, ci: u32, id: u32, sid: u32, pid: u32, region: Option[wl.Region], lifetime: pc.PointerConstraintsLifetime, lock: bool) {
+    let si = srv.slot(ci, sid)
+    let st = srv.slot(ci, pid)
+    guard si != state.none and st != state.none else {
+        return
+    }
+    for k in 0..srv.constraints.items.len() {
+        if srv.constraints.used(k) and srv.constraints.items[k].surface == si and srv.constraints.items[k].seat == st and not srv.constraints.items[k].dead {
+            srv.fail(ci, id, u32(pc.PointerConstraintsError.AlreadyConstrained), "the surface is already constrained")
+            return
+        }
+    }
+    let rects: Option[List[ids.Rect]] = match region {
+        Some(r) => Some(surface.region_rects(srv, ci, r.id))
+        None => None
+    }
+    let oneshot = lifetime == pc.PointerConstraintsLifetime.Oneshot
+    let k = srv.constraints.add(state.ConstraintData { client: ci, obj: id, surface: si, seat: st, lock, region: rects, oneshot })
+    srv.bind(ci, id, k.index)
+}
+
+fn locked_pointer(mut srv: server.Server, ci: u32, l: pc.LockedPointer, take req: pc.LockedPointerRequest) {
+    let k = srv.slot(ci, l.id)
+    guard k != state.none else {
+        return
+    }
+    match req {
+        Destroy => {
+            srv.unbind(ci, l.id)
+            srv.constraints.remove(k, state.ConstraintData {})
+        }
+        SetCursorPositionHint(x, y) => {
+            srv.constraints.items[int(k)].hint_set = true
+            srv.constraints.items[int(k)].hint_x = x
+            srv.constraints.items[int(k)].hint_y = y
+        }
+        SetRegion(r) => set_region(mut srv, ci, k, r)
+    }
+}
+
+fn confined_pointer(mut srv: server.Server, ci: u32, c: pc.ConfinedPointer, take req: pc.ConfinedPointerRequest) {
+    let k = srv.slot(ci, c.id)
+    guard k != state.none else {
+        return
+    }
+    match req {
+        Destroy => {
+            srv.unbind(ci, c.id)
+            srv.constraints.remove(k, state.ConstraintData {})
+        }
+        SetRegion(r) => set_region(mut srv, ci, k, r)
+    }
+}
+
+fn set_region(mut srv: server.Server, ci: u32, k: u32, r: Option[wl.Region]) {
+    srv.constraints.items[int(k)].region = match r {
+        Some(x) => Some(surface.region_rects(srv, ci, x.id))
+        None => None
+    }
+}
+
+/// The live constraint of surface `si` for seat `st`, or none.
+fn constraint_of(srv: server.Server, si: u32, st: u32) -> u32 {
+    for k in 0..srv.constraints.items.len() {
+        if srv.constraints.used(k) and srv.constraints.items[k].surface == si and srv.constraints.items[k].seat == st and not srv.constraints.items[k].dead {
+            return u32(k)
+        }
+    }
+    return state.none
+}
+
+/// Turn constraint `k` on or off (a oneshot one ends for good).
+fn activate(mut srv: server.Server, k: u32, on: bool) {
+    let i = int(k)
+    guard srv.constraints.items[i].active != on else {
+        return
+    }
+    srv.constraints.items[i].active = on
+    let c = int(srv.constraints.items[i].client)
+    let obj = srv.constraints.items[i].obj
+    let lock = srv.constraints.items[i].lock
+    if on {
+        if lock {
+            pc.LockedPointer { id: obj }.locked(mut srv.conns[c])
+        } else {
+            pc.ConfinedPointer { id: obj }.confined(mut srv.conns[c])
+        }
+        return
+    }
+    if lock {
+        pc.LockedPointer { id: obj }.unlocked(mut srv.conns[c])
+    } else {
+        pc.ConfinedPointer { id: obj }.unconfined(mut srv.conns[c])
+    }
+    if srv.constraints.items[i].oneshot {
+        srv.constraints.items[i].dead = true
+    }
+}
+
+// --------------------------------------------------------- gestures
+
+fn gestures(mut srv: server.Server, ci: u32, take req: pg.GesturesRequest) {
+    match req {
+        GetSwipeGesture(g, p) => add_gesture(mut srv, ci, g.id, p.id, 0)
+        GetPinchGesture(g, p) => add_gesture(mut srv, ci, g.id, p.id, 1)
+        GetHoldGesture(g, p) => add_gesture(mut srv, ci, g.id, p.id, 2)
+        Release => {}
+    }
+}
+
+fn add_gesture(mut srv: server.Server, ci: u32, id: u32, pid: u32, kind: int) {
+    let si = srv.slot(ci, pid)
+    guard si != state.none else {
+        return
+    }
+    let r = res(srv, ci, id)
+    let i = int(si)
+    if kind == 0 {
+        srv.seats.items[i].swipes.push(r)
+    } else if kind == 1 {
+        srv.seats.items[i].pinches.push(r)
+    } else {
+        srv.seats.items[i].holds.push(r)
+    }
+    srv.bind(ci, id, si)
+}
+
+/// Gesture `kind` (0 swipe, 1 pinch, 2 hold) phase `phase` (0 begin,
+/// 1 update, 2 end) to the surface the gesture began on.
+fn gesture(mut srv: server.Server, si: u32, kind: int, phase: int, time: u32, fingers: u32, dx: f64, dy: f64, scale: f64, rotation: f64, cancelled: bool) {
+    let i = int(si)
+    if phase == 0 {
+        srv.seats.items[i].gesture_surface = srv.seats.items[i].ptr_focus
+    }
+    let gs = srv.seats.items[i].gesture_surface
+    guard gs != state.none and srv.surfaces.used(int(gs)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(gs)].client
+    let obj = wl.Surface { id: srv.surfaces.items[int(gs)].obj }
+    let serial: u32 = if phase == 1 { 0 } else { srv.next_serial() }
+    let list = if kind == 0 { srv.seats.items[i].swipes.clone() } else if kind == 1 { srv.seats.items[i].pinches.clone() } else { srv.seats.items[i].holds.clone() }
+    let c = int(fc)
+    let gone: i32 = if cancelled { 1 } else { 0 }
+    for r in list {
+        guard r.client == fc else {
+            continue
+        }
+        if kind == 0 {
+            let g = pg.GestureSwipe { id: r.id }
+            if phase == 0 {
+                g.begin(mut srv.conns[c], serial, time, obj, fingers)
+            } else if phase == 1 {
+                g.update(mut srv.conns[c], time, dx, dy)
+            } else {
+                g.end(mut srv.conns[c], serial, time, gone)
+            }
+        } else if kind == 1 {
+            let g = pg.GesturePinch { id: r.id }
+            if phase == 0 {
+                g.begin(mut srv.conns[c], serial, time, obj, fingers)
+            } else if phase == 1 {
+                g.update(mut srv.conns[c], time, dx, dy, scale, rotation)
+            } else {
+                g.end(mut srv.conns[c], serial, time, gone)
+            }
+        } else {
+            let g = pg.GestureHold { id: r.id }
+            if phase == 0 {
+                g.begin(mut srv.conns[c], serial, time, obj, fingers)
+            } else if phase == 2 {
+                g.end(mut srv.conns[c], serial, time, gone)
+            }
+        }
+    }
+    if phase == 2 {
+        srv.seats.items[i].gesture_surface = state.none
+    }
+}
+
+fn gesture_object(mut srv: server.Server, ci: u32, id: u32) {
+    drop_res(mut srv, ci, id)
+}
+
+// ------------------------------------------------------ cursor shape
+
+fn shape_manager(mut srv: server.Server, ci: u32, take req: cs.ManagerRequest) {
+    match req {
+        GetPointer(d, p) => {
+            let si = srv.slot(ci, p.id)
+            if si != state.none {
+                srv.bind(ci, d.id, si)
+            }
+        }
+        GetTabletToolV2 => {}
+        Destroy => {}
+    }
+}
+
+fn shape_device(mut srv: server.Server, ci: u32, d: cs.Device, take req: cs.DeviceRequest) {
+    match req {
+        SetShape(serial, shape) => {
+            let si = srv.slot(ci, d.id)
+            guard si != state.none else {
+                return
+            }
+            // Like set_cursor: only the client under the pointer, with its
+            // enter serial.
+            guard seat.focused_client(srv, si) == ci and serial == srv.clients.items[int(ci)].enter_serial else {
+                return
+            }
+            let n = u32(shape)
+            guard n >= 1 and n <= 36 else {
+                srv.fail(ci, d.id, u32(cs.DeviceError.InvalidShape), "cursor shape {n}")
+                return
+            }
+            srv.push(server.Event.CursorShape(ids.Seat { id: srv.seats.id(si) }, n))
+        }
+        Destroy => srv.unbind(ci, d.id)
+    }
+}
+
+/// CSS cursor names of wp_cursor_shape_device_v1.shape (1-based), the
+/// names XCursor themes use.
+let shape_names: List[str] = ["default", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text", "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing", "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize", "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out", "dnd-ask", "all-resize"]
+
+fn shape_name(n: u32) -> str {
+    guard n >= 1 and int(n) <= shape_names.len() else {
+        return "default"
+    }
+    return shape_names[int(n - 1)].clone()
+}
+
+/// A surface went away: its constraints become inert.
+fn surface_gone(mut srv: server.Server, si: u32) {
+    for k in 0..srv.constraints.items.len() {
+        if srv.constraints.used(k) and srv.constraints.items[k].surface == si {
+            srv.constraints.items[k].dead = true
+            srv.constraints.items[k].active = false
+        }
+    }
+    for i in 0..srv.seats.items.len() {
+        if srv.seats.used(i) and srv.seats.items[i].gesture_surface == si {
+            srv.seats.items[i].gesture_surface = state.none
+        }
+    }
+}
+
+/// Teardown of a pointer extension object.
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == rp.pointer_iface or iface == pg.gesture_swipe_iface or iface == pg.gesture_pinch_iface or iface == pg.gesture_hold_iface {
+        // `destroyed` already unbound the id: find the seat by object.
+        for i in 0..srv.seats.items.len() {
+            if srv.seats.used(i) {
+                srv.seats.items[i].relatives.retain(fn(r) => not (r.client == ci and r.id == id))
+                srv.seats.items[i].swipes.retain(fn(r) => not (r.client == ci and r.id == id))
+                srv.seats.items[i].pinches.retain(fn(r) => not (r.client == ci and r.id == id))
+                srv.seats.items[i].holds.retain(fn(r) => not (r.client == ci and r.id == id))
+            }
+        }
+    } else if iface == pc.locked_pointer_iface or iface == pc.confined_pointer_iface {
+        if srv.constraints.used(int(slot)) {
+            srv.constraints.remove(slot, state.ConstraintData {})
+        }
+    } else if iface == cs.device_iface {
+        // Nothing kept.
+    } else {
+        return false
+    }
+    return true
+}

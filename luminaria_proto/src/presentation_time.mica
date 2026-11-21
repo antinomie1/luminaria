@@ -9,7 +9,7 @@ pub struct Presentation derive(Hash, Show) {
     pub id: u32
 }
 
-pub let presentation_iface: u16 = 36
+pub let presentation_iface: u16 = 68
 pub let presentation_version: u32 = 3
 
 /// fatal presentation errors
@@ -58,7 +58,7 @@ pub struct PresentationFeedback derive(Hash, Show) {
     pub id: u32
 }
 
-pub let presentation_feedback_iface: u16 = 37
+pub let presentation_feedback_iface: u16 = 69
 pub let presentation_feedback_version: u32 = 3
 
 /// bitmask of flags in presented event

@@ -9,7 +9,7 @@
 | 包 | 作用 |
 |----|------|
 | `luminaria` | `Display`：一个事件循环接起下面所有的包，加上布局、输入路由、操纵 |
-| `luminaria_server` | 协议状态：表面、事务、xdg-shell、seat、输出、缓冲、时序；不碰 GPU |
+| `luminaria_server` | 协议状态：表面、事务、xdg-shell、layer shell、锁屏、seat 与输入法、选区、输出、缓冲、时序；不碰 GPU |
 | `luminaria_compose` | 基于 `vk_compose` 的合成：放置表比对、客户端缓冲变纹理、栅栏、时钟 |
 | `luminaria_backend` | DRM/KMS、嵌套、无头三种输出；libseat、libinput、xkb |
 | `luminaria_proto` | 由 `protocols/*.xml` 生成的接口 |
@@ -22,9 +22,18 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
            └─ luminaria_backend ── luminaria_proto, vk_gpu, sys/*
 ```
 
-`protocols/` 是 wayland 1.26 和 wayland-protocols 1.50 的 XML：核心协议、xdg-shell、linux-dmabuf、
-linux-drm-syncobj、presentation-time、viewporter、fractional-scale、fifo、commit-timing、
-tearing-control、xdg-decoration（嵌套时向父合成器请求）。
+`protocols/` 是 wayland 1.26、wayland-protocols 1.50 和 wlr-protocols 的 XML。服务端支持：
+
+| 方面 | 协议 |
+|------|------|
+| 核心与外壳 | wl_compositor 6、subcompositor、shm、wl_seat 9、wl_output 4、xdg-shell 6、wl_fixes |
+| 缓冲与时序 | linux-dmabuf 4、linux-drm-syncobj、single-pixel-buffer、viewporter、fractional-scale、presentation-time、fifo、commit-timing、tearing-control、alpha-modifier、content-type |
+| 窗口 | xdg-decoration、xdg-activation、xdg-toplevel-icon、xdg-toplevel-tag、xdg-dialog、xdg-foreign v2、xdg-system-bell、ext-foreign-toplevel-list |
+| 桌面 | wlr-layer-shell 5、ext-session-lock、xdg-output 3、ext-idle-notify 2、idle-inhibit |
+| 输入 | relative-pointer、pointer-constraints、pointer-gestures 3、cursor-shape 2、keyboard-shortcuts-inhibit、text-input-v3、input-method-v2、virtual-keyboard |
+| 选区 | 剪贴板、主选区、ext-data-control |
+
+尚未支持：拖放、截屏录屏、数位板、security-context、输出配置。
 
 ## 写一个合成器
 
@@ -71,6 +80,9 @@ while true {
   `Panned` 报告结果。
 - **事务。** `begin` 和 `end` 之间的 configure 与其间给出的布局一起显示：等每个窗口按新尺寸画好，或
   到超时为止按已到的显示。
+- **外壳自己运转。** 面板、壁纸、启动器（layer shell）排在布局周围，`usable` 是它们留下的区域。锁屏
+  立刻隐藏一切，每个输出出完一帧不含会话内容的画面后才告诉锁屏客户端 `locked`。输入法候选窗跟着文本
+  光标；指针锁定与限定、相对运动、手势、空闲通知、剪贴板管理器都不需要合成器写代码。
 
 [`examples/tiny`](examples/tiny/src/main.mica) 是一个完整的堆叠式合成器，约 250 行：新窗口居中，
 点击聚焦并置顶，Alt+左键拖动移动、Alt+右键拖动缩放，Alt+F1 切换，Alt+Q 关闭，Alt+Escape 退出；
@@ -216,7 +228,9 @@ sheaf test    # luminaria：libwayland xdg 窗口（用 cc 编译）和 foot 在
               # configure、合成、读回、焦点、点击；server：提交、事务、toplevel、
               # 子表面、弹出菜单、焦点、dmabuf 等待；compose：比对、上传、时钟；
               # backend：xkb、无头帧、DRM 卡上已连接的显示器、嵌套窗口；
-              # wire、proto、sys 同前
+              # protocols：layer 表面、锁屏、选区、输入法、装饰与激活、
+              # 窗口列表、指针锁定、空闲、单像素缓冲；无头输出上的外壳：
+              # 面板独占区、锁屏；wire、proto、sys 同前
 sheaf test --release -p luminaria_compose   # 帧开销
 sheaf test --release -p luminaria           # 命中测试
 sheaf test --release -p luminaria_proto     # 线协议吞吐

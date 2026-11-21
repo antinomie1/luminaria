@@ -61,7 +61,13 @@ while true {
 | `Key(k)` | 发给键盘焦点；Ctrl+Alt+Fn（`XF86Switch_VT_n`）切 VT |
 | `Modifiers` | 无（修饰键状态在库内已经发给焦点客户端） |
 | `Motion` / `Button` / `Scroll` / `Touch` | 命中测试后发给对应表面，处理 enter/leave、隐式抓取、点外面关弹出菜单 |
-| `Gesture` | 无（没有客户端协议；用于 `manipulate_pan`） |
+| `Gesture` | 发给指针下的客户端（pointer-gestures）；`manipulate_pan` 进行中则由库消费 |
+| `WindowDecoration(w, server_side)` | `decorate(w, false)`：库不画标题栏，客户端自己画 |
+| `WindowIcon(w)` | 无（`icon(w)` 取图标） |
+| `RequestActivate(w)` | `focus(w)`（客户端带着有效的激活令牌） |
+| `Bell(w)` | 无 |
+| `Locked(locked)` | 无（锁屏期间库只显示锁屏表面、只把输入给它） |
+| `OutputArea(o)` | 无（面板改变了 `usable(o)`；最大化按它的尺寸 configure） |
 | `DeviceAdded` / `DeviceRemoved` | 无 |
 | `Moved` / `Resized` / `Panned` | 无：操纵结束，合成器把结果并入自己的布局 |
 | `Session(active)` | 无（库已暂停或恢复设备） |
@@ -96,7 +102,25 @@ d.layout(fn(mut l) {
 | `focus(Option[Window])` / `focused()` | 键盘焦点；有弹出菜单抓取时焦点留在菜单上 |
 | `window_at(x, y)` | 全局坐标下的窗口（子表面和弹出菜单算作所属窗口） |
 | `title` / `app_id` / `parent` / `size` / `size_hints` / `client` / `credentials` | 查询 |
+| `icon` / `tag` / `modal` / `content_type` | 图标、跨重启的标签、模态、内容类型（照片、视频、游戏） |
+| `decorate(w, server_side)` | 谁画标题栏：合成器（在布局里放图像）或客户端 |
 | `visible(w)` | 是否有任何部分在某个输出上可见 |
+| `activation_token()` | 合成器启动程序时放进 `XDG_ACTIVATION_TOKEN`，它的窗口就能拿焦点 |
+
+## 桌面外壳
+
+库按协议自己处理，合成器只需要知道结果：
+
+- **layer 表面**按锚定、外边距和独占区排在各自输出上：背景层和底层在布局下面，顶层和覆盖层在布局上
+  面。`usable(o)` 是面板留下的区域（`OutputArea` 通知变化），合成器在里面摆窗口；`accept` 的最大化
+  也按它。键盘交互为 exclusive 的顶层 / 覆盖层表面拿走键盘；on-demand 的点击后拿到，直到合成器
+  `focus` 别的窗口。
+- **锁屏**：收到锁屏请求立即只显示锁屏表面（没有的输出显示背景色），每个输出出完一帧才告诉锁屏客户端
+  `locked`；输入只给锁屏表面，`focus` 记下但不生效，解锁后恢复。`locked()` 查询。
+- **输入法**候选窗放在文本光标下方，在一切之上。
+- **空闲**：输入时通知恢复，到时间发空闲；可见表面上的 idle-inhibit 挡住普通通知。`idle_inhibited()`
+  供合成器自己的熄屏策略参考。
+- **快捷键抑制**：`shortcuts_inhibited()` 为真时，焦点客户端要求拿到所有按键，绑定应放行。
 
 ## 布局事务
 

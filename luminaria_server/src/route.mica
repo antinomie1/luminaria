@@ -14,6 +14,11 @@ import seat
 import output
 import data
 import extra
+import shell
+import ime
+import pointer
+import toplevel
+import inhibit
 
 /// Object `id` (interface `iface`) of client `ci` went away: free what it
 /// owned.
@@ -55,8 +60,16 @@ fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
         srv.timelines.remove(slot, state.TimelineData {})
     } else if iface == wl.keyboard_iface or iface == wl.pointer_iface or iface == wl.touch_iface or iface == wl.seat_iface or iface == wl.data_device_iface {
         seat.drop_resource(mut srv, slot, ci, id)
-    } else if iface == wl.output_iface {
+    } else if iface == wl.output_iface or iface == proto.xdg_output_unstable.output_iface {
         output.drop_bind(mut srv, slot, ci, id)
+    } else if iface == proto.primary_selection_unstable.source_iface or iface == proto.ext_data_control.source_iface {
+        data.destroy_source(mut srv, slot)
+    } else if iface == proto.primary_selection_unstable.offer_iface or iface == proto.ext_data_control.offer_iface {
+        srv.offers.remove(slot, state.OfferData {})
+    } else if iface == proto.primary_selection_unstable.device_iface or iface == proto.ext_data_control.device_iface {
+        seat.drop_resource(mut srv, slot, ci, id)
+    } else if shell.destroyed(mut srv, ci, slot, iface, id) or ime.destroyed(mut srv, ci, slot, iface, id) or pointer.destroyed(mut srv, ci, slot, iface, id) or toplevel.destroyed(mut srv, ci, slot, iface, id) or inhibit.destroyed(mut srv, ci, slot, iface, id) {
+        return
     } else {
         extra.destroyed(mut srv, ci, slot, iface)
     }
@@ -114,6 +127,67 @@ fn handle(mut srv: server.Server, ci: u32, take r: proto.Request) {
         WpCommitTimer(t, req) => extra.timer(mut srv, ci, t, req)
         WpTearingControlManager(_, req) => extra.tearing_manager(mut srv, ci, req)
         WpTearingControl(t, req) => extra.tearing(mut srv, ci, t, req)
+        WpAlphaModifier(_, req) => extra.alpha_manager(mut srv, ci, req)
+        WpAlphaModifierSurface(m, req) => extra.alpha_surface(mut srv, ci, m, req)
+        WpContentTypeManager(_, req) => extra.content_manager(mut srv, ci, req)
+        WpContentType(t, req) => extra.content(mut srv, ci, t, req)
+        WpSinglePixelBufferManager(_, req) => buffer.single_pixel(mut srv, ci, req)
+        ZwpPrimarySelectionDeviceManager(_, req) => data.primary_manager(mut srv, ci, req)
+        ZwpPrimarySelectionDevice(d, req) => data.primary_device(mut srv, ci, d, req)
+        ZwpPrimarySelectionSource(s, req) => data.primary_source(mut srv, ci, s, req)
+        ZwpPrimarySelectionOffer(o, req) => data.primary_offer(mut srv, ci, o, req)
+        ExtDataControlManager(_, req) => data.control_manager(mut srv, ci, req)
+        ExtDataControlDevice(d, req) => data.control_device(mut srv, ci, d, req)
+        ExtDataControlSource(s, req) => data.control_source(mut srv, ci, s, req)
+        ExtDataControlOffer(o, req) => data.control_offer(mut srv, ci, o, req)
+        ZwlrLayerShell(_, req) => shell.layer_shell(mut srv, ci, req)
+        ZwlrLayerSurface(l, req) => shell.layer_surface(mut srv, ci, l, req)
+        ExtSessionLockManager(_, req) => shell.lock_manager(mut srv, ci, req)
+        ExtSessionLock(l, req) => shell.session_lock(mut srv, ci, l, req)
+        ExtSessionLockSurface(l, req) => shell.lock_surface(mut srv, ci, l, req)
+        ZwpTextInputManager(_, req) => ime.text_manager(mut srv, ci, req)
+        ZwpTextInput(t, req) => ime.text_input(mut srv, ci, t, req)
+        ZwpInputMethodManager(_, req) => ime.method_manager(mut srv, ci, req)
+        ZwpInputMethod(m, req) => ime.input_method(mut srv, ci, m, req)
+        ZwpInputPopupSurface(p, req) => ime.popup(mut srv, ci, p, req)
+        ZwpInputMethodKeyboardGrab(g, req) => ime.grab_request(mut srv, ci, g, req)
+        ZwpVirtualKeyboardManager(_, req) => ime.keyboard_manager(mut srv, ci, req)
+        ZwpVirtualKeyboard(k, req) => ime.virtual_keyboard(mut srv, ci, k, req)
+        ZwpRelativePointerManager(_, req) => pointer.relative_manager(mut srv, ci, req)
+        ZwpRelativePointer(r, req) => pointer.relative(mut srv, ci, r, req)
+        ZwpPointerConstraints(_, req) => pointer.constraints(mut srv, ci, req)
+        ZwpLockedPointer(l, req) => pointer.locked_pointer(mut srv, ci, l, req)
+        ZwpConfinedPointer(c, req) => pointer.confined_pointer(mut srv, ci, c, req)
+        ZwpPointerGestures(_, req) => pointer.gestures(mut srv, ci, req)
+        ZwpPointerGestureSwipe(g, req) => pointer.gesture_object(mut srv, ci, g.id)
+        ZwpPointerGesturePinch(g, req) => pointer.gesture_object(mut srv, ci, g.id)
+        ZwpPointerGestureHold(g, req) => pointer.gesture_object(mut srv, ci, g.id)
+        WpCursorShapeManager(_, req) => pointer.shape_manager(mut srv, ci, req)
+        WpCursorShapeDevice(d, req) => pointer.shape_device(mut srv, ci, d, req)
+        ZxdgDecorationManager(_, req) => toplevel.decoration_manager(mut srv, ci, req)
+        ZxdgToplevelDecoration(d, req) => toplevel.decoration(mut srv, ci, d, req)
+        XdgToplevelIconManager(_, req) => toplevel.icon_manager(mut srv, ci, req)
+        XdgToplevelIcon(i, req) => toplevel.icon(mut srv, ci, i, req)
+        XdgToplevelTagManager(_, req) => toplevel.tag_manager(mut srv, ci, req)
+        XdgWmDialog(_, req) => toplevel.dialog_manager(mut srv, ci, req)
+        XdgDialog(d, req) => toplevel.dialog(mut srv, ci, d, req)
+        XdgActivation(_, req) => toplevel.activation(mut srv, ci, req)
+        XdgActivationToken(t, req) => toplevel.activation_token(mut srv, ci, t, req)
+        ZxdgExporter(_, req) => toplevel.exporter(mut srv, ci, req)
+        ZxdgExported(e, req) => toplevel.exported(mut srv, ci, e, req)
+        ZxdgImporter(_, req) => toplevel.importer(mut srv, ci, req)
+        ZxdgImported(i, req) => toplevel.imported(mut srv, ci, i, req)
+        ExtForeignToplevelList(l, req) => toplevel.toplevel_list(mut srv, ci, l, req)
+        ExtForeignToplevelHandle(h, req) => toplevel.toplevel_handle(mut srv, ci, h, req)
+        XdgSystemBell(_, req) => toplevel.system_bell(mut srv, ci, req)
+        ZwpIdleInhibitManager(_, req) => inhibit.inhibit_manager(mut srv, ci, req)
+        ZwpIdleInhibitor(i, req) => inhibit.inhibitor(mut srv, ci, i, req)
+        ExtIdleNotifier(_, req) => inhibit.notifier(mut srv, ci, req)
+        ExtIdleNotification(n, req) => inhibit.notification(mut srv, ci, n, req)
+        ZwpKeyboardShortcutsInhibitManager(_, req) => inhibit.shortcuts_manager(mut srv, ci, req)
+        ZwpKeyboardShortcutsInhibitor(i, req) => inhibit.shortcuts_inhibitor(mut srv, ci, i, req)
+        ZxdgOutputManager(_, req) => output.xdg_manager(mut srv, ci, req)
+        ZxdgOutput(x, req) => output.xdg_output(mut srv, ci, x, req)
         _ => {}
     }
 }
@@ -162,6 +236,10 @@ fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.Regi
                         buffer.dmabuf_bound(mut srv, ci, obj.id, obj.version)
                     } else if g.iface == proto.presentation_time.presentation_iface {
                         extra.presentation_bound(mut srv, ci, obj.id)
+                    } else if g.iface == proto.xdg_toplevel_icon.icon_manager_iface {
+                        toplevel.icon_manager_bound(mut srv, ci, obj.id)
+                    } else if g.iface == proto.ext_foreign_toplevel_list.toplevel_list_iface {
+                        toplevel.list_bound(mut srv, ci, obj.id, obj.version)
                     }
                 }
             }

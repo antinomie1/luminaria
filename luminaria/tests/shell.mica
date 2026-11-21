@@ -1,0 +1,184 @@
+// The Display's shell on a headless output, with an in-process client
+// on the generated API: a panel is arranged along its edge and the rest
+// of the output stays usable; the session lock shows only the lock
+// surface and tells the locker once a frame without the session is out.
+// Skipped without a Vulkan device.
+
+import std.env
+import std.fs
+import std.io
+import std.os
+import std.time
+import luminaria as lum
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.wlr_layer_shell_unstable as ls
+import luminaria_proto.ext_session_lock as sl
+
+struct Fx {
+    d: lum.Display
+    c: wire.Conn
+    reg: wl.Registry = wl.Registry { id: 0 }
+    globals: List[(u32, u16)] = []
+    /// Display events seen.
+    seen: List[lum.Event] = []
+}
+
+fn setup() -> Option[Fx] {
+    let dir = fs.create_temp_dir("luminaria-shell").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    match lum.Display.open(lum.Options { backend: lum.Kind.Headless, headless: [lum.Mode { width: 128, height: 96, refresh_mhz: 60000 }] }) {
+        Ok(d) => {
+            let c = wire.connect(d.socket()).expect("connect")
+            return Some(Fx { d, c })
+        }
+        Err(e) => {
+            io.eprint("skipped: {e}")
+            return None
+        }
+    }
+}
+
+/// Run both ends for a while; the client's events.
+fn pump(mut f: Fx, ms: int) -> List[proto.Event] {
+    var out: List[proto.Event] = []
+    let end = time.now_ns() + ms * 1000000
+    while time.now_ns() < end {
+        discard f.c.flush()
+        while true {
+            guard let Some(e) = f.d.poll().expect("poll") else {
+                break
+            }
+            f.seen.push(e.clone())
+            f.d.accept(e)
+        }
+        discard f.c.read()
+        while true {
+            match proto.next_event(mut f.c) {
+                Ok(Some(e)) => {
+                    match e {
+                        WlRegistry(_, Global(n, i, v)) => f.globals.push((n, proto.ifaces.by_name(i)))
+                        _ => {}
+                    }
+                    out.push(e)
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(e) => panic("client: {e}")
+            }
+        }
+        time.sleep_ms(2)
+    }
+    return out
+}
+
+fn bind(mut f: Fx, iface: u16, version: u32) -> u32 {
+    if f.reg.id == 0 {
+        f.reg = wl.Display { id: 1 }.get_registry(mut f.c)
+        discard pump(mut f, 30)
+    }
+    for (n, i) in f.globals.clone() {
+        if i == iface {
+            return f.reg.bind(mut f.c, n, iface, version)
+        }
+    }
+    panic("no global {proto.ifaces.name(iface)}")
+}
+
+fn shm_buffer(mut f: Fx, w: i32, h: i32) -> wl.Buffer {
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let size = w * h * 4
+    let fd = os.memfd("t", int(size)).expect("memfd")
+    let pool = shm.create_pool(mut f.c, fd, size)
+    os.close(fd)
+    return pool.create_buffer(mut f.c, 0, w, h, w * 4, wl.ShmFormat.Argb8888)
+}
+
+test "a panel takes its zone and leaves the rest usable" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let shell = ls.Shell { id: bind(mut f, ls.shell_iface, 5) }
+    let surf = comp.create_surface(mut f.c)
+    let l = shell.get_layer_surface(mut f.c, surf, None, ls.ShellLayer.Top, "panel")
+    l.set_anchor(mut f.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    l.set_size(mut f.c, 0, 30)
+    l.set_exclusive_zone(mut f.c, 30)
+    surf.commit(mut f.c)
+    var serial: u32 = 0
+    var size = (u32(0), u32(0))
+    for e in pump(mut f, 100) {
+        match e {
+            ZwlrLayerSurface(_, Configure(s, w, h)) => {
+                serial = s
+                size = (w, h)
+            }
+            _ => {}
+        }
+    }
+    // Stretched across the output.
+    assert_eq(size, (u32(128), u32(30)))
+    l.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 128, 30)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f, 100)
+    let o = f.d.outputs()[0]
+    assert_eq(f.d.usable(o), (0.0, 30.0, 128.0, 66.0))
+    assert(f.seen.any(fn(e) => match e {
+        OutputArea(x) => x == o
+        _ => false
+    }))
+    // Gone: the whole output is free again.
+    l.destroy(mut f.c)
+    surf.destroy(mut f.c)
+    discard pump(mut f, 100)
+    assert_eq(f.d.usable(o), (0.0, 0.0, 128.0, 96.0))
+}
+
+test "the lock screen alone shows until unlock" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let mgr = sl.LockManager { id: bind(mut f, sl.lock_manager_iface, 1) }
+    let lock = mgr.lock(mut f.c)
+    let surf = comp.create_surface(mut f.c)
+    let lsurf = lock.get_lock_surface(mut f.c, surf, out)
+    var serial: u32 = 0
+    var size = (u32(0), u32(0))
+    var locked = false
+    for e in pump(mut f, 200) {
+        match e {
+            ExtSessionLockSurface(_, Configure(s, w, h)) => {
+                serial = s
+                size = (w, h)
+            }
+            ExtSessionLock(_, Locked) => locked = true
+            _ => {}
+        }
+    }
+    assert_eq(size, (u32(128), u32(96)))
+    assert(locked)
+    assert(f.d.locked())
+    assert(f.seen.any(fn(e) => match e {
+        Locked(true) => true
+        _ => false
+    }))
+    lsurf.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 128, 96)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f, 100)
+    lock.unlock_and_destroy(mut f.c)
+    discard pump(mut f, 100)
+    assert(not f.d.locked())
+    assert(f.seen.any(fn(e) => match e {
+        Locked(false) => true
+        _ => false
+    }))
+}

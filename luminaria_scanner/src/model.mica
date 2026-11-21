@@ -172,6 +172,8 @@ pub fn parse(path: str, src: str) -> Result[Proto, str] {
     return Ok(p)
 }
 
+let builtins: List[str] = ["List", "Map", "Option", "Result", "Ptr", "Set", "Show", "Hash"]
+
 /// Type names: drop the version and the leading words every interface of
 /// the file shares, keeping at least one word each (wl_surface: Surface;
 /// zwp_linux_buffer_params_v1: BufferParams).
@@ -199,6 +201,10 @@ fn name_types(mut p: Proto) {
     for n, mut i in p.ifaces {
         let s = segs[n].clone()
         i.short = camel(str.join(s.slice(k, s.len()), "_"))
+        // A built-in type name keeps one more word (ToplevelList).
+        if k > 0 and builtins.contains(i.short) {
+            i.short = camel(str.join(s.slice(k - 1, s.len()), "_"))
+        }
         i.full = camel(unversion(i.name))
     }
 }

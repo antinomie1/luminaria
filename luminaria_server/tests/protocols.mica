@@ -1,0 +1,553 @@
+// The desktop protocols against the generated client API through a real
+// socket: layer surfaces, the session lock, selections for clipboard
+// managers, input methods, decorations and activation, the toplevel
+// list, pointer constraints and relative motion, idle notification and
+// single-pixel buffers.
+
+import std.env
+import std.fs
+import std.os
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_shell as xdg
+import luminaria_proto.wlr_layer_shell_unstable as ls
+import luminaria_proto.ext_session_lock as sl
+import luminaria_proto.primary_selection_unstable as ps
+import luminaria_proto.ext_data_control as dc
+import luminaria_proto.text_input_unstable as ti
+import luminaria_proto.input_method_unstable as im
+import luminaria_proto.xdg_decoration_unstable as xd
+import luminaria_proto.xdg_activation as act
+import luminaria_proto.ext_foreign_toplevel_list as ftl
+import luminaria_proto.pointer_constraints_unstable as pc
+import luminaria_proto.relative_pointer_unstable as rp
+import luminaria_proto.ext_idle_notify as idle
+import luminaria_proto.single_pixel_buffer as spb
+import luminaria_server as server
+
+struct Fx {
+    srv: server.Server
+    c: wire.Conn
+    client: server.Client
+    reg: wl.Registry = wl.Registry { id: 0 }
+    globals: List[(u32, u16)] = []
+}
+
+fn setup() -> Fx {
+    let dir = fs.create_temp_dir("luminaria-protocols").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    var srv = server.Server.open("").expect("listen")
+    let c = wire.connect(srv.name()).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some((client, _))) = srv.accept() {
+            return Fx { srv, c, client }
+        }
+    }
+    panic("accept")
+}
+
+fn pump(mut f: Fx) -> List[proto.Event] {
+    discard f.c.flush()
+    for _ in 0..3 {
+        assert(f.srv.dispatch(f.client))
+    }
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    assert(gone.is_empty())
+    var out: List[proto.Event] = []
+    for _ in 0..3 {
+        discard f.c.read()
+        while true {
+            match proto.next_event(mut f.c) {
+                Ok(Some(e)) => {
+                    match e {
+                        WlRegistry(_, Global(n, i, v)) => f.globals.push((n, proto.ifaces.by_name(i)))
+                        _ => {}
+                    }
+                    out.push(e)
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(e) => panic("client: {e}")
+            }
+        }
+    }
+    return out
+}
+
+fn events(mut f: Fx) -> List[server.Event] {
+    var out: List[server.Event] = []
+    while true {
+        guard let Some(e) = f.srv.next() else {
+            break
+        }
+        out.push(e)
+    }
+    return out
+}
+
+fn bind(mut f: Fx, iface: u16, version: u32) -> u32 {
+    if f.reg.id == 0 {
+        f.reg = wl.Display { id: 1 }.get_registry(mut f.c)
+        discard pump(mut f)
+    }
+    for _ in 0..2 {
+        for (n, i) in f.globals.clone() {
+            if i == iface {
+                return f.reg.bind(mut f.c, n, iface, version)
+            }
+        }
+        // Added since: announced on the next round trip.
+        discard pump(mut f)
+    }
+    panic("no global {proto.ifaces.name(iface)}")
+}
+
+fn shm_buffer(mut f: Fx, w: i32, h: i32) -> wl.Buffer {
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let size = w * h * 4
+    let fd = os.memfd("t", int(size)).expect("memfd")
+    let pool = shm.create_pool(mut f.c, fd, size)
+    os.close(fd)
+    return pool.create_buffer(mut f.c, 0, w, h, w * 4, wl.ShmFormat.Argb8888)
+}
+
+/// A mapped plain surface and its server handle.
+fn plain_surface(mut f: Fx, comp: wl.Compositor) -> (wl.Surface, server.Surface) {
+    let buf = shm_buffer(mut f, 4, 4)
+    let surf = comp.create_surface(mut f.c)
+    surf.attach(mut f.c, Some(buf), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var s: Option[server.Surface] = None
+    for e in events(mut f) {
+        match e {
+            Applied(x) => s = Some(x)
+            _ => {}
+        }
+    }
+    return (surf, s.expect("applied"))
+}
+
+test "a layer surface is configured, maps, and keeps its zone" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let shell = ls.Shell { id: bind(mut f, ls.shell_iface, 5) }
+    let surf = comp.create_surface(mut f.c)
+    let l = shell.get_layer_surface(mut f.c, surf, None, ls.ShellLayer.Top, "panel")
+    l.set_anchor(mut f.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    l.set_size(mut f.c, 0, 30)
+    l.set_exclusive_zone(mut f.c, 30)
+    l.set_keyboard_interactivity(mut f.c, ls.SurfaceKeyboardInteractivity.OnDemand)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var layer: Option[server.Layer] = None
+    for e in events(mut f) {
+        match e {
+            LayerNew(x) => layer = Some(x)
+            _ => {}
+        }
+    }
+    let lh = layer.expect("LayerNew at the initial commit")
+    let info = f.srv.layer(lh)
+    assert_eq(info.namespace, "panel")
+    assert_eq(info.state.anchor, u32(13))
+    assert_eq(info.state.exclusive, i32(30))
+    assert_eq(info.state.keyboard, u32(2))
+    assert_eq(info.state.layer, u32(2))
+    let serial = f.srv.configure_layer(lh, 800, 30)
+    var got = (u32(0), u32(0), u32(0))
+    for e in pump(mut f) {
+        match e {
+            ZwlrLayerSurface(_, Configure(s, w, h)) => got = (s, w, h)
+            _ => {}
+        }
+    }
+    assert_eq(got, (serial, u32(800), u32(30)))
+    l.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 800, 30)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var changed = false
+    for e in events(mut f) {
+        match e {
+            LayerChanged(x) => changed = x == lh
+            _ => {}
+        }
+    }
+    assert(changed)
+    assert(f.srv.layer(lh).mapped)
+    assert_eq(f.srv.layer_of(f.srv.layer(lh).surface), Some(lh))
+    l.destroy(mut f.c)
+    discard pump(mut f)
+    var gone = false
+    for e in events(mut f) {
+        match e {
+            LayerGone(x) => gone = x == lh
+            _ => {}
+        }
+    }
+    assert(gone)
+}
+
+test "the session lock: lock surfaces, locked, unlock" {
+    var f = setup()
+    let o = f.srv.add_output(server.OutputInfo { name: "TEST-1", width: 640, height: 480 })
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let mgr = sl.LockManager { id: bind(mut f, sl.lock_manager_iface, 1) }
+    let lock = mgr.lock(mut f.c)
+    let surf = comp.create_surface(mut f.c)
+    let lsurf = lock.get_lock_surface(mut f.c, surf, out)
+    discard pump(mut f)
+    var requested = false
+    var ls_new: Option[server.LockSurface] = None
+    for e in events(mut f) {
+        match e {
+            LockRequest => requested = true
+            LockSurfaceNew(k) => ls_new = Some(k)
+            _ => {}
+        }
+    }
+    assert(requested)
+    let k = ls_new.expect("LockSurfaceNew")
+    let (_, so, _) = f.srv.lock_surface(k)
+    assert_eq(so, Some(o))
+    let serial = f.srv.configure_lock(k, 640, 480)
+    f.srv.lock_done()
+    var configured = false
+    var locked = false
+    for e in pump(mut f) {
+        match e {
+            ExtSessionLockSurface(_, Configure(s, 640, 480)) => configured = s == serial
+            ExtSessionLock(_, Locked) => locked = true
+            _ => {}
+        }
+    }
+    assert(configured and locked)
+    lsurf.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 640, 480)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    let (_, _, mapped) = f.srv.lock_surface(k)
+    assert(mapped)
+    // A second locker is turned away while the first holds the lock.
+    let other = mgr.lock(mut f.c)
+    var finished = false
+    for e in pump(mut f) {
+        match e {
+            ExtSessionLock(l, Finished) => finished = l == other
+            _ => {}
+        }
+    }
+    assert(finished)
+    lock.unlock_and_destroy(mut f.c)
+    discard pump(mut f)
+    var unlocked = false
+    for e in events(mut f) {
+        match e {
+            Unlock => unlocked = true
+            _ => {}
+        }
+    }
+    assert(unlocked)
+}
+
+test "clipboard managers see and set the primary selection" {
+    var f = setup()
+    let seat = f.srv.add_seat("seat0")
+    discard seat
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let pmgr = ps.DeviceManager { id: bind(mut f, ps.device_manager_iface, 1) }
+    let cmgr = dc.Manager { id: bind(mut f, dc.manager_iface, 1) }
+    let cdev = cmgr.get_data_device(mut f.c, ws)
+    let pdev = pmgr.get_device(mut f.c, ws)
+    discard pump(mut f)
+    let src = pmgr.create_source(mut f.c)
+    src.offer(mut f.c, "text/plain")
+    pdev.set_selection(mut f.c, Some(src), 1)
+    var offer: Option[dc.Offer] = None
+    var mime = ""
+    var primary = false
+    for e in pump(mut f) {
+        match e {
+            ExtDataControlDevice(_, DataOffer(o)) => offer = Some(o)
+            ExtDataControlOffer(_, Offer(m)) => mime = m.clone()
+            ExtDataControlDevice(d, PrimarySelection(Some(o))) => primary = d == cdev and Some(o) == offer
+            _ => {}
+        }
+    }
+    assert(primary)
+    assert_eq(mime, "text/plain")
+    // The manager takes over the clipboard: the old source is cancelled.
+    let csrc = cmgr.create_data_source(mut f.c)
+    csrc.offer(mut f.c, "text/plain")
+    cdev.set_primary_selection(mut f.c, Some(csrc))
+    var cancelled = false
+    for e in pump(mut f) {
+        match e {
+            ZwpPrimarySelectionSource(s, Cancelled) => cancelled = s == src
+            _ => {}
+        }
+    }
+    assert(cancelled)
+}
+
+test "an input method serves the focused text field" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let seat = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(seat, 3)
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let kb = ws.get_keyboard(mut f.c)
+    let tim = ti.InputManager { id: bind(mut f, ti.input_manager_iface, 1) }
+    let imm = im.MethodManager { id: bind(mut f, im.method_manager_iface, 1) }
+    let (surf, target) = plain_surface(mut f, comp)
+    let text = tim.get_text_input(mut f.c, ws)
+    let m = imm.get_input_method(mut f.c, ws)
+    discard pump(mut f)
+    f.srv.keyboard_focus(seat, Some(target))
+    var entered = false
+    for e in pump(mut f) {
+        match e {
+            ZwpTextInput(t, Enter(s)) => entered = t == text and s == surf
+            _ => {}
+        }
+    }
+    assert(entered)
+    text.enable(mut f.c)
+    text.set_cursor_rectangle(mut f.c, 10, 20, 2, 16)
+    text.commit(mut f.c)
+    var active = false
+    var done = false
+    for e in pump(mut f) {
+        match e {
+            ZwpInputMethod(_, Activate) => active = true
+            ZwpInputMethod(_, Done) => done = active
+            _ => {}
+        }
+    }
+    assert(active and done)
+    let (cs, r) = f.srv.text_cursor(seat).expect("text cursor")
+    assert_eq(cs, target)
+    assert_eq(r, server.Rect { x: 10, y: 20, w: 2, h: 16 })
+    m.commit_string(mut f.c, "你好")
+    m.commit(mut f.c, 1)
+    var committed = ""
+    var serial: u32 = 0
+    for e in pump(mut f) {
+        match e {
+            ZwpTextInput(_, CommitString(Some(t))) => committed = t.clone()
+            ZwpTextInput(_, Done(s)) => serial = s
+            _ => {}
+        }
+    }
+    assert_eq(committed, "你好")
+    assert_eq(serial, u32(1))
+    // With a keyboard grab, keys go to the input method.
+    let g = m.grab_keyboard(mut f.c)
+    discard pump(mut f)
+    discard f.srv.key(seat, 7, 30, true)
+    var grabbed = false
+    var direct = false
+    for e in pump(mut f) {
+        match e {
+            ZwpInputMethodKeyboardGrab(x, Key(_, 7, 30, Pressed)) => grabbed = x == g
+            WlKeyboard(k, Key(_, 7, 30, _)) => direct = k == kb
+            _ => {}
+        }
+    }
+    assert(grabbed and not direct)
+}
+
+test "decorations, activation and the toplevel list" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 6) }
+    let dm = xd.DecorationManager { id: bind(mut f, xd.decoration_manager_iface, 1) }
+    let activation = act.Activation { id: bind(mut f, act.activation_iface, 1) }
+    let surf = comp.create_surface(mut f.c)
+    let xs = wm.get_xdg_surface(mut f.c, surf)
+    let top = xs.get_toplevel(mut f.c)
+    top.set_title(mut f.c, "editor")
+    let deco = dm.get_toplevel_decoration(mut f.c, top)
+    deco.set_mode(mut f.c, xd.ToplevelDecorationMode.ServerSide)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var win: Option[server.Window] = None
+    var asked = false
+    for e in events(mut f) {
+        match e {
+            WindowNew(w) => win = Some(w)
+            WindowDecoration => asked = true
+            _ => {}
+        }
+    }
+    let w = win.expect("WindowNew")
+    assert(asked)
+    assert_eq(f.srv.decoration(w), u32(2))
+    f.srv.set_decoration(w, true)
+    let serial = f.srv.configure(w, 0, 0, server.States {})
+    var mode = 0
+    var order_ok = false
+    for e in pump(mut f) {
+        match e {
+            ZxdgToplevelDecoration(_, Configure(m)) => mode = int(u32(m))
+            XdgSurface(_, Configure(s)) => order_ok = mode == 2 and s == serial
+            _ => {}
+        }
+    }
+    assert(order_ok)
+    xs.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 4, 4)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    discard events(mut f)
+    // A taskbar sees the mapped window.
+    let list = ftl.ToplevelList { id: bind(mut f, ftl.toplevel_list_iface, 1) }
+    discard list
+    var title = ""
+    var handle_done = false
+    for e in pump(mut f) {
+        match e {
+            ExtForeignToplevelHandle(_, Title(t)) => title = t.clone()
+            ExtForeignToplevelHandle(_, Done) => handle_done = true
+            _ => {}
+        }
+    }
+    assert_eq(title, "editor")
+    assert(handle_done)
+    // A token from the client brings its window forward.
+    let tok = activation.get_activation_token(mut f.c)
+    tok.commit(mut f.c)
+    var token = ""
+    for e in pump(mut f) {
+        match e {
+            XdgActivationToken(_, Done(t)) => token = t.clone()
+            _ => {}
+        }
+    }
+    assert(not token.is_empty())
+    activation.activate(mut f.c, token, surf)
+    discard pump(mut f)
+    var activated = false
+    for e in events(mut f) {
+        match e {
+            Activate(x) => activated = x == w
+            _ => {}
+        }
+    }
+    assert(activated)
+    // A used token is gone.
+    activation.activate(mut f.c, token, surf)
+    discard pump(mut f)
+    for e in events(mut f) {
+        match e {
+            Activate => panic("a token works once")
+            _ => {}
+        }
+    }
+}
+
+test "a pointer lock with relative motion" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let seat = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(seat, 3)
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let ptr = ws.get_pointer(mut f.c)
+    let cons = pc.PointerConstraints { id: bind(mut f, pc.pointer_constraints_iface, 1) }
+    let rel = rp.PointerManager { id: bind(mut f, rp.pointer_manager_iface, 1) }
+    let (surf, target) = plain_surface(mut f, comp)
+    let lp = cons.lock_pointer(mut f.c, surf, ptr, None, pc.PointerConstraintsLifetime.Persistent)
+    lp.set_cursor_position_hint(mut f.c, 1.0, 2.0)
+    let r = rel.get_relative_pointer(mut f.c, ptr)
+    discard pump(mut f)
+    let c = f.srv.constraint(seat, target).expect("constraint")
+    assert(c.lock and not c.active)
+    f.srv.pointer_focus(seat, Some(target), 1.0, 1.0)
+    f.srv.set_constraint(seat, target, true)
+    f.srv.relative_motion(seat, 1000, 3.0, 4.0, 1.5, 2.0)
+    var locked = false
+    var motion = false
+    for e in pump(mut f) {
+        match e {
+            ZwpLockedPointer(x, Locked) => locked = x == lp
+            ZwpRelativePointer(x, RelativeMotion(_, lo, dx, dy, ux, uy)) => motion = x == r and lo == 1000 and dx == 3.0 and dy == 4.0 and ux == 1.5 and uy == 2.0
+            _ => {}
+        }
+    }
+    assert(locked and motion)
+    let now = f.srv.constraint(seat, target).expect("constraint")
+    assert(now.active)
+    assert_eq(now.hint, Some((1.0, 2.0)))
+    f.srv.set_constraint(seat, target, false)
+    var unlocked = false
+    for e in pump(mut f) {
+        match e {
+            ZwpLockedPointer(_, Unlocked) => unlocked = true
+            _ => {}
+        }
+    }
+    assert(unlocked)
+}
+
+test "idle notifications fire, resume and wait for inhibitors" {
+    var f = setup()
+    let seat = f.srv.add_seat("seat0")
+    discard seat
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let n = idle.Notifier { id: bind(mut f, idle.notifier_iface, 2) }
+    let a = n.get_idle_notification(mut f.c, 100, ws)
+    let b = n.get_input_idle_notification(mut f.c, 100, ws)
+    discard pump(mut f)
+    f.srv.input_activity(1000000000)
+    // Inhibited: only the input-idle one fires.
+    assert_eq(f.srv.idle_check(1050000000, true), 1100000000)
+    assert_eq(f.srv.idle_check(1200000000, true), -1)
+    var idled_a = false
+    var idled_b = false
+    for e in pump(mut f) {
+        match e {
+            ExtIdleNotification(x, Idled) => {
+                idled_a = idled_a or x == a
+                idled_b = idled_b or x == b
+            }
+            _ => {}
+        }
+    }
+    assert(idled_b and not idled_a)
+    assert_eq(f.srv.idle_check(1200000000, false), 0)
+    f.srv.input_activity(1300000000)
+    var idled = false
+    var resumed = 0
+    for e in pump(mut f) {
+        match e {
+            ExtIdleNotification(x, Idled) => idled = x == a
+            ExtIdleNotification(_, Resumed) => resumed += 1
+            _ => {}
+        }
+    }
+    assert(idled)
+    assert_eq(resumed, 2)
+}
+
+test "a single-pixel buffer carries its colour" {
+    var f = setup()
+    let m = spb.SinglePixelBufferManager { id: bind(mut f, spb.single_pixel_buffer_manager_iface, 1) }
+    discard m.create_u32_rgba_buffer(mut f.c, 0xFFFFFFFF, 0, 0, 0xFFFFFFFF)
+    discard pump(mut f)
+    var b: Option[server.Buffer] = None
+    for e in events(mut f) {
+        match e {
+            BufferNew(x) => b = Some(x)
+            _ => {}
+        }
+    }
+    let info = f.srv.buffer(b.expect("BufferNew"))
+    assert(info.kind == server.BufferKind.SinglePixel)
+    assert_eq((info.width, info.height), (i32(1), i32(1)))
+    assert_eq(info.color, [0xFFFFFFFF, 0, 0, 0xFFFFFFFF])
+}

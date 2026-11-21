@@ -55,6 +55,6 @@
 
 - overlay 平面（现在只用主平面和光标平面）、按内容降低刷新率（Q4）。
 - 设备丢失恢复、GPU 全局优先级、显存驻留与快照（Q5）、模糊缓存（Q7）。
-- 可选协议：xdg-decoration、primary selection、xdg-activation、cursor-shape、text-input、
-  layer-shell、session-lock；拖放（现在源会被取消）。
+- 协议：拖放（现在源会被取消）、截屏与录屏（ext-image-copy-capture）、数位板（tablet-v2）、
+  security-context（目前特权协议对所有客户端开放）、输出配置（wlr-output-management）。
 - 多个 seat（现在只有 seat0）。

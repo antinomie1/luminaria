@@ -81,13 +81,52 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 - 键盘：keymap memfd 共享给所有客户端；enter 带已按下的键；修饰键变化才发 `modifiers`。
 - 指针：enter / leave 配对；每组事件后发 `frame`（v5+）；滚轮按版本发 `axis_value120`（v8+）或
   `axis_discrete`，手指滚动结束发 `axis_stop`。
-- `set_cursor` 只接受指针所在客户端、带最近 enter serial 的请求，以 `Cursor` 事件交给门面。
+- `set_cursor` 和 cursor-shape 的 `set_shape` 只接受指针所在客户端、带最近 enter serial 的请求，以
+  `Cursor` / `CursorShape` 事件交给门面；形状按 CSS 名字（`text`、`pointer`、`ew-resize` ……）取主题光标。
+- 指针扩展只发给指针焦点客户端：相对运动（加速前后两组增量，微秒时间戳）、滑动 / 捏合 / 长按手势
+  （开始时的焦点表面收到整组）、指针锁定与限定（锁定时指针不动只有相对运动；限定时夹在区域内；只在
+  该客户端有键盘焦点、指针进入区域时生效，oneshot 的失效后不再生效，锁定结束按客户端给的位置提示放
+  回光标）。
 - serial 全局递增。
 
-### 剪贴板
+### 输入法
 
-`wl_data_device_manager` 的选区按 seat 保存。键盘焦点客户端收到一个 data offer；它要哪种 MIME 就把管道
-fd 直接转给源客户端，数据不经过合成器。拖放目前拒绝（源被取消）。
+- text-input-v3：键盘焦点客户端的文本框收到 enter / leave；`enable` + `commit` 激活输入法，之后每次
+  `commit` 把周围文本、改动原因、内容类型转给输入法并 `done`。
+- input-method-v2：每个 seat 一个输入法（第二个收到 `unavailable`）。它的 `commit` 把预编辑、提交文本
+  和删除一并发给当前文本框，`done` 带文本框的提交计数。键盘抓取后硬件按键先给输入法。候选窗是
+  `zwp_input_popup_surface_v2`，门面把它放在文本光标下方，并告诉它光标矩形的位置。
+- virtual-keyboard-v1：输入法转发的按键、屏幕键盘、wtype 直接发给键盘焦点（越过抓取）。它自带
+  keymap；内容和焦点客户端已有的不同才重发（按 FNV 哈希比较），硬件按键到来时换回 seat 的 keymap。
+
+### 选区
+
+剪贴板（`wl_data_device_manager`）和主选区（primary selection，中键粘贴）按 seat 各存一个源。键盘焦点
+客户端收到 offer；它要哪种 MIME 就把管道 fd 直接转给源客户端，数据不经过合成器。ext-data-control
+（剪贴板管理器、wl-copy / wl-paste）不需要焦点，看得到也能设置两种选区。拖放目前拒绝（源被取消）。
+
+### 桌面外壳
+
+- **layer-shell（v5）**：面板、壁纸、启动器、通知。锚定边、尺寸、外边距、独占区、键盘交互、层（背景 /
+  底 / 顶 / 覆盖）都是随提交生效的双缓冲状态。首次提交发 `LayerNew`，此后映射、取消映射、状态变化发
+  `LayerChanged`；`layer(l)` 查状态，`configure_layer`、`close_layer` 回应。0 尺寸必须锚定两侧对边，
+  ack 之前带缓冲提交是协议错误。layer 表面的弹出菜单（`get_popup`）以它为父表面。
+- **ext-session-lock**：同一时间只有一个锁屏客户端，第二个收到 `finished`。`LockRequest` 后门面隐藏
+  一切，`lock_done` 才发 `locked`；锁屏客户端死掉时会话保持锁定，下一个锁屏客户端接管。每个输出一个锁屏
+  表面（`LockSurfaceNew` 后按输出尺寸 configure）。
+
+### 窗口扩展
+
+| 协议 | 作用 |
+|---|---|
+| xdg-decoration | 客户端想要的模式（`decoration(w)`、`WindowDecoration`）；`set_decoration` 决定，每次 configure 都先发装饰模式 |
+| xdg-toplevel-icon | 图标名和图像（`set_icon` 时拷贝 ARGB8888 像素，客户端可以复用缓冲） |
+| xdg-toplevel-tag | 跨重启不变的窗口标签和描述 |
+| xdg-dialog | 模态对话框标记 |
+| xdg-activation | 令牌（最多保留 64 个，用一次即失效）；有效令牌的 `activate` 发 `Activate`；合成器启动程序时可用 `activation_token` |
+| xdg-foreign v2 | 导出窗口得到句柄，别的客户端（门户）导入后设为自己窗口的父窗口 |
+| ext-foreign-toplevel-list | 任务栏看到每个已映射窗口的标识、标题、app id 及其变化和关闭 |
+| xdg-system-bell | `Bell` 事件 |
 
 ### 输出
 
@@ -107,7 +146,20 @@ fd 直接转给源客户端，数据不经过合成器。拖放目前拒绝（�
 | fifo | 1 | 屏障与等待 |
 | commit-timing | 1 | 目标呈现时间 |
 | tearing-control | 1 | 允许撕裂（直接扫描输出时异步翻转） |
+| single-pixel-buffer | 1 | 一个像素的缓冲（纯色背景、遮罩），配合 viewporter 拉伸 |
+| alpha-modifier | 1 | 表面整体透明度（乘到放置的不透明度上，不透明区域随之失效） |
+| content-type | 1 | 内容类型：照片、视频、游戏 |
+| xdg-output | 3 | 逻辑位置与尺寸（缩放后）、名字、描述 |
+| idle-inhibit | 1 | 表面可见时阻止空闲（视频播放） |
+| ext-idle-notify | 2 | 空闲与恢复通知；普通通知被抑制器挡住，input-idle 通知不受影响 |
+| keyboard-shortcuts-inhibit | 1 | 焦点表面要求拿到合成器快捷键（远程桌面、虚拟机） |
 | wl_fixes | 1 | 销毁 registry |
 
 核心协议的版本：`wl_compositor` 6、`wl_subcompositor` 1、`wl_shm` 2（ARGB/XRGB/ABGR/XBGR8888）、
 `wl_data_device_manager` 3、`wl_seat` 9、`wl_output` 4、`xdg_wm_base` 6。
+
+析构请求的 id 由解码层释放。处理函数没有清理的对象，在本次分派后按断开连接时的路径拆除，所以复用同一
+id 或同一客户端槽位的新对象不会继承旧记录。
+
+layer-shell、session-lock、input-method、virtual-keyboard、data-control、foreign-toplevel-list 是特权
+协议，目前对所有客户端公布（还没有 security-context）。

@@ -8,6 +8,7 @@
 // nothing.
 
 import std.libc
+import std.mem
 import std.net
 import std.os
 import fd
@@ -98,6 +99,9 @@ pub struct Conn {
     high: List[Obj] = []
     /// This end's freed ids, reused first.
     free: List[u32] = []
+    /// Client objects (id, interface) destroyed by requests since
+    /// `take_removed`: the server tears down what it kept for them.
+    removed: List[(u32, u16)] = []
     /// Set when the connection must close after the last flush.
     dead: Option[str] = None
 }
@@ -315,7 +319,8 @@ pub fn Conn.alloc(mut self, iface: u16, version: u32) -> u32 {
 /// Destroy object `id`. A server frees the client's id and tells it with
 /// wl_display.delete_id; a client keeps its own id until that arrives.
 pub fn Conn.remove(mut self, id: u32) {
-    guard self.lookup(id).iface != 0 else {
+    let iface = self.lookup(id).iface
+    guard iface != 0 else {
         return
     }
     if self.end == End.Client and id < server_base {
@@ -330,7 +335,17 @@ pub fn Conn.remove(mut self, id: u32) {
     } else if self.end == End.Server {
         var w = self.begin(1, 1, 12)
         w.u32(mut self, id)
+        self.removed.push((id, iface))
     }
+}
+
+pub fn Conn.removed_pending(self) -> bool {
+    return not self.removed.is_empty()
+}
+
+/// The client objects destroyed since the last call (server side).
+pub fn Conn.take_removed(mut self, mut out: List[(u32, u16)]) {
+    out.extend(mem.replace(mut self.removed, []))
 }
 
 /// The server freed our id `id`.

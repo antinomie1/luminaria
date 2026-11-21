@@ -11,7 +11,7 @@ and its own loop. The design is in [docs/](docs/README.md) (Chinese).
 | Package | Role |
 |---------|------|
 | `luminaria` | `Display`: one event loop over everything below, layouts, input routing, manipulations |
-| `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, seats, outputs, buffers, timing; no GPU |
+| `luminaria_server` | Protocol state: surfaces, transactions, xdg-shell, layer shell, session lock, seats and input methods, selections, outputs, buffers, timing; no GPU |
 | `luminaria_compose` | Composition on `vk_compose`: placement diffs, client buffers as textures, fences, clock |
 | `luminaria_backend` | DRM/KMS, nested and headless outputs; libseat, libinput, xkb |
 | `luminaria_proto` | Interfaces generated from `protocols/*.xml` |
@@ -24,10 +24,20 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
            └─ luminaria_backend ── luminaria_proto, vk_gpu, sys/*
 ```
 
-`protocols/` holds the XML from wayland 1.26 and wayland-protocols 1.50:
-core, xdg-shell, linux-dmabuf, linux-drm-syncobj, presentation-time,
-viewporter, fractional-scale, fifo, commit-timing, tearing-control and
-xdg-decoration (asked of the parent when nested).
+`protocols/` holds the XML from wayland 1.26, wayland-protocols 1.50 and
+wlr-protocols. The server speaks:
+
+| Area | Protocols |
+|------|-----------|
+| Core and shell | wl_compositor 6, subcompositor, shm, wl_seat 9, wl_output 4, xdg-shell 6, wl_fixes |
+| Buffers and timing | linux-dmabuf 4, linux-drm-syncobj, single-pixel-buffer, viewporter, fractional-scale, presentation-time, fifo, commit-timing, tearing-control, alpha-modifier, content-type |
+| Windows | xdg-decoration, xdg-activation, xdg-toplevel-icon, xdg-toplevel-tag, xdg-dialog, xdg-foreign v2, xdg-system-bell, ext-foreign-toplevel-list |
+| Desktop | wlr-layer-shell 5, ext-session-lock, xdg-output 3, ext-idle-notify 2, idle-inhibit |
+| Input | relative-pointer, pointer-constraints, pointer-gestures 3, cursor-shape 2, keyboard-shortcuts-inhibit, text-input-v3, input-method-v2, virtual-keyboard |
+| Selections | clipboard, primary selection, ext-data-control |
+
+Not yet: drag and drop, screen capture, tablets, security-context, output
+management.
 
 ## Writing a compositor
 
@@ -85,6 +95,13 @@ while true {
 - **Transactions.** Configures between `begin` and `end` show together
   with the layout given meanwhile, once every window drew its new size,
   or at the timeout with what arrived.
+- **The shell runs itself.** Panels, wallpapers and launchers (layer
+  shell) are arranged around the layout; `usable` is what they leave free.
+  A lock screen hides everything at once and the locker hears `locked`
+  only after every output showed a frame without the session. Input
+  method popups follow the text cursor; pointer locks, confinement,
+  relative motion, gestures, idle notification and clipboard managers
+  need no code in the compositor.
 
 [`examples/tiny`](examples/tiny/src/main.mica) is a complete stacking
 compositor in about 250 lines: windows open centred, click to focus and
@@ -258,7 +275,11 @@ sheaf test    # luminaria: a libwayland xdg window (built with cc) and foot on a
               # clicked; server: commits, transactions, toplevels,
               # subsurfaces, popups, focus, dmabuf waits; compose: diffs,
               # uploads, clock; backend: xkb, headless frames, the DRM card's
-              # displays, a nested window; wire, proto, sys as before
+              # displays, a nested window; protocols: layer surfaces, the
+              # session lock, selections, input methods, decorations and
+              # activation, the toplevel list, pointer locks, idle, single
+              # pixels; the shell on a headless output: panel zones, lock
+              # screen; wire, proto, sys as before
 sheaf test --release -p luminaria_compose   # frame cost
 sheaf test --release -p luminaria           # hit testing
 sheaf test --release -p luminaria_proto     # wire throughput

@@ -90,6 +90,34 @@ struct State {
     /// New stacking order of this surface and its subsurfaces.
     order_set: bool = false
     order: List[u32] = []
+    /// wp_alpha_modifier multiplier (0xFFFFFFFF opaque).
+    alpha_set: bool = false
+    alpha: u32 = 0xFFFFFFFF
+    /// wp_content_type type.
+    content_set: bool = false
+    content: u32 = 0
+    /// zwlr_layer_surface state set since the last commit.
+    layer_set: bool = false
+    layer: LayerState = LayerState {}
+}
+
+/// A layer surface's double-buffered state.
+pub struct LayerState {
+    /// Requested size; 0 stretches between opposite anchors.
+    pub width: i32 = 0
+    pub height: i32 = 0
+    /// Anchored edges: top 1, bottom 2, left 4, right 8.
+    pub anchor: u32 = 0
+    /// Space kept free for it along its edge; -1 ignores other zones.
+    pub exclusive: i32 = 0
+    /// The edge the zone applies to when anchored to a corner (0: implied).
+    pub exclusive_edge: u32 = 0
+    /// Margins: top, right, bottom, left.
+    pub margin: [4]i32 = [0, 0, 0, 0]
+    /// Keyboard: none 0, exclusive 1, on demand 2.
+    pub keyboard: u32 = 0
+    /// Background 0, bottom 1, top 2, overlay 3.
+    pub layer: u32 = 0
 }
 
 enum Role {
@@ -98,6 +126,12 @@ enum Role {
     Popup(u32)
     Sub
     Cursor
+    Layer(u32)
+    Lock(u32)
+    /// zwp_input_popup_surface_v2 of an input method.
+    ImePopup(u32)
+    /// A wl_surface given to xdg_toplevel_icon (shown nowhere).
+    Icon
 }
 
 struct SurfaceData {
@@ -132,6 +166,8 @@ struct SurfaceData {
     fifo: u32 = 0
     timer: u32 = 0
     tearing: u32 = 0
+    alpha_obj: u32 = 0
+    content_obj: u32 = 0
     /// Output slots it is on (bit per slot below 64).
     outputs: u64 = 0
     /// Mapped: has a buffer and (with a role) the role allows showing it.
@@ -159,6 +195,8 @@ pub let changed_tree: u32 = 32
 enum BufferKind {
     Shm
     Dmabuf
+    /// wp_single_pixel_buffer: one premultiplied RGBA pixel.
+    SinglePixel
 }
 
 /// One plane of a dmabuf.
@@ -188,6 +226,8 @@ struct BufferData {
     busy: bool = false
     /// zwp_linux_buffer_params id awaiting created / failed (dmabuf `create`).
     params_obj: u32 = 0
+    /// Single-pixel colour, premultiplied, 0..0xFFFFFFFF per channel.
+    color: [4]u32 = [0, 0, 0, 0]
 }
 
 struct PoolData {
@@ -227,6 +267,42 @@ struct WindowData {
     /// Size of the last acked configure.
     acked_w: i32 = 0
     acked_h: i32 = 0
+    /// zxdg_toplevel_decoration_v1 id (0: none) and the mode the client
+    /// wants (0 none, 1 client side, 2 server side), the mode granted.
+    decoration: u32 = 0
+    deco_wanted: u32 = 0
+    deco_mode: u32 = 1
+    icon: Icon = Icon {}
+    tag: str = ""
+    description: str = ""
+    dialog: u32 = 0
+    modal: bool = false
+    /// xdg-foreign handles exported for it.
+    exports: List[str] = []
+    /// ext_foreign_toplevel_handle_v1 objects: client slot, id.
+    handles: List[(u32, u32)] = []
+    /// ext-foreign-toplevel-list identifier.
+    identifier: str = ""
+}
+
+/// One image of a toplevel icon: ARGB8888 premultiplied pixels.
+pub struct IconImage {
+    pub size: i32 = 0
+    pub scale: i32 = 1
+    pub pixels: List[u8] = []
+}
+
+/// A toplevel's icon: a theme name, images, or both.
+pub struct Icon {
+    pub name: str = ""
+    pub images: List[IconImage] = []
+}
+
+struct IconData {
+    client: u32 = 0
+    icon: Icon = Icon {}
+    /// set_icon happened: the icon is immutable.
+    used: bool = false
 }
 
 struct PopupData {
@@ -276,6 +352,8 @@ struct OutputData {
     info: OutputInfo = OutputInfo {}
     /// Bound wl_output objects: client slot, id, version.
     binds: List[(u32, u32, u32)] = []
+    /// zxdg_output_v1 objects: client slot, id, version.
+    xdg: List[(u32, u32, u32)] = []
 }
 
 /// A per-client input object of a seat: client slot, id, version.
@@ -308,17 +386,154 @@ struct SeatData {
     touch_points: List[(i32, u32)] = []
     /// Popups grabbing this seat, innermost last.
     grabs: List[u32] = []
+    /// Primary selection source slot, its devices; data-control devices
+    /// (see every selection, any client).
+    primary: u32 = 0xFFFFFFFF
+    primary_devices: List[Res] = []
+    control_devices: List[Res] = []
+    /// zwp_relative_pointer_v1 objects (by client).
+    relatives: List[Res] = []
+    /// Gesture objects: swipe, pinch, hold.
+    swipes: List[Res] = []
+    pinches: List[Res] = []
+    holds: List[Res] = []
+    /// A gesture in progress went to this surface slot.
+    gesture_surface: u32 = 0xFFFFFFFF
+    /// The input method (zwp_input_method_v2, client and id; id 0: none),
+    /// its keyboard grab and popup surfaces.
+    im_client: u32 = 0
+    im: u32 = 0
+    im_version: u32 = 1
+    grab_client: u32 = 0
+    grab: u32 = 0
+    /// What the input method committed, applied on its commit.
+    im_preedit: str = ""
+    im_preedit_begin: i32 = 0
+    im_preedit_end: i32 = 0
+    im_commit: str = ""
+    im_delete_before: u32 = 0
+    im_delete_after: u32 = 0
+    im_dones: u32 = 0
+    /// The text input the input method serves (slot), or none.
+    im_active: u32 = 0xFFFFFFFF
+    /// Input method popups: client, id, surface slot.
+    im_popups: List[(u32, u32, u32)] = []
+    /// The keymap clients last got: 0 the seat's, k + 1 virtual keyboard
+    /// slot k. Content hashes avoid resending equal keymaps.
+    keymap_from: u32 = 0
+    keymap_hash: u64 = 0
+}
+
+/// zwp_virtual_keyboard_v1 (input methods, on-screen keyboards, wtype).
+struct VirtualKeyboardData {
+    client: u32 = 0
+    obj: u32 = 0
+    seat: u32 = 0
+    keymap: Option[wire.Fd] = None
+    size: u32 = 0
+    hash: u64 = 0
+}
+
+/// zwp_text_input_v3: what a client's text field says about itself.
+struct TextState {
+    enabled: bool = false
+    surrounding: str = ""
+    cursor: i32 = 0
+    anchor: i32 = 0
+    cause: u32 = 0
+    hint: u32 = 0
+    purpose: u32 = 0
+    /// Cursor rectangle in surface coordinates.
+    rect: ids.Rect = ids.Rect {}
+}
+
+struct TextInputData {
+    client: u32 = 0
+    obj: u32 = 0
+    seat: u32 = 0
+    /// Surface slot it entered (keyboard focus), or none.
+    focus: u32 = 0xFFFFFFFF
+    pending: TextState = TextState {}
+    current: TextState = TextState {}
+    /// Number of commits (the serial of `done`).
+    commits: u32 = 0
+}
+
+struct LayerData {
+    surface: u32 = 0
+    client: u32 = 0
+    obj: u32 = 0
+    /// Output slot it asked for, or none (the compositor picks).
+    output: u32 = 0xFFFFFFFF
+    namespace: str = ""
+    current: LayerState = LayerState {}
+    initial: bool = false
+    configured: bool = false
+    mapped: bool = false
+    configures: List[Configure] = []
+    /// Size of the last configure sent.
+    width: i32 = 0
+    height: i32 = 0
+}
+
+struct LockSurfaceData {
+    surface: u32 = 0
+    client: u32 = 0
+    obj: u32 = 0
+    output: u32 = 0xFFFFFFFF
+    configured: bool = false
+    mapped: bool = false
+    configures: List[Configure] = []
+}
+
+/// zwp_pointer_constraints_v1 lock or confinement.
+struct ConstraintData {
+    client: u32 = 0
+    obj: u32 = 0
+    surface: u32 = 0
+    seat: u32 = 0
+    lock: bool = true
+    region: Option[List[ids.Rect]] = None
+    oneshot: bool = true
+    active: bool = false
+    /// A oneshot constraint that ended: inert.
+    dead: bool = false
+    hint_set: bool = false
+    hint_x: f64 = 0.0
+    hint_y: f64 = 0.0
+}
+
+/// ext_idle_notification_v1.
+struct IdleData {
+    client: u32 = 0
+    obj: u32 = 0
+    timeout_ms: int = 0
+    /// get_input_idle_notification: inhibitors do not hold it back.
+    input_only: bool = false
+    idle: bool = false
+}
+
+/// Which protocol a data source or offer belongs to.
+enum DataKind {
+    /// wl_data_device_manager.
+    Data
+    /// zwp_primary_selection_device_manager_v1.
+    Primary
+    /// ext_data_control_manager_v1.
+    Control
 }
 
 struct SourceData {
     client: u32 = 0
     obj: u32 = 0
+    kind: DataKind = DataKind.Data
     mimes: List[str] = []
 }
 
 struct OfferData {
     client: u32 = 0
     obj: u32 = 0
+    kind: DataKind = DataKind.Data
     source: u32 = 0xFFFFFFFF
 }
 

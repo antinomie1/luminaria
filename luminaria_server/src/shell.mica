@@ -1,0 +1,344 @@
+// Desktop shell surfaces: wlr-layer-shell (panels, wallpapers, launchers,
+// notifications: surfaces anchored to an output's edges in one of four
+// layers, with exclusive zones) and ext-session-lock (the lock screen).
+// Their state is double-buffered like any surface state; the compositor
+// arranges and configures them, the server checks the protocol.
+
+import luminaria_proto.wayland as wl
+import luminaria_proto.wlr_layer_shell_unstable as ls
+import luminaria_proto.ext_session_lock as sl
+import ids
+import state
+import server
+import xdg
+
+// --------------------------------------------------------------- layers
+
+fn layer_shell(mut srv: server.Server, ci: u32, take req: ls.ShellRequest) {
+    match take req {
+        GetLayerSurface(l, s, o, layer, namespace) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            let i = int(si)
+            guard srv.surfaces.items[i].role == state.Role.Plain and srv.surfaces.items[i].current.buffer.is_none() else {
+                srv.fail(ci, l.id, u32(ls.ShellError.AlreadyConstructed), "surface already has a role or a buffer")
+                return
+            }
+            guard u32(layer) <= 3 else {
+                srv.fail(ci, l.id, u32(ls.ShellError.InvalidLayer), "layer {u32(layer)}")
+                return
+            }
+            var out = state.none
+            if let Some(w) = o {
+                out = srv.slot(ci, w.id)
+            }
+            let st = state.LayerState { layer: u32(layer) }
+            let id = srv.layers.add(state.LayerData { surface: si, client: ci, obj: l.id, output: out, namespace, current: st })
+            srv.surfaces.items[i].role = state.Role.Layer(id.index)
+            srv.bind(ci, l.id, id.index)
+        }
+        Destroy => {}
+    }
+}
+
+/// The pending layer state of layer `li`, started from the current one.
+fn pending(mut srv: server.Server, li: u32) -> int {
+    let si = int(srv.layers.items[int(li)].surface)
+    if not srv.surfaces.items[si].pending.layer_set {
+        srv.surfaces.items[si].pending.layer_set = true
+        srv.surfaces.items[si].pending.layer = srv.layers.items[int(li)].current
+    }
+    return si
+}
+
+fn layer_surface(mut srv: server.Server, ci: u32, l: ls.Surface, take req: ls.SurfaceRequest) {
+    let li = srv.slot(ci, l.id)
+    guard li != state.none else {
+        return
+    }
+    match req {
+        SetSize(w, h) => {
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.width = i32(w)
+            srv.surfaces.items[si].pending.layer.height = i32(h)
+        }
+        SetAnchor(a) => {
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.anchor = u32(a) & 15
+        }
+        SetExclusiveZone(z) => {
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.exclusive = z
+        }
+        SetMargin(t, r, b, lm) => {
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.margin = [t, r, b, lm]
+        }
+        SetKeyboardInteractivity(k) => {
+            guard u32(k) <= 2 else {
+                srv.fail(ci, l.id, u32(ls.SurfaceError.InvalidKeyboardInteractivity), "keyboard interactivity {u32(k)}")
+                return
+            }
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.keyboard = u32(k)
+        }
+        SetLayer(layer) => {
+            guard u32(layer) <= 3 else {
+                srv.fail(ci, l.id, u32(ls.ShellError.InvalidLayer), "layer {u32(layer)}")
+                return
+            }
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.layer = u32(layer)
+        }
+        SetExclusiveEdge(e) => {
+            let si = pending(mut srv, li)
+            srv.surfaces.items[si].pending.layer.exclusive_edge = u32(e)
+        }
+        GetPopup(p) => {
+            let pi = srv.slot(ci, p.id)
+            if pi != state.none and srv.popups.used(int(pi)) {
+                srv.popups.items[int(pi)].parent = srv.layers.items[int(li)].surface
+            }
+        }
+        AckConfigure(serial) => {
+            let si = int(srv.layers.items[int(li)].surface)
+            srv.surfaces.items[si].pending.acked = serial
+        }
+        Destroy => {
+            srv.unbind(ci, l.id)
+            destroy_layer(mut srv, li)
+        }
+    }
+}
+
+/// A commit of layer `li` became current.
+fn layer_applied(mut srv: server.Server, li: u32, serial: u32, set: bool, st: state.LayerState) {
+    let i = int(li)
+    let si = int(srv.layers.items[i].surface)
+    let ci = srv.layers.items[i].client
+    let obj = srv.layers.items[i].obj
+    let l = ids.Layer { id: srv.layers.id(li) }
+    if set {
+        let horizontal = st.anchor & 12 == 12
+        let vertical = st.anchor & 3 == 3
+        guard (st.width > 0 or horizontal) and (st.height > 0 or vertical) else {
+            srv.fail(ci, obj, u32(ls.SurfaceError.InvalidSize), "a 0 size needs both opposite anchors")
+            return
+        }
+        srv.layers.items[i].current = st
+    }
+    if xdg.acked(mut srv.layers.items[i].configures, serial).is_some() {
+        srv.layers.items[i].configured = true
+    }
+    let has_buffer = srv.surfaces.items[si].current.buffer.is_some()
+    if not srv.layers.items[i].initial {
+        if has_buffer {
+            srv.fail(ci, obj, u32(ls.ShellError.AlreadyConstructed), "buffer before the initial configure")
+            return
+        }
+        srv.layers.items[i].initial = true
+        srv.push(server.Event.LayerNew(l))
+        return
+    }
+    var changed = set
+    if has_buffer and not srv.layers.items[i].mapped {
+        guard srv.layers.items[i].configured else {
+            srv.fail(ci, obj, u32(ls.ShellError.AlreadyConstructed), "buffer before acking a configure")
+            return
+        }
+        srv.layers.items[i].mapped = true
+        srv.surfaces.items[si].mapped = true
+        changed = true
+    } else if not has_buffer and srv.layers.items[i].mapped {
+        // Unmapped: it starts over with an initial commit.
+        srv.layers.items[i].mapped = false
+        srv.layers.items[i].initial = false
+        srv.layers.items[i].configured = false
+        srv.surfaces.items[si].mapped = false
+        changed = true
+    }
+    if changed {
+        srv.push(server.Event.LayerChanged(l))
+    }
+}
+
+fn configure_layer(mut srv: server.Server, li: u32, width: i32, height: i32) -> u32 {
+    let i = int(li)
+    let serial = srv.next_serial()
+    let ci = srv.layers.items[i].client
+    ls.Surface { id: srv.layers.items[i].obj }.configure(mut srv.conns[int(ci)], serial, u32(max(width, 0)), u32(max(height, 0)))
+    srv.layers.items[i].configures.push(state.Configure { serial, width, height })
+    srv.layers.items[i].width = width
+    srv.layers.items[i].height = height
+    return serial
+}
+
+fn close_layer(mut srv: server.Server, li: u32) {
+    let i = int(li)
+    let ci = srv.layers.items[i].client
+    ls.Surface { id: srv.layers.items[i].obj }.closed(mut srv.conns[int(ci)])
+}
+
+fn destroy_layer(mut srv: server.Server, li: u32) {
+    let i = int(li)
+    guard srv.layers.used(i) else {
+        return
+    }
+    let si = int(srv.layers.items[i].surface)
+    if srv.surfaces.used(si) {
+        srv.surfaces.items[si].mapped = false
+    }
+    srv.push(server.Event.LayerGone(ids.Layer { id: srv.layers.id(li) }))
+    srv.layers.remove(li, state.LayerData {})
+}
+
+// ----------------------------------------------------------------- lock
+
+fn lock_manager(mut srv: server.Server, ci: u32, take req: sl.LockManagerRequest) {
+    match req {
+        Lock(l) => {
+            // One locker at a time; a dead locker's session stays locked
+            // and the next one takes over.
+            if srv.lock_obj != 0 {
+                l.finished(mut srv.conns[int(ci)])
+                return
+            }
+            srv.lock_client = ci
+            srv.lock_obj = l.id
+            srv.bind(ci, l.id, 0)
+            srv.push(server.Event.LockRequest)
+        }
+        Destroy => {}
+    }
+}
+
+fn session_lock(mut srv: server.Server, ci: u32, l: sl.Lock, take req: sl.LockRequest) {
+    let active = srv.lock_obj == l.id and srv.lock_client == ci
+    match req {
+        Destroy => {
+            srv.unbind(ci, l.id)
+            if active {
+                srv.lock_obj = 0
+            }
+        }
+        GetLockSurface(lsurf, s, o) => {
+            guard active else {
+                return
+            }
+            let si = srv.slot(ci, s.id)
+            let oi = srv.slot(ci, o.id)
+            guard si != state.none and oi != state.none else {
+                return
+            }
+            let i = int(si)
+            guard srv.surfaces.items[i].role == state.Role.Plain and srv.surfaces.items[i].current.buffer.is_none() else {
+                srv.fail(ci, l.id, u32(sl.LockError.Role), "surface already has a role or a buffer")
+                return
+            }
+            for k in 0..srv.lock_surfaces.items.len() {
+                if srv.lock_surfaces.used(k) and srv.lock_surfaces.items[k].output == oi {
+                    srv.fail(ci, l.id, u32(sl.LockError.DuplicateOutput), "a lock surface for this output exists")
+                    return
+                }
+            }
+            let id = srv.lock_surfaces.add(state.LockSurfaceData { surface: si, client: ci, obj: lsurf.id, output: oi })
+            srv.surfaces.items[i].role = state.Role.Lock(id.index)
+            srv.bind(ci, lsurf.id, id.index)
+            srv.push(server.Event.LockSurfaceNew(ids.LockSurface { id }))
+        }
+        UnlockAndDestroy => {
+            srv.unbind(ci, l.id)
+            guard active else {
+                return
+            }
+            srv.lock_obj = 0
+            srv.locked = false
+            srv.push(server.Event.Unlock)
+        }
+    }
+}
+
+fn lock_surface(mut srv: server.Server, ci: u32, lsurf: sl.LockSurface, take req: sl.LockSurfaceRequest) {
+    let k = srv.slot(ci, lsurf.id)
+    guard k != state.none else {
+        return
+    }
+    match req {
+        AckConfigure(serial) => {
+            let si = int(srv.lock_surfaces.items[int(k)].surface)
+            srv.surfaces.items[si].pending.acked = serial
+        }
+        Destroy => {
+            srv.unbind(ci, lsurf.id)
+            destroy_lock_surface(mut srv, k)
+        }
+    }
+}
+
+fn lock_applied(mut srv: server.Server, k: u32, serial: u32) {
+    let i = int(k)
+    let si = int(srv.lock_surfaces.items[i].surface)
+    if xdg.acked(mut srv.lock_surfaces.items[i].configures, serial).is_some() {
+        srv.lock_surfaces.items[i].configured = true
+    }
+    let has_buffer = srv.surfaces.items[si].current.buffer.is_some()
+    guard has_buffer != srv.lock_surfaces.items[i].mapped else {
+        return
+    }
+    if has_buffer and not srv.lock_surfaces.items[i].configured {
+        let ci = srv.lock_surfaces.items[i].client
+        srv.fail(ci, srv.lock_surfaces.items[i].obj, u32(sl.LockSurfaceError.CommitBeforeFirstAck), "buffer before acking a configure")
+        return
+    }
+    srv.lock_surfaces.items[i].mapped = has_buffer
+    srv.surfaces.items[si].mapped = has_buffer
+    srv.push(server.Event.LockSurfaceChanged(ids.LockSurface { id: srv.lock_surfaces.id(k) }))
+}
+
+fn configure_lock(mut srv: server.Server, k: u32, width: i32, height: i32) -> u32 {
+    let i = int(k)
+    let serial = srv.next_serial()
+    let ci = srv.lock_surfaces.items[i].client
+    sl.LockSurface { id: srv.lock_surfaces.items[i].obj }.configure(mut srv.conns[int(ci)], serial, u32(width), u32(height))
+    srv.lock_surfaces.items[i].configures.push(state.Configure { serial, width, height })
+    return serial
+}
+
+fn destroy_lock_surface(mut srv: server.Server, k: u32) {
+    guard srv.lock_surfaces.used(int(k)) else {
+        return
+    }
+    let si = int(srv.lock_surfaces.items[int(k)].surface)
+    if srv.surfaces.used(si) {
+        srv.surfaces.items[si].mapped = false
+    }
+    let id = srv.lock_surfaces.id(k)
+    srv.lock_surfaces.remove(k, state.LockSurfaceData {})
+    srv.push(server.Event.LockSurfaceChanged(ids.LockSurface { id }))
+}
+
+/// The screen shows nothing of the session any more: tell the locker.
+fn lock_done(mut srv: server.Server) {
+    srv.locked = true
+    if srv.lock_obj != 0 {
+        sl.Lock { id: srv.lock_obj }.locked(mut srv.conns[int(srv.lock_client)])
+    }
+}
+
+/// Teardown of a layer or lock object.
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == ls.surface_iface {
+        destroy_layer(mut srv, slot)
+    } else if iface == sl.lock_surface_iface {
+        destroy_lock_surface(mut srv, slot)
+    } else if iface == sl.lock_iface {
+        if srv.lock_obj == id and srv.lock_client == ci {
+            srv.lock_obj = 0
+        }
+    } else {
+        return false
+    }
+    return true
+}

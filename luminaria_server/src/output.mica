@@ -4,6 +4,7 @@
 
 import luminaria_proto.wayland as wl
 import luminaria_proto.fractional_scale as frac
+import luminaria_proto.xdg_output_unstable as xo
 import ids
 import state
 import server
@@ -29,6 +30,55 @@ fn send(mut srv: server.Server, oi: u32, ci: u32, id: u32) {
     o.done(mut srv.conns[c])
 }
 
+/// zxdg_output_v1: the logical position and size (after scale).
+fn send_xdg(mut srv: server.Server, oi: u32, ci: u32, id: u32, version: u32) {
+    let inf = srv.outputs.items[int(oi)].info.clone()
+    let x = xo.Output { id }
+    let c = int(ci)
+    let s = max(inf.scale120, 1)
+    x.logical_position(mut srv.conns[c], inf.x, inf.y)
+    x.logical_size(mut srv.conns[c], inf.width * 120 / s, inf.height * 120 / s)
+    if version >= 2 {
+        x.name(mut srv.conns[c], inf.name)
+        x.description(mut srv.conns[c], inf.description)
+    }
+    // From version 3 wl_output.done ends the batch.
+    if version < 3 {
+        x.done(mut srv.conns[c])
+    }
+}
+
+fn xdg_manager(mut srv: server.Server, ci: u32, take req: xo.OutputManagerRequest) {
+    match req {
+        GetXdgOutput(x, o) => {
+            let oi = srv.slot(ci, o.id)
+            guard oi != state.none and srv.outputs.used(int(oi)) else {
+                return
+            }
+            let version = srv.conns[int(ci)].version(x.id)
+            srv.outputs.items[int(oi)].xdg.push((ci, x.id, version))
+            srv.bind(ci, x.id, oi)
+            send_xdg(mut srv, oi, ci, x.id, version)
+            if version >= 3 {
+                o.done(mut srv.conns[int(ci)])
+            }
+        }
+        Destroy => {}
+    }
+}
+
+fn xdg_output(mut srv: server.Server, ci: u32, x: xo.Output, take req: xo.OutputRequest) {
+    match req {
+        Destroy => {
+            let oi = srv.slot(ci, x.id)
+            srv.unbind(ci, x.id)
+            if oi != state.none and srv.outputs.used(int(oi)) {
+                srv.outputs.items[int(oi)].xdg.retain(fn(e) => not (e.0 == ci and e.1 == x.id))
+            }
+        }
+    }
+}
+
 fn bound(mut srv: server.Server, ci: u32, oi: u32, id: u32, version: u32) {
     srv.outputs.items[int(oi)].binds.push((ci, id, version))
     srv.bind(ci, id, oi)
@@ -37,6 +87,10 @@ fn bound(mut srv: server.Server, ci: u32, oi: u32, id: u32, version: u32) {
 
 fn update(mut srv: server.Server, oi: u32, take info: state.OutputInfo) {
     srv.outputs.items[int(oi)].info = info
+    for k in 0..srv.outputs.items[int(oi)].xdg.len() {
+        let (ci, id, version) = srv.outputs.items[int(oi)].xdg[k]
+        send_xdg(mut srv, oi, ci, id, version)
+    }
     for k in 0..srv.outputs.items[int(oi)].binds.len() {
         let (ci, id, _) = srv.outputs.items[int(oi)].binds[k]
         send(mut srv, oi, ci, id)
@@ -65,6 +119,7 @@ fn drop_bind(mut srv: server.Server, oi: u32, ci: u32, id: u32) {
         return
     }
     srv.outputs.items[int(oi)].binds.retain(fn(b) => not (b.0 == ci and b.1 == id))
+    srv.outputs.items[int(oi)].xdg.retain(fn(b) => not (b.0 == ci and b.1 == id))
 }
 
 /// Surface `si` is now on the outputs in `mask` (bit per slot): send

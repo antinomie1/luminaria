@@ -25,8 +25,10 @@ struct View {
     w: lum.Window
     x: f64
     y: f64
-    /// Maximized or fullscreen: shown at this output's origin instead.
+    /// Maximized or fullscreen on this output: shown at the top left of
+    /// its free area (maximized) or of the output (fullscreen).
     full: Option[lum.Output] = None
+    fullscreen: bool = false
 }
 
 struct Tiny {
@@ -48,7 +50,7 @@ fn Tiny.show(mut self) {
     var places: List[(lum.Window, f64, f64)] = []
     for v in self.views {
         if let Some(o) = v.full {
-            let (x, y, _, _) = self.d.output_rect(o)
+            let (x, y, _, _) = if v.fullscreen { self.d.output_rect(o) } else { self.d.usable(o) }
             places.push((v.w, x, y))
         } else {
             places.push((v.w, v.x, v.y))
@@ -88,7 +90,7 @@ fn Tiny.mapped(mut self, w: lum.Window) {
     var x: f64 = 0.0
     var y: f64 = 0.0
     if let Some(o) = self.d.output_under(px, py) {
-        let (ox, oy, ow, oh) = self.d.output_rect(o)
+        let (ox, oy, ow, oh) = self.d.usable(o)
         let (ww, wh) = self.d.size(w)
         x = ox + max((ow - f64(ww)) / 2.0, 0.0)
         y = oy + max((oh - f64(wh)) / 2.0, 0.0)
@@ -119,11 +121,12 @@ fn Tiny.shift(mut self, w: lum.Window, dx: f64, dy: f64) {
     self.show()
 }
 
-fn Tiny.full(mut self, w: lum.Window, o: Option[lum.Output], on: bool) {
+fn Tiny.full(mut self, w: lum.Window, o: Option[lum.Output], on: bool, fullscreen: bool) {
     let i = self.find(w)
     guard i >= 0 else {
         return
     }
+    self.views[i].fullscreen = fullscreen
     self.views[i].full = if not on {
         None
     } else if o.is_some() {
@@ -136,7 +139,8 @@ fn Tiny.full(mut self, w: lum.Window, o: Option[lum.Output], on: bool) {
 
 /// A compositor binding: true when the key was taken.
 fn Tiny.bind(mut self, k: lum.Key) -> bool {
-    guard k.pressed and k.mods.alt else {
+    // A remote desktop or VM in focus asked for every key.
+    guard k.pressed and k.mods.alt and not self.d.shortcuts_inhibited() else {
         return false
     }
     if k.sym == lum.keysym.key_Escape {
@@ -212,12 +216,14 @@ fn run(startup: str) -> Result[(), str] {
             Resized(w, dx, dy, _, _) => t.shift(w, dx, dy)
             RequestMaximize(w, on) => {
                 t.d.accept(e)
-                t.full(w, None, on)
+                t.full(w, None, on, false)
             }
             RequestFullscreen(w, o, on) => {
                 t.d.accept(e)
-                t.full(w, o, on)
+                t.full(w, o, on, true)
             }
+            // Panels came or went: maximized windows move with the free area.
+            OutputArea => t.show()
             Key(k) => {
                 if not t.bind(k) {
                     t.d.accept(e)

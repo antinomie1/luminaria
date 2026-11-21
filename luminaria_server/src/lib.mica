@@ -1,7 +1,9 @@
 // luminaria_server: the protocol state every compositor needs, with no GPU
 // and no policy. Surfaces and subsurfaces with double-buffered commits and
-// transactions, xdg-shell, seats and focus, outputs, shm and dmabuf
-// buffers, explicit sync, presentation and frame timing, the clipboard.
+// transactions, xdg-shell and its extensions, layer shell and session
+// lock, seats and focus with pointer constraints, gestures and input
+// methods, outputs, shm, dmabuf and single-pixel buffers, explicit sync,
+// presentation and frame timing, selections, idle notification.
 // Buffers and damage come out as plain data; requests that need a
 // decision come out as events.
 
@@ -30,6 +32,13 @@ pub type Popup = ids.Popup
 pub type Output = ids.Output
 pub type Seat = ids.Seat
 pub type Txn = ids.Txn
+pub type Layer = ids.Layer
+pub type LockSurface = ids.LockSurface
+pub type LayerInfo = server.LayerInfo
+pub type LayerState = state.LayerState
+pub type Constraint = server.Constraint
+pub type Icon = state.Icon
+pub type IconImage = state.IconImage
 
 pub let changed_buffer = state.changed_buffer
 pub let changed_damage = state.changed_damage

@@ -9,6 +9,7 @@ import std.os
 import luminaria_wire as wire
 import luminaria_proto.wayland as wl
 import luminaria_proto.linux_dmabuf as dmabuf_p
+import luminaria_proto.single_pixel_buffer as spb
 import ids
 import state
 import server
@@ -314,6 +315,18 @@ fn create(mut srv: server.Server, ci: u32, pobj: u32, pi: u32, obj: u32, w: i32,
         srv.bind(ci, obj, id.index)
     }
     srv.push(server.Event.BufferNew(ids.Buffer { id }))
+}
+
+/// wp_single_pixel_buffer_manager_v1: a 1x1 buffer of one colour.
+fn single_pixel(mut srv: server.Server, ci: u32, take req: spb.SinglePixelBufferManagerRequest) {
+    match req {
+        CreateU32RgbaBuffer(b, r, g, bl, a) => {
+            let id = srv.buffers.add(state.BufferData { client: ci, obj: b.id, kind: state.BufferKind.SinglePixel, width: 1, height: 1, format: argb8888, color: [r, g, bl, a] })
+            srv.bind(ci, b.id, id.index)
+            srv.push(server.Event.BufferNew(ids.Buffer { id }))
+        }
+        Destroy => {}
+    }
 }
 
 /// The compositor tried importing dmabuf `bi`: answer `create`, or end a

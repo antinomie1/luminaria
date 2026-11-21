@@ -1,0 +1,539 @@
+// Input methods: text-input-v3 (the text field of the focused client),
+// input-method-v2 (the IME: fcitx5, ibus, squeekboard) and
+// virtual-keyboard-v1 (keys typed by the IME, on-screen keyboards, wtype).
+// The server relays between them: the focused client's enabled text input
+// activates the input method, which grabs the keyboard, shows its
+// candidate popup and commits text back.
+
+import std.os
+import luminaria_wire as wire
+import luminaria_proto.wayland as wl
+import luminaria_proto.text_input_unstable as ti
+import luminaria_proto.input_method_unstable as im
+import luminaria_proto.virtual_keyboard_unstable as vk
+import ids
+import state
+import server
+
+// ---------------------------------------------------------- text input
+
+fn text_manager(mut srv: server.Server, ci: u32, take req: ti.InputManagerRequest) {
+    match req {
+        GetTextInput(t, st) => {
+            let si = srv.slot(ci, st.id)
+            guard si != state.none else {
+                return
+            }
+            let k = srv.text_inputs.add(state.TextInputData { client: ci, obj: t.id, seat: si })
+            srv.bind(ci, t.id, k.index)
+            let f = srv.seats.items[int(si)].kb_focus
+            if f != state.none and srv.surfaces.used(int(f)) and srv.surfaces.items[int(f)].client == ci {
+                enter(mut srv, k.index, f)
+            }
+        }
+        Destroy => {}
+    }
+}
+
+fn text_input(mut srv: server.Server, ci: u32, t: ti.Input, take req: ti.InputRequest) {
+    let k = srv.slot(ci, t.id)
+    guard k != state.none else {
+        return
+    }
+    let i = int(k)
+    match take req {
+        Enable => srv.text_inputs.items[i].pending = state.TextState { enabled: true }
+        Disable => srv.text_inputs.items[i].pending.enabled = false
+        SetSurroundingText(text, cursor, anchor) => {
+            srv.text_inputs.items[i].pending.surrounding = text
+            srv.text_inputs.items[i].pending.cursor = cursor
+            srv.text_inputs.items[i].pending.anchor = anchor
+        }
+        SetTextChangeCause(c) => srv.text_inputs.items[i].pending.cause = u32(c)
+        SetContentType(hint, purpose) => {
+            srv.text_inputs.items[i].pending.hint = u32(hint)
+            srv.text_inputs.items[i].pending.purpose = u32(purpose)
+        }
+        SetCursorRectangle(x, y, w, h) => srv.text_inputs.items[i].pending.rect = ids.Rect { x, y, w, h }
+        Commit => commit(mut srv, k)
+        Destroy => {
+            srv.unbind(ci, t.id)
+            drop_text_input(mut srv, k)
+        }
+        _ => {}
+    }
+}
+
+fn commit(mut srv: server.Server, k: u32) {
+    let i = int(k)
+    let was = srv.text_inputs.items[i].current.enabled
+    let old_rect = srv.text_inputs.items[i].current.rect
+    srv.text_inputs.items[i].commits += 1
+    srv.text_inputs.items[i].current = srv.text_inputs.items[i].pending.clone()
+    // Text and its cause are one-shot.
+    srv.text_inputs.items[i].pending.cause = 0
+    let si = srv.text_inputs.items[i].seat
+    guard srv.text_inputs.items[i].focus != state.none else {
+        return
+    }
+    let now = srv.text_inputs.items[i].current.enabled
+    if now and not was {
+        activate(mut srv, si, k)
+    } else if was and not now {
+        deactivate(mut srv, si)
+    } else if now and srv.seats.items[int(si)].im_active == k {
+        send_state(mut srv, si, k)
+    }
+    let r = srv.text_inputs.items[i].current.rect
+    if r != old_rect {
+        popup_rects(mut srv, si)
+        srv.push(server.Event.ImeChanged(ids.Seat { id: srv.seats.id(si) }))
+    }
+}
+
+fn enter(mut srv: server.Server, k: u32, surf: u32) {
+    let i = int(k)
+    let c = int(srv.text_inputs.items[i].client)
+    srv.text_inputs.items[i].focus = surf
+    ti.Input { id: srv.text_inputs.items[i].obj }.enter(mut srv.conns[c], wl.Surface { id: srv.surfaces.items[int(surf)].obj })
+}
+
+/// Keyboard focus of seat `si` moved: text inputs leave and enter.
+fn focus_changed(mut srv: server.Server, si: u32) {
+    let f = srv.seats.items[int(si)].kb_focus
+    let fc = if f != state.none and srv.surfaces.used(int(f)) { srv.surfaces.items[int(f)].client } else { state.none }
+    for k in 0..srv.text_inputs.items.len() {
+        guard srv.text_inputs.used(k) and srv.text_inputs.items[k].seat == si else {
+            continue
+        }
+        let old = srv.text_inputs.items[k].focus
+        guard old != f else {
+            continue
+        }
+        if old != state.none {
+            if srv.seats.items[int(si)].im_active == u32(k) {
+                deactivate(mut srv, si)
+            }
+            srv.text_inputs.items[k].focus = state.none
+            srv.text_inputs.items[k].current.enabled = false
+            if srv.surfaces.used(int(old)) {
+                let c = int(srv.text_inputs.items[k].client)
+                ti.Input { id: srv.text_inputs.items[k].obj }.leave(mut srv.conns[c], wl.Surface { id: srv.surfaces.items[int(old)].obj })
+            }
+        }
+        if fc != state.none and srv.text_inputs.items[k].client == fc {
+            enter(mut srv, u32(k), f)
+        }
+    }
+}
+
+fn drop_text_input(mut srv: server.Server, k: u32) {
+    guard srv.text_inputs.used(int(k)) else {
+        return
+    }
+    let si = srv.text_inputs.items[int(k)].seat
+    if srv.seats.used(int(si)) and srv.seats.items[int(si)].im_active == k {
+        deactivate(mut srv, si)
+    }
+    srv.text_inputs.remove(k, state.TextInputData {})
+}
+
+// -------------------------------------------------------- input method
+
+fn method(srv: server.Server, si: u32) -> (int, im.Method) {
+    return (int(srv.seats.items[int(si)].im_client), im.Method { id: srv.seats.items[int(si)].im })
+}
+
+fn activate(mut srv: server.Server, si: u32, k: u32) {
+    srv.seats.items[int(si)].im_active = k
+    guard srv.seats.items[int(si)].im != 0 else {
+        return
+    }
+    let (c, m) = method(srv, si)
+    m.activate(mut srv.conns[c])
+    send_state(mut srv, si, k)
+}
+
+/// The text field's state to the input method, then done.
+fn send_state(mut srv: server.Server, si: u32, k: u32) {
+    guard srv.seats.items[int(si)].im != 0 else {
+        return
+    }
+    let (c, m) = method(srv, si)
+    let st = srv.text_inputs.items[int(k)].current.clone()
+    m.surrounding_text(mut srv.conns[c], st.surrounding, u32(max(st.cursor, 0)), u32(max(st.anchor, 0)))
+    m.text_change_cause(mut srv.conns[c], ti.InputChangeCause(st.cause))
+    m.content_type(mut srv.conns[c], ti.InputContentHint(st.hint), ti.InputContentPurpose(st.purpose))
+    m.done(mut srv.conns[c])
+    srv.seats.items[int(si)].im_dones += 1
+}
+
+fn deactivate(mut srv: server.Server, si: u32) {
+    guard srv.seats.items[int(si)].im_active != state.none else {
+        return
+    }
+    srv.seats.items[int(si)].im_active = state.none
+    guard srv.seats.items[int(si)].im != 0 else {
+        return
+    }
+    let (c, m) = method(srv, si)
+    m.deactivate(mut srv.conns[c])
+    m.done(mut srv.conns[c])
+    srv.seats.items[int(si)].im_dones += 1
+}
+
+fn method_manager(mut srv: server.Server, ci: u32, take req: im.MethodManagerRequest) {
+    match req {
+        GetInputMethod(st, m) => {
+            let si = srv.slot(ci, st.id)
+            guard si != state.none else {
+                return
+            }
+            let i = int(si)
+            guard srv.seats.items[i].im == 0 else {
+                m.unavailable(mut srv.conns[int(ci)])
+                return
+            }
+            srv.seats.items[i].im_client = ci
+            srv.seats.items[i].im = m.id
+            srv.seats.items[i].im_version = srv.conns[int(ci)].version(m.id)
+            srv.bind(ci, m.id, si)
+            // A text field already waits for it.
+            let a = srv.seats.items[i].im_active
+            if a != state.none and srv.text_inputs.used(int(a)) {
+                activate(mut srv, si, a)
+            }
+        }
+        Destroy => {}
+    }
+}
+
+fn input_method(mut srv: server.Server, ci: u32, m: im.Method, take req: im.MethodRequest) {
+    let si = srv.slot(ci, m.id)
+    guard si != state.none and srv.seats.items[int(si)].im == m.id and srv.seats.items[int(si)].im_client == ci else {
+        return
+    }
+    let i = int(si)
+    match take req {
+        CommitString(text) => srv.seats.items[i].im_commit = text
+        SetPreeditString(text, b, e) => {
+            srv.seats.items[i].im_preedit = text
+            srv.seats.items[i].im_preedit_begin = b
+            srv.seats.items[i].im_preedit_end = e
+        }
+        DeleteSurroundingText(before, after) => {
+            srv.seats.items[i].im_delete_before = before
+            srv.seats.items[i].im_delete_after = after
+        }
+        Commit(serial) => method_commit(mut srv, si)
+        GetInputPopupSurface(p, s) => {
+            let ps = srv.slot(ci, s.id)
+            guard ps != state.none and srv.surfaces.items[int(ps)].role == state.Role.Plain else {
+                srv.fail(ci, m.id, 0, "popup surface already has a role")
+                return
+            }
+            srv.surfaces.items[int(ps)].role = state.Role.ImePopup(si)
+            srv.seats.items[i].im_popups.push((ci, p.id, ps))
+            srv.bind(ci, p.id, ps)
+            popup_rects(mut srv, si)
+        }
+        GrabKeyboard(g) => {
+            srv.seats.items[i].grab_client = ci
+            srv.seats.items[i].grab = g.id
+            srv.bind(ci, g.id, si)
+            send_grab_keymap(mut srv, si)
+        }
+        Destroy => {
+            srv.unbind(ci, m.id)
+            drop_method(mut srv, si)
+        }
+    }
+}
+
+/// The input method's commit: preedit, committed text and deletion go to
+/// the text field, then done with the field's commit count.
+fn method_commit(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let k = srv.seats.items[i].im_active
+    let preedit = srv.seats.items[i].im_preedit.clone()
+    let text = srv.seats.items[i].im_commit.clone()
+    let before = srv.seats.items[i].im_delete_before
+    let after = srv.seats.items[i].im_delete_after
+    let pb = srv.seats.items[i].im_preedit_begin
+    let pe = srv.seats.items[i].im_preedit_end
+    srv.seats.items[i].im_preedit = ""
+    srv.seats.items[i].im_commit = ""
+    srv.seats.items[i].im_delete_before = 0
+    srv.seats.items[i].im_delete_after = 0
+    guard k != state.none and srv.text_inputs.used(int(k)) and srv.text_inputs.items[int(k)].current.enabled else {
+        return
+    }
+    let c = int(srv.text_inputs.items[int(k)].client)
+    let t = ti.Input { id: srv.text_inputs.items[int(k)].obj }
+    t.preedit_string(mut srv.conns[c], if preedit.is_empty() { None } else { Some(preedit) }, pb, pe)
+    if not text.is_empty() {
+        t.commit_string(mut srv.conns[c], Some(text))
+    }
+    if before > 0 or after > 0 {
+        t.delete_surrounding_text(mut srv.conns[c], before, after)
+    }
+    t.done(mut srv.conns[c], srv.text_inputs.items[int(k)].commits)
+}
+
+fn drop_method(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    guard srv.seats.used(i) else {
+        return
+    }
+    srv.seats.items[i].im = 0
+    srv.seats.items[i].grab = 0
+    srv.seats.items[i].im_popups.clear()
+    srv.push(server.Event.ImeChanged(ids.Seat { id: srv.seats.id(si) }))
+}
+
+fn popup(mut srv: server.Server, ci: u32, p: im.PopupSurface, take req: im.PopupSurfaceRequest) {
+    match req {
+        Destroy => {
+            let ps = srv.slot(ci, p.id)
+            srv.unbind(ci, p.id)
+            if ps != state.none {
+                popup_gone(mut srv, ps)
+            }
+        }
+    }
+}
+
+/// An input method popup surface went away.
+fn popup_gone(mut srv: server.Server, ps: u32) {
+    for i in 0..srv.seats.items.len() {
+        if srv.seats.used(i) {
+            srv.seats.items[i].im_popups.retain(fn(p) => p.2 != ps)
+        }
+    }
+    if srv.surfaces.used(int(ps)) {
+        srv.surfaces.items[int(ps)].role = state.Role.Plain
+    }
+}
+
+/// Popups are placed with their top left under the text cursor: the
+/// cursor rectangle in popup coordinates is just above them.
+fn popup_rects(mut srv: server.Server, si: u32) {
+    let k = srv.seats.items[int(si)].im_active
+    guard k != state.none and srv.text_inputs.used(int(k)) else {
+        return
+    }
+    let r = srv.text_inputs.items[int(k)].current.rect
+    for (c, id, _) in srv.seats.items[int(si)].im_popups.clone() {
+        im.PopupSurface { id }.text_input_rectangle(mut srv.conns[int(c)], 0, -r.h, r.w, r.h)
+    }
+}
+
+fn grab_request(mut srv: server.Server, ci: u32, g: im.MethodKeyboardGrab, take req: im.MethodKeyboardGrabRequest) {
+    match req {
+        Release => {
+            let si = srv.slot(ci, g.id)
+            srv.unbind(ci, g.id)
+            if si != state.none and srv.seats.items[int(si)].grab == g.id {
+                srv.seats.items[int(si)].grab = 0
+            }
+        }
+    }
+}
+
+fn send_grab_keymap(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    guard srv.seats.items[i].grab != 0 else {
+        return
+    }
+    let c = int(srv.seats.items[i].grab_client)
+    let g = im.MethodKeyboardGrab { id: srv.seats.items[i].grab }
+    var fd = -1
+    if let Some(f) = srv.seats.items[i].keymap {
+        fd = f.raw()
+    }
+    if fd >= 0 {
+        g.keymap(mut srv.conns[c], wl.KeyboardKeymapFormat.XkbV1, fd, srv.seats.items[i].keymap_size)
+    }
+    g.repeat_info(mut srv.conns[c], srv.seats.items[i].rate, srv.seats.items[i].delay)
+}
+
+/// A hardware key: to the input method's grab, if it has one.
+fn grab_key(mut srv: server.Server, si: u32, serial: u32, time: u32, code: u32, pressed: bool) -> bool {
+    let i = int(si)
+    guard srv.seats.items[i].grab != 0 else {
+        return false
+    }
+    let st = if pressed { wl.KeyboardKeyState.Pressed } else { wl.KeyboardKeyState.Released }
+    im.MethodKeyboardGrab { id: srv.seats.items[i].grab }.key(mut srv.conns[int(srv.seats.items[i].grab_client)], serial, time, code, st)
+    return true
+}
+
+fn grab_modifiers(mut srv: server.Server, si: u32, serial: u32, m: [4]u32) -> bool {
+    let i = int(si)
+    guard srv.seats.items[i].grab != 0 else {
+        return false
+    }
+    im.MethodKeyboardGrab { id: srv.seats.items[i].grab }.modifiers(mut srv.conns[int(srv.seats.items[i].grab_client)], serial, m[0], m[1], m[2], m[3])
+    return true
+}
+
+// ---------------------------------------------------- virtual keyboard
+
+/// FNV-1a over a keymap memfd, to tell equal keymaps apart cheaply.
+fn keymap_hash(fd: int, size: u32) -> u64 {
+    guard let Ok(m) = os.map(fd, int(size), 0, false) else {
+        return 0
+    }
+    var h: u64 = 0xcbf29ce484222325
+    unsafe {
+        let b = Ptr.slice(m.ptr, int(size))
+        for x in b {
+            h = (h ^ u64(x)) * 0x100000001b3
+        }
+    }
+    return h
+}
+
+fn keyboard_manager(mut srv: server.Server, ci: u32, take req: vk.KeyboardManagerRequest) {
+    match req {
+        CreateVirtualKeyboard(st, k) => {
+            let si = srv.slot(ci, st.id)
+            guard si != state.none else {
+                return
+            }
+            let id = srv.vkeys.add(state.VirtualKeyboardData { client: ci, obj: k.id, seat: si })
+            srv.bind(ci, k.id, id.index)
+        }
+    }
+}
+
+fn virtual_keyboard(mut srv: server.Server, ci: u32, k: vk.Keyboard, take req: vk.KeyboardRequest) {
+    let v = srv.slot(ci, k.id)
+    guard v != state.none else {
+        return
+    }
+    let i = int(v)
+    match take req {
+        Keymap(format, f, size) => {
+            srv.vkeys.items[i].hash = keymap_hash(f.raw(), size)
+            srv.vkeys.items[i].keymap = Some(f)
+            srv.vkeys.items[i].size = size
+        }
+        Key(time, code, st) => {
+            guard srv.vkeys.items[i].keymap.is_some() else {
+                srv.fail(ci, k.id, u32(vk.KeyboardError.NoKeymap), "key before keymap")
+                return
+            }
+            let si = srv.vkeys.items[i].seat
+            use_keymap(mut srv, si, v + 1)
+            let serial = srv.next_serial()
+            send_key(mut srv, si, serial, time, code, st == 1)
+        }
+        Modifiers(d, l, lk, g) => {
+            let si = srv.vkeys.items[i].seat
+            use_keymap(mut srv, si, v + 1)
+            let serial = srv.next_serial()
+            send_modifiers(mut srv, si, serial, [d, l, lk, g])
+        }
+        Destroy => {
+            srv.unbind(ci, k.id)
+            srv.vkeys.remove(v, state.VirtualKeyboardData {})
+        }
+    }
+}
+
+/// Make the focused client's keyboards use keymap `from` (0: the seat's,
+/// v + 1: virtual keyboard v) unless it already has an equal one.
+fn use_keymap(mut srv: server.Server, si: u32, from: u32) {
+    let i = int(si)
+    guard srv.seats.items[i].keymap_from != from else {
+        return
+    }
+    var fd = -1
+    var size: u32 = 0
+    var hash: u64 = 0
+    if from == 0 {
+        if let Some(f) = srv.seats.items[i].keymap {
+            fd = f.raw()
+        }
+        size = srv.seats.items[i].keymap_size
+        if fd >= 0 {
+            hash = keymap_hash(fd, size)
+        }
+    } else if srv.vkeys.used(int(from - 1)) {
+        if let Some(f) = srv.vkeys.items[int(from - 1)].keymap {
+            fd = f.raw()
+        }
+        size = srv.vkeys.items[int(from - 1)].size
+        hash = srv.vkeys.items[int(from - 1)].hash
+    }
+    srv.seats.items[i].keymap_from = from
+    guard fd >= 0 and hash != srv.seats.items[i].keymap_hash else {
+        return
+    }
+    srv.seats.items[i].keymap_hash = hash
+    let f = srv.seats.items[i].kb_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    for r in srv.seats.items[i].keyboards.clone() {
+        if r.client == fc {
+            wl.Keyboard { id: r.id }.keymap(mut srv.conns[int(r.client)], wl.KeyboardKeymapFormat.XkbV1, fd, size)
+        }
+    }
+}
+
+/// A key to the keyboard focus, past any input method grab.
+fn send_key(mut srv: server.Server, si: u32, serial: u32, time: u32, code: u32, pressed: bool) {
+    let i = int(si)
+    let f = srv.seats.items[i].kb_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    let st = if pressed { wl.KeyboardKeyState.Pressed } else { wl.KeyboardKeyState.Released }
+    for r in srv.seats.items[i].keyboards.clone() {
+        if r.client == fc {
+            wl.Keyboard { id: r.id }.key(mut srv.conns[int(r.client)], serial, time, code, st)
+        }
+    }
+}
+
+fn send_modifiers(mut srv: server.Server, si: u32, serial: u32, m: [4]u32) {
+    let i = int(si)
+    let f = srv.seats.items[i].kb_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    for r in srv.seats.items[i].keyboards.clone() {
+        if r.client == fc {
+            wl.Keyboard { id: r.id }.modifiers(mut srv.conns[int(r.client)], serial, m[0], m[1], m[2], m[3])
+        }
+    }
+}
+
+/// Teardown of an input method object.
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == ti.input_iface {
+        drop_text_input(mut srv, slot)
+    } else if iface == im.method_iface {
+        if srv.seats.used(int(slot)) and srv.seats.items[int(slot)].im == id and srv.seats.items[int(slot)].im_client == ci {
+            drop_method(mut srv, slot)
+        }
+    } else if iface == im.method_keyboard_grab_iface {
+        if srv.seats.used(int(slot)) and srv.seats.items[int(slot)].grab == id and srv.seats.items[int(slot)].grab_client == ci {
+            srv.seats.items[int(slot)].grab = 0
+        }
+    } else if iface == im.popup_surface_iface {
+        popup_gone(mut srv, slot)
+    } else if iface == vk.keyboard_iface {
+        if srv.vkeys.used(int(slot)) {
+            srv.vkeys.remove(slot, state.VirtualKeyboardData {})
+        }
+    } else {
+        return false
+    }
+    return true
+}

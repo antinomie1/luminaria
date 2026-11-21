@@ -20,6 +20,11 @@ import output
 import data
 import extra
 import route
+import shell
+import ime
+import pointer
+import toplevel
+import inhibit
 
 /// What happened, for the compositor (and luminaria's glue) to act on.
 pub enum Event {
@@ -54,6 +59,33 @@ pub enum Event {
     /// wl_pointer.set_cursor from the focused client: surface (None
     /// hides), hotspot.
     Cursor(ids.Seat, Option[ids.Surface], i32, i32)
+    /// wp_cursor_shape from the focused client: `cursor_name(shape)`.
+    CursorShape(ids.Seat, u32)
+    /// A layer surface's initial commit: arrange and configure it.
+    LayerNew(ids.Layer)
+    /// Mapped, unmapped, or its anchors, size, zone or layer changed.
+    LayerChanged(ids.Layer)
+    LayerGone(ids.Layer)
+    /// A client asks to lock the session: hide everything, then
+    /// `lock_done`.
+    LockRequest
+    /// The locker unlocked the session.
+    Unlock
+    /// A lock surface for an output: configure it to the output's size.
+    LockSurfaceNew(ids.LockSurface)
+    /// Mapped, unmapped or gone.
+    LockSurfaceChanged(ids.LockSurface)
+    /// The client wants a decoration mode (`decoration`): answer with
+    /// `set_decoration` and a configure.
+    WindowDecoration(ids.Window)
+    WindowIcon(ids.Window)
+    /// xdg-activation with a valid token: the window wants focus.
+    Activate(ids.Window)
+    Bell(Option[ids.Surface])
+    /// The input method's popups or the text cursor moved.
+    ImeChanged(ids.Seat)
+    /// Idle notifications were added: `idle_check` again.
+    IdleChanged
 }
 
 /// A toplevel's request for a decision.
@@ -97,6 +129,34 @@ pub struct Server {
     params: ids.Slab[state.ParamsData] = ids.Slab {}
     timelines: ids.Slab[state.TimelineData] = ids.Slab {}
     txns: ids.Slab[state.TxnData] = ids.Slab {}
+    icons: ids.Slab[state.IconData] = ids.Slab {}
+    text_inputs: ids.Slab[state.TextInputData] = ids.Slab {}
+    layers: ids.Slab[state.LayerData] = ids.Slab {}
+    lock_surfaces: ids.Slab[state.LockSurfaceData] = ids.Slab {}
+    constraints: ids.Slab[state.ConstraintData] = ids.Slab {}
+    idles: ids.Slab[state.IdleData] = ids.Slab {}
+    vkeys: ids.Slab[state.VirtualKeyboardData] = ids.Slab {}
+    /// The session lock: its client and ext_session_lock_v1 id (0: none);
+    /// whether the session is locked (it stays locked when the locker dies).
+    lock_client: u32 = 0
+    lock_obj: u32 = 0
+    locked: bool = false
+    /// xdg-activation tokens handed out: token, client slot.
+    tokens: List[(str, u32)] = []
+    token_count: u64 = 0
+    /// xdg-foreign: exported handle, window slot, client, zxdg_exported id;
+    /// imports: client, id, handle.
+    exported: List[(str, u32, u32, u32)] = []
+    imported: List[(u32, u32, str)] = []
+    /// ext_foreign_toplevel_list_v1 objects.
+    toplevel_lists: List[state.Res] = []
+    /// Keyboard shortcut inhibitors: client, id, surface slot, seat slot,
+    /// active.
+    shortcut_inhibitors: List[(u32, u32, u32, u32, bool)] = []
+    /// Idle inhibitors: client, id, surface slot.
+    idle_inhibitors: List[(u32, u32, u32)] = []
+    /// When the seat last saw input (CLOCK_MONOTONIC ns).
+    last_input: int = 0
     /// Events queued; `next` reads from `head`.
     events: List[Event] = []
     head: int = 0
@@ -126,6 +186,33 @@ pub fn Server.open(name: str) -> Result[Server, str] {
     s.add_global(proto.commit_timing.timing_manager_iface, 1)
     s.add_global(proto.tearing_control.control_manager_iface, 1)
     s.add_global(wl.fixes_iface, 1)
+    s.add_global(proto.xdg_decoration_unstable.decoration_manager_iface, 1)
+    s.add_global(proto.xdg_activation.activation_iface, 1)
+    s.add_global(proto.xdg_toplevel_icon.icon_manager_iface, 1)
+    s.add_global(proto.xdg_toplevel_tag.toplevel_tag_manager_iface, 1)
+    s.add_global(proto.xdg_dialog.wm_dialog_iface, 1)
+    s.add_global(proto.xdg_system_bell.system_bell_iface, 1)
+    s.add_global(proto.xdg_foreign_unstable.exporter_iface, 1)
+    s.add_global(proto.xdg_foreign_unstable.importer_iface, 1)
+    s.add_global(proto.xdg_output_unstable.output_manager_iface, 3)
+    s.add_global(proto.ext_foreign_toplevel_list.toplevel_list_iface, 1)
+    s.add_global(proto.wlr_layer_shell_unstable.shell_iface, 5)
+    s.add_global(proto.ext_session_lock.lock_manager_iface, 1)
+    s.add_global(proto.primary_selection_unstable.device_manager_iface, 1)
+    s.add_global(proto.ext_data_control.manager_iface, 1)
+    s.add_global(proto.text_input_unstable.input_manager_iface, 1)
+    s.add_global(proto.input_method_unstable.method_manager_iface, 1)
+    s.add_global(proto.virtual_keyboard_unstable.keyboard_manager_iface, 1)
+    s.add_global(proto.relative_pointer_unstable.pointer_manager_iface, 1)
+    s.add_global(proto.pointer_constraints_unstable.pointer_constraints_iface, 1)
+    s.add_global(proto.pointer_gestures_unstable.gestures_iface, 3)
+    s.add_global(proto.cursor_shape.manager_iface, 2)
+    s.add_global(proto.idle_inhibit_unstable.inhibit_manager_iface, 1)
+    s.add_global(proto.ext_idle_notify.notifier_iface, 2)
+    s.add_global(proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface, 1)
+    s.add_global(proto.single_pixel_buffer.single_pixel_buffer_manager_iface, 1)
+    s.add_global(proto.alpha_modifier.modifier_iface, 1)
+    s.add_global(proto.content_type.type_manager_iface, 1)
     return Ok(s)
 }
 
@@ -293,7 +380,21 @@ pub fn Server.dispatch(mut self, c: ids.Client) -> bool {
         }
         while true {
             match proto.next(mut self.conns[int(ci)]) {
-                Ok(Some(r)) => route.handle(mut self, ci, r)
+                Ok(Some(r)) => {
+                    route.handle(mut self, ci, r)
+                    // A destructor its handler left alone is torn down like
+                    // at disconnect, so nothing stays behind for the next
+                    // object with the same id.
+                    if self.conns[int(ci)].removed_pending() {
+                        var gone: List[(u32, u16)] = []
+                        self.conns[int(ci)].take_removed(mut gone)
+                        for (id, iface) in gone {
+                            if self.slot(ci, id) != state.none {
+                                route.destroyed(mut self, ci, id, iface)
+                            }
+                        }
+                    }
+                }
                 Ok(None) => {
                     break
                 }
@@ -387,6 +488,17 @@ pub fn Server.disconnect(mut self, c: ids.Client) {
     for t in self.clients.items[int(ci)].txns.clone() {
         self.txns.remove(t, state.TxnData {})
     }
+    // Records not tied to a slot.
+    self.toplevel_lists.retain(fn(r) => r.client != ci)
+    self.tokens.retain(fn(t) => t.1 != ci)
+    self.imported.retain(fn(i) => i.0 != ci)
+    toplevel.unexport(mut self, fn(x) => x.2 == ci)
+    self.idle_inhibitors.retain(fn(x) => x.0 != ci)
+    self.shortcut_inhibitors.retain(fn(x) => x.0 != ci)
+    if self.lock_obj != 0 and self.lock_client == ci {
+        // The session stays locked: the next locker takes over.
+        self.lock_obj = 0
+    }
     self.conns[int(ci)] = wire.Conn.closed()
     self.clients.remove(ci, state.ClientData {})
     self.push(Event.ClientGone(c))
@@ -416,6 +528,10 @@ pub struct SurfaceInfo {
     pub mapped: bool = false
     /// Window geometry (xdg), or the whole surface.
     pub geometry: ids.Rect = ids.Rect {}
+    /// wp_alpha_modifier: multiply the surface's alpha by this.
+    pub alpha: f32 = 1.0
+    /// wp_content_type: none 0, photo 1, video 2, game 3.
+    pub content: u32 = 0
 }
 
 pub fn Server.surface_alive(self, s: ids.Surface) -> bool {
@@ -446,6 +562,8 @@ pub fn Server.info(self, s: ids.Surface) -> SurfaceInfo {
         dx: self.surfaces.items[i].current.dx,
         dy: self.surfaces.items[i].current.dy,
         tearing: self.surfaces.items[i].current.tearing,
+        alpha: f32(f64(self.surfaces.items[i].current.alpha) / 4294967295.0),
+        content: self.surfaces.items[i].current.content,
         mapped: self.surfaces.items[i].mapped,
         geometry: geo,
     }
@@ -564,6 +682,8 @@ pub fn Server.release_point(self, s: ids.Surface) -> Option[(int, u64)] {
 pub enum BufferKind {
     Shm
     Dmabuf
+    /// One premultiplied RGBA pixel (`color`).
+    SinglePixel
 }
 
 pub struct BufferInfo {
@@ -577,6 +697,8 @@ pub struct BufferInfo {
     /// shm row pitch in bytes.
     pub stride: int = 0
     pub client: ids.Client = ids.Client { id: ids.Id {} }
+    /// Single-pixel colour, premultiplied, 0..0xFFFFFFFF per channel.
+    pub color: [4]u32 = [0, 0, 0, 0]
 }
 
 pub fn Server.buffer_alive(self, b: ids.Buffer) -> bool {
@@ -588,7 +710,11 @@ pub fn Server.buffer(self, b: ids.Buffer) -> BufferInfo {
         return BufferInfo {}
     }
     let i = int(b.id.index)
-    let k = if self.buffers.items[i].kind == state.BufferKind.Dmabuf { BufferKind.Dmabuf } else { BufferKind.Shm }
+    let k = match self.buffers.items[i].kind {
+        Dmabuf => BufferKind.Dmabuf
+        SinglePixel => BufferKind.SinglePixel
+        Shm => BufferKind.Shm
+    }
     let ci = self.buffers.items[i].client
     return BufferInfo {
         kind: k,
@@ -599,6 +725,7 @@ pub fn Server.buffer(self, b: ids.Buffer) -> BufferInfo {
         planes: self.buffers.items[i].planes.len(),
         stride: self.buffers.items[i].stride,
         client: ids.Client { id: self.clients.id(ci) },
+        color: self.buffers.items[i].color,
     }
 }
 
@@ -997,4 +1124,279 @@ pub fn Server.touch_cancel(mut self, s: ids.Seat) {
     if self.seats.live(s.id) {
         seat.touch_frame(mut self, s.id.index, true)
     }
+}
+
+// ---------------------------------------------------------- toplevels
+
+/// The decoration mode the client wants: 0 no preference (or no
+/// decoration object), 1 client side, 2 server side.
+pub fn Server.decoration(self, w: ids.Window) -> u32 {
+    guard self.windows.live(w.id) and self.windows.items[int(w.id.index)].decoration != 0 else {
+        return 0
+    }
+    return self.windows.items[int(w.id.index)].deco_wanted
+}
+
+/// Who draws the title bar from the next configure on: the compositor
+/// (`server_side`) or the client.
+pub fn Server.set_decoration(mut self, w: ids.Window, server_side: bool) {
+    if self.windows.live(w.id) {
+        self.windows.items[int(w.id.index)].deco_mode = if server_side { 2 } else { 1 }
+    }
+}
+
+pub fn Server.icon(self, w: ids.Window) -> state.Icon {
+    guard self.windows.live(w.id) else {
+        return state.Icon {}
+    }
+    return self.windows.items[int(w.id.index)].icon.clone()
+}
+
+/// xdg-toplevel-tag: a name for the window that stays across restarts,
+/// and a description of it.
+pub fn Server.tag(self, w: ids.Window) -> (str, str) {
+    guard self.windows.live(w.id) else {
+        return ("", "")
+    }
+    let i = int(w.id.index)
+    return (self.windows.items[i].tag.clone(), self.windows.items[i].description.clone())
+}
+
+/// xdg-dialog: the window is modal to its parent.
+pub fn Server.modal(self, w: ids.Window) -> bool {
+    return self.windows.live(w.id) and self.windows.items[int(w.id.index)].modal
+}
+
+/// An activation token for a program the compositor starts
+/// (XDG_ACTIVATION_TOKEN): its first window may take focus.
+pub fn Server.activation_token(mut self) -> str {
+    return toplevel.new_token(mut self, state.none)
+}
+
+// ------------------------------------------------------------- layers
+
+pub struct LayerInfo {
+    pub surface: ids.Surface = ids.Surface { id: ids.Id {} }
+    /// The output it asked for (None: the compositor picks).
+    pub output: Option[ids.Output] = None
+    pub namespace: str = ""
+    pub state: state.LayerState = state.LayerState {}
+    pub mapped: bool = false
+    /// The size last configured.
+    pub width: i32 = 0
+    pub height: i32 = 0
+}
+
+pub fn Server.layers(self) -> List[ids.Layer] {
+    var out: List[ids.Layer] = []
+    for k in 0..self.layers.items.len() {
+        if self.layers.used(k) {
+            out.push(ids.Layer { id: self.layers.id(u32(k)) })
+        }
+    }
+    return out
+}
+
+pub fn Server.layer(self, l: ids.Layer) -> LayerInfo {
+    guard self.layers.live(l.id) else {
+        return LayerInfo {}
+    }
+    let i = int(l.id.index)
+    let o = self.layers.items[i].output
+    return LayerInfo {
+        surface: ids.Surface { id: self.surfaces.id(self.layers.items[i].surface) },
+        output: if o != state.none and self.outputs.used(int(o)) { Some(ids.Output { id: self.outputs.id(o) }) } else { None },
+        namespace: self.layers.items[i].namespace.clone(),
+        state: self.layers.items[i].current,
+        mapped: self.layers.items[i].mapped,
+        width: self.layers.items[i].width,
+        height: self.layers.items[i].height,
+    }
+}
+
+pub fn Server.layer_of(self, s: ids.Surface) -> Option[ids.Layer] {
+    guard self.surfaces.live(s.id) else {
+        return None
+    }
+    return match self.surfaces.items[int(s.id.index)].role {
+        Layer(l) => Some(ids.Layer { id: self.layers.id(l) })
+        _ => None
+    }
+}
+
+/// Configure a layer surface to this size; the serial.
+pub fn Server.configure_layer(mut self, l: ids.Layer, width: i32, height: i32) -> u32 {
+    guard self.layers.live(l.id) else {
+        return 0
+    }
+    return shell.configure_layer(mut self, l.id.index, width, height)
+}
+
+/// The layer surface will not be shown (its output went away).
+pub fn Server.close_layer(mut self, l: ids.Layer) {
+    if self.layers.live(l.id) {
+        shell.close_layer(mut self, l.id.index)
+    }
+}
+
+// --------------------------------------------------------------- lock
+
+pub fn Server.lock_surfaces(self) -> List[ids.LockSurface] {
+    var out: List[ids.LockSurface] = []
+    for k in 0..self.lock_surfaces.items.len() {
+        if self.lock_surfaces.used(k) {
+            out.push(ids.LockSurface { id: self.lock_surfaces.id(u32(k)) })
+        }
+    }
+    return out
+}
+
+/// A lock surface: its surface, output and whether it is mapped.
+pub fn Server.lock_surface(self, k: ids.LockSurface) -> (ids.Surface, Option[ids.Output], bool) {
+    guard self.lock_surfaces.live(k.id) else {
+        return (ids.Surface { id: ids.Id {} }, None, false)
+    }
+    let i = int(k.id.index)
+    let o = self.lock_surfaces.items[i].output
+    let out = if o != state.none and self.outputs.used(int(o)) { Some(ids.Output { id: self.outputs.id(o) }) } else { None }
+    return (ids.Surface { id: self.surfaces.id(self.lock_surfaces.items[i].surface) }, out, self.lock_surfaces.items[i].mapped)
+}
+
+pub fn Server.configure_lock(mut self, k: ids.LockSurface, width: i32, height: i32) -> u32 {
+    guard self.lock_surfaces.live(k.id) else {
+        return 0
+    }
+    return shell.configure_lock(mut self, k.id.index, width, height)
+}
+
+/// Every output shows the lock (or nothing): the locker hears `locked`.
+pub fn Server.lock_done(mut self) {
+    shell.lock_done(mut self)
+}
+
+// ------------------------------------------------------------ pointer
+
+/// A pointer lock or confinement of a surface.
+pub struct Constraint {
+    /// A lock (the pointer stays put), else a confinement.
+    pub lock: bool = true
+    /// Surface coordinates; None is the whole surface.
+    pub region: Option[List[ids.Rect]] = None
+    pub active: bool = false
+    /// Where the client says the cursor is when a lock ends.
+    pub hint: Option[(f64, f64)] = None
+}
+
+pub fn Server.constraint(self, st: ids.Seat, s: ids.Surface) -> Option[Constraint] {
+    guard self.seats.live(st.id) and self.surfaces.live(s.id) else {
+        return None
+    }
+    let k = pointer.constraint_of(self, s.id.index, st.id.index)
+    guard k != state.none else {
+        return None
+    }
+    let i = int(k)
+    let hint = if self.constraints.items[i].hint_set { Some((self.constraints.items[i].hint_x, self.constraints.items[i].hint_y)) } else { None }
+    return Some(Constraint { lock: self.constraints.items[i].lock, region: self.constraints.items[i].region.clone(), active: self.constraints.items[i].active, hint })
+}
+
+/// Turn the constraint of `s` on (the pointer is inside its region and
+/// the surface has focus) or off.
+pub fn Server.set_constraint(mut self, st: ids.Seat, s: ids.Surface, on: bool) {
+    guard self.seats.live(st.id) and self.surfaces.live(s.id) else {
+        return
+    }
+    let k = pointer.constraint_of(self, s.id.index, st.id.index)
+    if k != state.none {
+        pointer.activate(mut self, k, on)
+    }
+}
+
+/// Unaccelerated and accelerated motion for zwp_relative_pointer
+/// (microsecond timestamp).
+pub fn Server.relative_motion(mut self, st: ids.Seat, time_us: u64, dx: f64, dy: f64, raw_dx: f64, raw_dy: f64) {
+    if self.seats.live(st.id) {
+        pointer.relative_motion(mut self, st.id.index, time_us, dx, dy, raw_dx, raw_dy)
+    }
+}
+
+/// A touchpad gesture to the client under the pointer: `kind` swipe 0,
+/// pinch 1, hold 2; `phase` begin 0, update 1, end 2.
+pub fn Server.gesture(mut self, st: ids.Seat, kind: int, phase: int, time_ms: u32, fingers: u32, dx: f64, dy: f64, scale: f64, rotation: f64, cancelled: bool) {
+    if self.seats.live(st.id) {
+        pointer.gesture(mut self, st.id.index, kind, phase, time_ms, fingers, dx, dy, scale, rotation, cancelled)
+    }
+}
+
+// ---------------------------------------------------------------- ime
+
+/// The focused text field with an input method on it: its surface and
+/// cursor rectangle (surface coordinates).
+pub fn Server.text_cursor(self, st: ids.Seat) -> Option[(ids.Surface, ids.Rect)] {
+    guard self.seats.live(st.id) else {
+        return None
+    }
+    let k = self.seats.items[int(st.id.index)].im_active
+    guard k != state.none and self.text_inputs.used(int(k)) else {
+        return None
+    }
+    let f = self.text_inputs.items[int(k)].focus
+    guard f != state.none and self.surfaces.used(int(f)) else {
+        return None
+    }
+    return Some((ids.Surface { id: self.surfaces.id(f) }, self.text_inputs.items[int(k)].current.rect))
+}
+
+/// The input method's mapped popups (candidate lists).
+pub fn Server.ime_popups(self, st: ids.Seat) -> List[ids.Surface] {
+    var out: List[ids.Surface] = []
+    guard self.seats.live(st.id) else {
+        return out
+    }
+    for (_, _, ps) in self.seats.items[int(st.id.index)].im_popups {
+        if self.surfaces.used(int(ps)) and self.surfaces.items[int(ps)].mapped {
+            out.push(ids.Surface { id: self.surfaces.id(ps) })
+        }
+    }
+    return out
+}
+
+// --------------------------------------------------------------- idle
+
+/// The seat saw input at `now` (CLOCK_MONOTONIC ns).
+pub fn Server.input_activity(mut self, now: int) {
+    inhibit.activity(mut self, now)
+}
+
+/// Send the idle notifications that are due; the next deadline (0:
+/// none, -1: some wait for the inhibitors to go). While `inhibited` only
+/// input-idle notifications fire.
+pub fn Server.idle_check(mut self, now: int, inhibited: bool) -> int {
+    return inhibit.check(mut self, now, inhibited)
+}
+
+/// Surfaces whose clients want the screen kept on while they show.
+pub fn Server.idle_inhibitors(self) -> List[ids.Surface] {
+    var out: List[ids.Surface] = []
+    for (_, _, si) in self.idle_inhibitors {
+        if self.surfaces.used(int(si)) {
+            out.push(ids.Surface { id: self.surfaces.id(si) })
+        }
+    }
+    return out
+}
+
+/// The keyboard focus asked for the compositor's shortcuts (remote
+/// desktop, VM): bindings should let keys through.
+pub fn Server.shortcuts_inhibited(self, st: ids.Seat) -> bool {
+    guard self.seats.live(st.id) else {
+        return false
+    }
+    let f = self.seats.items[int(st.id.index)].kb_focus
+    return f != state.none and self.shortcut_inhibitors.any(fn(x) => x.2 == f and x.4)
+}
+
+/// The XCursor name of a wp_cursor_shape shape.
+pub fn cursor_name(shape: u32) -> str {
+    return pointer.shape_name(shape)
 }

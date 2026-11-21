@@ -9,6 +9,8 @@ import ids
 import state
 import server
 import data
+import ime
+import inhibit
 
 fn bound(mut srv: server.Server, ci: u32, si: u32, id: u32, version: u32) {
     let i = int(si)
@@ -123,6 +125,8 @@ fn drop_resource(mut srv: server.Server, si: u32, ci: u32, id: u32) {
     srv.seats.items[i].keyboards.retain(fn(r) => not (r.client == ci and r.id == id))
     srv.seats.items[i].touches.retain(fn(r) => not (r.client == ci and r.id == id))
     srv.seats.items[i].devices.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].primary_devices.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].control_devices.retain(fn(r) => not (r.client == ci and r.id == id))
 }
 
 // ------------------------------------------------------------ keyboard
@@ -148,6 +152,9 @@ fn set_keymap(mut srv: server.Server, si: u32, fd: int, size: u32) {
     let i = int(si)
     srv.seats.items[i].keymap = Some(wire.Fd.of(fd))
     srv.seats.items[i].keymap_size = size
+    srv.seats.items[i].keymap_from = 0
+    srv.seats.items[i].keymap_hash = ime.keymap_hash(fd, size)
+    ime.send_grab_keymap(mut srv, si)
     for k in 0..srv.seats.items[i].keyboards.len() {
         let r = srv.seats.items[i].keyboards[k]
         send_keymap(mut srv, si, r.client, r.id, r.version)
@@ -215,6 +222,8 @@ fn keyboard_focus(mut srv: server.Server, si: u32, surf: u32) {
         }
     }
     data.focus_changed(mut srv, si)
+    ime.focus_changed(mut srv, si)
+    inhibit.focus_changed(mut srv, si)
 }
 
 /// A key (evdev code) went down or up; sent to the focused client.
@@ -228,6 +237,11 @@ fn key(mut srv: server.Server, si: u32, time: u32, code: u32, pressed: bool) -> 
         srv.seats.items[i].pressed.retain(fn(c) => c != code)
     }
     let serial = srv.next_serial()
+    // An input method that grabbed the keyboard gets it first.
+    if ime.grab_key(mut srv, si, serial, time, code, pressed) {
+        return serial
+    }
+    ime.use_keymap(mut srv, si, 0)
     let f = srv.seats.items[i].kb_focus
     guard f != state.none and srv.surfaces.used(int(f)) else {
         return serial
@@ -250,6 +264,10 @@ fn modifiers(mut srv: server.Server, si: u32, depressed: u32, latched: u32, lock
         return
     }
     srv.seats.items[i].mods = m
+    if ime.grab_modifiers(mut srv, si, srv.serial + 1, m) {
+        discard srv.next_serial()
+        return
+    }
     let f = srv.seats.items[i].kb_focus
     guard f != state.none and srv.surfaces.used(int(f)) else {
         return

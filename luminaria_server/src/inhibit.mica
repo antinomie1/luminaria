@@ -1,0 +1,173 @@
+// Idle and shortcuts: idle-inhibit (a video keeps the screen on while it
+// shows), ext-idle-notify (swayidle and friends hear when the seat went
+// idle and resumed) and keyboard-shortcuts-inhibit (remote desktops and
+// VMs get the compositor's shortcuts while focused).
+
+import luminaria_proto.idle_inhibit_unstable as ii
+import luminaria_proto.ext_idle_notify as idle
+import luminaria_proto.keyboard_shortcuts_inhibit_unstable as ksi
+import ids
+import state
+import server
+
+// ------------------------------------------------------- idle inhibit
+
+fn inhibit_manager(mut srv: server.Server, ci: u32, take req: ii.InhibitManagerRequest) {
+    match req {
+        CreateInhibitor(i, s) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            srv.idle_inhibitors.push((ci, i.id, si))
+            srv.bind(ci, i.id, si)
+        }
+        Destroy => {}
+    }
+}
+
+fn inhibitor(mut srv: server.Server, ci: u32, i: ii.Inhibitor, take req: ii.InhibitorRequest) {
+    match req {
+        Destroy => {
+            srv.unbind(ci, i.id)
+            srv.idle_inhibitors.retain(fn(x) => not (x.0 == ci and x.1 == i.id))
+        }
+    }
+}
+
+// -------------------------------------------------------- idle notify
+
+fn notifier(mut srv: server.Server, ci: u32, take req: idle.NotifierRequest) {
+    match req {
+        GetIdleNotification(n, timeout, st) => add(mut srv, ci, n.id, timeout, false)
+        GetInputIdleNotification(n, timeout, st) => add(mut srv, ci, n.id, timeout, true)
+        Destroy => {}
+    }
+}
+
+fn add(mut srv: server.Server, ci: u32, id: u32, timeout: u32, input_only: bool) {
+    let k = srv.idles.add(state.IdleData { client: ci, obj: id, timeout_ms: int(timeout), input_only })
+    srv.bind(ci, id, k.index)
+    srv.push(server.Event.IdleChanged)
+}
+
+fn notification(mut srv: server.Server, ci: u32, n: idle.Notification, take req: idle.NotificationRequest) {
+    match req {
+        Destroy => {
+            let k = srv.slot(ci, n.id)
+            srv.unbind(ci, n.id)
+            if k != state.none {
+                srv.idles.remove(k, state.IdleData {})
+            }
+        }
+    }
+}
+
+/// Input arrived at `now`: idle notifications resume.
+fn activity(mut srv: server.Server, now: int) {
+    srv.last_input = now
+    for k in 0..srv.idles.items.len() {
+        if srv.idles.used(k) and srv.idles.items[k].idle {
+            srv.idles.items[k].idle = false
+            idle.Notification { id: srv.idles.items[k].obj }.resumed(mut srv.conns[int(srv.idles.items[k].client)])
+        }
+    }
+}
+
+/// Fire the notifications whose timeout passed (those inhibitors hold
+/// back wait while `inhibited`); the next deadline, 0 for none, -1 when
+/// only inhibited ones wait (check again later).
+fn check(mut srv: server.Server, now: int, inhibited: bool) -> int {
+    var next = 0
+    var held = false
+    for k in 0..srv.idles.items.len() {
+        guard srv.idles.used(k) and not srv.idles.items[k].idle else {
+            continue
+        }
+        guard srv.idles.items[k].input_only or not inhibited else {
+            held = true
+            continue
+        }
+        let due = srv.last_input + srv.idles.items[k].timeout_ms * 1000000
+        if due <= now {
+            srv.idles.items[k].idle = true
+            idle.Notification { id: srv.idles.items[k].obj }.idled(mut srv.conns[int(srv.idles.items[k].client)])
+        } else if next == 0 or due < next {
+            next = due
+        }
+    }
+    return if next == 0 and held { -1 } else { next }
+}
+
+// ------------------------------------------------- shortcuts inhibit
+
+fn shortcuts_manager(mut srv: server.Server, ci: u32, take req: ksi.InhibitManagerRequest) {
+    match req {
+        InhibitShortcuts(i, s, st) => {
+            let si = srv.slot(ci, s.id)
+            let seat = srv.slot(ci, st.id)
+            guard si != state.none and seat != state.none else {
+                return
+            }
+            guard not srv.shortcut_inhibitors.any(fn(x) => x.2 == si and x.3 == seat) else {
+                srv.fail(ci, i.id, u32(ksi.InhibitManagerError.AlreadyInhibited), "shortcuts are already inhibited")
+                return
+            }
+            srv.shortcut_inhibitors.push((ci, i.id, si, seat, false))
+            srv.bind(ci, i.id, si)
+            focus_changed(mut srv, seat)
+        }
+        Destroy => {}
+    }
+}
+
+fn shortcuts_inhibitor(mut srv: server.Server, ci: u32, i: ksi.Inhibitor, take req: ksi.InhibitorRequest) {
+    match req {
+        Destroy => {
+            srv.unbind(ci, i.id)
+            srv.shortcut_inhibitors.retain(fn(x) => not (x.0 == ci and x.1 == i.id))
+        }
+    }
+}
+
+/// Inhibitors are active while their surface has the keyboard.
+fn focus_changed(mut srv: server.Server, si: u32) {
+    let f = srv.seats.items[int(si)].kb_focus
+    for k in 0..srv.shortcut_inhibitors.len() {
+        let (c, id, s, seat, active) = srv.shortcut_inhibitors[k]
+        guard seat == si else {
+            continue
+        }
+        let want = s == f
+        guard want != active else {
+            continue
+        }
+        srv.shortcut_inhibitors[k] = (c, id, s, seat, want)
+        if want {
+            ksi.Inhibitor { id }.active(mut srv.conns[int(c)])
+        } else {
+            ksi.Inhibitor { id }.inactive(mut srv.conns[int(c)])
+        }
+    }
+}
+
+/// A surface went away: its inhibitors are inert.
+fn surface_gone(mut srv: server.Server, si: u32) {
+    srv.idle_inhibitors.retain(fn(x) => x.2 != si)
+    srv.shortcut_inhibitors.retain(fn(x) => x.2 != si)
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    if iface == ii.inhibitor_iface {
+        srv.idle_inhibitors.retain(fn(x) => not (x.0 == ci and x.1 == id))
+    } else if iface == ksi.inhibitor_iface {
+        srv.shortcut_inhibitors.retain(fn(x) => not (x.0 == ci and x.1 == id))
+    } else if iface == idle.notification_iface {
+        if srv.idles.used(int(slot)) {
+            srv.idles.remove(slot, state.IdleData {})
+        }
+    } else {
+        return false
+    }
+    return true
+}

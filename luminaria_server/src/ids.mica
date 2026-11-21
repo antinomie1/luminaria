@@ -40,6 +40,16 @@ pub struct Seat derive(Hash, Show) {
     pub id: Id
 }
 
+/// A layer-shell surface (panel, wallpaper, launcher, notification).
+pub struct Layer derive(Hash, Show) {
+    pub id: Id
+}
+
+/// A session-lock surface (the lock screen on one output).
+pub struct LockSurface derive(Hash, Show) {
+    pub id: Id
+}
+
 /// A commit (with the synchronized subsurfaces it carries) waiting for
 /// its buffers to be ready.
 pub struct Txn derive(Hash, Show) {
@@ -84,7 +94,7 @@ fn Slab[T].id(self, i: u32) -> Id {
 
 /// Whether slot `i` is in use.
 fn Slab[T].used(self, i: int) -> bool {
-    return self.gens[i] % 2 == 1
+    return i >= 0 and i < self.gens.len() and self.gens[i] % 2 == 1
 }
 
 /// A rectangle in integer coordinates (surface-local or buffer pixels).
