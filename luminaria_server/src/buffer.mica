@@ -1,0 +1,353 @@
+// wl_shm pools and buffers, and linux-dmabuf. shm pools are mapped once
+// (read-only) and remapped on resize; reads go through a SIGBUS-safe
+// window. dmabuf parameters become buffers; the compositor imports them
+// (`BufferNew`) and reports the result, which answers `create`. Feedback
+// shares one format table (a sealed memfd) among all clients.
+
+import std.mem
+import std.os
+import luminaria_wire as wire
+import luminaria_proto.wayland as wl
+import luminaria_proto.linux_dmabuf as dmabuf_p
+import ids
+import state
+import server
+
+/// DRM fourcc codes the shm path accepts.
+pub let argb8888: u32 = 0x34325241
+pub let xrgb8888: u32 = 0x34325258
+pub let abgr8888: u32 = 0x34324241
+pub let xbgr8888: u32 = 0x34324258
+
+/// wl_shm's code for a fourcc (0 and 1 are special).
+fn shm_code(fourcc: u32) -> u32 {
+    return match fourcc {
+        0x34325241 => 0
+        0x34325258 => 1
+        _ => fourcc
+    }
+}
+
+fn fourcc(code: u32) -> u32 {
+    return match code {
+        0 => argb8888
+        1 => xrgb8888
+        _ => code
+    }
+}
+
+fn shm_bound(mut srv: server.Server, ci: u32, id: u32) {
+    let shm = wl.Shm { id }
+    for f in [argb8888, xrgb8888, abgr8888, xbgr8888] {
+        shm.format(mut srv.conns[int(ci)], wl.ShmFormat(shm_code(f)))
+    }
+}
+
+fn shm(mut srv: server.Server, ci: u32, take req: wl.ShmRequest) {
+    match take req {
+        CreatePool(p, f, size) => {
+            guard size > 0 else {
+                srv.fail(ci, p.id, u32(wl.ShmError.InvalidStride), "pool size {size}")
+                return
+            }
+            guard let Ok(map) = os.map(f.raw(), int(size), 0, false) else {
+                srv.fail(ci, p.id, u32(wl.ShmError.InvalidFd), "cannot map the pool")
+                return
+            }
+            let id = srv.pools.add(state.PoolData { client: ci, obj: p.id, fd: Some(f), map: Some(map), size: int(size), refs: 1 })
+            srv.bind(ci, p.id, id.index)
+        }
+        Release => {}
+    }
+}
+
+fn pool(mut srv: server.Server, ci: u32, p: wl.ShmPool, take req: wl.ShmPoolRequest) {
+    let pi = srv.slot(ci, p.id)
+    guard pi != state.none else {
+        return
+    }
+    let i = int(pi)
+    match req {
+        CreateBuffer(b, offset, w, h, stride, format) => {
+            let f = fourcc(u32(format))
+            guard f == argb8888 or f == xrgb8888 or f == abgr8888 or f == xbgr8888 else {
+                srv.fail(ci, p.id, u32(wl.ShmError.InvalidFormat), "shm format {u32(format)}")
+                return
+            }
+            let size = srv.pools.items[i].size
+            guard w > 0 and h > 0 and offset >= 0 and stride >= w * 4 and int(offset) + int(stride) * int(h) <= size else {
+                srv.fail(ci, p.id, u32(wl.ShmError.InvalidStride), "buffer {w}x{h} stride {stride} at {offset} in a {size}-byte pool")
+                return
+            }
+            srv.pools.items[i].refs += 1
+            let id = srv.buffers.add(state.BufferData { client: ci, obj: b.id, kind: state.BufferKind.Shm, width: w, height: h, format: f, pool: pi, offset: int(offset), stride: int(stride) })
+            srv.bind(ci, b.id, id.index)
+            srv.push(server.Event.BufferNew(ids.Buffer { id }))
+        }
+        Destroy => {
+            srv.unbind(ci, p.id)
+            unref_pool(mut srv, pi)
+        }
+        Resize(size) => {
+            guard int(size) >= srv.pools.items[i].size else {
+                srv.fail(ci, p.id, u32(wl.ShmError.InvalidStride), "pools only grow")
+                return
+            }
+            var fd = -1
+            if let Some(f) = srv.pools.items[i].fd {
+                fd = f.raw()
+            }
+            match os.map(fd, int(size), 0, false) {
+                Ok(m) => {
+                    srv.pools.items[i].map = Some(m)
+                    srv.pools.items[i].size = int(size)
+                }
+                Err => srv.fail(ci, p.id, u32(wl.ShmError.InvalidFd), "cannot remap the pool")
+            }
+        }
+    }
+}
+
+fn unref_pool(mut srv: server.Server, pi: u32) {
+    guard srv.pools.used(int(pi)) else {
+        return
+    }
+    srv.pools.items[int(pi)].refs -= 1
+    if srv.pools.items[int(pi)].refs <= 0 {
+        srv.pools.remove(pi, state.PoolData {})
+    }
+}
+
+fn destroy_buffer(mut srv: server.Server, bi: u32) {
+    guard srv.buffers.used(int(bi)) else {
+        return
+    }
+    let id = srv.buffers.id(bi)
+    let pool = srv.buffers.items[int(bi)].pool
+    srv.buffers.remove(bi, state.BufferData {})
+    if pool != state.none {
+        unref_pool(mut srv, pool)
+    }
+    srv.push(server.Event.BufferGone(ids.Buffer { id }))
+}
+
+/// Lend `f` the bytes of shm buffer `bi` (from its first pixel, `stride`
+/// bytes per row) while a client shrinking the pool cannot crash us; false
+/// when the buffer is gone or the client truncated the pool meanwhile.
+fn with_shm(srv: server.Server, bi: u32, f: fn(&[u8], int)) -> bool {
+    guard srv.buffers.used(int(bi)) and srv.buffers.items[int(bi)].kind == state.BufferKind.Shm else {
+        return false
+    }
+    let pi = srv.buffers.items[int(bi)].pool
+    let off = srv.buffers.items[int(bi)].offset
+    let stride = srv.buffers.items[int(bi)].stride
+    let len = stride * int(srv.buffers.items[int(bi)].height)
+    var ok = false
+    if let Some(m) = srv.pools.items[int(pi)].map {
+        guard off + len <= m.len else {
+            return false
+        }
+        discard m.begin_access()
+        unsafe let bytes = Ptr.slice(m.ptr.offset(off), len)
+        f(bytes, stride)
+        ok = not m.end_access()
+    }
+    return ok
+}
+
+// ------------------------------------------------------------- dmabuf
+
+/// Write the format table both feedback paths share.
+fn make_table(mut srv: server.Server, d: server.Dmabuf) -> Result[(), str] {
+    let n = d.formats.len()
+    let size = max(n, 1) * 16
+    let fd = try os.memfd("luminaria-dmabuf", size).map_err(fn(e) => "{e}")
+    var m = try os.map(fd, size, 0, true).map_err(fn(e) => "{e}")
+    let b = m.bytes()
+    for k in 0..n {
+        let (f, md) = d.formats[k]
+        let at = k * 16
+        for j in 0..4 {
+            b[at + j] = u8((f >> u32(8 * j)) & 0xff)
+            b[at + 4 + j] = 0
+        }
+        for j in 0..8 {
+            b[at + 8 + j] = u8((md >> u64(8 * j)) & 0xff)
+        }
+    }
+    if srv.table_fd >= 0 {
+        os.close(srv.table_fd)
+    }
+    srv.table_fd = fd
+    srv.table_size = u32(size)
+    return Ok(())
+}
+
+fn dev_bytes(dev: u64) -> [8]u8 {
+    var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+    for j in 0..8 {
+        b[j] = u8((dev >> u64(8 * j)) & 0xff)
+    }
+    return b
+}
+
+/// Table indices (u16 little endian) of `want` within the format table.
+fn indices(all: &[(u32, u64)], want: &[(u32, u64)]) -> List[u8] {
+    var out: List[u8] = []
+    for k in 0..all.len() {
+        var hit = false
+        for w in want {
+            hit = hit or w == all[k]
+        }
+        if hit {
+            out.push(u8(k & 0xff))
+            out.push(u8((k >> 8) & 0xff))
+        }
+    }
+    return out
+}
+
+fn feedback(mut srv: server.Server, ci: u32, fb: dmabuf_p.DmabufFeedback) {
+    guard let Some(d) = srv.dmabuf.clone() else {
+        return
+    }
+    let c = int(ci)
+    fb.format_table(mut srv.conns[c], srv.table_fd, srv.table_size)
+    let main = dev_bytes(d.device)
+    fb.main_device(mut srv.conns[c], main)
+    if not d.scanout.is_empty() {
+        let sd = dev_bytes(d.scanout_device)
+        fb.tranche_target_device(mut srv.conns[c], sd)
+        fb.tranche_flags(mut srv.conns[c], dmabuf_p.DmabufFeedbackTrancheFlags.Scanout)
+        let si = indices(d.formats, d.scanout)
+        fb.tranche_formats(mut srv.conns[c], si)
+        fb.tranche_done(mut srv.conns[c])
+    }
+    fb.tranche_target_device(mut srv.conns[c], main)
+    fb.tranche_flags(mut srv.conns[c], dmabuf_p.DmabufFeedbackTrancheFlags(0))
+    let all = indices(d.formats, d.formats)
+    fb.tranche_formats(mut srv.conns[c], all)
+    fb.tranche_done(mut srv.conns[c])
+    fb.done(mut srv.conns[c])
+}
+
+/// A version 3 client learns formats from modifier events at bind.
+fn dmabuf_bound(mut srv: server.Server, ci: u32, id: u32, version: u32) {
+    guard version < 4 else {
+        return
+    }
+    guard let Some(d) = srv.dmabuf.clone() else {
+        return
+    }
+    let o = dmabuf_p.Dmabuf { id }
+    for (f, md) in d.formats {
+        if version >= 3 {
+            o.modifier(mut srv.conns[int(ci)], f, u32(md >> 32), u32(md & 0xffffffff))
+        } else {
+            o.format(mut srv.conns[int(ci)], f)
+        }
+    }
+}
+
+fn dmabuf(mut srv: server.Server, ci: u32, take req: dmabuf_p.DmabufRequest) {
+    match req {
+        Destroy => {}
+        CreateParams(p) => {
+            let id = srv.params.add(state.ParamsData { client: ci })
+            srv.bind(ci, p.id, id.index)
+        }
+        GetDefaultFeedback(fb) => {
+            feedback(mut srv, ci, fb)
+        }
+        GetSurfaceFeedback(fb, s) => {
+            feedback(mut srv, ci, fb)
+        }
+    }
+}
+
+fn params(mut srv: server.Server, ci: u32, p: dmabuf_p.BufferParams, take req: dmabuf_p.BufferParamsRequest) {
+    let pi = srv.slot(ci, p.id)
+    guard pi != state.none else {
+        return
+    }
+    let i = int(pi)
+    match take req {
+        Destroy => {
+            srv.unbind(ci, p.id)
+            srv.params.remove(pi, state.ParamsData {})
+        }
+        Add(f, plane, offset, stride, hi, lo) => {
+            guard not srv.params.items[i].used else {
+                srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.AlreadyUsed), "params already used")
+                return
+            }
+            guard plane == u32(srv.params.items[i].planes.len()) and plane < 4 else {
+                srv.fail(ci, p.id, u32(dmabuf_p.BufferParamsError.PlaneIdx), "plane {plane} out of order")
+                return
+            }
+            srv.params.items[i].modifier = (u64(hi) << 32) | u64(lo)
+            srv.params.items[i].planes.push(state.Plane { fd: f, offset, stride })
+        }
+        Create(w, h, format, flags) => {
+            create(mut srv, ci, p.id, pi, 0, w, h, format)
+        }
+        CreateImmed(b, w, h, format, flags) => {
+            create(mut srv, ci, p.id, pi, b.id, w, h, format)
+        }
+        SetSamplingDevice => {}
+    }
+}
+
+/// Make the buffer of params `pi`: with client id `obj`, or (0) answered
+/// with created / failed once the compositor imported it.
+fn create(mut srv: server.Server, ci: u32, pobj: u32, pi: u32, obj: u32, w: i32, h: i32, format: u32) {
+    let i = int(pi)
+    guard not srv.params.items[i].used else {
+        srv.fail(ci, pobj, u32(dmabuf_p.BufferParamsError.AlreadyUsed), "params already used")
+        return
+    }
+    srv.params.items[i].used = true
+    guard not srv.params.items[i].planes.is_empty() else {
+        srv.fail(ci, pobj, u32(dmabuf_p.BufferParamsError.Incomplete), "no planes")
+        return
+    }
+    guard w > 0 and h > 0 else {
+        srv.fail(ci, pobj, u32(dmabuf_p.BufferParamsError.InvalidDimensions), "buffer {w}x{h}")
+        return
+    }
+    let planes = mem.replace(mut srv.params.items[i].planes, [])
+    let md = srv.params.items[i].modifier
+    let id = srv.buffers.add(state.BufferData { client: ci, obj, kind: state.BufferKind.Dmabuf, width: w, height: h, format, planes, modifier: md, params_obj: if obj == 0 { pobj } else { 0 } })
+    if obj != 0 {
+        srv.bind(ci, obj, id.index)
+    }
+    srv.push(server.Event.BufferNew(ids.Buffer { id }))
+}
+
+/// The compositor tried importing dmabuf `bi`: answer `create`, or end a
+/// client whose `create_immed` buffer cannot be used.
+fn imported(mut srv: server.Server, bi: u32, ok: bool) {
+    guard srv.buffers.used(int(bi)) else {
+        return
+    }
+    let i = int(bi)
+    let ci = srv.buffers.items[i].client
+    let pobj = srv.buffers.items[i].params_obj
+    if pobj == 0 {
+        if not ok {
+            let obj = srv.buffers.items[i].obj
+            srv.fail(ci, obj, u32(dmabuf_p.BufferParamsError.InvalidWlBuffer), "the dmabuf cannot be imported")
+        }
+        return
+    }
+    srv.buffers.items[i].params_obj = 0
+    let params = dmabuf_p.BufferParams { id: pobj }
+    if ok {
+        let b = params.created(mut srv.conns[int(ci)])
+        srv.buffers.items[i].obj = b.id
+        srv.bind(ci, b.id, bi)
+    } else {
+        params.failed(mut srv.conns[int(ci)])
+        srv.buffers.remove(bi, state.BufferData {})
+    }
+}

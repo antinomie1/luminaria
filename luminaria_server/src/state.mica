@@ -1,0 +1,356 @@
+// What the server keeps per object. Every record names its client slot and
+// protocol id so requests and teardown find it; slots of other records are
+// `none` when unset.
+
+import std.os
+import luminaria_wire as wire
+import ids
+import positioner
+
+let none: u32 = 0xFFFFFFFF
+
+struct ClientData {
+    pid: int = 0
+    uid: int = 0
+    gid: int = 0
+    /// Object id -> slot in its kind's slab, for ids below server_base.
+    objs: List[u32] = []
+    /// Ids from server_base (data offers) -> slot.
+    high: List[u32] = []
+    registries: List[u32] = []
+    /// Transactions of this client, oldest first: applied in order.
+    txns: List[u32] = []
+    /// Pointer enter serial last sent to this client (cursor requests
+    /// must name it).
+    enter_serial: u32 = 0
+}
+
+/// A global's kind: static ones by interface, outputs and seats by slot.
+enum GlobalKind {
+    Static
+    Output(u32)
+    Seat(u32)
+}
+
+struct Global {
+    iface: u16
+    version: u32
+    kind: GlobalKind
+    alive: bool = true
+}
+
+/// Double-buffered surface state: what a commit carries.
+struct State {
+    /// A buffer was attached (`buffer` None detaches).
+    attached: bool = false
+    buffer: Option[ids.Id] = None
+    dx: i32 = 0
+    dy: i32 = 0
+    damage: List[ids.Rect] = []
+    bdamage: List[ids.Rect] = []
+    opaque_set: bool = false
+    opaque: List[ids.Rect] = []
+    input_set: bool = false
+    /// None is infinite (the whole surface).
+    input: Option[List[ids.Rect]] = None
+    transform_set: bool = false
+    transform: u32 = 0
+    scale_set: bool = false
+    scale: i32 = 1
+    viewport_set: bool = false
+    /// wp_viewport source (x, y, w, h); w < 0 unset.
+    src: [4]f64 = [-1.0, -1.0, -1.0, -1.0]
+    /// wp_viewport destination; w < 0 unset.
+    dst_w: i32 = -1
+    dst_h: i32 = -1
+    frames: List[u32] = []
+    feedbacks: List[u32] = []
+    acquire_set: bool = false
+    acquire: u32 = 0xFFFFFFFF
+    acquire_point: u64 = 0
+    release_set: bool = false
+    release: u32 = 0xFFFFFFFF
+    release_point: u64 = 0
+    fifo_barrier: bool = false
+    fifo_wait: bool = false
+    target_ns: int = 0
+    tearing_set: bool = false
+    tearing: bool = false
+    geometry_set: bool = false
+    geometry: ids.Rect = ids.Rect {}
+    min_set: bool = false
+    min_w: i32 = 0
+    min_h: i32 = 0
+    max_set: bool = false
+    max_w: i32 = 0
+    max_h: i32 = 0
+    acked: u32 = 0
+    /// Subsurface positions set on this (parent) surface: child slot, x, y.
+    moves: List[(u32, i32, i32)] = []
+    /// New stacking order of this surface and its subsurfaces.
+    order_set: bool = false
+    order: List[u32] = []
+}
+
+enum Role {
+    Plain
+    Toplevel(u32)
+    Popup(u32)
+    Sub
+    Cursor
+}
+
+struct SurfaceData {
+    client: u32 = 0
+    obj: u32 = 0
+    role: Role = Role.Plain
+    /// xdg_surface id when it has one.
+    xdg: u32 = 0
+    pending: State = State {}
+    cached: State = State {}
+    has_cached: bool = false
+    current: State = State {}
+    /// Surface size in surface coordinates, after scale, transform and
+    /// viewport; 0 without a buffer.
+    width: i32 = 0
+    height: i32 = 0
+    buffer_w: i32 = 0
+    buffer_h: i32 = 0
+    /// Subsurface tree: parent slot, position, synchronized mode.
+    parent: u32 = 0xFFFFFFFF
+    sub_obj: u32 = 0
+    sub_x: i32 = 0
+    sub_y: i32 = 0
+    synced: bool = true
+    /// This surface and its subsurfaces, bottom to top.
+    stack: List[u32] = []
+    frames: List[u32] = []
+    feedbacks: List[u32] = []
+    viewport: u32 = 0
+    fractional: u32 = 0
+    syncobj: u32 = 0
+    fifo: u32 = 0
+    timer: u32 = 0
+    tearing: u32 = 0
+    /// Output slots it is on (bit per slot below 64).
+    outputs: u64 = 0
+    /// Mapped: has a buffer and (with a role) the role allows showing it.
+    mapped: bool = false
+    /// The last applied commit's damage, merged until `take_damage`.
+    applied_damage: List[ids.Rect] = []
+    applied_bdamage: List[ids.Rect] = []
+    /// What the last applied commits changed (`changed_*` bits).
+    changed: u32 = 0
+    /// A wp_fifo barrier is set and not yet cleared by a presentation.
+    barrier: bool = false
+    /// Release point of the current buffer (explicit sync).
+    release: u32 = 0xFFFFFFFF
+    release_point: u64 = 0
+}
+
+/// Bits of `SurfaceData.changed`.
+pub let changed_buffer: u32 = 1
+pub let changed_damage: u32 = 2
+pub let changed_geometry: u32 = 4
+pub let changed_opaque: u32 = 8
+pub let changed_input: u32 = 16
+pub let changed_tree: u32 = 32
+
+enum BufferKind {
+    Shm
+    Dmabuf
+}
+
+/// One plane of a dmabuf.
+struct Plane {
+    fd: wire.Fd
+    offset: u32
+    stride: u32
+}
+
+struct BufferData {
+    client: u32 = 0
+    obj: u32 = 0
+    kind: BufferKind = BufferKind.Shm
+    width: i32 = 0
+    height: i32 = 0
+    /// DRM fourcc.
+    format: u32 = 0
+    /// shm: pool slot, byte offset and stride.
+    pool: u32 = 0xFFFFFFFF
+    offset: int = 0
+    stride: int = 0
+    planes: List[Plane] = []
+    modifier: u64 = 0
+    /// Surfaces that hold it as their current buffer.
+    users: int = 0
+    /// The facade still needs it (until `release_buffer`).
+    busy: bool = false
+    /// zwp_linux_buffer_params id awaiting created / failed (dmabuf `create`).
+    params_obj: u32 = 0
+}
+
+struct PoolData {
+    client: u32 = 0
+    obj: u32 = 0
+    fd: Option[wire.Fd] = None
+    map: Option[os.Map] = None
+    size: int = 0
+    /// The pool object (while not destroyed) and each buffer.
+    refs: int = 0
+}
+
+struct RegionData {
+    client: u32 = 0
+    rects: List[ids.Rect] = []
+}
+
+/// A configure the client has not acked yet.
+struct Configure {
+    serial: u32
+    width: i32
+    height: i32
+}
+
+struct WindowData {
+    surface: u32 = 0
+    client: u32 = 0
+    obj: u32 = 0
+    title: str = ""
+    app_id: str = ""
+    parent: u32 = 0xFFFFFFFF
+    /// The initial commit happened (WindowNew sent).
+    initial: bool = false
+    configured: bool = false
+    mapped: bool = false
+    configures: List[Configure] = []
+    /// Size of the last acked configure.
+    acked_w: i32 = 0
+    acked_h: i32 = 0
+}
+
+struct PopupData {
+    surface: u32 = 0
+    client: u32 = 0
+    obj: u32 = 0
+    /// Parent surface slot.
+    parent: u32 = 0xFFFFFFFF
+    pos: positioner.Positioner = positioner.Positioner {}
+    /// Position relative to the parent's window geometry, and size.
+    geometry: ids.Rect = ids.Rect {}
+    initial: bool = false
+    mapped: bool = false
+    configures: List[Configure] = []
+    /// A reposition request's token, sent with the next configure.
+    token: u32 = 0
+    repositioned: bool = false
+}
+
+struct PositionerData {
+    client: u32 = 0
+    pos: positioner.Positioner = positioner.Positioner {}
+}
+
+/// Output data compositors fill in (wl_output, xdg_output-like).
+pub struct OutputInfo {
+    pub name: str = ""
+    pub description: str = ""
+    pub make: str = ""
+    pub model: str = ""
+    /// Position in the global layout, logical pixels.
+    pub x: i32 = 0
+    pub y: i32 = 0
+    /// Current mode, physical pixels.
+    pub width: i32 = 0
+    pub height: i32 = 0
+    pub refresh_mhz: i32 = 60000
+    pub width_mm: i32 = 0
+    pub height_mm: i32 = 0
+    /// Fractional scale in 120ths (120 = 1.0).
+    pub scale120: i32 = 120
+    pub transform: u32 = 0
+}
+
+struct OutputData {
+    name: u32 = 0
+    info: OutputInfo = OutputInfo {}
+    /// Bound wl_output objects: client slot, id, version.
+    binds: List[(u32, u32, u32)] = []
+}
+
+/// A per-client input object of a seat: client slot, id, version.
+struct Res {
+    client: u32
+    id: u32
+    version: u32
+}
+
+struct SeatData {
+    name: str = ""
+    global: u32 = 0
+    caps: u32 = 0
+    seats: List[Res] = []
+    keyboards: List[Res] = []
+    pointers: List[Res] = []
+    touches: List[Res] = []
+    devices: List[Res] = []
+    kb_focus: u32 = 0xFFFFFFFF
+    ptr_focus: u32 = 0xFFFFFFFF
+    keymap: Option[wire.Fd] = None
+    keymap_size: u32 = 0
+    rate: i32 = 25
+    delay: i32 = 600
+    pressed: List[u32] = []
+    mods: [4]u32 = [0, 0, 0, 0]
+    /// Current selection source slot.
+    selection: u32 = 0xFFFFFFFF
+    /// Touch points down: id and surface slot.
+    touch_points: List[(i32, u32)] = []
+    /// Popups grabbing this seat, innermost last.
+    grabs: List[u32] = []
+}
+
+struct SourceData {
+    client: u32 = 0
+    obj: u32 = 0
+    mimes: List[str] = []
+}
+
+struct OfferData {
+    client: u32 = 0
+    obj: u32 = 0
+    source: u32 = 0xFFFFFFFF
+}
+
+struct ParamsData {
+    client: u32 = 0
+    planes: List[Plane] = []
+    modifier: u64 = 0
+    used: bool = false
+}
+
+struct TimelineData {
+    client: u32 = 0
+    fd: Option[wire.Fd] = None
+}
+
+/// What a transaction waits for before it can apply.
+pub enum Wait {
+    /// A dmabuf's implicit fence: export a sync_file from this plane fd.
+    Implicit(ids.Buffer, int)
+    /// A drm_syncobj timeline fd and point to reach.
+    Timeline(int, u64)
+    /// The next presentation of this surface's output (wp_fifo).
+    Fifo(ids.Surface)
+    /// Present no earlier than this CLOCK_MONOTONIC time (commit-timing).
+    Time(int)
+}
+
+struct TxnData {
+    client: u32 = 0
+    /// Surfaces and the states they apply.
+    surfaces: List[ids.Id] = []
+    states: List[State] = []
+    waits: List[Wait] = []
+    ready: bool = false
+}

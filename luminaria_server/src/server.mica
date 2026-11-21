@@ -1,0 +1,942 @@
+// The server: the listening socket, clients and every protocol object.
+// `dispatch` reads a client and handles its requests; requests that change
+// what is shown or need a decision come out of `next` as events, and the
+// compositor answers through the methods here and in the other modules.
+// Nothing blocks and nothing allocates per request in steady state.
+
+import std.mem
+import std.net
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.ifaces as ifaces
+import ids
+import state
+import surface
+import buffer
+import xdg
+import seat
+import output
+import data
+import extra
+import route
+
+/// What happened, for the compositor (and luminaria's glue) to act on.
+pub enum Event {
+    ClientNew(ids.Client)
+    ClientGone(ids.Client)
+    /// A wl_buffer exists: import it now (dmabuf) or wait for its first
+    /// commit (shm).
+    BufferNew(ids.Buffer)
+    BufferGone(ids.Buffer)
+    /// A commit waits: resolve `waits(txn)`, then `ready(txn)`.
+    Committed(ids.Txn)
+    /// A commit became current: `changes(surface)` says what changed.
+    Applied(ids.Surface)
+    SurfaceGone(ids.Surface)
+    /// A toplevel's initial commit: title and app id are set; configure it.
+    WindowNew(ids.Window)
+    WindowMapped(ids.Window)
+    WindowUnmapped(ids.Window)
+    WindowClosed(ids.Window)
+    WindowTitle(ids.Window)
+    WindowAppId(ids.Window)
+    WindowParent(ids.Window)
+    WindowRequest(ids.Window, Request)
+    /// The client acked a configure of this size and committed with it.
+    WindowAcked(ids.Window, i32, i32)
+    PopupNew(ids.Popup)
+    PopupMapped(ids.Popup)
+    PopupGone(ids.Popup)
+    PopupGrab(ids.Popup, ids.Seat)
+    /// The client asked for a new position (reposition): configure again.
+    PopupReposition(ids.Popup)
+    /// wl_pointer.set_cursor from the focused client: surface (None
+    /// hides), hotspot.
+    Cursor(ids.Seat, Option[ids.Surface], i32, i32)
+}
+
+/// A toplevel's request for a decision.
+pub enum Request {
+    Move(ids.Seat, u32)
+    /// Edges as xdg_toplevel.resize_edge.
+    Resize(ids.Seat, u32, u32)
+    Maximize(bool)
+    Fullscreen(bool, Option[ids.Output])
+    Minimize
+    Menu(ids.Seat, i32, i32)
+}
+
+/// linux-dmabuf setup: what the GPU imports, which device it is.
+pub struct Dmabuf {
+    /// dev_t of the main device.
+    pub device: u64 = 0
+    /// DRM fourcc and modifier pairs the compositor can sample.
+    pub formats: List[(u32, u64)] = []
+    /// The subset KMS can scan out of directly (a scanout tranche).
+    pub scanout: List[(u32, u64)] = []
+    pub scanout_device: u64 = 0
+}
+
+pub struct Server {
+    pub listener: wire.Listener
+    clients: ids.Slab[state.ClientData] = ids.Slab {}
+    conns: List[wire.Conn] = []
+    globals: List[state.Global] = []
+    surfaces: ids.Slab[state.SurfaceData] = ids.Slab {}
+    buffers: ids.Slab[state.BufferData] = ids.Slab {}
+    pools: ids.Slab[state.PoolData] = ids.Slab {}
+    regions: ids.Slab[state.RegionData] = ids.Slab {}
+    windows: ids.Slab[state.WindowData] = ids.Slab {}
+    popups: ids.Slab[state.PopupData] = ids.Slab {}
+    positioners: ids.Slab[state.PositionerData] = ids.Slab {}
+    outputs: ids.Slab[state.OutputData] = ids.Slab {}
+    seats: ids.Slab[state.SeatData] = ids.Slab {}
+    sources: ids.Slab[state.SourceData] = ids.Slab {}
+    offers: ids.Slab[state.OfferData] = ids.Slab {}
+    params: ids.Slab[state.ParamsData] = ids.Slab {}
+    timelines: ids.Slab[state.TimelineData] = ids.Slab {}
+    txns: ids.Slab[state.TxnData] = ids.Slab {}
+    /// Events queued; `next` reads from `head`.
+    events: List[Event] = []
+    head: int = 0
+    serial: u32 = 0
+    dmabuf: Option[Dmabuf] = None
+    /// linux-dmabuf format table (memfd) and size.
+    table_fd: int = -1
+    table_size: u32 = 0
+    syncobj: bool = false
+    no_waits: List[state.Wait] = []
+}
+
+/// Listen on `name` ("" for the first free wayland-N) with the core
+/// globals; add outputs, seats, dmabuf and syncobj support afterwards.
+pub fn Server.open(name: str) -> Result[Server, str] {
+    let l = try wire.listen(name)
+    var s = Server { listener: l }
+    s.add_global(wl.compositor_iface, 6)
+    s.add_global(wl.subcompositor_iface, 1)
+    s.add_global(wl.shm_iface, 2)
+    s.add_global(wl.data_device_manager_iface, 3)
+    s.add_global(proto.xdg_shell.wm_base_iface, 6)
+    s.add_global(proto.presentation_time.presentation_iface, 1)
+    s.add_global(proto.viewporter.viewporter_iface, 1)
+    s.add_global(proto.fractional_scale.scale_manager_iface, 1)
+    s.add_global(proto.fifo.fifo_manager_iface, 1)
+    s.add_global(proto.commit_timing.timing_manager_iface, 1)
+    s.add_global(proto.tearing_control.control_manager_iface, 1)
+    s.add_global(wl.fixes_iface, 1)
+    return Ok(s)
+}
+
+/// The socket name clients connect to (WAYLAND_DISPLAY).
+pub fn Server.name(self) -> str {
+    return self.listener.name.clone()
+}
+
+/// Advertise linux-dmabuf with this setup.
+pub fn Server.enable_dmabuf(mut self, take d: Dmabuf) -> Result[(), str] {
+    try buffer.make_table(mut self, d)
+    self.dmabuf = Some(d)
+    self.add_global(proto.linux_dmabuf.dmabuf_iface, 4)
+    return Ok(())
+}
+
+/// Advertise linux-drm-syncobj (the compositor waits on and signals the
+/// timelines).
+pub fn Server.enable_syncobj(mut self) {
+    guard not self.syncobj else {
+        return
+    }
+    self.syncobj = true
+    self.add_global(proto.linux_drm_syncobj.manager_iface, 1)
+}
+
+fn Server.add_global(mut self, iface: u16, version: u32) {
+    self.globals.push(state.Global { iface, version: min(version, ifaces.version(iface)), kind: state.GlobalKind.Static })
+    self.announce(u32(self.globals.len()))
+}
+
+/// Add a global of `kind`; its name.
+fn Server.add_dynamic(mut self, iface: u16, version: u32, kind: state.GlobalKind) -> u32 {
+    self.globals.push(state.Global { iface, version: min(version, ifaces.version(iface)), kind })
+    let name = u32(self.globals.len())
+    self.announce(name)
+    return name
+}
+
+/// Tell every registry about global `name`.
+fn Server.announce(mut self, name: u32) {
+    let g = self.globals[int(name - 1)]
+    let iface = ifaces.name(g.iface)
+    for ci in 0..self.clients.items.len() {
+        guard self.clients.used(ci) else {
+            continue
+        }
+        for r in self.clients.items[ci].registries.clone() {
+            wl.Registry { id: r }.global(mut self.conns[ci], name, iface, g.version)
+        }
+    }
+}
+
+fn Server.remove_global(mut self, name: u32) {
+    guard name > 0 and int(name) <= self.globals.len() else {
+        return
+    }
+    self.globals[int(name - 1)].alive = false
+    for ci in 0..self.clients.items.len() {
+        guard self.clients.used(ci) else {
+            continue
+        }
+        for r in self.clients.items[ci].registries.clone() {
+            wl.Registry { id: r }.global_remove(mut self.conns[ci], name)
+        }
+    }
+}
+
+fn Server.push(mut self, e: Event) {
+    self.events.push(e)
+}
+
+/// The next event, oldest first.
+pub fn Server.next(mut self) -> Option[Event] {
+    guard self.head < self.events.len() else {
+        self.events.clear()
+        self.head = 0
+        return None
+    }
+    let e = self.events[self.head]
+    self.head += 1
+    return Some(e)
+}
+
+fn Server.next_serial(mut self) -> u32 {
+    self.serial += 1
+    return self.serial
+}
+
+// ------------------------------------------------------------- clients
+
+/// Accept a waiting client: its handle and socket (to poll for reading).
+pub fn Server.accept(mut self) -> Result[Option[(ids.Client, int)], str] {
+    let got = self.listener.accept().map_err(fn(e) => "{e}")
+    guard let Some(conn) = try got else {
+        return Ok(None)
+    }
+    let fd = conn.fd
+    var cd = state.ClientData {}
+    let sock = net.Conn { fd }
+    if let Ok(cred) = sock.peer_cred() {
+        cd.pid = cred.pid
+        cd.uid = cred.uid
+        cd.gid = cred.gid
+    }
+    let id = self.clients.add(cd)
+    while self.conns.len() <= int(id.index) {
+        self.conns.push(wire.Conn.closed())
+    }
+    self.conns[int(id.index)] = conn
+    let c = ids.Client { id }
+    self.push(Event.ClientNew(c))
+    return Ok(Some((c, fd)))
+}
+
+pub fn Server.client_fd(self, c: ids.Client) -> int {
+    guard self.clients.live(c.id) else {
+        return -1
+    }
+    return self.conns[int(c.id.index)].fd
+}
+
+/// The client's process id, user and group (from the socket).
+pub fn Server.credentials(self, c: ids.Client) -> (int, int, int) {
+    guard self.clients.live(c.id) else {
+        return (0, 0, 0)
+    }
+    let i = int(c.id.index)
+    return (self.clients.items[i].pid, self.clients.items[i].uid, self.clients.items[i].gid)
+}
+
+pub fn Server.client_of(self, s: ids.Surface) -> ids.Client {
+    guard self.surfaces.live(s.id) else {
+        return ids.Client { id: ids.Id {} }
+    }
+    let ci = self.surfaces.items[int(s.id.index)].client
+    return ids.Client { id: self.clients.id(ci) }
+}
+
+/// Read and handle what client `c` sent. False when it is gone (call
+/// `disconnect` after removing its socket from the poller).
+pub fn Server.dispatch(mut self, c: ids.Client) -> bool {
+    guard self.clients.live(c.id) else {
+        return false
+    }
+    let ci = c.id.index
+    while true {
+        match self.conns[int(ci)].read() {
+            Ok(true) => {}
+            Ok(false) => {
+                return true
+            }
+            Err => {
+                return false
+            }
+        }
+        while true {
+            match proto.next(mut self.conns[int(ci)]) {
+                Ok(Some(r)) => route.handle(mut self, ci, r)
+                Ok(None) => {
+                    break
+                }
+                Err => {
+                    return false
+                }
+            }
+        }
+    }
+}
+
+/// Send what is queued for every client; the clients that must go (they
+/// stopped reading, or broke the protocol).
+pub fn Server.flush(mut self, mut gone: List[ids.Client]) {
+    for ci in 0..self.conns.len() {
+        guard self.clients.used(ci) and self.conns[ci].pending() else {
+            continue
+        }
+        match self.conns[ci].flush() {
+            Err => gone.push(ids.Client { id: self.clients.id(u32(ci)) })
+            Ok => {}
+        }
+    }
+}
+
+/// Protocol error `code` on `obj`: the client is told and dropped after
+/// the next flush.
+fn Server.fail(mut self, ci: u32, obj: u32, code: u32, msg: &str) {
+    discard self.conns[int(ci)].error(obj, code, msg)
+}
+
+/// Remember that id `id` of client `ci` is slot `slot` of its kind.
+fn Server.bind(mut self, ci: u32, id: u32, slot: u32) {
+    if id >= wire.server_base {
+        let k = int(id - wire.server_base)
+        while self.clients.items[int(ci)].high.len() <= k {
+            self.clients.items[int(ci)].high.push(state.none)
+        }
+        self.clients.items[int(ci)].high[k] = slot
+        return
+    }
+    while self.clients.items[int(ci)].objs.len() <= int(id) {
+        self.clients.items[int(ci)].objs.push(state.none)
+    }
+    self.clients.items[int(ci)].objs[int(id)] = slot
+}
+
+/// The slot id `id` of client `ci` names, `none` when unbound.
+fn Server.slot(self, ci: u32, id: u32) -> u32 {
+    if id >= wire.server_base {
+        let k = int(id - wire.server_base)
+        guard k < self.clients.items[int(ci)].high.len() else {
+            return state.none
+        }
+        return self.clients.items[int(ci)].high[k]
+    }
+    guard int(id) < self.clients.items[int(ci)].objs.len() else {
+        return state.none
+    }
+    return self.clients.items[int(ci)].objs[int(id)]
+}
+
+fn Server.unbind(mut self, ci: u32, id: u32) {
+    self.bind(ci, id, state.none)
+}
+
+/// Drop client `c` and everything it made.
+pub fn Server.disconnect(mut self, c: ids.Client) {
+    guard self.clients.live(c.id) else {
+        return
+    }
+    let ci = c.id.index
+    let limit = self.conns[int(ci)].id_limit()
+    // Children before parents: destroy in reverse creation order.
+    var id = limit
+    while id > 1 {
+        id -= 1
+        let iface = self.conns[int(ci)].iface(id)
+        if iface != 0 {
+            route.destroyed(mut self, ci, id, iface)
+        }
+    }
+    let highs = self.clients.items[int(ci)].high.len()
+    for k in 0..highs {
+        let hid = wire.server_base + u32(k)
+        let iface = self.conns[int(ci)].iface(hid)
+        if iface != 0 {
+            route.destroyed(mut self, ci, hid, iface)
+        }
+    }
+    for t in self.clients.items[int(ci)].txns.clone() {
+        self.txns.remove(t, state.TxnData {})
+    }
+    self.conns[int(ci)] = wire.Conn.closed()
+    self.clients.remove(ci, state.ClientData {})
+    self.push(Event.ClientGone(c))
+}
+
+// ------------------------------------------------------------- surfaces
+
+/// A surface's current state, as the last applied commit left it.
+pub struct SurfaceInfo {
+    pub buffer: Option[ids.Buffer] = None
+    /// Size in surface coordinates (after scale, transform and viewport).
+    pub width: i32 = 0
+    pub height: i32 = 0
+    pub buffer_width: i32 = 0
+    pub buffer_height: i32 = 0
+    pub scale: i32 = 1
+    /// wl_output.transform value.
+    pub transform: u32 = 0
+    /// wp_viewport source in buffer coordinates after transform and scale
+    /// (x, y, w, h); w < 0 is unset.
+    pub src: [4]f64 = [-1.0, -1.0, -1.0, -1.0]
+    /// Offset the last commit moved the content by.
+    pub dx: i32 = 0
+    pub dy: i32 = 0
+    /// The client allows tearing (wp_tearing_control async).
+    pub tearing: bool = false
+    pub mapped: bool = false
+    /// Window geometry (xdg), or the whole surface.
+    pub geometry: ids.Rect = ids.Rect {}
+}
+
+pub fn Server.surface_alive(self, s: ids.Surface) -> bool {
+    return self.surfaces.live(s.id)
+}
+
+pub fn Server.info(self, s: ids.Surface) -> SurfaceInfo {
+    guard self.surfaces.live(s.id) else {
+        return SurfaceInfo {}
+    }
+    let i = int(s.id.index)
+    var geo = ids.Rect { w: self.surfaces.items[i].width, h: self.surfaces.items[i].height }
+    if self.surfaces.items[i].current.geometry_set {
+        geo = self.surfaces.items[i].current.geometry
+    }
+    return SurfaceInfo {
+        buffer: match self.surfaces.items[i].current.buffer {
+            Some(b) => Some(ids.Buffer { id: b })
+            None => None
+        },
+        width: self.surfaces.items[i].width,
+        height: self.surfaces.items[i].height,
+        buffer_width: self.surfaces.items[i].buffer_w,
+        buffer_height: self.surfaces.items[i].buffer_h,
+        scale: self.surfaces.items[i].current.scale,
+        transform: self.surfaces.items[i].current.transform,
+        src: self.surfaces.items[i].current.src,
+        dx: self.surfaces.items[i].current.dx,
+        dy: self.surfaces.items[i].current.dy,
+        tearing: self.surfaces.items[i].current.tearing,
+        mapped: self.surfaces.items[i].mapped,
+        geometry: geo,
+    }
+}
+
+/// What applied commits changed since the last call (`changed_*` bits),
+/// moving their damage (surface and buffer coordinates) into the lists.
+pub fn Server.take_changes(mut self, s: ids.Surface, mut damage: List[ids.Rect], mut buffer_damage: List[ids.Rect]) -> u32 {
+    guard self.surfaces.live(s.id) else {
+        return 0
+    }
+    let i = int(s.id.index)
+    damage.extend(mem.replace(mut self.surfaces.items[i].applied_damage, []))
+    buffer_damage.extend(mem.replace(mut self.surfaces.items[i].applied_bdamage, []))
+    let c = self.surfaces.items[i].changed
+    self.surfaces.items[i].changed = 0
+    return c
+}
+
+/// The largest rectangle of the opaque region (surface coordinates).
+pub fn Server.opaque(self, s: ids.Surface) -> ids.Rect {
+    guard self.surfaces.live(s.id) else {
+        return ids.Rect {}
+    }
+    return ids.region_largest(self.surfaces.items[int(s.id.index)].current.opaque)
+}
+
+/// Whether surface-local `x, y` is inside the surface and its input region.
+pub fn Server.accepts(self, s: ids.Surface, x: f64, y: f64) -> bool {
+    guard self.surfaces.live(s.id) else {
+        return false
+    }
+    let i = int(s.id.index)
+    guard x >= 0.0 and y >= 0.0 and x < f64(self.surfaces.items[i].width) and y < f64(self.surfaces.items[i].height) else {
+        return false
+    }
+    return match self.surfaces.items[i].current.input {
+        Some(rs) => ids.region_contains(rs, x, y)
+        None => true
+    }
+}
+
+/// The mapped surfaces of `s`'s subsurface tree, bottom to top, with
+/// their offsets from `s`.
+pub fn Server.tree(self, s: ids.Surface, mut out: List[(ids.Surface, i32, i32)]) {
+    guard self.surfaces.live(s.id) else {
+        return
+    }
+    surface.tree(self, s.id.index, 0, 0, mut out)
+}
+
+/// The surface's frame callbacks fire (it was shown, or the compositor
+/// lets a hidden one go on); `ms` is the frame time.
+pub fn Server.frame_done(mut self, s: ids.Surface, ms: u32) {
+    if self.surfaces.live(s.id) {
+        surface.frame_done(mut self, s.id.index, ms)
+    }
+}
+
+/// Whether the surface waits for a frame callback.
+pub fn Server.wants_frame(self, s: ids.Surface) -> bool {
+    return self.surfaces.live(s.id) and not self.surfaces.items[int(s.id.index)].frames.is_empty()
+}
+
+/// wp_presentation: the last commit was shown on `o` at `ns`.
+pub fn Server.presented(mut self, s: ids.Surface, o: ids.Output, ns: int, refresh_ns: int, seq: u64, flags: u32) {
+    if self.surfaces.live(s.id) {
+        extra.presented(mut self, s.id.index, o.id.index, ns, refresh_ns, seq, flags)
+    }
+}
+
+pub fn Server.discarded(mut self, s: ids.Surface) {
+    if self.surfaces.live(s.id) {
+        extra.discard_feedbacks(mut self, s.id.index)
+    }
+}
+
+/// The surface's content was latched for display: its fifo barrier clears.
+pub fn Server.latch(mut self, s: ids.Surface) {
+    if self.surfaces.live(s.id) {
+        self.surfaces.items[int(s.id.index)].barrier = false
+    }
+}
+
+/// The outputs the surface is on (bit per output slot index).
+pub fn Server.set_outputs(mut self, s: ids.Surface, mask: u64) {
+    if self.surfaces.live(s.id) {
+        output.set_outputs(mut self, s.id.index, mask)
+    }
+}
+
+pub fn Server.preferred(mut self, s: ids.Surface, scale120: i32, transform: u32) {
+    if self.surfaces.live(s.id) {
+        output.preferred(mut self, s.id.index, scale120, transform)
+    }
+}
+
+/// Release point (timeline fd, point) of the surface's current buffer
+/// when the client uses explicit sync.
+pub fn Server.release_point(self, s: ids.Surface) -> Option[(int, u64)] {
+    guard self.surfaces.live(s.id) else {
+        return None
+    }
+    let t = self.surfaces.items[int(s.id.index)].release
+    guard t != state.none and self.timelines.used(int(t)) else {
+        return None
+    }
+    if let Some(f) = self.timelines.items[int(t)].fd {
+        return Some((f.raw(), self.surfaces.items[int(s.id.index)].release_point))
+    }
+    return None
+}
+
+// ------------------------------------------------------------- buffers
+
+pub enum BufferKind {
+    Shm
+    Dmabuf
+}
+
+pub struct BufferInfo {
+    pub kind: BufferKind = BufferKind.Shm
+    pub width: i32 = 0
+    pub height: i32 = 0
+    /// DRM fourcc.
+    pub format: u32 = 0
+    pub modifier: u64 = 0
+    pub planes: int = 0
+    /// shm row pitch in bytes.
+    pub stride: int = 0
+    pub client: ids.Client = ids.Client { id: ids.Id {} }
+}
+
+pub fn Server.buffer_alive(self, b: ids.Buffer) -> bool {
+    return self.buffers.live(b.id)
+}
+
+pub fn Server.buffer(self, b: ids.Buffer) -> BufferInfo {
+    guard self.buffers.live(b.id) else {
+        return BufferInfo {}
+    }
+    let i = int(b.id.index)
+    let k = if self.buffers.items[i].kind == state.BufferKind.Dmabuf { BufferKind.Dmabuf } else { BufferKind.Shm }
+    let ci = self.buffers.items[i].client
+    return BufferInfo {
+        kind: k,
+        width: self.buffers.items[i].width,
+        height: self.buffers.items[i].height,
+        format: self.buffers.items[i].format,
+        modifier: self.buffers.items[i].modifier,
+        planes: self.buffers.items[i].planes.len(),
+        stride: self.buffers.items[i].stride,
+        client: ids.Client { id: self.clients.id(ci) },
+    }
+}
+
+/// Plane `k` of a dmabuf: fd (still the server's), offset, stride.
+pub fn Server.plane(self, b: ids.Buffer, k: int) -> (int, u32, u32) {
+    guard self.buffers.live(b.id) and k < self.buffers.items[int(b.id.index)].planes.len() else {
+        return (-1, 0, 0)
+    }
+    let i = int(b.id.index)
+    return (self.buffers.items[i].planes[k].fd.raw(), self.buffers.items[i].planes[k].offset, self.buffers.items[i].planes[k].stride)
+}
+
+/// Lend `f` the shm buffer's bytes and stride (SIGBUS-safe); false when
+/// the client broke the buffer.
+pub fn Server.with_shm(self, b: ids.Buffer, f: fn(&[u8], int)) -> bool {
+    guard self.buffers.live(b.id) else {
+        return false
+    }
+    return buffer.with_shm(self, b.id.index, f)
+}
+
+/// The compositor is done reading the buffer: wl_buffer.release once no
+/// surface shows it either.
+pub fn Server.release(mut self, b: ids.Buffer) {
+    guard self.buffers.live(b.id) else {
+        return
+    }
+    let i = int(b.id.index)
+    guard self.buffers.items[i].busy else {
+        return
+    }
+    self.buffers.items[i].busy = false
+    let ci = self.buffers.items[i].client
+    let obj = self.buffers.items[i].obj
+    if obj != 0 {
+        wl.Buffer { id: obj }.release(mut self.conns[int(ci)])
+    }
+}
+
+/// The result of importing a dmabuf the compositor got as BufferNew.
+pub fn Server.imported(mut self, b: ids.Buffer, ok: bool) {
+    if self.buffers.live(b.id) {
+        buffer.imported(mut self, b.id.index, ok)
+    }
+}
+
+// --------------------------------------------------------- transactions
+
+pub fn Server.waits(self, t: ids.Txn) -> &[state.Wait] {
+    guard self.txns.live(t.id) else {
+        return self.no_waits[0..0]
+    }
+    return self.txns.items[int(t.id.index)].waits
+}
+
+/// Every wait of `t` is over: apply it (and what queued behind it).
+pub fn Server.ready(mut self, t: ids.Txn) {
+    surface.ready(mut self, t)
+}
+
+// ------------------------------------------------------------- windows
+
+pub fn Server.window_alive(self, w: ids.Window) -> bool {
+    return self.windows.live(w.id)
+}
+
+pub fn Server.window_surface(self, w: ids.Window) -> ids.Surface {
+    guard self.windows.live(w.id) else {
+        return ids.Surface { id: ids.Id {} }
+    }
+    return ids.Surface { id: self.surfaces.id(self.windows.items[int(w.id.index)].surface) }
+}
+
+pub fn Server.window_client(self, w: ids.Window) -> ids.Client {
+    return self.client_of(self.window_surface(w))
+}
+
+/// The window a surface is the toplevel of.
+pub fn Server.window_of(self, s: ids.Surface) -> Option[ids.Window] {
+    guard self.surfaces.live(s.id) else {
+        return None
+    }
+    return match self.surfaces.items[int(s.id.index)].role {
+        Toplevel(w) => Some(ids.Window { id: self.windows.id(w) })
+        _ => None
+    }
+}
+
+pub fn Server.title(self, w: ids.Window) -> &str {
+    guard self.windows.live(w.id) else {
+        return ""
+    }
+    return self.windows.items[int(w.id.index)].title
+}
+
+pub fn Server.app_id(self, w: ids.Window) -> &str {
+    guard self.windows.live(w.id) else {
+        return ""
+    }
+    return self.windows.items[int(w.id.index)].app_id
+}
+
+pub fn Server.parent(self, w: ids.Window) -> Option[ids.Window] {
+    guard self.windows.live(w.id) else {
+        return None
+    }
+    let p = self.windows.items[int(w.id.index)].parent
+    return if p == state.none or not self.windows.used(int(p)) { None } else { Some(ids.Window { id: self.windows.id(p) }) }
+}
+
+/// Minimum and maximum size the client asked for (0: none).
+pub fn Server.size_hints(self, w: ids.Window) -> (i32, i32, i32, i32) {
+    guard self.windows.live(w.id) else {
+        return (0, 0, 0, 0)
+    }
+    let si = int(self.windows.items[int(w.id.index)].surface)
+    let c = int(si)
+    return (self.surfaces.items[c].current.min_w, self.surfaces.items[c].current.min_h, self.surfaces.items[c].current.max_w, self.surfaces.items[c].current.max_h)
+}
+
+pub fn Server.mapped(self, w: ids.Window) -> bool {
+    return self.windows.live(w.id) and self.windows.items[int(w.id.index)].mapped
+}
+
+/// Configure a window: size (0 lets the client choose) and states. The
+/// serial the client will ack.
+pub fn Server.configure(mut self, w: ids.Window, width: i32, height: i32, st: xdg.States) -> u32 {
+    guard self.windows.live(w.id) else {
+        return 0
+    }
+    return xdg.configure_toplevel(mut self, w.id.index, width, height, st)
+}
+
+/// Ask the window to close (xdg_toplevel.close).
+pub fn Server.close(mut self, w: ids.Window) {
+    if self.windows.live(w.id) {
+        xdg.close_toplevel(mut self, w.id.index)
+    }
+}
+
+// -------------------------------------------------------------- popups
+
+pub fn Server.popup_surface(self, p: ids.Popup) -> ids.Surface {
+    guard self.popups.live(p.id) else {
+        return ids.Surface { id: ids.Id {} }
+    }
+    return ids.Surface { id: self.surfaces.id(self.popups.items[int(p.id.index)].surface) }
+}
+
+/// The surface a popup is placed relative to.
+pub fn Server.popup_parent(self, p: ids.Popup) -> Option[ids.Surface] {
+    guard self.popups.live(p.id) else {
+        return None
+    }
+    let ps = self.popups.items[int(p.id.index)].parent
+    return if ps == state.none or not self.surfaces.used(int(ps)) { None } else { Some(ids.Surface { id: self.surfaces.id(ps) }) }
+}
+
+/// Position (relative to the parent's window geometry) and size.
+pub fn Server.popup_geometry(self, p: ids.Popup) -> ids.Rect {
+    guard self.popups.live(p.id) else {
+        return ids.Rect {}
+    }
+    return self.popups.items[int(p.id.index)].geometry
+}
+
+/// Configure a popup kept inside `bounds` (relative to the parent's window
+/// geometry; empty for none); its geometry.
+pub fn Server.configure_popup(mut self, p: ids.Popup, bounds: ids.Rect) -> ids.Rect {
+    guard self.popups.live(p.id) else {
+        return ids.Rect {}
+    }
+    return xdg.configure_popup(mut self, p.id.index, bounds)
+}
+
+/// Dismiss a popup (xdg_popup.popup_done).
+pub fn Server.dismiss(mut self, p: ids.Popup) {
+    if self.popups.live(p.id) {
+        xdg.popup_done(mut self, p.id.index)
+    }
+}
+
+/// The popup a surface is the role of.
+pub fn Server.popup_of(self, s: ids.Surface) -> Option[ids.Popup] {
+    guard self.surfaces.live(s.id) else {
+        return None
+    }
+    return match self.surfaces.items[int(s.id.index)].role {
+        Popup(p) => Some(ids.Popup { id: self.popups.id(p) })
+        _ => None
+    }
+}
+
+// ------------------------------------------------------------- outputs
+
+pub fn Server.add_output(mut self, take info: state.OutputInfo) -> ids.Output {
+    return output.add(mut self, info)
+}
+
+pub fn Server.update_output(mut self, o: ids.Output, take info: state.OutputInfo) {
+    if self.outputs.live(o.id) {
+        output.update(mut self, o.id.index, info)
+    }
+}
+
+pub fn Server.remove_output(mut self, o: ids.Output) {
+    if self.outputs.live(o.id) {
+        output.remove(mut self, o.id.index)
+    }
+}
+
+// --------------------------------------------------------------- seats
+
+pub fn Server.add_seat(mut self, take name: str) -> ids.Seat {
+    return seat.add(mut self, name)
+}
+
+/// Pointer 1, keyboard 2, touch 4.
+pub fn Server.set_capabilities(mut self, s: ids.Seat, caps: u32) {
+    if self.seats.live(s.id) {
+        seat.set_caps(mut self, s.id.index, caps)
+    }
+}
+
+/// Keymap text in a sealed memfd (`fd` is taken) of `size` bytes.
+pub fn Server.set_keymap(mut self, s: ids.Seat, fd: int, size: u32) {
+    if self.seats.live(s.id) {
+        seat.set_keymap(mut self, s.id.index, fd, size)
+    }
+}
+
+pub fn Server.set_repeat(mut self, s: ids.Seat, rate: i32, delay: i32) {
+    if self.seats.live(s.id) {
+        seat.set_repeat(mut self, s.id.index, rate, delay)
+    }
+}
+
+fn Server.slot_of(self, s: Option[ids.Surface]) -> u32 {
+    guard let Some(x) = s else {
+        return state.none
+    }
+    return if self.surfaces.live(x.id) { x.id.index } else { state.none }
+}
+
+pub fn Server.keyboard_focus(mut self, s: ids.Seat, target: Option[ids.Surface]) {
+    if self.seats.live(s.id) {
+        let slot = self.slot_of(target)
+        seat.keyboard_focus(mut self, s.id.index, slot)
+    }
+}
+
+pub fn Server.keyboard_focused(self, s: ids.Seat) -> Option[ids.Surface] {
+    guard self.seats.live(s.id) else {
+        return None
+    }
+    let f = self.seats.items[int(s.id.index)].kb_focus
+    return if f == state.none or not self.surfaces.used(int(f)) { None } else { Some(ids.Surface { id: self.surfaces.id(f) }) }
+}
+
+/// A key (evdev code) to the keyboard focus; its serial.
+pub fn Server.key(mut self, s: ids.Seat, time_ms: u32, code: u32, pressed: bool) -> u32 {
+    guard self.seats.live(s.id) else {
+        return 0
+    }
+    return seat.key(mut self, s.id.index, time_ms, code, pressed)
+}
+
+pub fn Server.modifiers(mut self, s: ids.Seat, depressed: u32, latched: u32, locked: u32, group: u32) {
+    if self.seats.live(s.id) {
+        seat.modifiers(mut self, s.id.index, depressed, latched, locked, group)
+    }
+}
+
+/// The pointer is over `target` at surface-local `x, y` (None: no client).
+pub fn Server.pointer_focus(mut self, s: ids.Seat, target: Option[ids.Surface], x: f64, y: f64) {
+    if self.seats.live(s.id) {
+        let slot = self.slot_of(target)
+        seat.pointer_focus(mut self, s.id.index, slot, x, y)
+    }
+}
+
+pub fn Server.pointer_focused(self, s: ids.Seat) -> Option[ids.Surface] {
+    guard self.seats.live(s.id) else {
+        return None
+    }
+    let f = self.seats.items[int(s.id.index)].ptr_focus
+    return if f == state.none or not self.surfaces.used(int(f)) { None } else { Some(ids.Surface { id: self.surfaces.id(f) }) }
+}
+
+pub fn Server.pointer_motion(mut self, s: ids.Seat, time_ms: u32, x: f64, y: f64) {
+    if self.seats.live(s.id) {
+        seat.pointer_motion(mut self, s.id.index, time_ms, x, y)
+    }
+}
+
+pub fn Server.pointer_button(mut self, s: ids.Seat, time_ms: u32, button: u32, pressed: bool) -> u32 {
+    guard self.seats.live(s.id) else {
+        return 0
+    }
+    return seat.pointer_button(mut self, s.id.index, time_ms, button, pressed)
+}
+
+/// Scroll: `dx, dy` in surface pixels, wheel clicks in 120ths, source as
+/// wl_pointer.axis_source; all zero ends a finger scroll.
+pub fn Server.pointer_axis(mut self, s: ids.Seat, time_ms: u32, source: u32, dx: f64, dy: f64, v120x: i32, v120y: i32, inverted: bool) {
+    if self.seats.live(s.id) {
+        seat.pointer_axis(mut self, s.id.index, time_ms, source, dx, dy, v120x, v120y, inverted)
+    }
+}
+
+pub fn Server.touch_down(mut self, s: ids.Seat, target: ids.Surface, time_ms: u32, id: i32, x: f64, y: f64) -> u32 {
+    guard self.seats.live(s.id) and self.surfaces.live(target.id) else {
+        return 0
+    }
+    return seat.touch_down(mut self, s.id.index, target.id.index, time_ms, id, x, y)
+}
+
+pub fn Server.touch_motion(mut self, s: ids.Seat, time_ms: u32, id: i32, x: f64, y: f64) {
+    if self.seats.live(s.id) {
+        seat.touch_motion(mut self, s.id.index, time_ms, id, x, y)
+    }
+}
+
+pub fn Server.touch_up(mut self, s: ids.Seat, time_ms: u32, id: i32) -> u32 {
+    guard self.seats.live(s.id) else {
+        return 0
+    }
+    return seat.touch_up(mut self, s.id.index, time_ms, id)
+}
+
+/// The surface touch point `id` went down on.
+pub fn Server.touch_target(self, s: ids.Seat, id: i32) -> Option[ids.Surface] {
+    guard self.seats.live(s.id) else {
+        return None
+    }
+    let t = seat.touch_surface(self, s.id.index, id)
+    return if t == state.none or not self.surfaces.used(int(t)) { None } else { Some(ids.Surface { id: self.surfaces.id(t) }) }
+}
+
+pub fn Server.touch_frame(mut self, s: ids.Seat) {
+    if self.seats.live(s.id) {
+        seat.touch_frame(mut self, s.id.index, false)
+    }
+}
+
+pub fn Server.touch_cancel(mut self, s: ids.Seat) {
+    if self.seats.live(s.id) {
+        seat.touch_frame(mut self, s.id.index, true)
+    }
+}

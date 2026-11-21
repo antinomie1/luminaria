@@ -1,0 +1,114 @@
+// wl_output globals: geometry, mode, scale, name, sent at bind and again
+// (with done) when the compositor changes them; surfaces entering and
+// leaving outputs; preferred scale and transform hints.
+
+import luminaria_proto.wayland as wl
+import luminaria_proto.fractional_scale as frac
+import ids
+import state
+import server
+
+fn add(mut srv: server.Server, take info: state.OutputInfo) -> ids.Output {
+    let id = srv.outputs.add(state.OutputData { info })
+    let g = srv.add_dynamic(wl.output_iface, 4, state.GlobalKind.Output(id.index))
+    srv.outputs.items[int(id.index)].name = g
+    return ids.Output { id }
+}
+
+fn send(mut srv: server.Server, oi: u32, ci: u32, id: u32) {
+    let i = int(oi)
+    let o = wl.Output { id }
+    let c = int(ci)
+    let inf = srv.outputs.items[i].info.clone()
+    o.geometry(mut srv.conns[c], inf.x, inf.y, inf.width_mm, inf.height_mm, wl.OutputSubpixel.Unknown, inf.make, inf.model, wl.OutputTransform(inf.transform))
+    o.mode(mut srv.conns[c], wl.OutputMode.Current, inf.width, inf.height, inf.refresh_mhz)
+    // wl_output carries an integer scale: round up, clients downscale.
+    o.scale(mut srv.conns[c], (inf.scale120 + 119) / 120)
+    o.name(mut srv.conns[c], inf.name)
+    o.description(mut srv.conns[c], inf.description)
+    o.done(mut srv.conns[c])
+}
+
+fn bound(mut srv: server.Server, ci: u32, oi: u32, id: u32, version: u32) {
+    srv.outputs.items[int(oi)].binds.push((ci, id, version))
+    srv.bind(ci, id, oi)
+    send(mut srv, oi, ci, id)
+}
+
+fn update(mut srv: server.Server, oi: u32, take info: state.OutputInfo) {
+    srv.outputs.items[int(oi)].info = info
+    for k in 0..srv.outputs.items[int(oi)].binds.len() {
+        let (ci, id, _) = srv.outputs.items[int(oi)].binds[k]
+        send(mut srv, oi, ci, id)
+    }
+}
+
+fn remove(mut srv: server.Server, oi: u32) {
+    guard srv.outputs.used(int(oi)) else {
+        return
+    }
+    let name = srv.outputs.items[int(oi)].name
+    srv.remove_global(name)
+    // Surfaces leave it.
+    let bit = if oi < 64 { u64(1) << u64(oi) } else { u64(0) }
+    for k in 0..srv.surfaces.items.len() {
+        if srv.surfaces.used(k) and srv.surfaces.items[k].outputs & bit != 0 {
+            let mask = srv.surfaces.items[k].outputs & ~bit
+            set_outputs(mut srv, u32(k), mask)
+        }
+    }
+    srv.outputs.remove(oi, state.OutputData {})
+}
+
+fn drop_bind(mut srv: server.Server, oi: u32, ci: u32, id: u32) {
+    guard srv.outputs.used(int(oi)) else {
+        return
+    }
+    srv.outputs.items[int(oi)].binds.retain(fn(b) => not (b.0 == ci and b.1 == id))
+}
+
+/// Surface `si` is now on the outputs in `mask` (bit per slot): send
+/// enter and leave for the difference.
+fn set_outputs(mut srv: server.Server, si: u32, mask: u64) {
+    let i = int(si)
+    let old = srv.surfaces.items[i].outputs
+    guard old != mask else {
+        return
+    }
+    srv.surfaces.items[i].outputs = mask
+    let ci = srv.surfaces.items[i].client
+    let obj = srv.surfaces.items[i].obj
+    let s = wl.Surface { id: obj }
+    for oi in 0..min(srv.outputs.items.len(), 64) {
+        let bit = u64(1) << u64(oi)
+        guard (old ^ mask) & bit != 0 and srv.outputs.used(oi) else {
+            continue
+        }
+        for k in 0..srv.outputs.items[oi].binds.len() {
+            let (bc, id, _) = srv.outputs.items[oi].binds[k]
+            guard bc == ci else {
+                continue
+            }
+            if mask & bit != 0 {
+                s.enter(mut srv.conns[int(ci)], wl.Output { id })
+            } else {
+                s.leave(mut srv.conns[int(ci)], wl.Output { id })
+            }
+        }
+    }
+}
+
+/// Tell the surface the scale (120ths) and transform it should render
+/// for: wp_fractional_scale when it asked, wl_surface v6 hints otherwise.
+fn preferred(mut srv: server.Server, si: u32, scale120: i32, transform: u32) {
+    let i = int(si)
+    let ci = srv.surfaces.items[i].client
+    let obj = srv.surfaces.items[i].obj
+    let s = wl.Surface { id: obj }
+    let fr = srv.surfaces.items[i].fractional
+    if fr != 0 {
+        frac.Scale { id: fr }.preferred_scale(mut srv.conns[int(ci)], u32(scale120))
+    }
+    s.preferred_buffer_scale(mut srv.conns[int(ci)], (scale120 + 119) / 120)
+    s.preferred_buffer_transform(mut srv.conns[int(ci)], wl.OutputTransform(transform))
+}

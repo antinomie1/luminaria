@@ -1,0 +1,203 @@
+// Handles and plain geometry shared by every module. A handle is a slot
+// index plus a generation, so a stale one (its object destroyed, the slot
+// reused) never names the new object. Handles are Copy and hashable: use
+// them as map keys.
+
+import std.collections.map
+
+/// A slot and its generation: odd while the slot is in use.
+pub struct Id derive(Hash, Show) {
+    pub index: u32 = 0
+    pub gen: u32 = 0
+}
+
+pub struct Client derive(Hash, Show) {
+    pub id: Id
+}
+
+pub struct Surface derive(Hash, Show) {
+    pub id: Id
+}
+
+pub struct Buffer derive(Hash, Show) {
+    pub id: Id
+}
+
+/// An xdg_toplevel.
+pub struct Window derive(Hash, Show) {
+    pub id: Id
+}
+
+pub struct Popup derive(Hash, Show) {
+    pub id: Id
+}
+
+pub struct Output derive(Hash, Show) {
+    pub id: Id
+}
+
+pub struct Seat derive(Hash, Show) {
+    pub id: Id
+}
+
+/// A commit (with the synchronized subsurfaces it carries) waiting for
+/// its buffers to be ready.
+pub struct Txn derive(Hash, Show) {
+    pub id: Id
+}
+
+/// Items in stable slots, reused after removal.
+struct Slab[T] {
+    items: List[T] = []
+    gens: List[u32] = []
+    free: List[u32] = []
+}
+
+fn Slab[T].add(mut self, take v: T) -> Id {
+    if let Some(i) = self.free.pop() {
+        self.items[int(i)] = v
+        self.gens[int(i)] += 1
+        return Id { index: i, gen: self.gens[int(i)] }
+    }
+    self.items.push(v)
+    self.gens.push(1)
+    return Id { index: u32(self.items.len() - 1), gen: 1 }
+}
+
+fn Slab[T].live(self, id: Id) -> bool {
+    return int(id.index) < self.gens.len() and self.gens[int(id.index)] == id.gen and id.gen % 2 == 1
+}
+
+/// Free slot `i`, leaving `empty` in it.
+fn Slab[T].remove(mut self, i: u32, take empty: T) {
+    guard int(i) < self.gens.len() and self.gens[int(i)] % 2 == 1 else {
+        return
+    }
+    self.items[int(i)] = empty
+    self.gens[int(i)] += 1
+    self.free.push(i)
+}
+
+fn Slab[T].id(self, i: u32) -> Id {
+    return Id { index: i, gen: self.gens[int(i)] }
+}
+
+/// Whether slot `i` is in use.
+fn Slab[T].used(self, i: int) -> bool {
+    return self.gens[i] % 2 == 1
+}
+
+/// A rectangle in integer coordinates (surface-local or buffer pixels).
+pub struct Rect derive(Show) {
+    pub x: i32 = 0
+    pub y: i32 = 0
+    pub w: i32 = 0
+    pub h: i32 = 0
+}
+
+pub fn Rect.is_empty(self) -> bool {
+    return self.w <= 0 or self.h <= 0
+}
+
+pub fn Rect.contains(self, x: f64, y: f64) -> bool {
+    return x >= f64(self.x) and y >= f64(self.y) and x < f64(self.x) + f64(self.w) and y < f64(self.y) + f64(self.h)
+}
+
+pub fn Rect.intersect(self, o: Rect) -> Rect {
+    let x = max(self.x, o.x)
+    let y = max(self.y, o.y)
+    let w = min(self.x + self.w, o.x + o.w) - x
+    let h = min(self.y + self.h, o.y + o.h) - y
+    return if w > 0 and h > 0 { Rect { x, y, w, h } } else { Rect {} }
+}
+
+pub fn Rect.union(self, o: Rect) -> Rect {
+    guard not self.is_empty() else {
+        return o
+    }
+    guard not o.is_empty() else {
+        return self
+    }
+    let x = min(self.x, o.x)
+    let y = min(self.y, o.y)
+    return Rect { x, y, w: max(self.x + self.w, o.x + o.w) - x, h: max(self.y + self.h, o.y + o.h) - y }
+}
+
+pub fn Rect.area(self) -> int {
+    return if self.is_empty() { 0 } else { int(self.w) * int(self.h) }
+}
+
+/// Damage beyond this many rectangles collapses to their bounding box.
+let max_damage = 16
+
+/// Add `r` to damage list `d` (bounded).
+fn add_damage(mut d: List[Rect], r: Rect) {
+    guard not r.is_empty() else {
+        return
+    }
+    if d.len() < max_damage {
+        d.push(r)
+        return
+    }
+    var b = r
+    for e in d {
+        b = b.union(e)
+    }
+    d.clear()
+    d.push(b)
+}
+
+/// A region as disjoint rectangles (wl_region: add and subtract).
+fn region_add(mut rs: List[Rect], r: Rect) {
+    guard not r.is_empty() else {
+        return
+    }
+    region_sub(mut rs, r)
+    rs.push(r)
+}
+
+fn region_sub(mut rs: List[Rect], r: Rect) {
+    guard not r.is_empty() else {
+        return
+    }
+    var out: List[Rect] = []
+    for e in rs {
+        let i = e.intersect(r)
+        if i.is_empty() {
+            out.push(e)
+            continue
+        }
+        // Up to four pieces of `e` around `i`.
+        let top = Rect { x: e.x, y: e.y, w: e.w, h: i.y - e.y }
+        let bottom = Rect { x: e.x, y: i.y + i.h, w: e.w, h: e.y + e.h - (i.y + i.h) }
+        let left = Rect { x: e.x, y: i.y, w: i.x - e.x, h: i.h }
+        let right = Rect { x: i.x + i.w, y: i.y, w: e.x + e.w - (i.x + i.w), h: i.h }
+        for p in [top, bottom, left, right] {
+            if not p.is_empty() {
+                out.push(p)
+            }
+        }
+    }
+    rs.clear()
+    rs.extend(out)
+}
+
+/// The largest rectangle of a region (what occlusion can use).
+fn region_largest(rs: &[Rect]) -> Rect {
+    var best = Rect {}
+    for r in rs {
+        if r.area() > best.area() {
+            best = r
+        }
+    }
+    return best
+}
+
+fn region_contains(rs: &[Rect], x: f64, y: f64) -> bool {
+    for r in rs {
+        if r.contains(x, y) {
+            return true
+        }
+    }
+    return false
+}

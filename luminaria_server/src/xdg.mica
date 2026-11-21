@@ -1,0 +1,489 @@
+// xdg-shell: toplevels (windows) and popups. The lifecycle the compositor
+// sees: WindowNew at the initial commit (title and app id known), a
+// configure from the compositor, WindowMapped at the first buffer after
+// the ack, WindowAcked as sizes arrive, WindowUnmapped / WindowClosed.
+// Requests that need a decision (move, resize, maximize, ...) come out as
+// WindowRequest; nothing here decides.
+
+import std.mem
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_shell as x
+import ids
+import state
+import server
+import positioner
+
+/// xdg_toplevel states sent with a configure.
+pub struct States {
+    pub maximized: bool = false
+    pub fullscreen: bool = false
+    pub resizing: bool = false
+    pub activated: bool = false
+    pub tiled_left: bool = false
+    pub tiled_right: bool = false
+    pub tiled_top: bool = false
+    pub tiled_bottom: bool = false
+    pub suspended: bool = false
+}
+
+fn States.bytes(self, version: u32) -> List[u8] {
+    var vals: List[u32] = []
+    if self.maximized {
+        vals.push(1)
+    }
+    if self.fullscreen {
+        vals.push(2)
+    }
+    if self.resizing {
+        vals.push(3)
+    }
+    if self.activated {
+        vals.push(4)
+    }
+    if version >= 2 {
+        if self.tiled_left {
+            vals.push(5)
+        }
+        if self.tiled_right {
+            vals.push(6)
+        }
+        if self.tiled_top {
+            vals.push(7)
+        }
+        if self.tiled_bottom {
+            vals.push(8)
+        }
+    }
+    if version >= 6 and self.suspended {
+        vals.push(9)
+    }
+    var out: List[u8] = []
+    for v in vals {
+        for j in 0..4 {
+            out.push(u8((v >> u32(8 * j)) & 0xff))
+        }
+    }
+    return out
+}
+
+fn wm_base(mut srv: server.Server, ci: u32, w: x.WmBase, take req: x.WmBaseRequest) {
+    match req {
+        Destroy => {}
+        CreatePositioner(p) => {
+            let id = srv.positioners.add(state.PositionerData { client: ci })
+            srv.bind(ci, p.id, id.index)
+        }
+        GetXdgSurface(xs, s) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            guard srv.surfaces.items[int(si)].xdg == 0 and srv.surfaces.items[int(si)].role == state.Role.Plain else {
+                srv.fail(ci, w.id, u32(x.WmBaseError.Role), "surface already has a role")
+                return
+            }
+            guard srv.surfaces.items[int(si)].current.buffer.is_none() and not srv.surfaces.items[int(si)].pending.attached else {
+                srv.fail(ci, xs.id, u32(x.SurfaceError.UnconfiguredBuffer), "xdg_surface on a surface with a buffer")
+                return
+            }
+            srv.surfaces.items[int(si)].xdg = xs.id
+            srv.bind(ci, xs.id, si)
+        }
+        Pong(serial) => {}
+    }
+}
+
+fn positioner_request(mut srv: server.Server, ci: u32, p: x.Positioner, take req: x.PositionerRequest) {
+    let pi = srv.slot(ci, p.id)
+    guard pi != state.none else {
+        return
+    }
+    let i = int(pi)
+    match req {
+        Destroy => {
+            srv.unbind(ci, p.id)
+            srv.positioners.remove(pi, state.PositionerData {})
+        }
+        SetSize(w, h) => {
+            guard w > 0 and h > 0 else {
+                srv.fail(ci, p.id, u32(x.PositionerError.InvalidInput), "positioner size {w}x{h}")
+                return
+            }
+            srv.positioners.items[i].pos.width = w
+            srv.positioners.items[i].pos.height = h
+        }
+        SetAnchorRect(ax, ay, w, h) => {
+            guard w >= 0 and h >= 0 else {
+                srv.fail(ci, p.id, u32(x.PositionerError.InvalidInput), "anchor rect {w}x{h}")
+                return
+            }
+            srv.positioners.items[i].pos.anchor_rect = ids.Rect { x: ax, y: ay, w, h }
+        }
+        SetAnchor(a) => srv.positioners.items[i].pos.anchor = u32(a)
+        SetGravity(g) => srv.positioners.items[i].pos.gravity = u32(g)
+        SetConstraintAdjustment(c) => srv.positioners.items[i].pos.adjust = c.bits()
+        SetOffset(ox, oy) => {
+            srv.positioners.items[i].pos.off_x = ox
+            srv.positioners.items[i].pos.off_y = oy
+        }
+        SetReactive => srv.positioners.items[i].pos.reactive = true
+        SetParentSize => {}
+        SetParentConfigure => {}
+    }
+}
+
+fn surface_request(mut srv: server.Server, ci: u32, xs: x.Surface, take req: x.SurfaceRequest) {
+    let si = srv.slot(ci, xs.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    match req {
+        Destroy => {
+            srv.unbind(ci, xs.id)
+            destroy_xdg_surface(mut srv, si)
+        }
+        GetToplevel(t) => {
+            guard srv.surfaces.items[i].role == state.Role.Plain else {
+                srv.fail(ci, xs.id, u32(x.SurfaceError.AlreadyConstructed), "already has a role object")
+                return
+            }
+            let id = srv.windows.add(state.WindowData { surface: si, client: ci, obj: t.id })
+            srv.surfaces.items[i].role = state.Role.Toplevel(id.index)
+            srv.bind(ci, t.id, id.index)
+            if srv.conns[int(ci)].version(t.id) >= 5 {
+                // Window menu, maximize, fullscreen, minimize.
+                let caps: [16]u8 = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
+                t.wm_capabilities(mut srv.conns[int(ci)], caps)
+            }
+        }
+        GetPopup(p, parent, pos) => {
+            guard srv.surfaces.items[i].role == state.Role.Plain else {
+                srv.fail(ci, xs.id, u32(x.SurfaceError.AlreadyConstructed), "already has a role object")
+                return
+            }
+            let ppi = srv.slot(ci, pos.id)
+            guard ppi != state.none and srv.positioners.items[int(ppi)].pos.complete() else {
+                srv.fail(ci, xs.id, u32(x.WmBaseError.InvalidPositioner), "incomplete positioner")
+                return
+            }
+            var parent_slot = state.none
+            if let Some(px) = parent {
+                parent_slot = srv.slot(ci, px.id)
+            }
+            let ps = srv.positioners.items[int(ppi)].pos
+            let id = srv.popups.add(state.PopupData { surface: si, client: ci, obj: p.id, parent: parent_slot, pos: ps })
+            srv.surfaces.items[i].role = state.Role.Popup(id.index)
+            srv.bind(ci, p.id, id.index)
+        }
+        SetWindowGeometry(gx, gy, w, h) => {
+            guard w > 0 and h > 0 else {
+                srv.fail(ci, xs.id, u32(x.SurfaceError.InvalidSize), "window geometry {w}x{h}")
+                return
+            }
+            srv.surfaces.items[i].pending.geometry_set = true
+            srv.surfaces.items[i].pending.geometry = ids.Rect { x: gx, y: gy, w, h }
+        }
+        AckConfigure(serial) => srv.surfaces.items[i].pending.acked = serial
+    }
+}
+
+fn toplevel(mut srv: server.Server, ci: u32, t: x.Toplevel, take req: x.ToplevelRequest) {
+    let wi = srv.slot(ci, t.id)
+    guard wi != state.none else {
+        return
+    }
+    let i = int(wi)
+    let w = ids.Window { id: srv.windows.id(wi) }
+    let si = int(srv.windows.items[i].surface)
+    match take req {
+        Destroy => {
+            srv.unbind(ci, t.id)
+            destroy_toplevel(mut srv, wi)
+        }
+        SetParent(p) => {
+            var ps = state.none
+            if let Some(pt) = p {
+                ps = srv.slot(ci, pt.id)
+            }
+            guard ps != wi else {
+                srv.fail(ci, t.id, u32(x.ToplevelError.InvalidParent), "a window cannot be its own parent")
+                return
+            }
+            srv.windows.items[i].parent = ps
+            srv.push(server.Event.WindowParent(w))
+        }
+        SetTitle(s) => {
+            srv.windows.items[i].title = s
+            srv.push(server.Event.WindowTitle(w))
+        }
+        SetAppId(s) => {
+            srv.windows.items[i].app_id = s
+            srv.push(server.Event.WindowAppId(w))
+        }
+        ShowWindowMenu(st, serial, mx, my) => {
+            let seat = seat_of(srv, ci, st.id)
+            srv.push(server.Event.WindowRequest(w, server.Request.Menu(seat, mx, my)))
+        }
+        Move(st, serial) => {
+            let seat = seat_of(srv, ci, st.id)
+            srv.push(server.Event.WindowRequest(w, server.Request.Move(seat, serial)))
+        }
+        Resize(st, serial, edges) => {
+            let seat = seat_of(srv, ci, st.id)
+            srv.push(server.Event.WindowRequest(w, server.Request.Resize(seat, serial, u32(edges))))
+        }
+        SetMaxSize(mw, mh) => {
+            guard mw >= 0 and mh >= 0 else {
+                srv.fail(ci, t.id, u32(x.ToplevelError.InvalidSize), "max size {mw}x{mh}")
+                return
+            }
+            srv.surfaces.items[si].pending.max_set = true
+            srv.surfaces.items[si].pending.max_w = mw
+            srv.surfaces.items[si].pending.max_h = mh
+        }
+        SetMinSize(mw, mh) => {
+            guard mw >= 0 and mh >= 0 else {
+                srv.fail(ci, t.id, u32(x.ToplevelError.InvalidSize), "min size {mw}x{mh}")
+                return
+            }
+            srv.surfaces.items[si].pending.min_set = true
+            srv.surfaces.items[si].pending.min_w = mw
+            srv.surfaces.items[si].pending.min_h = mh
+        }
+        SetMaximized => srv.push(server.Event.WindowRequest(w, server.Request.Maximize(true)))
+        UnsetMaximized => srv.push(server.Event.WindowRequest(w, server.Request.Maximize(false)))
+        SetFullscreen(o) => {
+            var out: Option[ids.Output] = None
+            if let Some(oo) = o {
+                let oi = srv.slot(ci, oo.id)
+                if oi != state.none {
+                    out = Some(ids.Output { id: srv.outputs.id(oi) })
+                }
+            }
+            srv.push(server.Event.WindowRequest(w, server.Request.Fullscreen(true, out)))
+        }
+        UnsetFullscreen => srv.push(server.Event.WindowRequest(w, server.Request.Fullscreen(false, None)))
+        SetMinimized => srv.push(server.Event.WindowRequest(w, server.Request.Minimize))
+    }
+}
+
+/// The seat a client's wl_seat id stands for.
+fn seat_of(srv: server.Server, ci: u32, id: u32) -> ids.Seat {
+    let s = srv.slot(ci, id)
+    return if s == state.none { ids.Seat { id: ids.Id {} } } else { ids.Seat { id: srv.seats.id(s) } }
+}
+
+fn popup(mut srv: server.Server, ci: u32, p: x.Popup, take req: x.PopupRequest) {
+    let pi = srv.slot(ci, p.id)
+    guard pi != state.none else {
+        return
+    }
+    let pp = ids.Popup { id: srv.popups.id(pi) }
+    match req {
+        Destroy => {
+            srv.unbind(ci, p.id)
+            destroy_popup(mut srv, pi)
+        }
+        Grab(st, serial) => {
+            let seat = seat_of(srv, ci, st.id)
+            srv.push(server.Event.PopupGrab(pp, seat))
+        }
+        Reposition(pos, token) => {
+            let ppi = srv.slot(ci, pos.id)
+            guard ppi != state.none else {
+                return
+            }
+            let ps = srv.positioners.items[int(ppi)].pos
+            srv.popups.items[int(pi)].pos = ps
+            srv.popups.items[int(pi)].token = token
+            srv.popups.items[int(pi)].repositioned = true
+            srv.push(server.Event.PopupReposition(pp))
+        }
+    }
+}
+
+/// Take the configure acked with `serial` (and drop older ones).
+fn acked(mut cs: List[state.Configure], serial: u32) -> Option[(i32, i32)] {
+    guard serial != 0 else {
+        return None
+    }
+    guard let Some(k) = cs.position(fn(c) => c.serial == serial) else {
+        return None
+    }
+    let c = cs[k]
+    for _ in 0..k + 1 {
+        discard cs.remove(0)
+    }
+    return Some((c.width, c.height))
+}
+
+fn toplevel_applied(mut srv: server.Server, wi: u32, serial: u32) {
+    let i = int(wi)
+    let si = int(srv.windows.items[i].surface)
+    let w = ids.Window { id: srv.windows.id(wi) }
+    let got = acked(mut srv.windows.items[i].configures, serial)
+    if let Some((cw, ch)) = got {
+        srv.windows.items[i].configured = true
+        srv.windows.items[i].acked_w = cw
+        srv.windows.items[i].acked_h = ch
+    }
+    let has_buffer = srv.surfaces.items[si].current.buffer.is_some()
+    if not srv.windows.items[i].initial {
+        if has_buffer {
+            let ci = srv.windows.items[i].client
+            let obj = srv.surfaces.items[si].xdg
+            srv.fail(ci, obj, u32(x.SurfaceError.UnconfiguredBuffer), "buffer before the initial configure")
+            return
+        }
+        srv.windows.items[i].initial = true
+        srv.push(server.Event.WindowNew(w))
+        return
+    }
+    if has_buffer and not srv.windows.items[i].mapped {
+        guard srv.windows.items[i].configured else {
+            let ci = srv.windows.items[i].client
+            let obj = srv.surfaces.items[si].xdg
+            srv.fail(ci, obj, u32(x.SurfaceError.UnconfiguredBuffer), "buffer before acking a configure")
+            return
+        }
+        srv.windows.items[i].mapped = true
+        srv.surfaces.items[si].mapped = true
+        srv.push(server.Event.WindowMapped(w))
+    } else if not has_buffer and srv.windows.items[i].mapped {
+        unmap_window(mut srv, wi)
+    }
+    if let Some((cw, ch)) = got {
+        srv.push(server.Event.WindowAcked(w, cw, ch))
+    }
+}
+
+fn unmap_window(mut srv: server.Server, wi: u32) {
+    let i = int(wi)
+    let si = int(srv.windows.items[i].surface)
+    srv.windows.items[i].mapped = false
+    srv.windows.items[i].initial = false
+    srv.windows.items[i].configured = false
+    srv.windows.items[i].configures.clear()
+    srv.surfaces.items[si].mapped = false
+    srv.push(server.Event.WindowUnmapped(ids.Window { id: srv.windows.id(wi) }))
+}
+
+fn popup_applied(mut srv: server.Server, pi: u32, serial: u32) {
+    let i = int(pi)
+    let si = int(srv.popups.items[i].surface)
+    let p = ids.Popup { id: srv.popups.id(pi) }
+    let got = acked(mut srv.popups.items[i].configures, serial)
+    let has_buffer = srv.surfaces.items[si].current.buffer.is_some()
+    if not srv.popups.items[i].initial {
+        srv.popups.items[i].initial = true
+        srv.push(server.Event.PopupNew(p))
+        return
+    }
+    if has_buffer and not srv.popups.items[i].mapped {
+        srv.popups.items[i].mapped = true
+        srv.surfaces.items[si].mapped = true
+        srv.push(server.Event.PopupMapped(p))
+    } else if not has_buffer and srv.popups.items[i].mapped {
+        srv.popups.items[i].mapped = false
+        srv.popups.items[i].initial = false
+        srv.surfaces.items[si].mapped = false
+        srv.push(server.Event.PopupGone(p))
+    }
+    discard got
+}
+
+/// Send a configure: size (0 lets the client choose) and states; the serial.
+fn configure_toplevel(mut srv: server.Server, wi: u32, width: i32, height: i32, st: States) -> u32 {
+    let i = int(wi)
+    let ci = srv.windows.items[i].client
+    let obj = srv.windows.items[i].obj
+    let si = int(srv.windows.items[i].surface)
+    let xobj = srv.surfaces.items[si].xdg
+    let serial = srv.next_serial()
+    let t = x.Toplevel { id: obj }
+    let version = srv.conns[int(ci)].version(obj)
+    let states = st.bytes(version)
+    t.configure(mut srv.conns[int(ci)], width, height, states)
+    x.Surface { id: xobj }.configure(mut srv.conns[int(ci)], serial)
+    srv.windows.items[i].configures.push(state.Configure { serial, width, height })
+    return serial
+}
+
+/// Configure a popup inside `bounds` (relative to the parent's window
+/// geometry; empty: unconstrained). Its geometry.
+fn configure_popup(mut srv: server.Server, pi: u32, bounds: ids.Rect) -> ids.Rect {
+    let i = int(pi)
+    let ci = srv.popups.items[i].client
+    let obj = srv.popups.items[i].obj
+    let si = int(srv.popups.items[i].surface)
+    let xobj = srv.surfaces.items[si].xdg
+    let g = srv.popups.items[i].pos.geometry(bounds)
+    srv.popups.items[i].geometry = g
+    let serial = srv.next_serial()
+    let p = x.Popup { id: obj }
+    p.configure(mut srv.conns[int(ci)], g.x, g.y, g.w, g.h)
+    if srv.popups.items[i].repositioned {
+        srv.popups.items[i].repositioned = false
+        let token = srv.popups.items[i].token
+        p.repositioned(mut srv.conns[int(ci)], token)
+    }
+    x.Surface { id: xobj }.configure(mut srv.conns[int(ci)], serial)
+    srv.popups.items[i].configures.push(state.Configure { serial, width: g.w, height: g.h })
+    return g
+}
+
+fn close_toplevel(mut srv: server.Server, wi: u32) {
+    let ci = srv.windows.items[int(wi)].client
+    let obj = srv.windows.items[int(wi)].obj
+    x.Toplevel { id: obj }.close(mut srv.conns[int(ci)])
+}
+
+fn popup_done(mut srv: server.Server, pi: u32) {
+    let ci = srv.popups.items[int(pi)].client
+    let obj = srv.popups.items[int(pi)].obj
+    x.Popup { id: obj }.popup_done(mut srv.conns[int(ci)])
+}
+
+fn destroy_toplevel(mut srv: server.Server, wi: u32) {
+    guard srv.windows.used(int(wi)) else {
+        return
+    }
+    let w = ids.Window { id: srv.windows.id(wi) }
+    let si = int(srv.windows.items[int(wi)].surface)
+    if srv.windows.items[int(wi)].mapped {
+        unmap_window(mut srv, wi)
+    }
+    if srv.surfaces.used(si) {
+        srv.surfaces.items[si].role = state.Role.Plain
+        srv.surfaces.items[si].mapped = false
+    }
+    // Children lose their parent window.
+    for k in 0..srv.windows.items.len() {
+        if srv.windows.used(k) and srv.windows.items[k].parent == wi {
+            srv.windows.items[k].parent = state.none
+        }
+    }
+    srv.windows.remove(wi, state.WindowData {})
+    srv.push(server.Event.WindowClosed(w))
+}
+
+fn destroy_popup(mut srv: server.Server, pi: u32) {
+    guard srv.popups.used(int(pi)) else {
+        return
+    }
+    let p = ids.Popup { id: srv.popups.id(pi) }
+    let si = int(srv.popups.items[int(pi)].surface)
+    if srv.surfaces.used(si) {
+        srv.surfaces.items[si].role = state.Role.Plain
+        srv.surfaces.items[si].mapped = false
+    }
+    srv.popups.remove(pi, state.PopupData {})
+    srv.push(server.Event.PopupGone(p))
+}
+
+fn destroy_xdg_surface(mut srv: server.Server, si: u32) {
+    if srv.surfaces.used(int(si)) {
+        srv.surfaces.items[int(si)].xdg = 0
+    }
+}

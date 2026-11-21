@@ -1,0 +1,369 @@
+// The server against the generated client API through a real socket:
+// shm commits and frame callbacks, the xdg toplevel lifecycle, synchronized
+// subsurfaces, popup placement, keyboard and pointer focus, dmabuf commits
+// that wait for their fence, and teardown on disconnect.
+
+import std.env
+import std.fs
+import std.os
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_shell as xdg
+import luminaria_proto.linux_dmabuf as dmabuf
+import luminaria_server as server
+
+struct Fx {
+    srv: server.Server
+    c: wire.Conn
+    client: server.Client
+}
+
+fn setup() -> Fx {
+    let dir = fs.create_temp_dir("luminaria-server").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    var srv = server.Server.open("").expect("listen")
+    let c = wire.connect(srv.name()).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some((client, _))) = srv.accept() {
+            return Fx { srv, c, client }
+        }
+    }
+    panic("accept")
+}
+
+/// Client to server and back: requests handled, events received.
+fn pump(mut f: Fx) -> List[proto.Event] {
+    discard f.c.flush()
+    for _ in 0..3 {
+        assert(f.srv.dispatch(f.client))
+    }
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    assert(gone.is_empty())
+    var out: List[proto.Event] = []
+    for _ in 0..3 {
+        discard f.c.read()
+        while true {
+            match proto.next_event(mut f.c) {
+                Ok(Some(e)) => out.push(e)
+                Ok(None) => {
+                    break
+                }
+                Err(e) => panic("client: {e}")
+            }
+        }
+    }
+    return out
+}
+
+/// Server events since the last call.
+fn events(mut f: Fx) -> List[server.Event] {
+    var out: List[server.Event] = []
+    while true {
+        guard let Some(e) = f.srv.next() else {
+            break
+        }
+        out.push(e)
+    }
+    return out
+}
+
+/// Bind a global by interface; its id.
+fn bind(mut f: Fx, iface: u16, version: u32) -> u32 {
+    let reg = wl.Display { id: 1 }.get_registry(mut f.c)
+    var name: u32 = 0
+    for e in pump(mut f) {
+        match e {
+            WlRegistry(_, Global(n, i, v)) => {
+                if proto.ifaces.by_name(i) == iface and name == 0 {
+                    name = n
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(name != 0)
+    return reg.bind(mut f.c, name, iface, version)
+}
+
+/// A 4x4 shm buffer.
+fn shm_buffer(mut f: Fx) -> wl.Buffer {
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let fd = os.memfd("t", 64).expect("memfd")
+    let pool = shm.create_pool(mut f.c, fd, 64)
+    os.close(fd)
+    return pool.create_buffer(mut f.c, 0, 4, 4, 16, wl.ShmFormat.Argb8888)
+}
+
+test "an shm commit applies at once, with damage and a frame callback" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let buf = shm_buffer(mut f)
+    let surf = comp.create_surface(mut f.c)
+    surf.attach(mut f.c, Some(buf), 0, 0)
+    surf.damage_buffer(mut f.c, 0, 0, 2, 2)
+    let cb = surf.frame(mut f.c)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var applied: Option[server.Surface] = None
+    var buffers = 0
+    for e in events(mut f) {
+        match e {
+            BufferNew => buffers += 1
+            Applied(s) => applied = Some(s)
+            _ => {}
+        }
+    }
+    assert_eq(buffers, 1)
+    let s = applied.expect("applied")
+    let info = f.srv.info(s)
+    assert_eq((info.width, info.height), (i32(4), i32(4)))
+    assert(info.mapped)
+    var d: List[server.Rect] = []
+    var bd: List[server.Rect] = []
+    let changed = f.srv.take_changes(s, mut d, mut bd)
+    assert(changed & server.changed_buffer != 0)
+    assert_eq(bd.len(), 1)
+    assert_eq(bd[0], server.Rect { w: 2, h: 2 })
+    // Shown: the callback fires and the buffer goes back.
+    assert(f.srv.wants_frame(s))
+    f.srv.frame_done(s, 16)
+    f.srv.release(info.buffer.unwrap())
+    var done = false
+    var released = false
+    for e in pump(mut f) {
+        match e {
+            WlCallback(c, Done(16)) => done = c == cb
+            WlBuffer(b, Release) => released = b == buf
+            _ => {}
+        }
+    }
+    assert(done and released)
+    // Gone with the client.
+    f.srv.disconnect(f.client)
+    var gone = false
+    for e in events(mut f) {
+        match e {
+            SurfaceGone(g) => gone = gone or g == s
+            _ => {}
+        }
+    }
+    assert(gone)
+}
+
+test "the toplevel lifecycle" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 6) }
+    let buf = shm_buffer(mut f)
+    let surf = comp.create_surface(mut f.c)
+    let xs = wm.get_xdg_surface(mut f.c, surf)
+    let top = xs.get_toplevel(mut f.c)
+    top.set_title(mut f.c, "hello")
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var win: Option[server.Window] = None
+    for e in events(mut f) {
+        match e {
+            WindowNew(w) => win = Some(w)
+            _ => {}
+        }
+    }
+    let w = win.expect("WindowNew at the initial commit")
+    assert_eq(f.srv.title(w), "hello")
+    let serial = f.srv.configure(w, 300, 200, server.States { activated: true })
+    var got = 0
+    var size = (i32(0), i32(0))
+    for e in pump(mut f) {
+        match e {
+            XdgSurface(_, Configure(s)) => got = int(s)
+            XdgToplevel(_, Configure(cw, ch, states)) => {
+                size = (cw, ch)
+                assert_eq(states.len(), 4)
+            }
+            _ => {}
+        }
+    }
+    assert_eq(got, int(serial))
+    assert_eq(size, (i32(300), i32(200)))
+    xs.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(buf), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var mapped = false
+    var acked = false
+    for e in events(mut f) {
+        match e {
+            WindowMapped(m) => mapped = m == w
+            WindowAcked(m, 300, 200) => acked = m == w
+            _ => {}
+        }
+    }
+    assert(mapped and acked)
+    assert(f.srv.mapped(w))
+    top.destroy(mut f.c)
+    discard pump(mut f)
+    var closed = false
+    for e in events(mut f) {
+        match e {
+            WindowClosed(m) => closed = m == w
+            _ => {}
+        }
+    }
+    assert(closed)
+}
+
+test "a synchronized subsurface applies with its parent" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let sub = wl.Subcompositor { id: bind(mut f, wl.subcompositor_iface, 1) }
+    let buf = shm_buffer(mut f)
+    let parent = comp.create_surface(mut f.c)
+    let child = comp.create_surface(mut f.c)
+    let ss = sub.get_subsurface(mut f.c, child, parent)
+    ss.set_position(mut f.c, 10, 20)
+    child.attach(mut f.c, Some(buf), 0, 0)
+    child.commit(mut f.c)
+    discard pump(mut f)
+    // Cached: nothing applied yet.
+    var applied = 0
+    for e in events(mut f) {
+        match e {
+            Applied => applied += 1
+            _ => {}
+        }
+    }
+    assert_eq(applied, 0)
+    parent.attach(mut f.c, Some(buf), 0, 0)
+    parent.commit(mut f.c)
+    discard pump(mut f)
+    var root: Option[server.Surface] = None
+    for e in events(mut f) {
+        match e {
+            Applied(s) => {
+                applied += 1
+                if root.is_none() {
+                    root = Some(s)
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq(applied, 2)
+    var tree: List[(server.Surface, i32, i32)] = []
+    f.srv.tree(root.unwrap(), mut tree)
+    assert_eq(tree.len(), 2)
+    assert_eq((tree[1].1, tree[1].2), (i32(10), i32(20)))
+    // Below the parent now.
+    ss.place_below(mut f.c, parent)
+    parent.commit(mut f.c)
+    discard pump(mut f)
+    discard events(mut f)
+    tree.clear()
+    f.srv.tree(root.unwrap(), mut tree)
+    assert_eq((tree[0].1, tree[0].2), (i32(10), i32(20)))
+}
+
+test "popup placement flips and slides inside the bounds" {
+    let p = server.positioner.Positioner { width: 100, height: 50, anchor_rect: server.Rect { x: 0, y: 0, w: 20, h: 20 }, anchor: 8, gravity: 8, adjust: 4 | 8 | 1 }
+    // Room below right: as asked.
+    assert_eq(p.geometry(server.Rect { w: 500, h: 500 }), server.Rect { x: 20, y: 20, w: 100, h: 50 })
+    // No room below: flipped above the anchor.
+    let up = server.positioner.Positioner { anchor_rect: server.Rect { x: 0, y: 460, w: 20, h: 20 }, ..p }
+    assert_eq(up.geometry(server.Rect { w: 500, h: 500 }).y, i32(410))
+    // No room right, flipping does not fit either: slid in.
+    let wide = server.positioner.Positioner { width: 480, ..p }
+    assert_eq(wide.geometry(server.Rect { w: 490, h: 500 }).x, i32(10))
+}
+
+test "keyboard and pointer focus" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let seat = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(seat, 3)
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let kb = ws.get_keyboard(mut f.c)
+    let ptr = ws.get_pointer(mut f.c)
+    let buf = shm_buffer(mut f)
+    let surf = comp.create_surface(mut f.c)
+    surf.attach(mut f.c, Some(buf), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var s: Option[server.Surface] = None
+    for e in events(mut f) {
+        match e {
+            Applied(x) => s = Some(x)
+            _ => {}
+        }
+    }
+    let target = s.unwrap()
+    f.srv.keyboard_focus(seat, Some(target))
+    discard f.srv.key(seat, 5, 30, true)
+    f.srv.pointer_focus(seat, Some(target), 1.5, 2.5)
+    let bs = f.srv.pointer_button(seat, 6, 272, true)
+    var entered = false
+    var key = false
+    var ptr_in = false
+    var button = false
+    for e in pump(mut f) {
+        match e {
+            WlKeyboard(k, Enter(_, es, _)) => entered = k == kb and es == surf
+            WlKeyboard(_, Key(_, 5, 30, Pressed)) => key = true
+            WlPointer(p, Enter(_, es, x, y)) => ptr_in = p == ptr and es == surf and x == 1.5 and y == 2.5
+            WlPointer(_, Button(serial, 6, 272, Pressed)) => button = serial == bs
+            _ => {}
+        }
+    }
+    assert(entered and key and ptr_in and button)
+    assert_eq(f.srv.keyboard_focused(seat), Some(target))
+}
+
+test "a dmabuf commit waits for its fence" {
+    var f = setup()
+    discard f.srv.enable_dmabuf(server.Dmabuf { device: 0xe280, formats: [(u32(0x34325241), u64(0))] })
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let dm = dmabuf.Dmabuf { id: bind(mut f, dmabuf.dmabuf_iface, 4) }
+    let fb = dm.get_default_feedback(mut f.c)
+    var table = false
+    var tranches = 0
+    for e in pump(mut f) {
+        match e {
+            ZwpLinuxDmabufFeedback(_, FormatTable(_, 16)) => table = true
+            ZwpLinuxDmabufFeedback(_, TrancheDone) => tranches += 1
+            _ => {}
+        }
+    }
+    assert(table)
+    assert_eq(tranches, 1)
+    discard fb
+    let params = dm.create_params(mut f.c)
+    let fd = os.memfd("plane", 64).expect("memfd")
+    params.add_(mut f.c, fd, 0, 0, 16, 0, 0)
+    os.close(fd)
+    let buf = params.create_immed(mut f.c, 4, 4, 0x34325241, dmabuf.BufferParamsFlags(0))
+    let surf = comp.create_surface(mut f.c)
+    surf.attach(mut f.c, Some(buf), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var txn: Option[server.Txn] = None
+    var applied = false
+    for e in events(mut f) {
+        match e {
+            Committed(t) => txn = Some(t)
+            Applied => applied = true
+            _ => {}
+        }
+    }
+    assert(not applied)
+    let t = txn.expect("a waiting transaction")
+    assert_eq(f.srv.waits(t).len(), 1)
+    f.srv.ready(t)
+    for e in events(mut f) {
+        match e {
+            Applied => applied = true
+            _ => {}
+        }
+    }
+    assert(applied)
+}

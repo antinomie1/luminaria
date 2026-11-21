@@ -1,5 +1,39 @@
 // luminaria_server: the protocol state every compositor needs, with no GPU
-// and no policy. Surfaces and subsurfaces with double-buffered commits,
-// xdg-shell, seats and focus, outputs, shm and dmabuf buffers, explicit
-// sync, presentation and frame timing. Buffers and damage come out as plain
-// data; requests that need a decision come out as events.
+// and no policy. Surfaces and subsurfaces with double-buffered commits and
+// transactions, xdg-shell, seats and focus, outputs, shm and dmabuf
+// buffers, explicit sync, presentation and frame timing, the clipboard.
+// Buffers and damage come out as plain data; requests that need a
+// decision come out as events.
+
+pub import ids
+pub import server
+pub import state
+pub import xdg
+pub import positioner
+
+pub type Server = server.Server
+pub type Event = server.Event
+pub type Request = server.Request
+pub type Dmabuf = server.Dmabuf
+pub type SurfaceInfo = server.SurfaceInfo
+pub type BufferInfo = server.BufferInfo
+pub type BufferKind = server.BufferKind
+pub type OutputInfo = state.OutputInfo
+pub type Wait = state.Wait
+pub type States = xdg.States
+pub type Rect = ids.Rect
+pub type Client = ids.Client
+pub type Surface = ids.Surface
+pub type Buffer = ids.Buffer
+pub type Window = ids.Window
+pub type Popup = ids.Popup
+pub type Output = ids.Output
+pub type Seat = ids.Seat
+pub type Txn = ids.Txn
+
+pub let changed_buffer = state.changed_buffer
+pub let changed_damage = state.changed_damage
+pub let changed_geometry = state.changed_geometry
+pub let changed_opaque = state.changed_opaque
+pub let changed_input = state.changed_input
+pub let changed_tree = state.changed_tree

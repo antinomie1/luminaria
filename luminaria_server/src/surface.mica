@@ -1,0 +1,652 @@
+// wl_compositor, wl_surface, wl_region, wl_subcompositor, wl_subsurface.
+// A commit snapshots the pending state. A synchronized subsurface caches
+// it until its parent's commit carries it; any other commit becomes a
+// transaction with the cached states of its synchronized descendants. A
+// transaction applies at once unless it waits for a buffer fence, a fifo
+// barrier or a target time, and a client's transactions apply in order:
+// one slow fence holds back only that client.
+
+import std.mem
+import luminaria_wire as wire
+import luminaria_proto.wayland as wl
+import ids
+import state
+import server
+import xdg
+import extra
+
+fn compositor(mut srv: server.Server, ci: u32, take req: wl.CompositorRequest) {
+    match req {
+        CreateSurface(s) => {
+            let id = srv.surfaces.add(state.SurfaceData { client: ci, obj: s.id })
+            srv.surfaces.items[int(id.index)].stack.push(id.index)
+            srv.bind(ci, s.id, id.index)
+        }
+        CreateRegion(r) => {
+            let id = srv.regions.add(state.RegionData { client: ci })
+            srv.bind(ci, r.id, id.index)
+        }
+        Release => {}
+    }
+}
+
+fn region(mut srv: server.Server, ci: u32, r: wl.Region, take req: wl.RegionRequest) {
+    let ri = srv.slot(ci, r.id)
+    guard ri != state.none else {
+        return
+    }
+    match req {
+        Destroy => {
+            srv.regions.remove(ri, state.RegionData {})
+            srv.unbind(ci, r.id)
+        }
+        Add(x, y, w, h) => ids.region_add(mut srv.regions.items[int(ri)].rects, ids.Rect { x, y, w, h })
+        Subtract(x, y, w, h) => ids.region_sub(mut srv.regions.items[int(ri)].rects, ids.Rect { x, y, w, h })
+    }
+}
+
+/// The rectangles of region `id` of client `ci`.
+fn region_rects(srv: server.Server, ci: u32, id: u32) -> List[ids.Rect] {
+    let ri = srv.slot(ci, id)
+    guard ri != state.none else {
+        return []
+    }
+    return srv.regions.items[int(ri)].rects.clone()
+}
+
+fn request(mut srv: server.Server, ci: u32, s: wl.Surface, take req: wl.SurfaceRequest) {
+    let si = srv.slot(ci, s.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    match req {
+        Destroy => {
+            srv.unbind(ci, s.id)
+            destroy(mut srv, si)
+        }
+        Attach(b, x, y) => {
+            var buf: Option[ids.Id] = None
+            if let Some(bb) = b {
+                let bi = srv.slot(ci, bb.id)
+                if bi != state.none {
+                    buf = Some(srv.buffers.id(bi))
+                }
+            }
+            if srv.conns[int(ci)].version(s.id) >= 5 and (x != 0 or y != 0) {
+                srv.fail(ci, s.id, u32(wl.SurfaceError.InvalidOffset), "attach with an offset")
+                return
+            }
+            srv.surfaces.items[i].pending.attached = true
+            srv.surfaces.items[i].pending.buffer = buf
+            srv.surfaces.items[i].pending.dx = x
+            srv.surfaces.items[i].pending.dy = y
+        }
+        Damage(x, y, w, h) => ids.add_damage(mut srv.surfaces.items[i].pending.damage, ids.Rect { x, y, w, h })
+        DamageBuffer(x, y, w, h) => ids.add_damage(mut srv.surfaces.items[i].pending.bdamage, ids.Rect { x, y, w, h })
+        Frame(cb) => srv.surfaces.items[i].pending.frames.push(cb.id)
+        SetOpaqueRegion(r) => {
+            let rects = match r {
+                Some(rg) => region_rects(srv, ci, rg.id)
+                None => []
+            }
+            srv.surfaces.items[i].pending.opaque_set = true
+            srv.surfaces.items[i].pending.opaque = rects
+        }
+        SetInputRegion(r) => {
+            let rects: Option[List[ids.Rect]] = match r {
+                Some(rg) => Some(region_rects(srv, ci, rg.id))
+                None => None
+            }
+            srv.surfaces.items[i].pending.input_set = true
+            srv.surfaces.items[i].pending.input = rects
+        }
+        SetBufferTransform(t) => {
+            guard u32(t) <= 7 else {
+                srv.fail(ci, s.id, u32(wl.SurfaceError.InvalidTransform), "buffer transform {u32(t)}")
+                return
+            }
+            srv.surfaces.items[i].pending.transform_set = true
+            srv.surfaces.items[i].pending.transform = u32(t)
+        }
+        SetBufferScale(n) => {
+            guard n >= 1 else {
+                srv.fail(ci, s.id, u32(wl.SurfaceError.InvalidScale), "buffer scale {n}")
+                return
+            }
+            srv.surfaces.items[i].pending.scale_set = true
+            srv.surfaces.items[i].pending.scale = n
+        }
+        Offset(x, y) => {
+            srv.surfaces.items[i].pending.dx = x
+            srv.surfaces.items[i].pending.dy = y
+        }
+        Commit => commit(mut srv, si)
+        GetRelease => {}
+    }
+}
+
+/// Fold state `src` (newer) into `dst`.
+fn merge(mut dst: state.State, take src: state.State) {
+    var s = src
+    if s.attached {
+        dst.attached = true
+        dst.buffer = s.buffer
+        dst.dx = s.dx
+        dst.dy = s.dy
+    }
+    for r in s.damage {
+        ids.add_damage(mut dst.damage, r)
+    }
+    for r in s.bdamage {
+        ids.add_damage(mut dst.bdamage, r)
+    }
+    if s.opaque_set {
+        dst.opaque_set = true
+        dst.opaque = mem.replace(mut s.opaque, [])
+    }
+    if s.input_set {
+        dst.input_set = true
+        dst.input = s.input.take()
+    }
+    if s.transform_set {
+        dst.transform_set = true
+        dst.transform = s.transform
+    }
+    if s.scale_set {
+        dst.scale_set = true
+        dst.scale = s.scale
+    }
+    if s.viewport_set {
+        dst.viewport_set = true
+        dst.src = s.src
+        dst.dst_w = s.dst_w
+        dst.dst_h = s.dst_h
+    }
+    dst.frames.extend(mem.replace(mut s.frames, []))
+    dst.feedbacks.extend(mem.replace(mut s.feedbacks, []))
+    if s.acquire_set {
+        dst.acquire_set = true
+        dst.acquire = s.acquire
+        dst.acquire_point = s.acquire_point
+    }
+    if s.release_set {
+        dst.release_set = true
+        dst.release = s.release
+        dst.release_point = s.release_point
+    }
+    dst.fifo_barrier = dst.fifo_barrier or s.fifo_barrier
+    dst.fifo_wait = dst.fifo_wait or s.fifo_wait
+    if s.target_ns != 0 {
+        dst.target_ns = s.target_ns
+    }
+    if s.tearing_set {
+        dst.tearing_set = true
+        dst.tearing = s.tearing
+    }
+    if s.geometry_set {
+        dst.geometry_set = true
+        dst.geometry = s.geometry
+    }
+    if s.min_set {
+        dst.min_set = true
+        dst.min_w = s.min_w
+        dst.min_h = s.min_h
+    }
+    if s.max_set {
+        dst.max_set = true
+        dst.max_w = s.max_w
+        dst.max_h = s.max_h
+    }
+    if s.acked != 0 {
+        dst.acked = s.acked
+    }
+    dst.moves.extend(mem.replace(mut s.moves, []))
+    if s.order_set {
+        dst.order_set = true
+        dst.order = mem.replace(mut s.order, [])
+    }
+}
+
+/// Whether `si` or an ancestor is a synchronized subsurface.
+fn synced(srv: server.Server, si: u32) -> bool {
+    var s = si
+    var hops = 0
+    while srv.surfaces.items[int(s)].parent != state.none and hops < 64 {
+        if srv.surfaces.items[int(s)].synced {
+            return true
+        }
+        s = srv.surfaces.items[int(s)].parent
+        hops += 1
+    }
+    return false
+}
+
+fn commit(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    var p = mem.replace(mut srv.surfaces.items[i].pending, state.State {})
+    if synced(srv, si) {
+        merge(mut srv.surfaces.items[i].cached, take p)
+        srv.surfaces.items[i].has_cached = true
+        return
+    }
+    if srv.surfaces.items[i].has_cached {
+        var c = mem.replace(mut srv.surfaces.items[i].cached, state.State {})
+        merge(mut c, take p)
+        p = c
+        srv.surfaces.items[i].has_cached = false
+    }
+    var t = state.TxnData { client: srv.surfaces.items[i].client }
+    t.surfaces.push(srv.surfaces.id(si))
+    t.states.push(p)
+    carry(mut srv, si, mut t)
+    find_waits(srv, mut t)
+    queue(mut srv, take t)
+}
+
+/// Add the cached states of `si`'s synchronized descendants.
+fn carry(mut srv: server.Server, si: u32, mut t: state.TxnData) {
+    let n = srv.surfaces.items[int(si)].stack.len()
+    for k in 0..n {
+        let c = srv.surfaces.items[int(si)].stack[k]
+        guard c != si and srv.surfaces.items[int(c)].synced else {
+            continue
+        }
+        if srv.surfaces.items[int(c)].has_cached {
+            let st = mem.replace(mut srv.surfaces.items[int(c)].cached, state.State {})
+            srv.surfaces.items[int(c)].has_cached = false
+            t.surfaces.push(srv.surfaces.id(c))
+            t.states.push(st)
+        }
+        carry(mut srv, c, mut t)
+    }
+}
+
+fn find_waits(srv: server.Server, mut t: state.TxnData) {
+    for k in 0..t.states.len() {
+        let sid = t.surfaces[k]
+        if t.states[k].attached {
+            if let Some(b) = t.states[k].buffer {
+                if srv.buffers.live(b) and srv.buffers.items[int(b.index)].kind == state.BufferKind.Dmabuf {
+                    if t.states[k].acquire_set {
+                        let tl = t.states[k].acquire
+                        if srv.timelines.used(int(tl)) {
+                            if let Some(f) = srv.timelines.items[int(tl)].fd {
+                                t.waits.push(state.Wait.Timeline(f.raw(), t.states[k].acquire_point))
+                            }
+                        }
+                    } else if not srv.buffers.items[int(b.index)].planes.is_empty() {
+                        t.waits.push(state.Wait.Implicit(ids.Buffer { id: b }, srv.buffers.items[int(b.index)].planes[0].fd.raw()))
+                    }
+                }
+            }
+        }
+        if t.states[k].fifo_wait and srv.surfaces.items[int(sid.index)].barrier {
+            t.waits.push(state.Wait.Fifo(ids.Surface { id: sid }))
+        }
+        if t.states[k].target_ns > 0 {
+            t.waits.push(state.Wait.Time(t.states[k].target_ns))
+        }
+    }
+}
+
+fn queue(mut srv: server.Server, take t: state.TxnData) {
+    let ci = t.client
+    if srv.clients.items[int(ci)].txns.is_empty() and t.waits.is_empty() {
+        apply(mut srv, take t)
+        return
+    }
+    var tx = t
+    let waiting = not tx.waits.is_empty()
+    tx.ready = not waiting
+    let id = srv.txns.add(tx)
+    srv.clients.items[int(ci)].txns.push(id.index)
+    if waiting {
+        srv.push(server.Event.Committed(ids.Txn { id }))
+    }
+    drain(mut srv, ci)
+}
+
+/// Apply the client's ready transactions from the front of its queue.
+fn drain(mut srv: server.Server, ci: u32) {
+    while not srv.clients.items[int(ci)].txns.is_empty() {
+        let ti = srv.clients.items[int(ci)].txns[0]
+        guard srv.txns.items[int(ti)].ready else {
+            return
+        }
+        discard srv.clients.items[int(ci)].txns.remove(0)
+        let t = mem.replace(mut srv.txns.items[int(ti)], state.TxnData {})
+        srv.txns.remove(ti, state.TxnData {})
+        apply(mut srv, take t)
+    }
+}
+
+/// Transaction `t`'s waits are resolved.
+fn ready(mut srv: server.Server, t: ids.Txn) {
+    guard srv.txns.live(t.id) else {
+        return
+    }
+    srv.txns.items[int(t.id.index)].ready = true
+    let ci = srv.txns.items[int(t.id.index)].client
+    drain(mut srv, ci)
+}
+
+fn apply(mut srv: server.Server, take t: state.TxnData) {
+    var tx = t
+    var states = mem.replace(mut tx.states, [])
+    var k = 0
+    for st in take states {
+        let sid = tx.surfaces[k]
+        k += 1
+        if srv.surfaces.live(sid) {
+            apply_state(mut srv, sid.index, st)
+        }
+    }
+}
+
+fn apply_state(mut srv: server.Server, si: u32, take st: state.State) {
+    var s = st
+    let i = int(si)
+    var changed: u32 = 0
+    if s.attached {
+        if let Some(o) = srv.surfaces.items[i].current.buffer {
+            if srv.buffers.live(o) {
+                srv.buffers.items[int(o.index)].users -= 1
+            }
+        }
+        var bw: i32 = 0
+        var bh: i32 = 0
+        if let Some(nb) = s.buffer {
+            if srv.buffers.live(nb) {
+                srv.buffers.items[int(nb.index)].users += 1
+                srv.buffers.items[int(nb.index)].busy = true
+                bw = srv.buffers.items[int(nb.index)].width
+                bh = srv.buffers.items[int(nb.index)].height
+            }
+        }
+        srv.surfaces.items[i].current.buffer = s.buffer
+        srv.surfaces.items[i].buffer_w = bw
+        srv.surfaces.items[i].buffer_h = bh
+        srv.surfaces.items[i].release = if s.release_set { s.release } else { state.none }
+        srv.surfaces.items[i].release_point = s.release_point
+        changed |= state.changed_buffer
+    }
+    srv.surfaces.items[i].current.dx = s.dx
+    srv.surfaces.items[i].current.dy = s.dy
+    for r in s.damage {
+        ids.add_damage(mut srv.surfaces.items[i].applied_damage, r)
+        changed |= state.changed_damage
+    }
+    for r in s.bdamage {
+        ids.add_damage(mut srv.surfaces.items[i].applied_bdamage, r)
+        changed |= state.changed_damage
+    }
+    if s.opaque_set {
+        srv.surfaces.items[i].current.opaque = mem.replace(mut s.opaque, [])
+        changed |= state.changed_opaque
+    }
+    if s.input_set {
+        srv.surfaces.items[i].current.input = s.input.take()
+        changed |= state.changed_input
+    }
+    if s.transform_set {
+        srv.surfaces.items[i].current.transform = s.transform
+        changed |= state.changed_geometry
+    }
+    if s.scale_set {
+        srv.surfaces.items[i].current.scale = s.scale
+        changed |= state.changed_geometry
+    }
+    if s.viewport_set {
+        srv.surfaces.items[i].current.src = s.src
+        srv.surfaces.items[i].current.dst_w = s.dst_w
+        srv.surfaces.items[i].current.dst_h = s.dst_h
+        changed |= state.changed_geometry
+    }
+    srv.surfaces.items[i].frames.extend(mem.replace(mut s.frames, []))
+    if not s.feedbacks.is_empty() {
+        extra.discard_feedbacks(mut srv, si)
+        srv.surfaces.items[i].feedbacks = mem.replace(mut s.feedbacks, [])
+    }
+    if s.fifo_barrier {
+        srv.surfaces.items[i].barrier = true
+    }
+    if s.tearing_set {
+        srv.surfaces.items[i].current.tearing = s.tearing
+    }
+    if s.geometry_set {
+        srv.surfaces.items[i].current.geometry = s.geometry
+        srv.surfaces.items[i].current.geometry_set = true
+        changed |= state.changed_geometry
+    }
+    if s.min_set {
+        srv.surfaces.items[i].current.min_w = s.min_w
+        srv.surfaces.items[i].current.min_h = s.min_h
+    }
+    if s.max_set {
+        srv.surfaces.items[i].current.max_w = s.max_w
+        srv.surfaces.items[i].current.max_h = s.max_h
+    }
+    for m in s.moves {
+        let (c, x, y) = m
+        if srv.surfaces.used(int(c)) and srv.surfaces.items[int(c)].parent == si {
+            srv.surfaces.items[int(c)].sub_x = x
+            srv.surfaces.items[int(c)].sub_y = y
+            changed |= state.changed_tree
+        }
+    }
+    if s.order_set {
+        // Keep only members still in the tree, then any missing ones.
+        var order: List[u32] = []
+        for c in s.order {
+            if srv.surfaces.items[i].stack.contains(c) and not order.contains(c) {
+                order.push(c)
+            }
+        }
+        for c in srv.surfaces.items[i].stack {
+            if not order.contains(c) {
+                order.push(c)
+            }
+        }
+        srv.surfaces.items[i].stack = order
+        changed |= state.changed_tree
+    }
+    resize(mut srv, si)
+    let role = srv.surfaces.items[i].role
+    match role {
+        Toplevel(w) => xdg.toplevel_applied(mut srv, w, s.acked)
+        Popup(p) => xdg.popup_applied(mut srv, p, s.acked)
+        _ => srv.surfaces.items[i].mapped = srv.surfaces.items[i].current.buffer.is_some()
+    }
+    srv.surfaces.items[i].changed |= changed
+    srv.push(server.Event.Applied(ids.Surface { id: srv.surfaces.id(si) }))
+}
+
+/// Surface size from the buffer, scale, transform and viewport.
+fn resize(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let scale = max(srv.surfaces.items[i].current.scale, 1)
+    let transform = srv.surfaces.items[i].current.transform
+    let dst_w = srv.surfaces.items[i].current.dst_w
+    let dst_h = srv.surfaces.items[i].current.dst_h
+    let src = srv.surfaces.items[i].current.src
+    var w = srv.surfaces.items[i].buffer_w / scale
+    var h = srv.surfaces.items[i].buffer_h / scale
+    if transform % 2 == 1 {
+        let t = w
+        w = h
+        h = t
+    }
+    if dst_w > 0 and dst_h > 0 {
+        w = dst_w
+        h = dst_h
+    } else if src[2] > 0.0 {
+        w = i32(src[2])
+        h = i32(src[3])
+    }
+    if srv.surfaces.items[i].buffer_w == 0 {
+        w = 0
+        h = 0
+    }
+    srv.surfaces.items[i].width = w
+    srv.surfaces.items[i].height = h
+}
+
+fn subcompositor(mut srv: server.Server, ci: u32, take req: wl.SubcompositorRequest) {
+    match req {
+        Destroy => {}
+        GetSubsurface(sub, s, parent) => {
+            let si = srv.slot(ci, s.id)
+            let pi = srv.slot(ci, parent.id)
+            guard si != state.none and pi != state.none and si != pi else {
+                srv.fail(ci, sub.id, u32(wl.SubcompositorError.BadSurface), "bad subsurface")
+                return
+            }
+            guard srv.surfaces.items[int(si)].role == state.Role.Plain and srv.surfaces.items[int(si)].parent == state.none else {
+                srv.fail(ci, sub.id, u32(wl.SubcompositorError.BadSurface), "surface already has a role")
+                return
+            }
+            // No cycles: the parent must not descend from the surface.
+            var a = pi
+            var hops = 0
+            while a != state.none and hops < 64 {
+                guard a != si else {
+                    srv.fail(ci, sub.id, u32(wl.SubcompositorError.BadParent), "parent is a descendant")
+                    return
+                }
+                a = srv.surfaces.items[int(a)].parent
+                hops += 1
+            }
+            srv.surfaces.items[int(si)].role = state.Role.Sub
+            srv.surfaces.items[int(si)].parent = pi
+            srv.surfaces.items[int(si)].sub_obj = sub.id
+            srv.surfaces.items[int(si)].synced = true
+            srv.surfaces.items[int(pi)].stack.push(si)
+            srv.surfaces.items[int(pi)].changed |= state.changed_tree
+            srv.bind(ci, sub.id, si)
+        }
+    }
+}
+
+fn subsurface(mut srv: server.Server, ci: u32, sub: wl.Subsurface, take req: wl.SubsurfaceRequest) {
+    let si = srv.slot(ci, sub.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    let pi = srv.surfaces.items[i].parent
+    match req {
+        Destroy => {
+            srv.unbind(ci, sub.id)
+            destroy_subsurface(mut srv, si)
+        }
+        SetPosition(x, y) => {
+            guard pi != state.none else {
+                return
+            }
+            srv.surfaces.items[int(pi)].pending.moves.push((si, x, y))
+        }
+        PlaceAbove(other) => restack(mut srv, ci, sub.id, si, other.id, true)
+        PlaceBelow(other) => restack(mut srv, ci, sub.id, si, other.id, false)
+        SetSync => srv.surfaces.items[i].synced = true
+        SetDesync => {
+            srv.surfaces.items[i].synced = false
+            // Cached state applies now unless an ancestor is still synced.
+            if srv.surfaces.items[i].has_cached and not synced(srv, si) {
+                commit(mut srv, si)
+            }
+        }
+    }
+}
+
+/// Put `si` above or below sibling (or parent) `other` in the parent's
+/// pending order.
+fn restack(mut srv: server.Server, ci: u32, obj: u32, si: u32, other: u32, above: bool) {
+    let pi = srv.surfaces.items[int(si)].parent
+    let oi = srv.slot(ci, other)
+    guard pi != state.none and oi != state.none and oi != si and (oi == pi or srv.surfaces.items[int(oi)].parent == pi) else {
+        srv.fail(ci, obj, u32(wl.SubsurfaceError.BadSurface), "not a sibling or the parent")
+        return
+    }
+    let p = int(pi)
+    if not srv.surfaces.items[p].pending.order_set {
+        srv.surfaces.items[p].pending.order = srv.surfaces.items[p].stack.clone()
+        srv.surfaces.items[p].pending.order_set = true
+    }
+    srv.surfaces.items[p].pending.order.retain(fn(x) => x != si)
+    let at = srv.surfaces.items[p].pending.order.position(fn(x) => x == oi).unwrap_or(0)
+    srv.surfaces.items[p].pending.order.insert(if above { at + 1 } else { at }, si)
+}
+
+/// The subsurface role of `si` ends: it is unmapped and leaves the tree.
+fn destroy_subsurface(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let pi = srv.surfaces.items[i].parent
+    if pi != state.none {
+        srv.surfaces.items[int(pi)].stack.retain(fn(x) => x != si)
+        srv.surfaces.items[int(pi)].changed |= state.changed_tree
+        srv.push(server.Event.Applied(ids.Surface { id: srv.surfaces.id(pi) }))
+    }
+    srv.surfaces.items[i].parent = state.none
+    srv.surfaces.items[i].role = state.Role.Plain
+    srv.surfaces.items[i].sub_obj = 0
+    srv.surfaces.items[i].has_cached = false
+}
+
+fn destroy(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    guard srv.surfaces.used(i) else {
+        return
+    }
+    let id = srv.surfaces.id(si)
+    let role = srv.surfaces.items[i].role
+    match role {
+        Toplevel(w) => xdg.destroy_toplevel(mut srv, w)
+        Popup(p) => xdg.destroy_popup(mut srv, p)
+        _ => {}
+    }
+    if srv.surfaces.items[i].parent != state.none {
+        destroy_subsurface(mut srv, si)
+    }
+    // Children lose their parent (their subsurface objects become inert).
+    for c in srv.surfaces.items[i].stack.clone() {
+        if c != si and srv.surfaces.used(int(c)) {
+            srv.surfaces.items[int(c)].parent = state.none
+            srv.surfaces.items[int(c)].role = state.Role.Plain
+        }
+    }
+    if let Some(b) = srv.surfaces.items[i].current.buffer {
+        if srv.buffers.live(b) {
+            srv.buffers.items[int(b.index)].users -= 1
+        }
+    }
+    extra.discard_feedbacks(mut srv, si)
+    extra.surface_gone(mut srv, si)
+    srv.surfaces.remove(si, state.SurfaceData {})
+    srv.push(server.Event.SurfaceGone(ids.Surface { id }))
+}
+
+/// Send wl_callback.done to the surface's frame callbacks.
+fn frame_done(mut srv: server.Server, si: u32, ms: u32) {
+    let i = int(si)
+    let ci = srv.surfaces.items[i].client
+    for cb in mem.replace(mut srv.surfaces.items[i].frames, []) {
+        wl.Callback { id: cb }.done(mut srv.conns[int(ci)], ms)
+    }
+}
+
+/// Mapped surfaces of `si`'s tree bottom to top, with their offsets from
+/// `si` (subsurface positions summed).
+fn tree(srv: server.Server, si: u32, x: i32, y: i32, mut out: List[(ids.Surface, i32, i32)]) {
+    let n = srv.surfaces.items[int(si)].stack.len()
+    for k in 0..n {
+        let c = srv.surfaces.items[int(si)].stack[k]
+        if c == si {
+            if srv.surfaces.items[int(si)].mapped and srv.surfaces.items[int(si)].width > 0 {
+                out.push((ids.Surface { id: srv.surfaces.id(si) }, x, y))
+            }
+        } else if srv.surfaces.used(int(c)) and srv.surfaces.items[int(c)].current.buffer.is_some() {
+            tree(srv, c, x + srv.surfaces.items[int(c)].sub_x, y + srv.surfaces.items[int(c)].sub_y, mut out)
+        }
+    }
+}

@@ -1,0 +1,162 @@
+// wl_data_device_manager: the clipboard selection, per seat. The source
+// client offers MIME types; the focused client gets a data offer and asks
+// for one type with a pipe, which goes straight to the source. The data
+// never passes through the compositor. Drag and drop is declined (the
+// source is cancelled).
+
+import luminaria_proto.wayland as wl
+import ids
+import state
+import server
+
+fn manager(mut srv: server.Server, ci: u32, take req: wl.DataDeviceManagerRequest) {
+    match req {
+        CreateDataSource(src) => {
+            let id = srv.sources.add(state.SourceData { client: ci, obj: src.id })
+            srv.bind(ci, src.id, id.index)
+        }
+        GetDataDevice(dev, st) => {
+            let si = srv.slot(ci, st.id)
+            guard si != state.none else {
+                return
+            }
+            let version = srv.conns[int(ci)].version(dev.id)
+            srv.seats.items[int(si)].devices.push(state.Res { client: ci, id: dev.id, version })
+            srv.bind(ci, dev.id, si)
+            let f = srv.seats.items[int(si)].kb_focus
+            if f != state.none and srv.surfaces.used(int(f)) and srv.surfaces.items[int(f)].client == ci {
+                send_selection(mut srv, si, state.Res { client: ci, id: dev.id, version })
+            }
+        }
+        Release => {}
+    }
+}
+
+fn source(mut srv: server.Server, ci: u32, src: wl.DataSource, take req: wl.DataSourceRequest) {
+    let si = srv.slot(ci, src.id)
+    guard si != state.none else {
+        return
+    }
+    match take req {
+        Offer(mime) => srv.sources.items[int(si)].mimes.push(mime)
+        Destroy => {
+            srv.unbind(ci, src.id)
+            destroy_source(mut srv, si)
+        }
+        SetActions => {}
+    }
+}
+
+fn device(mut srv: server.Server, ci: u32, dev: wl.DataDevice, take req: wl.DataDeviceRequest) {
+    let si = srv.slot(ci, dev.id)
+    guard si != state.none else {
+        return
+    }
+    match req {
+        StartDrag(src, origin, icon, serial) => {
+            if let Some(s) = src {
+                s.cancelled(mut srv.conns[int(ci)])
+            }
+        }
+        SetSelection(src, serial) => {
+            var slot = state.none
+            if let Some(s) = src {
+                slot = srv.slot(ci, s.id)
+            }
+            set_selection(mut srv, si, slot)
+        }
+        Release => {
+            srv.unbind(ci, dev.id)
+            srv.seats.items[int(si)].devices.retain(fn(r) => not (r.client == ci and r.id == dev.id))
+        }
+    }
+}
+
+fn offer(mut srv: server.Server, ci: u32, o: wl.DataOffer, take req: wl.DataOfferRequest) {
+    let oi = srv.slot(ci, o.id)
+    guard oi != state.none else {
+        return
+    }
+    match take req {
+        Receive(mime, f) => {
+            let src = srv.offers.items[int(oi)].source
+            guard src != state.none and srv.sources.used(int(src)) else {
+                return
+            }
+            let sc = srv.sources.items[int(src)].client
+            let sobj = srv.sources.items[int(src)].obj
+            wl.DataSource { id: sobj }.send(mut srv.conns[int(sc)], mime, f.raw())
+        }
+        Destroy => {
+            srv.unbind(ci, o.id)
+            srv.offers.remove(oi, state.OfferData {})
+        }
+        _ => {}
+    }
+}
+
+fn set_selection(mut srv: server.Server, si: u32, src: u32) {
+    let i = int(si)
+    let old = srv.seats.items[i].selection
+    guard old != src else {
+        return
+    }
+    if old != state.none and srv.sources.used(int(old)) {
+        let oc = srv.sources.items[int(old)].client
+        let obj = srv.sources.items[int(old)].obj
+        wl.DataSource { id: obj }.cancelled(mut srv.conns[int(oc)])
+    }
+    srv.seats.items[i].selection = src
+    focus_changed(mut srv, si)
+}
+
+/// Offer the selection to the keyboard-focused client.
+fn focus_changed(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let f = srv.seats.items[i].kb_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    for k in 0..srv.seats.items[i].devices.len() {
+        let r = srv.seats.items[i].devices[k]
+        if r.client == fc {
+            send_selection(mut srv, si, r)
+        }
+    }
+}
+
+fn send_selection(mut srv: server.Server, si: u32, r: state.Res) {
+    let src = srv.seats.items[int(si)].selection
+    let dev = wl.DataDevice { id: r.id }
+    let c = int(r.client)
+    guard src != state.none and srv.sources.used(int(src)) else {
+        dev.selection(mut srv.conns[c], None)
+        return
+    }
+    let o = dev.data_offer(mut srv.conns[c])
+    let id = srv.offers.add(state.OfferData { client: r.client, obj: o.id, source: src })
+    srv.bind(r.client, o.id, id.index)
+    for mime in srv.sources.items[int(src)].mimes.clone() {
+        o.offer(mut srv.conns[c], mime)
+    }
+    dev.selection(mut srv.conns[c], Some(o))
+}
+
+fn destroy_source(mut srv: server.Server, si: u32) {
+    guard srv.sources.used(int(si)) else {
+        return
+    }
+    srv.sources.remove(si, state.SourceData {})
+    for i in 0..srv.seats.items.len() {
+        if srv.seats.used(i) and srv.seats.items[i].selection == si {
+            srv.seats.items[i].selection = state.none
+            focus_changed(mut srv, u32(i))
+        }
+    }
+    for k in 0..srv.offers.items.len() {
+        if srv.offers.used(k) and srv.offers.items[k].source == si {
+            srv.offers.items[k].source = state.none
+        }
+    }
+}

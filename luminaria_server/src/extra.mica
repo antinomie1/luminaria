@@ -1,0 +1,297 @@
+// Per-surface extensions: viewporter, fractional scale, presentation time,
+// fifo, commit timing, tearing control and linux-drm-syncobj. Their state
+// rides in the surface's double-buffered state; their objects map to the
+// surface slot.
+
+import std.mem
+import luminaria_proto.wayland as wl
+import luminaria_proto.viewporter as vp
+import luminaria_proto.fractional_scale as frac
+import luminaria_proto.presentation_time as pt
+import luminaria_proto.fifo as fifo_p
+import luminaria_proto.commit_timing as ct
+import luminaria_proto.tearing_control as tc
+import luminaria_proto.linux_drm_syncobj as so
+import ids
+import state
+import server
+import seat
+
+/// Bind extension object `id` to surface `s`, failing when it has one.
+fn attach(mut srv: server.Server, ci: u32, id: u32, s: wl.Surface) -> u32 {
+    let si = srv.slot(ci, s.id)
+    guard si != state.none else {
+        return state.none
+    }
+    srv.bind(ci, id, si)
+    return si
+}
+
+fn viewporter(mut srv: server.Server, ci: u32, take req: vp.ViewporterRequest) {
+    match req {
+        Destroy => {}
+        GetViewport(v, s) => {
+            let si = attach(mut srv, ci, v.id, s)
+            if si != state.none {
+                srv.surfaces.items[int(si)].viewport = v.id
+            }
+        }
+    }
+}
+
+fn viewport(mut srv: server.Server, ci: u32, v: vp.Viewport, take req: vp.ViewportRequest) {
+    let si = srv.slot(ci, v.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    match req {
+        Destroy => {
+            srv.unbind(ci, v.id)
+            srv.surfaces.items[i].viewport = 0
+            srv.surfaces.items[i].pending.viewport_set = true
+            srv.surfaces.items[i].pending.src = [-1.0, -1.0, -1.0, -1.0]
+            srv.surfaces.items[i].pending.dst_w = -1
+            srv.surfaces.items[i].pending.dst_h = -1
+        }
+        SetSource(x, y, w, h) => {
+            let unset = x == -1.0 and y == -1.0 and w == -1.0 and h == -1.0
+            guard unset or (x >= 0.0 and y >= 0.0 and w > 0.0 and h > 0.0) else {
+                srv.fail(ci, v.id, u32(vp.ViewportError.BadValue), "viewport source")
+                return
+            }
+            srv.surfaces.items[i].pending.viewport_set = true
+            srv.surfaces.items[i].pending.src = [x, y, w, h]
+            srv.surfaces.items[i].pending.dst_w = srv.surfaces.items[i].current.dst_w
+            srv.surfaces.items[i].pending.dst_h = srv.surfaces.items[i].current.dst_h
+        }
+        SetDestination(w, h) => {
+            let unset = w == -1 and h == -1
+            guard unset or (w > 0 and h > 0) else {
+                srv.fail(ci, v.id, u32(vp.ViewportError.BadValue), "viewport destination")
+                return
+            }
+            if not srv.surfaces.items[i].pending.viewport_set {
+                srv.surfaces.items[i].pending.src = srv.surfaces.items[i].current.src
+            }
+            srv.surfaces.items[i].pending.viewport_set = true
+            srv.surfaces.items[i].pending.dst_w = w
+            srv.surfaces.items[i].pending.dst_h = h
+        }
+    }
+}
+
+fn fractional_manager(mut srv: server.Server, ci: u32, take req: frac.ScaleManagerRequest) {
+    match req {
+        Destroy => {}
+        GetFractionalScale(f, s) => {
+            let si = attach(mut srv, ci, f.id, s)
+            if si != state.none {
+                srv.surfaces.items[int(si)].fractional = f.id
+            }
+        }
+    }
+}
+
+fn presentation(mut srv: server.Server, ci: u32, take req: pt.PresentationRequest) {
+    match req {
+        Destroy => {}
+        Feedback(s, fb) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none else {
+                return
+            }
+            srv.surfaces.items[int(si)].pending.feedbacks.push(fb.id)
+        }
+    }
+}
+
+fn presentation_bound(mut srv: server.Server, ci: u32, id: u32) {
+    // CLOCK_MONOTONIC: what KMS and every frame timestamp use.
+    pt.Presentation { id }.clock_id(mut srv.conns[int(ci)], 1)
+}
+
+/// The surface's last commit was shown at `ns` on output `oi`.
+fn presented(mut srv: server.Server, si: u32, oi: u32, ns: int, refresh_ns: int, seq: u64, flags: u32) {
+    let i = int(si)
+    let ci = srv.surfaces.items[i].client
+    let fbs = mem.replace(mut srv.surfaces.items[i].feedbacks, [])
+    guard not fbs.is_empty() else {
+        return
+    }
+    let secs = u64(ns / 1000000000)
+    let nsec = u32(ns % 1000000000)
+    for id in fbs {
+        let fb = pt.PresentationFeedback { id }
+        if srv.outputs.used(int(oi)) {
+            for k in 0..srv.outputs.items[int(oi)].binds.len() {
+                let (bc, oid, _) = srv.outputs.items[int(oi)].binds[k]
+                if bc == ci {
+                    fb.sync_output(mut srv.conns[int(ci)], wl.Output { id: oid })
+                }
+            }
+        }
+        fb.presented(mut srv.conns[int(ci)], u32(secs >> 32), u32(secs & 0xffffffff), nsec, u32(refresh_ns), u32(seq >> 32), u32(seq & 0xffffffff), pt.PresentationFeedbackKind(flags))
+    }
+}
+
+fn discard_feedbacks(mut srv: server.Server, si: u32) {
+    let i = int(si)
+    let ci = srv.surfaces.items[i].client
+    for id in mem.replace(mut srv.surfaces.items[i].feedbacks, []) {
+        pt.PresentationFeedback { id }.discarded(mut srv.conns[int(ci)])
+    }
+}
+
+fn fifo_manager(mut srv: server.Server, ci: u32, take req: fifo_p.FifoManagerRequest) {
+    match req {
+        Destroy => {}
+        GetFifo(f, s) => {
+            let si = attach(mut srv, ci, f.id, s)
+            if si != state.none {
+                srv.surfaces.items[int(si)].fifo = f.id
+            }
+        }
+    }
+}
+
+fn fifo(mut srv: server.Server, ci: u32, f: fifo_p.Fifo, take req: fifo_p.FifoRequest) {
+    let si = srv.slot(ci, f.id)
+    guard si != state.none else {
+        return
+    }
+    match req {
+        SetBarrier => srv.surfaces.items[int(si)].pending.fifo_barrier = true
+        WaitBarrier => srv.surfaces.items[int(si)].pending.fifo_wait = true
+        Destroy => {
+            srv.unbind(ci, f.id)
+            srv.surfaces.items[int(si)].fifo = 0
+        }
+    }
+}
+
+fn timing_manager(mut srv: server.Server, ci: u32, take req: ct.TimingManagerRequest) {
+    match req {
+        Destroy => {}
+        GetTimer(t, s) => {
+            let si = attach(mut srv, ci, t.id, s)
+            if si != state.none {
+                srv.surfaces.items[int(si)].timer = t.id
+            }
+        }
+    }
+}
+
+fn timer(mut srv: server.Server, ci: u32, t: ct.Timer, take req: ct.TimerRequest) {
+    let si = srv.slot(ci, t.id)
+    guard si != state.none else {
+        return
+    }
+    match req {
+        SetTimestamp(hi, lo, nsec) => {
+            let secs = (u64(hi) << 32) | u64(lo)
+            srv.surfaces.items[int(si)].pending.target_ns = int(secs) * 1000000000 + int(nsec)
+        }
+        Destroy => {
+            srv.unbind(ci, t.id)
+            srv.surfaces.items[int(si)].timer = 0
+        }
+    }
+}
+
+fn tearing_manager(mut srv: server.Server, ci: u32, take req: tc.ControlManagerRequest) {
+    match req {
+        Destroy => {}
+        GetTearingControl(t, s) => {
+            let si = attach(mut srv, ci, t.id, s)
+            if si != state.none {
+                srv.surfaces.items[int(si)].tearing = t.id
+            }
+        }
+    }
+}
+
+fn tearing(mut srv: server.Server, ci: u32, t: tc.Control, take req: tc.ControlRequest) {
+    let si = srv.slot(ci, t.id)
+    guard si != state.none else {
+        return
+    }
+    match req {
+        SetPresentationHint(h) => {
+            srv.surfaces.items[int(si)].pending.tearing_set = true
+            srv.surfaces.items[int(si)].pending.tearing = h == tc.ControlPresentationHint.Async
+        }
+        Destroy => {
+            srv.unbind(ci, t.id)
+            srv.surfaces.items[int(si)].tearing = 0
+            srv.surfaces.items[int(si)].pending.tearing_set = true
+            srv.surfaces.items[int(si)].pending.tearing = false
+        }
+    }
+}
+
+fn syncobj_manager(mut srv: server.Server, ci: u32, take req: so.ManagerRequest) {
+    match take req {
+        Destroy => {}
+        GetSurface(o, s) => {
+            let si = attach(mut srv, ci, o.id, s)
+            if si != state.none {
+                srv.surfaces.items[int(si)].syncobj = o.id
+            }
+        }
+        ImportTimeline(t, f) => {
+            let id = srv.timelines.add(state.TimelineData { client: ci, fd: Some(f) })
+            srv.bind(ci, t.id, id.index)
+        }
+    }
+}
+
+fn syncobj_surface(mut srv: server.Server, ci: u32, o: so.Surface, take req: so.SurfaceRequest) {
+    let si = srv.slot(ci, o.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    match req {
+        Destroy => {
+            srv.unbind(ci, o.id)
+            srv.surfaces.items[i].syncobj = 0
+        }
+        SetAcquirePoint(t, hi, lo) => {
+            srv.surfaces.items[i].pending.acquire_set = true
+            srv.surfaces.items[i].pending.acquire = srv.slot(ci, t.id)
+            srv.surfaces.items[i].pending.acquire_point = (u64(hi) << 32) | u64(lo)
+        }
+        SetReleasePoint(t, hi, lo) => {
+            srv.surfaces.items[i].pending.release_set = true
+            srv.surfaces.items[i].pending.release = srv.slot(ci, t.id)
+            srv.surfaces.items[i].pending.release_point = (u64(hi) << 32) | u64(lo)
+        }
+    }
+}
+
+/// An extension object of a disconnecting client went away.
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16) {
+    guard srv.surfaces.used(int(slot)) else {
+        return
+    }
+    let i = int(slot)
+    if iface == vp.viewport_iface {
+        srv.surfaces.items[i].viewport = 0
+    } else if iface == frac.scale_iface {
+        srv.surfaces.items[i].fractional = 0
+    } else if iface == fifo_p.fifo_iface {
+        srv.surfaces.items[i].fifo = 0
+    } else if iface == ct.timer_iface {
+        srv.surfaces.items[i].timer = 0
+    } else if iface == tc.control_iface {
+        srv.surfaces.items[i].tearing = 0
+    } else if iface == so.surface_iface {
+        srv.surfaces.items[i].syncobj = 0
+    }
+}
+
+/// Surface `si` is going: forget it in every seat.
+fn surface_gone(mut srv: server.Server, si: u32) {
+    seat.surface_gone(mut srv, si)
+}

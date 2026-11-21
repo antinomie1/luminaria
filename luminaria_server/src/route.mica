@@ -1,0 +1,171 @@
+// Routing: each decoded request to its module, and teardown of each kind
+// of object when its id goes away.
+
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.ifaces as ifaces
+import state
+import server
+import surface
+import buffer
+import xdg
+import seat
+import output
+import data
+import extra
+
+/// Object `id` (interface `iface`) of client `ci` went away: free what it
+/// owned.
+fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
+    let slot = srv.slot(ci, id)
+    srv.unbind(ci, id)
+    if iface == wl.registry_iface {
+        srv.clients.items[int(ci)].registries.retain(fn(r) => r != id)
+        return
+    }
+    guard slot != state.none else {
+        return
+    }
+    if iface == wl.surface_iface {
+        surface.destroy(mut srv, slot)
+    } else if iface == wl.buffer_iface {
+        buffer.destroy_buffer(mut srv, slot)
+    } else if iface == wl.shm_pool_iface {
+        buffer.unref_pool(mut srv, slot)
+    } else if iface == wl.region_iface {
+        srv.regions.remove(slot, state.RegionData {})
+    } else if iface == wl.subsurface_iface {
+        surface.destroy_subsurface(mut srv, slot)
+    } else if iface == proto.xdg_shell.toplevel_iface {
+        xdg.destroy_toplevel(mut srv, slot)
+    } else if iface == proto.xdg_shell.popup_iface {
+        xdg.destroy_popup(mut srv, slot)
+    } else if iface == proto.xdg_shell.surface_iface {
+        xdg.destroy_xdg_surface(mut srv, slot)
+    } else if iface == proto.xdg_shell.positioner_iface {
+        srv.positioners.remove(slot, state.PositionerData {})
+    } else if iface == wl.data_source_iface {
+        data.destroy_source(mut srv, slot)
+    } else if iface == wl.data_offer_iface {
+        srv.offers.remove(slot, state.OfferData {})
+    } else if iface == proto.linux_dmabuf.buffer_params_iface {
+        srv.params.remove(slot, state.ParamsData {})
+    } else if iface == proto.linux_drm_syncobj.timeline_iface {
+        srv.timelines.remove(slot, state.TimelineData {})
+    } else if iface == wl.keyboard_iface or iface == wl.pointer_iface or iface == wl.touch_iface or iface == wl.seat_iface or iface == wl.data_device_iface {
+        seat.drop_resource(mut srv, slot, ci, id)
+    } else if iface == wl.output_iface {
+        output.drop_bind(mut srv, slot, ci, id)
+    } else {
+        extra.destroyed(mut srv, ci, slot, iface)
+    }
+}
+
+fn handle(mut srv: server.Server, ci: u32, take r: proto.Request) {
+    match take r {
+        WlDisplay(_, req) => display(mut srv, ci, req)
+        WlRegistry(reg, req) => registry(mut srv, ci, reg, req)
+        WlFixes(_, req) => {
+            match req {
+                DestroyRegistry(reg) => {
+                    srv.clients.items[int(ci)].registries.retain(fn(x) => x != reg.id)
+                    srv.conns[int(ci)].remove(reg.id)
+                }
+                _ => {}
+            }
+        }
+        WlCompositor(_, req) => surface.compositor(mut srv, ci, req)
+        WlSurface(s, req) => surface.request(mut srv, ci, s, req)
+        WlRegion(rg, req) => surface.region(mut srv, ci, rg, req)
+        WlSubcompositor(_, req) => surface.subcompositor(mut srv, ci, req)
+        WlSubsurface(sub, req) => surface.subsurface(mut srv, ci, sub, req)
+        WlShm(_, req) => buffer.shm(mut srv, ci, req)
+        WlShmPool(p, req) => buffer.pool(mut srv, ci, p, req)
+        WlBuffer(b, req) => {}
+        XdgWmBase(w, req) => xdg.wm_base(mut srv, ci, w, req)
+        XdgPositioner(p, req) => xdg.positioner_request(mut srv, ci, p, req)
+        XdgSurface(x, req) => xdg.surface_request(mut srv, ci, x, req)
+        XdgToplevel(t, req) => xdg.toplevel(mut srv, ci, t, req)
+        XdgPopup(p, req) => xdg.popup(mut srv, ci, p, req)
+        WlSeat(st, req) => seat.request(mut srv, ci, st, req)
+        WlPointer(p, req) => seat.pointer_request(mut srv, ci, p, req)
+        WlKeyboard(_, req) => {}
+        WlTouch(_, req) => {}
+        WlOutput(_, req) => {}
+        WlDataDeviceManager(_, req) => data.manager(mut srv, ci, req)
+        WlDataDevice(d, req) => data.device(mut srv, ci, d, req)
+        WlDataSource(src, req) => data.source(mut srv, ci, src, req)
+        WlDataOffer(o, req) => data.offer(mut srv, ci, o, req)
+        ZwpLinuxDmabuf(_, req) => buffer.dmabuf(mut srv, ci, req)
+        ZwpLinuxBufferParams(p, req) => buffer.params(mut srv, ci, p, req)
+        ZwpLinuxDmabufFeedback(_, req) => {}
+        WpLinuxDrmSyncobjManager(_, req) => extra.syncobj_manager(mut srv, ci, req)
+        WpLinuxDrmSyncobjTimeline(_, req) => {}
+        WpLinuxDrmSyncobjSurface(o, req) => extra.syncobj_surface(mut srv, ci, o, req)
+        WpPresentation(_, req) => extra.presentation(mut srv, ci, req)
+        WpViewporter(_, req) => extra.viewporter(mut srv, ci, req)
+        WpViewport(v, req) => extra.viewport(mut srv, ci, v, req)
+        WpFractionalScaleManager(_, req) => extra.fractional_manager(mut srv, ci, req)
+        WpFractionalScale(_, req) => {}
+        WpFifoManager(_, req) => extra.fifo_manager(mut srv, ci, req)
+        WpFifo(f, req) => extra.fifo(mut srv, ci, f, req)
+        WpCommitTimingManager(_, req) => extra.timing_manager(mut srv, ci, req)
+        WpCommitTimer(t, req) => extra.timer(mut srv, ci, t, req)
+        WpTearingControlManager(_, req) => extra.tearing_manager(mut srv, ci, req)
+        WpTearingControl(t, req) => extra.tearing(mut srv, ci, t, req)
+        _ => {}
+    }
+}
+
+fn display(mut srv: server.Server, ci: u32, take req: wl.DisplayRequest) {
+    match req {
+        Sync(cb) => {
+            let s = srv.next_serial()
+            cb.done(mut srv.conns[int(ci)], s)
+        }
+        GetRegistry(reg) => {
+            srv.clients.items[int(ci)].registries.push(reg.id)
+            for i in 0..srv.globals.len() {
+                let g = srv.globals[i]
+                if g.alive {
+                    reg.global(mut srv.conns[int(ci)], u32(i + 1), ifaces.name(g.iface), g.version)
+                }
+            }
+        }
+    }
+}
+
+fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.RegistryRequest) {
+    match req {
+        Bind(name, obj) => {
+            guard name > 0 and int(name) <= srv.globals.len() else {
+                srv.fail(ci, reg.id, wire.invalid_object, "no global {name}")
+                return
+            }
+            let g = srv.globals[int(name - 1)]
+            guard obj.iface == g.iface and obj.version >= 1 and obj.version <= g.version else {
+                srv.fail(ci, reg.id, wire.invalid_object, "bind of global {name} as {ifaces.name(obj.iface)} v{obj.version}")
+                return
+            }
+            guard g.alive else {
+                // Removed meanwhile: an inert object, as libwayland does.
+                return
+            }
+            match g.kind {
+                Output(slot) => output.bound(mut srv, ci, slot, obj.id, obj.version)
+                Seat(slot) => seat.bound(mut srv, ci, slot, obj.id, obj.version)
+                Static => {
+                    if g.iface == wl.shm_iface {
+                        buffer.shm_bound(mut srv, ci, obj.id)
+                    } else if g.iface == proto.linux_dmabuf.dmabuf_iface {
+                        buffer.dmabuf_bound(mut srv, ci, obj.id, obj.version)
+                    } else if g.iface == proto.presentation_time.presentation_iface {
+                        extra.presentation_bound(mut srv, ci, obj.id)
+                    }
+                }
+            }
+        }
+    }
+}
+

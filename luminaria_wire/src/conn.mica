@@ -118,8 +118,22 @@ pub fn Conn.new(sock: int, end: End) -> Result[Conn, Error] {
     return Ok(Conn { fd: sock, end, rx, low })
 }
 
+/// A connection to nobody: every read fails and sends are dropped. Fills
+/// the slots of disconnected clients.
+pub fn Conn.closed() -> Conn {
+    return Conn { fd: -1, end: End.Server, rx: [], dead: Some("closed") }
+}
+
+/// One past the largest id the peer may have used (iterate `1..` it to
+/// visit every object, `iface` 0 being free).
+pub fn Conn.id_limit(self) -> u32 {
+    return u32(self.low.len())
+}
+
 fn Conn.drop(mut self) {
-    os.close(self.fd)
+    if self.fd >= 0 {
+        os.close(self.fd)
+    }
     for i in self.fds_in_lo..self.fds_in.len() {
         os.close(self.fds_in[i])
     }

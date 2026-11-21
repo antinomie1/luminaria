@@ -1,0 +1,163 @@
+// xdg_positioner: where a popup goes relative to its parent's window
+// geometry, kept inside a constraint rectangle by flipping, sliding and
+// resizing as the client allows.
+
+import ids
+
+pub let anchor_none: u32 = 0
+let edge_top: u32 = 1
+let edge_bottom: u32 = 2
+let edge_left: u32 = 3
+let edge_right: u32 = 4
+let edge_top_left: u32 = 5
+let edge_bottom_left: u32 = 6
+let edge_top_right: u32 = 7
+let edge_bottom_right: u32 = 8
+
+let slide_x: u32 = 1
+let slide_y: u32 = 2
+let flip_x: u32 = 4
+let flip_y: u32 = 8
+let resize_x: u32 = 16
+let resize_y: u32 = 32
+
+pub struct Positioner {
+    pub width: i32 = 0
+    pub height: i32 = 0
+    pub anchor_rect: ids.Rect = ids.Rect {}
+    pub anchor: u32 = 0
+    pub gravity: u32 = 0
+    pub adjust: u32 = 0
+    pub off_x: i32 = 0
+    pub off_y: i32 = 0
+    pub reactive: bool = false
+}
+
+/// -1 left, 0 center, 1 right of an anchor or gravity value.
+fn horizontal(e: u32) -> int {
+    return match e {
+        3 or 5 or 6 => -1
+        4 or 7 or 8 => 1
+        _ => 0
+    }
+}
+
+/// -1 top, 0 middle, 1 bottom.
+fn vertical(e: u32) -> int {
+    return match e {
+        1 or 5 or 7 => -1
+        2 or 6 or 8 => 1
+        _ => 0
+    }
+}
+
+/// The edge value with the given sides.
+fn edge(h: int, v: int) -> u32 {
+    return match (h, v) {
+        (0, -1) => edge_top
+        (0, 1) => edge_bottom
+        (-1, 0) => edge_left
+        (1, 0) => edge_right
+        (-1, -1) => edge_top_left
+        (-1, 1) => edge_bottom_left
+        (1, -1) => edge_top_right
+        (1, 1) => edge_bottom_right
+        _ => anchor_none
+    }
+}
+
+/// The popup rectangle for anchor and gravity sides, before constraints.
+fn place(p: Positioner, ah: int, av: int, gh: int, gv: int) -> ids.Rect {
+    let a = p.anchor_rect
+    let ax = match ah {
+        -1 => a.x
+        1 => a.x + a.w
+        _ => a.x + a.w / 2
+    }
+    let ay = match av {
+        -1 => a.y
+        1 => a.y + a.h
+        _ => a.y + a.h / 2
+    }
+    let x = match gh {
+        -1 => ax - p.width
+        1 => ax
+        _ => ax - p.width / 2
+    }
+    let y = match gv {
+        -1 => ay - p.height
+        1 => ay
+        _ => ay - p.height / 2
+    }
+    return ids.Rect { x: x + p.off_x, y: y + p.off_y, w: p.width, h: p.height }
+}
+
+fn fits_x(r: ids.Rect, c: ids.Rect) -> bool {
+    return r.x >= c.x and r.x + r.w <= c.x + c.w
+}
+
+fn fits_y(r: ids.Rect, c: ids.Rect) -> bool {
+    return r.y >= c.y and r.y + r.h <= c.y + c.h
+}
+
+/// Where the popup goes: relative to the parent's window geometry, kept in
+/// `bounds` (also relative to it) as far as the positioner allows. Empty
+/// `bounds` means unconstrained.
+pub fn Positioner.geometry(self, bounds: ids.Rect) -> ids.Rect {
+    let ah = horizontal(self.anchor)
+    let av = vertical(self.anchor)
+    let gh = horizontal(self.gravity)
+    let gv = vertical(self.gravity)
+    var r = place(self, ah, av, gh, gv)
+    guard not bounds.is_empty() else {
+        return r
+    }
+    if not fits_x(r, bounds) and self.adjust & flip_x != 0 {
+        let f = place(self, -ah, av, -gh, gv)
+        if fits_x(f, bounds) {
+            r = ids.Rect { x: f.x, ..r }
+        }
+    }
+    if not fits_y(r, bounds) and self.adjust & flip_y != 0 {
+        let f = place(self, ah, -av, gh, -gv)
+        if fits_y(f, bounds) {
+            r = ids.Rect { y: f.y, ..r }
+        }
+    }
+    if not fits_x(r, bounds) and self.adjust & slide_x != 0 {
+        if r.x + r.w > bounds.x + bounds.w {
+            r.x = bounds.x + bounds.w - r.w
+        }
+        if r.x < bounds.x {
+            r.x = bounds.x
+        }
+    }
+    if not fits_y(r, bounds) and self.adjust & slide_y != 0 {
+        if r.y + r.h > bounds.y + bounds.h {
+            r.y = bounds.y + bounds.h - r.h
+        }
+        if r.y < bounds.y {
+            r.y = bounds.y
+        }
+    }
+    if not fits_x(r, bounds) and self.adjust & resize_x != 0 {
+        let x0 = max(r.x, bounds.x)
+        let x1 = min(r.x + r.w, bounds.x + bounds.w)
+        if x1 > x0 {
+            r = ids.Rect { x: x0, w: x1 - x0, ..r }
+        }
+    }
+    if not fits_y(r, bounds) and self.adjust & resize_y != 0 {
+        let y0 = max(r.y, bounds.y)
+        let y1 = min(r.y + r.h, bounds.y + bounds.h)
+        if y1 > y0 {
+            r = ids.Rect { y: y0, h: y1 - y0, ..r }
+        }
+    }
+    return r
+}
+
+/// A positioner is complete once it has a size and an anchor rectangle.
+pub fn Positioner.complete(self) -> bool {
+    return self.width > 0 and self.height > 0 and self.anchor_rect.w > 0 and self.anchor_rect.h > 0
+}

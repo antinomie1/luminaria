@@ -1,0 +1,509 @@
+// wl_seat with its pointers, keyboards and touch points. The compositor
+// decides focus and coordinates; these functions turn that into enter /
+// leave pairs, serials and events to the focused client's objects only.
+
+import std.os
+import luminaria_wire as wire
+import luminaria_proto.wayland as wl
+import ids
+import state
+import server
+import data
+
+fn bound(mut srv: server.Server, ci: u32, si: u32, id: u32, version: u32) {
+    let i = int(si)
+    srv.seats.items[i].seats.push(state.Res { client: ci, id, version })
+    srv.bind(ci, id, si)
+    let st = wl.Seat { id }
+    let caps = wl.SeatCapability(srv.seats.items[i].caps)
+    st.capabilities(mut srv.conns[int(ci)], caps)
+    let name = srv.seats.items[i].name.clone()
+    st.name(mut srv.conns[int(ci)], name)
+}
+
+fn add(mut srv: server.Server, take name: str) -> ids.Seat {
+    let id = srv.seats.add(state.SeatData { name })
+    let g = srv.add_dynamic(wl.seat_iface, 9, state.GlobalKind.Seat(id.index))
+    srv.seats.items[int(id.index)].global = g
+    return ids.Seat { id }
+}
+
+/// Which devices the seat has (pointer 1, keyboard 2, touch 4).
+fn set_caps(mut srv: server.Server, si: u32, caps: u32) {
+    let i = int(si)
+    guard srv.seats.items[i].caps != caps else {
+        return
+    }
+    srv.seats.items[i].caps = caps
+    for k in 0..srv.seats.items[i].seats.len() {
+        let r = srv.seats.items[i].seats[k]
+        wl.Seat { id: r.id }.capabilities(mut srv.conns[int(r.client)], wl.SeatCapability(caps))
+    }
+}
+
+fn request(mut srv: server.Server, ci: u32, st: wl.Seat, take req: wl.SeatRequest) {
+    let si = srv.slot(ci, st.id)
+    guard si != state.none else {
+        return
+    }
+    let i = int(si)
+    let version = srv.conns[int(ci)].version(st.id)
+    match req {
+        GetPointer(p) => {
+            srv.seats.items[i].pointers.push(state.Res { client: ci, id: p.id, version })
+            srv.bind(ci, p.id, si)
+        }
+        GetKeyboard(k) => {
+            srv.seats.items[i].keyboards.push(state.Res { client: ci, id: k.id, version })
+            srv.bind(ci, k.id, si)
+            send_keymap(mut srv, si, ci, k.id, version)
+            // Already focused: this keyboard enters too.
+            let f = srv.seats.items[i].kb_focus
+            if f != state.none and srv.surfaces.used(int(f)) and srv.surfaces.items[int(f)].client == ci {
+                let serial = srv.next_serial()
+                enter_keyboard(mut srv, si, state.Res { client: ci, id: k.id, version }, f, serial)
+            }
+        }
+        GetTouch(t) => {
+            srv.seats.items[i].touches.push(state.Res { client: ci, id: t.id, version })
+            srv.bind(ci, t.id, si)
+        }
+        Release => {
+            srv.unbind(ci, st.id)
+            drop_resource(mut srv, si, ci, st.id)
+        }
+    }
+}
+
+fn pointer_request(mut srv: server.Server, ci: u32, p: wl.Pointer, take req: wl.PointerRequest) {
+    let si = srv.slot(ci, p.id)
+    guard si != state.none else {
+        return
+    }
+    match req {
+        SetCursor(serial, s, hx, hy) => {
+            // Only the client the pointer is over, with its enter serial.
+            let f = srv.seats.items[int(si)].ptr_focus
+            guard f != state.none and srv.surfaces.used(int(f)) and srv.surfaces.items[int(f)].client == ci else {
+                return
+            }
+            guard serial == srv.clients.items[int(ci)].enter_serial else {
+                return
+            }
+            var surf: Option[ids.Surface] = None
+            if let Some(cs) = s {
+                let c = srv.slot(ci, cs.id)
+                if c != state.none {
+                    let role = srv.surfaces.items[int(c)].role
+                    guard role == state.Role.Plain or role == state.Role.Cursor else {
+                        srv.fail(ci, p.id, 0, "cursor surface has another role")
+                        return
+                    }
+                    srv.surfaces.items[int(c)].role = state.Role.Cursor
+                    surf = Some(ids.Surface { id: srv.surfaces.id(c) })
+                }
+            }
+            srv.push(server.Event.Cursor(ids.Seat { id: srv.seats.id(si) }, surf, hx, hy))
+        }
+        Release => {
+            srv.unbind(ci, p.id)
+            drop_resource(mut srv, si, ci, p.id)
+        }
+    }
+}
+
+/// Forget resource `id` of client `ci` in seat `si`, whatever its kind.
+fn drop_resource(mut srv: server.Server, si: u32, ci: u32, id: u32) {
+    let i = int(si)
+    guard srv.seats.used(i) else {
+        return
+    }
+    srv.seats.items[i].seats.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].pointers.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].keyboards.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].touches.retain(fn(r) => not (r.client == ci and r.id == id))
+    srv.seats.items[i].devices.retain(fn(r) => not (r.client == ci and r.id == id))
+}
+
+// ------------------------------------------------------------ keyboard
+
+fn send_keymap(mut srv: server.Server, si: u32, ci: u32, id: u32, version: u32) {
+    let i = int(si)
+    let k = wl.Keyboard { id }
+    var fd = -1
+    if let Some(f) = srv.seats.items[i].keymap {
+        fd = f.raw()
+    }
+    let size = srv.seats.items[i].keymap_size
+    if fd >= 0 {
+        k.keymap(mut srv.conns[int(ci)], wl.KeyboardKeymapFormat.XkbV1, fd, size)
+    }
+    let rate = srv.seats.items[i].rate
+    let delay = srv.seats.items[i].delay
+    k.repeat_info(mut srv.conns[int(ci)], rate, delay)
+}
+
+/// Use keymap `fd` (a sealed memfd of `size` bytes, taken) for the seat.
+fn set_keymap(mut srv: server.Server, si: u32, fd: int, size: u32) {
+    let i = int(si)
+    srv.seats.items[i].keymap = Some(wire.Fd.of(fd))
+    srv.seats.items[i].keymap_size = size
+    for k in 0..srv.seats.items[i].keyboards.len() {
+        let r = srv.seats.items[i].keyboards[k]
+        send_keymap(mut srv, si, r.client, r.id, r.version)
+    }
+}
+
+fn set_repeat(mut srv: server.Server, si: u32, rate: i32, delay: i32) {
+    let i = int(si)
+    srv.seats.items[i].rate = rate
+    srv.seats.items[i].delay = delay
+    for k in 0..srv.seats.items[i].keyboards.len() {
+        let r = srv.seats.items[i].keyboards[k]
+        if r.version >= 4 {
+            wl.Keyboard { id: r.id }.repeat_info(mut srv.conns[int(r.client)], rate, delay)
+        }
+    }
+}
+
+fn keys_bytes(keys: &[u32]) -> List[u8] {
+    var out: List[u8] = []
+    for k in keys {
+        for j in 0..4 {
+            out.push(u8((k >> u32(8 * j)) & 0xff))
+        }
+    }
+    return out
+}
+
+fn enter_keyboard(mut srv: server.Server, si: u32, r: state.Res, surf: u32, serial: u32) {
+    let i = int(si)
+    let obj = srv.surfaces.items[int(surf)].obj
+    let keys = keys_bytes(srv.seats.items[i].pressed)
+    let k = wl.Keyboard { id: r.id }
+    k.enter(mut srv.conns[int(r.client)], serial, wl.Surface { id: obj }, keys)
+    let m = srv.seats.items[i].mods
+    k.modifiers(mut srv.conns[int(r.client)], serial, m[0], m[1], m[2], m[3])
+}
+
+/// Move keyboard focus to `surf` (`none` for nothing): leave and enter.
+fn keyboard_focus(mut srv: server.Server, si: u32, surf: u32) {
+    let i = int(si)
+    let old = srv.seats.items[i].kb_focus
+    guard old != surf else {
+        return
+    }
+    let serial = srv.next_serial()
+    if old != state.none and srv.surfaces.used(int(old)) {
+        let oc = srv.surfaces.items[int(old)].client
+        let obj = srv.surfaces.items[int(old)].obj
+        for k in 0..srv.seats.items[i].keyboards.len() {
+            let r = srv.seats.items[i].keyboards[k]
+            if r.client == oc {
+                wl.Keyboard { id: r.id }.leave(mut srv.conns[int(r.client)], serial, wl.Surface { id: obj })
+            }
+        }
+    }
+    srv.seats.items[i].kb_focus = surf
+    if surf != state.none and srv.surfaces.used(int(surf)) {
+        let nc = srv.surfaces.items[int(surf)].client
+        for k in 0..srv.seats.items[i].keyboards.len() {
+            let r = srv.seats.items[i].keyboards[k]
+            if r.client == nc {
+                enter_keyboard(mut srv, si, r, surf, serial)
+            }
+        }
+    }
+    data.focus_changed(mut srv, si)
+}
+
+/// A key (evdev code) went down or up; sent to the focused client.
+fn key(mut srv: server.Server, si: u32, time: u32, code: u32, pressed: bool) -> u32 {
+    let i = int(si)
+    if pressed {
+        if not srv.seats.items[i].pressed.contains(code) {
+            srv.seats.items[i].pressed.push(code)
+        }
+    } else {
+        srv.seats.items[i].pressed.retain(fn(c) => c != code)
+    }
+    let serial = srv.next_serial()
+    let f = srv.seats.items[i].kb_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return serial
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    let st = if pressed { wl.KeyboardKeyState.Pressed } else { wl.KeyboardKeyState.Released }
+    for k in 0..srv.seats.items[i].keyboards.len() {
+        let r = srv.seats.items[i].keyboards[k]
+        if r.client == fc {
+            wl.Keyboard { id: r.id }.key(mut srv.conns[int(r.client)], serial, time, code, st)
+        }
+    }
+    return serial
+}
+
+fn modifiers(mut srv: server.Server, si: u32, depressed: u32, latched: u32, locked: u32, group: u32) {
+    let i = int(si)
+    let m: [4]u32 = [depressed, latched, locked, group]
+    guard srv.seats.items[i].mods != m else {
+        return
+    }
+    srv.seats.items[i].mods = m
+    let f = srv.seats.items[i].kb_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return
+    }
+    let fc = srv.surfaces.items[int(f)].client
+    let serial = srv.next_serial()
+    for k in 0..srv.seats.items[i].keyboards.len() {
+        let r = srv.seats.items[i].keyboards[k]
+        if r.client == fc {
+            wl.Keyboard { id: r.id }.modifiers(mut srv.conns[int(r.client)], serial, depressed, latched, locked, group)
+        }
+    }
+}
+
+// ------------------------------------------------------------- pointer
+
+fn frame_ptrs(mut srv: server.Server, si: u32, fc: u32) {
+    let i = int(si)
+    for k in 0..srv.seats.items[i].pointers.len() {
+        let r = srv.seats.items[i].pointers[k]
+        if r.client == fc and r.version >= 5 {
+            wl.Pointer { id: r.id }.frame(mut srv.conns[int(r.client)])
+        }
+    }
+}
+
+/// The pointer is over `surf` at surface-local `x, y` (`none`: over no
+/// client): leave the old surface, enter the new one.
+fn pointer_focus(mut srv: server.Server, si: u32, surf: u32, x: f64, y: f64) {
+    let i = int(si)
+    let old = srv.seats.items[i].ptr_focus
+    guard old != surf else {
+        return
+    }
+    let serial = srv.next_serial()
+    if old != state.none and srv.surfaces.used(int(old)) {
+        let oc = srv.surfaces.items[int(old)].client
+        let obj = srv.surfaces.items[int(old)].obj
+        for k in 0..srv.seats.items[i].pointers.len() {
+            let r = srv.seats.items[i].pointers[k]
+            if r.client == oc {
+                wl.Pointer { id: r.id }.leave(mut srv.conns[int(r.client)], serial, wl.Surface { id: obj })
+            }
+        }
+        frame_ptrs(mut srv, si, oc)
+    }
+    srv.seats.items[i].ptr_focus = surf
+    if surf != state.none and srv.surfaces.used(int(surf)) {
+        let nc = srv.surfaces.items[int(surf)].client
+        let obj = srv.surfaces.items[int(surf)].obj
+        srv.clients.items[int(nc)].enter_serial = serial
+        for k in 0..srv.seats.items[i].pointers.len() {
+            let r = srv.seats.items[i].pointers[k]
+            if r.client == nc {
+                wl.Pointer { id: r.id }.enter(mut srv.conns[int(r.client)], serial, wl.Surface { id: obj }, x, y)
+            }
+        }
+        frame_ptrs(mut srv, si, nc)
+    }
+}
+
+fn focused_client(srv: server.Server, si: u32) -> u32 {
+    let f = srv.seats.items[int(si)].ptr_focus
+    guard f != state.none and srv.surfaces.used(int(f)) else {
+        return state.none
+    }
+    return srv.surfaces.items[int(f)].client
+}
+
+fn pointer_motion(mut srv: server.Server, si: u32, time: u32, x: f64, y: f64) {
+    let fc = focused_client(srv, si)
+    guard fc != state.none else {
+        return
+    }
+    let i = int(si)
+    for k in 0..srv.seats.items[i].pointers.len() {
+        let r = srv.seats.items[i].pointers[k]
+        if r.client == fc {
+            wl.Pointer { id: r.id }.motion(mut srv.conns[int(r.client)], time, x, y)
+        }
+    }
+    frame_ptrs(mut srv, si, fc)
+}
+
+fn pointer_button(mut srv: server.Server, si: u32, time: u32, button: u32, pressed: bool) -> u32 {
+    let serial = srv.next_serial()
+    let fc = focused_client(srv, si)
+    guard fc != state.none else {
+        return serial
+    }
+    let i = int(si)
+    let st = if pressed { wl.PointerButtonState.Pressed } else { wl.PointerButtonState.Released }
+    for k in 0..srv.seats.items[i].pointers.len() {
+        let r = srv.seats.items[i].pointers[k]
+        if r.client == fc {
+            wl.Pointer { id: r.id }.button(mut srv.conns[int(r.client)], serial, time, button, st)
+        }
+    }
+    frame_ptrs(mut srv, si, fc)
+    return serial
+}
+
+/// Scroll by `dx, dy` (surface pixels); `v120x, v120y` are wheel clicks in
+/// 120ths (0 for continuous sources); `source` as wl_pointer.axis_source.
+fn pointer_axis(mut srv: server.Server, si: u32, time: u32, source: u32, dx: f64, dy: f64, v120x: i32, v120y: i32, inverted: bool) {
+    let fc = focused_client(srv, si)
+    guard fc != state.none else {
+        return
+    }
+    let i = int(si)
+    for k in 0..srv.seats.items[i].pointers.len() {
+        let r = srv.seats.items[i].pointers[k]
+        guard r.client == fc else {
+            continue
+        }
+        let p = wl.Pointer { id: r.id }
+        let c = int(r.client)
+        if r.version >= 5 {
+            p.axis_source(mut srv.conns[c], wl.PointerAxisSource(source))
+        }
+        for (axis, v, v120) in [(wl.PointerAxis.VerticalScroll, dy, v120y), (wl.PointerAxis.HorizontalScroll, dx, v120x)] {
+            guard v != 0.0 or v120 != 0 else {
+                continue
+            }
+            if r.version >= 9 {
+                p.axis_relative_direction(mut srv.conns[c], axis, if inverted { wl.PointerAxisRelativeDirection.Inverted } else { wl.PointerAxisRelativeDirection.Identical })
+            }
+            if v120 != 0 {
+                if r.version >= 8 {
+                    p.axis_value120(mut srv.conns[c], axis, v120)
+                } else if r.version >= 5 {
+                    p.axis_discrete(mut srv.conns[c], axis, v120 / 120)
+                }
+            }
+            p.axis(mut srv.conns[c], time, axis, v)
+        }
+        if dx == 0.0 and dy == 0.0 and v120x == 0 and v120y == 0 and r.version >= 5 {
+            // End of a continuous scroll (kinetic scrolling starts here).
+            p.axis_stop(mut srv.conns[c], time, wl.PointerAxis.VerticalScroll)
+            p.axis_stop(mut srv.conns[c], time, wl.PointerAxis.HorizontalScroll)
+        }
+    }
+    frame_ptrs(mut srv, si, fc)
+}
+
+// --------------------------------------------------------------- touch
+
+fn touches_of(srv: server.Server, si: u32, client: u32, mut out: List[state.Res]) {
+    let i = int(si)
+    for k in 0..srv.seats.items[i].touches.len() {
+        let r = srv.seats.items[i].touches[k]
+        if r.client == client {
+            out.push(r)
+        }
+    }
+}
+
+fn touch_down(mut srv: server.Server, si: u32, surf: u32, time: u32, id: i32, x: f64, y: f64) -> u32 {
+    let serial = srv.next_serial()
+    guard srv.surfaces.used(int(surf)) else {
+        return serial
+    }
+    let i = int(si)
+    srv.seats.items[i].touch_points.retain(fn(p) => p.0 != id)
+    srv.seats.items[i].touch_points.push((id, surf))
+    let client = srv.surfaces.items[int(surf)].client
+    let obj = srv.surfaces.items[int(surf)].obj
+    var rs: List[state.Res] = []
+    touches_of(srv, si, client, mut rs)
+    for r in rs {
+        wl.Touch { id: r.id }.down(mut srv.conns[int(r.client)], serial, time, wl.Surface { id: obj }, id, x, y)
+    }
+    return serial
+}
+
+/// The surface touch point `id` went down on.
+fn touch_surface(srv: server.Server, si: u32, id: i32) -> u32 {
+    for p in srv.seats.items[int(si)].touch_points {
+        if p.0 == id {
+            return p.1
+        }
+    }
+    return state.none
+}
+
+fn touch_motion(mut srv: server.Server, si: u32, time: u32, id: i32, x: f64, y: f64) {
+    let surf = touch_surface(srv, si, id)
+    guard surf != state.none and srv.surfaces.used(int(surf)) else {
+        return
+    }
+    let client = srv.surfaces.items[int(surf)].client
+    var rs: List[state.Res] = []
+    touches_of(srv, si, client, mut rs)
+    for r in rs {
+        wl.Touch { id: r.id }.motion(mut srv.conns[int(r.client)], time, id, x, y)
+    }
+}
+
+fn touch_up(mut srv: server.Server, si: u32, time: u32, id: i32) -> u32 {
+    let serial = srv.next_serial()
+    let surf = touch_surface(srv, si, id)
+    srv.seats.items[int(si)].touch_points.retain(fn(p) => p.0 != id)
+    guard surf != state.none and srv.surfaces.used(int(surf)) else {
+        return serial
+    }
+    let client = srv.surfaces.items[int(surf)].client
+    var rs: List[state.Res] = []
+    touches_of(srv, si, client, mut rs)
+    for r in rs {
+        wl.Touch { id: r.id }.up(mut srv.conns[int(r.client)], serial, time, id)
+    }
+    return serial
+}
+
+/// End a touch frame (or cancel every point) for the clients touched.
+fn touch_frame(mut srv: server.Server, si: u32, cancel: bool) {
+    let i = int(si)
+    var clients: List[u32] = []
+    for p in srv.seats.items[i].touch_points {
+        if srv.surfaces.used(int(p.1)) {
+            let c = srv.surfaces.items[int(p.1)].client
+            if not clients.contains(c) {
+                clients.push(c)
+            }
+        }
+    }
+    for c in clients {
+        var rs: List[state.Res] = []
+        touches_of(srv, si, c, mut rs)
+        for r in rs {
+            if cancel {
+                wl.Touch { id: r.id }.cancel(mut srv.conns[int(r.client)])
+            } else {
+                wl.Touch { id: r.id }.frame(mut srv.conns[int(r.client)])
+            }
+        }
+    }
+    if cancel {
+        srv.seats.items[i].touch_points.clear()
+    }
+}
+
+/// A surface went away: drop it from every focus.
+fn surface_gone(mut srv: server.Server, surf: u32) {
+    for i in 0..srv.seats.items.len() {
+        guard srv.seats.used(i) else {
+            continue
+        }
+        if srv.seats.items[i].kb_focus == surf {
+            srv.seats.items[i].kb_focus = state.none
+        }
+        if srv.seats.items[i].ptr_focus == surf {
+            srv.seats.items[i].ptr_focus = state.none
+        }
+        srv.seats.items[i].touch_points.retain(fn(p) => p.1 != surf)
+    }
+}
