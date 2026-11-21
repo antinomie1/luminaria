@@ -1,10 +1,12 @@
 # luminaria
 
+[中文](README.zh-CN.md)
+
 A library for writing Wayland compositors in
 [Mica](https://github.com/antinomie1/mica), built with
 [sheaf](https://github.com/antinomie1/sheaf). It provides the mechanism:
 protocol state, composition and devices. The compositor keeps the policy
-and its own loop.
+and its own loop. The design is in [docs/](docs/README.md) (Chinese).
 
 | Package | Role |
 |---------|------|
