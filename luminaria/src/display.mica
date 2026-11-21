@@ -2295,6 +2295,8 @@ fn Display.upload_pending(mut self) -> Result[(), str] {
     let got = comp.uploads(mut self.dev)
     self.comp = comp
     var e = try got
+    // The server lends each buffer's bytes while the device records them.
+    var srv = mem.replace(mut self.srv, server.Server.none())
     for s in self.surfs.keys() {
         guard let Some(sf) = self.surfs.get(s) else {
             continue
@@ -2303,16 +2305,15 @@ fn Display.upload_pending(mut self) -> Result[(), str] {
             continue
         }
         if let Some(t) = sf.shm_tex {
-            if let Some(a) = self.srv.shm_begin(b) {
-                let rect: List[(i32, i32, i32, i32)] = [(sf.px0, sf.py0, sf.px1 - sf.px0, sf.py1 - sf.py0)]
-                let r = compose.format.upload(mut self.dev, mut e, t, a.bytes(), a.stride, rect)
-                discard self.srv.shm_end(a)
-                discard r
-            }
+            let rect: List[(i32, i32, i32, i32)] = [(sf.px0, sf.py0, sf.px1 - sf.px0, sf.py1 - sf.py0)]
+            discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+                discard compose.format.upload(mut self.dev, mut e, t, bytes, stride, rect)
+            })
         }
-        self.srv.release(b)
+        srv.release(b)
         discard self.surfs.insert(s, Surf { pending: None, ..sf })
     }
+    self.srv = srv
     self.comp.put_uploads(e)
     return Ok(())
 }
@@ -2565,15 +2566,13 @@ fn Display.client_cursor(mut self, s: server.Surface) {
         return
     }
     var img = cursor.Image { width: bi.width, height: bi.height, hot_x: self.cursor_hx * info.scale, hot_y: self.cursor_hy * info.scale }
-    if let Some(a) = self.srv.shm_begin(b) {
-        let bytes = a.bytes()
+    discard self.srv.with_shm(b, fn(bytes: &[u8], stride: int) {
         for y in 0..int(bi.height) {
             for x in 0..int(bi.width) * 4 {
-                img.pixels.push(bytes[y * a.stride + x])
+                img.pixels.push(bytes[y * stride + x])
             }
         }
-        discard self.srv.shm_end(a)
-    }
+    })
     self.srv.release(b)
     let ms = u32((time.now_ns() / 1000000) & 0xffffffff)
     self.srv.frame_done(s, ms)

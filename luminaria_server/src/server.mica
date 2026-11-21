@@ -242,6 +242,12 @@ pub fn Server.open(name: str) -> Result[Server, str] {
     return Ok(s)
 }
 
+/// A server with no socket and nothing in it (a placeholder to move one
+/// out).
+pub fn Server.none() -> Server {
+    return Server { listener: wire.Listener.none() }
+}
+
 /// The socket name clients connect to (WAYLAND_DISPLAY).
 pub fn Server.name(self) -> str {
     return self.listener.name.clone()
@@ -835,62 +841,14 @@ pub fn Server.plane(self, b: ids.Buffer, k: int) -> (int, u32, u32) {
     return (self.buffers.items[i].planes[k].fd.raw(), self.buffers.items[i].planes[k].offset, self.buffers.items[i].planes[k].stride)
 }
 
-/// Lend `f` the shm buffer's bytes and stride (SIGBUS-safe); false when
-/// the client broke the buffer.
+/// Lend `f` the shm buffer's bytes and stride (SIGBUS-safe; the view
+/// cannot outlive the call, so a pool the client resizes or destroys
+/// later is never read); false when the client broke the buffer.
 pub fn Server.with_shm(self, b: ids.Buffer, f: fn(&[u8], int)) -> bool {
     guard self.buffers.live(b.id) else {
         return false
     }
     return buffer.with_shm(self, b.id.index, f)
-}
-
-/// Reading an shm buffer: its bytes from the first pixel and row stride,
-/// valid until `shm_end`.
-pub unsafe struct Shm {
-    ptr: Ptr[u8]
-    len: int
-    pub stride: int
-    pool: u32
-}
-
-pub fn Shm.bytes(self) -> &[u8] {
-    unsafe {
-        return Ptr.slice(self.ptr, self.len)
-    }
-}
-
-/// Start reading shm buffer `b` (a client shrinking the pool meanwhile
-/// cannot crash us); None when it is not an intact shm buffer.
-pub fn Server.shm_begin(self, b: ids.Buffer) -> Option[Shm] {
-    guard self.buffers.live(b.id) and self.buffers.items[int(b.id.index)].kind == state.BufferKind.Shm else {
-        return None
-    }
-    let i = int(b.id.index)
-    let pi = self.buffers.items[i].pool
-    let off = self.buffers.items[i].offset
-    let stride = self.buffers.items[i].stride
-    let len = stride * int(self.buffers.items[i].height)
-    if let Some(m) = self.pools.items[int(pi)].map {
-        guard off + len <= m.len else {
-            return None
-        }
-        discard m.begin_access()
-        unsafe {
-            return Some(Shm { ptr: m.ptr.offset(off), len, stride, pool: pi })
-        }
-    }
-    return None
-}
-
-/// Done reading: false when the client truncated the pool meanwhile (what
-/// was read is zeros).
-pub fn Server.shm_end(self, s: Shm) -> bool {
-    if self.pools.used(int(s.pool)) {
-        if let Some(m) = self.pools.items[int(s.pool)].map {
-            return not m.end_access()
-        }
-    }
-    return false
 }
 
 /// The compositor is done reading the buffer: wl_buffer.release once no

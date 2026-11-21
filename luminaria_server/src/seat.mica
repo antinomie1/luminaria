@@ -153,7 +153,7 @@ fn set_keymap(mut srv: server.Server, si: u32, fd: int, size: u32) {
     srv.seats.items[i].keymap = Some(wire.Fd.of(fd))
     srv.seats.items[i].keymap_size = size
     srv.seats.items[i].keymap_from = 0
-    srv.seats.items[i].keymap_hash = ime.keymap_hash(fd, size)
+    srv.seats.items[i].keymap_hash = ime.keymap_hash(fd, size).unwrap_or(0)
     ime.send_grab_keymap(mut srv, si)
     for k in 0..srv.seats.items[i].keyboards.len() {
         let r = srv.seats.items[i].keyboards[k]

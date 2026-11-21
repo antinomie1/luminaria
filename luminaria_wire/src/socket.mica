@@ -105,7 +105,15 @@ pub fn accept_on(fd: int) -> Result[Option[conn.Conn], conn.Error] {
     return Ok(Some(try conn.Conn.new(c.fd, conn.End.Server)))
 }
 
+/// A listener on nothing (a placeholder to move one out).
+pub fn Listener.none() -> Listener {
+    return Listener { fd: -1, name: "", path: "", lock_path: "", lock: -1 }
+}
+
 fn Listener.drop(mut self) {
+    guard self.fd >= 0 else {
+        return
+    }
     os.close(self.fd)
     discard fs.remove(self.path)
     discard fs.remove(self.lock_path)

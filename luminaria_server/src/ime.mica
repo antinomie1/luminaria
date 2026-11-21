@@ -380,19 +380,28 @@ fn grab_modifiers(mut srv: server.Server, si: u32, serial: u32, m: [4]u32) -> bo
 
 // ---------------------------------------------------- virtual keyboard
 
-/// FNV-1a over a keymap memfd, to tell equal keymaps apart cheaply.
-fn keymap_hash(fd: int, size: u32) -> u64 {
+/// FNV-1a over a keymap memfd, to tell equal keymaps apart cheaply; None
+/// when the file is shorter than `size` (reading past its end would
+/// SIGBUS) or shrinks meanwhile.
+fn keymap_hash(fd: int, size: u32) -> Option[u64] {
+    guard size > 0 and os.size(fd).unwrap_or(0) >= int(size) else {
+        return None
+    }
     guard let Ok(m) = os.map(fd, int(size), 0, false) else {
-        return 0
+        return None
     }
     var h: u64 = 0xcbf29ce484222325
+    discard m.begin_access()
     unsafe {
         let b = Ptr.slice(m.ptr, int(size))
         for x in b {
             h = math.wrap_mul(h ^ u64(x), 0x100000001b3)
         }
     }
-    return h
+    guard not m.end_access() else {
+        return None
+    }
+    return Some(h)
 }
 
 fn keyboard_manager(mut srv: server.Server, ci: u32, take req: vk.KeyboardManagerRequest) {
@@ -416,7 +425,11 @@ fn virtual_keyboard(mut srv: server.Server, ci: u32, k: vk.Keyboard, take req: v
     let i = int(v)
     match take req {
         Keymap(format, f, size) => {
-            srv.vkeys.items[i].hash = keymap_hash(f.raw(), size)
+            // A keymap shorter than it claims is ignored.
+            guard let Some(h) = keymap_hash(f.raw(), size) else {
+                return
+            }
+            srv.vkeys.items[i].hash = h
             srv.vkeys.items[i].keymap = Some(f)
             srv.vkeys.items[i].size = size
         }
@@ -459,7 +472,7 @@ fn use_keymap(mut srv: server.Server, si: u32, from: u32) {
         }
         size = srv.seats.items[i].keymap_size
         if fd >= 0 {
-            hash = keymap_hash(fd, size)
+            hash = keymap_hash(fd, size).unwrap_or(0)
         }
     } else if srv.vkeys.used(int(from - 1)) {
         if let Some(f) = srv.vkeys.items[int(from - 1)].keymap {

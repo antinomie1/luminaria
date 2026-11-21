@@ -2,8 +2,8 @@
 // socket: layer surfaces, the session lock, selections for clipboard
 // managers, input methods, decorations and activation, the toplevel
 // list, pointer constraints and relative motion, idle notification,
-// single-pixel buffers, drag and drop, screen capture, sandboxes and
-// output configuration.
+// single-pixel buffers, drag and drop, screen capture, sandboxes,
+// output configuration and a keymap shorter than it claims.
 
 import std.env
 import std.fs
@@ -30,6 +30,7 @@ import luminaria_proto.ext_image_capture_source as ics
 import luminaria_proto.ext_image_copy_capture as icc
 import luminaria_proto.security_context as sctx
 import luminaria_proto.wlr_output_management_unstable as wom
+import luminaria_proto.virtual_keyboard_unstable as vkb
 import luminaria_server as server
 
 struct Fx {
@@ -869,4 +870,37 @@ test "output configuration: heads, a mode and position applied, a stale one canc
         ZwlrOutputConfiguration(_, Cancelled) => true
         _ => false
     }))
+}
+
+test "a virtual keyboard keymap shorter than it claims is ignored" {
+    var f = setup()
+    discard f.srv.add_seat("seat0")
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let mgr = vkb.KeyboardManager { id: bind(mut f, vkb.keyboard_manager_iface, 1) }
+    let kb = mgr.create_virtual_keyboard(mut f.c, ws)
+    let fd = os.memfd("keymap", 16).expect("memfd")
+    // Hashing 1 MiB of a 16-byte file would read past its end (SIGBUS).
+    kb.keymap(mut f.c, 1, fd, 1 << 20)
+    os.close(fd)
+    discard pump(mut f)
+    // Not taken: a key now is a key before any keymap, and the client
+    // is dropped with no_keymap.
+    kb.key(mut f.c, 0, 30, 1)
+    discard f.c.flush()
+    discard f.srv.dispatch(f.client)
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    assert(gone.contains(f.client))
+    discard f.c.read()
+    var code: i64 = -1
+    while true {
+        match proto.next_event(mut f.c) {
+            Ok(Some(WlDisplay(_, Error(obj, c, _)))) => code = if obj == kb.id { i64(c) } else { -2 }
+            Ok(Some) => {}
+            _ => {
+                break
+            }
+        }
+    }
+    assert_eq(code, i64(vkb.KeyboardError.NoKeymap))
 }
