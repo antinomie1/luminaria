@@ -1,9 +1,11 @@
 [package]
 name = "luminaria_compose"
 version = "0.1.0"
-description = "Composition: frame placements, damage, occlusion, planes, compositor clock, transactions, device-loss recovery"
+description = "Composition on vk_compose: client buffers as textures, fences, planes, compositor clock, transactions, device-loss recovery"
 license = "Apache-2.0 OR BSD-2-Clause"
 
 [dependencies]
 vk_gpu = { workspace = true }
 vk_draw2d = { workspace = true }
+vk_compose = { workspace = true }
+libdrm_sys = { workspace = true }

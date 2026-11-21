@@ -1,6 +1,272 @@
-// luminaria_compose: one frame of composition on vk_gpu. The compositor
-// lists placements each frame; the library diffs them into damage, culls
-// occluded surfaces, assigns planes, picks the compositor clock's start
-// time, never waits on a client fence (an unready buffer shows its last
-// frame), holds layout transactions together, and rebuilds after device
-// loss. Client buffers are imported and cached as textures here.
+// luminaria_compose: composition on vk_compose. Each output is a scene the
+// compositor's placement list (back to front, output pixels) is diffed
+// into: what moved, appeared or changed becomes damage, opaque views hide
+// what is under them, and only the damage is redrawn, in one pass. Client
+// buffers become textures here (dmabufs imported once, shm damage
+// uploaded), their fences become descriptors to poll, and each output
+// keeps a compositor clock that starts frames as late as the next vblank
+// allows.
+
+import std.mem
+import vk_gpu as gpu
+import vk_draw2d as draw2d
+import vk_compose as vc
+pub import format
+pub import fence
+pub import clock
+
+pub type Clock = clock.Clock
+pub type Syncobj = fence.Syncobj
+pub type Rect = vc.Rect
+pub type Transform = vc.Transform
+
+/// One thing to show: a texture placed on an output.
+pub struct Placement {
+    /// Stable identity (a surface, a compositor image): a key keeps its
+    /// view, so only what changes is damaged.
+    pub key: u64 = 0
+    pub tex: gpu.Texture
+    /// Where, in output pixels.
+    pub x: f32 = 0.0
+    pub y: f32 = 0.0
+    pub w: f32 = 0.0
+    pub h: f32 = 0.0
+    /// Part of the texture (pixels of the upright picture); empty: all.
+    pub src: Rect = Rect {}
+    /// wl_output.transform the texture is turned by.
+    pub transform: u32 = 0
+    pub opacity: f32 = 1.0
+    pub radius: f32 = 0.0
+    pub shadow: f32 = 0.0
+    /// Opaque part, relative to x, y.
+    pub opaque: Rect = Rect {}
+}
+
+pub struct Output {
+    pub scene: vc.Scene
+    pub clock: Clock
+    pub width: u32
+    pub height: u32
+    pub alive: bool = true
+    keys: List[u64] = []
+    ids: List[u32] = []
+}
+
+pub struct Compositor {
+    canvas: Option[draw2d.Canvas] = None
+    pub outputs: List[Output] = []
+    /// Uploads waiting for the next frame (recorded once, before any draw).
+    uploads: Option[gpu.Encoder] = None
+}
+
+pub fn Compositor.new(mut dev: gpu.Device) -> Result[Compositor, str] {
+    let canvas = try draw2d.Canvas.create(mut dev, gpu.Format.B8G8R8A8_UNORM)
+    return Ok(Compositor { canvas: Some(canvas) })
+}
+
+/// A compositor with nothing behind it (a placeholder to move one out).
+pub fn Compositor.none() -> Compositor {
+    return Compositor {}
+}
+
+/// Output `o` (the backend's index) is `width` x `height` at `refresh_mhz`.
+pub fn Compositor.add_output(mut self, o: int, width: u32, height: u32, refresh_mhz: int, background: vec4) {
+    while self.outputs.len() <= o {
+        self.outputs.push(Output { scene: vc.Scene.new(1, 1, background), clock: Clock.new(60000), width: 1, height: 1, alive: false })
+    }
+    self.outputs[o] = Output { scene: vc.Scene.new(width, height, background), clock: Clock.new(refresh_mhz), width, height }
+}
+
+pub fn Compositor.resize(mut self, o: int, width: u32, height: u32, refresh_mhz: int) {
+    guard o < self.outputs.len() else {
+        return
+    }
+    self.outputs[o].scene.resize(width, height)
+    self.outputs[o].width = width
+    self.outputs[o].height = height
+    self.outputs[o].clock.refresh_ns = 1000000000000 / max(refresh_mhz, 1000)
+}
+
+pub fn Compositor.remove_output(mut self, o: int) {
+    if o < self.outputs.len() {
+        self.outputs[o].alive = false
+        self.outputs[o].keys.clear()
+        self.outputs[o].ids.clear()
+    }
+}
+
+fn view(p: Placement) -> vc.View {
+    return vc.View { tex: p.tex, x: p.x, y: p.y, w: p.w, h: p.h, src: p.src, transform: vc.Transform(p.transform), opacity: p.opacity, radius: p.radius, shadow: p.shadow, opaque: p.opaque }
+}
+
+/// Show `ps` (back to front) on output `o` from the next frame: views are
+/// added, changed, restacked and removed by key, and only that is damaged.
+pub fn Compositor.layout(mut self, o: int, ps: &[Placement]) {
+    guard o < self.outputs.len() and self.outputs[o].alive else {
+        return
+    }
+    var out = mem.replace(mut self.outputs[o], Output { scene: vc.Scene.new(1, 1, vec4(0.0)), clock: Clock {}, width: 0, height: 0 })
+    // Gone keys.
+    var i = out.keys.len() - 1
+    while i >= 0 {
+        let k = out.keys[i]
+        var keep = false
+        for p in ps {
+            if p.key == k {
+                keep = true
+                break
+            }
+        }
+        if not keep {
+            out.scene.remove(out.ids[i])
+            discard out.keys.remove(i)
+            discard out.ids.remove(i)
+        }
+        i -= 1
+    }
+    // New and changed views; then the order.
+    var ordered = true
+    var n = 0
+    for p in ps {
+        let at = out.keys.position(fn(k) => k == p.key).unwrap_or(-1)
+        if at < 0 {
+            let id = out.scene.add(view(p))
+            out.keys.push(p.key)
+            out.ids.push(id)
+            ordered = ordered and n == out.keys.len() - 1
+        } else {
+            out.scene.set(out.ids[at], view(p))
+            ordered = ordered and at == n
+        }
+        n += 1
+    }
+    if not ordered {
+        var keys: List[u64] = []
+        var ids: List[u32] = []
+        var prev: u32 = 0
+        for p in ps {
+            let at = out.keys.position(fn(k) => k == p.key).unwrap_or(-1)
+            if at >= 0 {
+                let id = out.ids[at]
+                out.scene.place_above(id, prev)
+                prev = id
+                keys.push(p.key)
+                ids.push(id)
+            }
+        }
+        out.keys = keys
+        out.ids = ids
+    }
+    self.outputs[o] = out
+}
+
+/// The client drew into key `key`'s texture: `rects` in texture pixels
+/// (empty: all of it). Damages every output showing it.
+pub fn Compositor.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {
+    for o in 0..self.outputs.len() {
+        guard let Some(at) = self.outputs[o].keys.position(fn(k) => k == key) else {
+            continue
+        }
+        let id = self.outputs[o].ids[at]
+        if rects.is_empty() {
+            self.outputs[o].scene.commit(id, None)
+        }
+        for r in rects {
+            self.outputs[o].scene.commit(id, Some(Rect { x: f32(r.0), y: f32(r.1), w: f32(r.2), h: f32(r.3) }))
+        }
+    }
+}
+
+/// Redraw `r` (output pixels) of output `o` next frame (a software cursor,
+/// an effect).
+pub fn Compositor.damage(mut self, o: int, r: Rect) {
+    if o < self.outputs.len() {
+        self.outputs[o].scene.damage(r)
+    }
+}
+
+/// Whether output `o` has nothing new to show.
+pub fn Compositor.idle(self, o: int) -> bool {
+    return o >= self.outputs.len() or not self.outputs[o].alive or self.outputs[o].scene.idle()
+}
+
+/// Whether key `key` shows on output `o` (not hidden by opaque views).
+pub fn Compositor.visible(self, o: int, key: u64) -> bool {
+    guard o < self.outputs.len() else {
+        return false
+    }
+    guard let Some(at) = self.outputs[o].keys.position(fn(k) => k == key) else {
+        return false
+    }
+    return self.outputs[o].scene.visible(self.outputs[o].ids[at])
+}
+
+/// The key of the view that alone fills output `o` as it is, when one
+/// does (scan its buffer out instead of composing).
+pub fn Compositor.scanout(self, o: int) -> Option[u64] {
+    guard o < self.outputs.len() else {
+        return None
+    }
+    guard let Some(id) = self.outputs[o].scene.scanout() else {
+        return None
+    }
+    let at = self.outputs[o].ids.position(fn(x) => x == id).unwrap_or(-1)
+    return if at < 0 { None } else { Some(self.outputs[o].keys[at]) }
+}
+
+/// The uploads encoder (created on first use), submitted before the next
+/// frame draws.
+pub fn Compositor.uploads(mut self, mut dev: gpu.Device) -> Result[gpu.Encoder, str] {
+    if let Some(e) = self.uploads.take() {
+        return Ok(e)
+    }
+    return dev.encoder()
+}
+
+pub fn Compositor.put_uploads(mut self, take e: gpu.Encoder) {
+    self.uploads = Some(e)
+}
+
+/// Submit pending uploads now (frames sample what they wrote).
+pub fn Compositor.flush_uploads(mut self, mut dev: gpu.Device) -> Result[(), str] {
+    if let Some(e) = self.uploads.take() {
+        var enc = e
+        discard try dev.submit(take enc)
+    }
+    return Ok(())
+}
+
+/// Draw what frame `f` of output `o` needs into encoder `e`; false when
+/// the image is already up to date.
+pub fn Compositor.render(mut self, o: int, mut dev: gpu.Device, mut e: gpu.Encoder, f: gpu.Frame) -> Result[bool, str] {
+    try self.flush_uploads(mut dev)
+    guard o < self.outputs.len() else {
+        return Ok(false)
+    }
+    var out = mem.replace(mut self.outputs[o], Output { scene: vc.Scene.new(1, 1, vec4(0.0)), clock: Clock {}, width: 0, height: 0 })
+    guard let Some(cv) = self.canvas.take() else {
+        self.outputs[o] = out
+        return Err("no canvas")
+    }
+    var canvas = cv
+    let r = out.scene.render(mut dev, mut canvas, mut e, f)
+    self.canvas = Some(canvas)
+    self.outputs[o] = out
+    return r
+}
+
+/// What the last frame of output `o` changed (damage for KMS and parents).
+pub fn Compositor.changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {
+    guard o < self.outputs.len() else {
+        return
+    }
+    for r in self.outputs[o].scene.changed() {
+        out.push((i32(r.x), i32(r.y), i32(r.w), i32(r.h)))
+    }
+}
+
+pub fn Compositor.destroy(self, mut dev: gpu.Device) {
+    if let Some(c) = self.canvas {
+        c.destroy(mut dev)
+    }
+}

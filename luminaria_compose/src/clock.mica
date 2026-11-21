@@ -1,0 +1,84 @@
+// The compositor clock of one output: when to start a frame so it is
+// ready just before the next vblank, which keeps input-to-photon latency
+// low without missing frames. The margin adapts: a frame that lands a
+// vblank late grows it, frames on time let it shrink back. With variable
+// refresh a frame starts as soon as there is something to show, no sooner
+// than the shortest refresh interval allows.
+
+pub let min_margin_ns = 1000000
+pub let start_margin_ns = 3000000
+
+pub struct Clock {
+    pub refresh_ns: int = 16666667
+    /// CLOCK_MONOTONIC ns of the last vblank a frame reached the screen.
+    pub last: int = 0
+    pub seq: u64 = 0
+    pub margin_ns: int = 3000000
+    pub vrr: bool = false
+    /// The vblank the frame in flight aims at (0: none).
+    target: int = 0
+}
+
+pub fn Clock.new(refresh_mhz: int) -> Clock {
+    return Clock { refresh_ns: 1000000000000 / max(refresh_mhz, 1000) }
+}
+
+/// The first vblank at or after `t`.
+pub fn Clock.vblank_after(self, t: int) -> int {
+    guard self.last > 0 and self.refresh_ns > 0 else {
+        return t
+    }
+    guard t > self.last else {
+        return self.last
+    }
+    let n = (t - self.last + self.refresh_ns - 1) / self.refresh_ns
+    return self.last + n * self.refresh_ns
+}
+
+/// When to start the next frame, if now is `now`: as late as still makes
+/// the next reachable vblank.
+pub fn Clock.start(self, now: int) -> int {
+    guard self.last > 0 else {
+        return now
+    }
+    if self.vrr {
+        return max(now, self.last + self.refresh_ns - self.margin_ns)
+    }
+    var v = self.vblank_after(now + self.margin_ns)
+    if v - self.margin_ns < now {
+        v += self.refresh_ns
+    }
+    return v - self.margin_ns
+}
+
+/// A frame starts now: the vblank it aims at (Frame events carry it as
+/// the predicted presentation time).
+pub fn Clock.begin(mut self, now: int) -> int {
+    self.target = if self.last > 0 { self.vblank_after(now + self.margin_ns) } else { now }
+    return self.target
+}
+
+/// A frame reached the screen at `ns` (vblank `seq`).
+pub fn Clock.presented(mut self, seq: u64, ns: int) {
+    if self.last > 0 and seq > self.seq + 1 and not self.vrr {
+        // Vblanks passed without a frame: idle, or a frame was late.
+    }
+    if self.target > 0 {
+        if ns > self.target + self.refresh_ns / 2 {
+            // Late: start earlier from now on.
+            self.margin_ns = min(self.margin_ns + 1000000, self.refresh_ns / 2)
+        } else {
+            self.margin_ns = max(self.margin_ns - 100000, min_margin_ns)
+        }
+        self.target = 0
+    }
+    if self.last > 0 and ns > self.last and seq == self.seq + 1 and not self.vrr {
+        // Track the real refresh (it drifts from the mode's nominal one).
+        let d = ns - self.last
+        if d > self.refresh_ns / 2 and d < self.refresh_ns * 2 {
+            self.refresh_ns = (self.refresh_ns * 7 + d) / 8
+        }
+    }
+    self.last = ns
+    self.seq = seq
+}

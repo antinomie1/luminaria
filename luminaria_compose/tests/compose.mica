@@ -1,0 +1,116 @@
+// Composition on the real device: placement lists diffed by key into
+// damage, restacking, shm damage uploads, dmabuf formats, and the clock's
+// deadlines.
+
+import vk_gpu as gpu
+import luminaria_compose as compose
+
+test "the clock starts frames just in time and adapts to late ones" {
+    var c = compose.Clock.new(60000)
+    let r = c.refresh_ns
+    // Nothing presented yet: start now.
+    assert_eq(c.start(1000), 1000)
+    c.presented(1, 1000000000)
+    // Right after a vblank: start at the next one minus the margin.
+    let s = c.start(1000000000 + 1000)
+    assert_eq(s, 1000000000 + r - c.margin_ns)
+    // Too late for the next one: the one after.
+    let late = 1000000000 + r - 1000
+    assert_eq(c.start(late), 1000000000 + 2 * r - c.margin_ns)
+    let m = c.margin_ns
+    let target = c.begin(s)
+    assert_eq(target, 1000000000 + r)
+    // It landed a vblank late: the margin grows.
+    c.presented(3, 1000000000 + 2 * r)
+    assert(c.margin_ns > m)
+    c.vrr = true
+    assert_eq(c.start(1000000000 + 2 * r + 10), 1000000000 + 3 * r - c.margin_ns)
+}
+
+fn solid(mut dev: gpu.Device, rgba: [4]u8) -> gpu.Texture {
+    let t = compose.format.shm_texture(mut dev, 8, 8, compose.format.abgr8888).unwrap()
+    var px: List[u8] = []
+    for _ in 0..64 {
+        for b in rgba {
+            px.push(b)
+        }
+    }
+    var e = dev.encoder().unwrap()
+    let none: List[(i32, i32, i32, i32)] = []
+    compose.format.upload(mut dev, mut e, t, px, 32, none).unwrap()
+    discard dev.submit(take e).unwrap()
+    return t
+}
+
+fn draw(mut dev: gpu.Device, mut c: compose.Compositor, mut out: gpu.Offscreen) -> List[u8] {
+    let f = out.acquire(mut dev).unwrap().unwrap()
+    var e = dev.encoder().unwrap()
+    discard c.render(0, mut dev, mut e, f).unwrap()
+    discard out.present(mut dev, f, take e).unwrap()
+    return dev.read_texture(out.texture()).unwrap()
+}
+
+fn px(img: List[u8], x: int, y: int) -> (u8, u8, u8) {
+    let i = (y * 16 + x) * 4
+    return (img[i], img[i + 1], img[i + 2])
+}
+
+test "placement lists diff into damage and order" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    var out = gpu.Offscreen.create(mut dev, 16, 16, gpu.Format.B8G8R8A8_UNORM).unwrap()
+    var c = compose.Compositor.new(mut dev).unwrap()
+    c.add_output(0, 16, 16, 60000, vec4(0.0, 0.0, 0.0, 1.0))
+    let red = solid(mut dev, [255, 0, 0, 255])
+    let green = solid(mut dev, [0, 255, 0, 255])
+    let a = compose.Placement { key: 1, tex: red, w: 8.0, h: 8.0 }
+    let b = compose.Placement { key: 2, tex: green, x: 4.0, y: 4.0, w: 8.0, h: 8.0 }
+    c.layout(0, [a, b])
+    var img = draw(mut dev, mut c, mut out)
+    // B8G8R8A8: blue, green, red.
+    assert_eq(px(img, 1, 1), (u8(0), u8(0), u8(255)))
+    assert_eq(px(img, 6, 6), (u8(0), u8(255), u8(0)))
+    // The same list again: nothing to draw.
+    c.layout(0, [a, b])
+    assert(c.idle(0))
+    // Red on top now.
+    c.layout(0, [b, a])
+    assert(not c.idle(0))
+    img = draw(mut dev, mut c, mut out)
+    assert_eq(px(img, 6, 6), (u8(0), u8(0), u8(255)))
+    // Green gone.
+    c.layout(0, [a])
+    img = draw(mut dev, mut c, mut out)
+    assert_eq(px(img, 10, 10), (u8(0), u8(0), u8(0)))
+    assert(c.visible(0, 1))
+    assert(not c.visible(0, 2))
+}
+
+test "shm damage uploads only the rectangles" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    let t = solid(mut dev, [0, 0, 0, 255])
+    var px: List[u8] = []
+    for _ in 0..64 {
+        for b in [u8(9), 8, 7, 255] {
+            px.push(b)
+        }
+    }
+    var e = dev.encoder().unwrap()
+    let rects: List[(i32, i32, i32, i32)] = [(2, 2, 2, 2), (-4, -4, 5, 5)]
+    compose.format.upload(mut dev, mut e, t, px, 32, rects).unwrap()
+    discard dev.submit(take e).unwrap()
+    let got = dev.read_texture(t).unwrap()
+    let at = fn(x: int, y: int) => got[(y * 8 + x) * 4]
+    assert_eq(at(2, 2), u8(9))
+    assert_eq(at(3, 3), u8(9))
+    assert_eq(at(0, 0), u8(9))
+    assert_eq(at(5, 5), u8(0))
+    assert(compose.format.vk_format(0x30303030).is_none())
+    assert_eq(compose.format.vk_format(compose.format.xrgb8888), Some((gpu.Format.B8G8R8A8_UNORM, true)))
+    assert(not compose.format.dmabuf_formats(dev).is_empty())
+}
