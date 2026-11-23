@@ -9,7 +9,7 @@ pub struct Notifier derive(Hash, Show) {
     pub id: u32
 }
 
-pub let notifier_iface: u16 = 38
+pub let notifier_iface: u16 = 47
 pub let notifier_version: u32 = 2
 
 /// Requests of ext_idle_notifier_v1.
@@ -57,7 +57,7 @@ pub struct Notification derive(Hash, Show) {
     pub id: u32
 }
 
-pub let notification_iface: u16 = 39
+pub let notification_iface: u16 = 48
 pub let notification_version: u32 = 2
 
 /// Requests of ext_idle_notification_v1.

@@ -33,13 +33,15 @@ fn listening(fd: int) -> bool {
 
 /// Globals a sandboxed client cannot see or bind.
 fn privileged(iface: u16) -> bool {
-    let hidden: [12]u16 = [
+    let hidden: [14]u16 = [
         sc.context_manager_iface,
         proto.ext_data_control.manager_iface,
         proto.wlr_layer_shell_unstable.shell_iface,
         proto.ext_session_lock.lock_manager_iface,
         proto.input_method_unstable.method_manager_iface,
         proto.virtual_keyboard_unstable.keyboard_manager_iface,
+        proto.wlr_virtual_pointer_unstable.pointer_manager_iface,
+        proto.wlr_gamma_control_unstable.control_manager_iface,
         proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface,
         proto.ext_foreign_toplevel_list.toplevel_list_iface,
         proto.ext_image_capture_source.output_image_capture_source_manager_iface,

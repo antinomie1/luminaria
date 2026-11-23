@@ -344,6 +344,24 @@ fn Input.configure(mut self, id: u32, c: Config) {
         }
         if li.device_config_accel_is_available(d) == 1 {
             discard li.device_config_accel_set_speed(d, c.accel)
+            let profs = li.device_config_accel_get_profiles(d)
+            if c.accel_profile == types.accel_profile_flat {
+                if profs & u32(li.libinput_config_accel_profile_flat) != 0 {
+                    discard li.device_config_accel_set_profile(d, i32(li.libinput_config_accel_profile_flat))
+                }
+            } else if c.accel_profile == types.accel_profile_adaptive {
+                if profs & u32(li.libinput_config_accel_profile_adaptive) != 0 {
+                    discard li.device_config_accel_set_profile(d, i32(li.libinput_config_accel_profile_adaptive))
+                }
+            } else {
+                let def = li.device_config_accel_get_default_profile(d)
+                if def != 0 {
+                    discard li.device_config_accel_set_profile(d, def)
+                }
+            }
+        }
+        if li.device_config_dwt_is_available(d) == 1 {
+            discard li.device_config_dwt_set_enabled(d, if c.dwt { i32(li.libinput_config_dwt_enabled) } else { i32(li.libinput_config_dwt_disabled) })
         }
         if li.device_config_left_handed_is_available(d) == 1 {
             discard li.device_config_left_handed_set(d, if c.left_handed { 1 } else { 0 })

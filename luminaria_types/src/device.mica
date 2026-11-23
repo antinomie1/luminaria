@@ -32,12 +32,21 @@ pub struct Mods {
     pub num: bool = false
 }
 
+/// Pointer acceleration profile for `InputConfig.accel_profile`.
+pub let accel_profile_default: i32 = 0
+pub let accel_profile_flat: i32 = 1
+pub let accel_profile_adaptive: i32 = 2
+
 /// Settings of an input device.
 pub struct InputConfig {
     pub tap: bool = true
     pub natural_scroll: bool = false
     /// -1..1, 0 is the default speed.
     pub accel: f64 = 0.0
+    /// Pointer acceleration profile (`accel_profile_default`, `accel_profile_flat`, `accel_profile_adaptive`).
+    pub accel_profile: i32 = 0
+    /// Disable touchpad while typing (when supported by the device).
+    pub dwt: bool = true
     pub left_handed: bool = false
     /// Disable the device (send no events).
     pub disabled: bool = false
@@ -64,6 +73,10 @@ pub struct OutputDesc {
     pub vrr: bool = false
     /// Internal panel (laptop): lid and backlight belong to it.
     pub internal: bool = false
+    /// Hardware CRTC gamma LUT size (0 if unsupported).
+    pub gamma_size: u32 = 0
+    /// Supports HDR static metadata + BT.2020 output.
+    pub hdr: bool = false
 }
 
 pub enum AxisSource {

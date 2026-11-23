@@ -8,7 +8,7 @@ pub struct ContextManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let context_manager_iface: u16 = 83
+pub let context_manager_iface: u16 = 92
 pub let context_manager_version: u32 = 1
 
 pub enum ContextManagerError: u32 {
@@ -51,7 +51,7 @@ pub struct Context derive(Hash, Show) {
     pub id: u32
 }
 
-pub let context_iface: u16 = 84
+pub let context_iface: u16 = 93
 pub let context_version: u32 = 1
 
 pub enum ContextError: u32 {

@@ -76,6 +76,10 @@ fn output_info[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: in
         enabled: out.enabled,
         vrr_capable: desc.vrr,
         vrr: out.vrr,
+        gamma_size: desc.gamma_size,
+        hdr: out.hdr,
+        sdr_nits: out.sdr_nits,
+        max_nits: out.max_nits,
     }
 }
 

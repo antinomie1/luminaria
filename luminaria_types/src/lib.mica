@@ -35,3 +35,15 @@ pub let presented_vsync = device.presented_vsync
 pub let presented_hw_clock = device.presented_hw_clock
 pub let presented_hw_completion = device.presented_hw_completion
 pub let presented_zero_copy = device.presented_zero_copy
+
+pub let accel_profile_default = device.accel_profile_default
+pub let accel_profile_flat = device.accel_profile_flat
+pub let accel_profile_adaptive = device.accel_profile_adaptive
+
+pub let color_sdr = scene.color_sdr
+pub let color_scrgb = scene.color_scrgb
+pub let color_bt2020_pq = scene.color_bt2020_pq
+pub let color_bt2020_hlg = scene.color_bt2020_hlg
+pub let dst_sdr = scene.dst_sdr
+pub let dst_hdr_pq = scene.dst_hdr_pq
+pub let dst_hdr_scrgb = scene.dst_hdr_scrgb

@@ -176,6 +176,9 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 | ext-image-capture-source | 1 | 输出源与顶层窗口（foreign toplevel）作为截屏源 |
 | ext-image-copy-capture | 1 | 截屏与录屏，见下 |
 | wlr-output-management | 4 | 输出配置，见下 |
+| wlr-virtual-pointer | 2 | 虚拟指针（相对/绝对移动、按键、滚轮，特权 global） |
+| wlr-gamma-control | 1 | 独占式硬件 CRTC Gamma LUT（护眼色温，特权 global） |
+| wp-color-management | 1 | 色彩空间描述与 HDR（sRGB、BT.2020 PQ/HLG、Windows scRGB，输出与表面反馈） |
 | security-context | 1 | 沙盒，见下 |
 | wl_fixes | 1 | 销毁 registry |
 
@@ -223,5 +226,5 @@ wlr-output-management v4：每个绑定的管理器为每个输出建一个 head
 security-context：沙盒（Flatpak）交来一个监听 socket 和一个关闭 fd，`commit` 后发 `Listen(k)`，
 门面监听它，从这里连进来的客户端带上沙盒引擎、app id、实例 id（`sandbox(c)`）；关闭 fd 挂断时停止
 接受，已连上的客户端不受影响。监听 fd 必须是在监听的 socket。沙盒客户端看不到也绑不了特权 global：security-context 本身（不能嵌套）、
-data-control、layer-shell、session-lock、input-method、virtual-keyboard、keyboard-shortcuts-inhibit、
+data-control、layer-shell、session-lock、input-method、virtual-keyboard、virtual-pointer、gamma-control、keyboard-shortcuts-inhibit、
 foreign-toplevel-list、截屏和输出配置。

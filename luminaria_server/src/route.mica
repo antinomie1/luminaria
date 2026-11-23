@@ -23,6 +23,9 @@ import inhibit
 import capture
 import security
 import outman
+import vptr
+import gamma
+import color
 
 /// Object `id` (interface `iface`) of client `ci` went away: free what it
 /// owned.
@@ -72,7 +75,7 @@ fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
         srv.offers.remove(slot, state.OfferData {})
     } else if iface == proto.primary_selection_unstable.device_iface or iface == proto.ext_data_control.device_iface {
         seat.drop_resource(mut srv, slot, ci, id)
-    } else if shell.destroyed(mut srv, ci, slot, iface, id) or ime.destroyed(mut srv, ci, slot, iface, id) or pointer.destroyed(mut srv, ci, slot, iface, id) or toplevel.destroyed(mut srv, ci, slot, iface, id) or inhibit.destroyed(mut srv, ci, slot, iface, id) or capture.destroyed(mut srv, ci, slot, iface, id) or security.destroyed(mut srv, ci, slot, iface, id) or outman.destroyed(mut srv, ci, slot, iface, id) {
+    } else if shell.destroyed(mut srv, ci, slot, iface, id) or ime.destroyed(mut srv, ci, slot, iface, id) or pointer.destroyed(mut srv, ci, slot, iface, id) or toplevel.destroyed(mut srv, ci, slot, iface, id) or inhibit.destroyed(mut srv, ci, slot, iface, id) or capture.destroyed(mut srv, ci, slot, iface, id) or security.destroyed(mut srv, ci, slot, iface, id) or outman.destroyed(mut srv, ci, slot, iface, id) or vptr.destroyed(mut srv, ci, slot, iface, id) or gamma.destroyed(mut srv, ci, slot, iface, id) or color.destroyed(mut srv, ci, slot, iface, id) {
         return
     } else {
         extra.destroyed(mut srv, ci, slot, iface)
@@ -207,6 +210,16 @@ fn handle(mut srv: server.Server, ci: u32, take r: proto.Request) {
         ZwlrOutputMode(m, req) => outman.mode(mut srv, ci, m, req)
         ZwlrOutputConfiguration(c, req) => outman.configuration(mut srv, ci, c, req)
         ZwlrOutputConfigurationHead(h, req) => outman.config_head(mut srv, ci, h, req)
+        ZwlrVirtualPointerManager(_, req) => vptr.manager(mut srv, ci, req)
+        ZwlrVirtualPointer(p, req) => vptr.pointer(mut srv, ci, p, req)
+        ZwlrGammaControlManager(_, req) => gamma.manager(mut srv, ci, req)
+        ZwlrGammaControl(c, req) => gamma.control(mut srv, ci, c, req)
+        WpColorManager(_, req) => color.manager(mut srv, ci, req)
+        WpColorManagementOutput(co, req) => color.output_req(mut srv, ci, co, req)
+        WpColorManagementSurface(cs, req) => color.surface_req(mut srv, ci, cs, req)
+        WpColorManagementSurfaceFeedback(fb, req) => color.feedback_req(mut srv, ci, fb, req)
+        WpImageDescriptionCreatorParams(cr, req) => color.creator_params(mut srv, ci, cr, req)
+        WpImageDescription(d, req) => color.image_description(mut srv, ci, d, req)
         _ => {}
     }
 }
@@ -266,6 +279,8 @@ fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.Regi
                         toplevel.list_bound(mut srv, ci, obj.id, obj.version)
                     } else if g.iface == proto.wlr_output_management_unstable.manager_iface {
                         outman.bound(mut srv, ci, obj.id)
+                    } else if g.iface == proto.color_management.color_manager_iface {
+                        color.manager_bound(mut srv, ci, obj.id)
                     }
                 }
             }

@@ -131,6 +131,8 @@ fn edid_names(e: List[u8]) -> (str, str) {
 struct Crtc {
     id: u32
     props: Props
+    /// Legacy gamma LUT length from drmModeGetCrtc (fallback when GAMMA_LUT_SIZE is absent).
+    legacy_gamma_size: u32 = 0
     /// Taken by an output.
     used: bool = false
 }
@@ -147,6 +149,8 @@ struct Plane {
     fmt_mods: List[(u32, u64)] = []
     /// Modifiers it scans XRGB8888 out with.
     xrgb: List[u64] = []
+    /// Modifiers it scans XRGB2101010 (10-bit HDR) out with.
+    xrgb10: List[u64] = []
 }
 
 struct OverlaySlot {
@@ -176,6 +180,10 @@ struct Connector {
     make: str = ""
     model: str = ""
     internal: bool = false
+    hdr_capable: bool = false
+    has_colorspace: bool = false
+    bt2020_rgb_val: u64 = 0
+    default_cs_val: u64 = 0
 }
 
 struct Output {
@@ -202,6 +210,13 @@ struct Output {
     modeset: bool = true
     enabled: bool = true
     vrr: bool = false
+    gamma_blob: u32 = 0
+    gamma_dirty: bool = false
+    hdr: bool = false
+    hdr_blob: u32 = 0
+    hdr_dirty: bool = false
+    /// Replaced property blobs freed once the replacing atomic commit is submitted.
+    retired_blobs: List[u32] = []
     cursor_fb: u32 = 0
     cursor_map: Option[os.Map] = None
     cursor_x: i32 = 0
@@ -290,7 +305,16 @@ fn Drm.probe(mut self) -> Result[(), str] {
         let r = res.read()
         for i in 0..int(r.count_crtcs) {
             let id = r.crtcs.offset(i).read()
-            self.crtcs.push(Crtc { id, props: props_of(self.fd, id, u32(uapi.drm_mode_object_crtc)) })
+            var legacy_gamma: u32 = 0
+            let cp = drm.mode_get_crtc(f, id)
+            if not cp.is_null() {
+                let gs = cp.read().gamma_size
+                if gs > 0 {
+                    legacy_gamma = u32(gs)
+                }
+                drm.mode_free_crtc(cp)
+            }
+            self.crtcs.push(Crtc { id, props: props_of(self.fd, id, u32(uapi.drm_mode_object_crtc)), legacy_gamma_size: legacy_gamma })
         }
         drm.mode_free_resources(res)
         let pres = drm.mode_get_plane_resources(f)
@@ -326,12 +350,18 @@ fn Drm.probe(mut self) -> Result[(), str] {
 fn Drm.read_plane_formats(self, id: u64, mut pl: Plane) {
     guard id != 0 else {
         pl.xrgb.push(0)
+        if pl.formats.contains(u32(uapi.drm_format_xrgb2101010)) {
+            pl.xrgb10.push(0)
+        }
         return
     }
     unsafe {
         let b = drm.mode_get_property_blob(i32(self.fd), u32(id))
         guard not b.is_null() else {
             pl.xrgb.push(0)
+            if pl.formats.contains(u32(uapi.drm_format_xrgb2101010)) {
+                pl.xrgb10.push(0)
+            }
             return
         }
         var it = drm.ModeFormatModifierIterator {}
@@ -339,6 +369,8 @@ fn Drm.read_plane_formats(self, id: u64, mut pl: Plane) {
             pl.fmt_mods.push((it.fmt, it.mod))
             if it.fmt == u32(uapi.drm_format_xrgb8888) {
                 pl.xrgb.push(it.mod)
+            } else if it.fmt == u32(uapi.drm_format_xrgb2101010) {
+                pl.xrgb10.push(it.mod)
             }
         }
         drm.mode_free_property_blob(b)
@@ -346,6 +378,38 @@ fn Drm.read_plane_formats(self, id: u64, mut pl: Plane) {
     if pl.xrgb.is_empty() and pl.formats.contains(u32(uapi.drm_format_xrgb8888)) {
         pl.xrgb.push(0)
     }
+    if pl.xrgb10.is_empty() and pl.formats.contains(u32(uapi.drm_format_xrgb2101010)) {
+        pl.xrgb10.push(0)
+    }
+}
+
+/// Inspect connector `Colorspace` enum property for `BT2020_RGB` and `Default`.
+fn read_colorspace_enums(fd: int, prop_id: u32) -> (bool, u64, u64) {
+    guard prop_id != 0 else {
+        return (false, 0, 0)
+    }
+    var found_bt2020 = false
+    var bt2020_val: u64 = 0
+    var default_val: u64 = 0
+    unsafe {
+        let pr = drm.mode_get_property(i32(fd), prop_id)
+        guard not pr.is_null() else {
+            return (false, 0, 0)
+        }
+        let p = pr.read()
+        for i in 0..int(p.count_enums) {
+            let e = p.enums.offset(i).read()
+            let name = cname(e.name)
+            if name == "BT2020_RGB" {
+                found_bt2020 = true
+                bt2020_val = e.value
+            } else if name == "Default" {
+                default_val = e.value
+            }
+        }
+        drm.mode_free_property(pr)
+    }
+    return (found_bt2020, bt2020_val, default_val)
 }
 
 fn Drm.plane_supports(self, p: int, fmt: u32, modifier: u64) -> bool {
@@ -392,6 +456,12 @@ fn Drm.scan(mut self) {
             let (make, model) = edid_names(blob(self.fd, u32(con.props.value("EDID"))))
             con.make = make
             con.model = model
+            let cs_id = con.props.id("Colorspace")
+            let (has_bt2020, bt2020_v, def_v) = read_colorspace_enums(self.fd, cs_id)
+            con.has_colorspace = has_bt2020
+            con.bt2020_rgb_val = bt2020_v
+            con.default_cs_val = def_v
+            con.hdr_capable = con.props.id("HDR_OUTPUT_METADATA") != 0 and has_bt2020
             conns.push(con)
         }
         drm.mode_free_resources(res)
@@ -472,10 +542,15 @@ fn Drm.connect(mut self, mut added: List[int]) {
 
 fn Drm.desc(self, o: int) -> types.OutputDesc {
     let c = self.outputs[o].conn
+    let ki = self.outputs[o].crtc
+    let primary = self.outputs[o].primary
     var modes: List[types.Mode] = []
     for m in self.conns[c].modes {
         modes.push(to_mode(m))
     }
+    let atomic_gamma = u32(self.crtcs[ki].props.value("GAMMA_LUT_SIZE"))
+    let gamma_size = if atomic_gamma > 0 { atomic_gamma } else { self.crtcs[ki].legacy_gamma_size }
+    let hdr = self.conns[c].hdr_capable and not self.planes[primary].xrgb10.is_empty()
     return types.OutputDesc {
         name: self.conns[c].name.clone(),
         make: self.conns[c].make.clone(),
@@ -486,6 +561,8 @@ fn Drm.desc(self, o: int) -> types.OutputDesc {
         mode: to_mode(self.outputs[o].mode),
         vrr: self.conns[c].props.value("vrr_capable") == 1,
         internal: self.conns[c].internal,
+        gamma_size,
+        hdr,
     }
 }
 
@@ -591,10 +668,12 @@ fn Drm.rm_fb(self, id: u32) {
 fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[types.Want] {
     let w = i32(self.outputs[o].mode.hdisplay)
     let h = i32(self.outputs[o].mode.vdisplay)
-    // A new mode needs buffers of its size.
+    let plane = self.outputs[o].primary
+    let want_fmt = if self.outputs[o].hdr and not self.planes[plane].xrgb10.is_empty() { types.buffer.xrgb2101010 } else { types.buffer.xrgb8888 }
+    // A new mode or HDR format switch needs matching buffers.
     if let Some(sw) = self.outputs[o].swap.take() {
         var old = sw
-        if old.width == w and old.height == h {
+        if old.width == w and old.height == h and old.format == want_fmt {
             self.outputs[o].swap = Some(old)
             return None
         }
@@ -606,22 +685,148 @@ fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[t
         self.outputs[o].shown = -1
         self.outputs[o].queued = -1
     }
-    let plane = self.outputs[o].primary
-    return Some(types.Want { width: w, height: h, format: types.buffer.xrgb8888, modifiers: self.planes[plane].xrgb.clone(), count })
+    let mods = if want_fmt == types.buffer.xrgb2101010 { self.planes[plane].xrgb10.clone() } else { self.planes[plane].xrgb.clone() }
+    return Some(types.Want { width: w, height: h, format: want_fmt, modifiers: mods, count })
 }
 
 /// Output `o`'s scanout buffers: framebuffers for the targets made.
 fn Drm.give(mut self, o: int, ts: &[types.Target]) -> Result[(), str] {
     let w = i32(self.outputs[o].mode.hdisplay)
     let h = i32(self.outputs[o].mode.vdisplay)
+    let plane = self.outputs[o].primary
+    let fmt = if self.outputs[o].hdr and not self.planes[plane].xrgb10.is_empty() { types.buffer.xrgb2101010 } else { types.buffer.xrgb8888 }
     var s = swap.create(w, h, ts)
+    s.format = fmt
     for i in 0..s.slots.len() {
-        let b = types.Dmabuf { format: u32(uapi.drm_format_xrgb8888), ..s.slots[i].buf }
+        let b = types.Dmabuf { format: fmt, ..s.slots[i].buf }
         s.slots[i].id = try self.add_fb(b)
     }
     self.outputs[o].swap = Some(s)
     try self.make_cursor(o)
     return Ok(())
+}
+
+/// Install or reset (empty slices) a hardware CRTC gamma LUT on output `o`.
+fn Drm.set_gamma(mut self, o: int, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+    guard o >= 0 and o < self.outputs.len() else {
+        return false
+    }
+    let ki = self.outputs[o].crtc
+    let crtc = self.crtcs[ki].id
+    let prop = self.crtcs[ki].props.id("GAMMA_LUT")
+    if prop != 0 {
+        if r.is_empty() {
+            if self.outputs[o].gamma_blob != 0 {
+                self.outputs[o].retired_blobs.push(self.outputs[o].gamma_blob)
+                self.outputs[o].gamma_blob = 0
+            }
+            self.outputs[o].gamma_dirty = true
+            if not self.outputs[o].modeset {
+                self.update(o)
+            }
+            return true
+        }
+        let want = int(self.crtcs[ki].props.value("GAMMA_LUT_SIZE"))
+        guard r.len() == g.len() and r.len() == b.len() and (want == 0 or r.len() == want) else {
+            return false
+        }
+        var luts: List[uapi.ColorLut] = []
+        for i in 0..r.len() {
+            luts.push(uapi.ColorLut { red: r[i], green: g[i], blue: b[i], reserved: 0 })
+        }
+        var bid: u32 = 0
+        unsafe {
+            guard drm.mode_create_property_blob(i32(self.fd), luts.as_ptr().cast[u8](), u64(luts.len() * size_of[uapi.ColorLut]()), Ptr.of_mut(mut bid)) == 0 and bid != 0 else {
+                return false
+            }
+        }
+        if self.outputs[o].gamma_blob != 0 {
+            self.outputs[o].retired_blobs.push(self.outputs[o].gamma_blob)
+        }
+        self.outputs[o].gamma_blob = bid
+        self.outputs[o].gamma_dirty = true
+        if not self.outputs[o].modeset {
+            self.update(o)
+        }
+        return true
+    }
+    let leg = int(self.crtcs[ki].legacy_gamma_size)
+    guard leg > 0 else {
+        return false
+    }
+    if r.is_empty() {
+        var ident: List[u16] = []
+        for i in 0..leg {
+            let v = if leg > 1 { u16(i * 65535 / (leg - 1)) } else { u16(0) }
+            ident.push(v)
+        }
+        unsafe {
+            return drm.mode_crtc_set_gamma(i32(self.fd), crtc, u32(leg), ident.as_ptr(), ident.as_ptr(), ident.as_ptr()) == 0
+        }
+    }
+    guard r.len() == leg and g.len() == leg and b.len() == leg else {
+        return false
+    }
+    unsafe {
+        return drm.mode_crtc_set_gamma(i32(self.fd), crtc, u32(leg), r.as_ptr(), g.as_ptr(), b.as_ptr()) == 0
+    }
+}
+
+/// Enable or disable HDR static metadata (BT.2020 + ST.2084 PQ) and 10-bit
+/// scanout on output `o`.
+fn Drm.set_hdr(mut self, o: int, enabled: bool, sdr_nits: f32, max_nits: f32) -> bool {
+    guard o >= 0 and o < self.outputs.len() else {
+        return false
+    }
+    let ci = self.outputs[o].conn
+    let primary = self.outputs[o].primary
+    if enabled {
+        guard ci < self.conns.len() and self.conns[ci].hdr_capable and not self.planes[primary].xrgb10.is_empty() else {
+            return false
+        }
+        let max_l = u16(int(max_nits).clamp(100, 10000))
+        let fall = u16(min(int(max_l), max(int(sdr_nits), 400)))
+        var info = uapi.HdrMetadataInfoframe {
+            eotf: 2,
+            metadata_type: 0,
+            display_primaries: [
+                uapi.HdrMetadataInfoframeDisplayPrimaries { x: 35400, y: 14600 },
+                uapi.HdrMetadataInfoframeDisplayPrimaries { x: 8500, y: 39850 },
+                uapi.HdrMetadataInfoframeDisplayPrimaries { x: 6550, y: 2300 },
+            ],
+            white_point: uapi.HdrMetadataInfoframeWhitePoint { x: 15635, y: 16450 },
+            max_display_mastering_luminance: max_l,
+            min_display_mastering_luminance: 50,
+            max_cll: max_l,
+            max_fall: fall,
+        }
+        var meta = uapi.HdrOutputMetadata { metadata_type: 0 }
+        var bid: u32 = 0
+        unsafe {
+            Ptr.of_mut(mut meta.anon0).cast[uapi.HdrMetadataInfoframe]().write(info)
+            guard drm.mode_create_property_blob(i32(self.fd), Ptr.of(meta).cast[u8](), u64(size_of[uapi.HdrOutputMetadata]()), Ptr.of_mut(mut bid)) == 0 and bid != 0 else {
+                return false
+            }
+        }
+        if self.outputs[o].hdr_blob != 0 {
+            self.outputs[o].retired_blobs.push(self.outputs[o].hdr_blob)
+        }
+        self.outputs[o].hdr_blob = bid
+        self.outputs[o].hdr = true
+        self.outputs[o].hdr_dirty = true
+        self.outputs[o].modeset = true
+        return true
+    }
+    if self.outputs[o].hdr_blob != 0 {
+        self.outputs[o].retired_blobs.push(self.outputs[o].hdr_blob)
+        self.outputs[o].hdr_blob = 0
+    }
+    if self.outputs[o].hdr {
+        self.outputs[o].hdr = false
+        self.outputs[o].hdr_dirty = true
+        self.outputs[o].modeset = true
+    }
+    return true
 }
 
 fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
@@ -716,6 +921,22 @@ fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: &[uap
         r.add(crtc, self.crtcs[ki].props.id("ACTIVE"), if self.outputs[o].enabled { 1 } else { 0 })
         r.add(crtc, self.crtcs[ki].props.id("VRR_ENABLED"), if self.outputs[o].vrr { 1 } else { 0 })
         r.flags |= u32(uapi.drm_mode_atomic_allow_modeset)
+    }
+    if modeset or self.outputs[o].gamma_dirty {
+        let gp = self.crtcs[ki].props.id("GAMMA_LUT")
+        if gp != 0 {
+            r.add(crtc, gp, u64(self.outputs[o].gamma_blob))
+        }
+    }
+    if modeset or self.outputs[o].hdr_dirty {
+        let hp = self.conns[ci].props.id("HDR_OUTPUT_METADATA")
+        if hp != 0 {
+            r.add(self.conns[ci].id, hp, u64(self.outputs[o].hdr_blob))
+        }
+        let cp = self.conns[ci].props.id("Colorspace")
+        if cp != 0 and self.conns[ci].has_colorspace {
+            r.add(self.conns[ci].id, cp, if self.outputs[o].hdr { self.conns[ci].bt2020_rgb_val } else { self.conns[ci].default_cs_val })
+        }
     }
     let pid = self.planes[primary].id
     if fb != 0 {
@@ -899,16 +1120,23 @@ fn Drm.probe_commit(mut self, r: commit.Req) -> bool {
 /// Queue `r` for the commit thread. A frame holds the output until it
 /// flips (or its commit fails).
 fn Drm.send(mut self, take r: commit.Req) {
-    let o = r.out
-    if r.frame {
+    var req = r
+    let o = req.out
+    if req.frame {
         self.outputs[o].pending = true
         let qov = mem.replace(mut self.outputs[o].queued_overlays, [])
         self.outputs[o].pend_overlays = qov
     }
+    for b in self.outputs[o].retired_blobs {
+        req.blobs.push(b)
+    }
+    self.outputs[o].retired_blobs.clear()
     self.outputs[o].modeset = false
+    self.outputs[o].gamma_dirty = false
+    self.outputs[o].hdr_dirty = false
     match self.thread {
-        Some(t) => t.send(commit.Job.Commit(r))
-        None => r.release(self.fd)
+        Some(t) => t.send(commit.Job.Commit(req))
+        None => req.release(self.fd)
     }
 }
 
@@ -1048,8 +1276,25 @@ fn Drm.reset_targets(mut self, mut retired: List[u64]) {
 /// Turn every output off (the session ends or the compositor exits).
 fn Drm.release(mut self, mut retired: List[u64]) {
     self.reset_targets(mut retired)
+    let f = i32(self.fd)
     for o in 0..self.outputs.len() {
         self.rm_fb(self.outputs[o].cursor_fb)
         self.outputs[o].cursor_fb = 0
+        if self.outputs[o].mode_blob != 0 {
+            discard drm.mode_destroy_property_blob(f, self.outputs[o].mode_blob)
+            self.outputs[o].mode_blob = 0
+        }
+        if self.outputs[o].gamma_blob != 0 {
+            discard drm.mode_destroy_property_blob(f, self.outputs[o].gamma_blob)
+            self.outputs[o].gamma_blob = 0
+        }
+        if self.outputs[o].hdr_blob != 0 {
+            discard drm.mode_destroy_property_blob(f, self.outputs[o].hdr_blob)
+            self.outputs[o].hdr_blob = 0
+        }
+        for b in self.outputs[o].retired_blobs {
+            discard drm.mode_destroy_property_blob(f, b)
+        }
+        self.outputs[o].retired_blobs.clear()
     }
 }

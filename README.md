@@ -50,12 +50,12 @@ wlr-protocols. The server speaks:
 | Area | Protocols |
 |------|-----------|
 | Core and shell | wl_compositor 6, subcompositor, shm, wl_seat 9, wl_output 4, xdg-shell 6, wl_fixes |
-| Buffers and timing | linux-dmabuf 4, linux-drm-syncobj, single-pixel-buffer, viewporter, fractional-scale, presentation-time, fifo, commit-timing, tearing-control, alpha-modifier, content-type |
+| Buffers and timing | linux-dmabuf 4 (8-bit, 10-bit, FP16), linux-drm-syncobj, single-pixel-buffer, viewporter, fractional-scale, presentation-time, fifo, commit-timing, tearing-control, alpha-modifier, content-type, wp-color-management v1 (HDR/BT.2020/PQ/scRGB) |
 | Windows | xdg-decoration, xdg-activation, xdg-toplevel-icon, xdg-toplevel-tag, xdg-dialog, xdg-foreign v2, xdg-system-bell, ext-foreign-toplevel-list |
-| Desktop | wlr-layer-shell 5, ext-session-lock, xdg-output 3, ext-idle-notify 2, idle-inhibit |
-| Input | relative-pointer, pointer-constraints, pointer-gestures 3, cursor-shape 2, keyboard-shortcuts-inhibit, text-input-v3, input-method-v2, virtual-keyboard |
+| Desktop | wlr-layer-shell 5, ext-session-lock, xdg-output 3, ext-idle-notify 2, idle-inhibit, wlr-gamma-control v1 (hardware CRTC gamma LUT / night light) |
+| Input | relative-pointer, pointer-constraints, pointer-gestures 3, cursor-shape 2, keyboard-shortcuts-inhibit, text-input-v3, input-method-v2, virtual-keyboard, wlr-virtual-pointer v2 |
 | Selections | clipboard, primary selection, ext-data-control, drag and drop with actions |
-| Capture and control | ext-image-copy-capture with output & toplevel window sources (shm and zero-copy dmabuf), wlr-output-management 4, security-context (sandboxed clients do not see privileged globals) |
+| Capture and control | ext-image-copy-capture with output & toplevel window sources (shm, zero-copy dmabuf, per-window `Style.block_capture` privacy redaction), wlr-output-management 4, security-context (sandboxed clients do not see privileged globals) |
 
 Not yet: tablets (`tablet-v2`).
 
@@ -184,7 +184,7 @@ sheaf run -p tiny -- -s foot    # on a VT, or as a window in your session
 
 | Backend | Output | Input |
 |---|---|---|
-| DRM | atomic KMS on a commit thread: primary, overlay and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, hotplug | libinput through libseat (multi-seat), xkb |
+| DRM | atomic KMS on a commit thread: primary, overlay and cursor planes, modifiers from `IN_FORMATS`, page-flip timestamps, async flips for tearing clients, VRR, DPMS, CRTC `GAMMA_LUT`, HDR static metadata (`HDR_OUTPUT_METADATA` / `BT2020_RGB` / 10-bit `XRGB2101010`), hotplug | libinput through libseat (multi-seat, accel profile, DWT), xkb (layout group switching) |
 | Nested | a window of the parent compositor (its title bar and borders through xdg-decoration), dmabufs over linux-dmabuf with implicit fences | the parent's seat and keymap |
 | Headless | textures shown on a vblank grid at the mode's refresh | `inject` / `inject_on` |
 

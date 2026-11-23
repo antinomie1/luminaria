@@ -10,6 +10,8 @@ import state
 import server
 import capture
 import outman
+import gamma
+import color
 
 fn add(mut srv: server.Server, take info: state.OutputInfo) -> ids.Output {
     let id = srv.outputs.add(state.OutputData { info })
@@ -90,9 +92,15 @@ fn bound(mut srv: server.Server, ci: u32, oi: u32, id: u32, version: u32) {
 
 fn update(mut srv: server.Server, oi: u32, take info: state.OutputInfo) {
     let resized = info.width != srv.outputs.items[int(oi)].info.width or info.height != srv.outputs.items[int(oi)].info.height
+    let color_changed = info.hdr != srv.outputs.items[int(oi)].info.hdr or info.sdr_nits != srv.outputs.items[int(oi)].info.sdr_nits or info.max_nits != srv.outputs.items[int(oi)].info.max_nits
+    let prev_cid = srv.outputs.items[int(oi)].info.color_identity
     srv.outputs.items[int(oi)].info = info
+    srv.outputs.items[int(oi)].info.color_identity = prev_cid
     if resized {
         capture.output_changed(mut srv, oi)
+    }
+    if color_changed {
+        color.output_changed(mut srv, oi)
     }
     outman.output_changed(mut srv, oi)
     for k in 0..srv.outputs.items[int(oi)].xdg.len() {
@@ -113,6 +121,8 @@ fn remove(mut srv: server.Server, oi: u32) {
     srv.remove_global(name)
     capture.output_gone(mut srv, oi)
     outman.output_gone(mut srv, oi)
+    gamma.output_gone(mut srv, oi)
+    color.output_gone(mut srv, oi)
     // Surfaces leave it.
     let bit = if oi < 64 { u64(1) << u64(oi) } else { u64(0) }
     for k in 0..srv.surfaces.items.len() {
@@ -161,6 +171,7 @@ fn set_outputs(mut srv: server.Server, si: u32, mask: u64) {
             }
         }
     }
+    color.surface_outputs_changed(mut srv, si)
 }
 
 /// Tell the surface the scale (120ths) and transform it should render

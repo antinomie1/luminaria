@@ -96,7 +96,7 @@ d.layout(fn(mut l) {
   pixels, stride)` 局部更新：`pixels` 是整幅图像，只拷 `x, y, w, h`；`drop_image` 释放），用于壁纸、
   服务端装饰、面板。
 - `Style`：`opacity`、`radius`、`shadow`、`scale`（缩略图；输入坐标同步缩放）、`transition_ms`
-  （从上一次的位置和不透明度动画过去，由库插值）。
+  （从上一次的位置和不透明度动画过去，由库插值）、`block_capture`（录屏与截屏时对该窗口及其弹出菜单自动遮蔽为纯黑，不影响屏幕显示）。
 - 每个输出只拿到它显示的那部分；只有变化的部分被重绘。
 
 ## 窗口
@@ -160,14 +160,14 @@ d.end(100)
 |---|---|
 | `outputs()` / `output_rect(o)` / `output_desc(o)` / `output_under(x, y)` | 查询 |
 | `set_scale(o, s)` / `set_position(o, x, y)` / `set_mode(o, mode)` | 缩放（客户端按它渲染）、位置、模式 |
-| `enable(o, on)` / `set_vrr(o, on)` | 关屏省电、可变刷新率 |
+| `enable(o, on)` / `output_enabled(o)` / `set_vrr(o, on)` / `set_hdr(o, on, sdr_nits, max_nits)` / `hdr(o)` | 关屏省电、可变刷新率、HDR（BT.2020 + PQ + 10-bit 扫描输出） |
 | `output_config(c)` / `apply_output_config(c, test)` / `output_config_done(c, ok)` | 输出配置工具（wlr-randr、kanshi）的请求 |
 | `add_seat(name)` / `remove_seat(Seat)` / `seats()` / `seat_name(Seat)` | 增加、移除逻辑 seat 及查询（主 seat0 不可移除） |
 | `assign_device_seat(device, name)` | 把 libinput 设备绑定到指定逻辑 seat |
 | `pointer()` / `pointer_on(Seat)` / `warp(x, y)` / `warp_on(Seat, x, y)` | 指针位置 |
 | `set_cursor_named(name)` / `hide_cursor()` | 主题光标 |
-| `configure_input(device, InputConfig)` | 轻触点击、自然滚动、加速、左手、禁用 |
-| `set_keymap(Names)` / `set_keymap_on(Seat, Names)` / `mods()` / `mods_on(Seat)` | 键盘布局、当前修饰键 |
+| `configure_input(device, InputConfig)` | 轻触点击、自然滚动、加速与平坦/自适应加速曲线、打字禁用触摸板（DWT）、左手、禁用 |
+| `set_keymap(Names)` / `set_keymap_on(Seat, Names)` / `switch_layout(delta)` / `switch_layout_on(Seat, delta)` / `layout_name()` / `mods()` / `mods_on(Seat)` | 键盘布局、布局组切换、当前修饰键 |
 | `read_output(o)` | 无头输出当前显示的像素（测试、截图） |
 | `stats(o)` / `reset_stats()` | 输出 `o` 测到的 `types.Stats`（见 [compose.md](compose.md#测量)）/ 重新开始计 |
 

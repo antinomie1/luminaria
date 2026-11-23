@@ -75,6 +75,11 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     d.origins.clear()
     d.surf_keys.clear()
     d.surf_window.clear()
+    d.blocked_keys.clear()
+    d.blocked_wins.clear()
+    for o in 0..d.outs.len() {
+        d.outs[o].has_blocked = false
+    }
     var per = mem.replace(mut d.per_scratch, [])
     while per.len() < d.outs.len() {
         per.push([])
@@ -117,6 +122,9 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                 Window(w) => {
                     guard d.srv.mapped(w) else {
                         continue
+                    }
+                    if p.style.block_capture {
+                        discard d.blocked_wins.insert(w, true)
                     }
                     let s = d.srv.window_surface(w)
                     let win = d.wins.get(w).unwrap_or(display.Win {})
@@ -262,6 +270,9 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
         }
         let tex = sf.tex
         let root = ts == s
+        if style.block_capture {
+            discard d.blocked_keys.insert(display.skey(ts), true)
+        }
         let opq = if info.alpha < 1.0 { server.Rect {} } else { d.srv.opaque(ts) }
         let alpha = opacity * info.alpha
         var mask: u64 = 0
@@ -272,6 +283,9 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
             let out = d.outs[o]
             guard out.alive and gx < out.x + out.lw() and gy < out.y + out.lh() and gx + gw > out.x and gy + gh > out.y else {
                 continue
+            }
+            if style.block_capture {
+                d.outs[o].has_blocked = true
             }
             let k = out.scale
             let f = sc * k
@@ -293,6 +307,7 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
                 radius: if root { style.radius * f32(f) } else { 0.0 },
                 shadow: if root { style.shadow * f32(k) } else { 0.0 },
                 opaque: types.Rect { x: f32(f64(opq.x) * f), y: f32(f64(opq.y) * f), w: f32(f64(opq.w) * f), h: f32(f64(opq.h) * f) },
+                color_space: info.color_space,
             })
             mask |= u64(1) << u64(out.sout.id.index)
         }

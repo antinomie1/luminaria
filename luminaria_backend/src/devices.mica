@@ -224,3 +224,57 @@ pub fn Devices.switch_vt(self, n: int) {
         s.switch_vt(n)
     }
 }
+
+/// Cycle the active XKB layout group on the default seat by `delta`.
+pub fn Devices.switch_layout(mut self, delta: int) -> bool {
+    guard let Some(kk) = self.kb.take() else {
+        return false
+    }
+    var k = kk
+    let changed = k.switch_layout(delta)
+    if changed {
+        let (d, l, lk, g) = k.serialized()
+        self.events.push(types.Event.Input(types.Input.Modifiers(d, l, lk, g)))
+    }
+    self.kb = Some(k)
+    return changed
+}
+
+/// Cycle the active XKB layout group on logical `seat` by `delta`.
+pub fn Devices.switch_layout_on(mut self, seat: str, delta: int) -> bool {
+    if seat.is_empty() or seat == "seat0" or seat == "default" or seat == self.seat {
+        return self.switch_layout(delta)
+    }
+    for i in 0..self.extra.len() {
+        if self.extra[i].0 == seat {
+            let changed = self.extra[i].1.switch_layout(delta)
+            if changed {
+                let (d, l, lk, g) = self.extra[i].1.serialized()
+                self.events.push(types.Event.InputOn(seat.clone(), types.Input.Modifiers(d, l, lk, g)))
+            }
+            return changed
+        }
+    }
+    return self.switch_layout(delta)
+}
+
+/// Active XKB layout name on the default seat.
+pub fn Devices.layout_name(self) -> str {
+    if let Some(k) = self.kb {
+        return k.layout_name()
+    }
+    return ""
+}
+
+/// Active XKB layout name on logical `seat`.
+pub fn Devices.layout_name_on(self, seat: str) -> str {
+    if seat.is_empty() or seat == "seat0" or seat == "default" or seat == self.seat {
+        return self.layout_name()
+    }
+    for x in self.extra {
+        if x.0 == seat {
+            return x.1.layout_name()
+        }
+    }
+    return self.layout_name()
+}

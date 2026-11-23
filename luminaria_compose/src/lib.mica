@@ -25,6 +25,9 @@ struct Output {
     width: u32 = 1
     height: u32 = 1
     background: vec4 = zeroed()
+    dst_color: u32 = 0
+    sdr_nits: f32 = 203.0
+    max_nits: f32 = 1000.0
     alive: bool = true
     /// Placement key -> (scene view id, last seen generation, texture key).
     by_key: map.Map[u64, (u32, u64, u64)]
@@ -53,8 +56,8 @@ pub struct Compositor {
     want_priority: gpu.Priority = gpu.Priority.Realtime
     resets: int = 0
     canvas: Option[draw2d.Canvas] = None
-    /// Lazily built for R8G8B8A8_UNORM dmabuf capture targets.
-    canvas_rgba: Option[draw2d.Canvas] = None
+    /// Lazily built canvases for non-BGRA8 target formats (RGBA8, 10-bit HDR, FP16).
+    extra_canvases: List[(gpu.Format, draw2d.Canvas)] = []
     outputs: List[Output] = []
     /// Uploads waiting for the next frame (recorded once, before any draw).
     uploads: Option[gpu.Encoder] = None
@@ -146,17 +149,22 @@ pub fn Compositor.recover(mut self) -> Result[(), str] {
     self.shms.clear()
     self.targets.clear()
     discard self.canvas.take()
-    discard self.canvas_rgba.take()
+    self.extra_canvases.clear()
     self.dev = new_dev
     self.canvas = Some(new_canvas)
     for o in 0..self.outputs.len() {
         let prev = mem.replace(mut self.outputs[o], blank())
         if prev.alive {
+            var sc = vc.Scene.new(prev.width, prev.height, prev.background)
+            sc.set_output_color(prev.dst_color, prev.sdr_nits, prev.max_nits)
             self.outputs[o] = Output {
-                scene: vc.Scene.new(prev.width, prev.height, prev.background),
+                scene: sc,
                 width: prev.width,
                 height: prev.height,
                 background: prev.background,
+                dst_color: prev.dst_color,
+                sdr_nits: prev.sdr_nits,
+                max_nits: prev.max_nits,
                 alive: true,
                 by_key: map.Map.new(),
                 by_id: map.Map.new(),
@@ -199,10 +207,34 @@ pub fn Compositor.remove_output(mut self, o: int) {
     }
 }
 
+/// Set the target color space and luminance parameters for output `o`.
+pub fn Compositor.set_output_color(mut self, o: int, dst_color: u32, sdr_nits: f32, max_nits: f32) {
+    guard o >= 0 and o < self.outputs.len() else {
+        return
+    }
+    self.outputs[o].dst_color = dst_color
+    self.outputs[o].sdr_nits = sdr_nits
+    self.outputs[o].max_nits = max_nits
+    self.outputs[o].scene.set_output_color(dst_color, sdr_nits, max_nits)
+}
+
 fn view(p: Placement, t: gpu.Texture) -> vc.View {
     let src = vc.Rect { x: p.src.x, y: p.src.y, w: p.src.w, h: p.src.h }
     let opaque = vc.Rect { x: p.opaque.x, y: p.opaque.y, w: p.opaque.w, h: p.opaque.h }
-    return vc.View { tex: t, x: p.x, y: p.y, w: p.w, h: p.h, src, transform: vc.Transform(p.transform), opacity: p.opacity, radius: p.radius, shadow: p.shadow, opaque }
+    return vc.View {
+        tex: t,
+        x: p.x,
+        y: p.y,
+        w: p.w,
+        h: p.h,
+        src,
+        transform: vc.Transform(p.transform),
+        opacity: p.opacity,
+        radius: p.radius,
+        shadow: p.shadow,
+        opaque,
+        color_space: p.color_space,
+    }
 }
 
 /// Show `ps` (back to front) on output `o` from the next frame: views are
@@ -567,6 +599,30 @@ pub fn Compositor.drop_target(mut self, key: u64) {
     }
 }
 
+fn Compositor.take_canvas(mut self, fmt: gpu.Format) -> Result[draw2d.Canvas, str] {
+    if fmt == gpu.Format.B8G8R8A8_UNORM {
+        guard let Some(cv) = self.canvas.take() else {
+            return Err("no canvas")
+        }
+        return Ok(cv)
+    }
+    for i in 0..self.extra_canvases.len() {
+        if self.extra_canvases[i].0 == fmt {
+            let (_, cv) = self.extra_canvases.remove(i)
+            return Ok(cv)
+        }
+    }
+    return draw2d.Canvas.create(mut self.dev, fmt)
+}
+
+fn Compositor.put_canvas(mut self, fmt: gpu.Format, take cv: draw2d.Canvas) {
+    if fmt == gpu.Format.B8G8R8A8_UNORM {
+        self.canvas = Some(cv)
+    } else {
+        self.extra_canvases.push((fmt, cv))
+    }
+}
+
 /// Draw what output `o` needs into target `key`, whose content is `age`
 /// frames old: the sync_file fence of the drawing, or None when the image
 /// is already up to date.
@@ -578,15 +634,19 @@ pub fn Compositor.render(mut self, o: int, key: u64, age: u32) -> Result[Option[
     guard let Some(t) = self.targets.get(key) else {
         return Err("no render target {key}")
     }
-    guard let Some(cv) = self.canvas.take() else {
-        return Err("no canvas")
+    let fmt = t.format()
+    var canvas = try self.take_canvas(fmt)
+    var e = match self.dev.encoder() {
+        Ok(e) => e
+        Err(err) => {
+            self.put_canvas(fmt, canvas)
+            return Err(err)
+        }
     }
-    var canvas = cv
-    var e = try self.dev.encoder()
     var out = mem.replace(mut self.outputs[o], blank())
     let r = out.scene.render(mut self.dev, mut canvas, mut e, gpu.Frame.new(t, age))
     self.outputs[o] = out
-    self.canvas = Some(canvas)
+    self.put_canvas(fmt, canvas)
     guard let Ok(drew) = r else {
         self.dev.cancel(take e)
         return Err(r.unwrap_err())
@@ -609,6 +669,7 @@ pub fn Compositor.read(mut self, key: u64) -> Result[List[u8], str] {
 
 fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encoder, dst: gpu.Texture, ps: &[Placement]) -> Result[(), str] {
     cv.clear()
+    cv.set_output_color(types.dst_sdr, 203.0, 1000.0)
     let w = dst.width()
     let h = dst.height()
     cv.rect(draw2d.Rect { w: f32(w), h: f32(h) }, vec4(0.0))
@@ -631,7 +692,7 @@ fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encode
         if v.shadow > 0.0 {
             cv.shadow(r, vec4(0.0, 0.0, 0.0, 0.45 * v.opacity), v.radius, v.shadow)
         }
-        cv.texture(t, r, src_rect, v.transform, vec4(1.0, 1.0, 1.0, v.opacity), v.radius)
+        cv.texture_color(t, r, src_rect, v.transform, vec4(1.0, 1.0, 1.0, v.opacity), v.radius, v.color_space)
         e.acquire(t)
     }
     let none: List[draw2d.Rect] = []
@@ -655,6 +716,10 @@ pub fn Compositor.copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, 
         return Err("invalid capture copy rect {w}x{h} into {dst_buf.width}x{dst_buf.height}")
     }
     let dst = try format.import_dmabuf_target(mut self.dev, dst_buf)
+    guard src.format() == dst.format() else {
+        self.dev.destroy_texture(dst)
+        return Err("capture dmabuf format differs from render target")
+    }
     var e = match self.dev.encoder() {
         Ok(e) => e
         Err(err) => {
@@ -678,21 +743,23 @@ pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: &[Plac
         return Err("invalid offscreen capture size {width}x{height}")
     }
     let dst = try self.dev.texture(gpu.TextureDesc { width, height, format: gpu.Format.B8G8R8A8_UNORM, target: true })
-    guard let Some(cv) = self.canvas.take() else {
-        self.dev.destroy_texture(dst)
-        return Err("no canvas")
+    var canvas = match self.take_canvas(gpu.Format.B8G8R8A8_UNORM) {
+        Ok(c) => c
+        Err(err) => {
+            self.dev.destroy_texture(dst)
+            return Err(err)
+        }
     }
-    var canvas = cv
     var e = match self.dev.encoder() {
         Ok(e) => e
         Err(err) => {
-            self.canvas = Some(canvas)
+            self.put_canvas(gpu.Format.B8G8R8A8_UNORM, canvas)
             self.dev.destroy_texture(dst)
             return Err(err)
         }
     }
     let r = self.draw_placements(mut canvas, mut e, dst, ps)
-    self.canvas = Some(canvas)
+    self.put_canvas(gpu.Format.B8G8R8A8_UNORM, canvas)
     guard r.is_ok() else {
         self.dev.cancel(take e)
         self.dev.destroy_texture(dst)
@@ -722,25 +789,18 @@ pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &
         return Err("capture format {dst_buf.format:08x} is not supported")
     }
     let dst = try format.import_dmabuf_target(mut self.dev, dst_buf)
-    let is_rgba = vf == gpu.Format.R8G8B8A8_UNORM
-    if dst.can_target() and is_rgba and self.canvas_rgba.is_none() {
-        match draw2d.Canvas.create(mut self.dev, gpu.Format.R8G8B8A8_UNORM) {
-            Ok(c) => self.canvas_rgba = Some(c)
-            Err(err) => {
-                self.dev.destroy_texture(dst)
-                return Err(err)
-            }
+    let cv_fmt = if dst.can_target() { vf } else { gpu.Format.B8G8R8A8_UNORM }
+    var cv = match self.take_canvas(cv_fmt) {
+        Ok(c) => c
+        Err(err) => {
+            self.dev.destroy_texture(dst)
+            return Err(err)
         }
     }
-    guard let Some(got_cv) = if dst.can_target() and is_rgba { self.canvas_rgba.take() } else { self.canvas.take() } else {
-        self.dev.destroy_texture(dst)
-        return Err("no canvas")
-    }
-    var cv = got_cv
     var e = match self.dev.encoder() {
         Ok(e) => e
         Err(err) => {
-            if dst.can_target() and is_rgba { self.canvas_rgba = Some(cv) } else { self.canvas = Some(cv) }
+            self.put_canvas(cv_fmt, cv)
             self.dev.destroy_texture(dst)
             return Err(err)
         }
@@ -748,7 +808,7 @@ pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &
     if dst.can_target() {
         e.acquire(dst)
         let r = self.draw_placements(mut cv, mut e, dst, ps)
-        if is_rgba { self.canvas_rgba = Some(cv) } else { self.canvas = Some(cv) }
+        self.put_canvas(cv_fmt, cv)
         guard r.is_ok() else {
             self.dev.cancel(take e)
             self.dev.destroy_texture(dst)
@@ -764,14 +824,14 @@ pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &
     let tmp = match self.dev.texture(gpu.TextureDesc { width: dst.width(), height: dst.height(), format: gpu.Format.B8G8R8A8_UNORM, target: true }) {
         Ok(t) => t
         Err(err) => {
-            self.canvas = Some(cv)
+            self.put_canvas(cv_fmt, cv)
             self.dev.cancel(take e)
             self.dev.destroy_texture(dst)
             return Err(err)
         }
     }
     let r = self.draw_placements(mut cv, mut e, tmp, ps)
-    self.canvas = Some(cv)
+    self.put_canvas(cv_fmt, cv)
     guard r.is_ok() else {
         self.dev.cancel(take e)
         self.dev.destroy_texture(tmp)
@@ -823,7 +883,8 @@ pub fn Compositor.close(mut self) {
     if let Some(c) = self.canvas.take() {
         c.destroy(mut self.dev)
     }
-    if let Some(c) = self.canvas_rgba.take() {
+    let extras = mem.replace(mut self.extra_canvases, [])
+    for (_, c) in take extras {
         c.destroy(mut self.dev)
     }
 }

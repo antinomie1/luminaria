@@ -9,7 +9,7 @@ pub struct Viewporter derive(Hash, Show) {
     pub id: u32
 }
 
-pub let viewporter_iface: u16 = 99
+pub let viewporter_iface: u16 = 108
 pub let viewporter_version: u32 = 1
 
 pub enum ViewporterError: u32 {
@@ -49,7 +49,7 @@ pub struct Viewport derive(Hash, Show) {
     pub id: u32
 }
 
-pub let viewport_iface: u16 = 100
+pub let viewport_iface: u16 = 109
 pub let viewport_version: u32 = 1
 
 pub enum ViewportError: u32 {

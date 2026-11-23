@@ -57,7 +57,65 @@ fn has_pending_output_dmabuf[O: plug.Output, R: plug.Renderer](d: display.Displa
     return false
 }
 
-fn window_placements[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window, mut out: List[types.Placement]) -> (i32, i32) {
+/// Lazily allocate the 1x1 opaque black texture used to redact `block_capture` windows.
+fn ensure_black[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -> u64 {
+    if not d.comp.has(display.black_key) {
+        discard d.comp.solid(display.black_key, [0, 0, 0, 0xFFFFFFFF])
+    }
+    return display.black_key
+}
+
+/// Lazily allocate a 1x1 opaque solid texture matching the display background.
+fn ensure_bg[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -> u64 {
+    if not d.comp.has(display.bg_key) {
+        let bg = d.background
+        let r = u32(int(bg.x.clamp(0.0, 1.0) * 255.0 + 0.5)) << 24
+        let g = u32(int(bg.y.clamp(0.0, 1.0) * 255.0 + 0.5)) << 24
+        let b = u32(int(bg.z.clamp(0.0, 1.0) * 255.0 + 0.5)) << 24
+        discard d.comp.solid(display.bg_key, [r, g, b, 0xFFFFFFFF])
+    }
+    return display.bg_key
+}
+
+/// Build an output's placement list for offscreen capture, replacing any
+/// `block_capture` surface with solid black (zero overhead when not capturing).
+fn redacted_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, mut out: List[types.Placement]) {
+    out.clear()
+    let bgk = ensure_bg(mut d)
+    out.push(types.Placement {
+        key: bgk,
+        tex: bgk,
+        w: f32(d.outs[o].width),
+        h: f32(d.outs[o].height),
+        opacity: 1.0,
+        opaque: types.Rect { w: f32(d.outs[o].width), h: f32(d.outs[o].height) },
+    })
+    let blk = if d.outs[o].has_blocked { ensure_black(mut d) } else { u64(0) }
+    guard o < d.per_scratch.len() else {
+        return
+    }
+    for p in d.per_scratch[o] {
+        if d.outs[o].has_blocked and d.blocked_keys.contains(p.key) {
+            out.push(types.Placement {
+                key: p.key,
+                tex: blk,
+                x: p.x,
+                y: p.y,
+                w: p.w,
+                h: p.h,
+                opacity: 1.0,
+                radius: p.radius,
+                shadow: p.shadow,
+                opaque: types.Rect { w: p.w, h: p.h },
+                color_space: types.color_sdr,
+            })
+        } else {
+            out.push(p)
+        }
+    }
+}
+
+fn window_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, mut out: List[types.Placement]) -> (i32, i32) {
     out.clear()
     guard d.srv.window_alive(w) and d.srv.mapped(w) else {
         return (0, 0)
@@ -69,6 +127,19 @@ fn window_placements[O: plug.Output, R: plug.Renderer](d: display.Display[O, R],
     let gh = if geo.w > 0 and geo.h > 0 { geo.h } else { info.height }
     guard gw > 0 and gh > 0 else {
         return (0, 0)
+    }
+    if d.blocked_wins.contains(w) {
+        let blk = ensure_black(mut d)
+        out.push(types.Placement {
+            key: display.skey(s),
+            tex: blk,
+            w: f32(gw),
+            h: f32(gh),
+            opacity: 1.0,
+            opaque: types.Rect { w: f32(gw), h: f32(gh) },
+            color_space: types.color_sdr,
+        })
+        return (gw, gh)
     }
     let ox = if geo.w > 0 and geo.h > 0 { geo.x } else { 0 }
     let oy = if geo.w > 0 and geo.h > 0 { geo.y } else { 0 }
@@ -99,6 +170,7 @@ fn window_placements[O: plug.Output, R: plug.Renderer](d: display.Display[O, R],
             transform: tinfo.transform,
             opacity: tinfo.alpha,
             opaque: types.Rect { x: f32(opq.x), y: f32(opq.y), w: f32(opq.w), h: f32(opq.h) },
+            color_space: tinfo.color_space,
         })
     }
     return (gw, gh)
@@ -125,7 +197,7 @@ fn finish_captures[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R
                 }
             }
             Window(w) => {
-                let (gw, gh) = window_placements(d, w, mut ps)
+                let (gw, gh) = window_placements(mut d, w, mut ps)
                 guard gw > 0 and gh > 0 and gw == req.width and gh == req.height else {
                     d.srv.capture_fail(req.session, 2)
                     d.srv.release(req.buffer)
@@ -157,7 +229,7 @@ fn finish_captures[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R
         guard d.srv.capture_window_waiting(w) else {
             continue
         }
-        let (gw, gh) = window_placements(d, w, mut ps)
+        let (gw, gh) = window_placements(mut d, w, mut ps)
         guard gw > 0 and gh > 0 else {
             continue
         }

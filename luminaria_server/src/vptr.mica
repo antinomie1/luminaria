@@ -1,0 +1,200 @@
+// zwlr_virtual_pointer_unstable_v1: virtual pointer devices (ydotool, remote
+// desktop, tests). Privileged: hidden from sandboxed clients.
+
+import luminaria_types as types
+import luminaria_proto.wayland as wl
+import luminaria_proto.wlr_virtual_pointer_unstable as vp
+import ids
+import state
+import server
+
+fn clamp_delta(v: f64) -> f64 {
+    if v != v {
+        return 0.0
+    }
+    return v.clamp(-1000000.0, 1000000.0)
+}
+
+fn create(mut srv: server.Server, ci: u32, seat_opt: Option[wl.Seat], out_opt: Option[wl.Output], ptr: vp.Pointer) {
+    var seat_slot = state.none
+    if let Some(s) = seat_opt {
+        seat_slot = srv.slot(ci, s.id)
+    } else if srv.seats.used(0) {
+        seat_slot = 0
+    }
+    var out_slot = state.none
+    if let Some(o) = out_opt {
+        out_slot = srv.slot(ci, o.id)
+    }
+    let id = srv.vptrs.add(state.VirtualPointerData { client: ci, obj: ptr.id, seat: seat_slot, output: out_slot })
+    srv.bind(ci, ptr.id, id.index)
+}
+
+fn manager(mut srv: server.Server, ci: u32, take req: vp.PointerManagerRequest) {
+    match req {
+        CreateVirtualPointer(seat_opt, ptr) => create(mut srv, ci, seat_opt, None, ptr)
+        CreateVirtualPointerWithOutput(seat_opt, out_opt, ptr) => create(mut srv, ci, seat_opt, out_opt, ptr)
+        Destroy => {}
+    }
+}
+
+fn seat_id(srv: server.Server, seat_slot: u32) -> Option[ids.Seat] {
+    if seat_slot != state.none and srv.seats.used(int(seat_slot)) {
+        return Some(ids.Seat { id: srv.seats.id(seat_slot) })
+    }
+    if srv.seats.used(0) {
+        return Some(ids.Seat { id: srv.seats.id(0) })
+    }
+    return None
+}
+
+fn out_id(srv: server.Server, out_slot: u32) -> Option[ids.Output] {
+    if out_slot != state.none and srv.outputs.used(int(out_slot)) {
+        return Some(ids.Output { id: srv.outputs.id(out_slot) })
+    }
+    return None
+}
+
+fn pointer(mut srv: server.Server, ci: u32, p: vp.Pointer, take req: vp.PointerRequest) {
+    let vi = srv.slot(ci, p.id)
+    guard vi != state.none and srv.vptrs.used(int(vi)) else {
+        return
+    }
+    let i = int(vi)
+    match req {
+        Motion(time, dx, dy) => {
+            let cx = clamp_delta(dx)
+            let cy = clamp_delta(dy)
+            srv.vptrs.items[i].time = time
+            srv.vptrs.items[i].dx += cx
+            srv.vptrs.items[i].dy += cy
+            srv.vptrs.items[i].has_motion = true
+        }
+        MotionAbsolute(time, x, y, x_extent, y_extent) => {
+            guard x_extent > 0 and y_extent > 0 else {
+                return
+            }
+            srv.vptrs.items[i].time = time
+            srv.vptrs.items[i].abs_x = (f64(x) / f64(x_extent)).clamp(0.0, 1.0)
+            srv.vptrs.items[i].abs_y = (f64(y) / f64(y_extent)).clamp(0.0, 1.0)
+            srv.vptrs.items[i].has_abs = true
+        }
+        Button(time, button, st) => {
+            let raw = u32(st)
+            guard raw <= 1 else {
+                return
+            }
+            if let Some(sid) = seat_id(srv, srv.vptrs.items[i].seat) {
+                let oid = out_id(srv, srv.vptrs.items[i].output)
+                srv.push(server.Event.VirtualPointer(sid, oid, types.Input.Button(time, button, raw == 1)))
+            }
+        }
+        Axis(time, axis, value) => {
+            let raw = u32(axis)
+            guard raw <= 1 else {
+                srv.fail(ci, p.id, u32(vp.PointerError.InvalidAxis), "invalid virtual pointer axis {raw}")
+                return
+            }
+            let v = clamp_delta(value).clamp(-100000.0, 100000.0)
+            srv.vptrs.items[i].time = time
+            if raw == 0 {
+                srv.vptrs.items[i].axis_dy += v
+            } else {
+                srv.vptrs.items[i].axis_dx += v
+            }
+            srv.vptrs.items[i].has_axis = true
+        }
+        AxisSource(src) => {
+            let raw = u32(src)
+            guard raw <= 3 else {
+                srv.fail(ci, p.id, u32(vp.PointerError.InvalidAxisSource), "invalid virtual pointer axis source {raw}")
+                return
+            }
+            srv.vptrs.items[i].axis_src = match raw {
+                0 => types.AxisSource.Wheel
+                1 => types.AxisSource.Finger
+                2 => types.AxisSource.Continuous
+                _ => types.AxisSource.WheelTilt
+            }
+        }
+        AxisStop(time, axis) => {
+            let raw = u32(axis)
+            guard raw <= 1 else {
+                srv.fail(ci, p.id, u32(vp.PointerError.InvalidAxis), "invalid virtual pointer axis {raw}")
+                return
+            }
+            srv.vptrs.items[i].time = time
+        }
+        AxisDiscrete(time, axis, value, discrete) => {
+            let raw = u32(axis)
+            guard raw <= 1 else {
+                srv.fail(ci, p.id, u32(vp.PointerError.InvalidAxis), "invalid virtual pointer axis {raw}")
+                return
+            }
+            let v = clamp_delta(value).clamp(-100000.0, 100000.0)
+            let d120 = int(discrete).clamp(-1000, 1000) * 120
+            srv.vptrs.items[i].time = time
+            srv.vptrs.items[i].axis_src = types.AxisSource.Wheel
+            if raw == 0 {
+                srv.vptrs.items[i].axis_dy += v
+                srv.vptrs.items[i].axis_cy = i32((int(srv.vptrs.items[i].axis_cy) + d120).clamp(-120000, 120000))
+            } else {
+                srv.vptrs.items[i].axis_dx += v
+                srv.vptrs.items[i].axis_cx = i32((int(srv.vptrs.items[i].axis_cx) + d120).clamp(-120000, 120000))
+            }
+            srv.vptrs.items[i].has_axis = true
+        }
+        Frame => {
+            let has_m = srv.vptrs.items[i].has_motion
+            let has_a = srv.vptrs.items[i].has_abs
+            let has_ax = srv.vptrs.items[i].has_axis
+            let dx = srv.vptrs.items[i].dx
+            let dy = srv.vptrs.items[i].dy
+            let ax = srv.vptrs.items[i].abs_x
+            let ay = srv.vptrs.items[i].abs_y
+            let adx = srv.vptrs.items[i].axis_dx
+            let ady = srv.vptrs.items[i].axis_dy
+            let acx = srv.vptrs.items[i].axis_cx
+            let acy = srv.vptrs.items[i].axis_cy
+            let src = srv.vptrs.items[i].axis_src
+            let t = srv.vptrs.items[i].time
+            let sslot = srv.vptrs.items[i].seat
+            let oslot = srv.vptrs.items[i].output
+            srv.vptrs.items[i].has_motion = false
+            srv.vptrs.items[i].dx = 0.0
+            srv.vptrs.items[i].dy = 0.0
+            srv.vptrs.items[i].has_abs = false
+            srv.vptrs.items[i].has_axis = false
+            srv.vptrs.items[i].axis_dx = 0.0
+            srv.vptrs.items[i].axis_dy = 0.0
+            srv.vptrs.items[i].axis_cx = 0
+            srv.vptrs.items[i].axis_cy = 0
+            if let Some(sid) = seat_id(srv, sslot) {
+                let oid = out_id(srv, oslot)
+                if has_m {
+                    srv.push(server.Event.VirtualPointer(sid, oid, types.Input.Motion(t, dx, dy, dx, dy)))
+                }
+                if has_a {
+                    srv.push(server.Event.VirtualPointer(sid, oid, types.Input.MotionAbsolute(t, 0, ax, ay)))
+                }
+                if has_ax {
+                    srv.push(server.Event.VirtualPointer(sid, oid, types.Input.Axis(t, src, adx, ady, acx, acy, false)))
+                }
+            }
+        }
+        Destroy => {
+            srv.unbind(ci, p.id)
+            srv.vptrs.remove(vi, state.VirtualPointerData {})
+        }
+    }
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    guard iface == vp.pointer_iface else {
+        return false
+    }
+    discard ci
+    discard id
+    srv.vptrs.remove(slot, state.VirtualPointerData {})
+    return true
+}

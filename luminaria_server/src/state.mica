@@ -3,6 +3,7 @@
 // `none` when unset.
 
 import std.os
+import luminaria_types as types
 import luminaria_wire as wire
 import ids
 import positioner
@@ -101,6 +102,9 @@ struct State {
     /// wp_content_type type.
     content_set: bool = false
     content: u32 = 0
+    /// wp_color_management_surface_v1 committed color space (`types.scene.color_*`).
+    color_set: bool = false
+    color_space: u32 = 0
     /// zwlr_layer_surface state set since the last commit.
     layer_set: bool = false
     layer: LayerState = LayerState {}
@@ -175,6 +179,7 @@ struct SurfaceData {
     tearing: u32 = 0
     alpha_obj: u32 = 0
     content_obj: u32 = 0
+    color_obj: u32 = 0
     /// Output slots it is on (bit per slot below 64).
     outputs: u64 = 0
     /// Mapped: has a buffer and (with a role) the role allows showing it.
@@ -354,6 +359,14 @@ pub struct OutputInfo {
     /// Variable refresh: supported, on.
     pub vrr_capable: bool = false
     pub vrr: bool = false
+    /// Hardware CRTC gamma LUT size (0 if unsupported).
+    pub gamma_size: u32 = 0
+    /// HDR output enabled and target luminance metadata.
+    pub hdr: bool = false
+    pub sdr_nits: f32 = 203.0
+    pub max_nits: f32 = 1000.0
+    /// Monotonic identity for wp_color_management_v1 output/feedback descriptions.
+    pub color_identity: u32 = 0
 }
 
 struct OutputData {
@@ -363,6 +376,8 @@ struct OutputData {
     binds: List[(u32, u32, u32)] = []
     /// zxdg_output_v1 objects: client slot, id, version.
     xdg: List[(u32, u32, u32)] = []
+    /// Active zwlr_gamma_control_v1 owner slot (or `none`).
+    gamma_owner: u32 = 0xFFFFFFFF
 }
 
 /// A per-client input object of a seat: client slot, id, version.
@@ -694,4 +709,80 @@ struct TxnData {
     states: List[State] = []
     waits: List[Wait] = []
     ready: bool = false
+}
+
+/// zwlr_virtual_pointer_v1 device state.
+struct VirtualPointerData {
+    client: u32 = 0
+    obj: u32 = 0
+    seat: u32 = 0xFFFFFFFF
+    output: u32 = 0xFFFFFFFF
+    time: u32 = 0
+    has_motion: bool = false
+    dx: f64 = 0.0
+    dy: f64 = 0.0
+    has_abs: bool = false
+    abs_x: f64 = 0.0
+    abs_y: f64 = 0.0
+    has_axis: bool = false
+    axis_src: types.AxisSource = types.AxisSource.Wheel
+    axis_dx: f64 = 0.0
+    axis_dy: f64 = 0.0
+    axis_cx: i32 = 0
+    axis_cy: i32 = 0
+}
+
+/// zwlr_gamma_control_v1 exclusive handle for an output.
+struct GammaData {
+    client: u32 = 0
+    obj: u32 = 0
+    output: u32 = 0xFFFFFFFF
+    active: bool = false
+}
+
+/// wp_image_description_v1 immutable colorimetric description.
+struct ColorDescData {
+    client: u32 = 0
+    obj: u32 = 0
+    color_space: u32 = 0
+    primaries: u32 = 1
+    tf: u32 = 9
+    min_lum: u32 = 2000
+    max_lum: u32 = 203
+    ref_lum: u32 = 203
+    ready: bool = false
+    allow_info: bool = false
+    identity: u32 = 0
+}
+
+/// wp_image_description_creator_params_v1 builder state.
+struct ColorCreatorData {
+    client: u32 = 0
+    obj: u32 = 0
+    has_primaries: bool = false
+    primaries: u32 = 1
+    has_tf: bool = false
+    tf: u32 = 9
+    has_lum: bool = false
+    min_lum: u32 = 2000
+    max_lum: u32 = 203
+    ref_lum: u32 = 203
+    has_mastering_prim: bool = false
+    has_mastering_lum: bool = false
+    has_cll: bool = false
+    has_fall: bool = false
+}
+
+/// wp_color_management_output_v1 listener.
+struct ColorOutputData {
+    client: u32 = 0
+    obj: u32 = 0
+    output: u32 = 0xFFFFFFFF
+}
+
+/// wp_color_management_surface_feedback_v1 listener.
+struct ColorFeedbackData {
+    client: u32 = 0
+    obj: u32 = 0
+    surface: u32 = 0xFFFFFFFF
 }

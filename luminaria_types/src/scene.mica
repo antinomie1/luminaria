@@ -10,6 +10,17 @@ pub struct Rect {
     pub h: f32 = 0.0
 }
 
+/// Source color space identifiers matching `vk_draw2d` (`color_*`).
+pub let color_sdr: u32 = 0
+pub let color_scrgb: u32 = 1
+pub let color_bt2020_pq: u32 = 2
+pub let color_bt2020_hlg: u32 = 3
+
+/// Output color space identifiers matching `vk_draw2d` (`dst_*`).
+pub let dst_sdr: u32 = 0
+pub let dst_hdr_pq: u32 = 1
+pub let dst_hdr_scrgb: u32 = 2
+
 /// One thing to show: a texture placed on an output.
 pub struct Placement {
     /// Stable identity (a surface, a compositor image): a key keeps its
@@ -31,6 +42,8 @@ pub struct Placement {
     pub shadow: f32 = 0.0
     /// Opaque part, relative to x, y.
     pub opaque: Rect = Rect {}
+    /// Source color space (`color_sdr`, `color_scrgb`, `color_bt2020_pq`, `color_bt2020_hlg`).
+    pub color_space: u32 = 0
 }
 
 /// A placement eligible for hardware overlay scanout on an output.

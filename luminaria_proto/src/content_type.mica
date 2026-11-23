@@ -9,7 +9,7 @@ pub struct TypeManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let type_manager_iface: u16 = 28
+pub let type_manager_iface: u16 = 37
 pub let type_manager_version: u32 = 1
 
 pub enum TypeManagerError: u32 {
@@ -49,7 +49,7 @@ pub struct Type derive(Hash, Show) {
     pub id: u32
 }
 
-pub let type_iface: u16 = 29
+pub let type_iface: u16 = 38
 pub let type_version: u32 = 1
 
 /// possible content types

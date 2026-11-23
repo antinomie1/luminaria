@@ -1,5 +1,6 @@
 // What clients do: server events, buffers, surfaces and popups.
 
+import luminaria_types as types
 import luminaria_types.pixels as pixels
 import luminaria_server as server
 import shell
@@ -9,6 +10,7 @@ import outputs
 import waits
 import place
 import seats
+import input
 
 fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     while true {
@@ -147,6 +149,45 @@ fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R])
                 discard d.poll.add(cf, display.tok_sandbox + int(k) * 2 + 1, true, false)
             }
             OutputConfig(c, only_test) => d.emit(display.Event.OutputConfig(c, only_test))
+            VirtualPointer(st, out_opt, inp) => {
+                var si = seats.seat_index(d, st)
+                if si < 0 {
+                    si = 0
+                }
+                var ev = inp
+                match take ev {
+                    MotionAbsolute(t, _, nx, ny) => {
+                        var oi = -1
+                        if let Some(so) = out_opt {
+                            oi = outputs.out_index(d, so)
+                        } else {
+                            for k in 0..d.outs.len() {
+                                if d.outs[k].alive {
+                                    oi = k
+                                    break
+                                }
+                            }
+                        }
+                        if oi >= 0 {
+                            input.input_on(mut d, si, types.Input.MotionAbsolute(t, u32(oi), nx, ny))
+                        }
+                    }
+                    other => input.input_on(mut d, si, other)
+                }
+            }
+            GammaSet(so, r, g, b) => {
+                let oi = outputs.out_index(d, so)
+                if oi < 0 or not d.be.set_gamma(u32(oi), r, g, b) {
+                    d.srv.gamma_failed(so)
+                }
+            }
+            GammaReset(so) => {
+                let oi = outputs.out_index(d, so)
+                if oi >= 0 {
+                    let empty: List[u16] = []
+                    discard d.be.set_gamma(u32(oi), empty, empty, empty)
+                }
+            }
         }
     }
 }

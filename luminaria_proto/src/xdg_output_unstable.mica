@@ -9,7 +9,7 @@ pub struct OutputManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let output_manager_iface: u16 = 120
+pub let output_manager_iface: u16 = 133
 pub let output_manager_version: u32 = 3
 
 /// Requests of zxdg_output_manager_v1.
@@ -44,7 +44,7 @@ pub struct Output derive(Hash, Show) {
     pub id: u32
 }
 
-pub let output_iface: u16 = 121
+pub let output_iface: u16 = 134
 pub let output_version: u32 = 3
 
 /// Requests of zxdg_output_v1.

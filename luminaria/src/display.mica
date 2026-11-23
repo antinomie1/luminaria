@@ -261,6 +261,11 @@ struct Out {
     shown_ns: int = 0
     vrr: bool = false
     enabled: bool = true
+    hdr: bool = false
+    sdr_nits: f32 = 203.0
+    max_nits: f32 = 1000.0
+    /// True when at least one `block_capture` placement lies on this output.
+    has_blocked: bool = false
     /// The area panels leave free (global logical).
     ux: f64 = 0.0
     uy: f64 = 0.0
@@ -367,6 +372,8 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     tree_scratch: List[(server.Surface, i32, i32)] = []
     surf_keys: map.Map[u64, server.Surface]
     surf_window: map.Map[server.Surface, server.Window]
+    blocked_keys: map.Map[u64, bool]
+    blocked_wins: map.Map[server.Window, bool]
     pending_shm: List[server.Surface] = []
 }
 
@@ -383,6 +390,8 @@ fn ikey(img: layout.Image) -> u64 {
 }
 
 let cursor_key: u64 = 0x7fffffffffffffff
+let black_key: u64 = 0x7ffffffffe000001
+let bg_key: u64 = 0x7ffffffffe000002
 
 /// A display on output `be` and renderer `comp` (any types with the
 /// methods of plug.Output and plug.Renderer; `lum.open` picks the
@@ -416,6 +425,8 @@ pub fn Display[O, R].with(o: Options, take be: O, take comp: R) -> Result[Displa
         popups_by_root: map.Map.new(),
         surf_keys: map.Map.new(),
         surf_window: map.Map.new(),
+        blocked_keys: map.Map.new(),
+        blocked_wins: map.Map.new(),
     }
     let formats = d.comp.formats()
     if not formats.is_empty() {
@@ -1100,6 +1111,48 @@ pub fn Display[O, R].set_vrr(mut self, so: server.Output, on: bool) {
     }
 }
 
+/// Whether output `so` is currently powered on (not disabled via DPMS).
+pub fn Display[O, R].output_enabled(self, so: server.Output) -> bool {
+    let o = outputs.out_index(self, so)
+    guard o >= 0 else {
+        return false
+    }
+    return self.outs[o].enabled
+}
+
+/// Enable or disable HDR output (BT.2020 + ST.2084 PQ) and 10-bit scanout on `so`.
+/// Returns false if the output does not support HDR.
+pub fn Display[O, R].set_hdr(mut self, so: server.Output, on: bool, sdr_nits: f32, max_nits: f32) -> bool {
+    let o = outputs.out_index(self, so)
+    guard o >= 0 else {
+        return false
+    }
+    let sdr = if sdr_nits > 0.0 { sdr_nits } else { 203.0 }
+    let peak = if max_nits > 0.0 { max_nits } else { 1000.0 }
+    guard self.be.set_hdr(u32(o), on, sdr, peak) else {
+        return false
+    }
+    self.outs[o].hdr = on
+    self.outs[o].sdr_nits = sdr
+    self.outs[o].max_nits = peak
+    self.outs[o].dirty = true
+    let dst = if on { types.dst_hdr_pq } else { types.dst_sdr }
+    self.comp.set_output_color(o, dst, sdr, peak)
+    self.comp.damage_all()
+    let info = outputs.output_info(self, o)
+    self.srv.update_output(so, info)
+    return true
+}
+
+/// Whether HDR output is currently enabled on `so`.
+pub fn Display[O, R].hdr(self, so: server.Output) -> bool {
+    let o = outputs.out_index(self, so)
+    guard o >= 0 else {
+        return false
+    }
+    return self.outs[o].hdr
+}
+
 /// What an output configuration asks of each output.
 pub fn Display[O, R].output_config(self, c: server.OutputConfig) -> List[server.HeadConfig] {
     return self.srv.output_config(c)
@@ -1415,6 +1468,46 @@ pub fn Display[O, R].mods_on(self, st: server.Seat) -> types.Mods {
 
 pub fn Display[O, R].assign_device_seat(mut self, device: u32, seat: str) -> bool {
     return self.be.assign_device_seat(device, seat)
+}
+
+/// Cycle the active XKB keyboard layout group on the default seat by `delta` (+1 next, -1 prev).
+pub fn Display[O, R].switch_layout(mut self, delta: int) -> bool {
+    guard not self.seats.is_empty() else {
+        return false
+    }
+    let st = self.seats[0].seat
+    return self.switch_layout_on(st, delta)
+}
+
+/// Cycle the active XKB keyboard layout group on seat `st` by `delta`.
+pub fn Display[O, R].switch_layout_on(mut self, st: server.Seat, delta: int) -> bool {
+    let si = seats.seat_index(self, st)
+    guard si >= 0 else {
+        return false
+    }
+    let name = self.seats[si].name.clone()
+    let ok = self.be.switch_layout_on(name, delta)
+    if ok {
+        outputs.backend_events(mut self)
+    }
+    return ok
+}
+
+/// Name of the active XKB layout group on the default seat.
+pub fn Display[O, R].layout_name(self) -> str {
+    guard not self.seats.is_empty() else {
+        return ""
+    }
+    return self.layout_name_on(self.seats[0].seat)
+}
+
+/// Name of the active XKB layout group on seat `st`.
+pub fn Display[O, R].layout_name_on(self, st: server.Seat) -> str {
+    let si = seats.seat_index(self, st)
+    guard si >= 0 else {
+        return ""
+    }
+    return self.be.layout_name_on(self.seats[si].name)
 }
 
 /// What output `so` measured since the last `reset_stats` (frames,

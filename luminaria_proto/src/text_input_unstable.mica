@@ -9,7 +9,7 @@ pub struct Input derive(Hash, Show) {
     pub id: u32
 }
 
-pub let input_iface: u16 = 97
+pub let input_iface: u16 = 106
 pub let input_version: u32 = 2
 
 /// text change reason
@@ -288,7 +288,7 @@ pub struct InputManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let input_manager_iface: u16 = 98
+pub let input_manager_iface: u16 = 107
 pub let input_manager_version: u32 = 2
 
 /// Requests of zwp_text_input_manager_v3.

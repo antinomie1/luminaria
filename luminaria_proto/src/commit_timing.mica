@@ -9,7 +9,7 @@ pub struct TimingManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let timing_manager_iface: u16 = 26
+pub let timing_manager_iface: u16 = 35
 pub let timing_manager_version: u32 = 1
 
 pub enum TimingManagerError: u32 {
@@ -49,7 +49,7 @@ pub struct Timer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let timer_iface: u16 = 27
+pub let timer_iface: u16 = 36
 pub let timer_version: u32 = 1
 
 pub enum TimerError: u32 {

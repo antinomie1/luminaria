@@ -9,7 +9,7 @@ pub struct Manager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let manager_iface: u16 = 65
+pub let manager_iface: u16 = 74
 pub let manager_version: u32 = 1
 
 pub enum ManagerError: u32 {
@@ -59,7 +59,7 @@ pub struct Timeline derive(Hash, Show) {
     pub id: u32
 }
 
-pub let timeline_iface: u16 = 66
+pub let timeline_iface: u16 = 75
 pub let timeline_version: u32 = 1
 
 /// Requests of wp_linux_drm_syncobj_timeline_v1.
@@ -86,7 +86,7 @@ pub struct Surface derive(Hash, Show) {
     pub id: u32
 }
 
-pub let surface_iface: u16 = 67
+pub let surface_iface: u16 = 76
 pub let surface_version: u32 = 1
 
 pub enum SurfaceError: u32 {

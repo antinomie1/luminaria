@@ -52,6 +52,7 @@
   只清图像没盖到的部分。指针移动产生一个只含光标的请求，由提交线程在下一个 vblank 前提交；帧先到就并进
   帧的提交。光标显示的是 vblank 前最后的位置，而不是帧开始时的位置。
 - **其他**：`set_mode` 换模式（下一帧按新尺寸重建缓冲）、`enable` 关屏（`ACTIVE` 0）、`set_vrr`、
+  `set_gamma`（CRTC `GAMMA_LUT` 原子 blob，缺失时回退 `drmModeCrtcSetGamma`）、`set_hdr`（`HDR_OUTPUT_METADATA` + `Colorspace` `BT2020_RGB` + `XRGB2101010` 10-bit 扫描链）、
   udev 热插拔（重扫连接器，增删输出）、`probe` 只读列出已连接的显示器而不接管。
 
 ## 提交线程
@@ -92,9 +93,9 @@ keymap），自己的输出端也可以内嵌它（见 [api.md](api.md#换输出
   `"default"` 规范化为 `""` 走默认 seat），支持 `assign_device_seat` 动态把设备指派到次级逻辑 seat，
   并将非空 seat 的输入包装成 `Event.InputOn(seat, input)`。键和按钮按 seat 计数，只报第一次按下和
   最后一次抬起。指针（相对、绝对）、滚动（滚轮 v120、手指、连续）、触摸、滑动 / 捏合 / 按住手势、
-  设备增删都变成纯数据的 `Input`。`configure_input` 设置轻触点击、自然滚动、加速、左手、禁用。
+  设备增删都变成纯数据的 `Input`。`configure_input` 设置轻触点击、自然滚动、加速速度与平坦/自适应加速曲线（`accel_profile`）、打字禁用触摸板（`dwt`）、左手、禁用。
 - **xkb**：按 RMLVO 名字编译 keymap，主 seat 一份，其他逻辑 seat 各一份（`keymap_on`、`mods_on`、
-  `set_keymap_on` 及 `Event.KeymapOn(seat)`）；键在这里就算出 keysym 和文字；序列化的修饰键变化时
+  `set_keymap_on`、`switch_layout_on`、`layout_name_on`、`keysym_from_name` 及 `Event.KeymapOn(seat)`）；键在这里就算出 keysym 和文字；序列化的修饰键变化时
   按 seat 单独报出。每个 seat 各自维护一块共享只读 keymap memfd 给客户端映射。
 
 ## 嵌套

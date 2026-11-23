@@ -24,6 +24,7 @@ struct Swap {
     frame: u64 = 0
     width: i32 = 0
     height: i32 = 0
+    format: u32 = types.buffer.xrgb8888
 }
 
 fn create(width: i32, height: i32, ts: &[types.Target]) -> Swap {

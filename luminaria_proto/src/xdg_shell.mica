@@ -9,7 +9,7 @@ pub struct WmBase derive(Hash, Show) {
     pub id: u32
 }
 
-pub let wm_base_iface: u16 = 122
+pub let wm_base_iface: u16 = 135
 pub let wm_base_version: u32 = 7
 
 pub enum WmBaseError: u32 {
@@ -81,7 +81,7 @@ pub struct Positioner derive(Hash, Show) {
     pub id: u32
 }
 
-pub let positioner_iface: u16 = 123
+pub let positioner_iface: u16 = 136
 pub let positioner_version: u32 = 7
 
 pub enum PositionerError: u32 {
@@ -232,7 +232,7 @@ pub struct Surface derive(Hash, Show) {
     pub id: u32
 }
 
-pub let surface_iface: u16 = 124
+pub let surface_iface: u16 = 137
 pub let surface_version: u32 = 7
 
 pub enum SurfaceError: u32 {
@@ -314,7 +314,7 @@ pub struct Toplevel derive(Hash, Show) {
     pub id: u32
 }
 
-pub let toplevel_iface: u16 = 125
+pub let toplevel_iface: u16 = 138
 pub let toplevel_version: u32 = 7
 
 pub enum ToplevelError: u32 {
@@ -533,7 +533,7 @@ pub struct Popup derive(Hash, Show) {
     pub id: u32
 }
 
-pub let popup_iface: u16 = 126
+pub let popup_iface: u16 = 139
 pub let popup_version: u32 = 7
 
 pub enum PopupError: u32 {

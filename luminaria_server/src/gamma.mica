@@ -1,0 +1,172 @@
+// zwlr_gamma_control_unstable_v1: per-output exclusive hardware gamma LUT
+// control (gammastep, wlsunset). Privileged: hidden from sandboxed clients.
+
+import std.os
+import luminaria_proto.wlr_gamma_control_unstable as gc
+import ids
+import state
+import server
+
+extern table Libc {
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64 = "lseek"
+}
+
+fn file_size(fd: int) -> Option[int] {
+    guard let Ok(c) = Libc.open("libc.so.6") else {
+        return None
+    }
+    let end = c.lseek(i32(fd), 0, 2) // SEEK_END
+    guard end >= 0 else {
+        return None
+    }
+    return Some(int(end))
+}
+
+fn manager(mut srv: server.Server, ci: u32, take req: gc.ControlManagerRequest) {
+    match req {
+        GetGammaControl(ctrl, out) => {
+            let oi = srv.slot(ci, out.id)
+            let ok = oi != state.none and srv.outputs.used(int(oi)) and srv.outputs.items[int(oi)].info.gamma_size > 0 and srv.outputs.items[int(oi)].gamma_owner == state.none
+            if not ok {
+                let id = srv.gammas.add(state.GammaData { client: ci, obj: ctrl.id, output: state.none, active: false })
+                srv.bind(ci, ctrl.id, id.index)
+                ctrl.failed(mut srv.conns[int(ci)])
+                return
+            }
+            let sz = srv.outputs.items[int(oi)].info.gamma_size
+            let id = srv.gammas.add(state.GammaData { client: ci, obj: ctrl.id, output: oi, active: true })
+            srv.bind(ci, ctrl.id, id.index)
+            srv.outputs.items[int(oi)].gamma_owner = id.index
+            ctrl.gamma_size(mut srv.conns[int(ci)], sz)
+        }
+        Destroy => {}
+    }
+}
+
+fn release_owner(mut srv: server.Server, gi: u32, notify_reset: bool) {
+    guard srv.gammas.used(int(gi)) else {
+        return
+    }
+    let g = srv.gammas.items[int(gi)]
+    srv.gammas.items[int(gi)].active = false
+    srv.gammas.items[int(gi)].output = state.none
+    guard g.active and g.output != state.none and srv.outputs.used(int(g.output)) else {
+        return
+    }
+    let oi = g.output
+    if srv.outputs.items[int(oi)].gamma_owner == gi {
+        srv.outputs.items[int(oi)].gamma_owner = state.none
+        if notify_reset {
+            srv.push(server.Event.GammaReset(ids.Output { id: srv.outputs.id(oi) }))
+        }
+    }
+}
+
+fn control(mut srv: server.Server, ci: u32, ctrl: gc.Control, take req: gc.ControlRequest) {
+    let gi = srv.slot(ci, ctrl.id)
+    guard gi != state.none and srv.gammas.used(int(gi)) else {
+        return
+    }
+    match take req {
+        SetGamma(fd) => {
+            let g = srv.gammas.items[int(gi)]
+            guard g.active and g.output != state.none and srv.outputs.used(int(g.output)) else {
+                return
+            }
+            let oi = g.output
+            let sz = int(srv.outputs.items[int(oi)].info.gamma_size)
+            guard sz > 0 and sz <= 65536 else {
+                release_owner(mut srv, gi, true)
+                ctrl.failed(mut srv.conns[int(ci)])
+                return
+            }
+            let need = sz * 6
+            if let Some(actual) = file_size(fd.raw()) {
+                if actual != need {
+                    release_owner(mut srv, gi, true)
+                    srv.fail(ci, ctrl.id, u32(gc.ControlError.InvalidGamma), "gamma fd size {actual} != expected {need}")
+                    return
+                }
+            }
+            guard let Ok(m) = os.map(fd.raw(), need, 0, false) else {
+                release_owner(mut srv, gi, true)
+                srv.fail(ci, ctrl.id, u32(gc.ControlError.InvalidGamma), "cannot map gamma table fd")
+                return
+            }
+            var r: List[u16] = List.with_cap(sz)
+            var gr: List[u16] = List.with_cap(sz)
+            var b: List[u16] = List.with_cap(sz)
+            discard m.begin_access()
+            unsafe {
+                let bytes = Ptr.slice(m.ptr, need)
+                let g_off = sz * 2
+                let b_off = sz * 4
+                for k in 0..sz {
+                    let o = k * 2
+                    r.push(u16(bytes[o]) | (u16(bytes[o + 1]) << 8))
+                    gr.push(u16(bytes[g_off + o]) | (u16(bytes[g_off + o + 1]) << 8))
+                    b.push(u16(bytes[b_off + o]) | (u16(bytes[b_off + o + 1]) << 8))
+                }
+            }
+            let bus_err = m.end_access()
+            if bus_err {
+                release_owner(mut srv, gi, true)
+                srv.fail(ci, ctrl.id, u32(gc.ControlError.InvalidGamma), "truncated gamma table fd")
+                return
+            }
+            srv.push(server.Event.GammaSet(ids.Output { id: srv.outputs.id(oi) }, r, gr, b))
+        }
+        Destroy => {
+            srv.unbind(ci, ctrl.id)
+            release_owner(mut srv, gi, true)
+            srv.gammas.remove(gi, state.GammaData {})
+        }
+    }
+}
+
+/// Output `oi` is going away: fail any active gamma control bound to it.
+fn output_gone(mut srv: server.Server, oi: u32) {
+    guard srv.outputs.used(int(oi)) else {
+        return
+    }
+    let gi = srv.outputs.items[int(oi)].gamma_owner
+    srv.outputs.items[int(oi)].gamma_owner = state.none
+    guard gi != state.none and srv.gammas.used(int(gi)) else {
+        return
+    }
+    let g = srv.gammas.items[int(gi)]
+    srv.gammas.items[int(gi)].active = false
+    srv.gammas.items[int(gi)].output = state.none
+    if g.active and srv.clients.used(int(g.client)) {
+        gc.Control { id: g.obj }.failed(mut srv.conns[int(g.client)])
+    }
+}
+
+/// Backend failed to apply gamma on output `oi`: notify the owner.
+fn fail_output(mut srv: server.Server, oi: u32) {
+    guard srv.outputs.used(int(oi)) else {
+        return
+    }
+    let gi = srv.outputs.items[int(oi)].gamma_owner
+    srv.outputs.items[int(oi)].gamma_owner = state.none
+    guard gi != state.none and srv.gammas.used(int(gi)) else {
+        return
+    }
+    let g = srv.gammas.items[int(gi)]
+    srv.gammas.items[int(gi)].active = false
+    srv.gammas.items[int(gi)].output = state.none
+    if g.active and srv.clients.used(int(g.client)) {
+        gc.Control { id: g.obj }.failed(mut srv.conns[int(g.client)])
+    }
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    guard iface == gc.control_iface else {
+        return false
+    }
+    discard ci
+    discard id
+    release_owner(mut srv, slot, true)
+    srv.gammas.remove(slot, state.GammaData {})
+    return true
+}

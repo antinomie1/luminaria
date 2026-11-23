@@ -10,7 +10,7 @@ pub struct Manager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let manager_iface: u16 = 43
+pub let manager_iface: u16 = 52
 pub let manager_version: u32 = 1
 
 pub enum ManagerError: u32 {
@@ -65,7 +65,7 @@ pub struct Session derive(Hash, Show) {
     pub id: u32
 }
 
-pub let session_iface: u16 = 44
+pub let session_iface: u16 = 53
 pub let session_version: u32 = 1
 
 pub enum SessionError: u32 {
@@ -140,7 +140,7 @@ pub struct Frame derive(Hash, Show) {
     pub id: u32
 }
 
-pub let frame_iface: u16 = 45
+pub let frame_iface: u16 = 54
 pub let frame_version: u32 = 1
 
 pub enum FrameError: u32 {
@@ -242,7 +242,7 @@ pub struct CursorSession derive(Hash, Show) {
     pub id: u32
 }
 
-pub let cursor_session_iface: u16 = 46
+pub let cursor_session_iface: u16 = 55
 pub let cursor_session_version: u32 = 1
 
 pub enum CursorSessionError: u32 {

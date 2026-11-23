@@ -215,7 +215,11 @@ fn place_popups[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         let own = d.srv.info(ps).geometry
         let ox = pgx + f64(pgeo.x + g.x - own.x) * psc
         let oy = pgy + f64(pgeo.y + g.y - own.y) * psc
-        place.place_tree(mut d, ps, ox, oy, psc, layout.Style {}, opacity, owner, mut per, mut masks)
+        let block = match owner {
+            Some(w) => d.blocked_wins.contains(w)
+            None => false
+        }
+        place.place_tree(mut d, ps, ox, oy, psc, layout.Style { block_capture: block }, opacity, owner, mut per, mut masks)
     }
 }
 

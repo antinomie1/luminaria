@@ -20,6 +20,12 @@ struct Out {
     /// The vblank grid's origin and the vblank the pending frame shows at.
     t0: int = 0
     at: int = 0
+    enabled: bool = true
+    hdr: bool = false
+    format: u32 = types.buffer.xrgb8888
+    gamma_r: List[u16] = []
+    gamma_g: List[u16] = []
+    gamma_b: List[u16] = []
 }
 
 struct Headless {
@@ -31,7 +37,18 @@ fn create(modes: &[types.Mode]) -> Result[Headless, str] {
     for k in 0..modes.len() {
         let m = modes[k]
         let t = try os.timerfd().map_err(fn(e) => "{e}")
-        h.outs.push(Out { desc: types.OutputDesc { name: "HEADLESS-{k + 1}", make: "luminaria", model: "headless", modes: [m], mode: m }, timer: t })
+        h.outs.push(Out {
+            desc: types.OutputDesc {
+                name: "HEADLESS-{k + 1}",
+                make: "luminaria",
+                model: "headless",
+                modes: [m],
+                mode: m,
+                gamma_size: 256,
+                hdr: true,
+            },
+            timer: t,
+        })
     }
     return Ok(h)
 }
@@ -48,7 +65,51 @@ fn Headless.prepare(self, o: int, count: int) -> Option[types.Want] {
         return None
     }
     let m = self.outs[o].desc.mode
-    return Some(types.Want { width: m.width, height: m.height, format: types.buffer.xrgb8888, count, export: false })
+    return Some(types.Want { width: m.width, height: m.height, format: self.outs[o].format, count, export: false })
+}
+
+fn Headless.set_gamma(mut self, o: int, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+    guard o >= 0 and o < self.outs.len() else {
+        return false
+    }
+    if r.is_empty() {
+        self.outs[o].gamma_r.clear()
+        self.outs[o].gamma_g.clear()
+        self.outs[o].gamma_b.clear()
+        return true
+    }
+    let want = int(self.outs[o].desc.gamma_size)
+    guard r.len() == want and g.len() == want and b.len() == want else {
+        return false
+    }
+    self.outs[o].gamma_r.clear()
+    self.outs[o].gamma_g.clear()
+    self.outs[o].gamma_b.clear()
+    for i in 0..want {
+        self.outs[o].gamma_r.push(r[i])
+        self.outs[o].gamma_g.push(g[i])
+        self.outs[o].gamma_b.push(b[i])
+    }
+    return true
+}
+
+fn Headless.set_hdr(mut self, o: int, on: bool, mut retired: List[u64]) -> bool {
+    guard o >= 0 and o < self.outs.len() else {
+        return false
+    }
+    let fmt = if on { types.buffer.xrgb2101010 } else { types.buffer.xrgb8888 }
+    self.outs[o].hdr = on
+    if self.outs[o].format != fmt {
+        self.outs[o].format = fmt
+        for k in self.outs[o].slots {
+            retired.push(k)
+        }
+        self.outs[o].slots.clear()
+        self.outs[o].drawn.clear()
+        self.outs[o].pending = -1
+        self.outs[o].shown = -1
+    }
+    return true
 }
 
 fn Headless.give(mut self, o: int, ts: &[types.Target]) {

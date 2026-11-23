@@ -5,6 +5,12 @@ pub let argb8888: u32 = 0x34325241
 pub let xrgb8888: u32 = 0x34325258
 pub let abgr8888: u32 = 0x34324241
 pub let xbgr8888: u32 = 0x34324258
+pub let argb2101010: u32 = 0x30335241
+pub let xrgb2101010: u32 = 0x30335258
+pub let abgr2101010: u32 = 0x30334241
+pub let xbgr2101010: u32 = 0x30334258
+pub let abgr16161616f: u32 = 0x48344241
+pub let xbgr16161616f: u32 = 0x48344258
 
 pub struct Plane {
     pub fd: int = -1

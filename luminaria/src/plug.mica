@@ -43,6 +43,14 @@ pub trait Input {
     }
     fn configure_input(mut self, device: u32, c: types.InputConfig) {}
     fn switch_vt(self, n: int) {}
+    /// Cycle the active XKB layout group on `seat` by `delta` (+1 next, -1 prev).
+    fn switch_layout_on(mut self, seat: str, delta: int) -> bool {
+        return false
+    }
+    /// Name of the active XKB layout group on `seat`.
+    fn layout_name_on(self, seat: str) -> str {
+        return ""
+    }
 }
 
 /// Where frames go. Every output is also an Input (with nothing to do by
@@ -98,6 +106,14 @@ pub trait Output: Input {
     fn set_mode(mut self, o: u32, m: types.Mode) {}
     fn enable(mut self, o: u32, on: bool) {}
     fn set_vrr(mut self, o: u32, on: bool) {}
+    /// Install or reset (empty slices) a hardware CRTC gamma LUT on `o`.
+    fn set_gamma(mut self, o: u32, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+        return false
+    }
+    /// Enable or disable HDR output (BT.2020 + ST.2084 PQ) on `o`.
+    fn set_hdr(mut self, o: u32, on: bool, sdr_nits: f32, max_nits: f32) -> bool {
+        return false
+    }
     /// It paces frames itself (a parent's frame callbacks).
     fn paced(self) -> bool {
         return false
@@ -200,5 +216,7 @@ pub trait Renderer {
     fn recover(mut self) -> Result[(), str] {
         return Err("recovery unsupported")
     }
+    /// Set target color space (`types.dst_*`) and luminance parameters for output `o`.
+    fn set_output_color(mut self, o: int, dst_color: u32, sdr_nits: f32, max_nits: f32) {}
     fn stats(self, mut s: types.Stats) {}
 }

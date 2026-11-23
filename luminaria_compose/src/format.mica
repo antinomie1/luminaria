@@ -11,6 +11,12 @@ pub let argb8888 = fourcc.argb8888
 pub let xrgb8888 = fourcc.xrgb8888
 pub let abgr8888 = fourcc.abgr8888
 pub let xbgr8888 = fourcc.xbgr8888
+pub let argb2101010 = fourcc.argb2101010
+pub let xrgb2101010 = fourcc.xrgb2101010
+pub let abgr2101010 = fourcc.abgr2101010
+pub let xbgr2101010 = fourcc.xbgr2101010
+pub let abgr16161616f = fourcc.abgr16161616f
+pub let xbgr16161616f = fourcc.xbgr16161616f
 
 /// The Vulkan format a fourcc samples as, and whether alpha is ignored.
 pub fn vk_format(fourcc: u32) -> Option[(gpu.Format, bool)] {
@@ -20,6 +26,15 @@ pub fn vk_format(fourcc: u32) -> Option[(gpu.Format, bool)] {
     if fourcc == abgr8888 or fourcc == xbgr8888 {
         return Some((gpu.Format.R8G8B8A8_UNORM, fourcc == xbgr8888))
     }
+    if fourcc == argb2101010 or fourcc == xrgb2101010 {
+        return Some((gpu.Format.A2R10G10B10_UNORM_PACK32, fourcc == xrgb2101010))
+    }
+    if fourcc == abgr2101010 or fourcc == xbgr2101010 {
+        return Some((gpu.Format.A2B10G10R10_UNORM_PACK32, fourcc == xbgr2101010))
+    }
+    if fourcc == abgr16161616f or fourcc == xbgr16161616f {
+        return Some((gpu.Format.R16G16B16A16_SFLOAT, fourcc == xbgr16161616f))
+    }
     return None
 }
 
@@ -27,7 +42,7 @@ pub fn vk_format(fourcc: u32) -> Option[(gpu.Format, bool)] {
 /// format table).
 pub fn dmabuf_formats(dev: gpu.Device) -> List[(u32, u64)] {
     var out: List[(u32, u64)] = []
-    for f in [argb8888, xrgb8888, abgr8888, xbgr8888] {
+    for f in [argb8888, xrgb8888, abgr8888, xbgr8888, argb2101010, xrgb2101010, abgr2101010, xbgr2101010, abgr16161616f, xbgr16161616f] {
         if let Some((vf, _)) = vk_format(f) {
             for m in dev.dmabuf_modifiers(vf, false) {
                 out.push((f, m))

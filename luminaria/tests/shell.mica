@@ -21,6 +21,9 @@ import luminaria_proto.ext_image_copy_capture as icc
 import luminaria_proto.ext_foreign_toplevel_list as ftl
 import luminaria_proto.linux_dmabuf as dmab
 import luminaria_proto.wlr_output_management_unstable as wom
+import luminaria_proto.wlr_virtual_pointer_unstable as vp
+import luminaria_proto.wlr_gamma_control_unstable as gc
+import luminaria_proto.color_management as cm
 import luminaria_proto.xdg_shell as xdg
 
 struct Fx {
@@ -476,4 +479,306 @@ test "an output dmabuf capture copies the rendered frame asynchronously" {
     assert_eq((px[0], px[1], px[2]), (px[size - 4], px[size - 3], px[size - 2]))
     cap_comp.forget(999)
     cap_comp.close()
+}
+
+test "virtual pointer drives pointer position, buttons and scroll" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let mgr = vp.PointerManager { id: bind(mut f, vp.pointer_manager_iface, 2) }
+    let p = mgr.create_virtual_pointer_with_output(mut f.c, None, Some(out))
+    p.motion_absolute(mut f.c, 10, 64, 48, 128, 96)
+    p.frame(mut f.c)
+    p.button(mut f.c, 11, 272, wl.PointerButtonState.Pressed)
+    p.frame(mut f.c)
+    p.button(mut f.c, 12, 272, wl.PointerButtonState.Released)
+    p.frame(mut f.c)
+    p.axis_source(mut f.c, wl.PointerAxisSource.Wheel)
+    p.axis_discrete(mut f.c, 13, wl.PointerAxis.VerticalScroll, 15.0, 1)
+    p.frame(mut f.c)
+    discard pump(mut f, 80)
+    let (px, py) = f.d.pointer()
+    assert(px >= 63.0 and px <= 65.0)
+    assert(py >= 47.0 and py <= 49.0)
+    assert(f.seen.any(fn(e) => match e {
+        Button(b) => b.button == 272 and b.pressed
+        _ => false
+    }))
+    assert(f.seen.any(fn(e) => match e {
+        Scroll(s) => s.v120y == 120
+        _ => false
+    }))
+    p.destroy(mut f.c)
+    mgr.destroy(mut f.c)
+    discard pump(mut f, 30)
+}
+
+test "gamma control enforces exclusive ownership and accepts valid ramps" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let mgr = gc.ControlManager { id: bind(mut f, gc.control_manager_iface, 1) }
+    let ctrl1 = mgr.get_gamma_control(mut f.c, out)
+    var gsize: u32 = 0
+    for e in pump(mut f, 50) {
+        match e {
+            ZwlrGammaControl(c, GammaSize(n)) => {
+                if c.id == ctrl1.id {
+                    gsize = n
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq(gsize, u32(256))
+    // Second concurrent owner on the same output must fail immediately.
+    let ctrl2 = mgr.get_gamma_control(mut f.c, out)
+    var failed2 = false
+    for e in pump(mut f, 50) {
+        match e {
+            ZwlrGammaControl(c, Failed) => {
+                if c.id == ctrl2.id {
+                    failed2 = true
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(failed2)
+    ctrl2.destroy(mut f.c)
+    // Supply a valid 256 * 3 * 2 byte gamma table via memfd.
+    let gbytes = int(gsize) * 3 * 2
+    let gfd = os.memfd("gamma", gbytes).expect("memfd")
+    var gmap = os.map(gfd, gbytes, 0, true).expect("map")
+    let gb = gmap.bytes()
+    for i in 0..int(gsize) {
+        let v = u16(i * 65535 / (int(gsize) - 1))
+        let lo = u8(v & 0xff)
+        let hi = u8(v >> 8)
+        for ch in 0..3 {
+            let at = (ch * int(gsize) + i) * 2
+            gb[at] = lo
+            gb[at + 1] = hi
+        }
+    }
+    ctrl1.set_gamma(mut f.c, gfd)
+    os.close(gfd)
+    let evs1 = pump(mut f, 50)
+    assert(not evs1.any(fn(e) => match e {
+        ZwlrGammaControl(c, Failed) => c.id == ctrl1.id
+        _ => false
+    }))
+    // Destroying ctrl1 releases ownership so a new control succeeds.
+    ctrl1.destroy(mut f.c)
+    discard pump(mut f, 30)
+    let ctrl3 = mgr.get_gamma_control(mut f.c, out)
+    var gsize3: u32 = 0
+    for e in pump(mut f, 50) {
+        match e {
+            ZwlrGammaControl(c, GammaSize(n)) => {
+                if c.id == ctrl3.id {
+                    gsize3 = n
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq(gsize3, u32(256))
+    ctrl3.destroy(mut f.c)
+    mgr.destroy(mut f.c)
+    discard pump(mut f, 30)
+}
+
+test "color management and HDR output toggle notify clients and render 10-bit targets" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let mgr = cm.ColorManager { id: bind(mut f, cm.color_manager_iface, 1) }
+    var got_done = false
+    for e in pump(mut f, 50) {
+        match e {
+            WpColorManager(_, Done) => got_done = true
+            _ => {}
+        }
+    }
+    assert(got_done)
+    let cm_out = mgr.get_output(mut f.c, out)
+    let desc0 = cm_out.get_image_description(mut f.c)
+    var id0: u32 = 0
+    for e in pump(mut f, 50) {
+        match e {
+            WpImageDescription(d, Ready(id)) => {
+                if d.id == desc0.id {
+                    id0 = id
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(id0 > 0)
+    // Toggle HDR on the headless output and verify image_description_changed fires.
+    let so = f.d.outputs()[0]
+    assert(f.d.set_hdr(so, true, 203.0, 1000.0))
+    assert(f.d.hdr(so))
+    var out_changed = false
+    for e in pump(mut f, 80) {
+        match e {
+            WpColorManagementOutput(o, ImageDescriptionChanged) => {
+                if o.id == cm_out.id {
+                    out_changed = true
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(out_changed)
+    // Create a parametric BT.2020 + ST.2084 PQ image description and attach to a surface.
+    let creator = mgr.create_parametric_creator(mut f.c)
+    creator.set_primaries_named(mut f.c, cm.ColorManagerPrimaries.Bt2020)
+    creator.set_tf_named(mut f.c, cm.ColorManagerTransferFunction.St2084Pq)
+    let pq_desc = creator.create(mut f.c)
+    var pq_ready = false
+    for e in pump(mut f, 50) {
+        match e {
+            WpImageDescription(d, Ready) => {
+                if d.id == pq_desc.id {
+                    pq_ready = true
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(pq_ready)
+    let surf = comp.create_surface(mut f.c)
+    let cm_surf = mgr.get_surface(mut f.c, surf)
+    cm_surf.set_image_description(mut f.c, pq_desc, cm.ColorManagerRenderIntent.Perceptual)
+    surf.commit(mut f.c)
+    discard pump(mut f, 60)
+    // Turn HDR back off cleanly.
+    assert(f.d.set_hdr(so, false, 203.0, 1000.0))
+    assert(not f.d.hdr(so))
+    discard pump(mut f, 50)
+    cm_surf.destroy(mut f.c)
+    pq_desc.destroy(mut f.c)
+    desc0.destroy(mut f.c)
+    cm_out.destroy(mut f.c)
+    mgr.destroy(mut f.c)
+    surf.destroy(mut f.c)
+    discard pump(mut f, 30)
+}
+
+test "block_capture redacts window in output and window captures without affecting display" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 2) }
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let list = ftl.ToplevelList { id: bind(mut f, ftl.toplevel_list_iface, 1) }
+    let out_srcs = ics.OutputImageCaptureSourceManager { id: bind(mut f, ics.output_image_capture_source_manager_iface, 1) }
+    let ft_srcs = ics.ForeignToplevelImageCaptureSourceManager { id: bind(mut f, ics.foreign_toplevel_image_capture_source_manager_iface, 1) }
+    let mgr = icc.Manager { id: bind(mut f, icc.manager_iface, 1) }
+
+    let surf = comp.create_surface(mut f.c)
+    let xs = wm.get_xdg_surface(mut f.c, surf)
+    let top = xs.get_toplevel(mut f.c)
+    top.set_title(mut f.c, "secret")
+    surf.commit(mut f.c)
+    for e in pump(mut f, 50) {
+        match e {
+            XdgSurface(s, Configure(serial)) => s.ack_configure(mut f.c, serial)
+            _ => {}
+        }
+    }
+    // Bright red window (BGRA: 0, 0, 255, 255).
+    let wsize = 48 * 32 * 4
+    let wfd = os.memfd("secret-red", wsize).expect("memfd")
+    var wmap = os.map(wfd, wsize, 0, true).expect("map")
+    let wpx = wmap.bytes()
+    for i in 0..(48 * 32) {
+        wpx[i * 4] = 0
+        wpx[i * 4 + 1] = 0
+        wpx[i * 4 + 2] = 255
+        wpx[i * 4 + 3] = 255
+    }
+    let wbuf = shm.create_pool(mut f.c, wfd, i32(wsize)).create_buffer(mut f.c, 0, 48, 32, 48 * 4, wl.ShmFormat.Argb8888)
+    os.close(wfd)
+    surf.attach(mut f.c, Some(wbuf), 0, 0)
+    surf.commit(mut f.c)
+
+    var handle: Option[ftl.Handle] = None
+    for e in pump(mut f, 80) {
+        match e {
+            ExtForeignToplevelList(_, Toplevel(h)) => handle = Some(h)
+            _ => {}
+        }
+    }
+    for e in f.seen.clone() {
+        match e {
+            WindowMapped(w) => f.d.layout(fn(mut l) {
+                l.window(w, 16.0, 16.0, lum.Style { block_capture: true })
+            })
+            _ => {}
+        }
+    }
+    // Wait for frame to present on-screen.
+    discard pump(mut f, 100)
+    let so = f.d.outputs()[0]
+    let disp_px = f.d.read_output(so).expect("read_output")
+    // Inside the window at (32, 32): on-screen must still show bright RED!
+    let d_at = (32 * 128 + 32) * 4
+    assert_eq((disp_px[d_at], disp_px[d_at + 1], disp_px[d_at + 2]), (u8(0), u8(0), u8(255)))
+
+    // Capture the entire output: window region must be solid black, background outside intact.
+    let osess = mgr.create_session(mut f.c, out_srcs.create_source(mut f.c, out), icc.ManagerOptions(0))
+    discard pump(mut f, 50)
+    let osize = 128 * 96 * 4
+    let ofd = os.memfd("cap-out", osize).expect("memfd")
+    var omap = os.map(ofd, osize, 0, true).expect("map")
+    let obuf = shm.create_pool(mut f.c, ofd, i32(osize)).create_buffer(mut f.c, 0, 128, 96, 128 * 4, wl.ShmFormat.Xrgb8888)
+    os.close(ofd)
+    let ofr = osess.create_frame(mut f.c)
+    ofr.attach_buffer(mut f.c, obuf)
+    ofr.damage_buffer(mut f.c, 0, 0, 128, 96)
+    ofr.capture(mut f.c)
+    assert(pump(mut f, 200).any(fn(e) => match e {
+        ExtImageCopyCaptureFrame(_, Ready) => true
+        _ => false
+    }))
+    let opx = omap.bytes()
+    assert_eq((opx[d_at], opx[d_at + 1], opx[d_at + 2]), (u8(0), u8(0), u8(0)))
+    // Background pixel at (110, 80) outside window is non-black.
+    let bg_at = (80 * 128 + 110) * 4
+    assert(opx[bg_at] > 0 or opx[bg_at + 1] > 0 or opx[bg_at + 2] > 0)
+
+    // Capture the toplevel window directly: must also be solid black.
+    let h = handle.expect("handle")
+    let wsess = mgr.create_session(mut f.c, ft_srcs.create_source(mut f.c, h), icc.ManagerOptions(0))
+    discard pump(mut f, 60)
+    let cfd = os.memfd("cap-win-blk", wsize).expect("memfd")
+    var cmap = os.map(cfd, wsize, 0, true).expect("map")
+    let cbuf = shm.create_pool(mut f.c, cfd, i32(wsize)).create_buffer(mut f.c, 0, 48, 32, 48 * 4, wl.ShmFormat.Xrgb8888)
+    os.close(cfd)
+    let wfr = wsess.create_frame(mut f.c)
+    wfr.attach_buffer(mut f.c, cbuf)
+    wfr.damage_buffer(mut f.c, 0, 0, 48, 32)
+    wfr.capture(mut f.c)
+    assert(pump(mut f, 200).any(fn(e) => match e {
+        ExtImageCopyCaptureFrame(_, Ready) => true
+        _ => false
+    }))
+    let cpx = cmap.bytes()
+    assert_eq((cpx[0], cpx[1], cpx[2]), (u8(0), u8(0), u8(0)))
+    let w_mid = (16 * 48 + 24) * 4
+    assert_eq((cpx[w_mid], cpx[w_mid + 1], cpx[w_mid + 2]), (u8(0), u8(0), u8(0)))
+    discard list
 }

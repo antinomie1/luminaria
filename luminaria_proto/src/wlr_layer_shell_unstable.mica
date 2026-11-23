@@ -10,7 +10,7 @@ pub struct Shell derive(Hash, Show) {
     pub id: u32
 }
 
-pub let shell_iface: u16 = 103
+pub let shell_iface: u16 = 114
 pub let shell_version: u32 = 5
 
 pub enum ShellError: u32 {
@@ -69,7 +69,7 @@ pub struct Surface derive(Hash, Show) {
     pub id: u32
 }
 
-pub let surface_iface: u16 = 104
+pub let surface_iface: u16 = 115
 pub let surface_version: u32 = 5
 
 /// types of keyboard interaction possible for a layer shell surface

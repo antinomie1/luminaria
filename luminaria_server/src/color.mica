@@ -1,0 +1,511 @@
+// wp_color_manager_v1 (v1): HDR & color space negotiation for surfaces and
+// outputs. Supports parametric descriptions (sRGB, BT.2020, gamma22, ext_linear,
+// ST.2084 PQ, HLG), Windows-scRGB, output image descriptions, and per-surface
+// preferred feedback. Maps committed surface descriptions into compact
+// `types.color_*` tags for single-pass GPU rendering and direct scanout.
+
+import luminaria_types as types
+import luminaria_proto.color_management as cm
+import state
+import server
+
+fn manager_bound(mut srv: server.Server, ci: u32, id: u32) {
+    let m = cm.ColorManager { id }
+    let c = int(ci)
+    m.supported_intent(mut srv.conns[c], cm.ColorManagerRenderIntent.Perceptual)
+    m.supported_intent(mut srv.conns[c], cm.ColorManagerRenderIntent.Relative)
+    m.supported_feature(mut srv.conns[c], cm.ColorManagerFeature.Parametric)
+    m.supported_feature(mut srv.conns[c], cm.ColorManagerFeature.SetLuminances)
+    m.supported_feature(mut srv.conns[c], cm.ColorManagerFeature.SetMasteringDisplayPrimaries)
+    m.supported_feature(mut srv.conns[c], cm.ColorManagerFeature.WindowsScrgb)
+    m.supported_tf_named(mut srv.conns[c], cm.ColorManagerTransferFunction.Gamma22)
+    m.supported_tf_named(mut srv.conns[c], cm.ColorManagerTransferFunction.ExtLinear)
+    m.supported_tf_named(mut srv.conns[c], cm.ColorManagerTransferFunction.Srgb)
+    m.supported_tf_named(mut srv.conns[c], cm.ColorManagerTransferFunction.St2084Pq)
+    m.supported_tf_named(mut srv.conns[c], cm.ColorManagerTransferFunction.Hlg)
+    m.supported_primaries_named(mut srv.conns[c], cm.ColorManagerPrimaries.Srgb)
+    m.supported_primaries_named(mut srv.conns[c], cm.ColorManagerPrimaries.Bt2020)
+    m.done(mut srv.conns[c])
+}
+
+fn next_identity(mut srv: server.Server) -> u32 {
+    srv.color_identity += 1
+    if srv.color_identity == 0 {
+        srv.color_identity = 1
+    }
+    return srv.color_identity
+}
+
+fn make_desc_for_output(mut srv: server.Server, ci: u32, obj: u32, oi: u32) {
+    let valid = oi != state.none and srv.outputs.used(int(oi))
+    if not valid {
+        let id = srv.color_descs.add(state.ColorDescData { client: ci, obj, ready: false, allow_info: true })
+        srv.bind(ci, obj, id.index)
+        cm.ImageDescription { id: obj }.failed(mut srv.conns[int(ci)], cm.ImageDescriptionCause.NoOutput, "output removed")
+        return
+    }
+    let hdr = srv.outputs.items[int(oi)].info.hdr
+    let sdr_nits = srv.outputs.items[int(oi)].info.sdr_nits
+    let max_nits = srv.outputs.items[int(oi)].info.max_nits
+    let cid = srv.outputs.items[int(oi)].info.color_identity
+    let cs = if hdr { types.scene.color_bt2020_pq } else { types.scene.color_sdr }
+    let prim = if hdr { u32(cm.ColorManagerPrimaries.Bt2020) } else { u32(cm.ColorManagerPrimaries.Srgb) }
+    let tf = if hdr { u32(cm.ColorManagerTransferFunction.St2084Pq) } else { u32(cm.ColorManagerTransferFunction.Srgb) }
+    let ref_lum = u32(max(i32(sdr_nits.round()), 10))
+    let max_lum = if hdr { u32(max(i32(max_nits.round()), i32(ref_lum))) } else { ref_lum }
+    let min_lum: u32 = if hdr { 50 } else { 2000 }
+    let ident = if cid != 0 { cid } else { next_identity(mut srv) }
+    let id = srv.color_descs.add(state.ColorDescData {
+        client: ci,
+        obj,
+        color_space: cs,
+        primaries: prim,
+        tf,
+        min_lum,
+        max_lum,
+        ref_lum,
+        ready: true,
+        allow_info: true,
+        identity: ident,
+    })
+    srv.bind(ci, obj, id.index)
+    cm.ImageDescription { id: obj }.ready(mut srv.conns[int(ci)], ident)
+}
+
+fn preferred_output_for_surface(srv: server.Server, si: u32) -> u32 {
+    guard srv.surfaces.used(int(si)) else {
+        return state.none
+    }
+    let mask = srv.surfaces.items[int(si)].outputs
+    var first = state.none
+    for oi in 0..min(srv.outputs.items.len(), 64) {
+        if srv.outputs.used(oi) and (mask & (u64(1) << u64(oi))) != 0 {
+            if first == state.none {
+                first = u32(oi)
+            }
+            if srv.outputs.items[oi].info.hdr {
+                return u32(oi)
+            }
+        }
+    }
+    if first != state.none {
+        return first
+    }
+    for oi in 0..srv.outputs.items.len() {
+        if srv.outputs.used(oi) {
+            return u32(oi)
+        }
+    }
+    return state.none
+}
+
+fn manager(mut srv: server.Server, ci: u32, take req: cm.ColorManagerRequest) {
+    match req {
+        Destroy => {}
+        GetOutput(co, o) => {
+            let oi = srv.slot(ci, o.id)
+            let slot = srv.color_outputs.add(state.ColorOutputData { client: ci, obj: co.id, output: oi })
+            srv.bind(ci, co.id, slot.index)
+        }
+        GetSurface(cs, s) => {
+            let si = srv.slot(ci, s.id)
+            guard si != state.none and srv.surfaces.used(int(si)) else {
+                return
+            }
+            guard srv.surfaces.items[int(si)].color_obj == 0 else {
+                srv.fail(ci, cs.id, u32(cm.ColorManagerError.SurfaceExists), "color management surface already exists")
+                return
+            }
+            srv.surfaces.items[int(si)].color_obj = cs.id
+            srv.bind(ci, cs.id, si)
+        }
+        GetSurfaceFeedback(fb, s) => {
+            let si = srv.slot(ci, s.id)
+            let slot = srv.color_feedbacks.add(state.ColorFeedbackData { client: ci, obj: fb.id, surface: si })
+            srv.bind(ci, fb.id, slot.index)
+        }
+        CreateIccCreator(obj) => {
+            srv.fail(ci, obj.id, u32(cm.ColorManagerError.UnsupportedFeature), "ICC profiles are not supported")
+        }
+        CreateParametricCreator(obj) => {
+            let id = srv.color_creators.add(state.ColorCreatorData { client: ci, obj: obj.id })
+            srv.bind(ci, obj.id, id.index)
+        }
+        CreateWindowsScrgb(desc) => {
+            let ident = next_identity(mut srv)
+            let id = srv.color_descs.add(state.ColorDescData {
+                client: ci,
+                obj: desc.id,
+                color_space: types.scene.color_scrgb,
+                primaries: u32(cm.ColorManagerPrimaries.Srgb),
+                tf: u32(cm.ColorManagerTransferFunction.ExtLinear),
+                min_lum: 0,
+                max_lum: 1000,
+                ref_lum: 80,
+                ready: true,
+                allow_info: false,
+                identity: ident,
+            })
+            srv.bind(ci, desc.id, id.index)
+            desc.ready(mut srv.conns[int(ci)], ident)
+        }
+        GetImageDescription(desc, _) => {
+            srv.fail(ci, desc.id, u32(cm.ColorManagerError.UnsupportedFeature), "image description references are not supported")
+        }
+        CreateWindowsBt2100(desc) => {
+            srv.fail(ci, desc.id, u32(cm.ColorManagerError.UnsupportedFeature), "windows_bt2100 is not supported")
+        }
+    }
+}
+
+fn output_req(mut srv: server.Server, ci: u32, co: cm.ColorManagementOutput, take req: cm.ColorManagementOutputRequest) {
+    let slot = srv.slot(ci, co.id)
+    guard slot != state.none and srv.color_outputs.used(int(slot)) else {
+        return
+    }
+    match req {
+        Destroy => {
+            srv.unbind(ci, co.id)
+            srv.color_outputs.remove(slot, state.ColorOutputData {})
+        }
+        GetImageDescription(desc) => {
+            let oi = srv.color_outputs.items[int(slot)].output
+            make_desc_for_output(mut srv, ci, desc.id, oi)
+        }
+    }
+}
+
+fn surface_req(mut srv: server.Server, ci: u32, cs: cm.ColorManagementSurface, take req: cm.ColorManagementSurfaceRequest) {
+    let si = srv.slot(ci, cs.id)
+    match req {
+        Destroy => {
+            srv.unbind(ci, cs.id)
+            if si != state.none and srv.surfaces.used(int(si)) {
+                srv.surfaces.items[int(si)].color_obj = 0
+                srv.surfaces.items[int(si)].pending.color_set = true
+                srv.surfaces.items[int(si)].pending.color_space = types.scene.color_sdr
+            }
+        }
+        SetImageDescription(desc, intent) => {
+            guard si != state.none and srv.surfaces.used(int(si)) else {
+                srv.fail(ci, cs.id, u32(cm.ColorManagementSurfaceError.Inert), "surface destroyed")
+                return
+            }
+            let ri = u32(intent)
+            guard ri == u32(cm.ColorManagerRenderIntent.Perceptual) or ri == u32(cm.ColorManagerRenderIntent.Relative) else {
+                srv.fail(ci, cs.id, u32(cm.ColorManagementSurfaceError.RenderIntent), "unsupported render intent {ri}")
+                return
+            }
+            let di = srv.slot(ci, desc.id)
+            guard di != state.none and srv.color_descs.used(int(di)) and srv.color_descs.items[int(di)].ready else {
+                srv.fail(ci, cs.id, u32(cm.ColorManagementSurfaceError.ImageDescription), "image description is not ready")
+                return
+            }
+            srv.surfaces.items[int(si)].pending.color_set = true
+            srv.surfaces.items[int(si)].pending.color_space = srv.color_descs.items[int(di)].color_space
+        }
+        UnsetImageDescription => {
+            guard si != state.none and srv.surfaces.used(int(si)) else {
+                srv.fail(ci, cs.id, u32(cm.ColorManagementSurfaceError.Inert), "surface destroyed")
+                return
+            }
+            srv.surfaces.items[int(si)].pending.color_set = true
+            srv.surfaces.items[int(si)].pending.color_space = types.scene.color_sdr
+        }
+    }
+}
+
+fn feedback_req(mut srv: server.Server, ci: u32, fb: cm.ColorManagementSurfaceFeedback, take req: cm.ColorManagementSurfaceFeedbackRequest) {
+    let slot = srv.slot(ci, fb.id)
+    guard slot != state.none and srv.color_feedbacks.used(int(slot)) else {
+        return
+    }
+    match req {
+        Destroy => {
+            srv.unbind(ci, fb.id)
+            srv.color_feedbacks.remove(slot, state.ColorFeedbackData {})
+        }
+        GetPreferred(desc) or GetPreferredParametric(desc) => {
+            let si = srv.color_feedbacks.items[int(slot)].surface
+            guard si != state.none and srv.surfaces.used(int(si)) else {
+                srv.fail(ci, fb.id, u32(cm.ColorManagementSurfaceFeedbackError.Inert), "surface destroyed")
+                return
+            }
+            let oi = preferred_output_for_surface(srv, si)
+            make_desc_for_output(mut srv, ci, desc.id, oi)
+        }
+    }
+}
+
+fn map_parametric_space(primaries: u32, tf: u32) -> Option[u32] {
+    if tf == u32(cm.ColorManagerTransferFunction.St2084Pq) {
+        return Some(types.scene.color_bt2020_pq)
+    }
+    if tf == u32(cm.ColorManagerTransferFunction.Hlg) {
+        return Some(types.scene.color_bt2020_hlg)
+    }
+    if tf == u32(cm.ColorManagerTransferFunction.ExtLinear) {
+        return Some(types.scene.color_scrgb)
+    }
+    if tf == u32(cm.ColorManagerTransferFunction.Srgb) or tf == u32(cm.ColorManagerTransferFunction.Gamma22) {
+        if primaries == u32(cm.ColorManagerPrimaries.Srgb) {
+            return Some(types.scene.color_sdr)
+        }
+        if primaries == u32(cm.ColorManagerPrimaries.Bt2020) {
+            return Some(types.scene.color_bt2020_hlg)
+        }
+    }
+    return None
+}
+
+fn creator_params(mut srv: server.Server, ci: u32, cr: cm.ImageDescriptionCreatorParams, take req: cm.ImageDescriptionCreatorParamsRequest) {
+    let slot = srv.slot(ci, cr.id)
+    guard slot != state.none and srv.color_creators.used(int(slot)) else {
+        return
+    }
+    let i = int(slot)
+    match req {
+        Create(desc) => {
+            let data = srv.color_creators.items[i]
+            srv.unbind(ci, cr.id)
+            srv.color_creators.remove(slot, state.ColorCreatorData {})
+            guard data.has_primaries and data.has_tf else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.IncompleteSet), "primaries and transfer function must be set")
+                return
+            }
+            let mapped = map_parametric_space(data.primaries, data.tf)
+            guard let Some(cs) = mapped else {
+                let id = srv.color_descs.add(state.ColorDescData { client: ci, obj: desc.id, ready: false, allow_info: false })
+                srv.bind(ci, desc.id, id.index)
+                desc.failed(mut srv.conns[int(ci)], cm.ImageDescriptionCause.Unsupported, "unsupported color space combination")
+                return
+            }
+            let ident = next_identity(mut srv)
+            let id = srv.color_descs.add(state.ColorDescData {
+                client: ci,
+                obj: desc.id,
+                color_space: cs,
+                primaries: data.primaries,
+                tf: data.tf,
+                min_lum: data.min_lum,
+                max_lum: data.max_lum,
+                ref_lum: data.ref_lum,
+                ready: true,
+                allow_info: false,
+                identity: ident,
+            })
+            srv.bind(ci, desc.id, id.index)
+            desc.ready(mut srv.conns[int(ci)], ident)
+        }
+        SetTfNamed(tf) => {
+            guard not srv.color_creators.items[i].has_tf else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "transfer function already set")
+                return
+            }
+            let raw = u32(tf)
+            let ok = raw == u32(cm.ColorManagerTransferFunction.Gamma22) or raw == u32(cm.ColorManagerTransferFunction.ExtLinear) or raw == u32(cm.ColorManagerTransferFunction.Srgb) or raw == u32(cm.ColorManagerTransferFunction.St2084Pq) or raw == u32(cm.ColorManagerTransferFunction.Hlg)
+            guard ok else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.InvalidTf), "unsupported transfer function {raw}")
+                return
+            }
+            srv.color_creators.items[i].has_tf = true
+            srv.color_creators.items[i].tf = raw
+        }
+        SetTfPower => {
+            srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.UnsupportedFeature), "set_tf_power not supported")
+        }
+        SetPrimariesNamed(prim) => {
+            guard not srv.color_creators.items[i].has_primaries else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "primaries already set")
+                return
+            }
+            let raw = u32(prim)
+            guard raw == u32(cm.ColorManagerPrimaries.Srgb) or raw == u32(cm.ColorManagerPrimaries.Bt2020) else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.InvalidPrimariesNamed), "unsupported primaries {raw}")
+                return
+            }
+            srv.color_creators.items[i].has_primaries = true
+            srv.color_creators.items[i].primaries = raw
+        }
+        SetPrimaries => {
+            srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.UnsupportedFeature), "custom primaries not supported")
+        }
+        SetLuminances(min_lum, max_lum, ref_lum) => {
+            guard not srv.color_creators.items[i].has_lum else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "luminances already set")
+                return
+            }
+            guard max_lum > 0 and ref_lum > 0 and max_lum >= ref_lum else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.InvalidLuminance), "invalid luminance range")
+                return
+            }
+            srv.color_creators.items[i].has_lum = true
+            srv.color_creators.items[i].min_lum = min_lum
+            srv.color_creators.items[i].max_lum = max_lum
+            srv.color_creators.items[i].ref_lum = ref_lum
+        }
+        SetMasteringDisplayPrimaries => {
+            guard not srv.color_creators.items[i].has_mastering_prim else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "mastering primaries already set")
+                return
+            }
+            srv.color_creators.items[i].has_mastering_prim = true
+        }
+        SetMasteringLuminance(min_lum, max_lum) => {
+            guard not srv.color_creators.items[i].has_mastering_lum else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "mastering luminance already set")
+                return
+            }
+            guard max_lum > 0 and u64(max_lum) * 10000 > u64(min_lum) else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.InvalidLuminance), "invalid mastering luminance")
+                return
+            }
+            srv.color_creators.items[i].has_mastering_lum = true
+        }
+        SetMaxCll => {
+            guard not srv.color_creators.items[i].has_cll else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "max_cll already set")
+                return
+            }
+            srv.color_creators.items[i].has_cll = true
+        }
+        SetMaxFall => {
+            guard not srv.color_creators.items[i].has_fall else {
+                srv.fail(ci, cr.id, u32(cm.ImageDescriptionCreatorParamsError.AlreadySet), "max_fall already set")
+                return
+            }
+            srv.color_creators.items[i].has_fall = true
+        }
+    }
+}
+
+fn image_description(mut srv: server.Server, ci: u32, desc: cm.ImageDescription, take req: cm.ImageDescriptionRequest) {
+    let slot = srv.slot(ci, desc.id)
+    guard slot != state.none and srv.color_descs.used(int(slot)) else {
+        return
+    }
+    match req {
+        Destroy => {
+            srv.unbind(ci, desc.id)
+            srv.color_descs.remove(slot, state.ColorDescData {})
+        }
+        GetInformation(info) => {
+            let d = srv.color_descs.items[int(slot)]
+            guard d.ready else {
+                srv.fail(ci, desc.id, u32(cm.ImageDescriptionError.NotReady), "image description not ready")
+                return
+            }
+            guard d.allow_info else {
+                srv.fail(ci, desc.id, u32(cm.ImageDescriptionError.NoInformation), "image description does not allow get_information")
+                return
+            }
+            let c = int(ci)
+            info.primaries_named(mut srv.conns[c], cm.ColorManagerPrimaries(d.primaries))
+            info.tf_named(mut srv.conns[c], cm.ColorManagerTransferFunction(d.tf))
+            info.luminances(mut srv.conns[c], d.min_lum, d.max_lum, d.ref_lum)
+            info.target_luminance(mut srv.conns[c], d.min_lum, d.max_lum)
+            info.done(mut srv.conns[c])
+        }
+    }
+}
+
+/// Output `oi`'s HDR / luminance settings changed: bump identity and notify
+/// bound color-management outputs and surface feedbacks.
+fn output_changed(mut srv: server.Server, oi: u32) {
+    guard srv.outputs.used(int(oi)) else {
+        return
+    }
+    let ident = next_identity(mut srv)
+    srv.outputs.items[int(oi)].info.color_identity = ident
+    for k in 0..srv.color_outputs.items.len() {
+        if srv.color_outputs.used(k) and srv.color_outputs.items[k].output == oi {
+            let ci = srv.color_outputs.items[k].client
+            let obj = srv.color_outputs.items[k].obj
+            if srv.clients.used(int(ci)) {
+                cm.ColorManagementOutput { id: obj }.image_description_changed(mut srv.conns[int(ci)])
+            }
+        }
+    }
+    let bit = if oi < 64 { u64(1) << u64(oi) } else { u64(0) }
+    for k in 0..srv.color_feedbacks.items.len() {
+        if not srv.color_feedbacks.used(k) {
+            continue
+        }
+        let si = srv.color_feedbacks.items[k].surface
+        guard si != state.none and srv.surfaces.used(int(si)) else {
+            continue
+        }
+        if srv.surfaces.items[int(si)].outputs == 0 or (srv.surfaces.items[int(si)].outputs & bit) != 0 {
+            let ci = srv.color_feedbacks.items[k].client
+            let obj = srv.color_feedbacks.items[k].obj
+            if srv.clients.used(int(ci)) {
+                cm.ColorManagementSurfaceFeedback { id: obj }.preferred_changed(mut srv.conns[int(ci)], ident)
+            }
+        }
+    }
+}
+
+fn output_gone(mut srv: server.Server, oi: u32) {
+    for k in 0..srv.color_outputs.items.len() {
+        if srv.color_outputs.used(k) and srv.color_outputs.items[k].output == oi {
+            srv.color_outputs.items[k].output = state.none
+        }
+    }
+}
+
+fn surface_gone(mut srv: server.Server, si: u32) {
+    for k in 0..srv.color_feedbacks.items.len() {
+        if srv.color_feedbacks.used(k) and srv.color_feedbacks.items[k].surface == si {
+            srv.color_feedbacks.items[k].surface = state.none
+        }
+    }
+}
+
+fn surface_outputs_changed(mut srv: server.Server, si: u32) {
+    let oi = preferred_output_for_surface(srv, si)
+    guard oi != state.none and srv.outputs.used(int(oi)) else {
+        return
+    }
+    var ident = srv.outputs.items[int(oi)].info.color_identity
+    if ident == 0 {
+        ident = next_identity(mut srv)
+        srv.outputs.items[int(oi)].info.color_identity = ident
+    }
+    for k in 0..srv.color_feedbacks.items.len() {
+        if srv.color_feedbacks.used(k) and srv.color_feedbacks.items[k].surface == si {
+            let ci = srv.color_feedbacks.items[k].client
+            let obj = srv.color_feedbacks.items[k].obj
+            if srv.clients.used(int(ci)) {
+                cm.ColorManagementSurfaceFeedback { id: obj }.preferred_changed(mut srv.conns[int(ci)], ident)
+            }
+        }
+    }
+}
+
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    discard ci
+    discard id
+    if iface == cm.color_management_output_iface {
+        srv.color_outputs.remove(slot, state.ColorOutputData {})
+        return true
+    }
+    if iface == cm.color_management_surface_iface {
+        if srv.surfaces.used(int(slot)) {
+            srv.surfaces.items[int(slot)].color_obj = 0
+        }
+        return true
+    }
+    if iface == cm.color_management_surface_feedback_iface {
+        srv.color_feedbacks.remove(slot, state.ColorFeedbackData {})
+        return true
+    }
+    if iface == cm.image_description_creator_params_iface {
+        srv.color_creators.remove(slot, state.ColorCreatorData {})
+        return true
+    }
+    if iface == cm.image_description_iface {
+        srv.color_descs.remove(slot, state.ColorDescData {})
+        return true
+    }
+    return false
+}

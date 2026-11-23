@@ -10,7 +10,7 @@ pub struct Manager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let manager_iface: u16 = 30
+pub let manager_iface: u16 = 39
 pub let manager_version: u32 = 2
 
 /// Requests of wp_cursor_shape_manager_v1.
@@ -53,7 +53,7 @@ pub struct Device derive(Hash, Show) {
     pub id: u32
 }
 
-pub let device_iface: u16 = 31
+pub let device_iface: u16 = 40
 pub let device_version: u32 = 2
 
 /// cursor shapes

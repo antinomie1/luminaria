@@ -8,7 +8,7 @@ pub struct ToplevelList derive(Hash, Show) {
     pub id: u32
 }
 
-pub let toplevel_list_iface: u16 = 36
+pub let toplevel_list_iface: u16 = 45
 pub let toplevel_list_version: u32 = 1
 
 /// Requests of ext_foreign_toplevel_list_v1.
@@ -54,7 +54,7 @@ pub struct Handle derive(Hash, Show) {
     pub id: u32
 }
 
-pub let handle_iface: u16 = 37
+pub let handle_iface: u16 = 46
 pub let handle_version: u32 = 1
 
 /// Requests of ext_foreign_toplevel_handle_v1.

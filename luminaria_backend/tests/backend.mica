@@ -245,3 +245,28 @@ test "set_keymap_on stores independent keymap for a second seat" {
     var gone: List[u64] = []
     b.shutdown(mut gone)
 }
+
+test "keyboard layout switching cycles XKB groups and resolves keysyms" {
+    guard let Ok(kb) = backend.keyboard.Keyboard.new(backend.Names { layout: "us,de" }) else {
+        io.eprint("skipped: no us,de xkb data")
+        return
+    }
+    var k = kb
+    // evdev 21 is KEY_Y on US, KEY_Z on DE.
+    let (sym0, _, _) = k.key(21, true)
+    discard k.key(21, false)
+    assert_eq(sym0, u32(0x79))
+    assert(not k.layout_name().is_empty())
+    assert(k.switch_layout(1))
+    let (sym1, _, _) = k.key(21, true)
+    discard k.key(21, false)
+    assert_eq(sym1, u32(0x7a))
+    assert(k.switch_layout(-1))
+    let (sym2, _, _) = k.key(21, true)
+    discard k.key(21, false)
+    assert_eq(sym2, u32(0x79))
+    assert_eq(backend.keysym_from_name("Return"), u32(0xff0d))
+    assert_eq(backend.keysym_from_name("return"), u32(0xff0d))
+    assert_eq(backend.keysym_from_name("XF86AudioRaiseVolume"), u32(0x1008ff13))
+    assert_eq(backend.keysym_from_name("not_a_real_keysym_xyz"), u32(0))
+}

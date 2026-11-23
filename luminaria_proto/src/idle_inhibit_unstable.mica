@@ -9,7 +9,7 @@ pub struct InhibitManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let inhibit_manager_iface: u16 = 54
+pub let inhibit_manager_iface: u16 = 63
 pub let inhibit_manager_version: u32 = 1
 
 /// Requests of zwp_idle_inhibit_manager_v1.
@@ -44,7 +44,7 @@ pub struct Inhibitor derive(Hash, Show) {
     pub id: u32
 }
 
-pub let inhibitor_iface: u16 = 55
+pub let inhibitor_iface: u16 = 64
 pub let inhibitor_version: u32 = 1
 
 /// Requests of zwp_idle_inhibitor_v1.

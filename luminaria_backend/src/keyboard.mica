@@ -162,3 +162,40 @@ pub fn Keyboard.mods(self) -> Mods {
         num: xkb.state_mod_name_is_active(self.state, "Mod2", eff) == 1,
     }
 }
+
+/// Serialized `(depressed, latched, locked, group)` modifier state.
+pub fn Keyboard.serialized(self) -> (u32, u32, u32, u32) {
+    return (self.depressed, self.latched, self.locked, self.group)
+}
+
+/// Cycle the active XKB layout group by `delta` (+1 next, -1 prev).
+/// Returns true when the effective layout group changed.
+pub fn Keyboard.switch_layout(mut self, delta: int) -> bool {
+    let n = int(xkb.keymap_num_layouts(self.keymap))
+    guard n > 1 else {
+        return false
+    }
+    var next = (int(self.group) + delta) % n
+    if next < 0 {
+        next += n
+    }
+    guard u32(next) != self.group else {
+        return false
+    }
+    discard xkb.state_update_mask(self.state, self.depressed, self.latched, self.locked, 0, 0, u32(next))
+    return self.serialize()
+}
+
+/// Name of the active XKB layout group ("" if unnamed).
+pub fn Keyboard.layout_name(self) -> str {
+    return xkb.keymap_layout_get_name(self.keymap, self.group).unwrap_or("")
+}
+
+/// Resolve an XKB keysym name (exact first, then case-insensitive); 0 if unknown.
+pub fn keysym_from_name(name: str) -> u32 {
+    let exact = xkb.keysym_from_name(name, i32(xkb.xkb_keysym_no_flags))
+    if exact != 0 {
+        return exact
+    }
+    return xkb.keysym_from_name(name, i32(xkb.xkb_keysym_case_insensitive))
+}

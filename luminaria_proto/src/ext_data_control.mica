@@ -9,7 +9,7 @@ pub struct Manager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let manager_iface: u16 = 32
+pub let manager_iface: u16 = 41
 pub let manager_version: u32 = 1
 
 /// Requests of ext_data_control_manager_v1.
@@ -51,7 +51,7 @@ pub struct Device derive(Hash, Show) {
     pub id: u32
 }
 
-pub let device_iface: u16 = 33
+pub let device_iface: u16 = 42
 pub let device_version: u32 = 1
 
 pub enum DeviceError: u32 {
@@ -124,7 +124,7 @@ pub struct Source derive(Hash, Show) {
     pub id: u32
 }
 
-pub let source_iface: u16 = 34
+pub let source_iface: u16 = 43
 pub let source_version: u32 = 1
 
 pub enum SourceError: u32 {
@@ -175,7 +175,7 @@ pub struct Offer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let offer_iface: u16 = 35
+pub let offer_iface: u16 = 44
 pub let offer_version: u32 = 1
 
 /// Requests of ext_data_control_offer_v1.

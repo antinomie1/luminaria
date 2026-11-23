@@ -39,12 +39,12 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 | 方面 | 协议 |
 |------|------|
 | 核心与外壳 | wl_compositor 6、subcompositor、shm、wl_seat 9、wl_output 4、xdg-shell 6、wl_fixes |
-| 缓冲与时序 | linux-dmabuf 4、linux-drm-syncobj、single-pixel-buffer、viewporter、fractional-scale、presentation-time、fifo、commit-timing、tearing-control、alpha-modifier、content-type |
+| 缓冲与时序 | linux-dmabuf 4（8-bit / 10-bit / FP16）、linux-drm-syncobj、single-pixel-buffer、viewporter、fractional-scale、presentation-time、fifo、commit-timing、tearing-control、alpha-modifier、content-type、wp-color-management v1（HDR / BT.2020 / PQ / scRGB） |
 | 窗口 | xdg-decoration、xdg-activation、xdg-toplevel-icon、xdg-toplevel-tag、xdg-dialog、xdg-foreign v2、xdg-system-bell、ext-foreign-toplevel-list |
-| 桌面 | wlr-layer-shell 5、ext-session-lock、xdg-output 3、ext-idle-notify 2、idle-inhibit |
-| 输入 | relative-pointer、pointer-constraints、pointer-gestures 3、cursor-shape 2、keyboard-shortcuts-inhibit、text-input-v3、input-method-v2、virtual-keyboard |
+| 桌面 | wlr-layer-shell 5、ext-session-lock、xdg-output 3、ext-idle-notify 2、idle-inhibit、wlr-gamma-control v1（硬件 CRTC Gamma LUT / 护眼色温） |
+| 输入 | relative-pointer、pointer-constraints、pointer-gestures 3、cursor-shape 2、keyboard-shortcuts-inhibit、text-input-v3、input-method-v2、virtual-keyboard、wlr-virtual-pointer v2 |
 | 选区 | 剪贴板、主选区、ext-data-control、带动作协商的拖放 |
-| 截屏与管控 | ext-image-copy-capture（输出源与窗口源，shm 及零拷贝 dmabuf）、wlr-output-management 4、security-context（沙盒客户端看不到特权 global） |
+| 截屏与管控 | ext-image-copy-capture（输出源与窗口源，shm、零拷贝 dmabuf 及按窗口 `Style.block_capture` 隐私遮罩）、wlr-output-management 4、security-context（沙盒客户端看不到特权 global） |
 
 尚未支持：数位板（`tablet-v2`）。
 
@@ -139,7 +139,7 @@ sheaf run -p tiny -- -s foot    # 在 VT 上，或作为当前桌面里的一个
 
 | 后端 | 输出 | 输入 |
 |------|------|------|
-| DRM | 原子 KMS（提交线程）：主平面、overlay 平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、热插拔 | libinput（经 libseat，支持多 seat）、xkb |
+| DRM | 原子 KMS（提交线程）：主平面、overlay 平面和光标平面、来自 `IN_FORMATS` 的修饰符、翻转时间戳、撕裂客户端的异步翻转、VRR、DPMS、CRTC `GAMMA_LUT`、HDR 静态元数据（`HDR_OUTPUT_METADATA` / `BT2020_RGB` / 10-bit `XRGB2101010`）、热插拔 | libinput（经 libseat，多 seat、平坦/自适应加速、DWT）、xkb（多布局切换） |
 | 嵌套 | 父合成器里的一个窗口（标题栏和边框经 xdg-decoration 由父合成器画），dmabuf 经 linux-dmabuf 交出，带隐式栅栏 | 父合成器的 seat 和 keymap |
 | 无头 | 按模式刷新率的 vblank 网格显示的纹理 | `inject` / `inject_on` |
 

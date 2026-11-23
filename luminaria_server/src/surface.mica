@@ -216,6 +216,10 @@ fn merge(mut dst: state.State, take src: state.State) {
         dst.content_set = true
         dst.content = s.content
     }
+    if s.color_set {
+        dst.color_set = true
+        dst.color_space = s.color_space
+    }
     if s.layer_set {
         dst.layer_set = true
         dst.layer = s.layer
@@ -465,6 +469,10 @@ fn apply_state(mut srv: server.Server, si: u32, take st: state.State) {
     }
     if s.content_set {
         srv.surfaces.items[i].current.content = s.content
+    }
+    if s.color_set {
+        srv.surfaces.items[i].current.color_space = s.color_space
+        changed |= state.changed_opaque
     }
     resize(mut srv, si)
     let role = srv.surfaces.items[i].role

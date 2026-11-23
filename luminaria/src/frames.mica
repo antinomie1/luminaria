@@ -88,6 +88,8 @@ fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -
     for o in 0..d.outs.len() {
         if d.outs[o].alive {
             d.comp.add_output(o, u32(d.outs[o].width), u32(d.outs[o].height), d.background)
+            let dst = if d.outs[o].hdr { types.dst_hdr_pq } else { types.dst_sdr }
+            d.comp.set_output_color(o, dst, d.outs[o].sdr_nits, d.outs[o].max_nits)
             d.outs[o].dirty = true
         }
     }
@@ -254,12 +256,22 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
             }
             if cap_dma {
                 var rest_caps: List[server.CaptureReq] = []
+                var red: List[types.Placement] = []
+                var red_ready = false
                 for req in mem.replace(mut d.caps.outputs, []) {
                     match req.target {
                         Output(target_so) => {
                             if target_so == so {
                                 let dbuf = d.srv.dmabuf(req.buffer)
-                                match d.comp.copy_dmabuf(key, dbuf, 0, 0, req.width, req.height) {
+                                let need_compose = d.outs[o].has_blocked or (d.outs[o].hdr and dbuf.format != types.buffer.xrgb2101010 and dbuf.format != types.buffer.argb2101010)
+                                let cap_res = if need_compose {
+                                    if not red_ready {
+                                        capture.redacted_placements(mut d, o, mut red)
+                                        red_ready = true
+                                    }
+                                    d.comp.render_offscreen_dmabuf(dbuf, red)
+                                } else { d.comp.copy_dmabuf(key, dbuf, 0, 0, req.width, req.height) }
+                                match cap_res {
                                     Ok(fd) => {
                                         if fd >= 0 {
                                             capture.add_cap_fence(mut d, req.session, req.buffer, fd, time.now_ns())
@@ -286,9 +298,17 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
                 d.caps.outputs = rest_caps
             }
             if cap_shm {
-                // The image is whole (drawn by buffer age): read it back.
-                if let Ok(px) = d.comp.read(key) {
-                    d.srv.capture(so, px, d.outs[o].width, d.outs[o].height, time.now_ns())
+                if d.outs[o].has_blocked or d.outs[o].hdr {
+                    var red: List[types.Placement] = []
+                    capture.redacted_placements(mut d, o, mut red)
+                    if let Ok(px) = d.comp.render_offscreen(u32(d.outs[o].width), u32(d.outs[o].height), red) {
+                        d.srv.capture(so, px, d.outs[o].width, d.outs[o].height, time.now_ns())
+                    }
+                } else {
+                    // The image is whole (drawn by buffer age): read it back.
+                    if let Ok(px) = d.comp.read(key) {
+                        d.srv.capture(so, px, d.outs[o].width, d.outs[o].height, time.now_ns())
+                    }
                 }
             }
         }

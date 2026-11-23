@@ -9,7 +9,7 @@ pub struct InhibitManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let inhibit_manager_iface: u16 = 60
+pub let inhibit_manager_iface: u16 = 69
 pub let inhibit_manager_version: u32 = 1
 
 pub enum InhibitManagerError: u32 {
@@ -50,7 +50,7 @@ pub struct Inhibitor derive(Hash, Show) {
     pub id: u32
 }
 
-pub let inhibitor_iface: u16 = 61
+pub let inhibitor_iface: u16 = 70
 pub let inhibitor_version: u32 = 1
 
 /// Requests of zwp_keyboard_shortcuts_inhibitor_v1.

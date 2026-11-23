@@ -15,6 +15,9 @@ pub struct Style {
     /// Move and fade from the previous placement over this many
     /// milliseconds instead of jumping (the library animates it).
     pub transition_ms: int = 0
+    /// Redact this window (and its popups) to solid black in screencasts
+    /// and screenshots without affecting on-screen display.
+    pub block_capture: bool = false
 }
 
 /// A texture the compositor owns.

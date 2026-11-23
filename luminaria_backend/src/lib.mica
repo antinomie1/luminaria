@@ -403,16 +403,25 @@ pub fn Backend.set_mode(mut self, o: u32, m: Mode) {
 
 /// Turn output `o` on or off (DPMS): an off output draws nothing.
 pub fn Backend.enable(mut self, o: u32, on: bool) {
-    guard let Some(dd) = self.drm.take() else {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        if int(o) < d.outputs.len() {
+            d.outputs[int(o)].enabled = on
+            d.outputs[int(o)].modeset = true
+            if not on {
+                d.update(int(o))
+            }
+        }
+        self.drm = Some(d)
         return
     }
-    var d = dd
-    d.outputs[int(o)].enabled = on
-    d.outputs[int(o)].modeset = true
-    if not on {
-        d.update(int(o))
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        if int(o) < h.outs.len() {
+            h.outs[int(o)].enabled = on
+        }
+        self.headless = Some(h)
     }
-    self.drm = Some(d)
 }
 
 /// Variable refresh rate on outputs that support it.
@@ -421,9 +430,46 @@ pub fn Backend.set_vrr(mut self, o: u32, on: bool) {
         return
     }
     var d = dd
-    d.outputs[int(o)].vrr = on and self.descs[int(o)].vrr
-    d.outputs[int(o)].modeset = true
+    if int(o) < d.outputs.len() {
+        d.outputs[int(o)].vrr = on and self.descs[int(o)].vrr
+        d.outputs[int(o)].modeset = true
+    }
     self.drm = Some(d)
+}
+
+/// Install or reset (empty slices) the hardware CRTC gamma LUT on output `o`.
+pub fn Backend.set_gamma(mut self, o: u32, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        let ok = d.set_gamma(int(o), r, g, b)
+        self.drm = Some(d)
+        return ok
+    }
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        let ok = h.set_gamma(int(o), r, g, b)
+        self.headless = Some(h)
+        return ok
+    }
+    return false
+}
+
+/// Enable or disable HDR static metadata (BT.2020 + ST.2084 PQ) and 10-bit
+/// scanout on output `o`.
+pub fn Backend.set_hdr(mut self, o: u32, on: bool, sdr_nits: f32, max_nits: f32) -> bool {
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        let ok = d.set_hdr(int(o), on, sdr_nits, max_nits)
+        self.drm = Some(d)
+        return ok
+    }
+    if let Some(hh) = self.headless.take() {
+        var h = hh
+        let ok = h.set_hdr(int(o), on, mut self.retired)
+        self.headless = Some(h)
+        return ok
+    }
+    return false
 }
 
 /// Whether a frame may be presented on `o` now (none is pending).
@@ -438,7 +484,7 @@ pub fn Backend.can_present(self, o: u32) -> bool {
         return n.frame_cb == 0
     }
     if let Some(h) = self.headless {
-        return h.outs[int(o)].pending < 0
+        return h.outs[int(o)].pending < 0 and h.outs[int(o)].enabled
     }
     return false
 }
@@ -850,6 +896,45 @@ pub fn Backend.configure_input(mut self, device: u32, c: InputConfig) {
 /// Switch to virtual terminal `n` (DRM sessions).
 pub fn Backend.switch_vt(self, n: int) {
     self.devices.switch_vt(n)
+}
+
+/// Cycle the active XKB layout group on the default seat by `delta` (+1 next, -1 prev).
+pub fn Backend.switch_layout(mut self, delta: int) -> bool {
+    guard self.kind != Kind.Nested else {
+        return false
+    }
+    return self.devices.switch_layout(delta)
+}
+
+/// Cycle the active XKB layout group on logical `seat` by `delta`.
+pub fn Backend.switch_layout_on(mut self, seat: str, delta: int) -> bool {
+    guard self.kind != Kind.Nested else {
+        return false
+    }
+    return self.devices.switch_layout_on(seat, delta)
+}
+
+/// Name of the active XKB layout group on the default seat.
+pub fn Backend.layout_name(self) -> str {
+    if let Some(n) = self.nested {
+        if let Some(k) = n.keyboard {
+            return k.layout_name()
+        }
+    }
+    return self.devices.layout_name()
+}
+
+/// Name of the active XKB layout group on logical `seat`.
+pub fn Backend.layout_name_on(self, seat: str) -> str {
+    guard self.kind != Kind.Nested else {
+        return self.layout_name()
+    }
+    return self.devices.layout_name_on(seat)
+}
+
+/// Resolve an XKB keysym name (case-insensitive) to its keysym value (0 if unknown).
+pub fn keysym_from_name(name: str) -> u32 {
+    return keyboard.keysym_from_name(name)
 }
 
 /// dev_t of the scanout device (for the dmabuf scanout tranche), 0 when
