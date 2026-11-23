@@ -136,6 +136,21 @@ pub fn Keyboard.set_mods(mut self, d: u32, l: u32, k: u32, g: u32) {
     discard self.serialize()
 }
 
+/// Unshifted level-0 keysym for evdev `code` under the active XKB layout
+/// (enables layout-independent shifted shortcuts without hardcoding US-QWERTY).
+pub fn Keyboard.base_sym(self, code: u32) -> u32 {
+    let kc = code + 8
+    let layout = xkb.state_key_get_layout(self.state, kc)
+    var syms: Ptr[u32] = Ptr.null()
+    unsafe {
+        let n = xkb.keymap_key_get_syms_by_level(self.keymap, kc, layout, 0, Ptr.of(syms))
+        if n > 0 and not syms.is_null() {
+            return syms.read()
+        }
+    }
+    return 0
+}
+
 pub fn Keyboard.mods(self) -> Mods {
     let eff = i32(xkb.xkb_state_mods_effective)
     return Mods {

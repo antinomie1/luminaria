@@ -125,7 +125,7 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                     let (x, y, opacity) = animate(mut d, display.skey(s), tx, ty, p.style.opacity, p.style.transition_ms, now)
                     let sc = f64(p.style.scale)
                     let geo = d.srv.info(s).geometry
-                    place_tree(mut d, s, x - f64(geo.x) * sc, y - f64(geo.y) * sc, sc, p.style, opacity, Some(w), mut per, mut masks)
+                    place_tree_on(mut d, s, x - f64(geo.x) * sc, y - f64(geo.y) * sc, sc, p.style, opacity, Some(w), p.only_output, mut per, mut masks)
                     shell.place_popups(mut d, s, pmap, opacity, Some(w), mut per, mut masks)
                 }
                 Image(img) => {
@@ -213,6 +213,23 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
 
 /// Place surface `s`'s tree with its origin at `ox, oy`.
 fn place_tree[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface, ox: f64, oy: f64, sc: f64, style: layout.Style, opacity: f32, owner: Option[server.Window], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    place_tree_on(mut d, s, ox, oy, sc, style, opacity, owner, None, mut per, mut masks)
+}
+
+/// Place surface `s`'s tree with its origin at `ox, oy`, optionally restricted to `only_output`.
+fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface, ox: f64, oy: f64, sc: f64, style: layout.Style, opacity: f32, owner: Option[server.Window], only_output: Option[server.Output], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
+    var clip_out = -1
+    if let Some(target_so) = only_output {
+        for oi in 0..d.outs.len() {
+            if d.outs[oi].alive and d.outs[oi].sout == target_so {
+                clip_out = oi
+                break
+            }
+        }
+        guard clip_out >= 0 else {
+            return
+        }
+    }
     var tree = mem.replace(mut d.tree_scratch, [])
     tree.clear()
     d.srv.tree(s, mut tree)
@@ -227,7 +244,16 @@ fn place_tree[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s:
         if let Some(w) = owner {
             discard d.surf_window.insert(ts, w)
         }
-        d.hits.add(ts, gx, gy, gw, gh, sc)
+        if clip_out >= 0 {
+            let co = d.outs[clip_out]
+            let hx0 = max(gx, co.x)
+            let hy0 = max(gy, co.y)
+            let hx1 = min(gx + gw, co.x + co.lw())
+            let hy1 = min(gy + gh, co.y + co.lh())
+            d.hits.add_clipped(ts, gx, gy, hx0, hy0, hx1, hy1, sc)
+        } else {
+            d.hits.add(ts, gx, gy, gw, gh, sc)
+        }
         guard let Some(sf) = d.surfs.get(ts) else {
             continue
         }
@@ -240,6 +266,9 @@ fn place_tree[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s:
         let alpha = opacity * info.alpha
         var mask: u64 = 0
         for o in 0..d.outs.len() {
+            if clip_out >= 0 and o != clip_out {
+                continue
+            }
             let out = d.outs[o]
             guard out.alive and gx < out.x + out.lw() and gy < out.y + out.lh() and gx + gw > out.x and gy + gh > out.y else {
                 continue

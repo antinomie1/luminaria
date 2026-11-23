@@ -807,6 +807,22 @@ pub fn Backend.keymap_on(self, seat: str) -> (int, u32) {
 }
 
 /// Active modifiers on `seat`; falls back to the default seat's modifiers.
+pub fn Backend.base_sym(self, code: u32) -> u32 {
+    if let Some(n) = self.nested {
+        if let Some(k) = n.keyboard {
+            return k.base_sym(code)
+        }
+    }
+    return self.devices.base_sym(code)
+}
+
+pub fn Backend.base_sym_on(self, seat: str, code: u32) -> u32 {
+    guard self.kind != Kind.Nested else {
+        return self.base_sym(code)
+    }
+    return self.devices.base_sym_on(seat, code)
+}
+
 pub fn Backend.mods_on(self, seat: str) -> Mods {
     guard self.kind != Kind.Nested else {
         return self.mods()

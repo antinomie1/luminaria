@@ -31,6 +31,10 @@ pub trait Input {
     fn mods_on(self, seat: str) -> types.Mods {
         return self.mods()
     }
+    /// Unshifted level-0 keysym for evdev `code` on `seat` (0 if unavailable).
+    fn base_sym_on(self, seat: str, code: u32) -> u32 {
+        return 0
+    }
     fn set_keymap_on(mut self, seat: str, names: types.Names) -> Result[(), str] {
         return self.set_keymap(names)
     }

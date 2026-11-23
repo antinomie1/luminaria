@@ -36,6 +36,8 @@ struct Place {
     w: f64 = 0.0
     h: f64 = 0.0
     style: Style
+    /// Optional single-output restriction (prevents scrolled/tiled windows from bleeding onto neighbor monitors).
+    only_output: Option[server.Output] = None
 }
 
 pub struct Layout {
@@ -45,6 +47,11 @@ pub struct Layout {
 /// Window `w` with its window geometry's top left at `x, y`.
 pub fn Layout.window(mut self, w: server.Window, x: f64, y: f64, style: Style) {
     self.places.push(Place { what: What.Window(w), x, y, style })
+}
+
+/// Window `w` restricted strictly to output `o` (both rendering and pointer hit-testing).
+pub fn Layout.window_on(mut self, w: server.Window, o: server.Output, x: f64, y: f64, style: Style) {
+    self.places.push(Place { what: What.Window(w), x, y, style, only_output: Some(o) })
 }
 
 /// Image `img` stretched over `x, y, w, h`.

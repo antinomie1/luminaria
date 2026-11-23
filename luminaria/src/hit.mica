@@ -42,6 +42,15 @@ pub fn Hits.clear(mut self) {
 /// A surface on top of the previous ones, at `x, y`, `w` x `h` global
 /// units, `scale` global units per surface unit.
 pub fn Hits.add(mut self, s: server.Surface, x: f64, y: f64, w: f64, h: f64, scale: f64) {
+    self.add_clipped(s, x, y, x, y, x + w, y + h, scale)
+}
+
+/// Like `add`, but clips the hittable bounding box to `[cx0, cy0) .. [cx1, cy1)` while
+/// preserving `(ox, oy)` as the true surface origin for local pointer coordinates.
+pub fn Hits.add_clipped(mut self, s: server.Surface, ox: f64, oy: f64, cx0: f64, cy0: f64, cx1: f64, cy1: f64, scale: f64) {
+    guard cx1 > cx0 and cy1 > cy0 else {
+        return
+    }
     let n = self.surfs.len()
     // Overwrite the padding of the last block, or start a new block.
     if n == self.x0.len() {
@@ -52,13 +61,13 @@ pub fn Hits.add(mut self, s: server.Surface, x: f64, y: f64, w: f64, h: f64, sca
             self.y1.push(-far)
         }
     }
-    self.x0[n] = i32(x.floor())
-    self.y0[n] = i32(y.floor())
-    self.x1[n] = i32((x + w).ceil())
-    self.y1[n] = i32((y + h).ceil())
+    self.x0[n] = i32(cx0.floor())
+    self.y0[n] = i32(cy0.floor())
+    self.x1[n] = i32(cx1.ceil())
+    self.y1[n] = i32(cy1.ceil())
     self.surfs.push(s)
-    self.ox.push(x)
-    self.oy.push(y)
+    self.ox.push(ox)
+    self.oy.push(oy)
     self.sc.push(scale)
 }
 

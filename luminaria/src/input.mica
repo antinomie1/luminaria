@@ -65,7 +65,8 @@ fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
     match take i {
         Key(t, code, pressed, sym, text) => {
             let mods = d.be.mods_on(sname)
-            d.emit(display.Event.Key(display.Key { seat: st, time: t, code, sym, text, pressed, mods }))
+            let base_sym = d.be.base_sym_on(sname, code)
+            d.emit(display.Event.Key(display.Key { seat: st, time: t, code, sym, base_sym, text, pressed, mods }))
         }
         Modifiers(desc, l, k, g) => {
             // Clients always see the modifier state, bindings or not.

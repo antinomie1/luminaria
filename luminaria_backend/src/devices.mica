@@ -158,6 +158,22 @@ pub fn Devices.keymap_on(self, seat: str) -> (int, u32) {
     return self.keymap()
 }
 
+pub fn Devices.base_sym(self, code: u32) -> u32 {
+    if let Some(k) = self.kb {
+        return k.base_sym(code)
+    }
+    return 0
+}
+
+pub fn Devices.base_sym_on(self, seat: str, code: u32) -> u32 {
+    for x in self.extra {
+        if x.0 == seat {
+            return x.1.base_sym(code)
+        }
+    }
+    return self.base_sym(code)
+}
+
 pub fn Devices.mods_on(self, seat: str) -> types.Mods {
     for x in self.extra {
         if x.0 == seat {

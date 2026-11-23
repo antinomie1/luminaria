@@ -46,6 +46,8 @@ pub struct Key {
     pub code: u32 = 0
     /// xkb keysym (lum.backend.keysym.key_a ...).
     pub sym: u32 = 0
+    /// Unshifted level-0 keysym in the active XKB layout (0 if unavailable).
+    pub base_sym: u32 = 0
     /// Text the key types, "" for none.
     pub text: str = ""
     pub pressed: bool = false
@@ -980,6 +982,33 @@ pub fn Display[O, R].sandbox(self, c: server.Client) -> Option[(str, str, str)] 
 }
 
 /// Whether any of the window shows on some output.
+/// Stable renderer placement key for window `w`'s root surface.
+pub fn Display[O, R].window_key(self, w: server.Window) -> u64 {
+    return skey(self.srv.window_surface(w))
+}
+
+/// Update keyboard repeat rate (keys/sec) and delay (ms) across all seats.
+pub fn Display[O, R].set_repeat(mut self, rate: i32, delay: i32) {
+    self.repeat_rate = rate
+    self.repeat_delay = delay
+    for i in 0..self.seats.len() {
+        self.seats[i].repeat_rate = rate
+        self.seats[i].repeat_delay = delay
+        self.srv.set_repeat(self.seats[i].seat, rate, delay)
+    }
+}
+
+/// Update keyboard repeat rate (keys/sec) and delay (ms) on a single seat.
+pub fn Display[O, R].set_repeat_on(mut self, st: server.Seat, rate: i32, delay: i32) {
+    let si = seats.seat_index(self, st)
+    guard si >= 0 else {
+        return
+    }
+    self.seats[si].repeat_rate = rate
+    self.seats[si].repeat_delay = delay
+    self.srv.set_repeat(st, rate, delay)
+}
+
 pub fn Display[O, R].visible(self, w: server.Window) -> bool {
     let s = self.srv.window_surface(w)
     for o in 0..self.outs.len() {
