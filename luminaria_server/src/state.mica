@@ -14,6 +14,11 @@ struct ClientData {
     pid: int = 0
     uid: int = 0
     gid: int = 0
+    /// Its last xdg_wm_base (0: none), the serial of the ping it has not
+    /// answered yet (0: none) and when that went out (ns).
+    wm_base: u32 = 0
+    ping: u32 = 0
+    ping_ns: int = 0
     /// Object id -> slot in its kind's slab, for ids below server_base.
     objs: List[u32] = []
     /// Ids from server_base (data offers) -> slot.
@@ -290,6 +295,10 @@ struct WindowData {
     handles: List[(u32, u32)] = []
     /// ext-foreign-toplevel-list identifier.
     identifier: str = ""
+    /// zwlr_foreign_toplevel_handle_v1 objects (client slot, id) and the
+    /// state bits they were last sent.
+    bars: List[(u32, u32)] = []
+    bar_state: u32 = 0
 }
 
 /// One image of a toplevel icon: ARGB8888 premultiplied pixels.
@@ -582,6 +591,12 @@ struct SourceData {
     /// chosen with the target.
     actions: u32 = 0
     action: u32 = 0
+    /// Its xdg_toplevel_drag_v1 (0: none), the window attached to it and
+    /// where the pointer holds that window (geometry coordinates).
+    tdrag: u32 = 0
+    tdrag_win: u32 = 0xFFFFFFFF
+    tdrag_x: i32 = 0
+    tdrag_y: i32 = 0
 }
 
 struct OfferData {

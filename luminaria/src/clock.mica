@@ -52,9 +52,12 @@ pub fn Clock.start(self, now: int) -> int {
 }
 
 /// A frame starts now: the vblank it aims at (Frame events carry it as
-/// the predicted presentation time).
+/// the predicted presentation time). `start` leaves the margin before that
+/// vblank, so it is the first one from now even when the timer fires a
+/// little late; adding the margin again would name the next one, and a
+/// frame that missed its vblank would count as on time and never grow it.
 pub fn Clock.begin(mut self, now: int) -> int {
-    self.target = if self.last > 0 { self.vblank_after(now + self.margin_ns) } else { now }
+    self.target = if self.last > 0 { self.vblank_after(now) } else { now }
     return self.target
 }
 

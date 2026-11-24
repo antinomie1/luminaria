@@ -19,6 +19,7 @@ import shell
 import ime
 import pointer
 import toplevel
+import taskbar
 import inhibit
 import capture
 import security
@@ -59,6 +60,8 @@ fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
         srv.positioners.remove(slot, state.PositionerData {})
     } else if iface == wl.data_source_iface {
         data.destroy_source(mut srv, slot)
+    } else if iface == proto.xdg_toplevel_drag.drag_iface {
+        data.toplevel_drag_destroyed(mut srv, slot, id)
     } else if iface == wl.data_offer_iface {
         srv.offers.remove(slot, state.OfferData {})
     } else if iface == proto.linux_dmabuf.buffer_params_iface {
@@ -75,7 +78,7 @@ fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
         srv.offers.remove(slot, state.OfferData {})
     } else if iface == proto.primary_selection_unstable.device_iface or iface == proto.ext_data_control.device_iface {
         seat.drop_resource(mut srv, slot, ci, id)
-    } else if shell.destroyed(mut srv, ci, slot, iface, id) or ime.destroyed(mut srv, ci, slot, iface, id) or pointer.destroyed(mut srv, ci, slot, iface, id) or toplevel.destroyed(mut srv, ci, slot, iface, id) or inhibit.destroyed(mut srv, ci, slot, iface, id) or capture.destroyed(mut srv, ci, slot, iface, id) or security.destroyed(mut srv, ci, slot, iface, id) or outman.destroyed(mut srv, ci, slot, iface, id) or vptr.destroyed(mut srv, ci, slot, iface, id) or gamma.destroyed(mut srv, ci, slot, iface, id) or color.destroyed(mut srv, ci, slot, iface, id) {
+    } else if shell.destroyed(mut srv, ci, slot, iface, id) or ime.destroyed(mut srv, ci, slot, iface, id) or pointer.destroyed(mut srv, ci, slot, iface, id) or toplevel.destroyed(mut srv, ci, slot, iface, id) or taskbar.destroyed(mut srv, ci, slot, iface, id) or inhibit.destroyed(mut srv, ci, slot, iface, id) or capture.destroyed(mut srv, ci, slot, iface, id) or security.destroyed(mut srv, ci, slot, iface, id) or outman.destroyed(mut srv, ci, slot, iface, id) or vptr.destroyed(mut srv, ci, slot, iface, id) or gamma.destroyed(mut srv, ci, slot, iface, id) or color.destroyed(mut srv, ci, slot, iface, id) {
         return
     } else {
         extra.destroyed(mut srv, ci, slot, iface)
@@ -187,6 +190,10 @@ fn handle(mut srv: server.Server, ci: u32, take r: proto.Request) {
         ZxdgImported(i, req) => toplevel.imported(mut srv, ci, i, req)
         ExtForeignToplevelList(l, req) => toplevel.toplevel_list(mut srv, ci, l, req)
         ExtForeignToplevelHandle(h, req) => toplevel.toplevel_handle(mut srv, ci, h, req)
+        ZwlrForeignToplevelManager(m, req) => taskbar.manager(mut srv, ci, m, req)
+        XdgToplevelDragManager(m, req) => data.toplevel_drag_manager(mut srv, ci, m, req)
+        XdgToplevelDrag(d, req) => data.toplevel_drag(mut srv, ci, d, req)
+        ZwlrForeignToplevelHandle(h, req) => taskbar.toplevel(mut srv, ci, h, req)
         XdgSystemBell(_, req) => toplevel.system_bell(mut srv, ci, req)
         ZwpIdleInhibitManager(_, req) => inhibit.inhibit_manager(mut srv, ci, req)
         ZwpIdleInhibitor(i, req) => inhibit.inhibitor(mut srv, ci, i, req)
@@ -277,6 +284,8 @@ fn registry(mut srv: server.Server, ci: u32, reg: wl.Registry, take req: wl.Regi
                         toplevel.icon_manager_bound(mut srv, ci, obj.id)
                     } else if g.iface == proto.ext_foreign_toplevel_list.toplevel_list_iface {
                         toplevel.list_bound(mut srv, ci, obj.id, obj.version)
+                    } else if g.iface == proto.wlr_foreign_toplevel_management_unstable.manager_iface {
+                        taskbar.bound(mut srv, ci, obj.id, obj.version)
                     } else if g.iface == proto.wlr_output_management_unstable.manager_iface {
                         outman.bound(mut srv, ci, obj.id)
                     } else if g.iface == proto.color_management.color_manager_iface {

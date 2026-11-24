@@ -21,6 +21,13 @@ test "the clock starts frames just in time and adapts to late ones" {
     // It landed a vblank late: the margin grows.
     c.presented(3, 1000000000 + 2 * r)
     assert(c.margin_ns > m)
+    // A timer firing a little after the start still aims at the same vblank,
+    // so missing it counts as late too.
+    let s2 = c.start(1000000000 + 2 * r + 1000)
+    let m2 = c.margin_ns
+    assert_eq(c.begin(s2 + 100000), 1000000000 + 3 * r)
+    c.presented(5, 1000000000 + 4 * r)
+    assert(c.margin_ns > m2)
     c.vrr = true
-    assert_eq(c.start(1000000000 + 2 * r + 10), 1000000000 + 3 * r - c.margin_ns)
+    assert_eq(c.start(1000000000 + 4 * r + 10), 1000000000 + 5 * r - c.margin_ns)
 }

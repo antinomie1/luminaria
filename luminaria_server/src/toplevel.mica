@@ -18,6 +18,7 @@ import ids
 import state
 import server
 import buffer
+import taskbar
 
 fn window(srv: server.Server, ci: u32, toplevel: u32) -> u32 {
     let wi = srv.slot(ci, toplevel)
@@ -349,6 +350,7 @@ fn imported(mut srv: server.Server, ci: u32, im: xf.Imported, take req: xf.Impor
             }
             srv.windows.items[int(wi)].parent = parent
             srv.push(server.Event.WindowParent(handle(srv, wi)))
+            taskbar.parent_changed(mut srv, wi)
         }
         Destroy => {
             srv.unbind(ci, im.id)
@@ -385,11 +387,12 @@ fn announce(mut srv: server.Server, wi: u32, r: state.Res) {
     h.done(mut srv.conns[c])
 }
 
-/// Window `wi` was mapped: every list hears of it.
+/// Window `wi` was mapped: every list and taskbar hears of it.
 fn mapped(mut srv: server.Server, wi: u32) {
     for r in srv.toplevel_lists.clone() {
         announce(mut srv, wi, r)
     }
+    taskbar.mapped(mut srv, wi)
 }
 
 /// Its title or app id changed.
@@ -401,6 +404,7 @@ fn retitled(mut srv: server.Server, wi: u32) {
         h.app_id(mut srv.conns[int(c)], srv.windows.items[i].app_id.clone())
         h.done(mut srv.conns[int(c)])
     }
+    taskbar.retitled(mut srv, wi)
 }
 
 /// Unmapped or destroyed: the handles close; exports end with it.
@@ -411,6 +415,7 @@ fn gone(mut srv: server.Server, wi: u32, destroyed: bool) {
         srv.unbind(c, id)
     }
     srv.windows.items[i].handles.clear()
+    taskbar.gone(mut srv, wi)
     if destroyed {
         unexport(mut srv, fn(x) => x.1 == wi)
     }

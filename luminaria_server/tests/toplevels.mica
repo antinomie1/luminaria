@@ -1,0 +1,251 @@
+// Toplevel management through a real socket: a wlr taskbar's handles
+// (title, state, requests, closing) and a toplevel drag's window.
+
+import std.env
+import std.fs
+import std.os
+import luminaria_wire as wire
+import luminaria_proto as proto
+import luminaria_proto.wayland as wl
+import luminaria_proto.xdg_shell as xdg
+import luminaria_proto.wlr_foreign_toplevel_management_unstable as ft
+import luminaria_proto.xdg_toplevel_drag as td
+import luminaria_server as server
+
+struct Fx {
+    srv: server.Server
+    c: wire.Conn
+    client: server.Client
+    reg: wl.Registry = wl.Registry { id: 0 }
+    globals: List[(u32, u16)] = []
+}
+
+fn setup() -> Fx {
+    let dir = fs.create_temp_dir("luminaria-toplevels").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    var srv = server.Server.open("").expect("listen")
+    let c = wire.connect(srv.name()).expect("connect")
+    for _ in 0..100 {
+        if let Ok(Some((client, _))) = srv.accept() {
+            return Fx { srv, c, client }
+        }
+    }
+    panic("accept")
+}
+
+fn pump(mut f: Fx) -> List[proto.Event] {
+    discard f.c.flush()
+    for _ in 0..3 {
+        assert(f.srv.dispatch(f.client))
+    }
+    var gone: List[server.Client] = []
+    f.srv.flush(mut gone)
+    assert(gone.is_empty())
+    var out: List[proto.Event] = []
+    for _ in 0..3 {
+        discard f.c.read()
+        while true {
+            match proto.next_event(mut f.c) {
+                Ok(Some(e)) => {
+                    match e {
+                        WlRegistry(_, Global(n, i, _)) => f.globals.push((n, proto.ifaces.by_name(i)))
+                        _ => {}
+                    }
+                    out.push(e)
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(e) => panic("client: {e}")
+            }
+        }
+    }
+    return out
+}
+
+fn events(mut f: Fx) -> List[server.Event] {
+    var out: List[server.Event] = []
+    while true {
+        guard let Some(e) = f.srv.next() else {
+            break
+        }
+        out.push(e)
+    }
+    return out
+}
+
+fn bind(mut f: Fx, iface: u16, version: u32) -> u32 {
+    if f.reg.id == 0 {
+        f.reg = wl.Display { id: 1 }.get_registry(mut f.c)
+        discard pump(mut f)
+    }
+    for (n, i) in f.globals.clone() {
+        if i == iface {
+            return f.reg.bind(mut f.c, n, iface, version)
+        }
+    }
+    panic("no global {proto.ifaces.name(iface)}")
+}
+
+fn shm_buffer(mut f: Fx, w: i32, h: i32) -> wl.Buffer {
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let size = w * h * 4
+    let fd = os.memfd("t", int(size)).expect("memfd")
+    let pool = shm.create_pool(mut f.c, fd, size)
+    os.close(fd)
+    return pool.create_buffer(mut f.c, 0, w, h, w * 4, wl.ShmFormat.Argb8888)
+}
+
+/// A mapped toplevel titled `title`: its surface, toplevel and window.
+fn window(mut f: Fx, comp: wl.Compositor, wm: xdg.WmBase, title: str) -> (wl.Surface, xdg.Toplevel, server.Window) {
+    let surf = comp.create_surface(mut f.c)
+    let xs = wm.get_xdg_surface(mut f.c, surf)
+    let top = xs.get_toplevel(mut f.c)
+    top.set_title(mut f.c, title)
+    top.set_app_id(mut f.c, "app")
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    var win: Option[server.Window] = None
+    for e in events(mut f) {
+        match e {
+            WindowNew(w) => win = Some(w)
+            _ => {}
+        }
+    }
+    let w = win.expect("WindowNew")
+    let serial = f.srv.configure(w, 0, 0, server.States {})
+    discard pump(mut f)
+    xs.ack_configure(mut f.c, serial)
+    surf.attach(mut f.c, Some(shm_buffer(mut f, 4, 4)), 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    discard events(mut f)
+    return (surf, top, w)
+}
+
+/// The states a handle was sent, as `ft.HandleState` values.
+fn states(bytes: &[u8]) -> List[u32] {
+    var out: List[u32] = []
+    var k = 0
+    while k + 4 <= bytes.len() {
+        out.push(u32(bytes[k]))
+        k += 4
+    }
+    return out
+}
+
+test "a wlr taskbar sees windows, their state and parent, asks for changes and hears them close" {
+    var f = setup()
+    let st = f.srv.add_seat("seat0")
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 6) }
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let (surf, _, w) = window(mut f, comp, wm, "editor")
+    // Bound after the window mapped: it is announced at once.
+    let mgr = ft.Manager { id: bind(mut f, ft.manager_iface, 3) }
+    discard mgr
+    var h: Option[ft.Handle] = None
+    var title = ""
+    var app = ""
+    var done = false
+    for e in pump(mut f) {
+        match e {
+            ZwlrForeignToplevelManager(_, Toplevel(x)) => h = Some(x)
+            ZwlrForeignToplevelHandle(_, Title(t)) => title = t.clone()
+            ZwlrForeignToplevelHandle(_, AppId(a)) => app = a.clone()
+            ZwlrForeignToplevelHandle(_, Done) => done = true
+            _ => {}
+        }
+    }
+    let handle = h.expect("toplevel")
+    assert_eq(title, "editor")
+    assert_eq(app, "app")
+    assert(done)
+    // The compositor's configure shows in the state.
+    discard f.srv.configure(w, 0, 0, server.States { activated: true, maximized: true })
+    var got: List[u32] = []
+    for e in pump(mut f) {
+        match e {
+            ZwlrForeignToplevelHandle(_, State(b)) => got = states(b)
+            _ => {}
+        }
+    }
+    assert_eq(got, [u32(0), u32(2)])
+    // A child window names its parent's handle.
+    let (_, ctop, _) = window(mut f, comp, wm, "dialog")
+    let (_, ptop, _) = window(mut f, comp, wm, "main")
+    ctop.set_parent(mut f.c, Some(ptop))
+    var parent_set = false
+    for e in pump(mut f) {
+        match e {
+            ZwlrForeignToplevelHandle(_, Parent(Some)) => parent_set = true
+            _ => {}
+        }
+    }
+    assert(parent_set)
+    // Requests reach the compositor.
+    handle.set_maximized(mut f.c)
+    handle.activate(mut f.c, ws)
+    handle.close(mut f.c)
+    handle.set_fullscreen(mut f.c, None)
+    discard pump(mut f)
+    var maximize = false
+    var activate = false
+    var close = false
+    var fullscreen = false
+    for e in events(mut f) {
+        match e {
+            WindowRequest(x, Maximize(true)) => maximize = x == w
+            WindowRequest(x, Close) => close = x == w
+            WindowRequest(x, Fullscreen(true, None)) => fullscreen = x == w
+            Activate(x) => activate = x == w
+            _ => {}
+        }
+    }
+    assert(maximize and activate and close and fullscreen)
+    discard st
+    // Unmapped: the handle closes.
+    surf.attach(mut f.c, None, 0, 0)
+    surf.commit(mut f.c)
+    assert(pump(mut f).any(fn(e) => match e {
+        ZwlrForeignToplevelHandle(x, Closed) => x == handle
+        _ => false
+    }))
+}
+
+test "a toplevel drag carries a mapped window until it is unmapped" {
+    var f = setup()
+    let st = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(st, 1)
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 6) }
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let ddm = wl.DataDeviceManager { id: bind(mut f, wl.data_device_manager_iface, 3) }
+    let tdm = td.DragManager { id: bind(mut f, td.drag_manager_iface, 1) }
+    discard ws.get_pointer(mut f.c)
+    let dev = ddm.get_data_device(mut f.c, ws)
+    let (surf, top, w) = window(mut f, comp, wm, "tab")
+    let ss = f.srv.window_surface(w)
+    f.srv.pointer_focus(st, Some(ss), 1.0, 1.0)
+    let src = ddm.create_data_source(mut f.c)
+    src.offer(mut f.c, "text/plain")
+    let drag = tdm.get_xdg_toplevel_drag(mut f.c, src)
+    drag.attach(mut f.c, top, 5, 6)
+    let serial = f.srv.pointer_button(st, 0, 272, true)
+    dev.start_drag(mut f.c, Some(src), surf, None, serial)
+    discard pump(mut f)
+    discard events(mut f)
+    assert(f.srv.drag_window(st) == Some((w, 5, 6)))
+    assert(f.srv.dragged(w))
+    // Unmapped while attached: let go of, and the seat hears.
+    surf.attach(mut f.c, None, 0, 0)
+    surf.commit(mut f.c)
+    discard pump(mut f)
+    assert(events(mut f).any(fn(e) => match e {
+        Drag(x) => x == st
+        _ => false
+    }))
+    assert(f.srv.drag_window(st).is_none())
+    assert(not f.srv.dragged(w))
+    assert(f.srv.dragging(st))
+}

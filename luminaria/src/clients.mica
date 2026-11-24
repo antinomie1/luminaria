@@ -132,7 +132,7 @@ fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R])
             }
             ImeChanged => place.rebuild(mut d)
             IdleChanged => d.idle_tick()
-            Drag => place.rebuild(mut d)
+            Drag(st) => manipulation.drag_changed(mut d, st)
             Capture(so) => {
                 // The first frame of a capture is taken at once.
                 let o = outputs.out_index(d, so)
@@ -201,6 +201,7 @@ fn request[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: se
         Maximize(on) => d.emit(display.Event.RequestMaximize(w, on))
         Fullscreen(on, o) => d.emit(display.Event.RequestFullscreen(w, o, on))
         Minimize => d.emit(display.Event.RequestMinimize(w))
+        Close => d.emit(display.Event.RequestClose(w))
         Menu(_, x, y) => d.emit(display.Event.RequestMenu(w, f64(x), f64(y)))
     }
 }

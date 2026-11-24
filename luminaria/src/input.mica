@@ -268,6 +268,14 @@ fn under[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], x: f64, y: 
     return d.hits.find(d.srv, x, y)
 }
 
+/// What a drag on seat `si` is over: the window it carries is no target.
+fn drag_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: int, x: f64, y: f64) -> Option[(server.Surface, f64, f64)] {
+    guard let Some((w, _, _)) = d.seats[si].drag_win else {
+        return under(d, x, y)
+    }
+    return d.hits.find_except(d.srv, x, y, fn(s) => d.surf_window.get(s) == Some(w))
+}
+
 fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, t: u32) {
     guard si >= 0 and si < d.seats.len() else {
         return
@@ -286,7 +294,7 @@ fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
         }
     }
     if target.is_none() {
-        target = under(d, px, py)
+        target = if dragging { drag_target(d, si, px, py) } else { under(d, px, py) }
     }
     match target {
         Some((s, lx, ly)) => {
@@ -309,7 +317,7 @@ fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
         }
     }
     update_constraint_on(mut d, si)
-    if dragging and d.srv.drag_icon(st).is_some() {
+    if dragging and (d.srv.drag_icon(st).is_some() or d.seats[si].drag_win.is_some()) {
         place.rebuild(mut d)
     }
 }
@@ -468,6 +476,7 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
             discard d.configure(w, 0, 0, server.States {})
         }
         RequestMove(w) => d.manipulate_move(w)
+        RequestClose(w) => d.close(w)
         RequestResize(w, edges) => d.manipulate_resize(w, edges)
         RequestMaximize(w, on) => {
             let cur = d.wins.get(w).unwrap_or(display.Win {})

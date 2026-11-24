@@ -20,7 +20,8 @@ fn schedule[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: i
     guard d.outs[o].alive and not d.outs[o].armed and not d.outs[o].due else {
         return
     }
-    var wants = d.outs[o].dirty or d.animating or manipulation.needs_resize_sync(d)
+    let draws = d.outs[o].dirty or d.animating or manipulation.needs_resize_sync(d)
+    var wants = draws or d.outs[o].wanted
     if not wants {
         for s in d.drawn[o] {
             if d.srv.wants_frame(s) {
@@ -34,8 +35,10 @@ fn schedule[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: i
     }
     let now = time.now_ns()
     // Nested, the parent's frame callback already says when to draw: a
-    // second, predicted deadline would only miss the parent's.
-    let start = if d.be.paced() { now } else { d.outs[o].clock.start(now) }
+    // second, predicted deadline would only miss the parent's. A frame with
+    // nothing to draw (client frame callbacks, `want_frame`) presents
+    // nothing, so no callback paces it: it follows the clock, or it spins.
+    let start = if d.be.paced() and draws { now } else { d.outs[o].clock.start(now) }
     if start <= now + 200000 {
         frame_due(mut d, o)
         return
@@ -49,6 +52,7 @@ fn frame_due[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: 
         return
     }
     d.outs[o].due = true
+    d.outs[o].wanted = false
     let target = d.outs[o].clock.begin(time.now_ns())
     let so = d.outs[o].sout
     d.emit(display.Event.Frame(so, target))
@@ -477,9 +481,10 @@ fn presented[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: 
 }
 
 fn housekeeping[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
-    place.occlusion(mut d)
     if d.waits.txn_layout.is_some() and time.now_ns() >= d.waits.txn_deadline {
         d.waits.txn_wins.clear()
         waits.try_finish(mut d)
     }
+    // Re-arms for whatever is still due (a pending deadline included).
+    place.occlusion(mut d)
 }

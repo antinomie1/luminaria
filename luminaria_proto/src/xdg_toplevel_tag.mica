@@ -9,7 +9,7 @@ pub struct ToplevelTagManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let toplevel_tag_manager_iface: u16 = 143
+pub let toplevel_tag_manager_iface: u16 = 147
 pub let toplevel_tag_manager_version: u32 = 1
 
 /// Requests of xdg_toplevel_tag_manager_v1.

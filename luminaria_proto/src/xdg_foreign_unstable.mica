@@ -9,7 +9,7 @@ pub struct Exporter derive(Hash, Show) {
     pub id: u32
 }
 
-pub let exporter_iface: u16 = 129
+pub let exporter_iface: u16 = 131
 pub let exporter_version: u32 = 1
 
 /// error values
@@ -50,7 +50,7 @@ pub struct Importer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let importer_iface: u16 = 130
+pub let importer_iface: u16 = 132
 pub let importer_version: u32 = 1
 
 /// Requests of zxdg_importer_v2.
@@ -85,7 +85,7 @@ pub struct Exported derive(Hash, Show) {
     pub id: u32
 }
 
-pub let exported_iface: u16 = 131
+pub let exported_iface: u16 = 133
 pub let exported_version: u32 = 1
 
 /// Requests of zxdg_exported_v2.
@@ -118,7 +118,7 @@ pub struct Imported derive(Hash, Show) {
     pub id: u32
 }
 
-pub let imported_iface: u16 = 132
+pub let imported_iface: u16 = 134
 pub let imported_version: u32 = 1
 
 /// error values

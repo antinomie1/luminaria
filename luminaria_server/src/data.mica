@@ -12,6 +12,7 @@ import luminaria_wire as wire
 import luminaria_proto.wayland as wl
 import luminaria_proto.primary_selection_unstable as ps
 import luminaria_proto.ext_data_control as dc
+import luminaria_proto.xdg_toplevel_drag as td
 import ids
 import state
 import server
@@ -630,5 +631,101 @@ fn drag_actions(mut srv: server.Server, ci: u32, id: u32, actions: u32, preferre
         srv.sources.items[int(src)].action = a
         let sc = int(srv.sources.items[int(src)].client)
         wl.DataSource { id: srv.sources.items[int(src)].obj }.action(mut srv.conns[sc], wl.DataDeviceManagerDndAction(a))
+    }
+}
+
+// ---------------------------------------------------- toplevel drag
+
+fn toplevel_drag_manager(mut srv: server.Server, ci: u32, m: td.DragManager, take req: td.DragManagerRequest) {
+    match req {
+        GetXdgToplevelDrag(d, src) => {
+            let ss = source_slot(srv, ci, src.id)
+            guard ss != state.none and srv.sources.items[int(ss)].kind == state.DataKind.Data else {
+                return
+            }
+            guard srv.sources.items[int(ss)].tdrag == 0 else {
+                srv.fail(ci, m.id, u32(td.DragManagerError.InvalidSource), "the data source has a toplevel drag")
+                return
+            }
+            srv.sources.items[int(ss)].tdrag = d.id
+            srv.bind(ci, d.id, ss)
+        }
+        Destroy => {}
+    }
+}
+
+/// The seat whose drag uses source `ss`, or none.
+fn drag_seat(srv: server.Server, ss: u32) -> u32 {
+    for i in 0..srv.seats.items.len() {
+        if srv.seats.used(i) and srv.seats.items[i].drag.active and srv.seats.items[i].drag.source == ss {
+            return u32(i)
+        }
+    }
+    return state.none
+}
+
+/// The window the drag of source `ss` carries changed: its seat hears.
+fn drag_window_changed(mut srv: server.Server, ss: u32) {
+    let si = drag_seat(srv, ss)
+    if si != state.none {
+        srv.push(server.Event.Drag(ids.Seat { id: srv.seats.id(si) }))
+    }
+}
+
+fn toplevel_drag(mut srv: server.Server, ci: u32, d: td.Drag, take req: td.DragRequest) {
+    let ss = srv.slot(ci, d.id)
+    let live = ss != state.none and srv.sources.used(int(ss)) and srv.sources.items[int(ss)].tdrag == d.id
+    match req {
+        Attach(t, x, y) => {
+            guard live else {
+                return
+            }
+            let wi = srv.slot(ci, t.id)
+            guard wi != state.none and srv.windows.used(int(wi)) else {
+                return
+            }
+            let cur = srv.sources.items[int(ss)].tdrag_win
+            guard cur == wi or cur == state.none or not srv.windows.used(int(cur)) or not srv.windows.items[int(cur)].mapped else {
+                srv.fail(ci, d.id, u32(td.DragError.ToplevelAttached), "a mapped toplevel is attached")
+                return
+            }
+            srv.sources.items[int(ss)].tdrag_win = wi
+            srv.sources.items[int(ss)].tdrag_x = ids.clamp(x)
+            srv.sources.items[int(ss)].tdrag_y = ids.clamp(y)
+            drag_window_changed(mut srv, ss)
+        }
+        Destroy => {
+            if live {
+                guard drag_seat(srv, ss) == state.none else {
+                    srv.fail(ci, d.id, u32(td.DragError.OngoingDrag), "the drag has not ended")
+                    return
+                }
+                srv.sources.items[int(ss)].tdrag = 0
+                srv.sources.items[int(ss)].tdrag_win = state.none
+            }
+            srv.unbind(ci, d.id)
+        }
+    }
+}
+
+/// Window `wi` was mapped (true) or unmapped or destroyed (false): a drag
+/// carrying it starts showing it, or lets go of it.
+fn toplevel_mapped(mut srv: server.Server, wi: u32, mapped: bool) {
+    for k in 0..srv.sources.items.len() {
+        guard srv.sources.used(k) and srv.sources.items[k].tdrag_win == wi else {
+            continue
+        }
+        if not mapped {
+            srv.sources.items[k].tdrag_win = state.none
+        }
+        drag_window_changed(mut srv, u32(k))
+    }
+}
+
+/// Teardown of a toplevel drag object.
+fn toplevel_drag_destroyed(mut srv: server.Server, slot: u32, id: u32) {
+    if srv.sources.used(int(slot)) and srv.sources.items[int(slot)].tdrag == id {
+        srv.sources.items[int(slot)].tdrag = 0
+        srv.sources.items[int(slot)].tdrag_win = state.none
     }
 }

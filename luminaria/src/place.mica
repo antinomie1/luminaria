@@ -147,7 +147,13 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                     let geo = info.geometry
                     let eff_w = if geo.w > 0 { geo.w } else { info.width }
                     let eff_h = if geo.h > 0 { geo.h } else { info.height }
-                    let win = d.wins.get(w).unwrap_or(display.Win {})
+                    var win = d.wins.get(w).unwrap_or(display.Win {})
+                    if let Some((hx, hy)) = manipulation.drag_hold(d, w) {
+                        // A drag carries it: the offset puts it under the pointer.
+                        win.off_x = hx - p.x - d.manip.pan_x
+                        win.off_y = hy - p.y - d.manip.pan_y
+                        discard d.wins.insert(w, win)
+                    }
                     let (off_x, off_y) = manipulation.resize_offset(d, w, eff_w, eff_h, win)
                     let tx = p.x + off_x + d.manip.pan_x
                     let ty = p.y + off_y + d.manip.pan_y
@@ -399,13 +405,13 @@ fn occlusion[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             win.hidden = true
             win.hidden_since = now
             changed = true
-            soon = 500000000
+            soon = sooner(soon, 500000000)
         } else if not win.occluded and now - win.hidden_since >= 500000000 {
             win.occluded = true
             changed = true
             d.emit(display.Event.Occluded(w, true))
         } else if not win.occluded {
-            soon = 500000000 - (now - win.hidden_since)
+            soon = sooner(soon, 500000000 - (now - win.hidden_since))
         }
         if changed {
             updates.push((w, win))
@@ -414,7 +420,23 @@ fn occlusion[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     for (w, win) in updates {
         discard d.wins.insert(w, win)
     }
-    if soon > 0 {
-        discard os.timer_arm(d.house_fd, soon, 0)
+    d.occl_due = if soon > 0 { now + soon } else { 0 }
+    arm_house(mut d)
+}
+
+/// The smaller of two delays, 0 being none.
+fn sooner(a: int, b: int) -> int {
+    return if a == 0 or b < a { b } else { a }
+}
+
+/// Arm the housekeeping timer for what is due first: the next occlusion
+/// check or the layout transaction deadline (one must not cancel the other).
+fn arm_house[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    var due = d.occl_due
+    if d.waits.txn_layout.is_some() and (due == 0 or d.waits.txn_deadline < due) {
+        due = d.waits.txn_deadline
+    }
+    if due > 0 {
+        discard os.timer_arm(d.house_fd, max(due - time.now_ns(), 1), 0)
     }
 }

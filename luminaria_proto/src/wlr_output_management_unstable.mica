@@ -9,7 +9,7 @@ pub struct Manager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let manager_iface: u16 = 116
+pub let manager_iface: u16 = 118
 pub let manager_version: u32 = 4
 
 /// Requests of zwlr_output_manager_v1.
@@ -63,7 +63,7 @@ pub struct Head derive(Hash, Show) {
     pub id: u32
 }
 
-pub let head_iface: u16 = 117
+pub let head_iface: u16 = 119
 pub let head_version: u32 = 4
 
 pub enum HeadAdaptiveSyncState: u32 {
@@ -199,7 +199,7 @@ pub struct Mode derive(Hash, Show) {
     pub id: u32
 }
 
-pub let mode_iface: u16 = 118
+pub let mode_iface: u16 = 120
 pub let mode_version: u32 = 3
 
 /// Requests of zwlr_output_mode_v1.
@@ -252,7 +252,7 @@ pub struct Configuration derive(Hash, Show) {
     pub id: u32
 }
 
-pub let configuration_iface: u16 = 119
+pub let configuration_iface: u16 = 121
 pub let configuration_version: u32 = 4
 
 pub enum ConfigurationError: u32 {
@@ -330,7 +330,7 @@ pub struct ConfigurationHead derive(Hash, Show) {
     pub id: u32
 }
 
-pub let configuration_head_iface: u16 = 120
+pub let configuration_head_iface: u16 = 122
 pub let configuration_head_version: u32 = 4
 
 pub enum ConfigurationHeadError: u32 {

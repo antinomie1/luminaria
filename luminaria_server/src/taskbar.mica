@@ -1,0 +1,258 @@
+// wlr-foreign-toplevel-management: taskbars and docks see every mapped
+// toplevel (title, app id, outputs, state, parent) and ask the compositor
+// to activate, close, maximize, minimize or fullscreen it.
+
+import luminaria_proto.wayland as wl
+import luminaria_proto.wlr_foreign_toplevel_management_unstable as ft
+import ids
+import state
+import server
+
+// State bits, by `ft.HandleState` value.
+let max_bit: u32 = 1
+let act_bit: u32 = 4
+let fs_bit: u32 = 8
+
+fn handle(srv: server.Server, wi: u32) -> ids.Window {
+    return ids.Window { id: srv.windows.id(wi) }
+}
+
+fn bound(mut srv: server.Server, ci: u32, id: u32, version: u32) {
+    let r = state.Res { client: ci, id, version }
+    srv.taskbars.push(r)
+    for wi in 0..srv.windows.items.len() {
+        if srv.windows.used(wi) and srv.windows.items[wi].mapped {
+            announce(mut srv, u32(wi), r)
+        }
+    }
+    // Parents once every handle exists.
+    for wi in 0..srv.windows.items.len() {
+        if srv.windows.used(wi) and srv.windows.items[wi].mapped and parent_of(srv, u32(wi)) != state.none {
+            send_parent(mut srv, u32(wi), ci)
+        }
+    }
+}
+
+fn manager(mut srv: server.Server, ci: u32, m: ft.Manager, take req: ft.ManagerRequest) {
+    match req {
+        Stop => {
+            srv.taskbars.retain(fn(r) => not (r.client == ci and r.id == m.id))
+            m.finished(mut srv.conns[int(ci)])
+        }
+    }
+}
+
+fn state_bytes(bits: u32) -> List[u8] {
+    var out: List[u8] = []
+    for v in 0..4 {
+        if bits & (u32(1) << u32(v)) != 0 {
+            out.push(u8(v))
+            out.push(0)
+            out.push(0)
+            out.push(0)
+        }
+    }
+    return out
+}
+
+/// The mapped parent window of `wi`, or none.
+fn parent_of(srv: server.Server, wi: u32) -> u32 {
+    let p = srv.windows.items[int(wi)].parent
+    return if p != state.none and srv.windows.used(int(p)) and srv.windows.items[int(p)].mapped { p } else { state.none }
+}
+
+/// Window `wi`'s handle for client `ci` (0: none).
+fn handle_for(srv: server.Server, wi: u32, ci: u32) -> u32 {
+    for (c, id) in srv.windows.items[int(wi)].bars {
+        if c == ci {
+            return id
+        }
+    }
+    return 0
+}
+
+/// Send `output_enter` (or leave) on handle `h` of client `ci` for each
+/// output in `mask` the client has bound.
+fn send_outputs(mut srv: server.Server, ci: u32, h: ft.Handle, mask: u64, enter: bool) {
+    for oi in 0..min(srv.outputs.items.len(), 64) {
+        guard mask & (u64(1) << u64(oi)) != 0 and srv.outputs.used(oi) else {
+            continue
+        }
+        for (bc, id, _) in srv.outputs.items[oi].binds.clone() {
+            guard bc == ci else {
+                continue
+            }
+            if enter {
+                h.output_enter(mut srv.conns[int(ci)], wl.Output { id })
+            } else {
+                h.output_leave(mut srv.conns[int(ci)], wl.Output { id })
+            }
+        }
+    }
+}
+
+fn announce(mut srv: server.Server, wi: u32, r: state.Res) {
+    let i = int(wi)
+    let c = int(r.client)
+    let h = ft.Manager { id: r.id }.toplevel(mut srv.conns[c])
+    srv.windows.items[i].bars.push((r.client, h.id))
+    srv.bind(r.client, h.id, wi)
+    h.title(mut srv.conns[c], srv.windows.items[i].title.clone())
+    h.app_id(mut srv.conns[c], srv.windows.items[i].app_id.clone())
+    let si = int(srv.windows.items[i].surface)
+    send_outputs(mut srv, r.client, h, srv.surfaces.items[si].outputs, true)
+    h.state(mut srv.conns[c], state_bytes(srv.windows.items[i].bar_state))
+    h.done(mut srv.conns[c])
+}
+
+fn send_parent(mut srv: server.Server, wi: u32, ci: u32) {
+    let id = handle_for(srv, wi, ci)
+    guard id != 0 and srv.conns[int(ci)].version(id) >= 3 else {
+        return
+    }
+    let p = parent_of(srv, wi)
+    let ph = if p == state.none { u32(0) } else { handle_for(srv, p, ci) }
+    let h = ft.Handle { id }
+    h.parent(mut srv.conns[int(ci)], if ph == 0 { None } else { Some(ft.Handle { id: ph }) })
+    h.done(mut srv.conns[int(ci)])
+}
+
+/// Window `wi` was mapped: every taskbar hears of it, and of the children
+/// that were waiting for it as their parent.
+fn mapped(mut srv: server.Server, wi: u32) {
+    for r in srv.taskbars.clone() {
+        announce(mut srv, wi, r)
+        if parent_of(srv, wi) != state.none {
+            send_parent(mut srv, wi, r.client)
+        }
+    }
+    children_changed(mut srv, wi)
+}
+
+/// The children of `wi` see their parent (re)appear or go.
+fn children_changed(mut srv: server.Server, wi: u32) {
+    for k in 0..srv.windows.items.len() {
+        guard srv.windows.used(k) and srv.windows.items[k].mapped and srv.windows.items[k].parent == wi else {
+            continue
+        }
+        for (c, _) in srv.windows.items[k].bars.clone() {
+            send_parent(mut srv, u32(k), c)
+        }
+    }
+}
+
+fn retitled(mut srv: server.Server, wi: u32) {
+    let i = int(wi)
+    for (c, id) in srv.windows.items[i].bars.clone() {
+        let h = ft.Handle { id }
+        h.title(mut srv.conns[int(c)], srv.windows.items[i].title.clone())
+        h.app_id(mut srv.conns[int(c)], srv.windows.items[i].app_id.clone())
+        h.done(mut srv.conns[int(c)])
+    }
+}
+
+fn parent_changed(mut srv: server.Server, wi: u32) {
+    for (c, _) in srv.windows.items[int(wi)].bars.clone() {
+        send_parent(mut srv, wi, c)
+    }
+}
+
+/// A configure went out with these states.
+fn configured(mut srv: server.Server, wi: u32, maximized: bool, fullscreen: bool, activated: bool) {
+    let i = int(wi)
+    var bits: u32 = 0
+    if maximized {
+        bits = bits | max_bit
+    }
+    if activated {
+        bits = bits | act_bit
+    }
+    if fullscreen {
+        bits = bits | fs_bit
+    }
+    guard bits != srv.windows.items[i].bar_state else {
+        return
+    }
+    srv.windows.items[i].bar_state = bits
+    for (c, id) in srv.windows.items[i].bars.clone() {
+        let h = ft.Handle { id }
+        h.state(mut srv.conns[int(c)], state_bytes(bits))
+        h.done(mut srv.conns[int(c)])
+    }
+}
+
+/// The window's surface moved from the outputs in `old` to those in `mask`.
+fn outputs_changed(mut srv: server.Server, wi: u32, old: u64, mask: u64) {
+    for (c, id) in srv.windows.items[int(wi)].bars.clone() {
+        let h = ft.Handle { id }
+        send_outputs(mut srv, c, h, old & ~mask, false)
+        send_outputs(mut srv, c, h, mask & ~old, true)
+        h.done(mut srv.conns[int(c)])
+    }
+}
+
+/// Unmapped or destroyed: the handles close, children lose their parent.
+fn gone(mut srv: server.Server, wi: u32) {
+    let i = int(wi)
+    for (c, id) in srv.windows.items[i].bars.clone() {
+        ft.Handle { id }.closed(mut srv.conns[int(c)])
+        srv.unbind(c, id)
+    }
+    srv.windows.items[i].bars.clear()
+    children_changed(mut srv, wi)
+}
+
+fn toplevel(mut srv: server.Server, ci: u32, h: ft.Handle, take req: ft.HandleRequest) {
+    let wi = srv.slot(ci, h.id)
+    let live = wi != state.none and srv.windows.used(int(wi)) and srv.windows.items[int(wi)].bars.contains((ci, h.id))
+    match req {
+        Destroy => {
+            srv.unbind(ci, h.id)
+            if live {
+                srv.windows.items[int(wi)].bars.retain(fn(x) => not (x.0 == ci and x.1 == h.id))
+            }
+            return
+        }
+        SetRectangle(_, _, _, w, hh) => {
+            if w < 0 or hh < 0 {
+                srv.fail(ci, h.id, u32(ft.HandleError.InvalidRectangle), "rectangle {w}x{hh}")
+            }
+            return
+        }
+        _ => {}
+    }
+    guard live else {
+        return
+    }
+    let w = handle(srv, wi)
+    match req {
+        SetMaximized => srv.push(server.Event.WindowRequest(w, server.Request.Maximize(true)))
+        UnsetMaximized => srv.push(server.Event.WindowRequest(w, server.Request.Maximize(false)))
+        SetMinimized => srv.push(server.Event.WindowRequest(w, server.Request.Minimize))
+        Activate => srv.push(server.Event.Activate(w))
+        Close => srv.push(server.Event.WindowRequest(w, server.Request.Close))
+        SetFullscreen(o) => {
+            var out: Option[ids.Output] = None
+            if let Some(oo) = o {
+                let oi = srv.slot(ci, oo.id)
+                if oi != state.none {
+                    out = Some(ids.Output { id: srv.outputs.id(oi) })
+                }
+            }
+            srv.push(server.Event.WindowRequest(w, server.Request.Fullscreen(true, out)))
+        }
+        UnsetFullscreen => srv.push(server.Event.WindowRequest(w, server.Request.Fullscreen(false, None)))
+        _ => {}
+    }
+}
+
+/// Teardown of a handle object.
+fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) -> bool {
+    guard iface == ft.handle_iface else {
+        return false
+    }
+    if srv.windows.used(int(slot)) {
+        srv.windows.items[int(slot)].bars.retain(fn(x) => not (x.0 == ci and x.1 == id))
+    }
+    return true
+}

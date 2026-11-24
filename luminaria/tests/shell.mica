@@ -8,6 +8,7 @@
 import std.env
 import std.fs
 import std.io
+import std.net
 import std.os
 import std.time
 import luminaria as lum
@@ -781,4 +782,74 @@ test "block_capture redacts window in output and window captures without affecti
     let w_mid = (16 * 48 + 24) * 4
     assert_eq((cpx[w_mid], cpx[w_mid + 1], cpx[w_mid + 2]), (u8(0), u8(0), u8(0)))
     discard list
+}
+
+/// Read what the socket holds without running the display: the
+/// wl_callback.done events in it.
+fn drain_callbacks(mut f: Fx) -> int {
+    var done = 0
+    while f.c.read().expect("read") {
+        while true {
+            match proto.next_event(mut f.c) {
+                Ok(Some(e)) => {
+                    match e {
+                        WlCallback(_, Done) => done += 1
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(e) => panic("client: {e}")
+            }
+        }
+    }
+    return done
+}
+
+test "output queued for a client that stopped reading goes out once it reads" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    // 20000 syncs answer with ~480 KB: more than the socket holds.
+    let n = 20000
+    for _ in 0..n {
+        discard wl.Display { id: 1 }.sync(mut f.c)
+    }
+    for _ in 0..500 {
+        let sent = f.c.flush().expect("flush")
+        while true {
+            guard let Some(e) = f.d.poll().expect("poll") else {
+                break
+            }
+            f.d.accept(e)
+        }
+        if sent {
+            break
+        }
+    }
+    // Drain the socket without running the display: the rest still waits.
+    var done = 0
+    done += drain_callbacks(mut f)
+    assert(done < n)
+    // The display wakes by itself (its socket is writable again).
+    var p = net.poller().expect("poller")
+    discard p.add(f.d.fd(), 1, true, false)
+    var evs: List[net.Event] = []
+    for _ in 0..100 {
+        guard done < n else {
+            break
+        }
+        assert(p.wait(mut evs, 1000).expect("wait") > 0)
+        while true {
+            guard let Some(e) = f.d.poll().expect("poll") else {
+                break
+            }
+            f.d.accept(e)
+        }
+        done += drain_callbacks(mut f)
+    }
+    assert_eq(done, n)
+    p.close()
 }

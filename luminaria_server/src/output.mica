@@ -12,6 +12,7 @@ import capture
 import outman
 import gamma
 import color
+import taskbar
 
 fn add(mut srv: server.Server, take info: state.OutputInfo) -> ids.Output {
     let id = srv.outputs.add(state.OutputData { info })
@@ -172,6 +173,10 @@ fn set_outputs(mut srv: server.Server, si: u32, mask: u64) {
         }
     }
     color.surface_outputs_changed(mut srv, si)
+    match srv.surfaces.items[i].role {
+        Toplevel(wi) => taskbar.outputs_changed(mut srv, wi, old, mask)
+        _ => {}
+    }
 }
 
 /// Tell the surface the scale (120ths) and transform it should render

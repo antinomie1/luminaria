@@ -202,6 +202,24 @@ test "the toplevel lifecycle" {
     }
     assert(mapped and acked)
     assert(f.srv.mapped(w))
+    // Close pings along: unanswered, the client counts as hung.
+    assert(not f.srv.hung(f.client, 0))
+    f.srv.close(w)
+    var ping: u32 = 0
+    var asked = false
+    for e in pump(mut f) {
+        match e {
+            XdgWmBase(_, Ping(s)) => ping = s
+            XdgToplevel(_, Close) => asked = true
+            _ => {}
+        }
+    }
+    assert(asked and ping != 0)
+    assert(f.srv.hung(f.client, 0))
+    assert(not f.srv.hung(f.client, 60000))
+    wm.pong(mut f.c, ping)
+    discard pump(mut f)
+    assert(not f.srv.hung(f.client, 0))
     top.destroy(mut f.c)
     discard pump(mut f)
     var closed = false

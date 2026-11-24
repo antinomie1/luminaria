@@ -35,6 +35,7 @@ while true {
 | `next()` / `poll()` / `fd()` | 阻塞取事件 / 不阻塞取事件 / 嵌进别人的循环时要监听的 fd |
 | `watch(fd, token)` / `unwatch(fd)` | 合成器自己的 fd 进同一个循环，可读时产生 `Ready(token)` |
 | `timer(ms, token)` | `ms` 毫秒后产生 `Timer(token)` |
+| `want_frame()` | 每个输出在下一个截止时间再来一次 `Frame`，不论有无变化（合成器自己跑的动画每帧调用）；没东西可画时按时钟节拍 |
 | `inject(Input)` / `inject_on(Seat, Input)` | 当作设备送来的输入（默认 seat 或指定 seat；远程输入、测试） |
 | `quit()` | 让 `next` 返回 `None` |
 
@@ -59,6 +60,8 @@ while true {
 | `RequestMove(w)` / `RequestResize(w, edges)` | 启动库内移动 / 缩放（见 [input.md](input.md)） |
 | `RequestMaximize(w, on)` / `RequestFullscreen(w, o, on)` | 按窗口所在（或指定）输出的逻辑尺寸 configure |
 | `RequestMinimize` / `RequestMenu` | 无 |
+| `RequestClose(w)` | 任务栏要关窗：`close(w)` |
+| `WindowDragged(w)` | 无（库把窗口放在拖动的指针处，拖动放开它时发 `Moved(w, dx, dy)`） |
 | `Occluded(w, hidden)` | 重发上次的 configure，`suspended` 随 `hidden` |
 | `Key(k)` | 发给键盘焦点；Ctrl+Alt+Fn（`XF86Switch_VT_n`）切 VT |
 | `Modifiers` / `ModifiersOn(Seat, Mods)` | 无（修饰键状态在库内已经发给焦点客户端；`Modifiers` 对应默认 seat0） |
@@ -104,12 +107,14 @@ d.layout(fn(mut l) {
 | 接口 | 用途 |
 |---|---|
 | `configure(w, width, height, States)` | 尺寸（0 让客户端自定）与状态（maximized、fullscreen、resizing、activated、tiled_*、suspended），返回 serial |
-| `close(w)` | 请客户端关闭 |
+| `close(w)` | 请客户端关闭（附带 `xdg_wm_base.ping`） |
+| `hung(w, ms)` / `kill(w)` | 客户端是否 `ms` 毫秒未回应 close 附带的 ping；SIGKILL 其进程并断开连接 |
 | `focus(Option[Window])` / `focused()` | seat0 的键盘焦点；多 seat 版本为 `focus_on(Seat, ...)` / `focused_on(Seat)`（有弹出菜单抓取时焦点留在菜单上） |
 | `window_at(x, y)` | 全局坐标下的窗口（子表面和弹出菜单算作所属窗口） |
 | `title` / `app_id` / `parent` / `size` / `size_hints` / `client` / `credentials` | 查询 |
 | `sandbox(c)` | 客户端所在沙盒（security-context）：引擎、app id、实例 id |
 | `icon` / `tag` / `modal` / `content_type` | 图标、跨重启的标签、模态、内容类型（照片、视频、游戏） |
+| `dragged(w)` | 有拖动带着这个窗口（xdg-toplevel-drag），映射前就可以问 |
 | `decorate(w, server_side)` | 谁画标题栏：合成器（在布局里放图像）或客户端 |
 | `visible(w)` | 是否有任何部分在某个输出上可见 |
 | `activation_token()` | 合成器启动程序时放进 `XDG_ACTIVATION_TOKEN`，它的窗口就能拿焦点 |

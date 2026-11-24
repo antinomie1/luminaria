@@ -16,6 +16,7 @@ import luminaria_proto as proto
 import luminaria_proto.wayland as wl
 import luminaria_proto.xdg_shell as xdg
 import luminaria_proto.linux_dmabuf as dmab
+import luminaria_proto.xdg_toplevel_drag as tdrag
 
 struct Trace {
     overlay_calls: List[List[u64]] = []
@@ -461,6 +462,8 @@ struct PlugFx {
     reg: wl.Registry = wl.Registry { id: 0 }
     globals: List[(u32, u16)] = []
     wins: List[lum.Window] = []
+    dragged: List[lum.Window] = []
+    moved: List[(lum.Window, f64, f64)] = []
 }
 
 fn plug_pump(mut fx: PlugFx, ms: int) {
@@ -473,6 +476,8 @@ fn plug_pump(mut fx: PlugFx, ms: int) {
             }
             match e {
                 WindowMapped(w) => fx.wins.push(w)
+                WindowDragged(w) => fx.dragged.push(w)
+                Moved(w, dx, dy) => fx.moved.push((w, dx, dy))
                 _ => {}
             }
             fx.d.accept(e)
@@ -524,6 +529,49 @@ fn make_dmabuf_win(mut fx: PlugFx, comp: wl.Compositor, wm: xdg.WmBase, dma: dma
     params.destroy(mut fx.c)
     s.attach(mut fx.c, Some(buf), 0, 0)
     s.commit(mut fx.c)
+}
+
+/// Frames until `Timer(token)` fires `ms` from now, calling `want_frame`
+/// on each of the first `asks` of them.
+fn frames_within(mut d: lum.display.Display[TestOut, SoftRen], ms: int, token: int, asks: int) -> int {
+    d.timer(ms, token)
+    var frames = 0
+    while true {
+        guard let Some(e) = d.next().expect("next") else {
+            break
+        }
+        match e {
+            Frame => {
+                frames += 1
+                if frames <= asks {
+                    d.want_frame()
+                }
+            }
+            Timer(t) => {
+                if t == token {
+                    break
+                }
+            }
+            _ => d.accept(e)
+        }
+    }
+    return frames
+}
+
+test "want_frame asks for frames with nothing changed, and an idle display stays idle" {
+    let dir = fs.create_temp_dir("luminaria-plug-want").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none() }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new() }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    // The first frame shows the background, then nothing is due.
+    discard frames_within(mut d, 150, 1, 0)
+    assert_eq(frames_within(mut d, 150, 2, 0), 0)
+    // Asked from the first frame on, three asks give four frames, then idle.
+    d.want_frame()
+    assert_eq(frames_within(mut d, 300, 3, 3), 4)
+    assert_eq(frames_within(mut d, 150, 4, 0), 0)
 }
 
 test "overlay promotion passes non-overlapping dmabuf candidates and blocks shm-occluded lower planes" {
@@ -1221,4 +1269,66 @@ test "a drag after a client-requested move drops on release" {
         WlDataSource(x, Cancelled) => x == src
         _ => false
     }))
+}
+
+test "a toplevel drag carries its window under the pointer, not as a target, and ends like a move" {
+    let dir = fs.create_temp_dir("luminaria-plug-tdrag").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 400, height: 400 }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new() }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let shm = wl.Shm { id: bind_global(mut fx, wl.shm_iface, 1) }
+    let ws = wl.Seat { id: bind_global(mut fx, wl.seat_iface, 7) }
+    let ddm = wl.DataDeviceManager { id: bind_global(mut fx, wl.data_device_manager_iface, 3) }
+    let tdm = tdrag.DragManager { id: bind_global(mut fx, tdrag.drag_manager_iface, 1) }
+    discard ws.get_pointer(mut fx.c)
+    let dev = ddm.get_data_device(mut fx.c, ws)
+    let s = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, s)
+    let top = xs.get_toplevel(mut fx.c)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let fd = os.memfd("shm", 100 * 80 * 4).expect("memfd")
+    let pool = shm.create_pool(mut fx.c, fd, 100 * 80 * 4)
+    os.close(fd)
+    s.attach(mut fx.c, Some(pool.create_buffer(mut fx.c, 0, 100, 80, 400, wl.ShmFormat.Xrgb8888)), 0, 0)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    let w = fx.wins[0]
+    let seat0 = fx.d.seats()[0]
+    fx.d.layout(fn(mut l) {
+        l.window(w, 50.0, 50.0, lum.Style {})
+    })
+    fx.d.warp_on(seat0, 60.0, 60.0)
+    plug_pump(mut fx, 10)
+
+    // The window drags itself, held at (10, 10).
+    fx.d.inject_on(seat0, lum.types.Input.Button(1, u32(0x110), true))
+    plug_pump(mut fx, 10)
+    let src = ddm.create_data_source(mut fx.c)
+    src.offer(mut fx.c, "text/plain")
+    let drag = tdm.get_xdg_toplevel_drag(mut fx.c, src)
+    drag.attach(mut fx.c, top, 10, 10)
+    dev.start_drag(mut fx.c, Some(src), s, None, 0)
+    plug_pump(mut fx, 20)
+    assert(fx.dragged.contains(w))
+    // It follows the pointer and is not what the drag is over.
+    fx.d.warp_on(seat0, 160.0, 110.0)
+    plug_pump(mut fx, 10)
+    assert(fx.d.window_at(60.0, 60.0).is_none())
+    assert(fx.d.window_at(200.0, 150.0) == Some(w))
+    let entered = plug_collect(mut fx, 10).any(fn(e) => match e {
+        WlDataDevice(_, Enter) => true
+        _ => false
+    })
+    assert(not entered)
+    // Let go: it ends where it was held, as a move would.
+    fx.d.inject_on(seat0, lum.types.Input.Button(2, u32(0x110), false))
+    plug_pump(mut fx, 20)
+    assert(fx.moved.contains((w, 100.0, 50.0)))
 }

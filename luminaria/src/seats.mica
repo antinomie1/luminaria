@@ -32,6 +32,8 @@ struct SeatState {
     cursor_key: u64 = 0x7fffffffffffffff
     repeat_rate: i32 = 25
     repeat_delay: i32 = 600
+    /// The window its drag carries and the point of it under the pointer.
+    drag_win: Option[(server.Window, i32, i32)] = None
 }
 
 fn seat_index[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], s: server.Seat) -> int {

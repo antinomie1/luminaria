@@ -7,6 +7,7 @@
 import std.io
 import std.mem
 import std.net
+import std.time
 import luminaria_types as types
 import luminaria_wire as wire
 import luminaria_proto as proto
@@ -99,8 +100,8 @@ pub enum Event {
     ImeChanged(ids.Seat)
     /// Idle notifications were added: `idle_check` again.
     IdleChanged
-    /// A drag started or ended on the seat (`drag_icon` follows the
-    /// pointer meanwhile).
+    /// A drag started or ended on the seat, or the window it carries
+    /// changed (`drag_icon` and `drag_window` follow the pointer meanwhile).
     Drag(ids.Seat)
     /// A screen capture of the output waits: draw a frame now, even
     /// without damage, and hand it to `capture`.
@@ -131,6 +132,8 @@ pub enum Request {
     Fullscreen(bool, Option[ids.Output])
     Minimize
     Menu(ids.Seat, i32, i32)
+    /// A taskbar asks to close it.
+    Close
 }
 
 /// Target of an async dmabuf capture request.
@@ -218,6 +221,8 @@ pub struct Server {
     imported: List[(u32, u32, str)] = []
     /// ext_foreign_toplevel_list_v1 objects.
     toplevel_lists: List[state.Res] = []
+    /// zwlr_foreign_toplevel_manager_v1 objects.
+    taskbars: List[state.Res] = []
     /// Keyboard shortcut inhibitors: client, id, surface slot, seat slot,
     /// active.
     shortcut_inhibitors: List[(u32, u32, u32, u32, bool)] = []
@@ -264,6 +269,8 @@ pub fn Server.open(name: str) -> Result[Server, str] {
     s.add_global(proto.xdg_foreign_unstable.importer_iface, 1)
     s.add_global(proto.xdg_output_unstable.output_manager_iface, 3)
     s.add_global(proto.ext_foreign_toplevel_list.toplevel_list_iface, 1)
+    s.add_global(proto.wlr_foreign_toplevel_management_unstable.manager_iface, 3)
+    s.add_global(proto.xdg_toplevel_drag.drag_manager_iface, 1)
     s.add_global(proto.wlr_layer_shell_unstable.shell_iface, 5)
     s.add_global(proto.ext_session_lock.lock_manager_iface, 1)
     s.add_global(proto.primary_selection_unstable.device_manager_iface, 1)
@@ -607,6 +614,16 @@ pub fn Server.flush(mut self, mut gone: List[ids.Client]) {
     }
 }
 
+/// The clients whose socket was full at the last flush: what is queued
+/// for them goes out once they read (wait for their socket to be writable).
+pub fn Server.stalled(self, mut out: List[ids.Client]) {
+    for ci in 0..self.conns.len() {
+        if self.clients.used(ci) and self.conns[ci].pending() {
+            out.push(ids.Client { id: self.clients.id(u32(ci)) })
+        }
+    }
+}
+
 /// Protocol error `code` on `obj`: the client is told and dropped after
 /// the next flush.
 fn Server.fail(mut self, ci: u32, obj: u32, code: u32, msg: &str) {
@@ -678,6 +695,7 @@ pub fn Server.disconnect(mut self, c: ids.Client) {
     }
     // Records not tied to a slot.
     self.toplevel_lists.retain(fn(r) => r.client != ci)
+    self.taskbars.retain(fn(r) => r.client != ci)
     self.tokens.retain(fn(t) => t.1 != ci)
     self.imported.retain(fn(i) => i.0 != ci)
     toplevel.unexport(mut self, fn(x) => x.2 == ci)
@@ -1056,11 +1074,21 @@ pub fn Server.configure(mut self, w: ids.Window, width: i32, height: i32, st: xd
     return xdg.configure_toplevel(mut self, w.id.index, width, height, st)
 }
 
-/// Ask the window to close (xdg_toplevel.close).
+/// Ask the window to close (xdg_toplevel.close), with an xdg_wm_base.ping.
 pub fn Server.close(mut self, w: ids.Window) {
     if self.windows.live(w.id) {
         xdg.close_toplevel(mut self, w.id.index)
     }
+}
+
+/// Whether client `c` left a ping (sent with `close`) unanswered for at
+/// least `ms` milliseconds: it no longer handles events.
+pub fn Server.hung(self, c: ids.Client, ms: int) -> bool {
+    guard self.clients.live(c.id) else {
+        return false
+    }
+    let i = int(c.id.index)
+    return self.clients.items[i].ping != 0 and time.now_ns() - self.clients.items[i].ping_ns >= ms * 1000000
 }
 
 // -------------------------------------------------------------- popups
@@ -1573,6 +1601,40 @@ pub fn Server.shortcuts_inhibited(self, st: ids.Seat) -> bool {
 
 pub fn Server.dragging(self, st: ids.Seat) -> bool {
     return self.seats.live(st.id) and self.seats.items[int(st.id.index)].drag.active
+}
+
+/// The mapped window a drag carries (xdg-toplevel-drag) and the point of
+/// its window geometry held under the pointer.
+pub fn Server.drag_window(self, st: ids.Seat) -> Option[(ids.Window, i32, i32)] {
+    guard self.dragging(st) else {
+        return None
+    }
+    let ss = self.seats.items[int(st.id.index)].drag.source
+    guard ss != state.none and self.sources.used(int(ss)) else {
+        return None
+    }
+    let wi = self.sources.items[int(ss)].tdrag_win
+    guard wi != state.none and self.windows.used(int(wi)) and self.windows.items[int(wi)].mapped else {
+        return None
+    }
+    return Some((ids.Window { id: self.windows.id(wi) }, self.sources.items[int(ss)].tdrag_x, self.sources.items[int(ss)].tdrag_y))
+}
+
+/// Whether a drag in progress carries window `w`, mapped or not yet.
+pub fn Server.dragged(self, w: ids.Window) -> bool {
+    guard self.windows.live(w.id) else {
+        return false
+    }
+    for i in 0..self.seats.items.len() {
+        guard self.seats.used(i) and self.seats.items[i].drag.active else {
+            continue
+        }
+        let ss = self.seats.items[i].drag.source
+        if ss != state.none and self.sources.used(int(ss)) and self.sources.items[int(ss)].tdrag_win == w.id.index {
+            return true
+        }
+    }
+    return false
 }
 
 /// The image a drag shows under the pointer and its offset from the

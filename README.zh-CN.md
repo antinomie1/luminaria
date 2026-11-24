@@ -40,10 +40,10 @@ luminaria ─┬─ luminaria_server ─── luminaria_proto ── luminaria_
 |------|------|
 | 核心与外壳 | wl_compositor 6、subcompositor、shm、wl_seat 9、wl_output 4、xdg-shell 6、wl_fixes |
 | 缓冲与时序 | linux-dmabuf 4（8-bit / 10-bit / FP16）、linux-drm-syncobj、single-pixel-buffer、viewporter、fractional-scale、presentation-time、fifo、commit-timing、tearing-control、alpha-modifier、content-type、wp-color-management v1（HDR / BT.2020 / PQ / scRGB） |
-| 窗口 | xdg-decoration、xdg-activation、xdg-toplevel-icon、xdg-toplevel-tag、xdg-dialog、xdg-foreign v2、xdg-system-bell、ext-foreign-toplevel-list |
+| 窗口 | xdg-decoration、xdg-activation、xdg-toplevel-icon、xdg-toplevel-tag、xdg-dialog、xdg-foreign v2、xdg-system-bell、ext-foreign-toplevel-list、wlr-foreign-toplevel-management 3 |
 | 桌面 | wlr-layer-shell 5、ext-session-lock、xdg-output 3、ext-idle-notify 2、idle-inhibit、wlr-gamma-control v1（硬件 CRTC Gamma LUT / 护眼色温） |
 | 输入 | relative-pointer、pointer-constraints、pointer-gestures 3、cursor-shape 2、keyboard-shortcuts-inhibit、text-input-v3、input-method-v2、virtual-keyboard、wlr-virtual-pointer v2 |
-| 选区 | 剪贴板、主选区、ext-data-control、带动作协商的拖放 |
+| 选区 | 剪贴板、主选区、ext-data-control、带动作协商的拖放、xdg-toplevel-drag |
 | 截屏与管控 | ext-image-copy-capture（输出源与窗口源，shm、零拷贝 dmabuf 及按窗口 `Style.block_capture` 隐私遮罩）、wlr-output-management 4、security-context（沙盒客户端看不到特权 global） |
 
 尚未支持：数位板（`tablet-v2`）。

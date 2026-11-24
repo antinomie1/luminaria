@@ -5,6 +5,7 @@ import luminaria_server as server
 import plug
 import display
 import place
+import seats
 
 /// The manipulation running, and the pan's inertia.
 struct State {
@@ -174,4 +175,40 @@ fn coast[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
         }
         _ => {}
     }
+}
+
+/// The window seat `st`'s drag carries changed (xdg-toplevel-drag): the
+/// one let go of ends like a move (`Moved`), a new one starts following.
+fn drag_changed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], st: server.Seat) {
+    let si = seats.seat_index(d, st)
+    if si >= 0 {
+        let now = d.srv.drag_window(st)
+        let was = d.seats[si].drag_win.map(fn(x) => x.0)
+        let next = now.map(fn(x) => x.0)
+        if was != next {
+            if let Some(w) = was {
+                let cur = d.wins.get(w).unwrap_or(display.Win {})
+                d.manip.offsets_done = true
+                d.emit(display.Event.Moved(w, cur.off_x, cur.off_y))
+            }
+            if let Some(w) = next {
+                d.emit(display.Event.WindowDragged(w))
+            }
+        }
+        d.seats[si].drag_win = now
+    }
+    place.rebuild(mut d)
+}
+
+/// Where a drag holds window `w` (its window geometry's top left), if one
+/// carries it.
+fn drag_hold[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window) -> Option[(f64, f64)] {
+    for s in d.seats {
+        if let Some((dw, hx, hy)) = s.drag_win {
+            if dw == w {
+                return Some((s.px - f64(hx), s.py - f64(hy)))
+            }
+        }
+    }
+    return None
 }

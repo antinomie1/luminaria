@@ -78,6 +78,11 @@ pub fn Hits.len(self) -> int {
 /// The topmost surface accepting input at `x, y` and the point in its
 /// coordinates.
 pub fn Hits.find(self, srv: server.Server, x: f64, y: f64) -> Option[(server.Surface, f64, f64)] {
+    return self.find_except(srv, x, y, fn(_) => false)
+}
+
+/// `find`, passing over the surfaces `skip` names.
+pub fn Hits.find_except(self, srv: server.Server, x: f64, y: f64, skip: fn(server.Surface) -> bool) -> Option[(server.Surface, f64, f64)] {
     let n = self.surfs.len()
     guard n > 0 else {
         return None
@@ -103,7 +108,7 @@ pub fn Hits.find(self, srv: server.Server, x: f64, y: f64) -> Option[(server.Sur
             let s = self.surfs[i]
             let lx = (x - self.ox[i]) / self.sc[i]
             let ly = (y - self.oy[i]) / self.sc[i]
-            if srv.accepts(s, lx, ly) {
+            if not skip(s) and srv.accepts(s, lx, ly) {
                 return Some((s, lx, ly))
             }
         }

@@ -9,7 +9,7 @@ pub struct Pointer derive(Hash, Show) {
     pub id: u32
 }
 
-pub let pointer_iface: u16 = 121
+pub let pointer_iface: u16 = 123
 pub let pointer_version: u32 = 2
 
 pub enum PointerError: u32 {
@@ -112,7 +112,7 @@ pub struct PointerManager derive(Hash, Show) {
     pub id: u32
 }
 
-pub let pointer_manager_iface: u16 = 122
+pub let pointer_manager_iface: u16 = 124
 pub let pointer_manager_version: u32 = 2
 
 /// Requests of zwlr_virtual_pointer_manager_v1.

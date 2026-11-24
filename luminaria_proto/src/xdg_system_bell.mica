@@ -9,7 +9,7 @@ pub struct SystemBell derive(Hash, Show) {
     pub id: u32
 }
 
-pub let system_bell_iface: u16 = 140
+pub let system_bell_iface: u16 = 142
 pub let system_bell_version: u32 = 1
 
 /// Requests of xdg_system_bell_v1.

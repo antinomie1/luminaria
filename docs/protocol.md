@@ -125,6 +125,10 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 `dnd_drop_performed`，否则取消；之后指针重新进入它下面的表面，目标 `finish` 时源收到
 `dnd_finished`。拖动图标是 `DragIcon` 角色，不接收输入，门面把它画在指针处、一切之上。
 
+xdg-toplevel-drag：源上附加的窗口映射着时随拖动走（`drag_window`），门面把它放在指针减去附加偏移处、
+不当拖放目标；拖动结束（放下或取消）、窗口取消映射或换了窗口时 seat 收到 `Drag`，门面发 `Moved`，
+和一次移动结束一样。
+
 ### 桌面外壳
 
 - **layer-shell（v5）**：面板、壁纸、启动器、通知。锚定边、尺寸、外边距、独占区、键盘交互、层（背景 /
@@ -146,6 +150,7 @@ xdg 几何与尺寸限制、子表面位置与叠放，然后重算表面尺寸�
 | xdg-activation | 令牌（最多保留 64 个，用一次即失效）；有效令牌的 `activate` 发 `Activate`；合成器启动程序时可用 `activation_token` |
 | xdg-foreign v2 | 导出窗口得到句柄，别的客户端（门户）导入后设为自己窗口的父窗口 |
 | ext-foreign-toplevel-list | 任务栏看到每个已映射窗口的标识、标题、app id 及其变化和关闭 |
+| wlr-foreign-toplevel-management 3 | 任务栏另外看到所在输出、状态（configure 发出的最大化 / 激活 / 全屏）和父窗口；它的最大化、最小化、全屏、关闭请求成为 `WindowRequest`，激活成为 `Activate` |
 | xdg-system-bell | `Bell` 事件 |
 
 ### 输出

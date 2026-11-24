@@ -16,6 +16,7 @@ import std.collections.map
 import std.mem
 import std.net
 import std.os
+import std.signal
 import std.time
 import luminaria_types as types
 import luminaria_types.pixels as pixels
@@ -150,6 +151,11 @@ pub enum Event {
     RequestFullscreen(server.Window, Option[server.Output], bool)
     RequestMinimize(server.Window)
     RequestMenu(server.Window, f64, f64)
+    /// A taskbar asks to close the window (`accept`: `close`).
+    RequestClose(server.Window)
+    /// The window follows the pointer of a drag (xdg-toplevel-drag) until
+    /// the drag lets go of it, which ends like a move: `Moved`.
+    WindowDragged(server.Window)
     /// The window is entirely hidden (or visible again) for a while.
     Occluded(server.Window, bool)
     Key(Key)
@@ -266,6 +272,8 @@ struct Out {
     max_nits: f32 = 1000.0
     /// True when at least one `block_capture` placement lies on this output.
     has_blocked: bool = false
+    /// The compositor asked for a frame (`want_frame`), changed or not.
+    wanted: bool = false
     /// The area panels leave free (global logical).
     ux: f64 = 0.0
     uy: f64 = 0.0
@@ -354,6 +362,13 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     waits: waits.Waits
     caps: capture.Captures = capture.Captures {}
     house_fd: int = -1
+    /// When occlusion next needs a look (ns, 0: never); shares `house_fd`
+    /// with the layout transaction deadline.
+    occl_due: int = 0
+    /// Clients polled for writability (their socket was full), and the
+    /// scratch list the next flush fills.
+    writing: List[server.Client] = []
+    stalled_scratch: List[server.Client] = []
     cursor_size: int = 24
     manip: manipulation.State = manipulation.State {}
     batching_input: bool = false
@@ -667,8 +682,34 @@ fn Display[O, R].finish(mut self) -> Result[(), str] {
     for c in gone {
         self.drop_client(c)
     }
+    self.watch_writes()
     clients.server_events(mut self)
     return Ok(())
+}
+
+/// Poll the sockets of clients with output still queued for writability,
+/// so it goes out as soon as they read instead of at the next unrelated
+/// wakeup (a client waiting on a frame callback stuck here would freeze).
+fn Display[O, R].watch_writes(mut self) {
+    var now = mem.replace(mut self.stalled_scratch, [])
+    now.clear()
+    self.srv.stalled(mut now)
+    guard not now.is_empty() or not self.writing.is_empty() else {
+        self.stalled_scratch = now
+        return
+    }
+    for c in now {
+        if not self.writing.contains(c) {
+            discard self.poll.modify(self.srv.client_fd(c), tok_client + int(c.id.index), true, true)
+        }
+    }
+    for c in self.writing {
+        let fd = self.srv.client_fd(c)
+        if fd >= 0 and not now.contains(c) {
+            discard self.poll.modify(fd, tok_client + int(c.id.index), true, false)
+        }
+    }
+    self.stalled_scratch = mem.replace(mut self.writing, now)
 }
 
 // ------------------------------------------------------------------ api
@@ -809,7 +850,7 @@ pub fn Display[O, R].end(mut self, timeout_ms: int) {
         return
     }
     self.waits.txn_deadline = time.now_ns() + timeout_ms * 1000000
-    discard os.timer_arm(self.house_fd, timeout_ms * 1000000, 0)
+    place.arm_house(mut self)
     waits.try_finish(mut self)
 }
 
@@ -837,6 +878,12 @@ pub fn Display[O, R].tag(self, w: server.Window) -> (str, str) {
 /// The window is a modal dialog of its parent.
 pub fn Display[O, R].modal(self, w: server.Window) -> bool {
     return self.srv.modal(w)
+}
+
+/// Whether a drag carries the window (xdg-toplevel-drag): it follows the
+/// pointer, even before it maps (`WindowDragged` once it does).
+pub fn Display[O, R].dragged(self, w: server.Window) -> bool {
+    return self.srv.dragged(w)
 }
 
 /// What the window shows: none 0, photo 1, video 2, game 3.
@@ -913,6 +960,23 @@ fn Display[O, R].idle_tick(mut self) {
 /// Ask window `w` to close.
 pub fn Display[O, R].close(mut self, w: server.Window) {
     self.srv.close(w)
+}
+
+/// Whether the client of window `w` left the ping sent with an earlier
+/// `close` unanswered for `ms` milliseconds: it is hung and will not close.
+pub fn Display[O, R].hung(self, w: server.Window, ms: int) -> bool {
+    return self.srv.hung(self.srv.window_client(w), ms)
+}
+
+/// End the client of window `w` at once: SIGKILL to its process (not this
+/// one) and the connection dropped, its windows with it.
+pub fn Display[O, R].kill(mut self, w: server.Window) {
+    let c = self.srv.window_client(w)
+    let (pid, _, _) = self.srv.credentials(c)
+    if pid > 0 and pid != signal.pid() {
+        discard signal.send(pid, signal.kill)
+    }
+    self.drop_client(c)
 }
 
 /// Give window `w` the keyboard on seat `st` (None: nobody).
@@ -1437,6 +1501,16 @@ pub fn Display[O, R].watch(mut self, fd: int, token: int) {
 
 pub fn Display[O, R].unwatch(mut self, fd: int) {
     discard self.poll.remove(fd)
+}
+
+/// One more Frame on every output at its next deadline, whether anything
+/// changed or not: animations the compositor runs itself ask each frame.
+pub fn Display[O, R].want_frame(mut self) {
+    for o in 0..self.outs.len() {
+        if self.outs[o].alive {
+            self.outs[o].wanted = true
+        }
+    }
 }
 
 /// Timer(token) after `ms` milliseconds.

@@ -51,10 +51,10 @@ wlr-protocols. The server speaks:
 |------|-----------|
 | Core and shell | wl_compositor 6, subcompositor, shm, wl_seat 9, wl_output 4, xdg-shell 6, wl_fixes |
 | Buffers and timing | linux-dmabuf 4 (8-bit, 10-bit, FP16), linux-drm-syncobj, single-pixel-buffer, viewporter, fractional-scale, presentation-time, fifo, commit-timing, tearing-control, alpha-modifier, content-type, wp-color-management v1 (HDR/BT.2020/PQ/scRGB) |
-| Windows | xdg-decoration, xdg-activation, xdg-toplevel-icon, xdg-toplevel-tag, xdg-dialog, xdg-foreign v2, xdg-system-bell, ext-foreign-toplevel-list |
+| Windows | xdg-decoration, xdg-activation, xdg-toplevel-icon, xdg-toplevel-tag, xdg-dialog, xdg-foreign v2, xdg-system-bell, ext-foreign-toplevel-list, wlr-foreign-toplevel-management 3 |
 | Desktop | wlr-layer-shell 5, ext-session-lock, xdg-output 3, ext-idle-notify 2, idle-inhibit, wlr-gamma-control v1 (hardware CRTC gamma LUT / night light) |
 | Input | relative-pointer, pointer-constraints, pointer-gestures 3, cursor-shape 2, keyboard-shortcuts-inhibit, text-input-v3, input-method-v2, virtual-keyboard, wlr-virtual-pointer v2 |
-| Selections | clipboard, primary selection, ext-data-control, drag and drop with actions |
+| Selections | clipboard, primary selection, ext-data-control, drag and drop with actions, xdg-toplevel-drag |
 | Capture and control | ext-image-copy-capture with output & toplevel window sources (shm, zero-copy dmabuf, per-window `Style.block_capture` privacy redaction), wlr-output-management 4, security-context (sandboxed clients do not see privileged globals) |
 
 Not yet: tablets (`tablet-v2`).
