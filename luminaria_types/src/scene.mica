@@ -33,6 +33,9 @@ pub struct Placement {
     pub y: f32 = 0.0
     pub w: f32 = 0.0
     pub h: f32 = 0.0
+    /// Visible window geometry in output pixels (from `xdg_surface.set_window_geometry`),
+    /// or empty when identical to `(x, y, w, h)`.
+    pub geometry: Rect = Rect {}
     /// Part of the texture (pixels of the upright picture); empty: all.
     pub src: Rect = Rect {}
     /// wl_output.transform the texture is turned by.

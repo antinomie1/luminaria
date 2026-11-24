@@ -14,46 +14,56 @@ import input
 import frames
 
 fn backend_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    d.batching_input = true
     while true {
         guard let Some(got) = d.be.next() else {
             break
         }
         var e = got
         match take e {
-            OutputAdded(o) => output_added(mut d, int(o))
-            OutputRemoved(o) => output_removed(mut d, int(o))
-            OutputChanged(o) => output_changed(mut d, int(o))
-            Presented(o, seq, ns, flags) => frames.presented(mut d, int(o), seq, ns, flags)
-            Released(o) => frames.schedule(mut d, int(o))
-            Dropped(o) => {
-                if int(o) < d.outs.len() {
-                    d.outs[int(o)].dirty = true
-                    d.comp.damage_all()
-                    frames.schedule(mut d, int(o))
-                }
-            }
             Input(i) => input.input_on(mut d, 0, i)
             InputOn(seat, i) => {
                 let si = seats.ensure_seat(mut d, seat)
                 input.input_on(mut d, si, i)
             }
-            Session(on) => {
-                if on {
-                    for o in 0..d.outs.len() {
-                        d.outs[o].dirty = true
+            other => {
+                input.flush_batch(mut d)
+                var ev = other
+                match take ev {
+                    OutputAdded(o) => output_added(mut d, int(o))
+                    OutputRemoved(o) => output_removed(mut d, int(o))
+                    OutputChanged(o) => output_changed(mut d, int(o))
+                    Presented(o, seq, ns, flags) => frames.presented(mut d, int(o), seq, ns, flags)
+                    Released(o) => frames.schedule(mut d, int(o))
+                    Dropped(o) => {
+                        if int(o) < d.outs.len() {
+                            d.outs[int(o)].dirty = true
+                            d.comp.damage_all()
+                            frames.schedule(mut d, int(o))
+                        }
                     }
-                    d.comp.damage_all()
+                    Session(on) => {
+                        if on {
+                            for o in 0..d.outs.len() {
+                                d.outs[o].dirty = true
+                            }
+                            d.comp.damage_all()
+                        }
+                        d.emit(display.Event.Session(on))
+                    }
+                    Keymap => seats.send_keymap_on(mut d, 0)
+                    KeymapOn(seat) => {
+                        let si = seats.ensure_seat(mut d, seat)
+                        seats.send_keymap_on(mut d, si)
+                    }
+                    Closed => d.quit = true
+                    Input or InputOn => {}
                 }
-                d.emit(display.Event.Session(on))
             }
-            Keymap => seats.send_keymap_on(mut d, 0)
-            KeymapOn(seat) => {
-                let si = seats.ensure_seat(mut d, seat)
-                seats.send_keymap_on(mut d, si)
-            }
-            Closed => d.quit = true
         }
     }
+    d.batching_input = false
+    input.flush_batch(mut d)
 }
 
 fn output_info[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: int) -> server.OutputInfo {
@@ -115,6 +125,9 @@ fn output_added[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         d.seats[0].px = x + d.outs[o].lw() / 2.0
         d.seats[0].py = d.outs[o].lh() / 2.0
     }
+    if not d.seats.is_empty() and d.seats[0].cursor.width > 0 {
+        seats.sync_cursor_on(mut d, 0)
+    }
     place.rebuild(mut d)
 }
 
@@ -149,6 +162,10 @@ fn output_removed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
     }
     for b in mem.replace(mut d.releases[o], []) {
         d.srv.release(b)
+    }
+    for (_, fd, point) in mem.replace(mut d.points[o], []) {
+        d.sync.signal(fd, point)
+        os.close(fd)
     }
     d.emit(display.Event.OutputRemoved(so))
     place.rebuild(mut d)

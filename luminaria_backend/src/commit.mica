@@ -14,6 +14,7 @@
 // A flip that arrived in between means the loop had stalled; one still
 // outstanding is the driver's (counted, and checked again each second).
 
+import std.io
 import std.os
 import std.sync
 import std.time
@@ -24,7 +25,8 @@ import sched
 /// Set in a flip event's user data when the commit carried a frame.
 pub let frame_bit: u64 = u64(1) << 32
 
-let base_margin_ns = 1500000
+let cursor_margin_ns = 600000
+let cursor_extra_cap_ns = 400000
 let flip_timeout_ns = 1000000000
 
 /// One atomic request, as plain data so it can cross threads.
@@ -82,8 +84,9 @@ fn Req.merge(mut self, take n: Req) {
     for b in n.blobs {
         self.blobs.push(b)
     }
-    if self.now {
+    if self.now or self.frame {
         self.at = 0
+        self.target = 0
     }
 }
 
@@ -156,20 +159,39 @@ struct Pipe {
     since: int = 0
     /// The last vblank.
     last: int = 0
-    /// Margin learned on top of the base one.
-    extra: int = 1000000
+    /// Margin learned on top of `cursor_margin_ns` for cursor-only commits.
+    extra: int = 100000
 }
 
 /// The last moment to submit `r` for its vblank (0: at once) and that
-/// vblank.
+/// vblank. Rendered frames (`r.frame`) are already paced by the compositor
+/// clock and gated by `IN_FENCE_FD`, so they submit immediately instead of
+/// risking a missed vblank behind a duplicate scheduling margin.
+/// Non-frame (cursor-only) commits wait tightly right before vblank (strictly
+/// after the compositor's 2–4 ms frame window) so any rendered frame for the
+/// same vblank merges with the latest cursor instead of having its flip slot
+/// stolen by a cursor-only commit.
 fn Pipe.plan(self, r: Req, now: int) -> (int, int) {
-    guard not r.now and self.last > 0 and r.refresh > 0 else {
+    guard not r.now and not r.frame and self.last > 0 and r.refresh > 0 else {
         return (0, 0)
     }
-    let margin = r.vblank + base_margin_ns + self.extra
-    let t = now + margin
-    let target = if t <= self.last { self.last } else { self.last + (t - self.last + r.refresh - 1) / r.refresh * r.refresh }
+    let margin = r.vblank + cursor_margin_ns + self.extra.clamp(0, cursor_extra_cap_ns)
+    let min_t = max(now + margin, self.last + 1)
+    let target = self.last + (min_t - self.last + r.refresh - 1) / r.refresh * r.refresh
     return (target - margin, target)
+}
+
+/// Re-plan queued cursor-only commits after a flip completes at `self.last`,
+/// preventing a cursor move queued while the previous flip was in flight from
+/// firing immediately at vblank start and stealing the next vblank from a frame.
+fn Pipe.replan_queued(mut self, now: int) {
+    for qi in 0..self.queue.len() {
+        if not self.queue[qi].frame and not self.queue[qi].now {
+            let (at, target) = self.plan(self.queue[qi], now)
+            self.queue[qi].at = at
+            self.queue[qi].target = target
+        }
+    }
 }
 
 fn pipe_of(mut ps: List[Pipe], crtc: u32) -> int {
@@ -247,6 +269,7 @@ fn run(fd: int, jobs: sync.Chan[Job], notes: sync.Chan[Note], wake: int, counts:
                     let k = pipe_of(mut ps, crtc)
                     ps[k].inflight = false
                     ps[k].last = ns
+                    ps[k].replan_queued(time.now_ns())
                 }
                 Pong => {
                     pinged = false
@@ -305,13 +328,13 @@ fn run(fd: int, jobs: sync.Chan[Job], notes: sync.Chan[Note], wake: int, counts:
                 ps[i].since = done
                 var late = false
                 if r.target > 0 {
-                    // How far from finishing a base margin before the
-                    // vblank: late grows the margin at once, early shrinks
-                    // it slowly (latency stays low).
-                    let diff = r.target - r.vblank - base_margin_ns - done
+                    // How far from finishing a cursor margin before the
+                    // vblank: late grows the margin gently within its cap,
+                    // early shrinks it slowly so frames always beat cursors.
+                    let diff = r.target - r.vblank - cursor_margin_ns - done
                     late = diff < 0
                     ps[i].extra = if late { ps[i].extra - diff } else { ps[i].extra - diff / 10 }
-                    ps[i].extra = ps[i].extra.clamp(0, min(3000000, r.refresh / 2))
+                    ps[i].extra = ps[i].extra.clamp(0, min(cursor_extra_cap_ns, r.refresh / 4))
                 }
                 counts.write(fn(mut c: Counts) {
                     c.commits += 1
@@ -320,6 +343,7 @@ fn run(fd: int, jobs: sync.Chan[Job], notes: sync.Chan[Note], wake: int, counts:
                     }
                 })
             } else {
+                io.eprint("luminaria: drm atomic commit failed (out={r.out} frame={r.frame} modeset={r.modeset}): err={res}")
                 counts.write(fn(mut c: Counts) { c.failed += 1 })
                 notes.send(Note.Failed(r.out, r.frame, r.modeset))
                 os.notify(wake, 1)
@@ -340,7 +364,7 @@ struct Thread {
 
 fn start(fd: int, realtime: bool) -> Result[Thread, str] {
     let wake = try os.eventfd(0).map_err(fn(e) => "{e}")
-    let jobs: sync.Chan[Job] = sync.chan(64)
+    let jobs: sync.Chan[Job] = sync.chan(256)
     let notes: sync.Chan[Note] = sync.chan(64)
     let counts = sync.mutex(Counts {})
     let h = go run(fd, jobs.clone(), notes.clone(), wake, counts.clone(), realtime)
@@ -357,4 +381,30 @@ fn Thread.drop(mut self) {
         h.join()
     }
     os.close(self.wake)
+}
+
+test "cursor-only commit queued during inflight flip replans for next vblank instead of stealing it" {
+    let refresh = 16666667
+    let vblank = 500000
+    var p = Pipe { crtc: 1, inflight: true, last: 100000000 }
+    // Frame N is in flight for vblank at 116.67ms; mouse moves at 114.5ms.
+    var cur = Req { crtc: 1, out: 0, frame: false, refresh, vblank }
+    let (at0, tgt0) = p.plan(cur, 114500000)
+    cur.at = at0
+    cur.target = tgt0
+    p.queue.push(cur)
+    // Flip N completes at 116.67ms.
+    let flip_ns = 116666667
+    p.inflight = false
+    p.last = flip_ns
+    p.replan_queued(flip_ns + 50000)
+    // Cursor commit must wait until just before vblank N+1 (~133.33ms), NOT fire immediately at 116.7ms.
+    assert(p.queue[0].at > flip_ns + 14000000)
+    assert(p.queue[0].target == flip_ns + refresh)
+    // A rendered frame arriving 2ms before vblank N+1 merges with it and submits immediately.
+    var frame_req = Req { crtc: 1, out: 0, frame: true, refresh, vblank }
+    var merged = p.queue.pop().unwrap()
+    merged.merge(frame_req)
+    assert(merged.frame)
+    assert_eq(merged.at, 0)
 }

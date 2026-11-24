@@ -11,6 +11,7 @@ import layout
 import shell
 import plug
 import display
+import manipulation
 
 /// A placement's last shown position, and its animation.
 struct Anim {
@@ -117,24 +118,51 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
         shell.place_layers(mut d, 0, pmap, mut per, mut masks)
         shell.place_layers(mut d, 1, pmap, mut per, mut masks)
         let places = mem.replace(mut d.lay.places, [])
-        for p in places {
+        var last_win = -1
+        for i in 0..places.len() {
+            match places[i].what {
+                Window => last_win = i
+                _ => {}
+            }
+        }
+        var win_popups: List[(server.Surface, f32, server.Window)] = []
+        for i in 0..places.len() {
+            let p = places[i]
             match p.what {
                 Window(w) => {
                     guard d.srv.mapped(w) else {
+                        if i == last_win {
+                            for (ps, pop_op, pw) in win_popups {
+                                shell.place_popups(mut d, ps, pmap, pop_op, Some(pw), mut per, mut masks)
+                            }
+                            win_popups.clear()
+                        }
                         continue
                     }
                     if p.style.block_capture {
                         discard d.blocked_wins.insert(w, true)
                     }
                     let s = d.srv.window_surface(w)
+                    let info = d.srv.info(s)
+                    let geo = info.geometry
+                    let eff_w = if geo.w > 0 { geo.w } else { info.width }
+                    let eff_h = if geo.h > 0 { geo.h } else { info.height }
                     let win = d.wins.get(w).unwrap_or(display.Win {})
-                    let tx = p.x + win.off_x + d.manip.pan_x
-                    let ty = p.y + win.off_y + d.manip.pan_y
+                    let (off_x, off_y) = manipulation.resize_offset(d, w, eff_w, eff_h, win)
+                    let tx = p.x + off_x + d.manip.pan_x
+                    let ty = p.y + off_y + d.manip.pan_y
                     let (x, y, opacity) = animate(mut d, display.skey(s), tx, ty, p.style.opacity, p.style.transition_ms, now)
                     let sc = f64(p.style.scale)
-                    let geo = d.srv.info(s).geometry
                     place_tree_on(mut d, s, x - f64(geo.x) * sc, y - f64(geo.y) * sc, sc, p.style, opacity, Some(w), p.only_output, mut per, mut masks)
-                    shell.place_popups(mut d, s, pmap, opacity, Some(w), mut per, mut masks)
+                    if pmap.contains(s) {
+                        win_popups.push((s, opacity, w))
+                    }
+                    if i == last_win {
+                        for (ps, pop_op, pw) in win_popups {
+                            shell.place_popups(mut d, ps, pmap, pop_op, Some(pw), mut per, mut masks)
+                        }
+                        win_popups.clear()
+                    }
                 }
                 Image(img) => {
                     guard int(img.index) < d.images.len() and d.images[int(img.index)].alive and d.images[int(img.index)].gen == img.gen else {
@@ -153,6 +181,9 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                     }
                 }
             }
+        }
+        for (ps, pop_op, pw) in win_popups {
+            shell.place_popups(mut d, ps, pmap, pop_op, Some(pw), mut per, mut masks)
         }
         d.lay.places = places
         shell.place_layers(mut d, 2, pmap, mut per, mut masks)
@@ -275,13 +306,22 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
         }
         let opq = if info.alpha < 1.0 { server.Rect {} } else { d.srv.opaque(ts) }
         let alpha = opacity * info.alpha
+        let has_geo = root and owner.is_some() and info.geometry.w > 0 and info.geometry.h > 0
+        let win_x = gx + f64(info.geometry.x) * sc
+        let win_y = gy + f64(info.geometry.y) * sc
+        let win_w = f64(info.geometry.w) * sc
+        let win_h = f64(info.geometry.h) * sc
+        let bx0 = if has_geo { min(gx, win_x) } else { gx }
+        let by0 = if has_geo { min(gy, win_y) } else { gy }
+        let bx1 = if has_geo { max(gx + gw, win_x + win_w) } else { gx + gw }
+        let by1 = if has_geo { max(gy + gh, win_y + win_h) } else { gy + gh }
         var mask: u64 = 0
         for o in 0..d.outs.len() {
             if clip_out >= 0 and o != clip_out {
                 continue
             }
             let out = d.outs[o]
-            guard out.alive and gx < out.x + out.lw() and gy < out.y + out.lh() and gx + gw > out.x and gy + gh > out.y else {
+            guard out.alive and bx0 < out.x + out.lw() and by0 < out.y + out.lh() and bx1 > out.x and by1 > out.y else {
                 continue
             }
             if style.block_capture {
@@ -294,6 +334,16 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
                 let bs = f64(info.scale)
                 src = types.Rect { x: f32(info.src[0] * bs), y: f32(info.src[1] * bs), w: f32(info.src[2] * bs), h: f32(info.src[3] * bs) }
             }
+            let geom = if has_geo {
+                types.Rect {
+                    x: f32(((win_x - out.x) * k).round()),
+                    y: f32(((win_y - out.y) * k).round()),
+                    w: f32((win_w * k).round()),
+                    h: f32((win_h * k).round()),
+                }
+            } else {
+                types.Rect {}
+            }
             per[o].push(types.Placement {
                 key: display.skey(ts),
                 tex,
@@ -301,6 +351,7 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
                 y: f32(((gy - out.y) * k).round()),
                 w: f32((gw * k).round()),
                 h: f32((gh * k).round()),
+                geometry: geom,
                 src,
                 transform: info.transform,
                 opacity: alpha,

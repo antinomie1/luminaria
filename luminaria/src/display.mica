@@ -334,10 +334,10 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     background: vec4
     outs: List[Out] = []
     /// Per output: surfaces the frame in flight shows, buffers and release
-    /// points to hand back once it is on screen.
+    /// points (buffer key, dup'd timeline fd, point) to hand back once on screen.
     drawn: List[List[server.Surface]] = []
     releases: List[List[server.Buffer]] = []
-    points: List[List[(int, u64)]] = []
+    points: List[List[(u64, int, u64)]] = []
     /// Per output: what it measured (`stats`).
     probes: List[types.Stats] = []
     lay: layout.Layout = layout.Layout {}
@@ -356,6 +356,10 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     house_fd: int = -1
     cursor_size: int = 24
     manip: manipulation.State = manipulation.State {}
+    batching_input: bool = false
+    batch_cursor: bool = false
+    batch_rebuild: bool = false
+    batch_resize: bool = false
     timers: List[(int, int)] = []
     quit: bool = false
     /// Layer surface positions.
@@ -467,9 +471,9 @@ pub fn Display[O, R].with(o: Options, take be: O, take comp: R) -> Result[Displa
     for (fd, t) in fds {
         discard d.poll.add(fd, tok_backend + t, true, false)
     }
-    d.set_cursor_named("default")
-    // Outputs the backend found at start.
+    // Outputs the backend found at start, then apply the initial cursor once outputs exist.
     outputs.backend_events(mut d)
+    d.set_cursor_named("default")
     return Ok(d)
 }
 
@@ -703,9 +707,10 @@ pub fn Display[O, R].manipulate_resize(mut self, w: server.Window, edges: u32) {
         return
     }
     let cur = self.wins.get(w).unwrap_or(Win {})
-    let geo = self.srv.info(self.srv.window_surface(w)).geometry
-    let w0 = if cur.width > 0 { cur.width } else { geo.w }
-    let h0 = if cur.height > 0 { cur.height } else { geo.h }
+    let info = self.srv.info(self.srv.window_surface(w))
+    let geo = info.geometry
+    let w0 = if geo.w > 0 { geo.w } else if info.width > 0 { info.width } else { cur.width }
+    let h0 = if geo.h > 0 { geo.h } else if info.height > 0 { info.height } else { cur.height }
     self.manip.active = manipulation.Manip.Resize(w, edges, self.seats[0].px, self.seats[0].py, w0, h0, cur.off_x, cur.off_y)
     clients.dismiss_popups(mut self)
     let name = match edges {
@@ -760,6 +765,17 @@ pub fn Display[O, R].layout(mut self, f: fn(mut layout.Layout)) {
     if self.waits.txn_open {
         self.waits.txn_layout = Some(l)
         return
+    }
+    if self.waits.txn_layout.is_some() {
+        // A newer layout outside begin/end supersedes the pending transaction so
+        // its completion cannot later roll animations back to an older snapshot.
+        self.waits.txn_layout = None
+        self.waits.txn_wins.clear()
+        for s in mem.replace(mut self.waits.held, []) {
+            if self.srv.surface_alive(s) {
+                clients.applied(mut self, s)
+            }
+        }
     }
     self.lay = l
     place.rebuild(mut self)
@@ -1579,6 +1595,18 @@ fn Display[O, R].drop(mut self) {
             self.caps.fences[i].used = false
         }
     }
+    for i in 0..self.points.len() {
+        for (_, fd, _) in mem.replace(mut self.points[i], []) {
+            if fd >= 0 {
+                os.close(fd)
+            }
+        }
+    }
+    self.surfs.each(fn(_, sf) {
+        if sf.rel_fd >= 0 {
+            os.close(sf.rel_fd)
+        }
+    })
     // The output lets go of its targets first; the renderer frees them all.
     var gone: List[u64] = []
     self.be.shutdown(mut gone)

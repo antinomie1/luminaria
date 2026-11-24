@@ -24,12 +24,15 @@ struct Trace {
     reset_targets_count: int = 0
     recover_count: int = 0
     last_layout: List[lum.types.Placement] = []
+    cursor_set_count: int = 0
+    cursor_pos: Option[(i32, i32)] = None
 }
 
 struct TestOut {
     timer: int
     width: i32 = 32
     height: i32 = 24
+    hw_cursor: bool = false
     events: List[lum.types.Event] = [lum.types.Event.OutputAdded(0)]
     targets: List[u64] = []
     drawing: int = -1
@@ -119,6 +122,29 @@ pub fn TestOut.shutdown(mut self, mut retired: List[u64]) {
 
 pub fn TestOut.shown(self, o: u32) -> Option[u64] {
     return if self.shown < 0 { None } else { Some(self.targets[self.shown]) }
+}
+
+pub fn TestOut.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+    guard self.hw_cursor else {
+        return false
+    }
+    if let Some(tr) = self.trace {
+        tr.write(fn(mut t: Trace) {
+            t.cursor_set_count += 1
+        })
+    }
+    return true
+}
+
+pub fn TestOut.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
+    guard self.hw_cursor else {
+        return
+    }
+    if let Some(tr) = self.trace {
+        tr.write(fn(mut t: Trace) {
+            t.cursor_pos = at
+        })
+    }
 }
 
 pub fn TestOut.test_overlays(mut self, o: u32, target_key: u64, cands: &[lum.types.Overlay]) -> List[u64] {
@@ -757,4 +783,353 @@ test "an output of its own takes seat keymaps from an embedded Devices" {
     d.set_keymap_on(s2, lum.Names { layout: "us" }).expect("seat keymap")
     // The default seat has no keyboard: Devices.none() has no keymap.
     assert(d.set_keymap(lum.Names { layout: "us" }).is_err())
+}
+
+test "interactive resize catches up to latest pointer position immediately on ack" {
+    let dir = fs.create_temp_dir("luminaria-plug-resize").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 400, height: 400 }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let dma = dmab.Dmabuf { id: bind_global(mut fx, dmab.dmabuf_iface, 4) }
+
+    let s = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, s)
+    discard xs.get_toplevel(mut fx.c)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let fd = os.memfd("dma", 100 * 80 * 4).expect("memfd")
+    let params = dma.create_params(mut fx.c)
+    params.add_(mut fx.c, fd, 0, 0, u32(100 * 4), 0, 0)
+    os.close(fd)
+    let buf = params.create_immed(mut fx.c, 100, 80, lum.types.buffer.xrgb8888, dmab.BufferParamsFlags(0))
+    params.destroy(mut fx.c)
+    s.attach(mut fx.c, Some(buf), 0, 0)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    assert_eq(fx.wins.len(), 1)
+    let w = fx.wins[0]
+
+    // Hold button down and begin bottom-right resize at (100, 100).
+    let seat0 = fx.d.seats()[0]
+    fx.d.warp_on(seat0, 100.0, 100.0)
+    fx.d.inject_on(seat0, lum.types.Input.Button(1, u32(0x111), true))
+    fx.d.manipulate_resize(w, u32(8 | 2))
+
+    // First motion triggers configure (110x85) and marks the window inflight.
+    fx.d.inject_on(seat0, lum.types.Input.Motion(2, 10.0, 5.0, 10.0, 5.0))
+    // Second motion arrives while configure #1 is still unacked (target 140x105).
+    fx.d.inject_on(seat0, lum.types.Input.Motion(3, 30.0, 20.0, 30.0, 20.0))
+
+    // Pump compositor to flush configure #1, read it on client, and verify only 110x85 arrived first.
+    discard fx.d.poll().expect("poll")
+    discard fx.d.poll().expect("poll")
+    discard fx.c.read()
+    var first_serial: u32 = 0
+    var first_size = (i32(0), i32(0))
+    var saw_second = false
+    while true {
+        match proto.next_event(mut fx.c) {
+            Ok(Some(ev)) => {
+                match ev {
+                    XdgToplevel(_, Configure(cw, ch, _)) => first_size = (cw, ch)
+                    XdgSurface(_, Configure(ser)) => first_serial = ser
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                break
+            }
+            Err(err) => panic("client: {err}")
+        }
+    }
+    assert_eq(first_size, (i32(110), i32(85)))
+    assert(first_serial != 0)
+
+    // Client acks configure #1 and commits — NO additional mouse motion is sent!
+    xs.ack_configure(mut fx.c, first_serial)
+    s.commit(mut fx.c)
+    discard fx.c.flush()
+
+    // Compositor must immediately send catch-up configure (140x105) on ack!
+    var catchup_size = (i32(0), i32(0))
+    for _ in 0..30 {
+        discard fx.d.poll().expect("poll")
+        discard fx.c.read()
+        while true {
+            match proto.next_event(mut fx.c) {
+                Ok(Some(ev)) => {
+                    match ev {
+                        XdgToplevel(_, Configure(cw, ch, _)) => {
+                            catchup_size = (cw, ch)
+                            saw_second = true
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(err) => panic("client: {err}")
+            }
+        }
+        if saw_second {
+            break
+        }
+        time.sleep_ms(2)
+    }
+    assert(saw_second)
+    assert_eq(catchup_size, (i32(140), i32(105)))
+}
+
+test "CSD window geometry propagates into Placement.geometry and frame-synced resize updates unacked clients" {
+    let dir = fs.create_temp_dir("luminaria-plug-csd-resize").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 400, height: 400, trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true, trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let dma = dmab.Dmabuf { id: bind_global(mut fx, dmab.dmabuf_iface, 4) }
+
+    // Map a 140x120 CSD surface with 20px drop-shadow margins -> visible geometry 100x80 at (20,20).
+    let s = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, s)
+    discard xs.get_toplevel(mut fx.c)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let fd = os.memfd("dma", 140 * 120 * 4).expect("memfd")
+    let params = dma.create_params(mut fx.c)
+    params.add_(mut fx.c, fd, 0, 0, u32(140 * 4), 0, 0)
+    os.close(fd)
+    let buf = params.create_immed(mut fx.c, 140, 120, lum.types.buffer.argb8888, dmab.BufferParamsFlags(0))
+    params.destroy(mut fx.c)
+    xs.set_window_geometry(mut fx.c, 20, 20, 100, 80)
+    s.attach(mut fx.c, Some(buf), 0, 0)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    assert_eq(fx.wins.len(), 1)
+    let w = fx.wins[0]
+    fx.d.layout(fn(mut l) {
+        l.window(w, 60.0, 50.0, lum.Style {})
+    })
+    var saw_geo = false
+    tr.read(
+        fn(t: Trace) {
+            for p in t.last_layout {
+                if p.w == 140.0 and p.h == 120.0 {
+                    // Surface sits at (60 - 20, 50 - 20) = (40, 30); visible geometry sits at (60, 50, 100, 80).
+                    assert_eq((p.x, p.y), (f32(40.0), f32(30.0)))
+                    assert_eq((p.geometry.x, p.geometry.y, p.geometry.w, p.geometry.h), (f32(60.0), f32(50.0), f32(100.0), f32(80.0)))
+                    saw_geo = true
+                }
+            }
+        },
+    )
+    assert(saw_geo)
+
+    // Frame-paced client requests wl_surface.frame, starts resize, moves pointer twice WITHOUT acking configure #1.
+    let cb = s.frame(mut fx.c)
+    s.commit(mut fx.c)
+    discard fx.c.flush()
+    plug_pump(mut fx, 10)
+    let seat0 = fx.d.seats()[0]
+    fx.d.warp_on(seat0, 160.0, 130.0)
+    fx.d.inject_on(seat0, lum.types.Input.Button(1, u32(0x111), true))
+    fx.d.manipulate_resize(w, u32(8 | 2))
+    fx.d.inject_on(seat0, lum.types.Input.Motion(2, 10.0, 5.0, 10.0, 5.0))
+    fx.d.inject_on(seat0, lum.types.Input.Motion(3, 50.0, 30.0, 50.0, 30.0))
+
+    // Even without acking configure #1, the next output frame must push the latest (160x115) before frame_done!
+    var last_size = (i32(0), i32(0))
+    var got_frame = false
+    for _ in 0..40 {
+        discard fx.d.poll().expect("poll")
+        discard fx.c.read()
+        while true {
+            match proto.next_event(mut fx.c) {
+                Ok(Some(ev)) => {
+                    match ev {
+                        XdgToplevel(_, Configure(cw, ch, _)) => last_size = (cw, ch)
+                        WlCallback(c2, Done) => {
+                            if c2.id == cb.id {
+                                got_frame = true
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(err) => panic("client: {err}")
+            }
+        }
+        if got_frame and last_size == (i32(160), i32(115)) {
+            break
+        }
+        time.sleep_ms(2)
+    }
+    assert_eq(last_size, (i32(160), i32(115)))
+}
+
+test "window xdg_popup stacks and hit-tests above neighboring windows" {
+    let dir = fs.create_temp_dir("luminaria-plug-popup-z").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 400, height: 300, trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true, trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let dma = dmab.Dmabuf { id: bind_global(mut fx, dmab.dmabuf_iface, 4) }
+    let seat_wl = wl.Seat { id: bind_global(mut fx, wl.seat_iface, 7) }
+    let _ptr = seat_wl.get_pointer(mut fx.c)
+
+    // Create two tiled windows side-by-side: w1 at (0,0) 100x100, w2 at (100,0) 100x100.
+    let s1 = comp.create_surface(mut fx.c)
+    let xs1 = wm.get_xdg_surface(mut fx.c, s1)
+    discard xs1.get_toplevel(mut fx.c)
+    s1.commit(mut fx.c)
+    let s2 = comp.create_surface(mut fx.c)
+    let xs2 = wm.get_xdg_surface(mut fx.c, s2)
+    discard xs2.get_toplevel(mut fx.c)
+    s2.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+
+    let fd1 = os.memfd("w1", 100 * 100 * 4).expect("memfd")
+    let p1 = dma.create_params(mut fx.c)
+    p1.add_(mut fx.c, fd1, 0, 0, u32(100 * 4), 0, 0)
+    os.close(fd1)
+    let b1 = p1.create_immed(mut fx.c, 100, 100, lum.types.buffer.xrgb8888, dmab.BufferParamsFlags(0))
+    p1.destroy(mut fx.c)
+    s1.attach(mut fx.c, Some(b1), 0, 0)
+    s1.commit(mut fx.c)
+
+    let fd2 = os.memfd("w2", 100 * 100 * 4).expect("memfd")
+    let p2 = dma.create_params(mut fx.c)
+    p2.add_(mut fx.c, fd2, 0, 0, u32(100 * 4), 0, 0)
+    os.close(fd2)
+    let b2 = p2.create_immed(mut fx.c, 100, 100, lum.types.buffer.xrgb8888, dmab.BufferParamsFlags(0))
+    p2.destroy(mut fx.c)
+    s2.attach(mut fx.c, Some(b2), 0, 0)
+    s2.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    assert_eq(fx.wins.len(), 2)
+    let w1 = fx.wins[0]
+    let w2 = fx.wins[1]
+
+    fx.d.layout(fn(mut l) {
+        l.window(w1, 0.0, 0.0, lum.Style {})
+        l.window(w2, 100.0, 0.0, lum.Style {})
+    })
+
+    // Window 1 opens a right-click popup at (80, 10, 60x40), extending 40px over neighboring Window 2.
+    let sp = comp.create_surface(mut fx.c)
+    let xsp = wm.get_xdg_surface(mut fx.c, sp)
+    let pos = wm.create_positioner(mut fx.c)
+    pos.set_size(mut fx.c, 60, 40)
+    pos.set_anchor_rect(mut fx.c, 80, 10, 1, 1)
+    pos.set_anchor(mut fx.c, xdg.PositionerAnchor.TopLeft)
+    pos.set_gravity(mut fx.c, xdg.PositionerGravity.BottomRight)
+    discard xsp.get_popup(mut fx.c, Some(xs1), pos)
+    pos.destroy(mut fx.c)
+    sp.commit(mut fx.c)
+    plug_pump(mut fx, 20)
+
+    let fdp = os.memfd("pop", 60 * 40 * 4).expect("memfd")
+    let pp = dma.create_params(mut fx.c)
+    pp.add_(mut fx.c, fdp, 0, 0, u32(60 * 4), 0, 0)
+    os.close(fdp)
+    let bp = pp.create_immed(mut fx.c, 60, 40, lum.types.buffer.argb8888, dmab.BufferParamsFlags(0))
+    pp.destroy(mut fx.c)
+    sp.attach(mut fx.c, Some(bp), 0, 0)
+    sp.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+
+    // 1. Visual stacking order: popup must appear AFTER neighboring Window 2.
+    var idx_w1 = -1
+    var idx_w2 = -1
+    var idx_pop = -1
+    tr.read(
+        fn(t: Trace) {
+            for i in 0..t.last_layout.len() {
+                let p = t.last_layout[i]
+                if p.w == 100.0 and p.x == 0.0 {
+                    idx_w1 = i
+                } else if p.w == 100.0 and p.x == 100.0 {
+                    idx_w2 = i
+                } else if p.w == 60.0 and p.h == 40.0 {
+                    idx_pop = i
+                }
+            }
+        },
+    )
+    assert(idx_w1 >= 0 and idx_w2 > idx_w1)
+    assert(idx_pop > idx_w2)
+
+    // 2. Pointer hit-testing at overlap point (115, 25) must hit the popup, not Window 2.
+    let seat0 = fx.d.seats()[0]
+    fx.d.warp_on(seat0, 115.0, 25.0)
+    fx.d.inject_on(seat0, lum.types.Input.Motion(10, 0.0, 0.0, 0.0, 0.0))
+    var entered: u32 = 0
+    for _ in 0..25 {
+        while true {
+            guard let Some(ev) = fx.d.poll().expect("poll") else {
+                break
+            }
+            fx.d.accept(ev)
+        }
+        discard fx.c.read()
+        while true {
+            match proto.next_event(mut fx.c) {
+                Ok(Some(ev)) => {
+                    match ev {
+                        WlPointer(_, Enter(_, surf, _, _)) => entered = surf.id
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(err) => panic("client: {err}")
+            }
+        }
+        if entered == sp.id {
+            break
+        }
+        time.sleep_ms(2)
+    }
+    assert_eq(entered, sp.id)
+}
+
+test "hardware cursor is positioned on startup after initial outputs are added" {
+    let dir = fs.create_temp_dir("luminaria-plug-hw-cursor").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 400, height: 300, hw_cursor: true, trace: Some(tr.clone()) }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), trace: Some(tr.clone()) }
+    let _d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    var sets = 0
+    var pos: Option[(i32, i32)] = None
+    tr.read(
+        fn(t: Trace) {
+            sets = t.cursor_set_count
+            pos = t.cursor_pos
+        },
+    )
+    assert(sets >= 1)
+    assert(pos.is_some())
 }

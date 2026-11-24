@@ -175,11 +175,12 @@ fn arrange[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     }
 }
 
-/// Place the mapped layer surfaces of `layer` (and their popups).
+/// Place the mapped layer surfaces of `layer`, then their popups above all surfaces of `layer`.
 fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], layer: u32, pmap: map.Map[server.Surface, List[server.Popup]], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
     guard d.srv.has_layers() else {
         return
     }
+    var pop_roots: List[server.Surface] = []
     for l in d.srv.layers() {
         let info = d.srv.layer(l)
         guard info.mapped and info.state.layer == layer else {
@@ -189,7 +190,12 @@ fn place_layers[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
             continue
         }
         place.place_tree(mut d, info.surface, sp.x, sp.y, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
-        place_popups(mut d, info.surface, pmap, 1.0, None, mut per, mut masks)
+        if pmap.contains(info.surface) {
+            pop_roots.push(info.surface)
+        }
+    }
+    for root in pop_roots {
+        place_popups(mut d, root, pmap, 1.0, None, mut per, mut masks)
     }
 }
 

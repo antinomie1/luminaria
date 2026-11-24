@@ -12,6 +12,10 @@ struct Slot {
     buf: types.Dmabuf
     /// KMS framebuffer id or parent wl_buffer id.
     id: u32 = 0
+    /// Optional KMS dumb-buffer backing when the renderer cannot export dmabufs.
+    dumb_handle: u32 = 0
+    dumb_pitch: u32 = 0
+    dumb_map: Option[os.Map] = None
     /// On screen or queued to be.
     busy: bool = false
     /// Present number it was last drawn for (0: never).

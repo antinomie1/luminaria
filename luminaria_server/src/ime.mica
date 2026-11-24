@@ -117,7 +117,7 @@ fn focus_changed(mut srv: server.Server, si: u32) {
             }
             srv.text_inputs.items[k].focus = state.none
             srv.text_inputs.items[k].current.enabled = false
-            if srv.surfaces.used(int(old)) {
+            if srv.surfaces.used(int(old)) and srv.surfaces.items[int(old)].client == srv.text_inputs.items[k].client {
                 let c = int(srv.text_inputs.items[k].client)
                 ti.Input { id: srv.text_inputs.items[k].obj }.leave(mut srv.conns[c], wl.Surface { id: srv.surfaces.items[int(old)].obj })
             }
@@ -137,6 +137,22 @@ fn drop_text_input(mut srv: server.Server, k: u32) {
         deactivate(mut srv, si)
     }
     srv.text_inputs.remove(k, state.TextInputData {})
+}
+
+/// Surface `si` went away: drop it from any text input that held it so a
+/// later focus change never sends `leave` with a recycled surface slot/id.
+fn surface_gone(mut srv: server.Server, si: u32) {
+    for k in 0..srv.text_inputs.items.len() {
+        guard srv.text_inputs.used(k) and srv.text_inputs.items[k].focus == si else {
+            continue
+        }
+        let seat_i = srv.text_inputs.items[k].seat
+        if srv.seats.used(int(seat_i)) and srv.seats.items[int(seat_i)].im_active == u32(k) {
+            deactivate(mut srv, seat_i)
+        }
+        srv.text_inputs.items[k].focus = state.none
+        srv.text_inputs.items[k].current.enabled = false
+    }
 }
 
 // -------------------------------------------------------- input method

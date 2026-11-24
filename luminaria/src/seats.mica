@@ -110,6 +110,15 @@ fn set_cursor_named_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[
     set_cursor_image_on(mut d, si, img)
 }
 
+/// Re-upload seat `si`'s current cursor image and position (e.g. after output hotplug).
+fn sync_cursor_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard si >= 0 and si < d.seats.len() and d.seats[si].cursor.width > 0 else {
+        return
+    }
+    let img = d.seats[si].cursor.clone()
+    set_cursor_image_on(mut d, si, img)
+}
+
 fn hide_cursor_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
     set_cursor_image_on(mut d, si, cursor.Image {})
     if si == 0 {

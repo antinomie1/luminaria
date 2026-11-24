@@ -55,6 +55,26 @@ fn clamp_pointer_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, 
     }
 }
 
+/// Flush coalesced pointer motion updates (hardware cursor, resize step,
+/// layout rebuild) once per input batch or before any non-motion event.
+fn flush_batch[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    let do_cursor = d.batch_cursor
+    let do_resize = d.batch_resize
+    let do_rebuild = d.batch_rebuild
+    d.batch_cursor = false
+    d.batch_resize = false
+    d.batch_rebuild = false
+    if do_cursor {
+        seats.move_cursor_on(mut d, 0)
+    }
+    if do_resize {
+        manipulation.resize_step(mut d, false)
+    }
+    if do_rebuild {
+        place.rebuild(mut d)
+    }
+}
+
 fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, take i: types.Input) {
     guard si >= 0 and si < d.seats.len() else {
         return
@@ -63,26 +83,12 @@ fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
     let sname = d.seats[si].name.clone()
     d.srv.input_activity_on(st, time.now_ns())
     match take i {
-        Key(t, code, pressed, sym, text) => {
-            let mods = d.be.mods_on(sname)
-            let base_sym = d.be.base_sym_on(sname, code)
-            d.emit(display.Event.Key(display.Key { seat: st, time: t, code, sym, base_sym, text, pressed, mods }))
-        }
-        Modifiers(desc, l, k, g) => {
-            // Clients always see the modifier state, bindings or not.
-            d.srv.modifiers(st, desc, l, k, g)
-            let m = d.be.mods_on(sname)
-            if si == 0 {
-                d.emit(display.Event.Modifiers(m))
-            } else {
-                d.emit(display.Event.ModifiersOn(st, m))
-            }
-        }
         Motion(t, dx, dy, rdx, rdy) => {
             let (x, y) = constrain_on(d, si, d.seats[si].px + dx, d.seats[si].py + dy)
             d.seats[si].px = x
             d.seats[si].py = y
             moved_on(mut d, si, t, dx, dy, rdx, rdy)
+            return
         }
         MotionAbsolute(t, o, nx, ny) => {
             let oi = int(o)
@@ -97,51 +103,74 @@ fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
             d.seats[si].px = cx
             d.seats[si].py = cy
             moved_on(mut d, si, t, dx, dy, dx, dy)
+            return
         }
-        Button(t, button, pressed) => {
-            if pressed {
-                d.seats[si].buttons += 1
-            } else {
-                d.seats[si].buttons = max(d.seats[si].buttons - 1, 0)
-            }
-            let p = display.Pointer { seat: st, time: t, x: d.seats[si].px, y: d.seats[si].py, button, pressed }
-            if si == 0 {
-                match d.manip.active {
-                    Move or Resize => {
-                        if not pressed and d.seats[0].buttons == 0 {
-                            manipulation.end_manipulation(mut d)
-                        }
-                        return
-                    }
-                    _ => {}
+        other => {
+            flush_batch(mut d)
+            var ev = other
+            match take ev {
+                Key(t, code, pressed, sym, text) => {
+                    let mods = d.be.mods_on(sname)
+                    let base_sym = d.be.base_sym_on(sname, code)
+                    d.emit(display.Event.Key(display.Key { seat: st, time: t, code, sym, base_sym, text, pressed, mods }))
                 }
+                Modifiers(desc, l, k, g) => {
+                    // Clients always see the modifier state, bindings or not.
+                    d.srv.modifiers(st, desc, l, k, g)
+                    let m = d.be.mods_on(sname)
+                    if si == 0 {
+                        d.emit(display.Event.Modifiers(m))
+                    } else {
+                        d.emit(display.Event.ModifiersOn(st, m))
+                    }
+                }
+                Button(t, button, pressed) => {
+                    if pressed {
+                        d.seats[si].buttons += 1
+                    } else {
+                        d.seats[si].buttons = max(d.seats[si].buttons - 1, 0)
+                    }
+                    let p = display.Pointer { seat: st, time: t, x: d.seats[si].px, y: d.seats[si].py, button, pressed }
+                    if si == 0 {
+                        match d.manip.active {
+                            Move or Resize => {
+                                if not pressed and d.seats[0].buttons == 0 {
+                                    manipulation.end_manipulation(mut d)
+                                }
+                                return
+                            }
+                            _ => {}
+                        }
+                    }
+                    d.emit(display.Event.Button(p))
+                }
+                Axis(t, src, dx, dy, cx, cy, inv) => {
+                    d.emit(display.Event.Scroll(display.Scroll { seat: st, time: t, x: d.seats[si].px, y: d.seats[si].py, dx, dy, v120x: cx, v120y: cy, source: src }))
+                }
+                TouchDown(t, id, o, nx, ny) => {
+                    let (x, y) = touch_point(d, int(o), nx, ny)
+                    d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Down, id, x, y }))
+                }
+                TouchMotion(t, id, o, nx, ny) => {
+                    let (x, y) = touch_point(d, int(o), nx, ny)
+                    d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Motion, id, x, y }))
+                }
+                TouchUp(t, id) => d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Up, id }))
+                TouchFrame => d.emit(display.Event.Touch(display.Touch { seat: st, kind: display.TouchKind.Frame }))
+                TouchCancel => d.emit(display.Event.Touch(display.Touch { seat: st, kind: display.TouchKind.Cancel }))
+                SwipeBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeBegin, fingers: f })
+                SwipeUpdate(t, dx, dy) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeUpdate, dx, dy })
+                SwipeEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeEnd, cancelled: c })
+                PinchBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchBegin, fingers: f })
+                PinchUpdate(t, dx, dy, sc, rot) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchUpdate, dx, dy, scale: sc, rotation: rot })
+                PinchEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchEnd, cancelled: c })
+                HoldBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.HoldBegin, fingers: f })
+                HoldEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.HoldEnd, cancelled: c })
+                DeviceAdded(id, desc) => d.emit(display.Event.DeviceAdded(id, desc))
+                DeviceRemoved(id) => d.emit(display.Event.DeviceRemoved(id))
+                Motion or MotionAbsolute => {}
             }
-            d.emit(display.Event.Button(p))
         }
-        Axis(t, src, dx, dy, cx, cy, inv) => {
-            d.emit(display.Event.Scroll(display.Scroll { seat: st, time: t, x: d.seats[si].px, y: d.seats[si].py, dx, dy, v120x: cx, v120y: cy, source: src }))
-        }
-        TouchDown(t, id, o, nx, ny) => {
-            let (x, y) = touch_point(d, int(o), nx, ny)
-            d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Down, id, x, y }))
-        }
-        TouchMotion(t, id, o, nx, ny) => {
-            let (x, y) = touch_point(d, int(o), nx, ny)
-            d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Motion, id, x, y }))
-        }
-        TouchUp(t, id) => d.emit(display.Event.Touch(display.Touch { seat: st, time: t, kind: display.TouchKind.Up, id }))
-        TouchFrame => d.emit(display.Event.Touch(display.Touch { seat: st, kind: display.TouchKind.Frame }))
-        TouchCancel => d.emit(display.Event.Touch(display.Touch { seat: st, kind: display.TouchKind.Cancel }))
-        SwipeBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeBegin, fingers: f })
-        SwipeUpdate(t, dx, dy) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeUpdate, dx, dy })
-        SwipeEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.SwipeEnd, cancelled: c })
-        PinchBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchBegin, fingers: f })
-        PinchUpdate(t, dx, dy, sc, rot) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchUpdate, dx, dy, scale: sc, rotation: rot })
-        PinchEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.PinchEnd, cancelled: c })
-        HoldBegin(t, f) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.HoldBegin, fingers: f })
-        HoldEnd(t, c) => gesture_on(mut d, si, display.Gesture { seat: st, time: t, kind: display.GestureKind.HoldEnd, cancelled: c })
-        DeviceAdded(id, desc) => d.emit(display.Event.DeviceAdded(id, desc))
-        DeviceRemoved(id) => d.emit(display.Event.DeviceRemoved(id))
     }
 }
 
@@ -156,7 +185,11 @@ fn touch_point[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: in
 /// manipulation on seat 0 moves its window, else the compositor hears of it.
 fn moved_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, t: u32, dx: f64, dy: f64, rdx: f64, rdy: f64) {
     clamp_pointer_on(mut d, si)
-    seats.move_cursor_on(mut d, si)
+    if si == 0 and d.batching_input {
+        d.batch_cursor = true
+    } else {
+        seats.move_cursor_on(mut d, si)
+    }
     let px = d.seats[si].px
     let py = d.seats[si].py
     if si == 0 {
@@ -165,11 +198,19 @@ fn moved_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
                 if let Some(cur) = d.wins.get(w) {
                     discard d.wins.insert(w, display.Win { off_x: bx + px - sx, off_y: by + py - sy, ..cur })
                 }
-                place.rebuild(mut d)
+                if d.batching_input {
+                    d.batch_rebuild = true
+                } else {
+                    place.rebuild(mut d)
+                }
                 return
             }
-            Resize(w, edges, sx, sy, w0, h0, ox, oy) => {
-                manipulation.resize_step(mut d, w, edges, sx, sy, w0, h0)
+            Resize => {
+                if d.batching_input {
+                    d.batch_resize = true
+                } else {
+                    manipulation.resize_step(mut d, false)
+                }
                 return
             }
             _ => {}

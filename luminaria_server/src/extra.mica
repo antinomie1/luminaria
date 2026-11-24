@@ -18,9 +18,11 @@ import ids
 import state
 import server
 import seat
+import ime
 import pointer
 import inhibit
 import color
+import xdg
 
 /// Bind extension object `id` to surface `s`, failing when it has one.
 fn attach(mut srv: server.Server, ci: u32, id: u32, s: wl.Surface) -> u32 {
@@ -384,7 +386,9 @@ fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16) {
 /// Surface `si` is going: forget it in every seat and extension.
 fn surface_gone(mut srv: server.Server, si: u32) {
     seat.surface_gone(mut srv, si)
+    ime.surface_gone(mut srv, si)
     pointer.surface_gone(mut srv, si)
     inhibit.surface_gone(mut srv, si)
     color.surface_gone(mut srv, si)
+    xdg.surface_gone(mut srv, si)
 }

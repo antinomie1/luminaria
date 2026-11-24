@@ -217,8 +217,12 @@ struct Output {
     hdr_dirty: bool = false
     /// Replaced property blobs freed once the replacing atomic commit is submitted.
     retired_blobs: List[u32] = []
-    cursor_fb: u32 = 0
-    cursor_map: Option[os.Map] = None
+    cursor_fbs: [2]u32 = [0, 0]
+    cursor_handles: [2]u32 = [0, 0]
+    cursor_pitches: [2]u32 = [0, 0]
+    cursor_map0: Option[os.Map] = None
+    cursor_map1: Option[os.Map] = None
+    cursor_idx: int = 0
     cursor_x: i32 = 0
     cursor_y: i32 = 0
     cursor_shown: bool = false
@@ -661,6 +665,70 @@ fn Drm.rm_fb(self, id: u32) {
     }
 }
 
+fn Drm.rm_dumb(self, handle: u32) {
+    if handle != 0 {
+        discard drm.mode_destroy_dumb_buffer(i32(self.fd), handle)
+    }
+}
+
+/// Allocate and mmap a KMS dumb buffer framebuffer for software-Vulkan renderers
+/// that cannot export DRM dmabufs (e.g. Mesa llvmpipe on virtio-gpu / UEFI GOP).
+fn Drm.make_dumb_fb(self, w: i32, h: i32, fmt: u32) -> Result[(u32, u32, u32, os.Map), str] {
+    let f = i32(self.fd)
+    var handle: u32 = 0
+    var pitch: u32 = 0
+    var size: u64 = 0
+    var offset: u64 = 0
+    var fb: u32 = 0
+    unsafe {
+        guard drm.mode_create_dumb_buffer(f, u32(w), u32(h), 32, 0, Ptr.of_mut(mut handle), Ptr.of_mut(mut pitch), Ptr.of_mut(mut size)) == 0 else {
+            return Err("create dumb buffer {w}x{h} failed")
+        }
+        let handles: [4]u32 = [handle, 0, 0, 0]
+        let pitches: [4]u32 = [pitch, 0, 0, 0]
+        let offsets: [4]u32 = [0, 0, 0, 0]
+        if drm.mode_add_fb2_with_modifiers(f, u32(w), u32(h), fmt, Ptr.of(handles).cast[u32](), Ptr.of(pitches).cast[u32](), Ptr.of(offsets).cast[u32](), Ptr.null(), Ptr.of_mut(mut fb), 0) != 0 {
+            discard drm.mode_destroy_dumb_buffer(f, handle)
+            return Err("addfb2 dumb buffer {w}x{h} failed")
+        }
+        if drm.mode_map_dumb_buffer(f, handle, Ptr.of_mut(mut offset)) != 0 {
+            discard drm.mode_rm_fb(f, fb)
+            discard drm.mode_destroy_dumb_buffer(f, handle)
+            return Err("map dumb buffer {w}x{h} failed")
+        }
+    }
+    let m = match os.map(self.fd, int(size), int(offset), true) {
+        Ok(m) => m
+        Err(e) => {
+            discard drm.mode_rm_fb(f, fb)
+            discard drm.mode_destroy_dumb_buffer(f, handle)
+            return Err("mmap dumb buffer: {e}")
+        }
+    }
+    return Ok((fb, handle, pitch, m))
+}
+
+fn Drm.upload_slot(mut self, o: int, slot_idx: int, px: &[u8], stride: int) {
+    guard o >= 0 and o < self.outputs.len() else {
+        return
+    }
+    guard let Some(sw) = self.outputs[o].swap.take() else {
+        return
+    }
+    var s = sw
+    if slot_idx >= 0 and slot_idx < s.slots.len() {
+        let pitch = int(s.slots[slot_idx].dumb_pitch)
+        let w = s.width
+        let h = s.height
+        if let Some(mm) = s.slots[slot_idx].dumb_map.take() {
+            var m = mm
+            discard pixels.copy_rows(mut m.bytes(), 0, pitch, px, 0, stride, int(w) * 4, int(h))
+            s.slots[slot_idx].dumb_map = Some(m)
+        }
+    }
+    self.outputs[o].swap = Some(s)
+}
+
 /// What output `o` needs before it can draw: None when its scanout
 /// buffers are there (and of the mode's size), else render targets laid
 /// out the way its primary plane can scan them out. Old buffers' keys go
@@ -679,6 +747,7 @@ fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[t
         }
         for sl in old.slots {
             self.rm_fb(sl.id)
+            self.rm_dumb(sl.dumb_handle)
         }
         old.close_fds()
         old.keys(mut retired)
@@ -698,8 +767,16 @@ fn Drm.give(mut self, o: int, ts: &[types.Target]) -> Result[(), str] {
     var s = swap.create(w, h, ts)
     s.format = fmt
     for i in 0..s.slots.len() {
-        let b = types.Dmabuf { format: fmt, ..s.slots[i].buf }
-        s.slots[i].id = try self.add_fb(b)
+        if s.slots[i].buf.planes > 0 {
+            let b = types.Dmabuf { format: fmt, ..s.slots[i].buf }
+            s.slots[i].id = try self.add_fb(b)
+        } else {
+            let (fb, handle, pitch, m) = try self.make_dumb_fb(w, h, fmt)
+            s.slots[i].id = fb
+            s.slots[i].dumb_handle = handle
+            s.slots[i].dumb_pitch = pitch
+            s.slots[i].dumb_map = Some(m)
+        }
     }
     self.outputs[o].swap = Some(s)
     try self.make_cursor(o)
@@ -829,10 +906,7 @@ fn Drm.set_hdr(mut self, o: int, enabled: bool, sdr_nits: f32, max_nits: f32) ->
     return true
 }
 
-fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
-    guard self.outputs[o].cursor >= 0 and self.outputs[o].cursor_fb == 0 else {
-        return Ok(())
-    }
+fn Drm.make_cursor_slot(self, w: u32, h: u32) -> Result[(u32, u32, u32, os.Map), str] {
     let f = i32(self.fd)
     var handle: u32 = 0
     var pitch: u32 = 0
@@ -840,47 +914,104 @@ fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
     var offset: u64 = 0
     var fb: u32 = 0
     unsafe {
-        guard drm.mode_create_dumb_buffer(f, self.cursor_w, self.cursor_h, 32, 0, Ptr.of_mut(mut handle), Ptr.of_mut(mut pitch), Ptr.of_mut(mut size)) == 0 else {
-            return Ok(())
+        guard drm.mode_create_dumb_buffer(f, w, h, 32, 0, Ptr.of_mut(mut handle), Ptr.of_mut(mut pitch), Ptr.of_mut(mut size)) == 0 else {
+            return Err("cursor create_dumb_buffer failed")
         }
         let handles: List[u32] = [handle, 0, 0, 0]
         let pitches: List[u32] = [pitch, 0, 0, 0]
         let offsets: List[u32] = [0, 0, 0, 0]
-        guard drm.mode_add_fb2_with_modifiers(f, self.cursor_w, self.cursor_h, 0x34325241, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), Ptr.null(), Ptr.of_mut(mut fb), 0) == 0 else {
-            return Ok(())
+        guard drm.mode_add_fb2_with_modifiers(f, w, h, 0x34325241, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), Ptr.null(), Ptr.of_mut(mut fb), 0) == 0 else {
+            self.rm_dumb(handle)
+            return Err("cursor add_fb2 failed")
         }
         guard drm.mode_map_dumb_buffer(f, handle, Ptr.of_mut(mut offset)) == 0 else {
-            return Ok(())
+            self.rm_fb(fb)
+            self.rm_dumb(handle)
+            return Err("cursor map_dumb_buffer failed")
         }
     }
-    let m = try os.map(self.fd, int(size), int(offset), true).map_err(fn(e) => "{e}")
-    self.outputs[o].cursor_fb = fb
-    self.outputs[o].cursor_map = Some(m)
+    match os.map(self.fd, int(size), int(offset), true) {
+        Ok(m) => {
+            return Ok((fb, handle, pitch, m))
+        }
+        Err(e) => {
+            self.rm_fb(fb)
+            self.rm_dumb(handle)
+            return Err("{e}")
+        }
+    }
+}
+
+fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
+    let cp = self.outputs[o].cursor
+    guard cp >= 0 and self.outputs[o].cursor_fbs[0] == 0 else {
+        return Ok(())
+    }
+    guard self.planes[cp].formats.is_empty() or self.planes[cp].formats.contains(0x34325241) else {
+        return Ok(())
+    }
+    guard let Ok((fb0, h0, p0, m0)) = self.make_cursor_slot(self.cursor_w, self.cursor_h) else {
+        return Ok(())
+    }
+    guard let Ok((fb1, h1, p1, m1)) = self.make_cursor_slot(self.cursor_w, self.cursor_h) else {
+        discard m0
+        self.rm_fb(fb0)
+        self.rm_dumb(h0)
+        return Ok(())
+    }
+    self.outputs[o].cursor_fbs = [fb0, fb1]
+    self.outputs[o].cursor_handles = [h0, h1]
+    self.outputs[o].cursor_pitches = [p0, p1]
+    self.outputs[o].cursor_map0 = Some(m0)
+    self.outputs[o].cursor_map1 = Some(m1)
+    self.outputs[o].cursor_idx = 0
     return Ok(())
 }
 
-/// Copy an ARGB8888 (premultiplied) cursor image into the cursor buffer;
-/// false when there is no cursor plane or the image is too large.
+/// Copy an ARGB8888 (premultiplied) cursor image into the back cursor buffer
+/// and flip to it so drivers that compare `old_fb != new_fb` always upload
+/// the updated cursor; false when there is no cursor plane or image is too large.
 fn Drm.set_cursor_image(mut self, o: int, px: &[u8], width: u32, height: u32) -> bool {
     guard width <= self.cursor_w and height <= self.cursor_h else {
         return false
     }
-    guard let Some(mm) = self.outputs[o].cursor_map.take() else {
+    let next = 1 - self.outputs[o].cursor_idx
+    let pitch = int(self.outputs[o].cursor_pitches[next])
+    guard self.outputs[o].cursor_fbs[next] != 0 and pitch >= int(width) * 4 else {
+        return false
+    }
+    guard let Some(mm) = if next == 0 { self.outputs[o].cursor_map0.take() } else { self.outputs[o].cursor_map1.take() } else {
         return false
     }
     var m = mm
-    let cw = int(self.cursor_w) * 4
     let row = int(width) * 4
-    let ok = pixels.copy_rows(mut m.bytes(), 0, cw, px, 0, row, row, int(height))
+    let ok = if width > 0 and height > 0 { pixels.copy_rows(mut m.bytes(), 0, pitch, px, 0, row, row, int(height)) } else { true }
     // Clear only what the image does not cover.
-    if row < cw {
+    if row < pitch {
         for y in 0..int(height) {
-            pixels.clear(mut m.bytes()[y * cw + row..(y + 1) * cw])
+            pixels.clear(mut m.bytes()[y * pitch + row..(y + 1) * pitch])
         }
     }
-    pixels.clear(mut m.bytes()[int(height) * cw..m.len])
-    self.outputs[o].cursor_map = Some(m)
+    let tail = int(height) * pitch
+    if tail < m.len {
+        pixels.clear(mut m.bytes()[tail..m.len])
+    }
+    if next == 0 {
+        self.outputs[o].cursor_map0 = Some(m)
+    } else {
+        self.outputs[o].cursor_map1 = Some(m)
+    }
+    if ok {
+        self.outputs[o].cursor_idx = next
+    }
     return ok
+}
+
+/// Encode a signed 32-bit KMS property value (such as CRTC_X / CRTC_Y) as the
+/// sign-extended 64-bit two's-complement bit pattern expected by DRM's
+/// `DRM_MODE_PROP_SIGNED_RANGE` (`U642I64`).
+fn signed_prop(v: i32) -> u64 {
+    return int(v).bits()
 }
 
 fn Drm.pprop(self, p: int, name: str) -> u32 {
@@ -957,13 +1088,27 @@ fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: &[uap
         }
         let clips = self.pprop(primary, "FB_DAMAGE_CLIPS")
         if not modeset and not rects.is_empty() and clips != 0 {
-            var blob: u32 = 0
-            unsafe {
-                discard drm.mode_create_property_blob(i32(self.fd), rects.as_ptr().cast[u8](), u64(rects.len() * size_of[uapi.ModeRect]()), Ptr.of_mut(mut blob))
+            let iw = i32(w)
+            let ih = i32(h)
+            var clean: List[uapi.ModeRect] = []
+            for rc in rects {
+                let x1 = max(rc.x1, 0)
+                let y1 = max(rc.y1, 0)
+                let x2 = min(rc.x2, iw)
+                let y2 = min(rc.y2, ih)
+                if x1 < x2 and y1 < y2 {
+                    clean.push(uapi.ModeRect { x1, y1, x2, y2 })
+                }
             }
-            if blob != 0 {
-                r.add(pid, clips, u64(blob))
-                r.blobs.push(blob)
+            if not clean.is_empty() {
+                var blob: u32 = 0
+                unsafe {
+                    discard drm.mode_create_property_blob(i32(self.fd), clean.as_ptr().cast[u8](), u64(clean.len() * size_of[uapi.ModeRect]()), Ptr.of_mut(mut blob))
+                }
+                if blob != 0 {
+                    r.add(pid, clips, u64(blob))
+                    r.blobs.push(blob)
+                }
             }
         }
         for sl in ovs {
@@ -974,8 +1119,8 @@ fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: &[uap
             r.add(oid, self.pprop(sl.plane, "SRC_Y"), sl.src_y)
             r.add(oid, self.pprop(sl.plane, "SRC_W"), sl.src_w)
             r.add(oid, self.pprop(sl.plane, "SRC_H"), sl.src_h)
-            r.add(oid, self.pprop(sl.plane, "CRTC_X"), u64(i64(sl.x)))
-            r.add(oid, self.pprop(sl.plane, "CRTC_Y"), u64(i64(sl.y)))
+            r.add(oid, self.pprop(sl.plane, "CRTC_X"), signed_prop(sl.x))
+            r.add(oid, self.pprop(sl.plane, "CRTC_Y"), signed_prop(sl.y))
             r.add(oid, self.pprop(sl.plane, "CRTC_W"), u64(sl.w))
             r.add(oid, self.pprop(sl.plane, "CRTC_H"), u64(sl.h))
         }
@@ -999,15 +1144,16 @@ fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: &[uap
     }
     if cursor >= 0 and not tear {
         let cid = self.planes[cursor].id
-        if self.outputs[o].cursor_shown and self.outputs[o].cursor_fb != 0 {
-            r.add(cid, self.pprop(cursor, "FB_ID"), u64(self.outputs[o].cursor_fb))
+        let cfb = self.outputs[o].cursor_fbs[self.outputs[o].cursor_idx]
+        if self.outputs[o].cursor_shown and cfb != 0 {
+            r.add(cid, self.pprop(cursor, "FB_ID"), u64(cfb))
             r.add(cid, self.pprop(cursor, "CRTC_ID"), u64(crtc))
             r.add(cid, self.pprop(cursor, "SRC_X"), 0)
             r.add(cid, self.pprop(cursor, "SRC_Y"), 0)
             r.add(cid, self.pprop(cursor, "SRC_W"), u64(self.cursor_w) << 16)
             r.add(cid, self.pprop(cursor, "SRC_H"), u64(self.cursor_h) << 16)
-            r.add(cid, self.pprop(cursor, "CRTC_X"), u64(i64(self.outputs[o].cursor_x)))
-            r.add(cid, self.pprop(cursor, "CRTC_Y"), u64(i64(self.outputs[o].cursor_y)))
+            r.add(cid, self.pprop(cursor, "CRTC_X"), signed_prop(self.outputs[o].cursor_x))
+            r.add(cid, self.pprop(cursor, "CRTC_Y"), signed_prop(self.outputs[o].cursor_y))
             r.add(cid, self.pprop(cursor, "CRTC_W"), u64(self.cursor_w))
             r.add(cid, self.pprop(cursor, "CRTC_H"), u64(self.cursor_h))
         } else {
@@ -1262,6 +1408,7 @@ fn Drm.reset_targets(mut self, mut retired: List[u64]) {
             var s = sw
             for sl in s.slots {
                 self.rm_fb(sl.id)
+                self.rm_dumb(sl.dumb_handle)
             }
             s.close_fds()
             s.keys(mut retired)
@@ -1278,8 +1425,15 @@ fn Drm.release(mut self, mut retired: List[u64]) {
     self.reset_targets(mut retired)
     let f = i32(self.fd)
     for o in 0..self.outputs.len() {
-        self.rm_fb(self.outputs[o].cursor_fb)
-        self.outputs[o].cursor_fb = 0
+        discard self.outputs[o].cursor_map0.take()
+        discard self.outputs[o].cursor_map1.take()
+        for ci in 0..2 {
+            self.rm_fb(self.outputs[o].cursor_fbs[ci])
+            self.rm_dumb(self.outputs[o].cursor_handles[ci])
+            self.outputs[o].cursor_fbs[ci] = 0
+            self.outputs[o].cursor_handles[ci] = 0
+            self.outputs[o].cursor_pitches[ci] = 0
+        }
         if self.outputs[o].mode_blob != 0 {
             discard drm.mode_destroy_property_blob(f, self.outputs[o].mode_blob)
             self.outputs[o].mode_blob = 0
@@ -1297,4 +1451,16 @@ fn Drm.release(mut self, mut retired: List[u64]) {
         }
         self.outputs[o].retired_blobs.clear()
     }
+}
+
+test "DRM signed_prop encodes negative CRTC_X/CRTC_Y as sign-extended two's complement" {
+    assert_eq(signed_prop(0), u64(0))
+    assert_eq(signed_prop(123), u64(123))
+    assert_eq(signed_prop(-1), ~u64(0))
+    assert_eq(signed_prop(-4), ~u64(3))
+    assert_eq(signed_prop(-8), ~u64(7))
+    assert_eq(signed_prop(-12), ~u64(11))
+    assert_eq(signed_prop(-16), ~u64(15))
+    assert_eq(signed_prop(-2147483648), ~u64(0x7fffffff))
+    assert_eq(signed_prop(2147483647), u64(0x7fffffff))
 }

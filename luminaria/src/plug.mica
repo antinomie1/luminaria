@@ -133,6 +133,12 @@ pub trait Output: Input {
     fn clear_overlays(mut self, o: u32) {}
     /// Drop scanout targets so they can be recreated after a GPU reset.
     fn reset_targets(mut self, mut retired: List[u64]) {}
+    /// True when the acquired target on `o` has no exported dmabuf and expects
+    /// CPU pixels via `upload_frame` before `present`.
+    fn needs_upload(self, o: u32) -> bool {
+        return false
+    }
+    fn upload_frame(mut self, o: u32, pixels: &[u8], stride: int) {}
 }
 
 pub trait Renderer {

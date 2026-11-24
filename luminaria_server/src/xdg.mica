@@ -495,3 +495,12 @@ fn destroy_xdg_surface(mut srv: server.Server, si: u32) {
         srv.surfaces.items[int(si)].xdg = 0
     }
 }
+
+/// Surface `si` went away: detach any popup that referenced it as parent.
+fn surface_gone(mut srv: server.Server, si: u32) {
+    for k in 0..srv.popups.items.len() {
+        if srv.popups.used(k) and srv.popups.items[k].parent == si {
+            srv.popups.items[k].parent = state.none
+        }
+    }
+}

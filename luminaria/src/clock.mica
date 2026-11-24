@@ -5,15 +5,15 @@
 // refresh a frame starts as soon as there is something to show, no sooner
 // than the shortest refresh interval allows.
 
-pub let min_margin_ns = 1000000
-pub let start_margin_ns = 3000000
+pub let min_margin_ns = 2000000
+pub let start_margin_ns = 4000000
 
 pub struct Clock {
     pub refresh_ns: int = 16666667
     /// CLOCK_MONOTONIC ns of the last vblank a frame reached the screen.
     pub last: int = 0
     pub seq: u64 = 0
-    pub margin_ns: int = 3000000
+    pub margin_ns: int = 4000000
     pub vrr: bool = false
     /// The vblank the frame in flight aims at (0: none).
     target: int = 0
@@ -68,7 +68,7 @@ pub fn Clock.presented(mut self, seq: u64, ns: int) -> bool {
             // Start earlier from now on.
             self.margin_ns = min(self.margin_ns + 1000000, self.refresh_ns / 2)
         } else {
-            self.margin_ns = max(self.margin_ns - 100000, min_margin_ns)
+            self.margin_ns = max(self.margin_ns - 50000, min_margin_ns)
         }
         self.target = 0
     }

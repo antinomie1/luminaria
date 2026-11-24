@@ -82,8 +82,8 @@ pub fn Hits.find(self, srv: server.Server, x: f64, y: f64) -> Option[(server.Sur
     guard n > 0 else {
         return None
     }
-    let px = u32x8(u32(i32(x.floor())))
-    let py = u32x8(u32(i32(y.floor())))
+    let px = u32x8(u32(int(i32(x.floor())).bits() & 0xffffffff))
+    let py = u32x8(u32(int(i32(y.floor())).bits() & 0xffffffff))
     let one = u32x8(1)
     var base = ((n - 1) / 8) * 8
     while base >= 0 {

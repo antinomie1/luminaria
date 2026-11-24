@@ -4,6 +4,7 @@
 // compositor answers through the methods here and in the other modules.
 // Nothing blocks and nothing allocates per request in steady state.
 
+import std.io
 import std.mem
 import std.net
 import luminaria_types as types
@@ -514,6 +515,19 @@ pub fn Server.client_of(self, s: ids.Surface) -> ids.Client {
     return ids.Client { id: self.clients.id(ci) }
 }
 
+/// Tear down any destroyed client object ids queued in `self.conns[ci]`.
+fn Server.drain_removed(mut self, ci: u32) {
+    if self.conns[int(ci)].removed_pending() {
+        var gone: List[(u32, u16)] = []
+        self.conns[int(ci)].take_removed(mut gone)
+        for (id, iface) in gone {
+            if self.slot(ci, id) != state.none {
+                route.destroyed(mut self, ci, id, iface)
+            }
+        }
+    }
+}
+
 /// Read and handle what client `c` sent. False when it is gone (call
 /// `disconnect` after removing its socket from the poller).
 pub fn Server.dispatch(mut self, c: ids.Client) -> bool {
@@ -532,26 +546,23 @@ pub fn Server.dispatch(mut self, c: ids.Client) -> bool {
             }
         }
         while true {
+            // Drain server-side destructor events (e.g. wl_callback.done) before
+            // decoding the next request, so a client reusing that id is not torn down.
+            self.drain_removed(ci)
             match proto.next(mut self.conns[int(ci)]) {
                 Ok(Some(r)) => {
                     route.handle(mut self, ci, r)
                     // A destructor its handler left alone is torn down like
                     // at disconnect, so nothing stays behind for the next
                     // object with the same id.
-                    if self.conns[int(ci)].removed_pending() {
-                        var gone: List[(u32, u16)] = []
-                        self.conns[int(ci)].take_removed(mut gone)
-                        for (id, iface) in gone {
-                            if self.slot(ci, id) != state.none {
-                                route.destroyed(mut self, ci, id, iface)
-                            }
-                        }
-                    }
+                    self.drain_removed(ci)
                 }
                 Ok(None) => {
                     break
                 }
-                Err => {
+                Err(e) => {
+                    io.eprint("luminaria: client pid={self.clients.items[int(ci)].pid} protocol error: {e}")
+                    discard self.conns[int(ci)].flush()
                     return false
                 }
             }
@@ -599,6 +610,7 @@ pub fn Server.flush(mut self, mut gone: List[ids.Client]) {
 /// Protocol error `code` on `obj`: the client is told and dropped after
 /// the next flush.
 fn Server.fail(mut self, ci: u32, obj: u32, code: u32, msg: &str) {
+    io.eprint("luminaria: client pid={self.clients.items[int(ci)].pid} fail obj={obj} code={code}: {msg}")
     discard self.conns[int(ci)].error(obj, code, msg)
 }
 

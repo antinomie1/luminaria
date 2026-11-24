@@ -1,5 +1,6 @@
 // What clients do: server events, buffers, surfaces and popups.
 
+import std.os
 import luminaria_types as types
 import luminaria_types.pixels as pixels
 import luminaria_server as server
@@ -11,6 +12,7 @@ import waits
 import place
 import seats
 import input
+import manipulation
 
 fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     while true {
@@ -210,20 +212,6 @@ fn acked[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: serv
     var win = cur
     win.inflight = false
     let resized = aw != win.width or ah != win.height
-    // A resize from the left or top keeps the opposite edge in place.
-    match d.manip.active {
-        Resize(mw, edges, _, _, w0, h0, ox, oy) => {
-            if mw == w {
-                if edges & 4 != 0 and aw > 0 {
-                    win.off_x = ox + f64(w0 - aw)
-                }
-                if edges & 1 != 0 and ah > 0 {
-                    win.off_y = oy + f64(h0 - ah)
-                }
-            }
-        }
-        _ => {}
-    }
     discard d.wins.insert(w, win)
     if d.waits.txn_open or d.waits.txn_layout.is_some() {
         d.waits.txn_wins.retain(fn(x) => x != w)
@@ -233,6 +221,7 @@ fn acked[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: serv
         d.emit(display.Event.WindowResized(w, aw, ah))
     }
     place.rebuild(mut d)
+    manipulation.resize_step(mut d, false)
 }
 
 fn buffer_new[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer) {
@@ -267,14 +256,15 @@ fn buffer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b
 }
 
 /// Release `b` once every output that may still read it has shown a newer
-/// frame (now when none does).
+/// frame (now when none does). Takes ownership of `rel_fd` (when >= 0).
 fn release_later[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer, s: server.Surface, rel_fd: int, rel_point: u64) {
+    let bk = display.bkey(b)
     var held = false
     for o in 0..d.outs.len() {
-        if d.outs[o].alive and (d.drawn[o].contains(s) or d.be.holds(display.bkey(b))) {
+        if d.outs[o].alive and (d.drawn[o].contains(s) or d.be.holds(bk)) {
             d.releases[o].push(b)
             if rel_fd >= 0 {
-                d.points[o].push((rel_fd, rel_point))
+                d.points[o].push((bk, rel_fd, rel_point))
             }
             held = true
             break
@@ -284,6 +274,7 @@ fn release_later[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
         d.srv.release(b)
         if rel_fd >= 0 {
             d.sync.signal(rel_fd, rel_point)
+            os.close(rel_fd)
         }
         drop_orphan(mut d, b)
     }
@@ -331,11 +322,26 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
         let old = sf.buffer
         let new = info.buffer
         if old != new {
+            let old_rel_fd = sf.rel_fd
+            let old_rel_point = sf.rel_point
+            sf.rel_fd = -1
+            sf.rel_point = 0
+            var handed = false
             if let Some(ob) = old {
                 if d.srv.buffer(ob).kind != server.BufferKind.Shm or not d.srv.buffer_alive(ob) {
-                    release_later(mut d, ob, s, sf.rel_fd, sf.rel_point)
+                    release_later(mut d, ob, s, old_rel_fd, old_rel_point)
+                    handed = true
                 }
             }
+            if not handed and old_rel_fd >= 0 {
+                d.sync.signal(old_rel_fd, old_rel_point)
+                os.close(old_rel_fd)
+            }
+        } else if sf.rel_fd >= 0 {
+            d.sync.signal(sf.rel_fd, sf.rel_point)
+            os.close(sf.rel_fd)
+            sf.rel_fd = -1
+            sf.rel_point = 0
         }
         sf.buffer = new
         match new {
@@ -364,8 +370,13 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
         }
         match d.srv.release_point(s) {
             Some((fd, point)) => {
-                sf.rel_fd = fd
-                sf.rel_point = point
+                match os.dup(fd) {
+                    Ok(dup_fd) => {
+                        sf.rel_fd = dup_fd
+                        sf.rel_point = point
+                    }
+                    Err => sf.rel_fd = -1
+                }
             }
             None => sf.rel_fd = -1
         }
@@ -415,6 +426,10 @@ fn surface_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
     d.comp.forget(display.skey(s))
     d.pending_shm.retain(fn(x) => x != s)
     if let Some(sf) = d.surfs.remove(s) {
+        if sf.rel_fd >= 0 {
+            d.sync.signal(sf.rel_fd, sf.rel_point)
+            os.close(sf.rel_fd)
+        }
         if let Some(p) = sf.pending {
             d.srv.release(p)
         }

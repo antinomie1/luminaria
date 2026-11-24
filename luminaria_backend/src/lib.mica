@@ -569,10 +569,51 @@ pub fn Backend.retired(mut self, mut out: List[u64]) {
     self.retired.clear()
 }
 
+/// True when the acquired target on `o` is backed by a KMS dumb buffer
+/// (software Vulkan fallback) and expects CPU pixel upload before `present`.
+pub fn Backend.needs_upload(self, o: u32) -> bool {
+    let oi = int(o)
+    guard oi >= 0 and oi < self.acquired.len() else {
+        return false
+    }
+    let i = self.acquired[oi]
+    guard i >= 0 else {
+        return false
+    }
+    if let Some(d) = self.drm {
+        if oi < d.outputs.len() {
+            if let Some(s) = d.outputs[oi].swap {
+                if i < s.slots.len() {
+                    return s.slots[i].dumb_map.is_some()
+                }
+            }
+        }
+    }
+    return false
+}
+
+pub fn Backend.upload_frame(mut self, o: u32, pixels: &[u8], stride: int) {
+    let oi = int(o)
+    guard oi >= 0 and oi < self.acquired.len() else {
+        return
+    }
+    let i = self.acquired[oi]
+    guard i >= 0 else {
+        return
+    }
+    if let Some(dd) = self.drm.take() {
+        var d = dd
+        d.upload_slot(oi, i, pixels, stride)
+        self.drm = Some(d)
+    }
+}
+
 fn to_clips(rects: &[Rect]) -> List[uapi.ModeRect] {
     var out: List[uapi.ModeRect] = []
     for r in rects {
-        out.push(uapi.ModeRect { x1: r.0, y1: r.1, x2: r.0 + r.2, y2: r.1 + r.3 })
+        if r.2 > 0 and r.3 > 0 {
+            out.push(uapi.ModeRect { x1: r.0, y1: r.1, x2: r.0 + r.2, y2: r.1 + r.3 })
+        }
     }
     return out
 }
@@ -592,18 +633,22 @@ pub fn Backend.present(mut self, o: u32, fence: int, rects: &[Rect], tear: bool)
     self.acquired[oi] = -1
     if let Some(dd) = self.drm.take() {
         var d = dd
+        let overlay_only = fence < 0 and rects.is_empty() and not d.outputs[oi].queued_overlays.is_empty() and d.outputs[oi].shown >= 0
+        let slot_idx = if overlay_only { d.outputs[oi].shown } else { i }
         var fb: u32 = 0
         if let Some(s) = d.outputs[oi].swap {
-            fb = s.slots[i].id
+            fb = s.slots[slot_idx].id
         }
         let r = d.request(oi, fb, fence, to_clips(rects), tear)
         d.send(r)
-        if let Some(sw) = d.outputs[oi].swap.take() {
-            var s = sw
-            s.queued(i)
-            d.outputs[oi].swap = Some(s)
+        if not overlay_only {
+            if let Some(sw) = d.outputs[oi].swap.take() {
+                var s = sw
+                s.queued(i)
+                d.outputs[oi].swap = Some(s)
+            }
         }
-        d.outputs[oi].queued = i
+        d.outputs[oi].queued = slot_idx
         d.outputs[oi].direct_queued = 0
         self.drm = Some(d)
         return Ok(())
@@ -769,14 +814,31 @@ pub fn Backend.shown(self, o: u32) -> Option[u64] {
 /// display shows it itself (a cursor plane, the parent's cursor); false
 /// means the compositor draws it.
 pub fn Backend.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+    guard width >= 0 and height >= 0 else {
+        return false
+    }
     if let Some(dd) = self.drm.take() {
         var d = dd
-        var ok = true
-        for o in 0..d.outputs.len() {
-            if d.outputs[o].cursor_fb == 0 {
-                discard d.make_cursor(o)
+        let sw_env = env.get("LUMINARIA_SW_CURSOR").unwrap_or("") == "1" or env.get("WLR_NO_HARDWARE_CURSORS").unwrap_or("") == "1"
+        var ok = not sw_env and not d.outputs.is_empty()
+        if ok {
+            for o in 0..d.outputs.len() {
+                if d.outputs[o].cursor_fbs[0] == 0 {
+                    discard d.make_cursor(o)
+                }
+                if width == 0 or height == 0 {
+                    ok = ok and d.outputs[o].cursor_fbs[0] != 0
+                } else {
+                    ok = ok and d.set_cursor_image(o, pixels, u32(width), u32(height))
+                }
             }
-            ok = ok and d.set_cursor_image(o, pixels, u32(width), u32(height))
+            if ok and width > 0 and height > 0 and self.active {
+                for o in 0..d.outputs.len() {
+                    if d.outputs[o].cursor_shown and not d.outputs[o].modeset {
+                        d.update(o)
+                    }
+                }
+            }
         }
         self.drm = Some(d)
         return ok
@@ -802,15 +864,24 @@ pub fn Backend.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
     var d = dd
     let oi = int(o)
     if oi < d.outputs.len() and d.outputs[oi].cursor >= 0 {
+        var changed = false
         match at {
             Some((x, y)) => {
-                d.outputs[oi].cursor_x = x
-                d.outputs[oi].cursor_y = y
-                d.outputs[oi].cursor_shown = true
+                if not d.outputs[oi].cursor_shown or d.outputs[oi].cursor_x != x or d.outputs[oi].cursor_y != y {
+                    d.outputs[oi].cursor_x = x
+                    d.outputs[oi].cursor_y = y
+                    d.outputs[oi].cursor_shown = true
+                    changed = true
+                }
             }
-            None => d.outputs[oi].cursor_shown = false
+            None => {
+                if d.outputs[oi].cursor_shown {
+                    d.outputs[oi].cursor_shown = false
+                    changed = true
+                }
+            }
         }
-        if not d.outputs[oi].modeset and self.active {
+        if changed and not d.outputs[oi].modeset and self.active {
             d.update(oi)
         }
     }

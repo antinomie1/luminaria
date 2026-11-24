@@ -1102,8 +1102,12 @@ test "multiple seats have independent focus, cursor serials, idle and remove_sea
     for e in pump(mut f) {
         match e {
             WlPointer(pid, Enter(ser, _, _, _)) => {
-                if pid == p0 { ser0 = ser }
-                if pid == p1 { ser1 = ser }
+                if pid == p0 {
+                    ser0 = ser
+                }
+                if pid == p1 {
+                    ser1 = ser
+                }
             }
             _ => {}
         }
@@ -1136,8 +1140,12 @@ test "multiple seats have independent focus, cursor serials, idle and remove_sea
     for e in pump(mut f) {
         match e {
             ExtIdleNotification(id, Idled) => {
-                if id == n0 { idled0 = true }
-                if id == n1 { idled1 = true }
+                if id == n0 {
+                    idled0 = true
+                }
+                if id == n1 {
+                    idled1 = true
+                }
             }
             _ => {}
         }
@@ -1149,8 +1157,12 @@ test "multiple seats have independent focus, cursor serials, idle and remove_sea
     for e in pump(mut f) {
         match e {
             ExtIdleNotification(id, Resumed) => {
-                if id == n0 { res0 = true }
-                if id == n1 { res1 = true }
+                if id == n0 {
+                    res0 = true
+                }
+                if id == n1 {
+                    res1 = true
+                }
             }
             _ => {}
         }
@@ -1162,4 +1174,103 @@ test "multiple seats have independent focus, cursor serials, idle and remove_sea
         WlRegistry(_, GlobalRemove(n)) => n == seat_names[1]
         _ => false
     }))
+}
+
+test "reusing a completed wl_callback id for a new wl_surface stays bound" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 6) }
+    let s1 = comp.create_surface(mut f.c)
+    let cb = s1.frame(mut f.c)
+    let cb_id = cb.id
+    s1.commit(mut f.c)
+    discard pump(mut f)
+    var surf1 = server.Surface { id: server.ids.Id {} }
+    for e in events(mut f) {
+        match e {
+            Applied(s) => surf1 = s
+            _ => {}
+        }
+    }
+    // Server fires wl_callback.done outside Server.dispatch, freeing cb_id.
+    f.srv.frame_done(surf1, 42)
+    discard pump(mut f)
+    // Client immediately creates a new surface + popup reusing cb_id.
+    let s2 = comp.create_surface(mut f.c)
+    assert_eq(s2.id, cb_id)
+    let pos = wm.create_positioner(mut f.c)
+    pos.set_size(mut f.c, 200, 100)
+    pos.set_anchor_rect(mut f.c, 0, 0, 20, 20)
+    let xs = wm.get_xdg_surface(mut f.c, s2)
+    let _pop = xs.get_popup(mut f.c, None, pos)
+    pos.destroy(mut f.c)
+    s2.commit(mut f.c)
+    discard pump(mut f)
+    assert(events(mut f).any(fn(e) => match e {
+        PopupNew => true
+        _ => false
+    }))
+}
+
+test "destroying a text-input focused surface does not send stale leave on slot reuse" {
+    var f = setup()
+    let st = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(st, 3)
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let tim = ti.InputManager { id: bind(mut f, ti.input_manager_iface, 1) }
+    let tin = tim.get_text_input(mut f.c, ws)
+    let s1 = comp.create_surface(mut f.c)
+    s1.commit(mut f.c)
+    discard pump(mut f)
+    var surf1 = server.Surface { id: server.ids.Id {} }
+    for e in events(mut f) {
+        match e {
+            Applied(s) => surf1 = s
+            _ => {}
+        }
+    }
+    f.srv.keyboard_focus(st, Some(surf1))
+    assert(pump(mut f).any(fn(e) => match e {
+        ZwpTextInput(_, Enter(s)) => s == s1
+        _ => false
+    }))
+    // Client destroys the focused surface, freeing its server surface slot.
+    s1.destroy(mut f.c)
+    discard pump(mut f)
+    // A second surface reuses that freed slot; focusing it must NOT emit a stale
+    // `zwp_text_input_v3.leave` referencing the destroyed/reused surface.
+    let s2 = comp.create_surface(mut f.c)
+    let s3 = comp.create_surface(mut f.c)
+    s2.commit(mut f.c)
+    s3.commit(mut f.c)
+    discard pump(mut f)
+    var surfs: List[server.Surface] = []
+    for e in events(mut f) {
+        match e {
+            Applied(s) => surfs.push(s)
+            _ => {}
+        }
+    }
+    assert_eq(surfs.len(), 2)
+    f.srv.keyboard_focus(st, Some(surfs[1]))
+    var got_leave = false
+    var got_enter_s3 = false
+    for e in pump(mut f) {
+        match e {
+            ZwpTextInput(t, Leave) => {
+                if t == tin {
+                    got_leave = true
+                }
+            }
+            ZwpTextInput(t, Enter(s)) => {
+                if t == tin and s == s3 {
+                    got_enter_s3 = true
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(not got_leave)
+    assert(got_enter_s3)
 }

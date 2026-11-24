@@ -27,15 +27,10 @@ enum Manip {
     Pan(f64, f64, u32)
 }
 
-fn resize_step[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, edges: u32, sx: f64, sy: f64, w0: i32, h0: i32) {
-    guard let Some(cur) = d.wins.get(w) else {
-        return
-    }
-    guard not cur.inflight else {
-        return
-    }
-    let dx = i32(d.seats[0].px - sx)
-    let dy = i32(d.seats[0].py - sy)
+/// Target `(width, height)` for an active resize from the current seat-0 pointer.
+fn resize_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window, edges: u32, sx: f64, sy: f64, w0: i32, h0: i32) -> (i32, i32) {
+    let dx = i32((d.seats[0].px - sx).round())
+    let dy = i32((d.seats[0].py - sy).round())
     var nw = w0
     var nh = h0
     if edges & 8 != 0 {
@@ -57,12 +52,72 @@ fn resize_step[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w
     if maxh > 0 {
         nh = min(nh, maxh)
     }
-    guard nw != cur.width or nh != cur.height else {
+    return (nw, nh)
+}
+
+/// Send the latest resize configure for an active `Manip.Resize`.
+/// When `force` is false (pointer motion / ack), waits for the current
+/// configure to be acked so slow clients are not flooded at pointer rate;
+/// when `force` is true (once per output frame, right before `frame_done`),
+/// always delivers the latest cursor target so frame-paced clients never
+/// render a stale size.
+fn resize_step[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], force: bool) {
+    guard not d.seats.is_empty() else {
         return
     }
-    var st = cur.states
-    st.resizing = true
-    discard d.configure(w, nw, nh, st)
+    match d.manip.active {
+        Resize(w, edges, sx, sy, w0, h0, _, _) => {
+            guard let Some(cur) = d.wins.get(w) else {
+                return
+            }
+            guard force or not cur.inflight else {
+                return
+            }
+            let (nw, nh) = resize_target(d, w, edges, sx, sy, w0, h0)
+            guard nw != cur.width or nh != cur.height else {
+                return
+            }
+            var st = cur.states
+            st.resizing = true
+            discard d.configure(w, nw, nh, st)
+        }
+        _ => {}
+    }
+}
+
+/// True when an active resize has a newer target size waiting to be sent
+/// on the next output frame.
+fn needs_resize_sync[O: plug.Output, R: plug.Renderer](d: display.Display[O, R]) -> bool {
+    guard not d.seats.is_empty() else {
+        return false
+    }
+    return match d.manip.active {
+        Resize(w, edges, sx, sy, w0, h0, _, _) => {
+            guard let Some(cur) = d.wins.get(w) else {
+                return false
+            }
+            let (nw, nh) = resize_target(d, w, edges, sx, sy, w0, h0)
+            return nw != cur.width or nh != cur.height
+        }
+        _ => false
+    }
+}
+
+/// Effective `(off_x, off_y)` for window `w`: during a left/top interactive
+/// resize, derives the offset purely from the window's committed geometry so
+/// the opposite edge stays pixel-locked regardless of commit timing or cell snap.
+fn resize_offset[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window, geo_w: i32, geo_h: i32, win: display.Win) -> (f64, f64) {
+    match d.manip.active {
+        Resize(mw, edges, _, _, w0, h0, ox, oy) => {
+            if mw == w {
+                let x = if edges & 4 != 0 and geo_w > 0 { ox + f64(w0 - geo_w) } else { ox }
+                let y = if edges & 1 != 0 and geo_h > 0 { oy + f64(h0 - geo_h) } else { oy }
+                return (x, y)
+            }
+        }
+        _ => {}
+    }
+    return (win.off_x, win.off_y)
 }
 
 fn end_manipulation[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
@@ -71,12 +126,17 @@ fn end_manipulation[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, 
             let cur = d.wins.get(w).unwrap_or(display.Win {})
             d.emit(display.Event.Moved(w, cur.off_x, cur.off_y))
         }
-        Resize(w, _, _, _, _, _, _, _) => {
+        Resize(w, edges, _, _, w0, h0, ox, oy) => {
             let cur = d.wins.get(w).unwrap_or(display.Win {})
+            let rw = if cur.width > 0 { cur.width } else { w0 }
+            let rh = if cur.height > 0 { cur.height } else { h0 }
+            let fx = if edges & 4 != 0 and rw > 0 { ox + f64(w0 - rw) } else { ox }
+            let fy = if edges & 1 != 0 and rh > 0 { oy + f64(h0 - rh) } else { oy }
+            discard d.wins.insert(w, display.Win { off_x: fx, off_y: fy, ..cur })
             var st = cur.states
             st.resizing = false
-            discard d.configure(w, cur.width, cur.height, st)
-            d.emit(display.Event.Resized(w, cur.off_x, cur.off_y, cur.width, cur.height))
+            discard d.configure(w, rw, rh, st)
+            d.emit(display.Event.Resized(w, fx, fy, rw, rh))
         }
         Pan => d.emit(display.Event.Panned(d.manip.pan_x, d.manip.pan_y))
         Idle => {}

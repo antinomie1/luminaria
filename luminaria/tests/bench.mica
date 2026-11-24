@@ -30,3 +30,15 @@ test "hit testing throughput" {
     io.print("hit test, 512 surfaces: {ns} ns")
     assert_eq(found, 0)
 }
+
+test "hit testing handles negative coordinates without conversion overflow" {
+    let dir = fs.create_temp_dir("luminaria-hit-neg").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let srv = lum.server.Server.open("").expect("server")
+    var h = lum.hit.Hits.new()
+    h.add(lum.Surface { id: lum.server.ids.Id { index: 0, gen: 1 } }, -1920.0, -1080.0, 500.0, 400.0, 1.0)
+    // Must not panic when querying negative pointer coordinates.
+    assert(h.find(srv, -1500.0, -800.0).is_none())
+    assert(h.find(srv, -0.5, -0.5).is_none())
+    assert(h.find(srv, -2000.0, -1200.0).is_none())
+}

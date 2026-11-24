@@ -20,7 +20,7 @@ fn schedule[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: i
     guard d.outs[o].alive and not d.outs[o].armed and not d.outs[o].due else {
         return
     }
-    var wants = d.outs[o].dirty or d.animating
+    var wants = d.outs[o].dirty or d.animating or manipulation.needs_resize_sync(d)
     if not wants {
         for s in d.drawn[o] {
             if d.srv.wants_frame(s) {
@@ -244,10 +244,20 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
                 return Err(r.unwrap_err())
             }
             if let Some(fence) = maybe_fence {
+                var present_fence = fence
+                if d.be.needs_upload(u32(o)) {
+                    if let Ok(px) = d.comp.read(key) {
+                        d.be.upload_frame(u32(o), px, int(d.outs[o].width) * 4)
+                    }
+                    if present_fence >= 0 {
+                        os.close(present_fence)
+                        present_fence = -1
+                    }
+                }
                 var rects: List[(i32, i32, i32, i32)] = []
                 d.comp.changed(o, mut rects)
                 count_damage(mut d, o, rects)
-                try d.be.present(u32(o), fence, rects, false)
+                try d.be.present(u32(o), present_fence, rects, false)
                 d.probes[o].frame(time.now_ns() - t0)
             } else if not promoted.is_empty() {
                 let empty: List[(i32, i32, i32, i32)] = []
@@ -314,6 +324,9 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
         }
         d.outs[o].dirty = false
     }
+    // Deliver the latest interactive resize size right before `frame_done` so
+    // frame-paced clients receive the exact pointer target in the same flush.
+    manipulation.resize_step(mut d, true)
     // What this frame shows: its clients hear of it.
     var drawn: List[server.Surface] = []
     d.origins.each(fn(s, _) {
@@ -451,8 +464,13 @@ fn presented[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: 
             clients.drop_orphan(mut d, b)
         }
     }
-    for (fd, point) in mem.replace(mut d.points[o], []) {
-        d.sync.signal(fd, point)
+    for (bk, fd, point) in mem.replace(mut d.points[o], []) {
+        if d.be.holds(bk) {
+            d.points[o].push((bk, fd, point))
+        } else {
+            d.sync.signal(fd, point)
+            os.close(fd)
+        }
     }
     shell.presented(mut d, o)
     schedule(mut d, o)

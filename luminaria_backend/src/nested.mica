@@ -239,16 +239,43 @@ fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
             out.push(types.Event.Input(types.Input.Axis(axis_ms(), types.AxisSource.Wheel, 0.0, 0.0, if vertical { 0 } else { v120 }, if vertical { v120 } else { 0 }, false)))
         }
         WlKeyboard(_, Keymap(_, f, size)) => {
-            if let Ok(m) = os.map(f.raw(), int(size), 0, false) {
+            var ktext = ""
+            let sz = int(size)
+            if let Ok(m) = os.map(f.raw(), sz, 0, false) {
                 unsafe {
-                    let text = Ptr.slice(m.ptr, max(int(size) - 1, 0))
-                    match keyboard.Keyboard.from_text(std_str(text)) {
-                        Ok(kb) => {
-                            self.keyboard = Some(kb)
-                            out.push(types.Event.Keymap)
+                    let text = Ptr.slice(m.ptr, max(sz - 1, 0))
+                    ktext = std_str(text)
+                }
+            } else if sz > 0 {
+                var buf: List[u8] = List.with_cap(sz)
+                var chunk: List[u8] = []
+                for _ in 0..4096 {
+                    chunk.push(0)
+                }
+                while buf.len() < sz {
+                    match os.read_into(f.raw(), mut chunk) {
+                        Ok(n) => {
+                            if n <= 0 {
+                                break
+                            }
+                            for i in 0..n {
+                                buf.push(chunk[i])
+                            }
                         }
-                        Err => {}
+                        Err => {
+                            break
+                        }
                     }
+                }
+                ktext = std_str(buf)
+            }
+            if not ktext.is_empty() {
+                match keyboard.Keyboard.from_text(ktext) {
+                    Ok(kb) => {
+                        self.keyboard = Some(kb)
+                        out.push(types.Event.Keymap)
+                    }
+                    Err => {}
                 }
             }
         }

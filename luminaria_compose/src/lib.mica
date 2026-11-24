@@ -558,8 +558,9 @@ pub fn Compositor.targets(mut self, w: types.Want) -> Result[List[types.Target],
         return Err("render target format {w.format:08x} is not supported")
     }
     let desc = gpu.TextureDesc { width: u32(w.width), height: u32(w.height), format: vf, target: true }
+    let do_export = w.export and self.dev.can_export_dmabuf()
     var mods: List[u64] = []
-    if w.export {
+    if do_export {
         let gpu_mods = self.dev.dmabuf_modifiers(vf, true)
         for m in gpu_mods {
             if w.modifiers.is_empty() or w.modifiers.contains(m) {
@@ -574,7 +575,7 @@ pub fn Compositor.targets(mut self, w: types.Want) -> Result[List[types.Target],
     for _ in 0..w.count {
         let key = self.next_target
         self.next_target += 1
-        if w.export {
+        if do_export {
             let (t, b) = try self.dev.export_dmabuf_with(desc, mods)
             discard self.targets.insert(key, t)
             let n = b.plane_count()
@@ -655,8 +656,13 @@ pub fn Compositor.render(mut self, o: int, key: u64, age: u32) -> Result[Option[
         self.dev.cancel(take e)
         return Ok(None)
     }
-    let (_, fence) = try self.dev.submit_sync_file(take e)
-    return Ok(Some(int(fence)))
+    if self.dev.can_export_sync_file() {
+        let (_, fence) = try self.dev.submit_sync_file(take e)
+        return Ok(Some(int(fence)))
+    }
+    let ticket = try self.dev.submit(take e)
+    try self.dev.wait(ticket)
+    return Ok(Some(-1))
 }
 
 /// The pixels of target `key` (B8G8R8A8), once the GPU is done with it.
