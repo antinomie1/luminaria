@@ -468,6 +468,9 @@ struct DragData {
     offer: u32 = 0xFFFFFFFF
     x: f64 = 0.0
     y: f64 = 0.0
+    /// The icon's position from the pointer: the sum of its attach offsets.
+    icon_x: i32 = 0
+    icon_y: i32 = 0
 }
 
 /// zwp_virtual_keyboard_v1 (input methods, on-screen keyboards, wtype).

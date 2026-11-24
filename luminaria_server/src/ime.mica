@@ -70,19 +70,26 @@ fn commit(mut srv: server.Server, k: u32) {
     let was = srv.text_inputs.items[i].current.enabled
     let old_rect = srv.text_inputs.items[i].current.rect
     srv.text_inputs.items[i].commits += 1
+    // Between leave and the next enter requests are ignored: a commit
+    // still in flight when focus left must not leave the field enabled,
+    // or its next enable would never activate the input method.
+    guard srv.text_inputs.items[i].focus != state.none else {
+        srv.text_inputs.items[i].pending = state.TextState {}
+        return
+    }
     srv.text_inputs.items[i].current = srv.text_inputs.items[i].pending.clone()
     // Text and its cause are one-shot.
     srv.text_inputs.items[i].pending.cause = 0
     let si = srv.text_inputs.items[i].seat
-    guard srv.text_inputs.items[i].focus != state.none else {
-        return
-    }
     let now = srv.text_inputs.items[i].current.enabled
-    if now and not was {
+    let active = srv.seats.items[int(si)].im_active
+    let mine = active == k
+    // Enabled now, or still enabled with the input method free again.
+    if now and not mine and (not was or active == state.none) {
         activate(mut srv, si, k)
-    } else if was and not now {
+    } else if was and not now and mine {
         deactivate(mut srv, si)
-    } else if now and srv.seats.items[int(si)].im_active == k {
+    } else if now and mine {
         send_state(mut srv, si, k)
     }
     let r = srv.text_inputs.items[i].current.rect
@@ -117,6 +124,7 @@ fn focus_changed(mut srv: server.Server, si: u32) {
             }
             srv.text_inputs.items[k].focus = state.none
             srv.text_inputs.items[k].current.enabled = false
+            srv.text_inputs.items[k].pending = state.TextState {}
             if srv.surfaces.used(int(old)) and srv.surfaces.items[int(old)].client == srv.text_inputs.items[k].client {
                 let c = int(srv.text_inputs.items[k].client)
                 ti.Input { id: srv.text_inputs.items[k].obj }.leave(mut srv.conns[c], wl.Surface { id: srv.surfaces.items[int(old)].obj })
@@ -152,6 +160,7 @@ fn surface_gone(mut srv: server.Server, si: u32) {
         }
         srv.text_inputs.items[k].focus = state.none
         srv.text_inputs.items[k].current.enabled = false
+        srv.text_inputs.items[k].pending = state.TextState {}
     }
 }
 
@@ -169,6 +178,9 @@ fn activate(mut srv: server.Server, si: u32, k: u32) {
     let (c, m) = method(srv, si)
     m.activate(mut srv.conns[c])
     send_state(mut srv, si, k)
+    // The popups follow the new field's cursor.
+    popup_rects(mut srv, si)
+    srv.push(server.Event.ImeChanged(ids.Seat { id: srv.seats.id(si) }))
 }
 
 /// The text field's state to the input method, then done.
@@ -195,6 +207,7 @@ fn deactivate(mut srv: server.Server, si: u32) {
     let (c, m) = method(srv, si)
     m.deactivate(mut srv.conns[c])
     m.done(mut srv.conns[c])
+    srv.push(server.Event.ImeChanged(ids.Seat { id: srv.seats.id(si) }))
 }
 
 fn method_manager(mut srv: server.Server, ci: u32, take req: im.MethodManagerRequest) {

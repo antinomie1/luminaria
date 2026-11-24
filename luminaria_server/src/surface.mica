@@ -385,6 +385,15 @@ fn apply_state(mut srv: server.Server, si: u32, take st: state.State) {
     }
     srv.surfaces.items[i].current.dx = s.dx
     srv.surfaces.items[i].current.dy = s.dy
+    // A drag icon moves by its offsets (its hotspot stays on the pointer).
+    if srv.surfaces.items[i].role == state.Role.DragIcon and (s.dx != 0 or s.dy != 0) {
+        for k in 0..srv.seats.items.len() {
+            if srv.seats.used(k) and srv.seats.items[k].drag.icon == si {
+                srv.seats.items[k].drag.icon_x = ids.clamp(srv.seats.items[k].drag.icon_x + s.dx)
+                srv.seats.items[k].drag.icon_y = ids.clamp(srv.seats.items[k].drag.icon_y + s.dy)
+            }
+        }
+    }
     for r in s.damage {
         ids.add_damage(mut srv.surfaces.items[i].applied_damage, r)
         changed |= state.changed_damage

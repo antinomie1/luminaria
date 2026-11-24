@@ -8,9 +8,11 @@ import libseat_sys as seat
 
 static var active: bool = false
 static var changed: bool = false
-/// Open devices: fd + 1 (0 is free) and libseat device id.
-static var devices: [16]i32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-static var device_ids: [16]i32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+/// Open devices: fd and libseat device id. Unbounded: a desk with a few
+/// wireless dongles has more than a handful of event nodes, and a device
+/// that is not closed through the seat cannot be opened again (a dongle
+/// coming back after suspend).
+static var devices: List[(int, i32)] = []
 static var handle: Option[seat.Libseat] = None
 /// libseat keeps the listener's address.
 static var listener: seat.SeatListener = seat.SeatListener {}
@@ -80,13 +82,7 @@ fn open_device(path: str) -> Result[int, str] {
         guard id >= 0 and fd >= 0 else {
             return Err("libseat cannot open {path}")
         }
-        for i in 0..16 {
-            if devices[i] == 0 {
-                devices[i] = fd + 1
-                device_ids[i] = id
-                break
-            }
-        }
+        devices.push((int(fd), id))
         return Ok(int(fd))
     }
 }
@@ -94,12 +90,12 @@ fn open_device(path: str) -> Result[int, str] {
 fn close_device(fd: int) {
     unsafe {
         if let Some(s) = handle {
-            for i in 0..16 {
-                if int(devices[i]) == fd + 1 {
-                    discard seat.close_device(s, device_ids[i])
-                    devices[i] = 0
+            for (f, id) in devices {
+                if f == fd {
+                    discard seat.close_device(s, id)
                 }
             }
+            devices.retain(fn(d) => d.0 != fd)
         }
     }
     os.close(fd)

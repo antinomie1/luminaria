@@ -1575,13 +1575,14 @@ pub fn Server.dragging(self, st: ids.Seat) -> bool {
     return self.seats.live(st.id) and self.seats.items[int(st.id.index)].drag.active
 }
 
-/// The image a drag shows under the pointer.
-pub fn Server.drag_icon(self, st: ids.Seat) -> Option[ids.Surface] {
+/// The image a drag shows under the pointer and its offset from the
+/// pointer (surface pixels).
+pub fn Server.drag_icon(self, st: ids.Seat) -> Option[(ids.Surface, i32, i32)] {
     guard self.dragging(st) else {
         return None
     }
-    let ic = self.seats.items[int(st.id.index)].drag.icon
-    return if ic == state.none or not self.surfaces.used(int(ic)) { None } else { Some(ids.Surface { id: self.surfaces.id(ic) }) }
+    let d = self.seats.items[int(st.id.index)].drag
+    return if d.icon == state.none or not self.surfaces.used(int(d.icon)) { None } else { Some((ids.Surface { id: self.surfaces.id(d.icon) }, d.icon_x, d.icon_y)) }
 }
 
 // ------------------------------------------------------------ capture

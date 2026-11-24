@@ -137,6 +137,15 @@ fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
                                 if not pressed and d.seats[0].buttons == 0 {
                                     manipulation.end_manipulation(mut d)
                                 }
+                                // The client that asked for the move saw the press:
+                                // it and the server's button count see the release
+                                // too, or the next drag never drops.
+                                if not pressed {
+                                    discard d.srv.pointer_button(st, t, button, false)
+                                    if d.seats[0].buttons == 0 {
+                                        d.seats[0].grab = None
+                                    }
+                                }
                                 return
                             }
                             _ => {}

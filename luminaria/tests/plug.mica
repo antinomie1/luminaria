@@ -1133,3 +1133,92 @@ test "hardware cursor is positioned on startup after initial outputs are added" 
     assert(sets >= 1)
     assert(pos.is_some())
 }
+
+/// Like `plug_pump`, keeping what the client received.
+fn plug_collect(mut fx: PlugFx, ms: int) -> List[proto.Event] {
+    var got: List[proto.Event] = []
+    let end = time.now_ns() + ms * 1000000
+    while time.now_ns() < end {
+        discard fx.c.flush()
+        while true {
+            guard let Some(e) = fx.d.poll().expect("poll") else {
+                break
+            }
+            fx.d.accept(e)
+        }
+        discard fx.c.read()
+        while true {
+            match proto.next_event(mut fx.c) {
+                Ok(Some(ev)) => got.push(ev)
+                Ok(None) => {
+                    break
+                }
+                Err(err) => panic("client: {err}")
+            }
+        }
+        time.sleep_ms(2)
+    }
+    return got
+}
+
+test "a drag after a client-requested move drops on release" {
+    let dir = fs.create_temp_dir("luminaria-plug-drag").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none(), width: 400, height: 400 }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let shm = wl.Shm { id: bind_global(mut fx, wl.shm_iface, 1) }
+    let ws = wl.Seat { id: bind_global(mut fx, wl.seat_iface, 7) }
+    let ddm = wl.DataDeviceManager { id: bind_global(mut fx, wl.data_device_manager_iface, 3) }
+    discard ws.get_pointer(mut fx.c)
+    let dev = ddm.get_data_device(mut fx.c, ws)
+    let s = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, s)
+    discard xs.get_toplevel(mut fx.c)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let fd = os.memfd("shm", 100 * 80 * 4).expect("memfd")
+    let pool = shm.create_pool(mut fx.c, fd, 100 * 80 * 4)
+    os.close(fd)
+    s.attach(mut fx.c, Some(pool.create_buffer(mut fx.c, 0, 100, 80, 400, wl.ShmFormat.Xrgb8888)), 0, 0)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    assert_eq(fx.wins.len(), 1)
+    let w = fx.wins[0]
+    let seat0 = fx.d.seats()[0]
+    fx.d.layout(fn(mut l) {
+        l.window(w, 50.0, 50.0, lum.Style {})
+    })
+    assert(fx.d.window_at(60.0, 60.0) == Some(w))
+    fx.d.warp_on(seat0, 60.0, 60.0)
+    plug_pump(mut fx, 10)
+
+    // A title-bar drag: the client asks to move on the press; the library
+    // takes the release.
+    fx.d.inject_on(seat0, lum.types.Input.Button(1, u32(0x110), true))
+    plug_pump(mut fx, 10)
+    fx.d.manipulate_move(w)
+    fx.d.inject_on(seat0, lum.types.Input.Button(2, u32(0x110), false))
+    assert(plug_collect(mut fx, 20).any(fn(e) => match e {
+        WlPointer(_, Button(_, _, 272, Released)) => true
+        _ => false
+    }))
+
+    // Then a drag and drop: it ends when the button goes up.
+    fx.d.inject_on(seat0, lum.types.Input.Button(3, u32(0x110), true))
+    plug_pump(mut fx, 10)
+    let src = ddm.create_data_source(mut fx.c)
+    src.offer(mut fx.c, "text/plain")
+    dev.start_drag(mut fx.c, Some(src), s, None, 0)
+    plug_pump(mut fx, 10)
+    fx.d.inject_on(seat0, lum.types.Input.Button(4, u32(0x110), false))
+    assert(plug_collect(mut fx, 20).any(fn(e) => match e {
+        WlDataSource(x, Cancelled) => x == src
+        _ => false
+    }))
+}

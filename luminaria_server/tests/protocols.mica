@@ -1274,3 +1274,98 @@ test "destroying a text-input focused surface does not send stale leave on slot 
     assert(not got_leave)
     assert(got_enter_s3)
 }
+
+test "a text field enabled again after focus came back activates the input method" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let seat = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(seat, 3)
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let tim = ti.InputManager { id: bind(mut f, ti.input_manager_iface, 1) }
+    let imm = im.MethodManager { id: bind(mut f, im.method_manager_iface, 1) }
+    let (_, a) = plain_surface(mut f, comp)
+    let (_, b) = plain_surface(mut f, comp)
+    let text = tim.get_text_input(mut f.c, ws)
+    discard imm.get_input_method(mut f.c, ws)
+    discard pump(mut f)
+    f.srv.keyboard_focus(seat, Some(a))
+    discard pump(mut f)
+    text.enable(mut f.c)
+    text.commit(mut f.c)
+    discard pump(mut f)
+    // Focus leaves for another client's surface while the field is still
+    // enabled: its commit, sent before it saw leave, arrives afterwards.
+    f.srv.keyboard_focus(seat, None)
+    text.set_cursor_rectangle(mut f.c, 1, 2, 3, 4)
+    text.commit(mut f.c)
+    discard pump(mut f)
+    assert(f.srv.text_cursor(seat).is_none())
+    // Back: the client enables again and the input method activates.
+    f.srv.keyboard_focus(seat, Some(b))
+    discard pump(mut f)
+    text.enable(mut f.c)
+    text.commit(mut f.c)
+    assert(pump(mut f).any(fn(e) => match e {
+        ZwpInputMethod(_, Activate) => true
+        _ => false
+    }))
+    let (cs, _) = f.srv.text_cursor(seat).expect("text cursor")
+    assert_eq(cs, b)
+}
+
+test "disabling one text field leaves the input method on the other" {
+    var f = setup()
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let seat = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(seat, 3)
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let tim = ti.InputManager { id: bind(mut f, ti.input_manager_iface, 1) }
+    let imm = im.MethodManager { id: bind(mut f, im.method_manager_iface, 1) }
+    let (_, a) = plain_surface(mut f, comp)
+    let t1 = tim.get_text_input(mut f.c, ws)
+    let t2 = tim.get_text_input(mut f.c, ws)
+    discard imm.get_input_method(mut f.c, ws)
+    discard pump(mut f)
+    f.srv.keyboard_focus(seat, Some(a))
+    discard pump(mut f)
+    t1.enable(mut f.c)
+    t1.commit(mut f.c)
+    t2.enable(mut f.c)
+    t2.commit(mut f.c)
+    discard pump(mut f)
+    t1.disable(mut f.c)
+    t1.commit(mut f.c)
+    assert(not pump(mut f).any(fn(e) => match e {
+        ZwpInputMethod(_, Deactivate) => true
+        _ => false
+    }))
+    assert(f.srv.text_cursor(seat).is_some())
+}
+
+test "a drag icon keeps the offset it moved by" {
+    var f = setup()
+    let st = f.srv.add_seat("seat0")
+    f.srv.set_capabilities(st, 1)
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let ws = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let ddm = wl.DataDeviceManager { id: bind(mut f, wl.data_device_manager_iface, 3) }
+    discard ws.get_pointer(mut f.c)
+    let dev = ddm.get_data_device(mut f.c, ws)
+    let (a, sa) = plain_surface(mut f, comp)
+    let icon = comp.create_surface(mut f.c)
+    f.srv.pointer_focus(st, Some(sa), 1.0, 1.0)
+    let serial = f.srv.pointer_button(st, 0, 272, true)
+    let src = ddm.create_data_source(mut f.c)
+    dev.start_drag(mut f.c, Some(src), a, Some(icon), serial)
+    icon.attach(mut f.c, Some(shm_buffer(mut f, 8, 8)), 0, 0)
+    icon.offset(mut f.c, -5, -6)
+    icon.commit(mut f.c)
+    discard pump(mut f)
+    let (_, x, y) = f.srv.drag_icon(st).expect("icon")
+    assert_eq((x, y), (-5, -6))
+    icon.offset(mut f.c, 1, 1)
+    icon.commit(mut f.c)
+    discard pump(mut f)
+    let (_, x2, y2) = f.srv.drag_icon(st).expect("icon")
+    assert_eq((x2, y2), (-4, -5))
+}

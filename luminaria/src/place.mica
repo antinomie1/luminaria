@@ -191,9 +191,9 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
         shell.place_ime(mut d, mut per, mut masks)
         // Each seat's drag image follows that seat's pointer.
         for si in 0..d.seats.len() {
-            if let Some(icon) = d.srv.drag_icon(d.seats[si].seat) {
+            if let Some((icon, ix, iy)) = d.srv.drag_icon(d.seats[si].seat) {
                 if d.srv.info(icon).mapped {
-                    place_tree(mut d, icon, d.seats[si].px, d.seats[si].py, 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
+                    place_tree(mut d, icon, d.seats[si].px + f64(ix), d.seats[si].py + f64(iy), 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
                 }
             }
         }
