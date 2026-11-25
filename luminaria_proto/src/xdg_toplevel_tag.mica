@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import xdg_shell
 
 /// xdg_toplevel_tag_manager_v1: protocol for setting toplevel tags
-pub struct ToplevelTagManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ToplevelTagManager {
     pub id: u32
 }
 
@@ -54,14 +55,14 @@ pub fn ToplevelTagManager.destroy(self, mut conn: wire.Conn) {
 }
 
 /// set tag
-pub fn ToplevelTagManager.set_toplevel_tag(self, mut conn: wire.Conn, toplevel: xdg_shell.Toplevel, tag: &str) {
+pub fn ToplevelTagManager.set_toplevel_tag(self, mut conn: wire.Conn, toplevel: xdg_shell.Toplevel, tag: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(tag) + 4)
     wr.u32(mut conn, toplevel.id)
     wr.str(mut conn, tag)
 }
 
 /// set description
-pub fn ToplevelTagManager.set_toplevel_description(self, mut conn: wire.Conn, toplevel: xdg_shell.Toplevel, description: &str) {
+pub fn ToplevelTagManager.set_toplevel_description(self, mut conn: wire.Conn, toplevel: xdg_shell.Toplevel, description: StrSlice) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(description) + 4)
     wr.u32(mut conn, toplevel.id)
     wr.str(mut conn, description)

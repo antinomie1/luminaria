@@ -459,7 +459,7 @@ test "decorations, activation and the toplevel list" {
     }
 }
 
-test "a pointer lock with relative motion" {
+test "a pointer lock follows focus, frames relative motion and hints on unlock" {
     var f = setup()
     let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
     let seat = f.srv.add_seat("seat0")
@@ -469,29 +469,39 @@ test "a pointer lock with relative motion" {
     let cons = pc.PointerConstraints { id: bind(mut f, pc.pointer_constraints_iface, 1) }
     let rel = rp.PointerManager { id: bind(mut f, rp.pointer_manager_iface, 1) }
     let (surf, target) = plain_surface(mut f, comp)
+    let r = rel.get_relative_pointer(mut f.c, ptr)
+    f.srv.pointer_focus(seat, Some(target), 1.0, 1.0)
+    f.srv.keyboard_focus(seat, Some(target))
+    discard pump(mut f)
+    // The pointer is already on the focused surface: the lock starts at once.
     let lp = cons.lock_pointer(mut f.c, surf, ptr, None, pc.PointerConstraintsLifetime.Persistent)
     lp.set_cursor_position_hint(mut f.c, 1.0, 2.0)
-    let r = rel.get_relative_pointer(mut f.c, ptr)
-    discard pump(mut f)
-    let c = f.srv.constraint(seat, target).expect("constraint")
-    assert(c.lock and not c.active)
-    f.srv.pointer_focus(seat, Some(target), 1.0, 1.0)
-    f.srv.set_constraint(seat, target, true)
-    f.srv.relative_motion(seat, 1000, 3.0, 4.0, 1.5, 2.0)
     var locked = false
-    var motion = false
     for e in pump(mut f) {
         match e {
             ZwpLockedPointer(x, Locked) => locked = x == lp
-            ZwpRelativePointer(x, RelativeMotion(_, lo, dx, dy, ux, uy)) => motion = x == r and lo == 1000 and dx == 3.0 and dy == 4.0 and ux == 1.5 and uy == 2.0
             _ => {}
         }
     }
-    assert(locked and motion)
-    let now = f.srv.constraint(seat, target).expect("constraint")
-    assert(now.active)
-    assert_eq(now.hint, Some((1.0, 2.0)))
-    f.srv.set_constraint(seat, target, false)
+    assert(locked)
+    let (on, c) = f.srv.active_constraint(seat).expect("active")
+    assert(on == target and c.lock and c.active)
+    assert_eq(c.hint, Some((1.0, 2.0)))
+    // Locked, relative motion comes alone and still ends with a frame.
+    f.srv.relative_motion(seat, 1000, 3.0, 4.0, 1.5, 2.0)
+    f.srv.pointer_frame(seat)
+    var motion = false
+    var framed = false
+    for e in pump(mut f) {
+        match e {
+            ZwpRelativePointer(x, RelativeMotion(_, lo, dx, dy, ux, uy)) => motion = x == r and lo == 1000 and dx == 3.0 and dy == 4.0 and ux == 1.5 and uy == 2.0
+            WlPointer(_, Frame) => framed = motion
+            _ => {}
+        }
+    }
+    assert(motion and framed)
+    // Keyboard focus elsewhere ends it; the hint says where the pointer is.
+    f.srv.keyboard_focus(seat, None)
     var unlocked = false
     for e in pump(mut f) {
         match e {
@@ -499,7 +509,33 @@ test "a pointer lock with relative motion" {
             _ => {}
         }
     }
-    assert(unlocked)
+    assert(unlocked and f.srv.active_constraint(seat).is_none())
+    var hinted = false
+    for e in events(mut f) {
+        match e {
+            PointerHint(st, hs, x, y) => hinted = st == seat and hs == target and x == 1.0 and y == 2.0
+            _ => {}
+        }
+    }
+    assert(hinted)
+    // Focus back: the persistent lock resumes.
+    f.srv.keyboard_focus(seat, Some(target))
+    discard pump(mut f)
+    assert(f.srv.active_constraint(seat).is_some())
+    // Destroyed and made again on the same surface (SDL's warp emulation),
+    // the new lock starts too.
+    lp.destroy(mut f.c)
+    discard pump(mut f)
+    assert(f.srv.active_constraint(seat).is_none())
+    let lp2 = cons.lock_pointer(mut f.c, surf, ptr, None, pc.PointerConstraintsLifetime.Persistent)
+    locked = false
+    for e in pump(mut f) {
+        match e {
+            ZwpLockedPointer(x, Locked) => locked = x == lp2
+            _ => {}
+        }
+    }
+    assert(locked)
 }
 
 test "idle notifications fire, resume and wait for inhibitors" {
@@ -706,16 +742,16 @@ test "a screen capture copies the output's image into the client's buffer" {
     }
     f.srv.capture(o, px, 4, 2, 1500000000)
     var ready = false
-    var when = (u32(9), u32(9), u32(9))
+    var ts = (u32(9), u32(9), u32(9))
     for e in pump(mut f) {
         match e {
-            ExtImageCopyCaptureFrame(_, PresentationTime(hi, lo, ns)) => when = (hi, lo, ns)
+            ExtImageCopyCaptureFrame(_, PresentationTime(hi, lo, ns)) => ts = (hi, lo, ns)
             ExtImageCopyCaptureFrame(_, Ready) => ready = true
             _ => {}
         }
     }
     assert(ready)
-    assert_eq(when, (u32(0), u32(1), u32(500000000)))
+    assert_eq(ts, (u32(0), u32(1), u32(500000000)))
     var mm = m
     let got = mm.bytes()
     assert_eq(got[0], u8(0))

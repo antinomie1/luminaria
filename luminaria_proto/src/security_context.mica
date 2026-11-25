@@ -4,7 +4,8 @@ import std.collections.map
 import luminaria_wire as wire
 
 /// wp_security_context_manager_v1: client security context manager
-pub struct ContextManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ContextManager {
     pub id: u32
 }
 
@@ -47,7 +48,8 @@ fn decode_context_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ContextMan
 }
 
 /// wp_security_context_v1: client security context
-pub struct Context derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Context {
     pub id: u32
 }
 
@@ -132,19 +134,19 @@ pub fn Context.destroy(self, mut conn: wire.Conn) {
 }
 
 /// set the sandbox engine
-pub fn Context.set_sandbox_engine(self, mut conn: wire.Conn, name: &str) {
+pub fn Context.set_sandbox_engine(self, mut conn: wire.Conn, name: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(name))
     wr.str(mut conn, name)
 }
 
 /// set the application ID
-pub fn Context.set_app_id(self, mut conn: wire.Conn, app_id: &str) {
+pub fn Context.set_app_id(self, mut conn: wire.Conn, app_id: StrSlice) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(app_id))
     wr.str(mut conn, app_id)
 }
 
 /// set the instance ID
-pub fn Context.set_instance_id(self, mut conn: wire.Conn, instance_id: &str) {
+pub fn Context.set_instance_id(self, mut conn: wire.Conn, instance_id: StrSlice) {
     var wr = conn.begin(self.id, 3, 8 + wire.str_size(instance_id))
     wr.str(mut conn, instance_id)
 }

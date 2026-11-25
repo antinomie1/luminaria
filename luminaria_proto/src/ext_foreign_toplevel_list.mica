@@ -4,7 +4,8 @@ import std.collections.map
 import luminaria_wire as wire
 
 /// ext_foreign_toplevel_list_v1: list toplevels
-pub struct ToplevelList derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ToplevelList {
     pub id: u32
 }
 
@@ -50,7 +51,8 @@ pub fn ToplevelList.finished(self, mut conn: wire.Conn) {
 }
 
 /// ext_foreign_toplevel_handle_v1: a mapped toplevel
-pub struct Handle derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Handle {
     pub id: u32
 }
 
@@ -87,19 +89,19 @@ pub fn Handle.done(self, mut conn: wire.Conn) {
 }
 
 /// title change
-pub fn Handle.title(self, mut conn: wire.Conn, title: &str) {
+pub fn Handle.title(self, mut conn: wire.Conn, title: StrSlice) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(title))
     wr.str(mut conn, title)
 }
 
 /// app_id change
-pub fn Handle.app_id(self, mut conn: wire.Conn, app_id: &str) {
+pub fn Handle.app_id(self, mut conn: wire.Conn, app_id: StrSlice) {
     var wr = conn.begin(self.id, 3, 8 + wire.str_size(app_id))
     wr.str(mut conn, app_id)
 }
 
 /// a stable identifier for a toplevel
-pub fn Handle.identifier(self, mut conn: wire.Conn, identifier: &str) {
+pub fn Handle.identifier(self, mut conn: wire.Conn, identifier: StrSlice) {
     var wr = conn.begin(self.id, 4, 8 + wire.str_size(identifier))
     wr.str(mut conn, identifier)
 }

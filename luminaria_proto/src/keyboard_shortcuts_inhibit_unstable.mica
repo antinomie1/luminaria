@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_keyboard_shortcuts_inhibit_manager_v1: context object for keyboard grab_manager
-pub struct InhibitManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct InhibitManager {
     pub id: u32
 }
 
@@ -46,7 +47,8 @@ fn decode_inhibit_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitMan
 }
 
 /// zwp_keyboard_shortcuts_inhibitor_v1: context object for keyboard shortcuts inhibitor
-pub struct Inhibitor derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Inhibitor {
     pub id: u32
 }
 

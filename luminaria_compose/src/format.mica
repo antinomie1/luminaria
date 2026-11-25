@@ -151,7 +151,7 @@ pub fn shm_texture(mut dev: gpu.Device, width: i32, height: i32, fourcc: u32) ->
 
 /// Copy damaged rectangles (buffer pixels; empty means all) of shm pixels
 /// into `tex`.
-pub fn upload(mut dev: gpu.Device, mut e: gpu.Encoder, tex: gpu.Texture, bytes: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> Result[(), str] {
+pub fn upload(mut dev: gpu.Device, mut e: gpu.Encoder, tex: gpu.Texture, bytes: Slice[u8], stride: int, rects: Slice[(i32, i32, i32, i32)]) -> Result[(), str] {
     let w = i32(tex.width())
     let h = i32(tex.height())
     if rects.is_empty() {

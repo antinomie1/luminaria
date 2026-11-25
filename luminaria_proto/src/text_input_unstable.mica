@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_text_input_v3: text input
-pub struct Input derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Input {
     pub id: u32
 }
 
@@ -21,7 +22,8 @@ pub enum InputChangeCause: u32 {
 }
 
 /// content hint
-pub enum InputContentHint: u32 derive(Flags) {
+@derive(Flags)
+pub enum InputContentHint: u32 {
     /// no special behavior
     None = 0x0
     /// suggest word completions
@@ -227,7 +229,7 @@ pub fn Input.leave(self, mut conn: wire.Conn, surface: wayland.Surface) {
 }
 
 /// pre-edit
-pub fn Input.preedit_string(self, mut conn: wire.Conn, text: Option[&str], cursor_begin: i32, cursor_end: i32) {
+pub fn Input.preedit_string(self, mut conn: wire.Conn, text: Option[StrSlice], cursor_begin: i32, cursor_end: i32) {
     var wr = conn.begin(self.id, 2, 8 + wire.opt_str_size(text) + 8)
     wr.opt_str(mut conn, text)
     wr.i32(mut conn, cursor_begin)
@@ -235,7 +237,7 @@ pub fn Input.preedit_string(self, mut conn: wire.Conn, text: Option[&str], curso
 }
 
 /// text commit
-pub fn Input.commit_string(self, mut conn: wire.Conn, text: Option[&str]) {
+pub fn Input.commit_string(self, mut conn: wire.Conn, text: Option[StrSlice]) {
     var wr = conn.begin(self.id, 3, 8 + wire.opt_str_size(text))
     wr.opt_str(mut conn, text)
 }
@@ -264,7 +266,7 @@ pub fn Input.action(self, mut conn: wire.Conn, action: InputAction, serial: u32)
 }
 
 /// notify of language selection
-pub fn Input.language(self, mut conn: wire.Conn, language: &str) {
+pub fn Input.language(self, mut conn: wire.Conn, language: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }
@@ -284,7 +286,8 @@ pub fn Input.preedit_hint(self, mut conn: wire.Conn, start: u32, end: u32, hint:
 }
 
 /// zwp_text_input_manager_v3: text input manager
-pub struct InputManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct InputManager {
     pub id: u32
 }
 
@@ -425,7 +428,7 @@ pub fn Input.disable(self, mut conn: wire.Conn) {
 }
 
 /// sets the surrounding text
-pub fn Input.set_surrounding_text(self, mut conn: wire.Conn, text: &str, cursor: i32, anchor: i32) {
+pub fn Input.set_surrounding_text(self, mut conn: wire.Conn, text: StrSlice, cursor: i32, anchor: i32) {
     var wr = conn.begin(self.id, 3, 8 + wire.str_size(text) + 8)
     wr.str(mut conn, text)
     wr.i32(mut conn, cursor)
@@ -460,7 +463,7 @@ pub fn Input.commit(self, mut conn: wire.Conn) {
 }
 
 /// set the available actions
-pub fn Input.set_available_actions(self, mut conn: wire.Conn, available_actions: &[u8]) {
+pub fn Input.set_available_actions(self, mut conn: wire.Conn, available_actions: Slice[u8]) {
     guard conn.version(self.id) >= 2 else {
         return
     }

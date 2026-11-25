@@ -367,6 +367,17 @@ fn apply_state(mut srv: server.Server, si: u32, take st: state.State) {
     let i = int(si)
     var changed: u32 = 0
     if s.attached {
+        // The commit this one replaces was never taken: hand it back with it.
+        if srv.surfaces.items[i].changed & state.changed_buffer != 0 {
+            let was = state.Superseded { buffer: srv.surfaces.items[i].current.buffer, release: srv.surfaces.items[i].release, point: srv.surfaces.items[i].release_point }
+            if srv.surfaces.items[i].superseded.len() < state.superseded_max {
+                srv.surfaces.items[i].superseded.push(was)
+            } else if let Some(ob) = was.buffer {
+                if Some(ob) != s.buffer {
+                    srv.release(ids.Buffer { id: ob })
+                }
+            }
+        }
         var bw: i32 = 0
         var bh: i32 = 0
         if let Some(nb) = s.buffer {
@@ -662,6 +673,11 @@ fn destroy(mut srv: server.Server, si: u32) {
     }
     extra.discard_feedbacks(mut srv, si)
     extra.surface_gone(mut srv, si)
+    for x in mem.replace(mut srv.surfaces.items[i].superseded, []) {
+        if let Some(b) = x.buffer {
+            srv.release(ids.Buffer { id: b })
+        }
+    }
     srv.surfaces.remove(si, state.SurfaceData {})
     srv.push(server.Event.SurfaceGone(ids.Surface { id }))
 }

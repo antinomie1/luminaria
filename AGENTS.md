@@ -93,14 +93,15 @@ luminaria (Display/plug/各主题文件)
 
 完整摘要见 `mica prompt`：
 
-- **语法**：没有 `;`、`&`/`*`、`::`、`?`、宏、`impl`、`as`、`let mut`；路径用 `.`；`let v = try f()`；
-  `guard cond else { return ... }`；`defer`；函数必须显式 `return`；`and` / `or` / `not`；无隐式数值转换；
+- **语法**：没有 `;`、`&`/`*`（类型和一元表达式中无 `&`/`*`）、`::`、`?`、宏、`impl`、`as`、`let mut`；路径用 `.`；`let v = try f()`；
+  `guard cond else { return ... }`；`defer`；函数必须显式 `return`；`and` / `or` / `not`；仅无损整型拓宽隐式，缩窄/浮点转换显式；
+  指令统一使用前置 `@attr`（`@derive(...)`、`@packed`、`@align(N)`、`@bits(T)`、`@inline` 等）；字节字面量用 `b'a'`（`u8`）；
   不用的 `Result` 写 `discard r`；字符串插值 `"{x}"` 里不能再写字符串字面量。
 - **模块**：方法只能定义在类型所在模块；同一 bundle 的模块互相看得到全部条目（含私有字段），别的 bundle
   只看 `pub`；别的 bundle 里结构体字段的默认值必须是常量表达式。
-- **所有权与借用**：参数默认只读借用，`mut p: T` 可变借用，`take p: T` 转移；引用视图只有 `&[T]`、
-  `&mut [T]`、`&str`；`str`、`List`、`Box` 及含它们的结构体默认移动，读字段或元素要 `.clone()` 或
+- **所有权与借用**：参数默认只读借用，`mut p: T` 可变借用，`take p: T` 转移；借用视图是 `Slice[T]`、
+  `MutSlice[T]`、`StrSlice`；`str`、`List`、`Box` 及含它们的结构体默认移动，读字段或元素要 `.clone()` 或
   `mem.replace(mut self.field, empty)`；一次调用不能同时把 `self` 作 `mut` 传又借出它的字段（先 clone 出来）。
-- **集合与匹配**：`Map.entries()` 的字段是 `.key` / `.val`；`match` 必须穷尽，忽略载荷写 `Err =>`；
-  切片 `&[T]` 没有 `.any`（`List` 有）；闭包捕获外部 `mut` 变量会占住借用，必要时拆成顶层函数。
+- **集合与匹配**：`Map.entries()` 的字段是 `.key` / `.val`；`match` 必须穷尽，忽略载荷写 `Err =>`，单句跳转/丢弃/赋值可省略大括号；
+  视图 `Slice[T]` 没有 `.any`（`List` 有）；闭包捕获外部 `mut` 变量会占住借用，必要时拆成顶层函数。
 - **其他**：`sync.mutex(v)`；三引号多行字符串；整数溢出与越界转换在 debug 构建里 panic。

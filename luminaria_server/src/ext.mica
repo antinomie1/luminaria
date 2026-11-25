@@ -177,7 +177,7 @@ fn size(a: Arg) -> int {
 
 /// Send event `op` of `o`'s interface with `args`; false when the object
 /// or the event is unknown.
-fn send(mut srv: server.Server, o: Object, op: u16, args: &[Arg]) -> bool {
+fn send(mut srv: server.Server, o: Object, op: u16, args: Slice[Arg]) -> bool {
     guard srv.clients.live(o.client.id) and o.iface >= 0 and o.iface < srv.exts.len() and int(op) < srv.exts[o.iface].events.len() else {
         return false
     }

@@ -8,6 +8,7 @@ import shell
 import plug
 import display
 import outputs
+import frames
 import waits
 import place
 import seats
@@ -93,6 +94,16 @@ fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R])
                     match s {
                         Some(cs) => seats.client_cursor_on(mut d, si, cs)
                         None => seats.hide_cursor_on(mut d, si)
+                    }
+                }
+            }
+            PointerHint(st, s, hx, hy) => {
+                let si = seats.seat_index(d, st)
+                if si >= 0 {
+                    if let Some((gx, gy, sc)) = d.origins.get(s) {
+                        d.seats[si].px = gx + hx * sc
+                        d.seats[si].py = gy + hy * sc
+                        seats.move_cursor_on(mut d, si)
                     }
                 }
             }
@@ -240,7 +251,8 @@ fn buffer_new[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b:
 
 fn buffer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer) {
     let bk = display.bkey(b)
-    guard not d.be.holds(bk) else {
+    // Still read by a frame in flight or a plane: `retire` frees it.
+    guard not frames.read(d, bk) else {
         return
     }
     // Still shown: the texture lives until the surface moves on.
@@ -256,27 +268,20 @@ fn buffer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b
     }
 }
 
-/// Release `b` once every output that may still read it has shown a newer
-/// frame (now when none does). Takes ownership of `rel_fd` (when >= 0).
-fn release_later[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b: server.Buffer, s: server.Surface, rel_fd: int, rel_point: u64) {
-    let bk = display.bkey(b)
-    var held = false
-    for o in 0..d.outs.len() {
-        if d.outs[o].alive and (d.drawn[o].contains(s) or d.be.holds(bk)) {
-            d.releases[o].push(b)
-            if rel_fd >= 0 {
-                d.points[o].push((bk, rel_fd, rel_point))
-            }
-            held = true
-            break
-        }
+/// Hand back buffer `buf` (when Some) and signal release point `rel_fd`
+/// (taken when >= 0) once no frame in flight and no plane reads `key`: at
+/// once for a buffer replaced before any frame used it.
+fn release_later[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], buf: Option[server.Buffer], key: u64, rel_fd: int, rel_point: u64) {
+    guard not frames.read(d, key) else {
+        d.releases.push(display.Release { buf, key, fd: rel_fd, point: rel_point })
+        return
     }
-    if not held {
+    if rel_fd >= 0 {
+        d.sync.signal(rel_fd, rel_point)
+        os.close(rel_fd)
+    }
+    if let Some(b) = buf {
         d.srv.release(b)
-        if rel_fd >= 0 {
-            d.sync.signal(rel_fd, rel_point)
-            os.close(rel_fd)
-        }
         drop_orphan(mut d, b)
     }
 }
@@ -322,6 +327,20 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
     if changed & server.changed_buffer != 0 {
         let old = sf.buffer
         let new = info.buffer
+        // Commits replaced before this one was taken were never read; a
+        // buffer still shown or current again keeps itself, its point waits.
+        var gone: List[(Option[server.Buffer], int, u64)] = []
+        d.srv.take_superseded(s, mut gone)
+        for (gb, gfd, gpoint) in gone {
+            let rel = if gfd >= 0 { os.dup(gfd).unwrap_or(-1) } else { -1 }
+            match gb {
+                Some(x) => {
+                    let used = old == Some(x) or new == Some(x)
+                    release_later(mut d, if used { None } else { Some(x) }, display.bkey(x), rel, gpoint)
+                }
+                None => release_later(mut d, None, 0, rel, gpoint)
+            }
+        }
         if old != new {
             let old_rel_fd = sf.rel_fd
             let old_rel_point = sf.rel_point
@@ -330,7 +349,7 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
             var handed = false
             if let Some(ob) = old {
                 if d.srv.buffer(ob).kind != server.BufferKind.Shm or not d.srv.buffer_alive(ob) {
-                    release_later(mut d, ob, s, old_rel_fd, old_rel_point)
+                    release_later(mut d, Some(ob), display.bkey(ob), old_rel_fd, old_rel_point)
                     handed = true
                 }
             }
@@ -339,8 +358,12 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
                 os.close(old_rel_fd)
             }
         } else if sf.rel_fd >= 0 {
-            d.sync.signal(sf.rel_fd, sf.rel_point)
-            os.close(sf.rel_fd)
+            // The same buffer again: its earlier point waits for the frames reading it.
+            let key = match new {
+                Some(b) => display.bkey(b)
+                None => 0
+            }
+            release_later(mut d, None, key, sf.rel_fd, sf.rel_point)
             sf.rel_fd = -1
             sf.rel_point = 0
         }
@@ -459,9 +482,6 @@ fn surface_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         }
         if d.seats[si].pointer_on == Some(s) {
             d.seats[si].pointer_on = None
-        }
-        if d.seats[si].constrained == Some(s) {
-            d.seats[si].constrained = None
         }
         if d.seats[si].cursor_surface == Some(s) {
             d.seats[si].cursor_surface = None

@@ -34,14 +34,14 @@ pub fn connect(name: str) -> Result[conn.Conn, str] {
     return socket.connect(name)
 }
 
-pub fn str_size(s: &str) -> int {
+pub fn str_size(s: StrSlice) -> int {
     return codec.str_size(s)
 }
 
-pub fn opt_str_size(s: Option[&str]) -> int {
+pub fn opt_str_size(s: Option[StrSlice]) -> int {
     return codec.opt_str_size(s)
 }
 
-pub fn array_size(a: &[u8]) -> int {
+pub fn array_size(a: Slice[u8]) -> int {
     return codec.array_size(a)
 }

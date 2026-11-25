@@ -6,58 +6,70 @@
 import std.collections.map
 
 /// A slot and its generation: odd while the slot is in use.
-pub struct Id derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Id {
     pub index: u32 = 0
     pub gen: u32 = 0
 }
 
-pub struct Client derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Client {
     pub id: Id
 }
 
-pub struct Surface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Surface {
     pub id: Id
 }
 
-pub struct Buffer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Buffer {
     pub id: Id
 }
 
 /// An xdg_toplevel.
-pub struct Window derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Window {
     pub id: Id
 }
 
-pub struct Popup derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Popup {
     pub id: Id
 }
 
-pub struct Output derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Output {
     pub id: Id
 }
 
-pub struct Seat derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Seat {
     pub id: Id
 }
 
 /// A layer-shell surface (panel, wallpaper, launcher, notification).
-pub struct Layer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Layer {
     pub id: Id
 }
 
 /// A session-lock surface (the lock screen on one output).
-pub struct LockSurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct LockSurface {
     pub id: Id
 }
 
 /// A zwlr_output_configuration_v1 waiting for the compositor's answer.
-pub struct OutputConfig derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct OutputConfig {
     pub id: Id
 }
 
 /// A commit (with the synchronized subsurfaces it carries) waiting for
 /// its buffers to be ready.
-pub struct Txn derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Txn {
     pub id: Id
 }
 
@@ -116,7 +128,8 @@ pub fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
 }
 
 /// A rectangle in integer coordinates (surface-local or buffer pixels).
-pub struct Rect derive(Show) {
+@derive(Show)
+pub struct Rect {
     pub x: i32 = 0
     pub y: i32 = 0
     pub w: i32 = 0
@@ -211,7 +224,7 @@ fn region_sub(mut rs: List[Rect], r: Rect) {
 }
 
 /// The largest rectangle of a region (what occlusion can use).
-fn region_largest(rs: &[Rect]) -> Rect {
+fn region_largest(rs: Slice[Rect]) -> Rect {
     var best = Rect {}
     for r in rs {
         if r.area() > best.area() {
@@ -221,7 +234,7 @@ fn region_largest(rs: &[Rect]) -> Rect {
     return best
 }
 
-fn region_contains(rs: &[Rect], x: f64, y: f64) -> bool {
+fn region_contains(rs: Slice[Rect], x: f64, y: f64) -> bool {
     for r in rs {
         if r.contains(x, y) {
             return true

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_content_type_manager_v1: surface content type manager
-pub struct TypeManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TypeManager {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_type_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TypeManagerRe
 }
 
 /// wp_content_type_v1: content type object for a surface
-pub struct Type derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Type {
     pub id: u32
 }
 

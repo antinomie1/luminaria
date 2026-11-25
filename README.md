@@ -159,7 +159,9 @@ sheaf run -p tiny -- -s foot    # on a VT, or as a window in your session
   holds back only itself.
 - shm commits are coalesced: the buffer is uploaded once per frame, only
   the damaged rectangles, then released; a buffer replaced before the
-  frame is released without a copy.
+  frame is released without a copy. Any buffer goes back as soon as no
+  frame in flight or plane reads it, so clients render past the refresh
+  rate.
 - A client buffer that fills an output unscaled and opaque is shown
   directly: a KMS framebuffer after an atomic test (zero copy, its damage
   as `FB_DAMAGE_CLIPS`), or handed to the parent compositor when nested.

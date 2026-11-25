@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_tearing_control_manager_v1: protocol for tearing control
-pub struct ControlManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ControlManager {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_control_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ControlMan
 }
 
 /// wp_tearing_control_v1: per-surface tearing control interface
-pub struct Control derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Control {
     pub id: u32
 }
 

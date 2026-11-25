@@ -9,7 +9,6 @@ import luminaria_server as server
 import luminaria_types as types
 import layout
 import display
-import input
 import place
 import clients
 import outputs
@@ -375,7 +374,6 @@ fn update_keyboard_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O
     }
     let t = keyboard_target(d, si)
     d.srv.keyboard_focus(d.seats[si].seat, t)
-    input.update_constraint_on(mut d, si)
 }
 
 fn update_keyboard[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {

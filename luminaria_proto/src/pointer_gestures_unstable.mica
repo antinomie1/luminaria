@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_pointer_gestures_v1: touchpad gestures
-pub struct Gestures derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Gestures {
     pub id: u32
 }
 
@@ -62,7 +63,8 @@ fn decode_gestures(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturesRequest, 
 }
 
 /// zwp_pointer_gesture_swipe_v1: a swipe gesture object
-pub struct GestureSwipe derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct GestureSwipe {
     pub id: u32
 }
 
@@ -114,7 +116,8 @@ pub fn GestureSwipe.end(self, mut conn: wire.Conn, serial: u32, time: u32, cance
 }
 
 /// zwp_pointer_gesture_pinch_v1: a pinch gesture object
-pub struct GesturePinch derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct GesturePinch {
     pub id: u32
 }
 
@@ -168,7 +171,8 @@ pub fn GesturePinch.end(self, mut conn: wire.Conn, serial: u32, time: u32, cance
 }
 
 /// zwp_pointer_gesture_hold_v1: a hold gesture object
-pub struct GestureHold derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct GestureHold {
     pub id: u32
 }
 

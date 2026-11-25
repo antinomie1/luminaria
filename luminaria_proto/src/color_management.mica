@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_color_manager_v1: color manager singleton
-pub struct ColorManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ColorManager {
     pub id: u32
 }
 
@@ -228,7 +229,8 @@ pub fn ColorManager.done(self, mut conn: wire.Conn) {
 }
 
 /// wp_color_management_output_v1: output color properties
-pub struct ColorManagementOutput derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ColorManagementOutput {
     pub id: u32
 }
 
@@ -267,7 +269,8 @@ pub fn ColorManagementOutput.image_description_changed(self, mut conn: wire.Conn
 }
 
 /// wp_color_management_surface_v1: color management extension to a surface
-pub struct ColorManagementSurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ColorManagementSurface {
     pub id: u32
 }
 
@@ -318,7 +321,8 @@ fn decode_color_management_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[C
 }
 
 /// wp_color_management_surface_feedback_v1: color management extension to a surface
-pub struct ColorManagementSurfaceFeedback derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ColorManagementSurfaceFeedback {
     pub id: u32
 }
 
@@ -383,7 +387,8 @@ pub fn ColorManagementSurfaceFeedback.preferred_changed2(self, mut conn: wire.Co
 }
 
 /// wp_image_description_creator_icc_v1: holder of image description ICC information
-pub struct ImageDescriptionCreatorIcc derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ImageDescriptionCreatorIcc {
     pub id: u32
 }
 
@@ -434,7 +439,8 @@ fn decode_image_description_creator_icc(mut conn: wire.Conn, m: wire.Msg) -> Res
 }
 
 /// wp_image_description_creator_params_v1: holder of image description parameters
-pub struct ImageDescriptionCreatorParams derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ImageDescriptionCreatorParams {
     pub id: u32
 }
 
@@ -558,7 +564,8 @@ fn decode_image_description_creator_params(mut conn: wire.Conn, m: wire.Msg) -> 
 }
 
 /// wp_image_description_v1: Colorimetric image description
-pub struct ImageDescription derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ImageDescription {
     pub id: u32
 }
 
@@ -612,7 +619,7 @@ fn decode_image_description(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDes
 }
 
 /// graceful error on creating the image description
-pub fn ImageDescription.failed(self, mut conn: wire.Conn, cause: ImageDescriptionCause, msg: &str) {
+pub fn ImageDescription.failed(self, mut conn: wire.Conn, cause: ImageDescriptionCause, msg: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(msg) + 4)
     wr.u32(mut conn, u32(cause))
     wr.str(mut conn, msg)
@@ -635,7 +642,8 @@ pub fn ImageDescription.ready2(self, mut conn: wire.Conn, identity_hi: u32, iden
 }
 
 /// wp_image_description_info_v1: Colorimetric image description information
-pub struct ImageDescriptionInfo derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ImageDescriptionInfo {
     pub id: u32
 }
 
@@ -727,7 +735,8 @@ pub fn ImageDescriptionInfo.target_max_fall(self, mut conn: wire.Conn, max_fall:
 }
 
 /// wp_image_description_reference_v1: Reference to an image description
-pub struct ImageDescriptionReference derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ImageDescriptionReference {
     pub id: u32
 }
 

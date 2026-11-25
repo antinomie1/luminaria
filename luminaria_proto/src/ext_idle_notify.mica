@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// ext_idle_notifier_v1: idle notification manager
-pub struct Notifier derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Notifier {
     pub id: u32
 }
 
@@ -53,7 +54,8 @@ fn decode_notifier(mut conn: wire.Conn, m: wire.Msg) -> Result[NotifierRequest, 
 }
 
 /// ext_idle_notification_v1: idle notification
-pub struct Notification derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Notification {
     pub id: u32
 }
 

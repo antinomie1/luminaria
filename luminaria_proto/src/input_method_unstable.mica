@@ -6,7 +6,8 @@ import wayland
 import text_input_unstable
 
 /// zwp_input_method_v2: input method
-pub struct Method derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Method {
     pub id: u32
 }
 
@@ -89,7 +90,7 @@ pub fn Method.deactivate(self, mut conn: wire.Conn) {
 }
 
 /// surrounding text event
-pub fn Method.surrounding_text(self, mut conn: wire.Conn, text: &str, cursor: u32, anchor: u32) {
+pub fn Method.surrounding_text(self, mut conn: wire.Conn, text: StrSlice, cursor: u32, anchor: u32) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(text) + 8)
     wr.str(mut conn, text)
     wr.u32(mut conn, cursor)
@@ -120,7 +121,8 @@ pub fn Method.unavailable(self, mut conn: wire.Conn) {
 }
 
 /// zwp_input_popup_surface_v2: popup surface
-pub struct PopupSurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct PopupSurface {
     pub id: u32
 }
 
@@ -155,7 +157,8 @@ pub fn PopupSurface.text_input_rectangle(self, mut conn: wire.Conn, x: i32, y: i
 }
 
 /// zwp_input_method_keyboard_grab_v2: keyboard grab
-pub struct MethodKeyboardGrab derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct MethodKeyboardGrab {
     pub id: u32
 }
 
@@ -216,7 +219,8 @@ pub fn MethodKeyboardGrab.repeat_info(self, mut conn: wire.Conn, rate: i32, dela
 }
 
 /// zwp_input_method_manager_v2: input method manager
-pub struct MethodManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct MethodManager {
     pub id: u32
 }
 
@@ -311,13 +315,13 @@ fn decode_method_event(mut conn: wire.Conn, m: wire.Msg) -> Result[MethodEvent, 
 }
 
 /// commit string
-pub fn Method.commit_string(self, mut conn: wire.Conn, text: &str) {
+pub fn Method.commit_string(self, mut conn: wire.Conn, text: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(text))
     wr.str(mut conn, text)
 }
 
 /// pre-edit string
-pub fn Method.set_preedit_string(self, mut conn: wire.Conn, text: &str, cursor_begin: i32, cursor_end: i32) {
+pub fn Method.set_preedit_string(self, mut conn: wire.Conn, text: StrSlice, cursor_begin: i32, cursor_end: i32) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(text) + 8)
     wr.str(mut conn, text)
     wr.i32(mut conn, cursor_begin)

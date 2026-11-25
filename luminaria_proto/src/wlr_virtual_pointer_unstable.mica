@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwlr_virtual_pointer_v1: virtual pointer
-pub struct Pointer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Pointer {
     pub id: u32
 }
 
@@ -108,7 +109,8 @@ fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wi
 }
 
 /// zwlr_virtual_pointer_manager_v1: virtual pointer manager
-pub struct PointerManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct PointerManager {
     pub id: u32
 }
 

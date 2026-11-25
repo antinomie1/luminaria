@@ -181,7 +181,7 @@ fn int_word(mut r: rand.Rng) -> u32 {
 }
 
 /// A live object of interface `iface`, 0 when there is none.
-fn pick(mut r: rand.Rng, objs: &[Obj], iface: u16) -> u32 {
+fn pick(mut r: rand.Rng, objs: Slice[Obj], iface: u16) -> u32 {
     var n = 0
     for x in objs {
         if iface == 0 or x.iface == iface {
@@ -204,7 +204,7 @@ fn pick(mut r: rand.Rng, objs: &[Obj], iface: u16) -> u32 {
 }
 
 /// An object and a request of it that makes an `iface`.
-fn maker(mut r: rand.Rng, sigs: map.Map[u16, List[Req]], objs: &[Obj], iface: u16) -> Option[(int, int)] {
+fn maker(mut r: rand.Rng, sigs: map.Map[u16, List[Req]], objs: Slice[Obj], iface: u16) -> Option[(int, int)] {
     var found: List[(int, int)] = []
     for i, o in objs {
         let reqs = sigs.get(o.iface).unwrap_or([])
@@ -362,7 +362,7 @@ test "random requests to every global do not crash or leak" {
     healthy(mut srv)
 }
 
-fn first(objs: &[Obj], iface: u16) -> u32 {
+fn first(objs: Slice[Obj], iface: u16) -> u32 {
     for o in objs {
         if o.iface == iface {
             return o.id

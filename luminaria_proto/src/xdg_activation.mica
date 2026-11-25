@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// xdg_activation_v1: interface for activating surfaces
-pub struct Activation derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Activation {
     pub id: u32
 }
 
@@ -47,7 +48,8 @@ fn decode_activation(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationReque
 }
 
 /// xdg_activation_token_v1: an exported activation handle
-pub struct ActivationToken derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ActivationToken {
     pub id: u32
 }
 
@@ -107,7 +109,7 @@ fn decode_activation_token(mut conn: wire.Conn, m: wire.Msg) -> Result[Activatio
 }
 
 /// the exported activation token
-pub fn ActivationToken.done(self, mut conn: wire.Conn, token: &str) {
+pub fn ActivationToken.done(self, mut conn: wire.Conn, token: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(token))
     wr.str(mut conn, token)
 }
@@ -127,7 +129,7 @@ pub fn Activation.get_activation_token(self, mut conn: wire.Conn) -> ActivationT
 }
 
 /// notify new interaction being available
-pub fn Activation.activate(self, mut conn: wire.Conn, token: &str, surface: wayland.Surface) {
+pub fn Activation.activate(self, mut conn: wire.Conn, token: StrSlice, surface: wayland.Surface) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(token) + 4)
     wr.str(mut conn, token)
     wr.u32(mut conn, surface.id)
@@ -160,7 +162,7 @@ pub fn ActivationToken.set_serial(self, mut conn: wire.Conn, serial: u32, seat: 
 }
 
 /// specifies the application being activated
-pub fn ActivationToken.set_app_id(self, mut conn: wire.Conn, app_id: &str) {
+pub fn ActivationToken.set_app_id(self, mut conn: wire.Conn, app_id: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(app_id))
     wr.str(mut conn, app_id)
 }

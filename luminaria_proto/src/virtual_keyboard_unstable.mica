@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_virtual_keyboard_v1: virtual keyboard
-pub struct Keyboard derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Keyboard {
     pub id: u32
 }
 
@@ -65,7 +66,8 @@ fn decode_keyboard(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardRequest, 
 }
 
 /// zwp_virtual_keyboard_manager_v1: virtual keyboard manager
-pub struct KeyboardManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct KeyboardManager {
     pub id: u32
 }
 

@@ -21,11 +21,11 @@ fn pad(n: int) -> int {
 }
 
 /// Wire size of a string argument (length, bytes, NUL, padding).
-pub fn str_size(s: &str) -> int {
+pub fn str_size(s: StrSlice) -> int {
     return 4 + pad(s.len() + 1)
 }
 
-pub fn opt_str_size(s: Option[&str]) -> int {
+pub fn opt_str_size(s: Option[StrSlice]) -> int {
     return match s {
         Some(v) => str_size(v)
         None => 4
@@ -33,7 +33,7 @@ pub fn opt_str_size(s: Option[&str]) -> int {
 }
 
 /// Wire size of an array argument.
-pub fn array_size(a: &[u8]) -> int {
+pub fn array_size(a: Slice[u8]) -> int {
     return 4 + pad(a.len())
 }
 
@@ -227,7 +227,7 @@ unsafe fn Writer.raw(mut self, mut c: conn.Conn, p: Ptr[u8], n: int) {
     self.at += size
 }
 
-pub fn Writer.str(mut self, mut c: conn.Conn, s: &str) {
+pub fn Writer.str(mut self, mut c: conn.Conn, s: StrSlice) {
     self.u32(mut c, u32(s.len() + 1))
     // The zeroed last word holds the NUL.
     let n = s.len()
@@ -241,14 +241,14 @@ pub fn Writer.str(mut self, mut c: conn.Conn, s: &str) {
     self.at += size
 }
 
-pub fn Writer.opt_str(mut self, mut c: conn.Conn, s: Option[&str]) {
+pub fn Writer.opt_str(mut self, mut c: conn.Conn, s: Option[StrSlice]) {
     match s {
         Some(v) => self.str(mut c, v)
         None => self.u32(mut c, 0)
     }
 }
 
-pub fn Writer.array(mut self, mut c: conn.Conn, a: &[u8]) {
+pub fn Writer.array(mut self, mut c: conn.Conn, a: Slice[u8]) {
     self.u32(mut c, u32(a.len()))
     unsafe self.raw(mut c, a.as_ptr(), a.len())
 }

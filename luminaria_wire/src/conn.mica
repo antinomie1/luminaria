@@ -260,7 +260,7 @@ fn Conn.set(mut self, id: u32, o: Obj) {
 /// Interface number of live object `id`, 0 when there is none.
 /// Interface `known` (the generated number of `name`) or, when that is
 /// 0, the run-time one called `name`; 0 when there is none.
-pub fn Conn.resolve(self, known: u16, name: &str) -> u16 {
+pub fn Conn.resolve(self, known: u16, name: StrSlice) -> u16 {
     guard known == 0 else {
         return known
     }
@@ -472,7 +472,7 @@ pub fn Conn.flush(mut self) -> Result[bool, Error] {
 
 /// A protocol error on object `id`. A server tells the client
 /// (wl_display.error) and closes after the next flush.
-pub fn Conn.error(mut self, id: u32, code: u32, msg: &str) -> Error {
+pub fn Conn.error(mut self, id: u32, code: u32, msg: StrSlice) -> Error {
     if self.end == End.Server and self.dead.is_none() {
         var w = self.begin(1, 0, 16 + codec.str_size(msg))
         w.u32(mut self, id)

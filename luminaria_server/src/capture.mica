@@ -274,7 +274,7 @@ fn waiting_kind(srv: server.Server, kind: state.CaptureTargetKind, target: u32) 
 
 /// Deliver `pixels` (BGRA8, rows packed) to all waiting shm capture frames
 /// matching `(kind, target)`.
-fn deliver_kind(mut srv: server.Server, kind: state.CaptureTargetKind, target: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+fn deliver_kind(mut srv: server.Server, kind: state.CaptureTargetKind, target: u32, pixels: Slice[u8], width: i32, height: i32, ns: int) {
     for k in 0..srv.captures.items.len() {
         guard srv.captures.used(k) and srv.captures.items[k].kind == kind and srv.captures.items[k].target == target and srv.captures.items[k].waiting else {
             continue
@@ -299,7 +299,7 @@ fn waiting(srv: server.Server, oi: u32) -> bool {
     return waiting_kind(srv, state.CaptureTargetKind.Output, oi)
 }
 
-fn deliver(mut srv: server.Server, oi: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+fn deliver(mut srv: server.Server, oi: u32, pixels: Slice[u8], width: i32, height: i32, ns: int) {
     deliver_kind(mut srv, state.CaptureTargetKind.Output, oi, pixels, width, height, ns)
 }
 
@@ -307,7 +307,7 @@ fn window_waiting(srv: server.Server, wi: u32) -> bool {
     return waiting_kind(srv, state.CaptureTargetKind.Window, wi)
 }
 
-fn window_deliver(mut srv: server.Server, wi: u32, pixels: &[u8], width: i32, height: i32, ns: int) {
+fn window_deliver(mut srv: server.Server, wi: u32, pixels: Slice[u8], width: i32, height: i32, ns: int) {
     deliver_kind(mut srv, state.CaptureTargetKind.Window, wi, pixels, width, height, ns)
 }
 
@@ -399,7 +399,7 @@ fn fail_async(mut srv: server.Server, session: u32, reason: u32) {
 
 /// Copy `px` into shm buffer `bi`; false when it is not a writable
 /// argb8888 / xrgb8888 buffer of this size.
-fn copy(mut srv: server.Server, bi: u32, px: &[u8], width: i32, height: i32) -> bool {
+fn copy(mut srv: server.Server, bi: u32, px: Slice[u8], width: i32, height: i32) -> bool {
     guard bi != state.none and srv.buffers.used(int(bi)) else {
         return false
     }

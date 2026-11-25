@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwlr_output_manager_v1: output device configuration manager
-pub struct Manager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Manager {
     pub id: u32
 }
 
@@ -59,7 +60,8 @@ pub fn Manager.finished(self, mut conn: wire.Conn) {
 }
 
 /// zwlr_output_head_v1: output device
-pub struct Head derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Head {
     pub id: u32
 }
 
@@ -96,13 +98,13 @@ fn decode_head(mut conn: wire.Conn, m: wire.Msg) -> Result[HeadRequest, wire.Err
 }
 
 /// head name
-pub fn Head.name(self, mut conn: wire.Conn, name: &str) {
+pub fn Head.name(self, mut conn: wire.Conn, name: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(name))
     wr.str(mut conn, name)
 }
 
 /// head description
-pub fn Head.description(self, mut conn: wire.Conn, description: &str) {
+pub fn Head.description(self, mut conn: wire.Conn, description: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(description))
     wr.str(mut conn, description)
 }
@@ -159,7 +161,7 @@ pub fn Head.finished(self, mut conn: wire.Conn) {
 }
 
 /// head manufacturer
-pub fn Head.make(self, mut conn: wire.Conn, make: &str) {
+pub fn Head.make(self, mut conn: wire.Conn, make: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }
@@ -168,7 +170,7 @@ pub fn Head.make(self, mut conn: wire.Conn, make: &str) {
 }
 
 /// head model
-pub fn Head.model(self, mut conn: wire.Conn, model: &str) {
+pub fn Head.model(self, mut conn: wire.Conn, model: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }
@@ -177,7 +179,7 @@ pub fn Head.model(self, mut conn: wire.Conn, model: &str) {
 }
 
 /// head serial number
-pub fn Head.serial_number(self, mut conn: wire.Conn, serial_number: &str) {
+pub fn Head.serial_number(self, mut conn: wire.Conn, serial_number: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }
@@ -195,7 +197,8 @@ pub fn Head.adaptive_sync(self, mut conn: wire.Conn, state: HeadAdaptiveSyncStat
 }
 
 /// zwlr_output_mode_v1: output mode
-pub struct Mode derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Mode {
     pub id: u32
 }
 
@@ -248,7 +251,8 @@ pub fn Mode.finished(self, mut conn: wire.Conn) {
 }
 
 /// zwlr_output_configuration_v1: output configuration
-pub struct Configuration derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Configuration {
     pub id: u32
 }
 
@@ -326,7 +330,8 @@ pub fn Configuration.cancelled(self, mut conn: wire.Conn) {
 }
 
 /// zwlr_output_configuration_head_v1: head configuration
-pub struct ConfigurationHead derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ConfigurationHead {
     pub id: u32
 }
 

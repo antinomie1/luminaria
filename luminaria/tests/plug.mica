@@ -96,14 +96,14 @@ pub fn TestOut.acquire(mut self, o: u32) -> lum.types.Acquire {
     return lum.types.Acquire.Draw(self.targets[self.drawing], 0)
 }
 
-pub fn TestOut.give(mut self, o: u32, ts: &[lum.types.Target]) -> Result[(), str] {
+pub fn TestOut.give(mut self, o: u32, ts: Slice[lum.types.Target]) -> Result[(), str] {
     for t in ts {
         self.targets.push(t.key)
     }
     return Ok(())
 }
 
-pub fn TestOut.present(mut self, o: u32, fence: int, rects: &[(i32, i32, i32, i32)], tear: bool) -> Result[(), str] {
+pub fn TestOut.present(mut self, o: u32, fence: int, rects: Slice[(i32, i32, i32, i32)], tear: bool) -> Result[(), str] {
     if fence >= 0 {
         os.close(fence)
     }
@@ -125,7 +125,7 @@ pub fn TestOut.shown(self, o: u32) -> Option[u64] {
     return if self.shown < 0 { None } else { Some(self.targets[self.shown]) }
 }
 
-pub fn TestOut.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+pub fn TestOut.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
     guard self.hw_cursor else {
         return false
     }
@@ -148,7 +148,7 @@ pub fn TestOut.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
     }
 }
 
-pub fn TestOut.test_overlays(mut self, o: u32, target_key: u64, cands: &[lum.types.Overlay]) -> List[u64] {
+pub fn TestOut.test_overlays(mut self, o: u32, target_key: u64, cands: Slice[lum.types.Overlay]) -> List[u64] {
     var keys: List[u64] = []
     for c in cands {
         keys.push(c.key)
@@ -216,7 +216,7 @@ pub fn SoftRen.resize(mut self, o: int, width: u32, height: u32) {}
 
 pub fn SoftRen.remove_output(mut self, o: int) {}
 
-pub fn SoftRen.layout(mut self, o: int, ps: &[lum.types.Placement]) {
+pub fn SoftRen.layout(mut self, o: int, ps: Slice[lum.types.Placement]) {
     self.lists[o] = ps.to_list()
     if let Some(tr) = self.trace {
         let copy = ps.to_list()
@@ -226,7 +226,7 @@ pub fn SoftRen.layout(mut self, o: int, ps: &[lum.types.Placement]) {
     }
 }
 
-pub fn SoftRen.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {}
+pub fn SoftRen.commit(mut self, key: u64, rects: Slice[(i32, i32, i32, i32)]) {}
 
 pub fn SoftRen.idle(self, o: int) -> bool {
     return false
@@ -260,7 +260,7 @@ pub fn SoftRen.import_dmabuf(mut self, key: u64, d: lum.types.Dmabuf) -> bool {
     return true
 }
 
-pub fn SoftRen.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool {
+pub fn SoftRen.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: Slice[u8], stride: int) -> bool {
     // RGBA (abgr8888, xbgr8888) to BGRA.
     let swap = fourcc == lum.types.buffer.abgr8888 or fourcc == lum.types.buffer.xbgr8888
     var px: List[u8] = []
@@ -283,11 +283,11 @@ pub fn SoftRen.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, p
     return true
 }
 
-pub fn SoftRen.update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool {
+pub fn SoftRen.update(mut self, key: u64, pixels: Slice[u8], stride: int, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     return false
 }
 
-pub fn SoftRen.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+pub fn SoftRen.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     var px: List[u8] = []
     for _ in 0..int(width * height * 4) {
         px.push(255)
@@ -296,7 +296,7 @@ pub fn SoftRen.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u
     return true
 }
 
-pub fn SoftRen.shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool {
+pub fn SoftRen.shm_upload(mut self, key: u64, bytes: Slice[u8], stride: int) -> bool {
     return true
 }
 
@@ -367,7 +367,7 @@ pub fn SoftRen.overlay_candidates(self, o: int, max_count: int) -> List[lum.type
     return out
 }
 
-pub fn SoftRen.set_overlays(mut self, o: int, keys: &[u64]) {
+pub fn SoftRen.set_overlays(mut self, o: int, keys: Slice[u64]) {
     if not keys.is_empty() {
         if let Some(tr) = self.trace {
             let copy = keys.to_list()
@@ -1331,4 +1331,73 @@ test "a toplevel drag carries its window under the pointer, not as a target, and
     fx.d.inject_on(seat0, lum.types.Input.Button(2, u32(0x110), false))
     plug_pump(mut fx, 20)
     assert(fx.moved.contains((w, 100.0, 50.0)))
+}
+
+fn dmabuf_buffer(mut fx: PlugFx, dma: dmab.Dmabuf, w: i32, h: i32) -> wl.Buffer {
+    let fd = os.memfd("dma", int(w * h * 4)).expect("memfd")
+    let params = dma.create_params(mut fx.c)
+    params.add_(mut fx.c, fd, 0, 0, u32(w * 4), 0, 0)
+    os.close(fd)
+    let buf = params.create_immed(mut fx.c, w, h, lum.types.buffer.xrgb8888, dmab.BufferParamsFlags(0))
+    params.destroy(mut fx.c)
+    return buf
+}
+
+test "buffers no frame reads go back at once, commits replaced unseen included" {
+    let dir = fs.create_temp_dir("luminaria-plug-release").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let out = TestOut { timer: os.timerfd().unwrap(), devices: lum.backend.Devices.none() }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), advertise_dmabuf: true }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let dma = dmab.Dmabuf { id: bind_global(mut fx, dmab.dmabuf_iface, 4) }
+    let s = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, s)
+    discard xs.get_toplevel(mut fx.c)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let b0 = dmabuf_buffer(mut fx, dma, 8, 8)
+    let b1 = dmabuf_buffer(mut fx, dma, 8, 8)
+    let b2 = dmabuf_buffer(mut fx, dma, 8, 8)
+    s.attach(mut fx.c, Some(b0), 0, 0)
+    s.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    assert_eq(fx.wins.len(), 1)
+    let w = fx.wins[0]
+    fx.d.layout(fn(mut l) {
+        l.window(w, 0.0, 0.0, lum.Style {})
+    })
+    plug_pump(mut fx, 80)
+    // b1 is replaced by b2 before the compositor saw it, and b0's frame is
+    // long on screen: both go back at once, before the frame showing b2.
+    s.attach(mut fx.c, Some(b1), 0, 0)
+    s.commit(mut fx.c)
+    s.attach(mut fx.c, Some(b2), 0, 0)
+    let cb = s.frame(mut fx.c)
+    s.commit(mut fx.c)
+    var order: List[int] = []
+    for e in plug_collect(mut fx, 120) {
+        match e {
+            WlBuffer(b, Release) => {
+                if b == b0 {
+                    order.push(0)
+                } else if b == b1 {
+                    order.push(1)
+                } else if b == b2 {
+                    order.push(2)
+                }
+            }
+            WlCallback(x, Done) => {
+                if x == cb {
+                    order.push(9)
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq(order, [1, 0, 9])
 }

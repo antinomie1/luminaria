@@ -6,7 +6,8 @@ import wayland
 import ext_foreign_toplevel_list
 
 /// ext_image_capture_source_v1: opaque image capture source object
-pub struct ImageCaptureSource derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ImageCaptureSource {
     pub id: u32
 }
 
@@ -33,7 +34,8 @@ fn decode_image_capture_source(mut conn: wire.Conn, m: wire.Msg) -> Result[Image
 }
 
 /// ext_output_image_capture_source_manager_v1: image capture source manager for outputs
-pub struct OutputImageCaptureSourceManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct OutputImageCaptureSourceManager {
     pub id: u32
 }
 
@@ -68,7 +70,8 @@ fn decode_output_image_capture_source_manager(mut conn: wire.Conn, m: wire.Msg) 
 }
 
 /// ext_foreign_toplevel_image_capture_source_manager_v1: image capture source manager for foreign toplevels
-pub struct ForeignToplevelImageCaptureSourceManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ForeignToplevelImageCaptureSourceManager {
     pub id: u32
 }
 

@@ -21,7 +21,8 @@ pub struct Style {
 }
 
 /// A texture the compositor owns.
-pub struct Image derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Image {
     pub index: u32 = 0
     pub gen: u32 = 0
 }

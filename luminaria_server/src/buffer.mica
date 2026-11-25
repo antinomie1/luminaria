@@ -140,7 +140,7 @@ fn destroy_buffer(mut srv: server.Server, bi: u32) {
 /// Lend `f` the bytes of shm buffer `bi` (from its first pixel, `stride`
 /// bytes per row) while a client shrinking the pool cannot crash us; false
 /// when the buffer is gone or the client truncated the pool meanwhile.
-fn with_shm(srv: server.Server, bi: u32, f: fn(&[u8], int)) -> bool {
+fn with_shm(srv: server.Server, bi: u32, f: fn(Slice[u8], int)) -> bool {
     guard srv.buffers.used(int(bi)) and srv.buffers.items[int(bi)].kind == state.BufferKind.Shm else {
         return false
     }
@@ -198,7 +198,7 @@ fn dev_bytes(dev: u64) -> [8]u8 {
 }
 
 /// Table indices (u16 little endian) of `want` within the format table.
-fn indices(all: &[(u32, u64)], want: &[(u32, u64)]) -> List[u8] {
+fn indices(all: Slice[(u32, u64)], want: Slice[(u32, u64)]) -> List[u8] {
     var out: List[u8] = []
     for k in 0..all.len() {
         var hit = false

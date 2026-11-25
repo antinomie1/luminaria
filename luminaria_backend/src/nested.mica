@@ -300,7 +300,7 @@ fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
     }
 }
 
-fn std_str(b: &[u8]) -> str {
+fn std_str(b: Slice[u8]) -> str {
     var n = 0
     while n < b.len() and b[n] != 0 {
         n += 1
@@ -353,7 +353,7 @@ fn Nested.prepare(mut self, count: int, mut retired: List[u64]) -> Option[types.
     return Some(types.Want { width: self.width, height: self.height, format: types.buffer.xrgb8888, modifiers: [0], count })
 }
 
-fn Nested.give(mut self, ts: &[types.Target]) {
+fn Nested.give(mut self, ts: Slice[types.Target]) {
     var s = swap.create(self.width, self.height, ts)
     for i in 0..s.slots.len() {
         let b = s.slots[i].buf
@@ -362,7 +362,7 @@ fn Nested.give(mut self, ts: &[types.Target]) {
     self.swap = Some(s)
 }
 
-fn Nested.damage(mut self, rects: &[(i32, i32, i32, i32)]) {
+fn Nested.damage(mut self, rects: Slice[(i32, i32, i32, i32)]) {
     if rects.is_empty() {
         self.surf.damage_buffer(mut self.c, 0, 0, self.width, self.height)
     }
@@ -372,7 +372,7 @@ fn Nested.damage(mut self, rects: &[(i32, i32, i32, i32)]) {
 }
 
 /// Show slot `i` of the swap (drawn, `fence` signals when done).
-fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) {
+fn Nested.present(mut self, i: int, fence: int, rects: Slice[(i32, i32, i32, i32)]) {
     guard let Some(sw) = self.swap.take() else {
         return
     }
@@ -391,7 +391,7 @@ fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) 
 }
 
 /// Show a client dmabuf directly; false when the parent cannot take it.
-fn Nested.scanout(mut self, key: u64, b: types.Dmabuf, rects: &[(i32, i32, i32, i32)]) -> bool {
+fn Nested.scanout(mut self, key: u64, b: types.Dmabuf, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     guard b.width == self.width and b.height == self.height and b.planes >= 1 and b.planes <= 4 else {
         return false
     }
@@ -436,7 +436,7 @@ fn Nested.forget(mut self, key: u64) {
 }
 
 /// The cursor image (ARGB8888 premultiplied) as the parent's cursor.
-fn Nested.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {
+fn Nested.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {
     guard self.shm.id != 0 and width > 0 and height > 0 else {
         return
     }

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// ext_data_control_manager_v1: manager to control data devices
-pub struct Manager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Manager {
     pub id: u32
 }
 
@@ -47,7 +48,8 @@ fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wi
 }
 
 /// ext_data_control_device_v1: manage a data device for a seat
-pub struct Device derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Device {
     pub id: u32
 }
 
@@ -120,7 +122,8 @@ pub fn Device.primary_selection(self, mut conn: wire.Conn, id_arg: Option[Offer]
 }
 
 /// ext_data_control_source_v1: offer to transfer data
-pub struct Source derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Source {
     pub id: u32
 }
 
@@ -159,7 +162,7 @@ fn decode_source(mut conn: wire.Conn, m: wire.Msg) -> Result[SourceRequest, wire
 }
 
 /// send the data
-pub fn Source.send(self, mut conn: wire.Conn, mime_type: &str, fd: int) {
+pub fn Source.send(self, mut conn: wire.Conn, mime_type: StrSlice, fd: int) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
     conn.put_fd(fd)
@@ -171,7 +174,8 @@ pub fn Source.cancelled(self, mut conn: wire.Conn) {
 }
 
 /// ext_data_control_offer_v1: offer to transfer data
-pub struct Offer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Offer {
     pub id: u32
 }
 
@@ -206,7 +210,7 @@ fn decode_offer(mut conn: wire.Conn, m: wire.Msg) -> Result[OfferRequest, wire.E
 }
 
 /// advertise offered MIME type
-pub fn Offer.offer(self, mut conn: wire.Conn, mime_type: &str) {
+pub fn Offer.offer(self, mut conn: wire.Conn, mime_type: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
 }
@@ -320,7 +324,7 @@ fn decode_source_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SourceEvent, 
 }
 
 /// add an offered MIME type
-pub fn Source.offer(self, mut conn: wire.Conn, mime_type: &str) {
+pub fn Source.offer(self, mut conn: wire.Conn, mime_type: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
 }
@@ -351,7 +355,7 @@ fn decode_offer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OfferEvent, wi
 }
 
 /// request that the data is transferred
-pub fn Offer.receive(self, mut conn: wire.Conn, mime_type: &str, fd: int) {
+pub fn Offer.receive(self, mut conn: wire.Conn, mime_type: StrSlice, fd: int) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
     conn.put_fd(fd)

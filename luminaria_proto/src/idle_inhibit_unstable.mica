@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_idle_inhibit_manager_v1: control behavior when display idles
-pub struct InhibitManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct InhibitManager {
     pub id: u32
 }
 
@@ -40,7 +41,8 @@ fn decode_inhibit_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitMan
 }
 
 /// zwp_idle_inhibitor_v1: context object for inhibiting idle behavior
-pub struct Inhibitor derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Inhibitor {
     pub id: u32
 }
 

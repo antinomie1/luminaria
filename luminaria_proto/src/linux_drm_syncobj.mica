@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_linux_drm_syncobj_manager_v1: global for providing explicit synchronization
-pub struct Manager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Manager {
     pub id: u32
 }
 
@@ -55,7 +56,8 @@ fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wi
 }
 
 /// wp_linux_drm_syncobj_timeline_v1: synchronization object timeline
-pub struct Timeline derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Timeline {
     pub id: u32
 }
 
@@ -82,7 +84,8 @@ fn decode_timeline(mut conn: wire.Conn, m: wire.Msg) -> Result[TimelineRequest, 
 }
 
 /// wp_linux_drm_syncobj_surface_v1: per-surface explicit synchronization
-pub struct Surface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Surface {
     pub id: u32
 }
 

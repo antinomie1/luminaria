@@ -30,6 +30,15 @@ fn schedule[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: i
             }
         }
     }
+    // A commit waiting on a fifo barrier needs the next refresh cycle.
+    if not wants {
+        for (s, _) in d.waits.fifo {
+            if d.drawn[o].contains(s) {
+                wants = true
+                break
+            }
+        }
+    }
     guard wants and d.be.can_present(u32(o)) else {
         return
     }
@@ -38,7 +47,8 @@ fn schedule[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: i
     // second, predicted deadline would only miss the parent's. A frame with
     // nothing to draw (client frame callbacks, `want_frame`) presents
     // nothing, so no callback paces it: it follows the clock, or it spins.
-    let start = if d.be.paced() and draws { now } else { d.outs[o].clock.start(now) }
+    // A tearing client on screen is shown as soon as it has a new frame.
+    let start = if (d.be.paced() or d.outs[o].tearing) and draws { now } else { d.outs[o].clock.start(now) }
     if start <= now + 200000 {
         frame_due(mut d, o)
         return
@@ -74,7 +84,7 @@ fn upload_pending[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
         guard let Some(b) = sf.pending else {
             continue
         }
-        discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+        discard srv.with_shm(b, fn(bytes: Slice[u8], stride: int) {
             discard d.comp.shm_upload(display.skey(s), bytes, stride)
         })
         srv.release(b)
@@ -130,7 +140,7 @@ fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -
         } else {
             if d.comp.shm_commit(display.skey(s), bi.width, bi.height, bi.format, all) {
                 var ok = false
-                discard srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+                discard srv.with_shm(b, fn(bytes: Slice[u8], stride: int) {
                     ok = d.comp.shm_upload(display.skey(s), bytes, stride)
                 })
                 sf.tex = if ok { display.skey(s) } else { 0 }
@@ -171,6 +181,10 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
         place.rebuild(mut d)
     }
     upload_pending(mut d)
+    // Whether this cycle hands the screen a new frame, and whether the
+    // renderer read client buffers for it.
+    var shows = false
+    var composed = false
     if d.outs[o].dirty {
         var scanned = false
         let so = d.outs[o].sout
@@ -182,10 +196,12 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
             if let Some(key) = d.comp.scanout(o) {
                 scanned = try_scanout(mut d, o, key)
             }
+            shows = scanned
         } else {
             d.comp.damage_all()
         }
         if not scanned {
+            d.outs[o].tearing = false
             guard let Some((key, age)) = try acquire(mut d, o) else {
                 // Every target is on screen (or GPU reset ran): try again on the next cycle.
                 return Ok(())
@@ -263,10 +279,13 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
                 count_damage(mut d, o, rects)
                 try d.be.present(u32(o), present_fence, rects, false)
                 d.probes[o].frame(time.now_ns() - t0)
+                shows = true
+                composed = true
             } else if not promoted.is_empty() {
                 let empty: List[(i32, i32, i32, i32)] = []
                 try d.be.present(u32(o), -1, empty, false)
                 d.probes[o].frame(time.now_ns() - t0)
+                shows = true
             }
             if cap_dma {
                 var rest_caps: List[server.CaptureReq] = []
@@ -342,7 +361,21 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
     for s in drawn {
         d.srv.frame_done(s, ms)
     }
+    if composed {
+        d.reads[o].clear()
+        for s in drawn {
+            if let Some(sf) = d.surfs.get(s) {
+                if let Some(b) = sf.buffer {
+                    d.reads[o].push(display.bkey(b))
+                }
+            }
+        }
+    }
     d.drawn[o] = drawn
+    // Nothing new reaches the screen: the refresh cycle ends now.
+    if not shows {
+        cycle_done(mut d, o)
+    }
     if d.animating {
         d.outs[o].dirty = true
     }
@@ -408,12 +441,13 @@ fn try_scanout[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o
     guard d.be.scanout(u32(o), display.bkey(b), d.srv.dmabuf(b), rects, tear) else {
         return false
     }
+    d.outs[o].tearing = tear
     count_damage(mut d, o, rects)
     d.probes[o].frame(time.now_ns() - t0)
     return true
 }
 
-fn count_damage[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, rects: &[(i32, i32, i32, i32)]) {
+fn count_damage[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, rects: Slice[(i32, i32, i32, i32)]) {
     if rects.is_empty() {
         d.probes[o].damage_rects += 1
         d.probes[o].damage_pixels += int(d.outs[o].width) * int(d.outs[o].height)
@@ -445,39 +479,70 @@ fn presented[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: 
     let drawn = mem.replace(mut d.drawn[o], [])
     for s in drawn {
         d.srv.presented(s, so, ns, refresh, seq, flags)
-        d.srv.latch(s)
-        var done: List[server.Txn] = []
-        for (fs, t) in d.waits.fifo {
-            if fs == s {
-                done.push(t)
-            }
-        }
-        d.waits.fifo.retain(fn(f) => f.0 != s)
-        for t in done {
-            waits.resolve(mut d, t)
-        }
     }
     d.drawn[o] = drawn
-    // Buffers the GPU and display are done with.
-    let rel = mem.replace(mut d.releases[o], [])
-    for b in rel {
-        if d.be.holds(display.bkey(b)) {
-            d.releases[o].push(b)
-        } else {
-            d.srv.release(b)
-            clients.drop_orphan(mut d, b)
-        }
-    }
-    for (bk, fd, point) in mem.replace(mut d.points[o], []) {
-        if d.be.holds(bk) {
-            d.points[o].push((bk, fd, point))
-        } else {
-            d.sync.signal(fd, point)
-            os.close(fd)
-        }
-    }
+    cycle_done(mut d, o)
     shell.presented(mut d, o)
     schedule(mut d, o)
+}
+
+/// Output `o`'s refresh cycle ended (presented, dropped, or with nothing
+/// new to show): what it showed is latched (fifo barriers clear) and the
+/// client buffers its frame read are free.
+fn cycle_done[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
+    let drawn = mem.replace(mut d.drawn[o], [])
+    for s in drawn {
+        d.srv.latch(s)
+    }
+    var done: List[server.Txn] = []
+    for (s, t) in d.waits.fifo {
+        if drawn.contains(s) {
+            done.push(t)
+        }
+    }
+    if not done.is_empty() {
+        d.waits.fifo.retain(fn(f) => not drawn.contains(f.0))
+    }
+    d.drawn[o] = drawn
+    for t in done {
+        waits.resolve(mut d, t)
+    }
+    d.reads[o].clear()
+    retire(mut d)
+}
+
+/// Whether a frame in flight or a plane still reads buffer `key`.
+fn read[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], key: u64) -> bool {
+    if d.be.holds(key) {
+        return true
+    }
+    for o in 0..d.reads.len() {
+        if d.reads[o].contains(key) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Hand back the replaced buffers (and release points) nothing reads.
+fn retire[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
+    guard not d.releases.is_empty() else {
+        return
+    }
+    for r in mem.replace(mut d.releases, []) {
+        if read(d, r.key) {
+            d.releases.push(r)
+        } else {
+            if r.fd >= 0 {
+                d.sync.signal(r.fd, r.point)
+                os.close(r.fd)
+            }
+            if let Some(b) = r.buf {
+                d.srv.release(b)
+                clients.drop_orphan(mut d, b)
+            }
+        }
+    }
 }
 
 fn housekeeping[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_fractional_scale_manager_v1: fractional surface scale information
-pub struct ScaleManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ScaleManager {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_scale_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleManager
 }
 
 /// wp_fractional_scale_v1: fractional scale interface to a wl_surface
-pub struct Scale derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Scale {
     pub id: u32
 }
 

@@ -63,7 +63,7 @@ server、compose、backend 之间互不依赖，只交换 `luminaria_types` 里�
 事务生效 ──▶ Applied ──▶ Display：缓冲变纹理、损坏记入场景、重建放置表 ──▶ 输出变脏
 输出变脏 ──▶ 按时钟定时 ──▶ Frame 事件（合成器可推进布局）──▶ 出帧：
              不出帧 / 直接扫描输出客户端缓冲 / 合成（只画损坏）──▶ backend 提交
-翻转完成 ──▶ Presented ──▶ 帧回调、呈现反馈、fifo 解除、释放缓冲、更新时钟
+周期结束（呈现 / 失败 / 无新帧）──▶ 呈现反馈、fifo 解除、归还无人读的缓冲、更新时钟
 
 libinput / 父合成器 ──▶ backend：xkb ──▶ Display：光标立即移动、操纵中则直接移动窗口
                                      └──▶ Key / Motion / Button ... 事件 ──▶ 合成器 ──▶ accept：路由给客户端

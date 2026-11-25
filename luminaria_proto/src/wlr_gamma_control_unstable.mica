@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwlr_gamma_control_manager_v1: manager to create per-output gamma controls
-pub struct ControlManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ControlManager {
     pub id: u32
 }
 
@@ -40,7 +41,8 @@ fn decode_control_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ControlMan
 }
 
 /// zwlr_gamma_control_v1: adjust gamma tables for an output
-pub struct Control derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Control {
     pub id: u32
 }
 

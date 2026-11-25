@@ -67,17 +67,17 @@ pub trait Output: Input {
     fn can_present(self, o: u32) -> bool
     /// The target to draw `o` into, Busy, or the targets it needs first.
     fn acquire(mut self, o: u32) -> types.Acquire
-    fn give(mut self, o: u32, ts: &[types.Target]) -> Result[(), str]
+    fn give(mut self, o: u32, ts: Slice[types.Target]) -> Result[(), str]
     /// Show the acquired target once `fence` signals (the output closes
     /// it; -1: none); `rects` changed (empty: all).
-    fn present(mut self, o: u32, fence: int, rects: &[(i32, i32, i32, i32)], tear: bool) -> Result[(), str]
+    fn present(mut self, o: u32, fence: int, rects: Slice[(i32, i32, i32, i32)], tear: bool) -> Result[(), str]
     /// Targets let go of, for the renderer to free.
     fn retired(mut self, mut out: List[u64])
     /// Let go of everything; every target's key goes to `retired`.
     fn shutdown(mut self, mut retired: List[u64])
 
     /// Show a client dmabuf as is; false: compose instead.
-    fn scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[(i32, i32, i32, i32)], tear: bool) -> bool {
+    fn scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: Slice[(i32, i32, i32, i32)], tear: bool) -> bool {
         return false
     }
     /// Whether the display still reads client buffer `key`.
@@ -90,7 +90,7 @@ pub trait Output: Input {
         return None
     }
     /// A cursor image it shows itself (ARGB8888); false: it is drawn.
-    fn set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+    fn set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
         return false
     }
     fn move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {}
@@ -107,7 +107,7 @@ pub trait Output: Input {
     fn enable(mut self, o: u32, on: bool) {}
     fn set_vrr(mut self, o: u32, on: bool) {}
     /// Install or reset (empty slices) a hardware CRTC gamma LUT on `o`.
-    fn set_gamma(mut self, o: u32, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+    fn set_gamma(mut self, o: u32, r: Slice[u16], g: Slice[u16], b: Slice[u16]) -> bool {
         return false
     }
     /// Enable or disable HDR output (BT.2020 + ST.2084 PQ) on `o`.
@@ -126,7 +126,7 @@ pub trait Output: Input {
     fn stats(self, mut s: types.Stats) {}
 
     /// Probe hardware overlay candidates against primary target `target_key`.
-    fn test_overlays(mut self, o: u32, target_key: u64, cands: &[types.Overlay]) -> List[u64] {
+    fn test_overlays(mut self, o: u32, target_key: u64, cands: Slice[types.Overlay]) -> List[u64] {
         let none: List[u64] = []
         return none
     }
@@ -138,7 +138,7 @@ pub trait Output: Input {
     fn needs_upload(self, o: u32) -> bool {
         return false
     }
-    fn upload_frame(mut self, o: u32, pixels: &[u8], stride: int) {}
+    fn upload_frame(mut self, o: u32, pixels: Slice[u8], stride: int) {}
 }
 
 pub trait Renderer {
@@ -146,19 +146,19 @@ pub trait Renderer {
     fn resize(mut self, o: int, width: u32, height: u32)
     fn remove_output(mut self, o: int)
     /// Show `ps` on `o` from the next frame (a key keeps its view).
-    fn layout(mut self, o: int, ps: &[types.Placement])
+    fn layout(mut self, o: int, ps: Slice[types.Placement])
     /// Texture `key` changed in `rects` (texture pixels; empty: all).
-    fn commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)])
+    fn commit(mut self, key: u64, rects: Slice[(i32, i32, i32, i32)])
     /// Whether output `o` has nothing new to draw.
     fn idle(self, o: int) -> bool
     fn has(self, key: u64) -> bool
     fn forget(mut self, key: u64)
     /// Texture `key` from pixels (create or replace) and its updates.
-    fn image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool
-    fn update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool
+    fn image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: Slice[u8], stride: int) -> bool
+    fn update(mut self, key: u64, pixels: Slice[u8], stride: int, rects: Slice[(i32, i32, i32, i32)]) -> bool
     /// An shm commit (damage merges) and its upload before the next frame.
-    fn shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool
-    fn shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool
+    fn shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: Slice[(i32, i32, i32, i32)]) -> bool
+    fn shm_upload(mut self, key: u64, bytes: Slice[u8], stride: int) -> bool
     fn targets(mut self, w: types.Want) -> Result[List[types.Target], str]
     fn drop_target(mut self, key: u64)
     /// Draw output `o` into target `key` (`age` frames old): the fence,
@@ -201,7 +201,7 @@ pub trait Renderer {
         let none: List[types.OverlayCand] = []
         return none
     }
-    fn set_overlays(mut self, o: int, keys: &[u64]) {}
+    fn set_overlays(mut self, o: int, keys: Slice[u64]) {}
     /// Writable (fourcc, modifier) pairs supported for dmabuf capture.
     fn capture_formats(self) -> List[(u32, u64)] {
         let none: List[(u32, u64)] = []
@@ -210,10 +210,10 @@ pub trait Renderer {
     fn copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, sx: i32, sy: i32, w: i32, h: i32) -> Result[int, str] {
         return Err("dmabuf capture unsupported")
     }
-    fn render_offscreen(mut self, width: u32, height: u32, ps: &[types.Placement]) -> Result[List[u8], str] {
+    fn render_offscreen(mut self, width: u32, height: u32, ps: Slice[types.Placement]) -> Result[List[u8], str] {
         return Err("offscreen render unsupported")
     }
-    fn render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &[types.Placement]) -> Result[int, str] {
+    fn render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: Slice[types.Placement]) -> Result[int, str] {
         return Err("offscreen dmabuf capture unsupported")
     }
     fn device_lost(self) -> bool {

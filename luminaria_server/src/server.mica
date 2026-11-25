@@ -75,6 +75,9 @@ pub enum Event {
     Cursor(ids.Seat, Option[ids.Surface], i32, i32)
     /// wp_cursor_shape from the focused client: `cursor_name(shape)`.
     CursorShape(ids.Seat, u32)
+    /// A pointer lock with a cursor position hint ended: the pointer is
+    /// now at this point of the surface.
+    PointerHint(ids.Seat, ids.Surface, f64, f64)
     /// A layer surface's initial commit: arrange and configure it.
     LayerNew(ids.Layer)
     /// Mapped, unmapped, or its anchors, size, zone or layer changed.
@@ -586,7 +589,7 @@ pub fn Server.extend(mut self, take i: ext.Interface, global: bool) -> int {
 }
 
 /// Send event `op` of `o`'s interface; false when either is unknown.
-pub fn Server.ext_send(mut self, o: ext.Object, op: u16, args: &[ext.Arg]) -> bool {
+pub fn Server.ext_send(mut self, o: ext.Object, op: u16, args: Slice[ext.Arg]) -> bool {
     return ext.send(mut self, o, op, args)
 }
 
@@ -626,7 +629,7 @@ pub fn Server.stalled(self, mut out: List[ids.Client]) {
 
 /// Protocol error `code` on `obj`: the client is told and dropped after
 /// the next flush.
-fn Server.fail(mut self, ci: u32, obj: u32, code: u32, msg: &str) {
+fn Server.fail(mut self, ci: u32, obj: u32, code: u32, msg: StrSlice) {
     io.eprint("luminaria: client pid={self.clients.items[int(ci)].pid} fail obj={obj} code={code}: {msg}")
     discard self.conns[int(ci)].error(obj, code, msg)
 }
@@ -792,6 +795,28 @@ pub fn Server.take_changes(mut self, s: ids.Surface, mut damage: List[ids.Rect],
     return c
 }
 
+/// Commits replaced before `take_changes` saw them, oldest first: their
+/// buffer and release point (timeline fd, borrowed, or -1). Never shown:
+/// release each buffer unless it is still in use, then signal its point.
+pub fn Server.take_superseded(mut self, s: ids.Surface, mut out: List[(Option[ids.Buffer], int, u64)]) {
+    guard self.surfaces.live(s.id) else {
+        return
+    }
+    for x in mem.replace(mut self.surfaces.items[int(s.id.index)].superseded, []) {
+        var fd = -1
+        if x.release != state.none and self.timelines.used(int(x.release)) {
+            if let Some(f) = self.timelines.items[int(x.release)].fd {
+                fd = f.raw()
+            }
+        }
+        let b = match x.buffer {
+            Some(id) => Some(ids.Buffer { id })
+            None => None
+        }
+        out.push((b, fd, x.point))
+    }
+}
+
 /// The largest rectangle of the opaque region (surface coordinates).
 pub fn Server.opaque(self, s: ids.Surface) -> ids.Rect {
     guard self.surfaces.live(s.id) else {
@@ -955,7 +980,7 @@ pub fn Server.dmabuf(self, b: ids.Buffer) -> types.Dmabuf {
 /// Lend `f` the shm buffer's bytes and stride (SIGBUS-safe; the view
 /// cannot outlive the call, so a pool the client resizes or destroys
 /// later is never read); false when the client broke the buffer.
-pub fn Server.with_shm(self, b: ids.Buffer, f: fn(&[u8], int)) -> bool {
+pub fn Server.with_shm(self, b: ids.Buffer, f: fn(Slice[u8], int)) -> bool {
     guard self.buffers.live(b.id) else {
         return false
     }
@@ -989,7 +1014,7 @@ pub fn Server.imported(mut self, b: ids.Buffer, ok: bool) {
 
 // --------------------------------------------------------- transactions
 
-pub fn Server.waits(self, t: ids.Txn) -> &[state.Wait] {
+pub fn Server.waits(self, t: ids.Txn) -> Slice[state.Wait] {
     guard self.txns.live(t.id) else {
         return self.no_waits[0..0]
     }
@@ -1029,14 +1054,14 @@ pub fn Server.window_of(self, s: ids.Surface) -> Option[ids.Window] {
     }
 }
 
-pub fn Server.title(self, w: ids.Window) -> &str {
+pub fn Server.title(self, w: ids.Window) -> StrSlice {
     guard self.windows.live(w.id) else {
         return ""
     }
     return self.windows.items[int(w.id.index)].title
 }
 
-pub fn Server.app_id(self, w: ids.Window) -> &str {
+pub fn Server.app_id(self, w: ids.Window) -> StrSlice {
     guard self.windows.live(w.id) else {
         return ""
     }
@@ -1212,6 +1237,7 @@ pub fn Server.keyboard_focus(mut self, s: ids.Seat, target: Option[ids.Surface])
     if self.seats.live(s.id) {
         let slot = self.slot_of(target)
         seat.keyboard_focus(mut self, s.id.index, slot)
+        pointer.update(mut self, s.id.index)
     }
 }
 
@@ -1242,6 +1268,7 @@ pub fn Server.pointer_focus(mut self, s: ids.Seat, target: Option[ids.Surface], 
     if self.seats.live(s.id) {
         let slot = self.slot_of(target)
         seat.pointer_focus(mut self, s.id.index, slot, x, y)
+        pointer.update(mut self, s.id.index)
     }
 }
 
@@ -1256,6 +1283,7 @@ pub fn Server.pointer_focused(self, s: ids.Seat) -> Option[ids.Surface] {
 pub fn Server.pointer_motion(mut self, s: ids.Seat, time_ms: u32, x: f64, y: f64) {
     if self.seats.live(s.id) {
         seat.pointer_motion(mut self, s.id.index, time_ms, x, y)
+        pointer.update(mut self, s.id.index)
     }
 }
 
@@ -1488,28 +1516,42 @@ pub fn Server.constraint(self, st: ids.Seat, s: ids.Surface) -> Option[Constrain
     guard k != state.none else {
         return None
     }
-    let i = int(k)
-    let hint = if self.constraints.items[i].hint_set { Some((self.constraints.items[i].hint_x, self.constraints.items[i].hint_y)) } else { None }
-    return Some(Constraint { lock: self.constraints.items[i].lock, region: self.constraints.items[i].region.clone(), active: self.constraints.items[i].active, hint })
+    return Some(self.constraint_at(st.id.index, k))
 }
 
-/// Turn the constraint of `s` on (the pointer is inside its region and
-/// the surface has focus) or off.
-pub fn Server.set_constraint(mut self, st: ids.Seat, s: ids.Surface, on: bool) {
-    guard self.seats.live(st.id) and self.surfaces.live(s.id) else {
-        return
+/// The seat's active constraint and its surface: the server turns
+/// constraints on and off as pointer and keyboard focus move.
+pub fn Server.active_constraint(self, st: ids.Seat) -> Option[(ids.Surface, Constraint)] {
+    guard self.seats.live(st.id) else {
+        return None
     }
-    let k = pointer.constraint_of(self, s.id.index, st.id.index)
-    if k != state.none {
-        pointer.activate(mut self, k, on)
+    let k = self.seats.items[int(st.id.index)].constraint
+    guard k != state.none else {
+        return None
     }
+    let s = ids.Surface { id: self.surfaces.id(self.constraints.items[int(k)].surface) }
+    return Some((s, self.constraint_at(st.id.index, k)))
+}
+
+fn Server.constraint_at(self, si: u32, k: u32) -> Constraint {
+    let i = int(k)
+    let hint = if self.constraints.items[i].hint_set { Some((self.constraints.items[i].hint_x, self.constraints.items[i].hint_y)) } else { None }
+    return Constraint { lock: self.constraints.items[i].lock, region: self.constraints.items[i].region.clone(), active: self.seats.items[int(si)].constraint == k, hint }
 }
 
 /// Unaccelerated and accelerated motion for zwp_relative_pointer
-/// (microsecond timestamp).
+/// (microsecond timestamp); `pointer_frame` ends the input event.
 pub fn Server.relative_motion(mut self, st: ids.Seat, time_us: u64, dx: f64, dy: f64, raw_dx: f64, raw_dy: f64) {
     if self.seats.live(st.id) {
         pointer.relative_motion(mut self, st.id.index, time_us, dx, dy, raw_dx, raw_dy)
+    }
+}
+
+/// End an input event's pointer events: the wl_pointer.frame relative
+/// motion still owes (motion, enter and leave send their own).
+pub fn Server.pointer_frame(mut self, st: ids.Seat) {
+    if self.seats.live(st.id) {
+        pointer.frame(mut self, st.id.index)
     }
 }
 
@@ -1651,7 +1693,7 @@ pub fn Server.drag_icon(self, st: ids.Seat) -> Option[(ids.Surface, i32, i32)] {
 
 /// Advertise dmabuf device (`dev_t`) and writable (fourcc, modifier) pairs
 /// for ext-image-copy-capture sessions.
-pub fn Server.set_capture_dmabuf(mut self, dev: u64, formats: &[(u32, u64)]) {
+pub fn Server.set_capture_dmabuf(mut self, dev: u64, formats: Slice[(u32, u64)]) {
     self.capture_device = dev
     self.capture_formats.clear()
     for p in formats {
@@ -1666,7 +1708,7 @@ pub fn Server.capture_waiting(self, o: ids.Output) -> bool {
 
 /// What the output shows (BGRA8, rows packed), shown at `ns`
 /// (CLOCK_MONOTONIC): the waiting shm captures get it.
-pub fn Server.capture(mut self, o: ids.Output, pixels: &[u8], width: i32, height: i32, ns: int) {
+pub fn Server.capture(mut self, o: ids.Output, pixels: Slice[u8], width: i32, height: i32, ns: int) {
     if self.outputs.live(o.id) {
         capture.deliver(mut self, o.id.index, pixels, width, height, ns)
     }
@@ -1678,7 +1720,7 @@ pub fn Server.capture_window_waiting(self, w: ids.Window) -> bool {
 }
 
 /// Deliver rendered window pixels (BGRA8, rows packed) to waiting shm captures.
-pub fn Server.capture_window(mut self, w: ids.Window, pixels: &[u8], width: i32, height: i32, ns: int) {
+pub fn Server.capture_window(mut self, w: ids.Window, pixels: Slice[u8], width: i32, height: i32, ns: int) {
     if self.windows.live(w.id) {
         capture.window_deliver(mut self, w.id.index, pixels, width, height, ns)
     }

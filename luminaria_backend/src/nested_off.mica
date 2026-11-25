@@ -37,11 +37,11 @@ fn Nested.prepare(mut self, count: int, mut retired: List[u64]) -> Option[types.
     return None
 }
 
-fn Nested.give(mut self, ts: &[types.Target]) {}
+fn Nested.give(mut self, ts: Slice[types.Target]) {}
 
-fn Nested.present(mut self, i: int, fence: int, rects: &[(i32, i32, i32, i32)]) {}
+fn Nested.present(mut self, i: int, fence: int, rects: Slice[(i32, i32, i32, i32)]) {}
 
-fn Nested.scanout(mut self, key: u64, b: types.Dmabuf, rects: &[(i32, i32, i32, i32)]) -> bool {
+fn Nested.scanout(mut self, key: u64, b: types.Dmabuf, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     return false
 }
 
@@ -51,6 +51,6 @@ fn Nested.holds(self, key: u64) -> bool {
 
 fn Nested.forget(mut self, key: u64) {}
 
-fn Nested.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {}
+fn Nested.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) {}
 
 fn Nested.release(mut self, mut retired: List[u64]) {}

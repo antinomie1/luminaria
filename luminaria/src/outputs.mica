@@ -37,6 +37,8 @@ fn backend_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
                     Released(o) => frames.schedule(mut d, int(o))
                     Dropped(o) => {
                         if int(o) < d.outs.len() {
+                            // The frame never shows: its cycle still ends.
+                            frames.cycle_done(mut d, int(o))
                             d.outs[int(o)].dirty = true
                             d.comp.damage_all()
                             frames.schedule(mut d, int(o))
@@ -98,8 +100,7 @@ fn output_added[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
     while d.outs.len() <= o {
         d.outs.push(display.Out {})
         d.drawn.push([])
-        d.releases.push([])
-        d.points.push([])
+        d.reads.push([])
         d.probes.push(types.Stats.new())
     }
     // To the right of the others.
@@ -160,13 +161,9 @@ fn output_removed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
         os.close(d.outs[o].timer)
         d.outs[o].timer = -1
     }
-    for b in mem.replace(mut d.releases[o], []) {
-        d.srv.release(b)
-    }
-    for (_, fd, point) in mem.replace(mut d.points[o], []) {
-        d.sync.signal(fd, point)
-        os.close(fd)
-    }
+    // Its frames end here: what they showed and read is free.
+    frames.cycle_done(mut d, o)
+    d.drawn[o].clear()
     d.emit(display.Event.OutputRemoved(so))
     place.rebuild(mut d)
 }

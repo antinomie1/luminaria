@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zxdg_exporter_v2: interface for exporting surfaces
-pub struct Exporter derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Exporter {
     pub id: u32
 }
 
@@ -46,7 +47,8 @@ fn decode_exporter(mut conn: wire.Conn, m: wire.Msg) -> Result[ExporterRequest, 
 }
 
 /// zxdg_importer_v2: interface for importing surfaces
-pub struct Importer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Importer {
     pub id: u32
 }
 
@@ -81,7 +83,8 @@ fn decode_importer(mut conn: wire.Conn, m: wire.Msg) -> Result[ImporterRequest, 
 }
 
 /// zxdg_exported_v2: an exported surface handle
-pub struct Exported derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Exported {
     pub id: u32
 }
 
@@ -108,13 +111,14 @@ fn decode_exported(mut conn: wire.Conn, m: wire.Msg) -> Result[ExportedRequest, 
 }
 
 /// the exported surface handle
-pub fn Exported.handle(self, mut conn: wire.Conn, handle: &str) {
+pub fn Exported.handle(self, mut conn: wire.Conn, handle: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(handle))
     wr.str(mut conn, handle)
 }
 
 /// zxdg_imported_v2: an imported surface handle
-pub struct Imported derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Imported {
     pub id: u32
 }
 
@@ -180,7 +184,7 @@ pub fn Importer.destroy(self, mut conn: wire.Conn) {
 }
 
 /// import a toplevel surface
-pub fn Importer.import_toplevel(self, mut conn: wire.Conn, handle: &str) -> Imported {
+pub fn Importer.import_toplevel(self, mut conn: wire.Conn, handle: StrSlice) -> Imported {
     let id = Imported { id: conn.alloc(imported_iface, conn.version(self.id)) }
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(handle) + 4)
     wr.u32(mut conn, id.id)

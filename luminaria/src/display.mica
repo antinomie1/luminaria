@@ -274,6 +274,9 @@ struct Out {
     has_blocked: bool = false
     /// The compositor asked for a frame (`want_frame`), changed or not.
     wanted: bool = false
+    /// The frame on screen is a client buffer that asked for tearing:
+    /// frames start as soon as there is something new.
+    tearing: bool = false
     /// The area panels leave free (global logical).
     ux: f64 = 0.0
     uy: f64 = 0.0
@@ -328,6 +331,16 @@ struct ImageData {
     alive: bool = true
 }
 
+/// A replaced buffer (None: only a release point of a buffer still in
+/// use) to hand back once nothing reads `key`, with its release point
+/// (dup'd timeline fd, or -1).
+struct Release {
+    buf: Option[server.Buffer] = None
+    key: u64
+    fd: int = -1
+    point: u64 = 0
+}
+
 pub struct Display[O: plug.Output, R: plug.Renderer] {
     srv: server.Server
     be: O
@@ -341,11 +354,12 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     next_cursor_key: u64 = 0x7ffffffffffffffe
     background: vec4
     outs: List[Out] = []
-    /// Per output: surfaces the frame in flight shows, buffers and release
-    /// points (buffer key, dup'd timeline fd, point) to hand back once on screen.
+    /// Per output: surfaces the last frame showed (frame callbacks,
+    /// presentation, fifo) and the client buffers its rendering reads.
     drawn: List[List[server.Surface]] = []
-    releases: List[List[server.Buffer]] = []
-    points: List[List[(u64, int, u64)]] = []
+    reads: List[List[u64]] = []
+    /// Replaced buffers a frame in flight or a plane still reads.
+    releases: List[Release] = []
     /// Per output: what it measured (`stats`).
     probes: List[types.Stats] = []
     lay: layout.Layout = layout.Layout {}
@@ -355,6 +369,8 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     origins: map.Map[server.Surface, (f64, f64, f64)]
     anims: map.Map[u64, place.Anim]
     animating: bool = false
+    /// The scene changed under the pointers since they last looked.
+    refocus: bool = false
     popups: List[server.Popup] = []
     images: List[ImageData] = []
     queue: List[Event] = []
@@ -669,6 +685,12 @@ fn Display[O, R].drop_client(mut self, c: server.Client) {
 /// Finish due frames, flush every client.
 fn Display[O, R].finish(mut self) -> Result[(), str] {
     capture.finish_captures(mut self)
+    if self.refocus {
+        self.refocus = false
+        for si in 0..self.seats.len() {
+            input.refocus_on(mut self, si)
+        }
+    }
     for o in 0..self.outs.len() {
         if self.outs[o].due {
             try frames.render(mut self, o)
@@ -1421,7 +1443,7 @@ pub fn Display[O, R].warp(mut self, x: f64, y: f64) {
 
 /// A texture of `pixels` (RGBA8 premultiplied, rows packed) for layouts:
 /// wallpapers, decorations, panels.
-pub fn Display[O, R].image(mut self, width: i32, height: i32, pixels: &[u8], opaque: bool) -> Result[layout.Image, str] {
+pub fn Display[O, R].image(mut self, width: i32, height: i32, pixels: Slice[u8], opaque: bool) -> Result[layout.Image, str] {
     var at = self.images.len()
     var gen: u32 = 1
     for i in 0..self.images.len() {
@@ -1447,7 +1469,7 @@ pub fn Display[O, R].image(mut self, width: i32, height: i32, pixels: &[u8], opa
 
 /// Redraw part of an image: `pixels` is the whole image (rows `stride`
 /// bytes apart), of which `x, y, w, h` changed.
-pub fn Display[O, R].update_image(mut self, img: layout.Image, x: i32, y: i32, w: i32, h: i32, pixels: &[u8], stride: i32) -> Result[(), str] {
+pub fn Display[O, R].update_image(mut self, img: layout.Image, x: i32, y: i32, w: i32, h: i32, pixels: Slice[u8], stride: i32) -> Result[(), str] {
     guard int(img.index) < self.images.len() and self.images[int(img.index)].alive and self.images[int(img.index)].gen == img.gen else {
         return Err("no such image")
     }
@@ -1479,7 +1501,7 @@ pub fn Display[O, R].extend(mut self, take i: server.ext.Interface, global: bool
 }
 
 /// Send event `op` of `o`'s interface; false when either is unknown.
-pub fn Display[O, R].ext_send(mut self, o: server.ext.Object, op: u16, args: &[server.ext.Arg]) -> bool {
+pub fn Display[O, R].ext_send(mut self, o: server.ext.Object, op: u16, args: Slice[server.ext.Arg]) -> bool {
     return self.srv.ext_send(o, op, args)
 }
 
@@ -1669,11 +1691,9 @@ fn Display[O, R].drop(mut self) {
             self.caps.fences[i].used = false
         }
     }
-    for i in 0..self.points.len() {
-        for (_, fd, _) in mem.replace(mut self.points[i], []) {
-            if fd >= 0 {
-                os.close(fd)
-            }
+    for r in mem.replace(mut self.releases, []) {
+        if r.fd >= 0 {
+            os.close(r.fd)
         }
     }
     self.surfs.each(fn(_, sf) {

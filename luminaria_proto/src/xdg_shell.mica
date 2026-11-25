@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// xdg_wm_base: create desktop-style surfaces
-pub struct WmBase derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct WmBase {
     pub id: u32
 }
 
@@ -77,7 +78,8 @@ pub fn WmBase.ping(self, mut conn: wire.Conn, serial: u32) {
 }
 
 /// xdg_positioner: child surface positioner
-pub struct Positioner derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Positioner {
     pub id: u32
 }
 
@@ -114,7 +116,8 @@ pub enum PositionerGravity: u32 {
 }
 
 /// constraint adjustments
-pub enum PositionerConstraintAdjustment: u32 derive(Flags) {
+@derive(Flags)
+pub enum PositionerConstraintAdjustment: u32 {
     /// don't move the child surface when constrained
     None = 0
     /// move along the x axis until unconstrained
@@ -228,7 +231,8 @@ fn decode_positioner(mut conn: wire.Conn, m: wire.Msg) -> Result[PositionerReque
 }
 
 /// xdg_surface: desktop user interface surface base interface
-pub struct Surface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Surface {
     pub id: u32
 }
 
@@ -310,7 +314,8 @@ pub fn Surface.configure(self, mut conn: wire.Conn, serial: u32) {
 }
 
 /// xdg_toplevel: toplevel surface
-pub struct Toplevel derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Toplevel {
     pub id: u32
 }
 
@@ -497,7 +502,7 @@ fn decode_toplevel(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelRequest, 
 }
 
 /// suggest a surface change
-pub fn Toplevel.configure(self, mut conn: wire.Conn, width: i32, height: i32, states: &[u8]) {
+pub fn Toplevel.configure(self, mut conn: wire.Conn, width: i32, height: i32, states: Slice[u8]) {
     var wr = conn.begin(self.id, 0, 8 + wire.array_size(states) + 8)
     wr.i32(mut conn, width)
     wr.i32(mut conn, height)
@@ -520,7 +525,7 @@ pub fn Toplevel.configure_bounds(self, mut conn: wire.Conn, width: i32, height: 
 }
 
 /// compositor capabilities
-pub fn Toplevel.wm_capabilities(self, mut conn: wire.Conn, capabilities: &[u8]) {
+pub fn Toplevel.wm_capabilities(self, mut conn: wire.Conn, capabilities: Slice[u8]) {
     guard conn.version(self.id) >= 5 else {
         return
     }
@@ -529,7 +534,8 @@ pub fn Toplevel.wm_capabilities(self, mut conn: wire.Conn, capabilities: &[u8]) 
 }
 
 /// xdg_popup: short-lived, popup surfaces for menus
-pub struct Popup derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Popup {
     pub id: u32
 }
 
@@ -843,13 +849,13 @@ pub fn Toplevel.set_parent(self, mut conn: wire.Conn, parent: Option[Toplevel]) 
 }
 
 /// set surface title
-pub fn Toplevel.set_title(self, mut conn: wire.Conn, title: &str) {
+pub fn Toplevel.set_title(self, mut conn: wire.Conn, title: StrSlice) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(title))
     wr.str(mut conn, title)
 }
 
 /// set application ID
-pub fn Toplevel.set_app_id(self, mut conn: wire.Conn, app_id: &str) {
+pub fn Toplevel.set_app_id(self, mut conn: wire.Conn, app_id: StrSlice) {
     var wr = conn.begin(self.id, 3, 8 + wire.str_size(app_id))
     wr.str(mut conn, app_id)
 }

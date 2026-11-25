@@ -6,7 +6,8 @@ import ext_image_capture_source
 import wayland
 
 /// ext_image_copy_capture_manager_v1: manager to inform clients and begin capturing
-pub struct Manager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Manager {
     pub id: u32
 }
 
@@ -18,7 +19,8 @@ pub enum ManagerError: u32 {
     InvalidOption = 1
 }
 
-pub enum ManagerOptions: u32 derive(Flags) {
+@derive(Flags)
+pub enum ManagerOptions: u32 {
     /// paint cursors onto captured frames
     PaintCursors = 1
 }
@@ -61,7 +63,8 @@ fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wi
 }
 
 /// ext_image_copy_capture_session_v1: image copy capture session
-pub struct Session derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Session {
     pub id: u32
 }
 
@@ -113,13 +116,13 @@ pub fn Session.shm_format(self, mut conn: wire.Conn, format: wayland.ShmFormat) 
 }
 
 /// dma-buf device
-pub fn Session.dmabuf_device(self, mut conn: wire.Conn, device: &[u8]) {
+pub fn Session.dmabuf_device(self, mut conn: wire.Conn, device: Slice[u8]) {
     var wr = conn.begin(self.id, 2, 8 + wire.array_size(device))
     wr.array(mut conn, device)
 }
 
 /// dma-buf format
-pub fn Session.dmabuf_format(self, mut conn: wire.Conn, format: u32, modifiers: &[u8]) {
+pub fn Session.dmabuf_format(self, mut conn: wire.Conn, format: u32, modifiers: Slice[u8]) {
     var wr = conn.begin(self.id, 3, 8 + wire.array_size(modifiers) + 4)
     wr.u32(mut conn, format)
     wr.array(mut conn, modifiers)
@@ -136,7 +139,8 @@ pub fn Session.stopped(self, mut conn: wire.Conn) {
 }
 
 /// ext_image_copy_capture_frame_v1: image capture frame
-pub struct Frame derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Frame {
     pub id: u32
 }
 
@@ -238,7 +242,8 @@ pub fn Frame.failed(self, mut conn: wire.Conn, reason: FrameFailureReason) {
 }
 
 /// ext_image_copy_capture_cursor_session_v1: cursor capture session
-pub struct CursorSession derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct CursorSession {
     pub id: u32
 }
 

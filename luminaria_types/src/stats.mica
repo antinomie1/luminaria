@@ -73,7 +73,7 @@ pub fn Stats.frame(mut self, ns: int) {
 }
 
 /// The `p`th percentile (0..100) of `xs`, 0 when empty.
-pub fn percentile(xs: &[int], p: int) -> int {
+pub fn percentile(xs: Slice[int], p: int) -> int {
     guard not xs.is_empty() else {
         return 0
     }

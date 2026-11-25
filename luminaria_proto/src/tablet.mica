@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_tablet_manager_v2: controller object for graphic tablet devices
-pub struct TabletManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletManager {
     pub id: u32
 }
 
@@ -40,7 +41,8 @@ fn decode_tablet_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletManag
 }
 
 /// zwp_tablet_seat_v2: controller object for graphic tablet devices of a seat
-pub struct TabletSeat derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletSeat {
     pub id: u32
 }
 
@@ -91,7 +93,8 @@ pub fn TabletSeat.pad_added(self, mut conn: wire.Conn) -> TabletPad {
 }
 
 /// zwp_tablet_tool_v2: a physical tablet tool
-pub struct TabletTool derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletTool {
     pub id: u32
 }
 
@@ -297,7 +300,8 @@ pub fn TabletTool.frame(self, mut conn: wire.Conn, time: u32) {
 }
 
 /// zwp_tablet_v2: graphics tablet device
-pub struct Tablet derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Tablet {
     pub id: u32
 }
 
@@ -338,7 +342,7 @@ fn decode_tablet(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletRequest, wire
 }
 
 /// tablet device name
-pub fn Tablet.name(self, mut conn: wire.Conn, name: &str) {
+pub fn Tablet.name(self, mut conn: wire.Conn, name: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(name))
     wr.str(mut conn, name)
 }
@@ -351,7 +355,7 @@ pub fn Tablet.id(self, mut conn: wire.Conn, vid: u32, pid: u32) {
 }
 
 /// path to the device
-pub fn Tablet.path(self, mut conn: wire.Conn, path: &str) {
+pub fn Tablet.path(self, mut conn: wire.Conn, path: StrSlice) {
     var wr = conn.begin(self.id, 2, 8 + wire.str_size(path))
     wr.str(mut conn, path)
 }
@@ -376,7 +380,8 @@ pub fn Tablet.bustype(self, mut conn: wire.Conn, bustype: TabletBustype) {
 }
 
 /// zwp_tablet_pad_ring_v2: pad ring
-pub struct TabletPadRing derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletPadRing {
     pub id: u32
 }
 
@@ -440,7 +445,8 @@ pub fn TabletPadRing.frame(self, mut conn: wire.Conn, time: u32) {
 }
 
 /// zwp_tablet_pad_strip_v2: pad strip
-pub struct TabletPadStrip derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletPadStrip {
     pub id: u32
 }
 
@@ -504,7 +510,8 @@ pub fn TabletPadStrip.frame(self, mut conn: wire.Conn, time: u32) {
 }
 
 /// zwp_tablet_pad_group_v2: a set of buttons, rings and strips
-pub struct TabletPadGroup derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletPadGroup {
     pub id: u32
 }
 
@@ -531,7 +538,7 @@ fn decode_tablet_pad_group(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPad
 }
 
 /// buttons announced
-pub fn TabletPadGroup.buttons(self, mut conn: wire.Conn, buttons: &[u8]) {
+pub fn TabletPadGroup.buttons(self, mut conn: wire.Conn, buttons: Slice[u8]) {
     var wr = conn.begin(self.id, 0, 8 + wire.array_size(buttons))
     wr.array(mut conn, buttons)
 }
@@ -583,7 +590,8 @@ pub fn TabletPadGroup.dial(self, mut conn: wire.Conn) -> TabletPadDial {
 }
 
 /// zwp_tablet_pad_v2: a set of buttons, rings, strips and dials
-pub struct TabletPad derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletPad {
     pub id: u32
 }
 
@@ -635,7 +643,7 @@ pub fn TabletPad.group(self, mut conn: wire.Conn) -> TabletPadGroup {
 }
 
 /// path to the device
-pub fn TabletPad.path(self, mut conn: wire.Conn, path: &str) {
+pub fn TabletPad.path(self, mut conn: wire.Conn, path: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(path))
     wr.str(mut conn, path)
 }
@@ -680,7 +688,8 @@ pub fn TabletPad.removed(self, mut conn: wire.Conn) {
 }
 
 /// zwp_tablet_pad_dial_v2: pad dial
-pub struct TabletPadDial derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TabletPadDial {
     pub id: u32
 }
 
@@ -1047,7 +1056,7 @@ fn decode_tablet_pad_ring_event(mut conn: wire.Conn, m: wire.Msg) -> Result[Tabl
 }
 
 /// set compositor feedback
-pub fn TabletPadRing.set_feedback(self, mut conn: wire.Conn, description: &str, serial: u32) {
+pub fn TabletPadRing.set_feedback(self, mut conn: wire.Conn, description: StrSlice, serial: u32) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(description) + 4)
     wr.str(mut conn, description)
     wr.u32(mut conn, serial)
@@ -1099,7 +1108,7 @@ fn decode_tablet_pad_strip_event(mut conn: wire.Conn, m: wire.Msg) -> Result[Tab
 }
 
 /// set compositor feedback
-pub fn TabletPadStrip.set_feedback(self, mut conn: wire.Conn, description: &str, serial: u32) {
+pub fn TabletPadStrip.set_feedback(self, mut conn: wire.Conn, description: StrSlice, serial: u32) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(description) + 4)
     wr.str(mut conn, description)
     wr.u32(mut conn, serial)
@@ -1254,7 +1263,7 @@ fn decode_tablet_pad_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPad
 }
 
 /// set compositor feedback
-pub fn TabletPad.set_feedback(self, mut conn: wire.Conn, button: u32, description: &str, serial: u32) {
+pub fn TabletPad.set_feedback(self, mut conn: wire.Conn, button: u32, description: StrSlice, serial: u32) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(description) + 8)
     wr.u32(mut conn, button)
     wr.str(mut conn, description)
@@ -1294,7 +1303,7 @@ fn decode_tablet_pad_dial_event(mut conn: wire.Conn, m: wire.Msg) -> Result[Tabl
 }
 
 /// set compositor feedback
-pub fn TabletPadDial.set_feedback(self, mut conn: wire.Conn, description: &str, serial: u32) {
+pub fn TabletPadDial.set_feedback(self, mut conn: wire.Conn, description: StrSlice, serial: u32) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(description) + 4)
     wr.str(mut conn, description)
     wr.u32(mut conn, serial)

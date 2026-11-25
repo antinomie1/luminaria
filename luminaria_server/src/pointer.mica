@@ -53,16 +53,28 @@ fn relative(mut srv: server.Server, ci: u32, r: rp.Pointer, take req: rp.Pointer
     }
 }
 
-/// Motion before acceleration and clamping (and while locked).
+/// Motion before acceleration and clamping (and while locked). The frame
+/// that closes it is owed until `frame` (a lock sends no wl_pointer.motion).
 fn relative_motion(mut srv: server.Server, si: u32, time_us: u64, dx: f64, dy: f64, rdx: f64, rdy: f64) {
     let fc = seat.focused_client(srv, si)
     guard fc != state.none else {
         return
     }
-    for r in srv.seats.items[int(si)].relatives.clone() {
+    let i = int(si)
+    for k in 0..srv.seats.items[i].relatives.len() {
+        let r = srv.seats.items[i].relatives[k]
         if r.client == fc {
             rp.Pointer { id: r.id }.relative_motion(mut srv.conns[int(fc)], u32(time_us >> 32), u32(time_us & 0xffffffff), dx, dy, rdx, rdy)
+            srv.seats.items[i].frame_owed = fc
         }
+    }
+}
+
+/// Close the pointer events of one input event with the frame still owed.
+fn frame(mut srv: server.Server, si: u32) {
+    let c = srv.seats.items[int(si)].frame_owed
+    if c != state.none {
+        seat.frame_ptrs(mut srv, si, c)
     }
 }
 
@@ -95,6 +107,7 @@ fn add_constraint(mut srv: server.Server, ci: u32, id: u32, sid: u32, pid: u32, 
     let oneshot = lifetime == pc.PointerConstraintsLifetime.Oneshot
     let k = srv.constraints.add(state.ConstraintData { client: ci, obj: id, surface: si, seat: st, lock, region: rects, oneshot })
     srv.bind(ci, id, k.index)
+    update(mut srv, st)
 }
 
 fn locked_pointer(mut srv: server.Server, ci: u32, l: pc.LockedPointer, take req: pc.LockedPointerRequest) {
@@ -105,7 +118,7 @@ fn locked_pointer(mut srv: server.Server, ci: u32, l: pc.LockedPointer, take req
     match req {
         Destroy => {
             srv.unbind(ci, l.id)
-            srv.constraints.remove(k, state.ConstraintData {})
+            drop_constraint(mut srv, k)
         }
         SetCursorPositionHint(x, y) => {
             srv.constraints.items[int(k)].hint_set = true
@@ -124,7 +137,7 @@ fn confined_pointer(mut srv: server.Server, ci: u32, c: pc.ConfinedPointer, take
     match req {
         Destroy => {
             srv.unbind(ci, c.id)
-            srv.constraints.remove(k, state.ConstraintData {})
+            drop_constraint(mut srv, k)
         }
         SetRegion(r) => set_region(mut srv, ci, k, r)
     }
@@ -135,6 +148,18 @@ fn set_region(mut srv: server.Server, ci: u32, k: u32, r: Option[wl.Region]) {
         Some(x) => Some(surface.region_rects(srv, ci, x.id))
         None => None
     }
+    update(mut srv, srv.constraints.items[int(k)].seat)
+}
+
+/// Constraint `k` goes away with its object: a lock ending with a cursor
+/// hint moves the pointer there.
+fn drop_constraint(mut srv: server.Server, k: u32) {
+    let st = srv.constraints.items[int(k)].seat
+    if srv.seats.used(int(st)) and srv.seats.items[int(st)].constraint == k {
+        srv.seats.items[int(st)].constraint = state.none
+        hint(mut srv, st, k)
+    }
+    srv.constraints.remove(k, state.ConstraintData {})
 }
 
 /// The live constraint of surface `si` for seat `st`, or none.
@@ -147,32 +172,71 @@ fn constraint_of(srv: server.Server, si: u32, st: u32) -> u32 {
     return state.none
 }
 
-/// Turn constraint `k` on or off (a oneshot one ends for good).
-fn activate(mut srv: server.Server, k: u32, on: bool) {
-    let i = int(k)
-    guard srv.constraints.items[i].active != on else {
+/// Recompute seat `si`'s active constraint: the one on the surface under
+/// the pointer while that client has keyboard focus. It starts once the
+/// pointer is inside its region and holds until either focus moves on.
+fn update(mut srv: server.Server, si: u32) {
+    guard srv.seats.used(int(si)) else {
         return
     }
-    srv.constraints.items[i].active = on
-    let c = int(srv.constraints.items[i].client)
-    let obj = srv.constraints.items[i].obj
-    let lock = srv.constraints.items[i].lock
-    if on {
-        if lock {
-            pc.LockedPointer { id: obj }.locked(mut srv.conns[c])
+    let i = int(si)
+    let f = srv.seats.items[i].ptr_focus
+    let kf = srv.seats.items[i].kb_focus
+    var want = state.none
+    if f != state.none and kf != state.none and srv.surfaces.used(int(f)) and srv.surfaces.used(int(kf)) and srv.surfaces.items[int(f)].client == srv.surfaces.items[int(kf)].client and not srv.seats.items[i].drag.active {
+        want = constraint_of(srv, f, si)
+    }
+    let cur = srv.seats.items[i].constraint
+    guard want != cur else {
+        return
+    }
+    if cur != state.none {
+        srv.seats.items[i].constraint = state.none
+        let c = int(srv.constraints.items[int(cur)].client)
+        let obj = srv.constraints.items[int(cur)].obj
+        if srv.constraints.items[int(cur)].lock {
+            pc.LockedPointer { id: obj }.unlocked(mut srv.conns[c])
         } else {
-            pc.ConfinedPointer { id: obj }.confined(mut srv.conns[c])
+            pc.ConfinedPointer { id: obj }.unconfined(mut srv.conns[c])
         }
+        if srv.constraints.items[int(cur)].oneshot {
+            srv.constraints.items[int(cur)].dead = true
+        }
+        hint(mut srv, si, cur)
+    }
+    guard want != state.none and inside(srv, want, srv.seats.items[i].ptr_x, srv.seats.items[i].ptr_y) else {
         return
     }
-    if lock {
-        pc.LockedPointer { id: obj }.unlocked(mut srv.conns[c])
+    srv.seats.items[i].constraint = want
+    let c = int(srv.constraints.items[int(want)].client)
+    let obj = srv.constraints.items[int(want)].obj
+    if srv.constraints.items[int(want)].lock {
+        pc.LockedPointer { id: obj }.locked(mut srv.conns[c])
     } else {
-        pc.ConfinedPointer { id: obj }.unconfined(mut srv.conns[c])
+        pc.ConfinedPointer { id: obj }.confined(mut srv.conns[c])
     }
-    if srv.constraints.items[i].oneshot {
-        srv.constraints.items[i].dead = true
+}
+
+/// Whether surface-local `x, y` is in constraint `k`'s region (or the
+/// surface's input region when it has none).
+fn inside(srv: server.Server, k: u32, x: f64, y: f64) -> bool {
+    let s = srv.constraints.items[int(k)].surface
+    return match srv.constraints.items[int(k)].region {
+        Some(rs) => ids.region_contains(rs, x, y)
+        None => srv.accepts(ids.Surface { id: srv.surfaces.id(s) }, x, y)
     }
+}
+
+/// An active lock `k` of seat `si` ended: the client's cursor hint says
+/// where the pointer is now.
+fn hint(mut srv: server.Server, si: u32, k: u32) {
+    let i = int(k)
+    let s = srv.constraints.items[i].surface
+    guard srv.constraints.items[i].lock and srv.constraints.items[i].hint_set and srv.surfaces.used(int(s)) else {
+        return
+    }
+    let e = server.Event.PointerHint(ids.Seat { id: srv.seats.id(si) }, ids.Surface { id: srv.surfaces.id(s) }, srv.constraints.items[i].hint_x, srv.constraints.items[i].hint_y)
+    srv.push(e)
 }
 
 // --------------------------------------------------------- gestures
@@ -317,12 +381,18 @@ fn surface_gone(mut srv: server.Server, si: u32) {
     for k in 0..srv.constraints.items.len() {
         if srv.constraints.used(k) and srv.constraints.items[k].surface == si {
             srv.constraints.items[k].dead = true
-            srv.constraints.items[k].active = false
         }
     }
     for i in 0..srv.seats.items.len() {
-        if srv.seats.used(i) and srv.seats.items[i].gesture_surface == si {
+        guard srv.seats.used(i) else {
+            continue
+        }
+        if srv.seats.items[i].gesture_surface == si {
             srv.seats.items[i].gesture_surface = state.none
+        }
+        let k = srv.seats.items[i].constraint
+        if k != state.none and srv.constraints.items[int(k)].surface == si {
+            srv.seats.items[i].constraint = state.none
         }
     }
 }
@@ -341,7 +411,7 @@ fn destroyed(mut srv: server.Server, ci: u32, slot: u32, iface: u16, id: u32) ->
         }
     } else if iface == pc.locked_pointer_iface or iface == pc.confined_pointer_iface {
         if srv.constraints.used(int(slot)) {
-            srv.constraints.remove(slot, state.ConstraintData {})
+            drop_constraint(mut srv, slot)
         }
     } else if iface == cs.device_iface {
         // Nothing kept.

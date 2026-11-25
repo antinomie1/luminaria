@@ -31,7 +31,7 @@ struct Swap {
     format: u32 = types.buffer.xrgb8888
 }
 
-fn create(width: i32, height: i32, ts: &[types.Target]) -> Swap {
+fn create(width: i32, height: i32, ts: Slice[types.Target]) -> Swap {
     var s = Swap { width, height }
     for t in ts {
         s.slots.push(Slot { key: t.key, buf: t.buf })

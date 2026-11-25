@@ -199,7 +199,21 @@ struct SurfaceData {
     /// Release point of the current buffer (explicit sync).
     release: u32 = 0xFFFFFFFF
     release_point: u64 = 0
+    /// Buffers and release points later commits replaced before
+    /// `take_changes` saw them (the compositor never read them).
+    superseded: List[Superseded] = []
 }
+
+/// A replaced commit's buffer and release point (timeline slot, point).
+struct Superseded {
+    buffer: Option[ids.Id] = None
+    release: u32 = 0xFFFFFFFF
+    point: u64 = 0
+}
+
+/// Replaced commits kept per surface; past this the buffers go back at
+/// once and their release points are dropped (a client gone wild).
+let superseded_max: int = 256
 
 /// Bits of `SurfaceData.changed`.
 pub let changed_buffer: u32 = 1
@@ -407,6 +421,10 @@ struct SeatData {
     devices: List[Res] = []
     kb_focus: u32 = 0xFFFFFFFF
     ptr_focus: u32 = 0xFFFFFFFF
+    /// The active pointer constraint (slot), or none.
+    constraint: u32 = 0xFFFFFFFF
+    /// The client owed a wl_pointer.frame after relative motion, or none.
+    frame_owed: u32 = 0xFFFFFFFF
     /// Pointer enter serial last sent on this seat (cursor requests must name it).
     enter_serial: u32 = 0
     /// Last input timestamp on this seat (CLOCK_MONOTONIC ns).
@@ -553,7 +571,6 @@ struct ConstraintData {
     lock: bool = true
     region: Option[List[ids.Rect]] = None
     oneshot: bool = true
-    active: bool = false
     /// A oneshot constraint that ended: inert.
     dead: bool = false
     hint_set: bool = false

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_commit_timing_manager_v1: commit timing
-pub struct TimingManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct TimingManager {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_timing_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TimingManag
 }
 
 /// wp_commit_timer_v1: Surface commit timer
-pub struct Timer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Timer {
     pub id: u32
 }
 

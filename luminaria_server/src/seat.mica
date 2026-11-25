@@ -188,7 +188,7 @@ fn set_repeat(mut srv: server.Server, si: u32, rate: i32, delay: i32) {
     }
 }
 
-fn keys_bytes(keys: &[u32]) -> List[u8] {
+fn keys_bytes(keys: Slice[u32]) -> List[u8] {
     var out: List[u8] = []
     for k in keys {
         for j in 0..4 {
@@ -301,6 +301,9 @@ fn modifiers(mut srv: server.Server, si: u32, depressed: u32, latched: u32, lock
 
 fn frame_ptrs(mut srv: server.Server, si: u32, fc: u32) {
     let i = int(si)
+    if srv.seats.items[i].frame_owed == fc {
+        srv.seats.items[i].frame_owed = state.none
+    }
     for k in 0..srv.seats.items[i].pointers.len() {
         let r = srv.seats.items[i].pointers[k]
         if r.client == fc and r.version >= 5 {

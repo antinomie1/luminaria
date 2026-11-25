@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_fifo_manager_v1: protocol for fifo constraints
-pub struct FifoManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct FifoManager {
     pub id: u32
 }
 
@@ -46,7 +47,8 @@ fn decode_fifo_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[FifoManagerRe
 }
 
 /// wp_fifo_v1: fifo interface
-pub struct Fifo derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Fifo {
     pub id: u32
 }
 

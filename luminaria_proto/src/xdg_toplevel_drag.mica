@@ -6,7 +6,8 @@ import wayland
 import xdg_shell
 
 /// xdg_toplevel_drag_manager_v1: Move a window during a drag
-pub struct DragManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DragManager {
     pub id: u32
 }
 
@@ -46,7 +47,8 @@ fn decode_drag_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[DragManagerRe
 }
 
 /// xdg_toplevel_drag_v1: Object representing a toplevel move during a drag
-pub struct Drag derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Drag {
     pub id: u32
 }
 

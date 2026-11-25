@@ -32,7 +32,7 @@ struct Headless {
     outs: List[Out] = []
 }
 
-fn create(modes: &[types.Mode]) -> Result[Headless, str] {
+fn create(modes: Slice[types.Mode]) -> Result[Headless, str] {
     var h = Headless {}
     for k in 0..modes.len() {
         let m = modes[k]
@@ -68,7 +68,7 @@ fn Headless.prepare(self, o: int, count: int) -> Option[types.Want] {
     return Some(types.Want { width: m.width, height: m.height, format: self.outs[o].format, count, export: false })
 }
 
-fn Headless.set_gamma(mut self, o: int, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+fn Headless.set_gamma(mut self, o: int, r: Slice[u16], g: Slice[u16], b: Slice[u16]) -> bool {
     guard o >= 0 and o < self.outs.len() else {
         return false
     }
@@ -112,7 +112,7 @@ fn Headless.set_hdr(mut self, o: int, on: bool, mut retired: List[u64]) -> bool 
     return true
 }
 
-fn Headless.give(mut self, o: int, ts: &[types.Target]) {
+fn Headless.give(mut self, o: int, ts: Slice[types.Target]) {
     for t in ts {
         self.outs[o].slots.push(t.key)
         self.outs[o].drawn.push(0)

@@ -21,7 +21,6 @@ struct SeatState {
     buttons: int = 0
     grab: Option[server.Surface] = None
     pointer_on: Option[server.Surface] = None
-    constrained: Option[server.Surface] = None
     cursor: cursor.Image = cursor.Image {}
     /// The cursor is shown by the backend (hardware plane / parent);
     /// secondary seats always draw via renderer textures.
@@ -145,7 +144,7 @@ fn client_cursor_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, 
         return
     }
     var img = cursor.Image { width: bi.width, height: bi.height, hot_x: d.seats[si].cursor_hx * info.scale, hot_y: d.seats[si].cursor_hy * info.scale }
-    discard d.srv.with_shm(b, fn(bytes: &[u8], stride: int) {
+    discard d.srv.with_shm(b, fn(bytes: Slice[u8], stride: int) {
         img.pixels = pixels.pack(bytes, stride, int(bi.width) * 4, int(bi.height))
     })
     if bi.format == types.buffer.xrgb8888 {

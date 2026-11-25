@@ -316,7 +316,6 @@ fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
             }
         }
     }
-    update_constraint_on(mut d, si)
     if dragging and (d.srv.drag_icon(st).is_some() or d.seats[si].drag_win.is_some()) {
         place.rebuild(mut d)
     }
@@ -327,11 +326,8 @@ fn pointer_locked_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R],
     guard si >= 0 and si < d.seats.len() else {
         return false
     }
-    guard let Some(s) = d.seats[si].constrained else {
-        return false
-    }
-    return match d.srv.constraint(d.seats[si].seat, s) {
-        Some(c) => c.active and c.lock
+    return match d.srv.active_constraint(d.seats[si].seat) {
+        Some((_, c)) => c.lock
         None => false
     }
 }
@@ -341,13 +337,7 @@ fn constrain_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: 
     guard si >= 0 and si < d.seats.len() else {
         return (x, y)
     }
-    guard let Some(s) = d.seats[si].constrained else {
-        return (x, y)
-    }
-    guard let Some(c) = d.srv.constraint(d.seats[si].seat, s) else {
-        return (x, y)
-    }
-    guard c.active else {
+    guard let Some((s, c)) = d.srv.active_constraint(d.seats[si].seat) else {
         return (x, y)
     }
     let px = d.seats[si].px
@@ -381,60 +371,18 @@ fn constrain_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: 
     return (gx + nx * sc, gy + ny * sc)
 }
 
-/// Turn pointer constraints on and off for seat `si`.
-fn update_constraint_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
-    guard si >= 0 and si < d.seats.len() else {
+/// The scene moved under seat `si`'s still pointer: the surface now under
+/// it hears so (not while buttons are held or a drag runs).
+fn refocus_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int) {
+    guard d.seats[si].buttons == 0 and not d.srv.dragging(d.seats[si].seat) else {
         return
     }
-    let st = d.seats[si].seat
-    let kb = d.srv.keyboard_focused(st)
-    let kb_client = match kb {
-        Some(k) => Some(d.srv.client_of(k))
+    let now = match under(d, d.seats[si].px, d.seats[si].py) {
+        Some((s, _, _)) => Some(s)
         None => None
     }
-    if let Some(s) = d.seats[si].constrained {
-        let keep = d.seats[si].pointer_on == Some(s) and kb_client == Some(d.srv.client_of(s)) and d.srv.surface_alive(s)
-        if not keep {
-            if let Some(c) = d.srv.constraint(st, s) {
-                // A lock ends where the client says the cursor is.
-                if c.lock {
-                    if let Some((hx, hy)) = c.hint {
-                        if let Some((gx, gy, sc)) = d.origins.get(s) {
-                            d.seats[si].px = gx + hx * sc
-                            d.seats[si].py = gy + hy * sc
-                            seats.move_cursor_on(mut d, si)
-                        }
-                    }
-                }
-            }
-            d.srv.set_constraint(st, s, false)
-            d.seats[si].constrained = None
-        }
-    }
-    guard d.seats[si].constrained.is_none() else {
-        return
-    }
-    guard let Some(s) = d.seats[si].pointer_on else {
-        return
-    }
-    guard kb_client == Some(d.srv.client_of(s)) else {
-        return
-    }
-    guard let Some(c) = d.srv.constraint(st, s) else {
-        return
-    }
-    guard let Some((gx, gy, sc)) = d.origins.get(s) else {
-        return
-    }
-    let lx = (d.seats[si].px - gx) / sc
-    let ly = (d.seats[si].py - gy) / sc
-    let inside = match c.region.clone() {
-        Some(rs) => rs.any(fn(r) => lx >= f64(r.x) and ly >= f64(r.y) and lx < f64(r.x + r.w) and ly < f64(r.y + r.h))
-        None => d.srv.accepts(s, lx, ly)
-    }
-    if inside {
-        d.srv.set_constraint(st, s, true)
-        d.seats[si].constrained = Some(s)
+    if now != d.seats[si].pointer_on {
+        deliver_motion_on(mut d, si, u32((time.now_ns() / 1000000) & 0xffffffff))
     }
 }
 
@@ -534,6 +482,7 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
             if si >= 0 {
                 d.srv.relative_motion(d.seats[si].seat, u64(time.now_ns() / 1000), p.dx, p.dy, p.raw_dx, p.raw_dy)
                 deliver_motion_on(mut d, si, p.time)
+                d.srv.pointer_frame(d.seats[si].seat)
             }
         }
         Button(p) => {

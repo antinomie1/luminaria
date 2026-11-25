@@ -240,7 +240,7 @@ fn view(p: Placement, t: gpu.Texture) -> vc.View {
 /// Show `ps` (back to front) on output `o` from the next frame: views are
 /// added, changed, restacked and removed by key in O(N) time, and only what
 /// changed is damaged.
-pub fn Compositor.layout(mut self, o: int, placements: &[Placement]) {
+pub fn Compositor.layout(mut self, o: int, placements: Slice[Placement]) {
     guard o < self.outputs.len() and self.outputs[o].alive else {
         return
     }
@@ -294,7 +294,7 @@ pub fn Compositor.layout(mut self, o: int, placements: &[Placement]) {
 
 /// The client drew into key `key`'s texture: `rects` in texture pixels
 /// (empty: all of it). Damages every output showing it.
-pub fn Compositor.commit(mut self, key: u64, rects: &[(i32, i32, i32, i32)]) {
+pub fn Compositor.commit(mut self, key: u64, rects: Slice[(i32, i32, i32, i32)]) {
     for o in 0..self.outputs.len() {
         guard let Some((id, _, _)) = self.outputs[o].by_key.get(key) else {
             continue
@@ -382,7 +382,7 @@ pub fn Compositor.overlay_candidates(self, o: int, max_count: int) -> List[types
 
 /// Mark placements `keys` as hardware-promoted overlays on output `o` so
 /// primary composition skips them while damaging primary on transitions.
-pub fn Compositor.set_overlays(mut self, o: int, keys: &[u64]) {
+pub fn Compositor.set_overlays(mut self, o: int, keys: Slice[u64]) {
     guard o < self.outputs.len() and self.outputs[o].alive else {
         return
     }
@@ -450,7 +450,7 @@ pub fn Compositor.solid(mut self, key: u64, rgba: [4]u32) -> bool {
 /// `stride` bytes apart), made again only when the size or format changes;
 /// the copy is recorded for the next frame. False when the format is not
 /// supported.
-pub fn Compositor.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: &[u8], stride: int) -> bool {
+pub fn Compositor.image(mut self, key: u64, width: i32, height: i32, fourcc: u32, pixels: Slice[u8], stride: int) -> bool {
     guard self.target(key, width, height, fourcc) else {
         return false
     }
@@ -459,7 +459,7 @@ pub fn Compositor.image(mut self, key: u64, width: i32, height: i32, fourcc: u32
 }
 
 /// Copy `rects` (texture pixels) of `pixels` into texture `key`.
-pub fn Compositor.update(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool {
+pub fn Compositor.update(mut self, key: u64, pixels: Slice[u8], stride: int, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     return self.texs.contains(key) and self.write(key, pixels, stride, rects)
 }
 
@@ -480,7 +480,7 @@ fn Compositor.target(mut self, key: u64, width: i32, height: i32, fourcc: u32) -
     return true
 }
 
-fn Compositor.write(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i32, i32, i32, i32)]) -> bool {
+fn Compositor.write(mut self, key: u64, pixels: Slice[u8], stride: int, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     guard let Some(t) = self.texs.get(key) else {
         return false
     }
@@ -501,7 +501,7 @@ fn Compositor.write(mut self, key: u64, pixels: &[u8], stride: int, rects: &[(i3
 /// again when the size or format changed; the damage merges with what is
 /// not uploaded yet and waits for `shm_upload`. False when the format is
 /// not supported.
-pub fn Compositor.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: &[(i32, i32, i32, i32)]) -> bool {
+pub fn Compositor.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc: u32, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     guard self.target(key, width, height, fourcc) else {
         return false
     }
@@ -531,7 +531,7 @@ pub fn Compositor.shm_commit(mut self, key: u64, width: i32, height: i32, fourcc
 
 /// Record surface `key`'s merged damage from the shm pixels `bytes`; the
 /// bytes may go back to the client after this returns.
-pub fn Compositor.shm_upload(mut self, key: u64, bytes: &[u8], stride: int) -> bool {
+pub fn Compositor.shm_upload(mut self, key: u64, bytes: Slice[u8], stride: int) -> bool {
     guard let Some(s) = self.shms.get(key) else {
         return false
     }
@@ -673,7 +673,7 @@ pub fn Compositor.read(mut self, key: u64) -> Result[List[u8], str] {
     return self.dev.read_texture(t)
 }
 
-fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encoder, dst: gpu.Texture, ps: &[Placement]) -> Result[(), str] {
+fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encoder, dst: gpu.Texture, ps: Slice[Placement]) -> Result[(), str] {
     cv.clear()
     cv.set_output_color(types.dst_sdr, 203.0, 1000.0)
     let w = dst.width()
@@ -743,7 +743,7 @@ pub fn Compositor.copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, 
 }
 
 /// Render `ps` into an offscreen `width` x `height` B8G8R8A8 target and return pixels.
-pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: &[Placement]) -> Result[List[u8], str] {
+pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: Slice[Placement]) -> Result[List[u8], str] {
     try self.flush_uploads()
     guard width > 0 and height > 0 else {
         return Err("invalid offscreen capture size {width}x{height}")
@@ -789,7 +789,7 @@ pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: &[Plac
 
 /// Render `ps` directly into (or copy into) a client's capture dmabuf `dst_buf`,
 /// returning the completion sync_file fd (or -1 if already signaled).
-pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: &[Placement]) -> Result[int, str] {
+pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: Slice[Placement]) -> Result[int, str] {
     try self.flush_uploads()
     guard let Some((vf, _)) = format.vk_format(dst_buf.format) else {
         return Err("capture format {dst_buf.format:08x} is not supported")

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_presentation: timed presentation related wl_surface requests
-pub struct Presentation derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Presentation {
     pub id: u32
 }
 
@@ -54,7 +55,8 @@ pub fn Presentation.clock_id(self, mut conn: wire.Conn, clk_id: u32) {
 }
 
 /// wp_presentation_feedback: presentation time feedback event
-pub struct PresentationFeedback derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct PresentationFeedback {
     pub id: u32
 }
 
@@ -62,7 +64,8 @@ pub let presentation_feedback_iface: u16 = 85
 pub let presentation_feedback_version: u32 = 3
 
 /// bitmask of flags in presented event
-pub enum PresentationFeedbackKind: u32 derive(Flags) {
+@derive(Flags)
+pub enum PresentationFeedbackKind: u32 {
     /// presentation was vsync'd
     Vsync = 0x1
     /// hardware provided the presentation timestamp

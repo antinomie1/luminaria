@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_pointer_constraints_v1: constrain the movement of a pointer
-pub struct PointerConstraints derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct PointerConstraints {
     pub id: u32
 }
 
@@ -70,7 +71,8 @@ fn decode_pointer_constraints(mut conn: wire.Conn, m: wire.Msg) -> Result[Pointe
 }
 
 /// zwp_locked_pointer_v1: receive relative pointer motion events
-pub struct LockedPointer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct LockedPointer {
     pub id: u32
 }
 
@@ -123,7 +125,8 @@ pub fn LockedPointer.unlocked(self, mut conn: wire.Conn) {
 }
 
 /// zwp_confined_pointer_v1: confined pointer object
-pub struct ConfinedPointer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ConfinedPointer {
     pub id: u32
 }
 

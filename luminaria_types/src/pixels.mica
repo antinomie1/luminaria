@@ -9,7 +9,7 @@ extern fn memset(dst: Ptr[u8], c: i32, n: u64) -> Ptr[u8]
 /// Copy `rows` rows of `row` bytes from `src` (rows `src_stride` apart,
 /// from `src_at`) to `dst` (rows `dst_stride` apart, from `dst_at`); false
 /// when either side is too short.
-pub fn copy_rows(mut dst: &mut [u8], dst_at: int, dst_stride: int, src: &[u8], src_at: int, src_stride: int, row: int, rows: int) -> bool {
+pub fn copy_rows(mut dst: MutSlice[u8], dst_at: int, dst_stride: int, src: Slice[u8], src_at: int, src_stride: int, row: int, rows: int) -> bool {
     guard rows > 0 and row > 0 else {
         return true
     }
@@ -34,7 +34,7 @@ pub fn copy_rows(mut dst: &mut [u8], dst_at: int, dst_stride: int, src: &[u8], s
 }
 
 /// Rows of `row` bytes, `stride` apart, as one tightly packed list.
-pub fn pack(src: &[u8], stride: int, row: int, rows: int) -> List[u8] {
+pub fn pack(src: Slice[u8], stride: int, row: int, rows: int) -> List[u8] {
     let n = max(row, 0) * max(rows, 0)
     var out: List[u8] = List.with_cap(n)
     unsafe {
@@ -47,7 +47,7 @@ pub fn pack(src: &[u8], stride: int, row: int, rows: int) -> List[u8] {
 }
 
 /// Zero `px`.
-pub fn clear(mut px: &mut [u8]) {
+pub fn clear(mut px: MutSlice[u8]) {
     if not px.is_empty() {
         unsafe {
             discard memset(px.as_ptr(), 0, u64(px.len()))
@@ -57,7 +57,7 @@ pub fn clear(mut px: &mut [u8]) {
 
 /// Make every 32-bit little-endian pixel of `px` opaque (its top byte
 /// 0xff): an X format read as A.
-pub fn opaque(mut px: &mut [u8]) {
+pub fn opaque(mut px: MutSlice[u8]) {
     let n = px.len() / 4 * 4
     unsafe {
         let p = px.as_ptr()

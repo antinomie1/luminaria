@@ -708,7 +708,7 @@ fn Drm.make_dumb_fb(self, w: i32, h: i32, fmt: u32) -> Result[(u32, u32, u32, os
     return Ok((fb, handle, pitch, m))
 }
 
-fn Drm.upload_slot(mut self, o: int, slot_idx: int, px: &[u8], stride: int) {
+fn Drm.upload_slot(mut self, o: int, slot_idx: int, px: Slice[u8], stride: int) {
     guard o >= 0 and o < self.outputs.len() else {
         return
     }
@@ -759,7 +759,7 @@ fn Drm.prepare(mut self, o: int, count: int, mut retired: List[u64]) -> Option[t
 }
 
 /// Output `o`'s scanout buffers: framebuffers for the targets made.
-fn Drm.give(mut self, o: int, ts: &[types.Target]) -> Result[(), str] {
+fn Drm.give(mut self, o: int, ts: Slice[types.Target]) -> Result[(), str] {
     let w = i32(self.outputs[o].mode.hdisplay)
     let h = i32(self.outputs[o].mode.vdisplay)
     let plane = self.outputs[o].primary
@@ -784,7 +784,7 @@ fn Drm.give(mut self, o: int, ts: &[types.Target]) -> Result[(), str] {
 }
 
 /// Install or reset (empty slices) a hardware CRTC gamma LUT on output `o`.
-fn Drm.set_gamma(mut self, o: int, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+fn Drm.set_gamma(mut self, o: int, r: Slice[u16], g: Slice[u16], b: Slice[u16]) -> bool {
     guard o >= 0 and o < self.outputs.len() else {
         return false
     }
@@ -971,7 +971,7 @@ fn Drm.make_cursor(mut self, o: int) -> Result[(), str] {
 /// Copy an ARGB8888 (premultiplied) cursor image into the back cursor buffer
 /// and flip to it so drivers that compare `old_fb != new_fb` always upload
 /// the updated cursor; false when there is no cursor plane or image is too large.
-fn Drm.set_cursor_image(mut self, o: int, px: &[u8], width: u32, height: u32) -> bool {
+fn Drm.set_cursor_image(mut self, o: int, px: Slice[u8], width: u32, height: u32) -> bool {
     guard width <= self.cursor_w and height <= self.cursor_h else {
         return false
     }
@@ -1021,12 +1021,12 @@ fn Drm.pprop(self, p: int, name: str) -> u32 {
 /// The atomic request that shows framebuffer `fb` (0: keeps the primary
 /// plane) on output `o` with GPU fence `fence` (-1: none; the request owns
 /// it) and damage `rects`, plus the cursor, and the mode when it changed.
-fn Drm.request(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], tear: bool) -> commit.Req {
+fn Drm.request(mut self, o: int, fb: u32, fence: int, rects: Slice[uapi.ModeRect], tear: bool) -> commit.Req {
     let ovs = self.outputs[o].queued_overlays.clone()
     return self.request_with_overlays(o, fb, fence, rects, tear, ovs)
 }
 
-fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: &[uapi.ModeRect], tear: bool, ovs: &[OverlaySlot]) -> commit.Req {
+fn Drm.request_with_overlays(mut self, o: int, fb: u32, fence: int, rects: Slice[uapi.ModeRect], tear: bool, ovs: Slice[OverlaySlot]) -> commit.Req {
     let ci = self.outputs[o].conn
     let ki = self.outputs[o].crtc
     let primary = self.outputs[o].primary
@@ -1174,7 +1174,7 @@ fn overlaps(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
 /// Probe hardware overlay candidates top-to-bottom on output `o` against
 /// `primary_fb` using atomic TEST_ONLY commits; stores accepted slots for
 /// the next `present` and returns their placement keys.
-fn Drm.test_overlays(mut self, o: int, primary_fb: u32, cands: &[types.Overlay]) -> List[u64] {
+fn Drm.test_overlays(mut self, o: int, primary_fb: u32, cands: Slice[types.Overlay]) -> List[u64] {
     var out: List[u64] = []
     guard o >= 0 and o < self.outputs.len() else {
         return out

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zxdg_output_manager_v1: manage xdg_output objects
-pub struct OutputManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct OutputManager {
     pub id: u32
 }
 
@@ -40,7 +41,8 @@ fn decode_output_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputManag
 }
 
 /// zxdg_output_v1: compositor logical output region
-pub struct Output derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Output {
     pub id: u32
 }
 
@@ -86,7 +88,7 @@ pub fn Output.done(self, mut conn: wire.Conn) {
 }
 
 /// name of this output
-pub fn Output.name(self, mut conn: wire.Conn, name: &str) {
+pub fn Output.name(self, mut conn: wire.Conn, name: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }
@@ -95,7 +97,7 @@ pub fn Output.name(self, mut conn: wire.Conn, name: &str) {
 }
 
 /// human-readable description of this output
-pub fn Output.description(self, mut conn: wire.Conn, description: &str) {
+pub fn Output.description(self, mut conn: wire.Conn, description: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }

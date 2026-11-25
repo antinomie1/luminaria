@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import xdg_shell
 
 /// zxdg_decoration_manager_v1: window decoration manager
-pub struct DecorationManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DecorationManager {
     pub id: u32
 }
 
@@ -40,7 +41,8 @@ fn decode_decoration_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[Decorat
 }
 
 /// zxdg_toplevel_decoration_v1: decoration object for a toplevel surface
-pub struct ToplevelDecoration derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ToplevelDecoration {
     pub id: u32
 }
 

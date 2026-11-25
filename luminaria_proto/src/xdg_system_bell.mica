@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// xdg_system_bell_v1: system bell
-pub struct SystemBell derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct SystemBell {
     pub id: u32
 }
 

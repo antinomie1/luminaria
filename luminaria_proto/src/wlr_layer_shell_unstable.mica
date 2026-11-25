@@ -6,7 +6,8 @@ import wayland
 import xdg_shell
 
 /// zwlr_layer_shell_v1: create surfaces that are layers of the desktop
-pub struct Shell derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Shell {
     pub id: u32
 }
 
@@ -65,7 +66,8 @@ fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.E
 }
 
 /// zwlr_layer_surface_v1: layer metadata interface
-pub struct Surface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Surface {
     pub id: u32
 }
 
@@ -95,7 +97,8 @@ pub enum SurfaceError: u32 {
     InvalidExclusiveEdge = 4
 }
 
-pub enum SurfaceAnchor: u32 derive(Flags) {
+@derive(Flags)
+pub enum SurfaceAnchor: u32 {
     /// the top edge of the anchor rectangle
     Top = 1
     /// the bottom edge of the anchor rectangle
@@ -212,7 +215,7 @@ pub fn Surface.closed(self, mut conn: wire.Conn) {
 }
 
 /// create a layer_surface from a surface
-pub fn Shell.get_layer_surface(self, mut conn: wire.Conn, surface: wayland.Surface, output: Option[wayland.Output], layer: ShellLayer, scope: &str) -> Surface {
+pub fn Shell.get_layer_surface(self, mut conn: wire.Conn, surface: wayland.Surface, output: Option[wayland.Output], layer: ShellLayer, scope: StrSlice) -> Surface {
     let id = Surface { id: conn.alloc(surface_iface, conn.version(self.id)) }
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(scope) + 16)
     wr.u32(mut conn, id.id)

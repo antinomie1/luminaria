@@ -13,6 +13,7 @@
 // that thread run in the real-time class (sched.mica).
 
 import std.env
+import std.io
 import std.mem
 import std.os
 import std.time
@@ -298,10 +299,16 @@ fn Backend.notes(mut self) {
                     }
                 }
             }
-            Failed(o, frame, modeset) => {
+            Failed(o, frame, modeset, tear) => {
                 if let Some(dd) = self.drm.take() {
                     var d = dd
                     d.failed(o, frame, modeset)
+                    // The driver refuses async flips here (plane, format or
+                    // property changes): tearing clients flip on vblank.
+                    if tear and d.async_flip {
+                        d.async_flip = false
+                        io.eprint("luminaria: async page flips refused; tearing falls back to vblank flips")
+                    }
                     self.drm = Some(d)
                 }
                 if frame {
@@ -438,7 +445,7 @@ pub fn Backend.set_vrr(mut self, o: u32, on: bool) {
 }
 
 /// Install or reset (empty slices) the hardware CRTC gamma LUT on output `o`.
-pub fn Backend.set_gamma(mut self, o: u32, r: &[u16], g: &[u16], b: &[u16]) -> bool {
+pub fn Backend.set_gamma(mut self, o: u32, r: Slice[u16], g: Slice[u16], b: Slice[u16]) -> bool {
     if let Some(dd) = self.drm.take() {
         var d = dd
         let ok = d.set_gamma(int(o), r, g, b)
@@ -539,7 +546,7 @@ pub fn Backend.acquire(mut self, o: u32) -> types.Acquire {
 }
 
 /// The render targets output `o` asked for.
-pub fn Backend.give(mut self, o: u32, ts: &[types.Target]) -> Result[(), str] {
+pub fn Backend.give(mut self, o: u32, ts: Slice[types.Target]) -> Result[(), str] {
     let oi = int(o)
     if let Some(dd) = self.drm.take() {
         var d = dd
@@ -592,7 +599,7 @@ pub fn Backend.needs_upload(self, o: u32) -> bool {
     return false
 }
 
-pub fn Backend.upload_frame(mut self, o: u32, pixels: &[u8], stride: int) {
+pub fn Backend.upload_frame(mut self, o: u32, pixels: Slice[u8], stride: int) {
     let oi = int(o)
     guard oi >= 0 and oi < self.acquired.len() else {
         return
@@ -608,7 +615,7 @@ pub fn Backend.upload_frame(mut self, o: u32, pixels: &[u8], stride: int) {
     }
 }
 
-fn to_clips(rects: &[Rect]) -> List[uapi.ModeRect] {
+fn to_clips(rects: Slice[Rect]) -> List[uapi.ModeRect] {
     var out: List[uapi.ModeRect] = []
     for r in rects {
         if r.2 > 0 and r.3 > 0 {
@@ -621,7 +628,7 @@ fn to_clips(rects: &[Rect]) -> List[uapi.ModeRect] {
 /// Show the acquired image once `fence` (a sync_file the output closes;
 /// -1: none) signals; `rects` is what changed (empty: everything), `tear`
 /// lets a full-screen game flip immediately.
-pub fn Backend.present(mut self, o: u32, fence: int, rects: &[Rect], tear: bool) -> Result[(), str] {
+pub fn Backend.present(mut self, o: u32, fence: int, rects: Slice[Rect], tear: bool) -> Result[(), str] {
     let oi = int(o)
     let i = self.acquired[oi]
     guard i >= 0 else {
@@ -674,7 +681,7 @@ pub fn Backend.present(mut self, o: u32, fence: int, rects: &[Rect], tear: bool)
 /// A client's dmabuf to show on `o` as is (it fills the output, opaque,
 /// unscaled): framebuffer import, an atomic test, then the flip. False
 /// when the display cannot take it (compose instead).
-pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rect], tear: bool) -> bool {
+pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: Slice[Rect], tear: bool) -> bool {
     guard b.planes >= 1 and b.planes <= 4 else {
         return false
     }
@@ -715,7 +722,7 @@ pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: &[Rec
 
 /// Probe hardware overlay candidates top-to-bottom on output `o` against
 /// primary render target `target_key`; returns promoted placement keys.
-pub fn Backend.test_overlays(mut self, o: u32, target_key: u64, cands: &[types.Overlay]) -> List[u64] {
+pub fn Backend.test_overlays(mut self, o: u32, target_key: u64, cands: Slice[types.Overlay]) -> List[u64] {
     guard let Some(dd) = self.drm.take() else {
         let none: List[u64] = []
         return none
@@ -813,7 +820,7 @@ pub fn Backend.shown(self, o: u32) -> Option[u64] {
 /// A hardware cursor image (ARGB8888 premultiplied): true when the
 /// display shows it itself (a cursor plane, the parent's cursor); false
 /// means the compositor draws it.
-pub fn Backend.set_cursor(mut self, pixels: &[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
+pub fn Backend.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
     guard width >= 0 and height >= 0 else {
         return false
     }

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_linux_dmabuf_v1: factory for creating dmabuf-based wl_buffers
-pub struct Dmabuf derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Dmabuf {
     pub id: u32
 }
 
@@ -77,7 +78,8 @@ pub fn Dmabuf.modifier(self, mut conn: wire.Conn, format: u32, modifier_hi: u32,
 }
 
 /// zwp_linux_buffer_params_v1: parameters for creating a dmabuf-based wl_buffer
-pub struct BufferParams derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct BufferParams {
     pub id: u32
 }
 
@@ -105,7 +107,8 @@ pub enum BufferParamsError: u32 {
     InvalidDevTSize = 8
 }
 
-pub enum BufferParamsFlags: u32 derive(Flags) {
+@derive(Flags)
+pub enum BufferParamsFlags: u32 {
     /// contents are y-inverted
     YInvert = 1
     /// content is interlaced
@@ -193,14 +196,16 @@ pub fn BufferParams.failed(self, mut conn: wire.Conn) {
 }
 
 /// zwp_linux_dmabuf_feedback_v1: dmabuf feedback
-pub struct DmabufFeedback derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DmabufFeedback {
     pub id: u32
 }
 
 pub let dmabuf_feedback_iface: u16 = 73
 pub let dmabuf_feedback_version: u32 = 6
 
-pub enum DmabufFeedbackTrancheFlags: u32 derive(Flags) {
+@derive(Flags)
+pub enum DmabufFeedbackTrancheFlags: u32 {
     /// direct scan-out tranche
     Scanout = 1
     /// sampling tranche
@@ -239,7 +244,7 @@ pub fn DmabufFeedback.format_table(self, mut conn: wire.Conn, fd: int, size: u32
 }
 
 /// preferred main device
-pub fn DmabufFeedback.main_device(self, mut conn: wire.Conn, device: &[u8]) {
+pub fn DmabufFeedback.main_device(self, mut conn: wire.Conn, device: Slice[u8]) {
     var wr = conn.begin(self.id, 2, 8 + wire.array_size(device))
     wr.array(mut conn, device)
 }
@@ -250,13 +255,13 @@ pub fn DmabufFeedback.tranche_done(self, mut conn: wire.Conn) {
 }
 
 /// target device
-pub fn DmabufFeedback.tranche_target_device(self, mut conn: wire.Conn, device: &[u8]) {
+pub fn DmabufFeedback.tranche_target_device(self, mut conn: wire.Conn, device: Slice[u8]) {
     var wr = conn.begin(self.id, 4, 8 + wire.array_size(device))
     wr.array(mut conn, device)
 }
 
 /// supported buffer format modifiers
-pub fn DmabufFeedback.tranche_formats(self, mut conn: wire.Conn, indices: &[u8]) {
+pub fn DmabufFeedback.tranche_formats(self, mut conn: wire.Conn, indices: Slice[u8]) {
     var wr = conn.begin(self.id, 5, 8 + wire.array_size(indices))
     wr.array(mut conn, indices)
 }
@@ -402,7 +407,7 @@ pub fn BufferParams.create_immed(self, mut conn: wire.Conn, width: i32, height: 
 }
 
 /// set the target device of the wl_buffer
-pub fn BufferParams.set_sampling_device(self, mut conn: wire.Conn, device: &[u8]) {
+pub fn BufferParams.set_sampling_device(self, mut conn: wire.Conn, device: Slice[u8]) {
     guard conn.version(self.id) >= 6 else {
         return
     }

@@ -134,8 +134,9 @@ enum Job {
 }
 
 enum Note {
-    /// The commit failed: output, whether it carried a frame, a mode.
-    Failed(int, bool, bool)
+    /// The commit failed: output, whether it carried a frame, a mode, and
+    /// whether it was an async (tearing) flip.
+    Failed(int, bool, bool, bool)
     /// Answer with Pong once the DRM events are read.
     Ping
 }
@@ -345,7 +346,7 @@ fn run(fd: int, jobs: sync.Chan[Job], notes: sync.Chan[Note], wake: int, counts:
             } else {
                 io.eprint("luminaria: drm atomic commit failed (out={r.out} frame={r.frame} modeset={r.modeset}): err={res}")
                 counts.write(fn(mut c: Counts) { c.failed += 1 })
-                notes.send(Note.Failed(r.out, r.frame, r.modeset))
+                notes.send(Note.Failed(r.out, r.frame, r.modeset, r.flags & u32(uapi.drm_mode_page_flip_async) != 0))
                 os.notify(wake, 1)
             }
         }

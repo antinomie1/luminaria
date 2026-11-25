@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import xdg_shell
 
 /// xdg_wm_dialog_v1: create dialogs related to other toplevels
-pub struct WmDialog derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct WmDialog {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_wm_dialog(mut conn: wire.Conn, m: wire.Msg) -> Result[WmDialogRequest,
 }
 
 /// xdg_dialog_v1: dialog object
-pub struct Dialog derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Dialog {
     pub id: u32
 }
 

@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwlr_foreign_toplevel_manager_v1: list and control opened apps
-pub struct Manager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Manager {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ pub fn Manager.finished(self, mut conn: wire.Conn) {
 }
 
 /// zwlr_foreign_toplevel_handle_v1: an opened toplevel
-pub struct Handle derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Handle {
     pub id: u32
 }
 
@@ -157,13 +159,13 @@ fn decode_handle(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleRequest, wire
 }
 
 /// title change
-pub fn Handle.title(self, mut conn: wire.Conn, title: &str) {
+pub fn Handle.title(self, mut conn: wire.Conn, title: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(title))
     wr.str(mut conn, title)
 }
 
 /// app-id change
-pub fn Handle.app_id(self, mut conn: wire.Conn, app_id: &str) {
+pub fn Handle.app_id(self, mut conn: wire.Conn, app_id: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(app_id))
     wr.str(mut conn, app_id)
 }
@@ -181,7 +183,7 @@ pub fn Handle.output_leave(self, mut conn: wire.Conn, output: wayland.Output) {
 }
 
 /// the toplevel state changed
-pub fn Handle.state(self, mut conn: wire.Conn, state: &[u8]) {
+pub fn Handle.state(self, mut conn: wire.Conn, state: Slice[u8]) {
     var wr = conn.begin(self.id, 4, 8 + wire.array_size(state))
     wr.array(mut conn, state)
 }

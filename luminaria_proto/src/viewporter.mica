@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_viewporter: surface cropping and scaling
-pub struct Viewporter derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Viewporter {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_viewporter(mut conn: wire.Conn, m: wire.Msg) -> Result[ViewporterReque
 }
 
 /// wp_viewport: crop and scale interface to a wl_surface
-pub struct Viewport derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Viewport {
     pub id: u32
 }
 

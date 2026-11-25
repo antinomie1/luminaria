@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// ext_session_lock_manager_v1: used to lock the session
-pub struct LockManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct LockManager {
     pub id: u32
 }
 
@@ -39,7 +40,8 @@ fn decode_lock_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[LockManagerRe
 }
 
 /// ext_session_lock_v1: manage lock state and create lock surfaces
-pub struct Lock derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Lock {
     pub id: u32
 }
 
@@ -105,7 +107,8 @@ pub fn Lock.finished(self, mut conn: wire.Conn) {
 }
 
 /// ext_session_lock_surface_v1: a surface displayed while the session is locked
-pub struct LockSurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct LockSurface {
     pub id: u32
 }
 

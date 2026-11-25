@@ -6,7 +6,8 @@ import xdg_shell
 import wayland
 
 /// xdg_toplevel_icon_manager_v1: interface to manage toplevel icons
-pub struct IconManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct IconManager {
     pub id: u32
 }
 
@@ -60,7 +61,8 @@ pub fn IconManager.done(self, mut conn: wire.Conn) {
 }
 
 /// xdg_toplevel_icon_v1: a toplevel window icon
-pub struct Icon derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Icon {
     pub id: u32
 }
 
@@ -163,7 +165,7 @@ pub fn Icon.destroy(self, mut conn: wire.Conn) {
 }
 
 /// set an icon name
-pub fn Icon.set_name(self, mut conn: wire.Conn, icon_name: &str) {
+pub fn Icon.set_name(self, mut conn: wire.Conn, icon_name: StrSlice) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(icon_name))
     wr.str(mut conn, icon_name)
 }

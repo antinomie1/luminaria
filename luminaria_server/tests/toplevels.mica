@@ -124,7 +124,7 @@ fn window(mut f: Fx, comp: wl.Compositor, wm: xdg.WmBase, title: str) -> (wl.Sur
 }
 
 /// The states a handle was sent, as `ft.HandleState` values.
-fn states(bytes: &[u8]) -> List[u32] {
+fn states(bytes: Slice[u8]) -> List[u32] {
     var out: List[u32] = []
     var k = 0
     while k + 4 <= bytes.len() {

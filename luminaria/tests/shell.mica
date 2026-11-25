@@ -267,7 +267,7 @@ test "an output configuration moves and scales the output" {
     assert_eq(f.d.output_rect(o), (200.0, 0.0, 64.0, 48.0))
 }
 
-fn read_u64_le(b: &[u8], at: int) -> u64 {
+fn read_u64_le(b: Slice[u8], at: int) -> u64 {
     var v: u64 = 0
     for i in 0..8 {
         v |= u64(b[at + i]) << u64(i * 8)

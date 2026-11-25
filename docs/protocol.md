@@ -31,7 +31,7 @@
 
 `luminaria_scanner` 从 `protocols/*.xml` 生成，每个协议文件一个模块：
 
-- 类型化 id（`wl.Surface`，`derive(Hash, Show)`）
+- 类型化 id（`wl.Surface`，`@derive(Hash, Show)`）
 - 请求枚举，用 `proto.next` 读
 - 事件发送函数，是类型化 id 上的方法；析构事件自动释放 id
 - 协议枚举，位域用 `Flags`
@@ -65,7 +65,7 @@
 |---|---|---|
 | `Implicit(buffer, fd)` | dmabuf 的隐式写栅栏 | 导出成 sync_file 放进 epoll |
 | `Timeline(fd, point)` | linux-drm-syncobj 获取点 | 转成 eventfd 放进 epoll |
-| `Fifo(surface)` | wp_fifo 屏障还没被呈现解除 | 等该表面下一次被显示（不可见的表面不等） |
+| `Fifo(surface)` | wp_fifo 屏障还没被解除 | 等该表面所在输出的下一个刷新周期（不可见的表面不等） |
 | `Time(ns)` | wp_commit_timing 的目标时间 | 定时器 |
 
 事务生效时：换缓冲（更新使用计数）、合并损坏（超过 16 个矩形就合成外接矩形）、更新区域、变换、

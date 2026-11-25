@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// wp_alpha_modifier_v1: surface alpha modifier manager
-pub struct Modifier derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Modifier {
     pub id: u32
 }
 
@@ -45,7 +46,8 @@ fn decode_modifier(mut conn: wire.Conn, m: wire.Msg) -> Result[ModifierRequest, 
 }
 
 /// wp_alpha_modifier_surface_v1: alpha modifier object for a surface
-pub struct ModifierSurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ModifierSurface {
     pub id: u32
 }
 

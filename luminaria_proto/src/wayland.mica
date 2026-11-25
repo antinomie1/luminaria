@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import ifaces
 
 /// wl_display: core global object
-pub struct Display derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Display {
     pub id: u32
 }
 
@@ -51,7 +52,7 @@ fn decode_display(mut conn: wire.Conn, m: wire.Msg) -> Result[DisplayRequest, wi
 }
 
 /// fatal error event
-pub fn Display.error(self, mut conn: wire.Conn, object_id: u32, code: u32, message: &str) {
+pub fn Display.error(self, mut conn: wire.Conn, object_id: u32, code: u32, message: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(message) + 8)
     wr.u32(mut conn, object_id)
     wr.u32(mut conn, code)
@@ -65,7 +66,8 @@ pub fn Display.delete_id(self, mut conn: wire.Conn, id_arg: u32) {
 }
 
 /// wl_registry: global registry object
-pub struct Registry derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Registry {
     pub id: u32
 }
 
@@ -95,7 +97,7 @@ fn decode_registry(mut conn: wire.Conn, m: wire.Msg) -> Result[RegistryRequest, 
 }
 
 /// announce global object
-pub fn Registry.global(self, mut conn: wire.Conn, name: u32, interface: &str, version: u32) {
+pub fn Registry.global(self, mut conn: wire.Conn, name: u32, interface: StrSlice, version: u32) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(interface) + 8)
     wr.u32(mut conn, name)
     wr.str(mut conn, interface)
@@ -109,7 +111,8 @@ pub fn Registry.global_remove(self, mut conn: wire.Conn, name: u32) {
 }
 
 /// wl_callback: callback object
-pub struct Callback derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Callback {
     pub id: u32
 }
 
@@ -124,7 +127,8 @@ pub fn Callback.done(self, mut conn: wire.Conn, callback_data: u32) {
 }
 
 /// wl_compositor: the compositor singleton
-pub struct Compositor derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Compositor {
     pub id: u32
 }
 
@@ -168,7 +172,8 @@ fn decode_compositor(mut conn: wire.Conn, m: wire.Msg) -> Result[CompositorReque
 }
 
 /// wl_shm_pool: a shared memory pool
-pub struct ShmPool derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ShmPool {
     pub id: u32
 }
 
@@ -222,7 +227,8 @@ fn decode_shm_pool(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmPoolRequest, w
 }
 
 /// wl_shm: shared memory support
-pub struct Shm derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Shm {
     pub id: u32
 }
 
@@ -564,7 +570,8 @@ pub fn Shm.format(self, mut conn: wire.Conn, format: ShmFormat) {
 }
 
 /// wl_buffer: content for a wl_surface
-pub struct Buffer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Buffer {
     pub id: u32
 }
 
@@ -596,7 +603,8 @@ pub fn Buffer.release(self, mut conn: wire.Conn) {
 }
 
 /// wl_data_offer: offer to transfer data
-pub struct DataOffer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DataOffer {
     pub id: u32
 }
 
@@ -670,7 +678,7 @@ fn decode_data_offer(mut conn: wire.Conn, m: wire.Msg) -> Result[DataOfferReques
 }
 
 /// advertise offered mime type
-pub fn DataOffer.offer(self, mut conn: wire.Conn, mime_type: &str) {
+pub fn DataOffer.offer(self, mut conn: wire.Conn, mime_type: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
 }
@@ -694,7 +702,8 @@ pub fn DataOffer.action(self, mut conn: wire.Conn, dnd_action: DataDeviceManager
 }
 
 /// wl_data_source: offer to transfer data
-pub struct DataSource derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DataSource {
     pub id: u32
 }
 
@@ -745,13 +754,13 @@ fn decode_data_source(mut conn: wire.Conn, m: wire.Msg) -> Result[DataSourceRequ
 }
 
 /// a target accepts an offered mime type
-pub fn DataSource.target(self, mut conn: wire.Conn, mime_type: Option[&str]) {
+pub fn DataSource.target(self, mut conn: wire.Conn, mime_type: Option[StrSlice]) {
     var wr = conn.begin(self.id, 0, 8 + wire.opt_str_size(mime_type))
     wr.opt_str(mut conn, mime_type)
 }
 
 /// send the data
-pub fn DataSource.send(self, mut conn: wire.Conn, mime_type: &str, fd: int) {
+pub fn DataSource.send(self, mut conn: wire.Conn, mime_type: StrSlice, fd: int) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
     conn.put_fd(fd)
@@ -788,7 +797,8 @@ pub fn DataSource.action(self, mut conn: wire.Conn, dnd_action: DataDeviceManage
 }
 
 /// wl_data_device: data transfer device
-pub struct DataDevice derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DataDevice {
     pub id: u32
 }
 
@@ -888,7 +898,8 @@ pub fn DataDevice.selection(self, mut conn: wire.Conn, id_arg: Option[DataOffer]
 }
 
 /// wl_data_device_manager: data transfer interface
-pub struct DataDeviceManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct DataDeviceManager {
     pub id: u32
 }
 
@@ -896,7 +907,8 @@ pub let data_device_manager_iface: u16 = 11
 pub let data_device_manager_version: u32 = 4
 
 /// drag and drop actions
-pub enum DataDeviceManagerDndAction: u32 derive(Flags) {
+@derive(Flags)
+pub enum DataDeviceManagerDndAction: u32 {
     /// no action
     None = 0
     /// copy action
@@ -945,7 +957,8 @@ fn decode_data_device_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDe
 }
 
 /// wl_shell: create desktop-style surfaces
-pub struct Shell derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Shell {
     pub id: u32
 }
 
@@ -978,7 +991,8 @@ fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.E
 }
 
 /// wl_shell_surface: desktop-style metadata interface
-pub struct ShellSurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct ShellSurface {
     pub id: u32
 }
 
@@ -986,7 +1000,8 @@ pub let shell_surface_iface: u16 = 13
 pub let shell_surface_version: u32 = 1
 
 /// edge values for resizing
-pub enum ShellSurfaceResize: u32 derive(Flags) {
+@derive(Flags)
+pub enum ShellSurfaceResize: u32 {
     /// no edge
     None = 0
     /// top edge
@@ -1008,7 +1023,8 @@ pub enum ShellSurfaceResize: u32 derive(Flags) {
 }
 
 /// details of transient behaviour
-pub enum ShellSurfaceTransient: u32 derive(Flags) {
+@derive(Flags)
+pub enum ShellSurfaceTransient: u32 {
     /// do not set keyboard focus
     Inactive = 0x1
 }
@@ -1141,7 +1157,8 @@ pub fn ShellSurface.popup_done(self, mut conn: wire.Conn) {
 }
 
 /// wl_surface: an onscreen surface
-pub struct Surface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Surface {
     pub id: u32
 }
 
@@ -1317,7 +1334,8 @@ pub fn Surface.preferred_buffer_transform(self, mut conn: wire.Conn, transform: 
 }
 
 /// wl_seat: group of input devices
-pub struct Seat derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Seat {
     pub id: u32
 }
 
@@ -1325,7 +1343,8 @@ pub let seat_iface: u16 = 15
 pub let seat_version: u32 = 11
 
 /// seat capability bitmask
-pub enum SeatCapability: u32 derive(Flags) {
+@derive(Flags)
+pub enum SeatCapability: u32 {
     /// the seat has pointer devices
     Pointer = 1
     /// the seat has one or more keyboards
@@ -1390,7 +1409,7 @@ pub fn Seat.capabilities(self, mut conn: wire.Conn, capabilities: SeatCapability
 }
 
 /// unique identifier for this seat
-pub fn Seat.name(self, mut conn: wire.Conn, name: &str) {
+pub fn Seat.name(self, mut conn: wire.Conn, name: StrSlice) {
     guard conn.version(self.id) >= 2 else {
         return
     }
@@ -1399,7 +1418,8 @@ pub fn Seat.name(self, mut conn: wire.Conn, name: &str) {
 }
 
 /// wl_pointer: pointer input device
-pub struct Pointer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Pointer {
     pub id: u32
 }
 
@@ -1589,7 +1609,8 @@ pub fn Pointer.warp(self, mut conn: wire.Conn, surface_x: f64, surface_y: f64) {
 }
 
 /// wl_keyboard: keyboard input device
-pub struct Keyboard derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Keyboard {
     pub id: u32
 }
 
@@ -1645,7 +1666,7 @@ pub fn Keyboard.keymap(self, mut conn: wire.Conn, format: KeyboardKeymapFormat, 
 }
 
 /// enter event
-pub fn Keyboard.enter(self, mut conn: wire.Conn, serial: u32, surface: Surface, keys: &[u8]) {
+pub fn Keyboard.enter(self, mut conn: wire.Conn, serial: u32, surface: Surface, keys: Slice[u8]) {
     var wr = conn.begin(self.id, 1, 8 + wire.array_size(keys) + 8)
     wr.u32(mut conn, serial)
     wr.u32(mut conn, surface.id)
@@ -1689,7 +1710,8 @@ pub fn Keyboard.repeat_info(self, mut conn: wire.Conn, rate: i32, delay: i32) {
 }
 
 /// wl_touch: touchscreen input device
-pub struct Touch derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Touch {
     pub id: u32
 }
 
@@ -1778,7 +1800,8 @@ pub fn Touch.orientation(self, mut conn: wire.Conn, id_arg: i32, orientation: f6
 }
 
 /// wl_output: compositor output region
-pub struct Output derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Output {
     pub id: u32
 }
 
@@ -1822,7 +1845,8 @@ pub enum OutputTransform: u32 {
 }
 
 /// mode information
-pub enum OutputMode: u32 derive(Flags) {
+@derive(Flags)
+pub enum OutputMode: u32 {
     /// indicates this is the current mode
     Current = 0x1
     /// indicates this is the preferred mode
@@ -1852,7 +1876,7 @@ fn decode_output(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputRequest, wire
 }
 
 /// properties of the output
-pub fn Output.geometry(self, mut conn: wire.Conn, x: i32, y: i32, physical_width: i32, physical_height: i32, subpixel: OutputSubpixel, make: &str, model: &str, transform: OutputTransform) {
+pub fn Output.geometry(self, mut conn: wire.Conn, x: i32, y: i32, physical_width: i32, physical_height: i32, subpixel: OutputSubpixel, make: StrSlice, model: StrSlice, transform: OutputTransform) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(make) + wire.str_size(model) + 24)
     wr.i32(mut conn, x)
     wr.i32(mut conn, y)
@@ -1891,7 +1915,7 @@ pub fn Output.scale(self, mut conn: wire.Conn, factor: i32) {
 }
 
 /// name of this output
-pub fn Output.name(self, mut conn: wire.Conn, name: &str) {
+pub fn Output.name(self, mut conn: wire.Conn, name: StrSlice) {
     guard conn.version(self.id) >= 4 else {
         return
     }
@@ -1900,7 +1924,7 @@ pub fn Output.name(self, mut conn: wire.Conn, name: &str) {
 }
 
 /// human-readable description of this output
-pub fn Output.description(self, mut conn: wire.Conn, description: &str) {
+pub fn Output.description(self, mut conn: wire.Conn, description: StrSlice) {
     guard conn.version(self.id) >= 4 else {
         return
     }
@@ -1909,7 +1933,8 @@ pub fn Output.description(self, mut conn: wire.Conn, description: &str) {
 }
 
 /// wl_region: region interface
-pub struct Region derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Region {
     pub id: u32
 }
 
@@ -1956,7 +1981,8 @@ fn decode_region(mut conn: wire.Conn, m: wire.Msg) -> Result[RegionRequest, wire
 }
 
 /// wl_subcompositor: sub-surface compositing
-pub struct Subcompositor derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Subcompositor {
     pub id: u32
 }
 
@@ -1999,7 +2025,8 @@ fn decode_subcompositor(mut conn: wire.Conn, m: wire.Msg) -> Result[Subcomposito
 }
 
 /// wl_subsurface: sub-surface interface to a wl_surface
-pub struct Subsurface derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Subsurface {
     pub id: u32
 }
 
@@ -2065,7 +2092,8 @@ fn decode_subsurface(mut conn: wire.Conn, m: wire.Msg) -> Result[SubsurfaceReque
 }
 
 /// wl_fixes: wayland protocol fixes
-pub struct Fixes derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Fixes {
     pub id: u32
 }
 
@@ -2370,14 +2398,14 @@ fn decode_data_offer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataOffer
 }
 
 /// accept one of the offered mime types
-pub fn DataOffer.accept(self, mut conn: wire.Conn, serial: u32, mime_type: Option[&str]) {
+pub fn DataOffer.accept(self, mut conn: wire.Conn, serial: u32, mime_type: Option[StrSlice]) {
     var wr = conn.begin(self.id, 0, 8 + wire.opt_str_size(mime_type) + 4)
     wr.u32(mut conn, serial)
     wr.opt_str(mut conn, mime_type)
 }
 
 /// request that the data is transferred
-pub fn DataOffer.receive(self, mut conn: wire.Conn, mime_type: &str, fd: int) {
+pub fn DataOffer.receive(self, mut conn: wire.Conn, mime_type: StrSlice, fd: int) {
     var wr = conn.begin(self.id, 1, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
     conn.put_fd(fd)
@@ -2469,7 +2497,7 @@ fn decode_data_source_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataSour
 }
 
 /// add an offered mime type
-pub fn DataSource.offer(self, mut conn: wire.Conn, mime_type: &str) {
+pub fn DataSource.offer(self, mut conn: wire.Conn, mime_type: StrSlice) {
     var wr = conn.begin(self.id, 0, 8 + wire.str_size(mime_type))
     wr.str(mut conn, mime_type)
 }
@@ -2704,13 +2732,13 @@ pub fn ShellSurface.set_maximized(self, mut conn: wire.Conn, output: Option[Outp
 }
 
 /// set surface title
-pub fn ShellSurface.set_title(self, mut conn: wire.Conn, title: &str) {
+pub fn ShellSurface.set_title(self, mut conn: wire.Conn, title: StrSlice) {
     var wr = conn.begin(self.id, 8, 8 + wire.str_size(title))
     wr.str(mut conn, title)
 }
 
 /// set surface class
-pub fn ShellSurface.set_class(self, mut conn: wire.Conn, class_: &str) {
+pub fn ShellSurface.set_class(self, mut conn: wire.Conn, class_: StrSlice) {
     var wr = conn.begin(self.id, 9, 8 + wire.str_size(class_))
     wr.str(mut conn, class_)
 }

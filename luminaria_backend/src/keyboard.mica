@@ -33,7 +33,7 @@ fn Keyboard.drop(mut self) {
     }
 }
 
-fn cstr(s: &str) -> str {
+fn cstr(s: StrSlice) -> str {
     return s.to_str() + "\0"
 }
 
@@ -86,7 +86,7 @@ pub fn Keyboard.new(n: Names) -> Result[Keyboard, str] {
 }
 
 /// A keymap a parent compositor sent (text in a mapped fd).
-pub fn Keyboard.from_text(text: &str) -> Result[Keyboard, str] {
+pub fn Keyboard.from_text(text: StrSlice) -> Result[Keyboard, str] {
     guard let Some(ctx) = xkb.context_new(xkb.xkb_context_no_flags) else {
         return Err("xkb_context_new failed")
     }

@@ -29,7 +29,7 @@ fn frame(mut b: backend.Backend, mut r: compose.Compositor, o: u32) -> (u64, u32
 }
 
 /// Draw and present the acquired image.
-fn show(mut b: backend.Backend, mut r: compose.Compositor, o: u32, key: u64, age: u32, rects: &[backend.Rect]) {
+fn show(mut b: backend.Backend, mut r: compose.Compositor, o: u32, key: u64, age: u32, rects: Slice[backend.Rect]) {
     let fence = r.render(int(o), key, age).unwrap().unwrap_or(-1)
     b.present(o, fence, rects, false).unwrap()
 }

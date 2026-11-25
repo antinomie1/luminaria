@@ -71,6 +71,7 @@ fn Anim.at(self, now: int) -> (f64, f64, f32) {
 /// and indexing popups by root surface to avoid per-frame allocations.
 fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let now = time.now_ns()
+    d.refocus = true
     d.animating = false
     d.hits.clear()
     d.origins.clear()
@@ -378,6 +379,7 @@ fn occlusion[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let now = time.now_ns()
     var soon = 0
     var updates: List[(server.Window, display.Win)] = []
+    var emitted: List[(server.Window, bool)] = []
     for e in d.wins.entries() {
         let w = e.key
         let cur = e.val
@@ -399,7 +401,7 @@ fn occlusion[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             if win.occluded {
                 win.occluded = false
                 changed = true
-                d.emit(display.Event.Occluded(w, false))
+                emitted.push((w, false))
             }
         } else if not win.hidden {
             win.hidden = true
@@ -409,13 +411,16 @@ fn occlusion[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
         } else if not win.occluded and now - win.hidden_since >= 500000000 {
             win.occluded = true
             changed = true
-            d.emit(display.Event.Occluded(w, true))
+            emitted.push((w, true))
         } else if not win.occluded {
             soon = sooner(soon, 500000000 - (now - win.hidden_since))
         }
         if changed {
             updates.push((w, win))
         }
+    }
+    for (w, occ) in emitted {
+        d.emit(display.Event.Occluded(w, occ))
     }
     for (w, win) in updates {
         discard d.wins.insert(w, win)

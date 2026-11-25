@@ -5,7 +5,8 @@ import luminaria_wire as wire
 import wayland
 
 /// zwp_relative_pointer_manager_v1: get relative pointer objects
-pub struct PointerManager derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct PointerManager {
     pub id: u32
 }
 
@@ -40,7 +41,8 @@ fn decode_pointer_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerMan
 }
 
 /// zwp_relative_pointer_v1: relative pointer object
-pub struct Pointer derive(Hash, Show) {
+@derive(Hash, Show)
+pub struct Pointer {
     pub id: u32
 }
 

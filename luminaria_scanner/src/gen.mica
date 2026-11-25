@@ -117,8 +117,8 @@ fn World.object_type(self, mut o: Out, a: model.Arg) -> Result[str, str] {
 /// Type of an argument passed to a sender; "" for a new_id it returns.
 fn World.param(self, mut o: Out, owner: str, a: model.Arg) -> Result[str, str] {
     return match a.kind {
-        "string" => Ok(if a.nullable { "Option[&str]" } else { "&str" })
-        "array" => Ok("&[u8]")
+        "string" => Ok(if a.nullable { "Option[StrSlice]" } else { "StrSlice" })
+        "array" => Ok("Slice[u8]")
         "fd" => Ok("int")
         "new_id" => Ok("")
         _ => self.decoded(mut o, owner, a)
@@ -351,7 +351,8 @@ fn enum_variant(e: model.Enum, x: model.Entry) -> str {
 fn World.iface_items(self, mut o: Out, i: model.Iface) -> Result[(), str] {
     let s = model.snake(i.short)
     doc(mut o, "", i.name + ": " + i.summary)
-    o.line("pub struct {i.short} derive(Hash, Show) \{")
+    o.line("@derive(Hash, Show)")
+    o.line("pub struct {i.short} \{")
     o.line("    pub id: u32")
     o.line("\}")
     o.line("")
@@ -360,7 +361,10 @@ fn World.iface_items(self, mut o: Out, i: model.Iface) -> Result[(), str] {
     o.line("")
     for e in i.enums {
         doc(mut o, "", e.summary)
-        o.line("pub enum {i.short}{model.camel(e.name)}: u32" + (if e.bitfield { " derive(Flags)" } else { "" }) + " \{")
+        if e.bitfield {
+            o.line("@derive(Flags)")
+        }
+        o.line("pub enum {i.short}{model.camel(e.name)}: u32 \{")
         for x in e.entries {
             doc(mut o, "    ", x.summary)
             o.line("    {enum_variant(e, x)} = {x.value}")
