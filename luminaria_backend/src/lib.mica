@@ -80,9 +80,10 @@ pub struct Backend {
     kind: Kind
     /// The session, libinput and keymaps (keymaps only when not DRM).
     devices: devices.Devices = devices.Devices {}
-    drm: Option[drm.Drm] = None
-    nested: Option[nested.Nested] = None
-    headless: Option[headless.Headless] = None
+    /// Active backend instance (0 or 1 element each, mutated in-place without struct copies).
+    drm: List[drm.Drm] = []
+    nested: List[nested.Nested] = []
+    headless: List[headless.Headless] = []
     monitor: Option[udev.Monitor] = None
     udev: Option[udev.Udev] = None
     descs: List[OutputDesc] = []
@@ -95,11 +96,16 @@ pub struct Backend {
     acquired: List[int] = []
     /// Render targets let go of, for the renderer to free.
     retired: List[u64] = []
+    /// Scratch buffers reused across flips and presents.
+    flips_scratch: List[(int, u64, int, bool)] = []
+    clips_scratch: List[uapi.ModeRect] = []
     realtime: bool = true
     /// The event loop's scheduling (policy, priority or nice).
     sched: (int, int) = (0, 0)
 }
 
+@noinline
+@cold
 pub fn Backend.open(o: Options) -> Result[Backend, str] {
     var kind = o.kind
     if kind == Kind.Auto {
@@ -111,7 +117,7 @@ pub fn Backend.open(o: Options) -> Result[Backend, str] {
         Nested => {
             let n = try nested.open(o.title.clone())
             let desc = n.desc()
-            b.nested = Some(n)
+            b.nested.push(n)
             b.add_output(desc)
         }
         Headless => {
@@ -123,7 +129,7 @@ pub fn Backend.open(o: Options) -> Result[Backend, str] {
             for out in h.outs {
                 b.add_output(out.desc.clone())
             }
-            b.headless = Some(h)
+            b.headless.push(h)
         }
         Auto => {}
     }
@@ -137,6 +143,8 @@ fn Backend.add_output(mut self, take d: OutputDesc) {
     self.push(Event.OutputAdded(u32(self.descs.len() - 1)))
 }
 
+@noinline
+@cold
 fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
     self.devices = try devices.Devices.open(names)
     let path = try drm.find_card()
@@ -156,7 +164,7 @@ fn Backend.open_drm(mut self, names: Names) -> Result[(), str] {
         }
         self.add_output(desc)
     }
-    self.drm = Some(d)
+    self.drm.push(d)
     if let Some(u) = udev.new() {
         if let Some(m) = udev.monitor_new_from_netlink(u, "udev") {
             discard udev.monitor_filter_add_match_subsystem_devtype(m, "drm", "")
@@ -179,7 +187,7 @@ pub fn Backend.next(mut self) -> Option[Event] {
         self.head = 0
         return self.devices.next()
     }
-    let e = self.events[self.head].clone()
+    let e = mem.replace(mut self.events[self.head], Event.Closed)
     self.head += 1
     return Some(e)
 }
@@ -190,9 +198,9 @@ pub fn Backend.kind(self) -> Kind {
 
 /// Descriptors to poll for reading and their tokens.
 pub fn Backend.fds(self, mut out: List[(int, int)]) {
-    if let Some(d) = self.drm {
-        out.push((d.fd, token_drm))
-        if let Some(t) = d.thread {
+    if not self.drm.is_empty() {
+        out.push((self.drm[0].fd, token_drm))
+        if let Some(t) = self.drm[0].thread {
             out.push((t.wake, token_commit))
         }
     }
@@ -200,12 +208,12 @@ pub fn Backend.fds(self, mut out: List[(int, int)]) {
     if let Some(m) = self.monitor {
         out.push((int(udev.monitor_get_fd(m)), token_udev))
     }
-    if let Some(n) = self.nested {
-        out.push((n.fd(), token_nested))
+    if not self.nested.is_empty() {
+        out.push((self.nested[0].fd(), token_nested))
     }
-    if let Some(h) = self.headless {
-        for k in 0..h.outs.len() {
-            out.push((h.outs[k].timer, token_headless + k))
+    if not self.headless.is_empty() {
+        for k in 0..self.headless[0].outs.len() {
+            out.push((self.headless[0].outs[k].timer, token_headless + k))
         }
     }
 }
@@ -223,26 +231,19 @@ pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
     } else if token == token_udev {
         self.hotplug()
     } else if token == token_nested {
-        if let Some(nn) = self.nested.take() {
-            var n = nn
-            var got: List[Event] = []
-            let r = n.dispatch(mut got)
-            if n.resized {
-                self.descs[0] = n.desc()
-            }
-            self.nested = Some(n)
-            for g in take got {
-                self.push(g)
+        if not self.nested.is_empty() {
+            var evs = mem.replace(mut self.events, [])
+            let r = self.nested[0].dispatch(mut evs)
+            self.events = evs
+            if self.nested[0].resized {
+                self.descs[0] = self.nested[0].desc()
             }
             try r
         }
     } else if token >= token_headless {
         let k = token - token_headless
-        if let Some(hh) = self.headless.take() {
-            var h = hh
-            let t = h.tick(k)
-            self.headless = Some(h)
-            if let Some((seq, ns)) = t {
+        if not self.headless.is_empty() {
+            if let Some((seq, ns)) = self.headless[0].tick(k) {
                 self.push(Event.Presented(u32(k), seq, ns, 0))
             }
         }
@@ -253,33 +254,35 @@ pub fn Backend.dispatch(mut self, token: int) -> Result[(), str] {
 /// Finished page flips: frames are presented (cursor-only flips only
 /// free the commit thread).
 fn Backend.flips(mut self) {
-    guard let Some(dd) = self.drm.take() else {
+    guard not self.drm.is_empty() else {
         return
     }
-    var d = dd
-    var flips: List[(int, u64, int, bool)] = []
-    d.read_events(mut flips)
+    var flips = mem.replace(mut self.flips_scratch, [])
+    flips.clear()
+    self.drm[0].read_events(mut flips)
     for (o, seq, ns, frame) in flips {
         guard frame else {
             continue
         }
-        let direct = d.outputs[o].direct_queued != 0
-        d.flipped(o)
+        let direct = self.drm[0].outputs[o].direct_queued != 0
+        self.drm[0].flipped(o)
         var flags = types.presented_vsync | types.presented_hw_clock | types.presented_hw_completion
         if direct {
             flags |= types.presented_zero_copy
         }
         self.push(Event.Presented(u32(o), seq, ns, flags))
     }
-    self.drm = Some(d)
+    self.flips_scratch = flips
 }
 
 /// What the commit thread reports: failed commits, and its watchdog's
 /// ping (answered once the flips that arrived are read).
+@noinline
+@cold
 fn Backend.notes(mut self) {
     var got: List[commit.Note] = []
-    if let Some(d) = self.drm {
-        if let Some(t) = d.thread {
+    if not self.drm.is_empty() {
+        if let Some(t) = self.drm[0].thread {
             discard os.count(t.wake)
             while true {
                 guard let Some(n) = t.notes.try_recv() else {
@@ -293,23 +296,21 @@ fn Backend.notes(mut self) {
         match n {
             Ping => {
                 self.flips()
-                if let Some(d) = self.drm {
-                    if let Some(t) = d.thread {
+                if not self.drm.is_empty() {
+                    if let Some(t) = self.drm[0].thread {
                         t.send(commit.Job.Pong)
                     }
                 }
             }
             Failed(o, frame, modeset, tear) => {
-                if let Some(dd) = self.drm.take() {
-                    var d = dd
-                    d.failed(o, frame, modeset)
+                if not self.drm.is_empty() {
+                    self.drm[0].failed(o, frame, modeset)
                     // The driver refuses async flips here (plane, format or
                     // property changes): tearing clients flip on vblank.
-                    if tear and d.async_flip {
-                        d.async_flip = false
+                    if tear and self.drm[0].async_flip {
+                        self.drm[0].async_flip = false
                         io.eprint("luminaria: async page flips refused; tearing falls back to vblank flips")
                     }
-                    self.drm = Some(d)
                 }
                 if frame {
                     self.push(Event.Dropped(u32(o)))
@@ -319,25 +320,27 @@ fn Backend.notes(mut self) {
     }
 }
 
+@noinline
+@cold
 fn Backend.set_active(mut self, on: bool) {
     self.active = on
-    if let Some(dd) = self.drm.take() {
-        var d = dd
+    if not self.drm.is_empty() {
         // Queued commits would fail without the device, and flips
         // outstanding at the switch never report.
-        if let Some(t) = d.thread {
+        if let Some(t) = self.drm[0].thread {
             t.send(commit.Job.Reset)
         }
         if on {
-            for o in 0..d.outputs.len() {
-                d.outputs[o].modeset = true
-                d.failed(o, true, true)
+            for o in 0..self.drm[0].outputs.len() {
+                self.drm[0].outputs[o].modeset = true
+                self.drm[0].failed(o, true, true)
             }
         }
-        self.drm = Some(d)
     }
 }
 
+@noinline
+@cold
 fn Backend.hotplug(mut self) {
     guard let Some(m) = self.monitor else {
         return
@@ -345,23 +348,23 @@ fn Backend.hotplug(mut self) {
     if let Some(dev) = udev.monitor_receive_device(m) {
         discard udev.device_unref(dev)
     }
-    guard let Some(dd) = self.drm.take() else {
+    guard not self.drm.is_empty() else {
         return
     }
-    var d = dd
-    d.scan()
-    for o in d.disconnected() {
+    self.drm[0].scan()
+    for o in self.drm[0].disconnected() {
         if o < self.alive.len() and self.alive[o] {
             self.alive[o] = false
-            d.crtcs[d.outputs[o].crtc].used = false
-            d.outputs[o].conn = d.conns.len() + 1000
+            let crtc = self.drm[0].outputs[o].crtc
+            self.drm[0].crtcs[crtc].used = false
+            self.drm[0].outputs[o].conn = self.drm[0].conns.len() + 1000
             self.push(Event.OutputRemoved(u32(o)))
         }
     }
     var added: List[int] = []
-    d.connect(mut added)
+    self.drm[0].connect(mut added)
     for o in added {
-        let desc = d.desc(o)
+        let desc = self.drm[0].desc(o)
         while self.descs.len() < o {
             self.descs.push(OutputDesc {})
             self.alive.push(false)
@@ -369,7 +372,6 @@ fn Backend.hotplug(mut self) {
         }
         self.add_output(desc)
     }
-    self.drm = Some(d)
 }
 
 // --------------------------------------------------------------- outputs
@@ -386,94 +388,91 @@ pub fn Backend.output_alive(self, o: u32) -> bool {
 }
 
 /// Pick a mode (one of the output's) for output `o`.
+@noinline
+@cold
 pub fn Backend.set_mode(mut self, o: u32, m: Mode) {
-    guard let Some(dd) = self.drm.take() else {
+    guard not self.drm.is_empty() else {
         return
     }
-    var d = dd
-    let ci = d.outputs[int(o)].conn
-    if ci < d.conns.len() {
-        for raw in d.conns[ci].modes.clone() {
+    let oi = int(o)
+    let ci = self.drm[0].outputs[oi].conn
+    if ci < self.drm[0].conns.len() {
+        for raw in self.drm[0].conns[ci].modes.clone() {
             let tm = drm.to_mode(raw)
             if tm.width == m.width and tm.height == m.height and (m.refresh_mhz == 0 or int(tm.refresh_mhz - m.refresh_mhz).abs() < 500) {
-                d.outputs[int(o)].mode = raw
-                d.outputs[int(o)].mode_blob = 0
-                d.outputs[int(o)].modeset = true
-                self.descs[int(o)].mode = tm
+                self.drm[0].outputs[oi].mode = raw
+                self.drm[0].outputs[oi].mode_blob = 0
+                self.drm[0].outputs[oi].modeset = true
+                self.descs[oi].mode = tm
                 self.push(Event.OutputChanged(o))
                 break
             }
         }
     }
-    self.drm = Some(d)
 }
 
 /// Turn output `o` on or off (DPMS): an off output draws nothing.
+@noinline
+@cold
 pub fn Backend.enable(mut self, o: u32, on: bool) {
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        if int(o) < d.outputs.len() {
-            d.outputs[int(o)].enabled = on
-            d.outputs[int(o)].modeset = true
+    let oi = int(o)
+    if not self.drm.is_empty() {
+        if oi < self.drm[0].outputs.len() {
+            self.drm[0].outputs[oi].enabled = on
+            self.drm[0].outputs[oi].modeset = true
             if not on {
-                d.update(int(o))
+                self.drm[0].update(oi)
             }
         }
-        self.drm = Some(d)
         return
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        if int(o) < h.outs.len() {
-            h.outs[int(o)].enabled = on
+    if not self.headless.is_empty() {
+        if oi < self.headless[0].outs.len() {
+            self.headless[0].outs[oi].enabled = on
         }
-        self.headless = Some(h)
     }
 }
 
 /// Variable refresh rate on outputs that support it.
+@noinline
+@cold
 pub fn Backend.set_vrr(mut self, o: u32, on: bool) {
-    guard let Some(dd) = self.drm.take() else {
+    guard not self.drm.is_empty() else {
         return
     }
-    var d = dd
-    if int(o) < d.outputs.len() {
-        d.outputs[int(o)].vrr = on and self.descs[int(o)].vrr
-        d.outputs[int(o)].modeset = true
+    let oi = int(o)
+    let allow = self.descs[oi].vrr
+    if oi < self.drm[0].outputs.len() {
+        self.drm[0].outputs[oi].vrr = on and allow
+        self.drm[0].outputs[oi].modeset = true
     }
-    self.drm = Some(d)
 }
 
 /// Install or reset (empty slices) the hardware CRTC gamma LUT on output `o`.
+@noinline
+@cold
 pub fn Backend.set_gamma(mut self, o: u32, r: Slice[u16], g: Slice[u16], b: Slice[u16]) -> bool {
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        let ok = d.set_gamma(int(o), r, g, b)
-        self.drm = Some(d)
-        return ok
+    if not self.drm.is_empty() {
+        return self.drm[0].set_gamma(int(o), r, g, b)
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        let ok = h.set_gamma(int(o), r, g, b)
-        self.headless = Some(h)
-        return ok
+    if not self.headless.is_empty() {
+        return self.headless[0].set_gamma(int(o), r, g, b)
     }
     return false
 }
 
 /// Enable or disable HDR static metadata (BT.2020 + ST.2084 PQ) and 10-bit
 /// scanout on output `o`.
+@noinline
+@cold
 pub fn Backend.set_hdr(mut self, o: u32, on: bool, sdr_nits: f32, max_nits: f32) -> bool {
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        let ok = d.set_hdr(int(o), on, sdr_nits, max_nits)
-        self.drm = Some(d)
-        return ok
+    if not self.drm.is_empty() {
+        return self.drm[0].set_hdr(int(o), on, sdr_nits, max_nits)
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        let ok = h.set_hdr(int(o), on, mut self.retired)
-        self.headless = Some(h)
+    if not self.headless.is_empty() {
+        var ret = mem.replace(mut self.retired, [])
+        let ok = self.headless[0].set_hdr(int(o), on, mut ret)
+        self.retired = ret
         return ok
     }
     return false
@@ -484,14 +483,14 @@ pub fn Backend.can_present(self, o: u32) -> bool {
     guard self.active and self.output_alive(o) else {
         return false
     }
-    if let Some(d) = self.drm {
-        return not d.outputs[int(o)].pending and d.outputs[int(o)].enabled
+    if not self.drm.is_empty() {
+        return not self.drm[0].outputs[int(o)].pending and self.drm[0].outputs[int(o)].enabled
     }
-    if let Some(n) = self.nested {
-        return n.frame_cb == 0
+    if not self.nested.is_empty() {
+        return self.nested[0].frame_cb == 0
     }
-    if let Some(h) = self.headless {
-        return h.outs[int(o)].pending < 0 and h.outs[int(o)].enabled
+    if not self.headless.is_empty() {
+        return self.headless[0].outs[int(o)].pending < 0 and self.headless[0].outs[int(o)].enabled
     }
     return false
 }
@@ -500,42 +499,39 @@ pub fn Backend.can_present(self, o: u32) -> bool {
 /// the render targets the output needs first.
 pub fn Backend.acquire(mut self, o: u32) -> types.Acquire {
     let oi = int(o)
+    let bufs = self.buffers
     var pick: Option[(int, u32, u64)] = None
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        let want = d.prepare(oi, self.buffers, mut self.retired)
-        if want.is_none() {
-            if let Some(s) = d.outputs[oi].swap {
-                if let Some((i, age)) = s.acquire() {
-                    pick = Some((i, age, s.slots[i].key))
-                }
-            }
-        }
-        self.drm = Some(d)
+    if not self.drm.is_empty() {
+        var ret = mem.replace(mut self.retired, [])
+        let want = self.drm[0].prepare(oi, bufs, mut ret)
+        self.retired = ret
         if let Some(w) = take want {
             return types.Acquire.Need(w)
         }
-    } else if let Some(nn) = self.nested.take() {
-        var n = nn
+        if let Some(s) = self.drm[0].outputs[oi].swap {
+            if let Some((i, age)) = s.acquire() {
+                pick = Some((i, age, s.slots[i].key))
+            }
+        }
+    } else if not self.nested.is_empty() {
         // The parent holds the shown buffer and may hold the queued one.
-        let want = n.prepare(max(self.buffers, 3), mut self.retired)
-        if want.is_none() {
-            if let Some(s) = n.swap {
-                if let Some((i, age)) = s.acquire() {
-                    pick = Some((i, age, s.slots[i].key))
-                }
-            }
-        }
-        self.nested = Some(n)
+        var ret = mem.replace(mut self.retired, [])
+        let want = self.nested[0].prepare(max(bufs, 3), mut ret)
+        self.retired = ret
         if let Some(w) = take want {
             return types.Acquire.Need(w)
         }
-    } else if let Some(h) = self.headless {
-        if let Some(w) = h.prepare(oi, self.buffers) {
+        if let Some(s) = self.nested[0].swap {
+            if let Some((i, age)) = s.acquire() {
+                pick = Some((i, age, s.slots[i].key))
+            }
+        }
+    } else if not self.headless.is_empty() {
+        if let Some(w) = self.headless[0].prepare(oi, bufs) {
             return types.Acquire.Need(w)
         }
-        if let Some((i, age)) = h.acquire(oi) {
-            pick = Some((i, age, h.outs[oi].slots[i]))
+        if let Some((i, age)) = self.headless[0].acquire(oi) {
+            pick = Some((i, age, self.headless[0].outs[oi].slots[i]))
         }
     }
     guard let Some((i, age, key)) = pick else {
@@ -546,24 +542,19 @@ pub fn Backend.acquire(mut self, o: u32) -> types.Acquire {
 }
 
 /// The render targets output `o` asked for.
+@noinline
+@cold
 pub fn Backend.give(mut self, o: u32, ts: Slice[types.Target]) -> Result[(), str] {
     let oi = int(o)
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        let r = d.give(oi, ts)
-        self.drm = Some(d)
-        return r
+    if not self.drm.is_empty() {
+        return self.drm[0].give(oi, ts)
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        n.give(ts)
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        self.nested[0].give(ts)
         return Ok(())
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        h.give(oi, ts)
-        self.headless = Some(h)
+    if not self.headless.is_empty() {
+        self.headless[0].give(oi, ts)
     }
     return Ok(())
 }
@@ -587,9 +578,9 @@ pub fn Backend.needs_upload(self, o: u32) -> bool {
     guard i >= 0 else {
         return false
     }
-    if let Some(d) = self.drm {
-        if oi < d.outputs.len() {
-            if let Some(s) = d.outputs[oi].swap {
+    if not self.drm.is_empty() {
+        if oi < self.drm[0].outputs.len() {
+            if let Some(s) = self.drm[0].outputs[oi].swap {
                 if i < s.slots.len() {
                     return s.slots[i].dumb_map.is_some()
                 }
@@ -599,6 +590,8 @@ pub fn Backend.needs_upload(self, o: u32) -> bool {
     return false
 }
 
+@noinline
+@cold
 pub fn Backend.upload_frame(mut self, o: u32, pixels: Slice[u8], stride: int) {
     let oi = int(o)
     guard oi >= 0 and oi < self.acquired.len() else {
@@ -608,21 +601,18 @@ pub fn Backend.upload_frame(mut self, o: u32, pixels: Slice[u8], stride: int) {
     guard i >= 0 else {
         return
     }
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        d.upload_slot(oi, i, pixels, stride)
-        self.drm = Some(d)
+    if not self.drm.is_empty() {
+        self.drm[0].upload_slot(oi, i, pixels, stride)
     }
 }
 
-fn to_clips(rects: Slice[Rect]) -> List[uapi.ModeRect] {
-    var out: List[uapi.ModeRect] = []
+fn fill_clips(rects: Slice[Rect], mut out: List[uapi.ModeRect]) {
+    out.clear()
     for r in rects {
         if r.2 > 0 and r.3 > 0 {
             out.push(uapi.ModeRect { x1: r.0, y1: r.1, x2: r.0 + r.2, y2: r.1 + r.3 })
         }
     }
-    return out
 }
 
 /// Show the acquired image once `fence` (a sync_file the output closes;
@@ -638,42 +628,39 @@ pub fn Backend.present(mut self, o: u32, fence: int, rects: Slice[Rect], tear: b
         return Err("present without acquire")
     }
     self.acquired[oi] = -1
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        let overlay_only = fence < 0 and rects.is_empty() and not d.outputs[oi].queued_overlays.is_empty() and d.outputs[oi].shown >= 0
-        let slot_idx = if overlay_only { d.outputs[oi].shown } else { i }
+    if not self.drm.is_empty() {
+        let overlay_only = fence < 0 and rects.is_empty() and not self.drm[0].outputs[oi].queued_overlays.is_empty() and self.drm[0].outputs[oi].shown >= 0
+        let slot_idx = if overlay_only { self.drm[0].outputs[oi].shown } else { i }
         var fb: u32 = 0
-        if let Some(s) = d.outputs[oi].swap {
+        if let Some(s) = self.drm[0].outputs[oi].swap {
             fb = s.slots[slot_idx].id
         }
-        let r = d.request(oi, fb, fence, to_clips(rects), tear)
-        d.send(r)
+        var clips = mem.replace(mut self.clips_scratch, [])
+        fill_clips(rects, mut clips)
+        let r = self.drm[0].request(oi, fb, fence, clips, tear)
+        self.clips_scratch = clips
+        self.drm[0].send(r)
         if not overlay_only {
-            if let Some(sw) = d.outputs[oi].swap.take() {
+            if let Some(sw) = self.drm[0].outputs[oi].swap.take() {
                 var s = sw
                 s.queued(i)
-                d.outputs[oi].swap = Some(s)
+                self.drm[0].outputs[oi].swap = Some(s)
             }
         }
-        d.outputs[oi].queued = slot_idx
-        d.outputs[oi].direct_queued = 0
-        self.drm = Some(d)
+        self.drm[0].outputs[oi].queued = slot_idx
+        self.drm[0].outputs[oi].direct_queued = 0
         return Ok(())
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        n.present(i, fence, rects)
-        n.flush()
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        self.nested[0].present(i, fence, rects)
+        self.nested[0].flush()
         return Ok(())
     }
     if fence >= 0 {
         os.close(fence)
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        h.present(oi, i)
-        self.headless = Some(h)
+    if not self.headless.is_empty() {
+        self.headless[0].present(oi, i)
     }
     return Ok(())
 }
@@ -686,36 +673,43 @@ pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: Slice
         return false
     }
     let oi = int(o)
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        d.outputs[oi].queued_overlays.clear()
+    if not self.drm.is_empty() {
+        self.drm[0].outputs[oi].queued_overlays.clear()
         var fb: u32 = 0
-        if let Ok(id) = d.get_or_add_fb(oi, key, b) {
+        if let Ok(id) = self.drm[0].get_or_add_fb(oi, key, b) {
             fb = id
         }
         var ok = false
-        if fb != 0 and not d.outputs[oi].modeset {
-            let r = d.request(oi, fb, -1, to_clips(rects), tear)
-            ok = d.probe_commit(r)
+        if fb != 0 and not self.drm[0].outputs[oi].modeset {
+            var clips = mem.replace(mut self.clips_scratch, [])
+            fill_clips(rects, mut clips)
+            let r = self.drm[0].request(oi, fb, -1, clips, tear)
+            self.clips_scratch = clips
+            ok = self.drm[0].probe_commit(r)
             if ok {
-                d.send(r)
+                self.drm[0].send(r)
             } else {
-                r.release(d.fd)
+                r.release(self.drm[0].fd)
             }
         }
         if ok {
-            d.outputs[oi].direct_queued = fb
-            d.outputs[oi].queued = -1
+            self.drm[0].outputs[oi].direct_queued = fb
+            self.drm[0].outputs[oi].queued = -1
         }
-        self.drm = Some(d)
         return ok
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        let ok = n.scanout(key, b, rects)
-        n.flush()
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        let ok = self.nested[0].scanout(key, b, rects)
+        self.nested[0].flush()
         return ok
+    }
+    return false
+}
+
+/// Whether output `o` has hardware overlay planes available.
+pub fn Backend.has_overlays(self, o: u32) -> bool {
+    if not self.drm.is_empty() {
+        return self.drm[0].has_overlays(int(o))
     }
     return false
 }
@@ -723,15 +717,14 @@ pub fn Backend.scanout(mut self, o: u32, key: u64, b: types.Dmabuf, rects: Slice
 /// Probe hardware overlay candidates top-to-bottom on output `o` against
 /// primary render target `target_key`; returns promoted placement keys.
 pub fn Backend.test_overlays(mut self, o: u32, target_key: u64, cands: Slice[types.Overlay]) -> List[u64] {
-    guard let Some(dd) = self.drm.take() else {
+    guard not self.drm.is_empty() else {
         let none: List[u64] = []
         return none
     }
-    var d = dd
     let oi = int(o)
     var primary_fb: u32 = 0
-    if oi < d.outputs.len() {
-        if let Some(s) = d.outputs[oi].swap {
+    if oi < self.drm[0].outputs.len() {
+        if let Some(s) = self.drm[0].outputs[oi].swap {
             for sl in s.slots {
                 if sl.key == target_key {
                     primary_fb = sl.id
@@ -740,24 +733,20 @@ pub fn Backend.test_overlays(mut self, o: u32, target_key: u64, cands: Slice[typ
             }
         }
     }
-    let promoted = d.test_overlays(oi, primary_fb, cands)
-    self.drm = Some(d)
-    return promoted
+    return self.drm[0].test_overlays(oi, primary_fb, cands)
 }
 
 /// Drop any queued overlay promotion on output `o`.
 pub fn Backend.clear_overlays(mut self, o: u32) {
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        d.clear_overlays(int(o))
-        self.drm = Some(d)
+    if not self.drm.is_empty() {
+        self.drm[0].clear_overlays(int(o))
     }
 }
 
 /// Whether the display still reads client buffer `key` (scanned out or overlay).
 pub fn Backend.holds(self, key: u64) -> bool {
-    if let Some(d) = self.drm {
-        for o in d.outputs {
+    if not self.drm.is_empty() {
+        for o in self.drm[0].outputs {
             for (k, id) in o.fbs {
                 if k == key and (id == o.direct_queued or id == o.direct_shown) {
                     return true
@@ -780,37 +769,33 @@ pub fn Backend.holds(self, key: u64) -> bool {
             }
         }
     }
-    if let Some(n) = self.nested {
-        return n.holds(key)
+    if not self.nested.is_empty() {
+        return self.nested[0].holds(key)
     }
     return false
 }
 
 /// A client buffer goes away: drop what was made for it.
 pub fn Backend.forget(mut self, key: u64) {
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        for o in 0..d.outputs.len() {
-            for (k, id) in d.outputs[o].fbs {
+    if not self.drm.is_empty() {
+        for o in 0..self.drm[0].outputs.len() {
+            for (k, id) in self.drm[0].outputs[o].fbs {
                 if k == key {
-                    d.rm_fb(id)
+                    self.drm[0].rm_fb(id)
                 }
             }
-            d.outputs[o].fbs.retain(fn(p) => p.0 != key)
+            self.drm[0].outputs[o].fbs.retain(fn(p) => p.0 != key)
         }
-        self.drm = Some(d)
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        n.forget(key)
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        self.nested[0].forget(key)
     }
 }
 
 /// The render target a headless output shows (tests, screenshots).
 pub fn Backend.shown(self, o: u32) -> Option[u64] {
-    if let Some(h) = self.headless {
-        return h.shown(int(o))
+    if not self.headless.is_empty() {
+        return self.headless[0].shown(int(o))
     }
     return None
 }
@@ -820,41 +805,39 @@ pub fn Backend.shown(self, o: u32) -> Option[u64] {
 /// A hardware cursor image (ARGB8888 premultiplied): true when the
 /// display shows it itself (a cursor plane, the parent's cursor); false
 /// means the compositor draws it.
+@noinline
+@cold
 pub fn Backend.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
     guard width >= 0 and height >= 0 else {
         return false
     }
-    if let Some(dd) = self.drm.take() {
-        var d = dd
+    if not self.drm.is_empty() {
         let sw_env = env.get("LUMINARIA_SW_CURSOR").unwrap_or("") == "1" or env.get("WLR_NO_HARDWARE_CURSORS").unwrap_or("") == "1"
-        var ok = not sw_env and not d.outputs.is_empty()
+        var ok = not sw_env and not self.drm[0].outputs.is_empty()
         if ok {
-            for o in 0..d.outputs.len() {
-                if d.outputs[o].cursor_fbs[0] == 0 {
-                    discard d.make_cursor(o)
+            for o in 0..self.drm[0].outputs.len() {
+                if self.drm[0].outputs[o].cursor_fbs[0] == 0 {
+                    discard self.drm[0].make_cursor(o)
                 }
                 if width == 0 or height == 0 {
-                    ok = ok and d.outputs[o].cursor_fbs[0] != 0
+                    ok = ok and self.drm[0].outputs[o].cursor_fbs[0] != 0
                 } else {
-                    ok = ok and d.set_cursor_image(o, pixels, u32(width), u32(height))
+                    ok = ok and self.drm[0].set_cursor_image(o, pixels, u32(width), u32(height))
                 }
             }
             if ok and width > 0 and height > 0 and self.active {
-                for o in 0..d.outputs.len() {
-                    if d.outputs[o].cursor_shown and not d.outputs[o].modeset {
-                        d.update(o)
+                for o in 0..self.drm[0].outputs.len() {
+                    if self.drm[0].outputs[o].cursor_shown and not self.drm[0].outputs[o].modeset {
+                        self.drm[0].update(o)
                     }
                 }
             }
         }
-        self.drm = Some(d)
         return ok
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        n.set_cursor(pixels, width, height, hot_x, hot_y)
-        n.flush()
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        self.nested[0].set_cursor(pixels, width, height, hot_x, hot_y)
+        self.nested[0].flush()
         return true
     }
     return false
@@ -865,42 +848,40 @@ pub fn Backend.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, 
 /// into the frame when one comes first: the cursor shows where it is last,
 /// not where it was when the frame began.
 pub fn Backend.move_cursor(mut self, o: u32, at: Option[(i32, i32)]) {
-    guard let Some(dd) = self.drm.take() else {
+    guard not self.drm.is_empty() else {
         return
     }
-    var d = dd
     let oi = int(o)
-    if oi < d.outputs.len() and d.outputs[oi].cursor >= 0 {
+    if oi < self.drm[0].outputs.len() and self.drm[0].outputs[oi].cursor >= 0 {
         var changed = false
         match at {
             Some((x, y)) => {
-                if not d.outputs[oi].cursor_shown or d.outputs[oi].cursor_x != x or d.outputs[oi].cursor_y != y {
-                    d.outputs[oi].cursor_x = x
-                    d.outputs[oi].cursor_y = y
-                    d.outputs[oi].cursor_shown = true
+                if not self.drm[0].outputs[oi].cursor_shown or self.drm[0].outputs[oi].cursor_x != x or self.drm[0].outputs[oi].cursor_y != y {
+                    self.drm[0].outputs[oi].cursor_x = x
+                    self.drm[0].outputs[oi].cursor_y = y
+                    self.drm[0].outputs[oi].cursor_shown = true
                     changed = true
                 }
             }
             None => {
-                if d.outputs[oi].cursor_shown {
-                    d.outputs[oi].cursor_shown = false
+                if self.drm[0].outputs[oi].cursor_shown {
+                    self.drm[0].outputs[oi].cursor_shown = false
                     changed = true
                 }
             }
         }
-        if changed and not d.outputs[oi].modeset and self.active {
-            d.update(oi)
+        if changed and not self.drm[0].outputs[oi].modeset and self.active {
+            self.drm[0].update(oi)
         }
     }
-    self.drm = Some(d)
 }
 
 // ----------------------------------------------------------------- input
 
 /// The keymap for clients: memfd and size (with its NUL).
 pub fn Backend.keymap(self) -> (int, u32) {
-    if let Some(n) = self.nested {
-        if let Some(k) = n.keyboard {
+    if not self.nested.is_empty() {
+        if let Some(k) = self.nested[0].keyboard {
             return (k.fd, k.size)
         }
     }
@@ -909,8 +890,8 @@ pub fn Backend.keymap(self) -> (int, u32) {
 
 /// Modifiers in effect now.
 pub fn Backend.mods(self) -> Mods {
-    if let Some(n) = self.nested {
-        if let Some(k) = n.keyboard {
+    if not self.nested.is_empty() {
+        if let Some(k) = self.nested[0].keyboard {
             return k.mods()
         }
     }
@@ -932,8 +913,8 @@ pub fn Backend.keymap_on(self, seat: str) -> (int, u32) {
 
 /// Active modifiers on `seat`; falls back to the default seat's modifiers.
 pub fn Backend.base_sym(self, code: u32) -> u32 {
-    if let Some(n) = self.nested {
-        if let Some(k) = n.keyboard {
+    if not self.nested.is_empty() {
+        if let Some(k) = self.nested[0].keyboard {
             return k.base_sym(code)
         }
     }
@@ -994,8 +975,8 @@ pub fn Backend.switch_layout_on(mut self, seat: str, delta: int) -> bool {
 
 /// Name of the active XKB layout group on the default seat.
 pub fn Backend.layout_name(self) -> str {
-    if let Some(n) = self.nested {
-        if let Some(k) = n.keyboard {
+    if not self.nested.is_empty() {
+        if let Some(k) = self.nested[0].keyboard {
             return k.layout_name()
         }
     }
@@ -1018,17 +999,17 @@ pub fn keysym_from_name(name: str) -> u32 {
 /// dev_t of the scanout device (for the dmabuf scanout tranche), 0 when
 /// there is none.
 pub fn Backend.scanout_device(self) -> u64 {
-    if let Some(d) = self.drm {
-        return d.devnum
+    if not self.drm.is_empty() {
+        return self.drm[0].devnum
     }
     return 0
 }
 
 /// XRGB8888 modifiers output `o`'s primary plane scans out.
 pub fn Backend.scanout_modifiers(self, o: u32) -> List[u64] {
-    if let Some(d) = self.drm {
-        if int(o) < d.outputs.len() {
-            return d.planes[d.outputs[int(o)].primary].xrgb.clone()
+    if not self.drm.is_empty() {
+        if int(o) < self.drm[0].outputs.len() {
+            return self.drm[0].planes[self.drm[0].outputs[int(o)].primary].xrgb.clone()
         }
     }
     let none: List[u64] = []
@@ -1036,46 +1017,38 @@ pub fn Backend.scanout_modifiers(self, o: u32) -> List[u64] {
 }
 
 /// Release every render target so they can be recreated after a GPU reset.
+@noinline
+@cold
 pub fn Backend.reset_targets(mut self, mut retired: List[u64]) {
     self.retired(mut retired)
     for i in 0..self.acquired.len() {
         self.acquired[i] = -1
     }
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        d.reset_targets(mut retired)
-        self.drm = Some(d)
+    if not self.drm.is_empty() {
+        self.drm[0].reset_targets(mut retired)
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        n.release(mut retired)
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        self.nested[0].release(mut retired)
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        h.release(mut retired)
-        self.headless = Some(h)
+    if not self.headless.is_empty() {
+        self.headless[0].release(mut retired)
     }
 }
 
 /// Let go of every render target (their keys go to `retired`, for the
 /// renderer to free) before the renderer goes away.
+@noinline
+@cold
 pub fn Backend.shutdown(mut self, mut retired: List[u64]) {
     self.retired(mut retired)
-    if let Some(dd) = self.drm.take() {
-        var d = dd
-        d.release(mut retired)
-        self.drm = Some(d)
+    if not self.drm.is_empty() {
+        self.drm[0].release(mut retired)
     }
-    if let Some(nn) = self.nested.take() {
-        var n = nn
-        n.release(mut retired)
-        self.nested = Some(n)
+    if not self.nested.is_empty() {
+        self.nested[0].release(mut retired)
     }
-    if let Some(hh) = self.headless.take() {
-        var h = hh
-        h.release(mut retired)
-        self.headless = Some(h)
+    if not self.headless.is_empty() {
+        self.headless[0].release(mut retired)
     }
 }
 
@@ -1083,12 +1056,12 @@ pub fn Backend.shutdown(mut self, mut retired: List[u64]) {
 pub fn Backend.stats(self, mut s: types.Stats) {
     s.policy = self.sched.0
     s.priority = self.sched.1
-    guard let Some(d) = self.drm else {
+    guard not self.drm.is_empty() else {
         return
     }
-    s.tests = d.tests
-    s.overlays = d.overlay_frames
-    if let Some(t) = d.thread {
+    s.tests = self.drm[0].tests
+    s.overlays = self.drm[0].overlay_frames
+    if let Some(t) = self.drm[0].thread {
         t.counts.read(fn(c: commit.Counts) {
             s.commits = c.commits
             s.merged = c.merged
@@ -1114,6 +1087,8 @@ pub fn Backend.sets_modes(self) -> bool {
 
 /// The displays connected to DRM card `path` ("" for the default card),
 /// without taking them over.
+@noinline
+@cold
 pub fn probe(path: str) -> Result[List[OutputDesc], str] {
     let p = if path.is_empty() { try drm.find_card() } else { path.clone() }
     var d = try drm.open(p)

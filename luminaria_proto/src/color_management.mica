@@ -136,67 +136,77 @@ pub enum ColorManagerRequest {
     CreateWindowsBt2100(ImageDescription)
 }
 
-fn decode_color_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagerRequest, wire.Error] {
+pub fn decode_color_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ColorManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ColorManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = ColorManagementOutput { id: rd.new_id(mut conn, color_management_output_iface, m.version) }
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.GetOutput(id, output))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.GetOutput(id, output))
+            }
         }
         2 => {
             let id = ColorManagementSurface { id: rd.new_id(mut conn, color_management_surface_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.GetSurface(id, surface))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.GetSurface(id, surface))
+            }
         }
         3 => {
             let id = ColorManagementSurfaceFeedback { id: rd.new_id(mut conn, color_management_surface_feedback_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.GetSurfaceFeedback(id, surface))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.GetSurfaceFeedback(id, surface))
+            }
         }
         4 => {
             let obj = ImageDescriptionCreatorIcc { id: rd.new_id(mut conn, image_description_creator_icc_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.CreateIccCreator(obj))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.CreateIccCreator(obj))
+            }
         }
         5 => {
             let obj = ImageDescriptionCreatorParams { id: rd.new_id(mut conn, image_description_creator_params_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.CreateParametricCreator(obj))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.CreateParametricCreator(obj))
+            }
         }
         6 => {
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.CreateWindowsScrgb(image_description))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.CreateWindowsScrgb(image_description))
+            }
         }
         7 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wp_color_manager_v1.get_image_description needs version 2"))
+                return Err(conn.needs_version(m, "wp_color_manager_v1.get_image_description", 2))
             }
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
             let reference = ImageDescriptionReference { id: rd.object(conn, image_description_reference_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.GetImageDescription(image_description, reference))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.GetImageDescription(image_description, reference))
+            }
         }
         8 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wp_color_manager_v1.create_windows_bt2100 needs version 3"))
+                return Err(conn.needs_version(m, "wp_color_manager_v1.create_windows_bt2100", 3))
             }
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerRequest.CreateWindowsBt2100(image_description))
+            if rd.valid() {
+                return Ok(ColorManagerRequest.CreateWindowsBt2100(image_description))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_color_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_color_manager_v1") })
 }
 
 /// supported rendering intent
@@ -245,22 +255,25 @@ pub enum ColorManagementOutputRequest {
     GetImageDescription(ImageDescription)
 }
 
-fn decode_color_management_output(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementOutputRequest, wire.Error] {
+pub fn decode_color_management_output(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementOutputRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ColorManagementOutputRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ColorManagementOutputRequest.Destroy)
+            }
         }
         1 => {
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementOutputRequest.GetImageDescription(image_description))
+            if rd.valid() {
+                return Ok(ColorManagementOutputRequest.GetImageDescription(image_description))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_color_management_output_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_color_management_output_v1") })
 }
 
 /// image description changed
@@ -297,27 +310,31 @@ pub enum ColorManagementSurfaceRequest {
     UnsetImageDescription
 }
 
-fn decode_color_management_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementSurfaceRequest, wire.Error] {
+pub fn decode_color_management_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementSurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ColorManagementSurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ColorManagementSurfaceRequest.Destroy)
+            }
         }
         1 => {
             let image_description = ImageDescription { id: rd.object(conn, image_description_iface, false) }
             let render_intent = ColorManagerRenderIntent(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementSurfaceRequest.SetImageDescription(image_description, render_intent))
+            if rd.valid() {
+                return Ok(ColorManagementSurfaceRequest.SetImageDescription(image_description, render_intent))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementSurfaceRequest.UnsetImageDescription)
+            if rd.valid() {
+                return Ok(ColorManagementSurfaceRequest.UnsetImageDescription)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_color_management_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_color_management_surface_v1") })
 }
 
 /// wp_color_management_surface_feedback_v1: color management extension to a surface
@@ -347,27 +364,31 @@ pub enum ColorManagementSurfaceFeedbackRequest {
     GetPreferredParametric(ImageDescription)
 }
 
-fn decode_color_management_surface_feedback(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementSurfaceFeedbackRequest, wire.Error] {
+pub fn decode_color_management_surface_feedback(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementSurfaceFeedbackRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ColorManagementSurfaceFeedbackRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ColorManagementSurfaceFeedbackRequest.Destroy)
+            }
         }
         1 => {
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementSurfaceFeedbackRequest.GetPreferred(image_description))
+            if rd.valid() {
+                return Ok(ColorManagementSurfaceFeedbackRequest.GetPreferred(image_description))
+            }
         }
         2 => {
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementSurfaceFeedbackRequest.GetPreferredParametric(image_description))
+            if rd.valid() {
+                return Ok(ColorManagementSurfaceFeedbackRequest.GetPreferredParametric(image_description))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_color_management_surface_feedback_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_color_management_surface_feedback_v1") })
 }
 
 /// the preferred image description changed (32-bit)
@@ -417,25 +438,28 @@ pub enum ImageDescriptionCreatorIccRequest {
     SetIccFile(wire.Fd, u32, u32)
 }
 
-fn decode_image_description_creator_icc(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionCreatorIccRequest, wire.Error] {
+pub fn decode_image_description_creator_icc(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionCreatorIccRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ImageDescriptionCreatorIccRequest.Create(image_description))
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ImageDescriptionCreatorIccRequest.Create(image_description))
+            }
         }
         1 => {
             let icc_profile = rd.fd(mut conn)
             let offset = rd.u32(conn)
             let length = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorIccRequest.SetIccFile(icc_profile, offset, length))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorIccRequest.SetIccFile(icc_profile, offset, length))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_image_description_creator_icc_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_image_description_creator_icc_v1") })
 }
 
 /// wp_image_description_creator_params_v1: holder of image description parameters
@@ -487,29 +511,34 @@ pub enum ImageDescriptionCreatorParamsRequest {
     SetMaxFall(u32)
 }
 
-fn decode_image_description_creator_params(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionCreatorParamsRequest, wire.Error] {
+pub fn decode_image_description_creator_params(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionCreatorParamsRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let image_description = ImageDescription { id: rd.new_id(mut conn, image_description_iface, m.version) }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ImageDescriptionCreatorParamsRequest.Create(image_description))
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ImageDescriptionCreatorParamsRequest.Create(image_description))
+            }
         }
         1 => {
             let tf = ColorManagerTransferFunction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetTfNamed(tf))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetTfNamed(tf))
+            }
         }
         2 => {
             let eexp = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetTfPower(eexp))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetTfPower(eexp))
+            }
         }
         3 => {
             let primaries = ColorManagerPrimaries(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetPrimariesNamed(primaries))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetPrimariesNamed(primaries))
+            }
         }
         4 => {
             let r_x = rd.i32(conn)
@@ -520,15 +549,17 @@ fn decode_image_description_creator_params(mut conn: wire.Conn, m: wire.Msg) -> 
             let b_y = rd.i32(conn)
             let w_x = rd.i32(conn)
             let w_y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetPrimaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetPrimaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            }
         }
         5 => {
             let min_lum = rd.u32(conn)
             let max_lum = rd.u32(conn)
             let reference_lum = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetLuminances(min_lum, max_lum, reference_lum))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetLuminances(min_lum, max_lum, reference_lum))
+            }
         }
         6 => {
             let r_x = rd.i32(conn)
@@ -539,28 +570,32 @@ fn decode_image_description_creator_params(mut conn: wire.Conn, m: wire.Msg) -> 
             let b_y = rd.i32(conn)
             let w_x = rd.i32(conn)
             let w_y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetMasteringDisplayPrimaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetMasteringDisplayPrimaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            }
         }
         7 => {
             let min_lum = rd.u32(conn)
             let max_lum = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetMasteringLuminance(min_lum, max_lum))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetMasteringLuminance(min_lum, max_lum))
+            }
         }
         8 => {
             let max_cll = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetMaxCll(max_cll))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetMaxCll(max_cll))
+            }
         }
         9 => {
             let max_fall = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionCreatorParamsRequest.SetMaxFall(max_fall))
+            if rd.valid() {
+                return Ok(ImageDescriptionCreatorParamsRequest.SetMaxFall(max_fall))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_image_description_creator_params_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_image_description_creator_params_v1") })
 }
 
 /// wp_image_description_v1: Colorimetric image description
@@ -600,22 +635,25 @@ pub enum ImageDescriptionRequest {
     GetInformation(ImageDescriptionInfo)
 }
 
-fn decode_image_description(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionRequest, wire.Error] {
+pub fn decode_image_description(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ImageDescriptionRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ImageDescriptionRequest.Destroy)
+            }
         }
         1 => {
             let information = ImageDescriptionInfo { id: rd.new_id(mut conn, image_description_info_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionRequest.GetInformation(information))
+            if rd.valid() {
+                return Ok(ImageDescriptionRequest.GetInformation(information))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_image_description_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_image_description_v1") })
 }
 
 /// graceful error on creating the image description
@@ -749,17 +787,19 @@ pub enum ImageDescriptionReferenceRequest {
     Destroy
 }
 
-fn decode_image_description_reference(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionReferenceRequest, wire.Error] {
+pub fn decode_image_description_reference(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionReferenceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ImageDescriptionReferenceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ImageDescriptionReferenceRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_image_description_reference_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_image_description_reference_v1") })
 }
 
 /// Events of wp_color_manager_v1.
@@ -776,36 +816,42 @@ pub enum ColorManagerEvent {
     Done
 }
 
-fn decode_color_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagerEvent, wire.Error] {
+pub fn decode_color_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let render_intent = ColorManagerRenderIntent(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerEvent.SupportedIntent(render_intent))
+            if rd.valid() {
+                return Ok(ColorManagerEvent.SupportedIntent(render_intent))
+            }
         }
         1 => {
             let feature = ColorManagerFeature(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerEvent.SupportedFeature(feature))
+            if rd.valid() {
+                return Ok(ColorManagerEvent.SupportedFeature(feature))
+            }
         }
         2 => {
             let tf = ColorManagerTransferFunction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerEvent.SupportedTfNamed(tf))
+            if rd.valid() {
+                return Ok(ColorManagerEvent.SupportedTfNamed(tf))
+            }
         }
         3 => {
             let primaries = ColorManagerPrimaries(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerEvent.SupportedPrimariesNamed(primaries))
+            if rd.valid() {
+                return Ok(ColorManagerEvent.SupportedPrimariesNamed(primaries))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagerEvent.Done)
+            if rd.valid() {
+                return Ok(ColorManagerEvent.Done)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_color_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_color_manager_v1") })
 }
 
 /// destroy the color manager
@@ -894,16 +940,18 @@ pub enum ColorManagementOutputEvent {
     ImageDescriptionChanged
 }
 
-fn decode_color_management_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementOutputEvent, wire.Error] {
+pub fn decode_color_management_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementOutputEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementOutputEvent.ImageDescriptionChanged)
+            if rd.valid() {
+                return Ok(ColorManagementOutputEvent.ImageDescriptionChanged)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_color_management_output_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_color_management_output_v1") })
 }
 
 /// destroy the color management output
@@ -946,26 +994,29 @@ pub enum ColorManagementSurfaceFeedbackEvent {
     PreferredChanged2(u32, u32)
 }
 
-fn decode_color_management_surface_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementSurfaceFeedbackEvent, wire.Error] {
+pub fn decode_color_management_surface_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ColorManagementSurfaceFeedbackEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let identity = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementSurfaceFeedbackEvent.PreferredChanged(identity))
+            if rd.valid() {
+                return Ok(ColorManagementSurfaceFeedbackEvent.PreferredChanged(identity))
+            }
         }
         1 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wp_color_management_surface_feedback_v1.preferred_changed2 needs version 2"))
+                return Err(conn.needs_version(m, "wp_color_management_surface_feedback_v1.preferred_changed2", 2))
             }
             let identity_hi = rd.u32(conn)
             let identity_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ColorManagementSurfaceFeedbackEvent.PreferredChanged2(identity_hi, identity_lo))
+            if rd.valid() {
+                return Ok(ColorManagementSurfaceFeedbackEvent.PreferredChanged2(identity_hi, identity_lo))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_color_management_surface_feedback_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_color_management_surface_feedback_v1") })
 }
 
 /// destroy the color management interface for a surface
@@ -1097,32 +1148,36 @@ pub enum ImageDescriptionEvent {
     Ready2(u32, u32)
 }
 
-fn decode_image_description_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionEvent, wire.Error] {
+pub fn decode_image_description_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let cause = ImageDescriptionCause(rd.u32(conn))
             let msg = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionEvent.Failed(cause, msg))
+            if rd.valid() {
+                return Ok(ImageDescriptionEvent.Failed(cause, msg))
+            }
         }
         1 => {
             let identity = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionEvent.Ready(identity))
+            if rd.valid() {
+                return Ok(ImageDescriptionEvent.Ready(identity))
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wp_image_description_v1.ready2 needs version 2"))
+                return Err(conn.needs_version(m, "wp_image_description_v1.ready2", 2))
             }
             let identity_hi = rd.u32(conn)
             let identity_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionEvent.Ready2(identity_hi, identity_lo))
+            if rd.valid() {
+                return Ok(ImageDescriptionEvent.Ready2(identity_hi, identity_lo))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_image_description_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_image_description_v1") })
 }
 
 /// destroy the image description
@@ -1165,19 +1220,22 @@ pub enum ImageDescriptionInfoEvent {
     TargetMaxFall(u32)
 }
 
-fn decode_image_description_info_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionInfoEvent, wire.Error] {
+pub fn decode_image_description_info_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageDescriptionInfoEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ImageDescriptionInfoEvent.Done)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ImageDescriptionInfoEvent.Done)
+            }
         }
         1 => {
             let icc = rd.fd(mut conn)
             let icc_size = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.IccFile(icc, icc_size))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.IccFile(icc, icc_size))
+            }
         }
         2 => {
             let r_x = rd.i32(conn)
@@ -1188,30 +1246,35 @@ fn decode_image_description_info_event(mut conn: wire.Conn, m: wire.Msg) -> Resu
             let b_y = rd.i32(conn)
             let w_x = rd.i32(conn)
             let w_y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.Primaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.Primaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            }
         }
         3 => {
             let primaries = ColorManagerPrimaries(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.PrimariesNamed(primaries))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.PrimariesNamed(primaries))
+            }
         }
         4 => {
             let eexp = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.TfPower(eexp))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.TfPower(eexp))
+            }
         }
         5 => {
             let tf = ColorManagerTransferFunction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.TfNamed(tf))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.TfNamed(tf))
+            }
         }
         6 => {
             let min_lum = rd.u32(conn)
             let max_lum = rd.u32(conn)
             let reference_lum = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.Luminances(min_lum, max_lum, reference_lum))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.Luminances(min_lum, max_lum, reference_lum))
+            }
         }
         7 => {
             let r_x = rd.i32(conn)
@@ -1222,28 +1285,32 @@ fn decode_image_description_info_event(mut conn: wire.Conn, m: wire.Msg) -> Resu
             let b_y = rd.i32(conn)
             let w_x = rd.i32(conn)
             let w_y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.TargetPrimaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.TargetPrimaries(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y))
+            }
         }
         8 => {
             let min_lum = rd.u32(conn)
             let max_lum = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.TargetLuminance(min_lum, max_lum))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.TargetLuminance(min_lum, max_lum))
+            }
         }
         9 => {
             let max_cll = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.TargetMaxCll(max_cll))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.TargetMaxCll(max_cll))
+            }
         }
         10 => {
             let max_fall = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ImageDescriptionInfoEvent.TargetMaxFall(max_fall))
+            if rd.valid() {
+                return Ok(ImageDescriptionInfoEvent.TargetMaxFall(max_fall))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_image_description_info_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_image_description_info_v1") })
 }
 
 /// destroy the reference

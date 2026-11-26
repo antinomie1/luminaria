@@ -26,23 +26,26 @@ pub enum WmDialogRequest {
     GetXdgDialog(Dialog, xdg_shell.Toplevel)
 }
 
-fn decode_wm_dialog(mut conn: wire.Conn, m: wire.Msg) -> Result[WmDialogRequest, wire.Error] {
+pub fn decode_wm_dialog(mut conn: wire.Conn, m: wire.Msg) -> Result[WmDialogRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(WmDialogRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(WmDialogRequest.Destroy)
+            }
         }
         1 => {
             let id = Dialog { id: rd.new_id(mut conn, dialog_iface, m.version) }
             let toplevel = xdg_shell.Toplevel { id: rd.object(conn, xdg_shell.toplevel_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(WmDialogRequest.GetXdgDialog(id, toplevel))
+            if rd.valid() {
+                return Ok(WmDialogRequest.GetXdgDialog(id, toplevel))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_wm_dialog_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_wm_dialog_v1") })
 }
 
 /// xdg_dialog_v1: dialog object
@@ -64,25 +67,29 @@ pub enum DialogRequest {
     UnsetModal
 }
 
-fn decode_dialog(mut conn: wire.Conn, m: wire.Msg) -> Result[DialogRequest, wire.Error] {
+pub fn decode_dialog(mut conn: wire.Conn, m: wire.Msg) -> Result[DialogRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DialogRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DialogRequest.Destroy)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(DialogRequest.SetModal)
+            if rd.valid() {
+                return Ok(DialogRequest.SetModal)
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(DialogRequest.UnsetModal)
+            if rd.valid() {
+                return Ok(DialogRequest.UnsetModal)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_dialog_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_dialog_v1") })
 }
 
 /// destroy the dialog manager object

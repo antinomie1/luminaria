@@ -17,6 +17,7 @@ import luminaria_proto.wayland as wl
 import luminaria_proto.xdg_shell as xdg
 import luminaria_proto.linux_dmabuf as dmab
 import luminaria_proto.xdg_toplevel_drag as tdrag
+import luminaria_proto.wlr_layer_shell_unstable as ls
 
 struct Trace {
     overlay_calls: List[List[u64]] = []
@@ -27,6 +28,7 @@ struct Trace {
     last_layout: List[lum.types.Placement] = []
     cursor_set_count: int = 0
     cursor_pos: Option[(i32, i32)] = None
+    scanout_keys: List[u64] = []
 }
 
 struct TestOut {
@@ -123,6 +125,15 @@ pub fn TestOut.shutdown(mut self, mut retired: List[u64]) {
 
 pub fn TestOut.shown(self, o: u32) -> Option[u64] {
     return if self.shown < 0 { None } else { Some(self.targets[self.shown]) }
+}
+
+pub fn TestOut.scanout(mut self, o: u32, key: u64, b: lum.types.Dmabuf, rects: Slice[(i32, i32, i32, i32)], tear: bool) -> bool {
+    if let Some(tr) = self.trace {
+        tr.write(fn(mut t: Trace) {
+            t.scanout_keys.push(key)
+        })
+    }
+    return false
 }
 
 pub fn TestOut.set_cursor(mut self, pixels: Slice[u8], width: i32, height: i32, hot_x: i32, hot_y: i32) -> bool {
@@ -1400,4 +1411,325 @@ test "buffers no frame reads go back at once, commits replaced unseen included" 
         }
     }
     assert_eq(order, [1, 0, 9])
+}
+
+fn vk_pump(mut d: lum.display.Display[TestOut, lum.compose.Compositor], mut c: wire.Conn, mut g: List[(u32, u16)], mut wins: List[lum.Window], ms: int) {
+    let end = time.now_ns() + ms * 1000000
+    while time.now_ns() < end {
+        discard c.flush()
+        while true {
+            guard let Some(e) = d.poll().expect("poll2") else {
+                break
+            }
+            match e {
+                WindowMapped(w2) => wins.push(w2)
+                _ => {}
+            }
+            d.accept(e)
+        }
+        discard c.read()
+        while true {
+            match proto.next_event(mut c) {
+                Ok(Some(ev)) => {
+                    match ev {
+                        WlRegistry(_, Global(n, i, _)) => g.push((n, proto.ifaces.by_name(i)))
+                        XdgSurface(xs2, Configure(ser)) => xs2.ack_configure(mut c, ser)
+                        ZwlrLayerSurface(ls2, Configure(ser, _, _)) => ls2.ack_configure(mut c, ser)
+                        _ => {}
+                    }
+                }
+                Ok(None) => {
+                    break
+                }
+                Err(err) => panic("client2: {err}")
+            }
+        }
+        time.sleep_ms(2)
+    }
+}
+
+fn vk_bind(mut c: wire.Conn, reg: wl.Registry, g: Slice[(u32, u16)], iface: u16, ver: u32) -> u32 {
+    for (n, i) in g {
+        if i == iface {
+            return reg.bind(mut c, n, iface, ver)
+        }
+    }
+    panic("missing global {iface}")
+}
+
+test "fullscreen puts Layer.Top before window for direct scanout while keeping Layer.Overlay on top" {
+    // Part A: Placement list Z-order via SoftRen + Trace.
+    let dir = fs.create_temp_dir("luminaria-plug-fslayer").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let tr = sync.mutex(Trace {})
+    let out = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr.clone()), devices: lum.backend.Devices.none() }
+    let ren = SoftRen { texs: map.Map.new(), targets: map.Map.new(), trace: Some(tr.clone()) }
+    var d = lum.display.Display.with(lum.Options {}, out, ren).expect("display")
+    d.hide_cursor()
+    let c = wire.connect(d.socket()).expect("connect")
+    var fx = PlugFx { d, c }
+    let comp = wl.Compositor { id: bind_global(mut fx, wl.compositor_iface, 6) }
+    let shm = wl.Shm { id: bind_global(mut fx, wl.shm_iface, 1) }
+    let wm = xdg.WmBase { id: bind_global(mut fx, xdg.wm_base_iface, 2) }
+    let shell = ls.Shell { id: bind_global(mut fx, ls.shell_iface, 5) }
+
+    // Map Layer.Top (32x8).
+    let ts = comp.create_surface(mut fx.c)
+    let tl_top = shell.get_layer_surface(mut fx.c, ts, None, ls.ShellLayer.Top, "bar")
+    tl_top.set_anchor(mut fx.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    tl_top.set_size(mut fx.c, 0, 8)
+    ts.commit(mut fx.c)
+    var top_ser: u32 = 0
+    for e in plug_collect(mut fx, 40) {
+        match e {
+            ZwlrLayerSurface(lsurf, Configure(ser, _, _)) => {
+                if lsurf.id == tl_top.id {
+                    top_ser = ser
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(top_ser != 0)
+    tl_top.ack_configure(mut fx.c, top_ser)
+    let fd_t = os.memfd("top", 32 * 8 * 4).expect("memfd")
+    let pool_t = shm.create_pool(mut fx.c, fd_t, 32 * 8 * 4)
+    os.close(fd_t)
+    ts.attach(mut fx.c, Some(pool_t.create_buffer(mut fx.c, 0, 32, 8, 32 * 4, wl.ShmFormat.Xrgb8888)), 0, 0)
+    ts.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+
+    // Map toplevel window (32x24).
+    let ws = comp.create_surface(mut fx.c)
+    let xs = wm.get_xdg_surface(mut fx.c, ws)
+    let top = xs.get_toplevel(mut fx.c)
+    ws.commit(mut fx.c)
+    plug_pump(mut fx, 30)
+    let fd_w = os.memfd("win", 32 * 24 * 4).expect("memfd")
+    let pool_w = shm.create_pool(mut fx.c, fd_w, 32 * 24 * 4)
+    os.close(fd_w)
+    ws.attach(mut fx.c, Some(pool_w.create_buffer(mut fx.c, 0, 32, 24, 32 * 4, wl.ShmFormat.Xrgb8888)), 0, 0)
+    ws.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    let w = fx.wins[0]
+    let wkey = fx.d.window_key(w)
+    fx.d.layout(fn(mut l) {
+        l.window(w, 0.0, 0.0, lum.Style {})
+    })
+    plug_pump(mut fx, 30)
+
+    // Non-fullscreen: [win, top] -> top is last.
+    var ps: List[lum.types.Placement] = []
+    tr.read(fn(t: Trace) {
+        ps = t.last_layout.clone()
+    })
+    assert_eq(ps.len(), 2)
+    assert_eq(ps[0].key, wkey)
+    assert(ps[1].key != wkey)
+    let top_key = ps[1].key
+
+    // Fullscreen: [top, win] -> fullscreen window is last!
+    top.set_fullscreen(mut fx.c, None)
+    plug_pump(mut fx, 30)
+    ws.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    tr.read(fn(t: Trace) {
+        ps = t.last_layout.clone()
+    })
+    assert_eq(ps.len(), 2)
+    assert_eq(ps[0].key, top_key)
+    assert_eq(ps[1].key, wkey)
+
+    // Fullscreen + Layer.Overlay: [top, win, overlay] -> overlay stays last!
+    let os_s = comp.create_surface(mut fx.c)
+    let ol = shell.get_layer_surface(mut fx.c, os_s, None, ls.ShellLayer.Overlay, "osd")
+    ol.set_anchor(mut fx.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Right)
+    ol.set_size(mut fx.c, 8, 8)
+    ol.set_exclusive_zone(mut fx.c, -1)
+    os_s.commit(mut fx.c)
+    var ov_ser: u32 = 0
+    for e in plug_collect(mut fx, 40) {
+        match e {
+            ZwlrLayerSurface(lsurf, Configure(ser, _, _)) => {
+                if lsurf.id == ol.id {
+                    ov_ser = ser
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(ov_ser != 0)
+    ol.ack_configure(mut fx.c, ov_ser)
+    let fd_o = os.memfd("ov", 8 * 8 * 4).expect("memfd")
+    let pool_o = shm.create_pool(mut fx.c, fd_o, 8 * 8 * 4)
+    os.close(fd_o)
+    os_s.attach(mut fx.c, Some(pool_o.create_buffer(mut fx.c, 0, 8, 8, 8 * 4, wl.ShmFormat.Xrgb8888)), 0, 0)
+    os_s.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    tr.read(fn(t: Trace) {
+        ps = t.last_layout.clone()
+    })
+    assert_eq(ps.len(), 3)
+    assert_eq(ps[0].key, top_key)
+    assert_eq(ps[1].key, wkey)
+    assert(ps[2].key != wkey and ps[2].key != top_key)
+
+    // Exit fullscreen after removing overlay: [win, top] restored!
+    ol.destroy(mut fx.c)
+    os_s.destroy(mut fx.c)
+    top.unset_fullscreen(mut fx.c)
+    plug_pump(mut fx, 30)
+    ws.commit(mut fx.c)
+    plug_pump(mut fx, 40)
+    tr.read(fn(t: Trace) {
+        ps = t.last_layout.clone()
+    })
+    assert_eq(ps.len(), 2)
+    assert_eq(ps[0].key, wkey)
+    assert_eq(ps[1].key, top_key)
+
+    // Part B: Real Vulkan Compositor.scanout() activates when fullscreen + Layer.Top,
+    // and yields when Layer.Overlay is mapped or fullscreen exits.
+    guard let Ok(vcomp) = lum.compose.Compositor.open(false) else {
+        return
+    }
+    guard let Ok(exp_comp_r) = lum.compose.Compositor.open(false) else {
+        return
+    }
+    var exp_comp = exp_comp_r
+    let exp_ts = match exp_comp.targets(lum.types.Want { width: 32, height: 24, format: lum.types.buffer.xrgb8888, count: 1, export: true }) {
+        Ok(ts) => ts
+        Err => {
+            exp_comp.close()
+            return
+        }
+    }
+    let dir2 = fs.create_temp_dir("luminaria-plug-fsscan").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir2)
+    let tr2 = sync.mutex(Trace {})
+    let out2 = TestOut { timer: os.timerfd().unwrap(), trace: Some(tr2.clone()), devices: lum.backend.Devices.none() }
+    var d2 = lum.display.Display.with(lum.Options {}, out2, vcomp).expect("vk display")
+    d2.hide_cursor()
+    var c2 = wire.connect(d2.socket()).expect("connect2")
+    let reg2 = wl.Display { id: 1 }.get_registry(mut c2)
+    var g2: List[(u32, u16)] = []
+    var wins2: List[lum.Window] = []
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+    let comp2 = wl.Compositor { id: vk_bind(mut c2, reg2, g2, wl.compositor_iface, 6) }
+    let shm2 = wl.Shm { id: vk_bind(mut c2, reg2, g2, wl.shm_iface, 1) }
+    let wm2 = xdg.WmBase { id: vk_bind(mut c2, reg2, g2, xdg.wm_base_iface, 2) }
+    let shell2 = ls.Shell { id: vk_bind(mut c2, reg2, g2, ls.shell_iface, 5) }
+    let dma2 = dmab.Dmabuf { id: vk_bind(mut c2, reg2, g2, dmab.dmabuf_iface, 4) }
+
+    // Map Layer.Top (32x8).
+    let ts2 = comp2.create_surface(mut c2)
+    let lt2 = shell2.get_layer_surface(mut c2, ts2, None, ls.ShellLayer.Top, "bar2")
+    lt2.set_anchor(mut c2, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    lt2.set_size(mut c2, 0, 8)
+    ts2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+    let fd_t2 = os.memfd("top2", 32 * 8 * 4).expect("memfd")
+    let pool_t2 = shm2.create_pool(mut c2, fd_t2, 32 * 8 * 4)
+    os.close(fd_t2)
+    ts2.attach(mut c2, Some(pool_t2.create_buffer(mut c2, 0, 32, 8, 32 * 4, wl.ShmFormat.Xrgb8888)), 0, 0)
+    ts2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+
+    // Map imported dmabuf toplevel (32x24).
+    let ws2 = comp2.create_surface(mut c2)
+    let xs2 = wm2.get_xdg_surface(mut c2, ws2)
+    let top2 = xs2.get_toplevel(mut c2)
+    ws2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+    let tgt = exp_ts[0]
+    let params2 = dma2.create_params(mut c2)
+    for pi in 0..tgt.buf.planes {
+        let pl = tgt.buf.plane[pi]
+        params2.add_(mut c2, pl.fd, u32(pi), pl.offset, pl.stride, u32(tgt.buf.modifier >> 32), u32(tgt.buf.modifier & 0xffffffff))
+    }
+    let dbuf2 = params2.create_immed(mut c2, 32, 24, lum.types.buffer.xrgb8888, dmab.BufferParamsFlags(0))
+    params2.destroy(mut c2)
+    for pi in 0..tgt.buf.planes {
+        os.close(tgt.buf.plane[pi].fd)
+    }
+    ws2.attach(mut c2, Some(dbuf2), 0, 0)
+    ws2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 50)
+    assert_eq(wins2.len(), 1)
+    let w2 = wins2[0]
+    d2.layout(fn(mut l) {
+        l.window(w2, 0.0, 0.0, lum.Style {})
+    })
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 80)
+
+    // Non-fullscreen with Layer.Top: direct scanout MUST be blocked.
+    var sc_count = 0
+    tr2.read(fn(t: Trace) {
+        sc_count = t.scanout_keys.len()
+    })
+    assert_eq(sc_count, 0)
+
+    // Fullscreen with Layer.Top: Scene.scanout() MUST succeed and reach Output.scanout()!
+    top2.set_fullscreen(mut c2, None)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+    ws2.damage(mut c2, 0, 0, 32, 24)
+    ws2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 80)
+    tr2.read(fn(t: Trace) {
+        sc_count = t.scanout_keys.len()
+    })
+    assert(sc_count > 0)
+
+    // Layer.Overlay above fullscreen MUST block direct scanout again.
+    let ovs2 = comp2.create_surface(mut c2)
+    let ovl2 = shell2.get_layer_surface(mut c2, ovs2, None, ls.ShellLayer.Overlay, "osd2")
+    ovl2.set_anchor(mut c2, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Right)
+    ovl2.set_size(mut c2, 8, 8)
+    ovl2.set_exclusive_zone(mut c2, -1)
+    ovs2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+    let fd_o2 = os.memfd("ov2", 8 * 8 * 4).expect("memfd")
+    let pool_o2 = shm2.create_pool(mut c2, fd_o2, 8 * 8 * 4)
+    os.close(fd_o2)
+    ovs2.attach(mut c2, Some(pool_o2.create_buffer(mut c2, 0, 8, 8, 8 * 4, wl.ShmFormat.Xrgb8888)), 0, 0)
+    ovs2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 50)
+    tr2.write(fn(mut t: Trace) {
+        t.scanout_keys.clear()
+    })
+    ws2.damage(mut c2, 0, 0, 32, 24)
+    ws2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 80)
+    tr2.read(fn(t: Trace) {
+        sc_count = t.scanout_keys.len()
+    })
+    assert_eq(sc_count, 0)
+
+    // Removing Layer.Overlay restores direct scanout; exiting fullscreen stops it again.
+    ovl2.destroy(mut c2)
+    ovs2.destroy(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 50)
+    ws2.damage(mut c2, 0, 0, 32, 24)
+    ws2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 80)
+    tr2.read(fn(t: Trace) {
+        sc_count = t.scanout_keys.len()
+    })
+    assert(sc_count > 0)
+
+    top2.unset_fullscreen(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 40)
+    tr2.write(fn(mut t: Trace) {
+        t.scanout_keys.clear()
+    })
+    ws2.damage(mut c2, 0, 0, 32, 24)
+    ws2.commit(mut c2)
+    vk_pump(mut d2, mut c2, mut g2, mut wins2, 80)
+    tr2.read(fn(t: Trace) {
+        sc_count = t.scanout_keys.len()
+    })
+    assert_eq(sc_count, 0)
+
+    exp_comp.drop_target(tgt.key)
+    exp_comp.close()
 }

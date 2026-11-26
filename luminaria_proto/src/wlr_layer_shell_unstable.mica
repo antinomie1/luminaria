@@ -39,8 +39,9 @@ pub enum ShellRequest {
     Destroy
 }
 
-fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.Error] {
+pub fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Surface { id: rd.new_id(mut conn, surface_iface, m.version) }
@@ -49,20 +50,22 @@ fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.E
             let output: Option[wayland.Output] = if output_raw == 0 { None } else { Some(wayland.Output { id: output_raw }) }
             let layer = ShellLayer(rd.u32(conn))
             let scope = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellRequest.GetLayerSurface(id, surface, output, layer, scope))
+            if rd.valid() {
+                return Ok(ShellRequest.GetLayerSurface(id, surface, output, layer, scope))
+            }
         }
         1 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_layer_shell_v1.destroy needs version 3"))
+                return Err(conn.needs_version(m, "zwlr_layer_shell_v1.destroy", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ShellRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ShellRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_layer_shell_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_layer_shell_v1") })
 }
 
 /// zwlr_layer_surface_v1: layer metadata interface
@@ -133,72 +136,83 @@ pub enum SurfaceRequest {
     SetExclusiveEdge(SurfaceAnchor)
 }
 
-fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
+pub fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let width = rd.u32(conn)
             let height = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetSize(width, height))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetSize(width, height))
+            }
         }
         1 => {
             let anchor = SurfaceAnchor(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetAnchor(anchor))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetAnchor(anchor))
+            }
         }
         2 => {
             let zone = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetExclusiveZone(zone))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetExclusiveZone(zone))
+            }
         }
         3 => {
             let top = rd.i32(conn)
             let right = rd.i32(conn)
             let bottom = rd.i32(conn)
             let left = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetMargin(top, right, bottom, left))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetMargin(top, right, bottom, left))
+            }
         }
         4 => {
             let keyboard_interactivity = SurfaceKeyboardInteractivity(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetKeyboardInteractivity(keyboard_interactivity))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetKeyboardInteractivity(keyboard_interactivity))
+            }
         }
         5 => {
             let popup = xdg_shell.Popup { id: rd.object(conn, xdg_shell.popup_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.GetPopup(popup))
+            if rd.valid() {
+                return Ok(SurfaceRequest.GetPopup(popup))
+            }
         }
         6 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.AckConfigure(serial))
+            if rd.valid() {
+                return Ok(SurfaceRequest.AckConfigure(serial))
+            }
         }
         7 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SurfaceRequest.Destroy)
+            }
         }
         8 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_layer_surface_v1.set_layer needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_layer_surface_v1.set_layer", 2))
             }
             let layer = ShellLayer(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetLayer(layer))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetLayer(layer))
+            }
         }
         9 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_layer_surface_v1.set_exclusive_edge needs version 5"))
+                return Err(conn.needs_version(m, "zwlr_layer_surface_v1.set_exclusive_edge", 5))
             }
             let edge = SurfaceAnchor(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetExclusiveEdge(edge))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetExclusiveEdge(edge))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_layer_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_layer_surface_v1") })
 }
 
 /// suggest a surface change
@@ -243,23 +257,26 @@ pub enum SurfaceEvent {
     Closed
 }
 
-fn decode_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceEvent, wire.Error] {
+pub fn decode_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let width = rd.u32(conn)
             let height = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.Configure(serial, width, height))
+            if rd.valid() {
+                return Ok(SurfaceEvent.Configure(serial, width, height))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.Closed)
+            if rd.valid() {
+                return Ok(SurfaceEvent.Closed)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_layer_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_layer_surface_v1") })
 }
 
 /// sets the size of the surface

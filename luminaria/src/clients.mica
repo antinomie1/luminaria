@@ -1,5 +1,6 @@
 // What clients do: server events, buffers, surfaces and popups.
 
+import std.mem
 import std.os
 import luminaria_types as types
 import luminaria_types.pixels as pixels
@@ -32,7 +33,8 @@ fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R])
             Applied(s) => applied(mut d, s)
             SurfaceGone(s) => surface_gone(mut d, s)
             WindowNew(w) => {
-                discard d.wins.insert(w, display.Win {})
+                let wi = d.win_ensure(w)
+                d.wins[wi] = display.Win { gen: w.id.gen }
                 d.emit(display.Event.WindowNew(w))
             }
             WindowMapped(w) => {
@@ -40,14 +42,18 @@ fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R])
                 place.rebuild(mut d)
             }
             WindowUnmapped(w) => {
-                if let Some(cur) = d.wins.get(w) {
-                    discard d.wins.insert(w, display.Win { width: cur.width, height: cur.height, states: cur.states })
+                let wi = d.win_idx(w)
+                if wi >= 0 {
+                    d.wins[wi] = display.Win { gen: w.id.gen, width: d.wins[wi].width, height: d.wins[wi].height, states: d.wins[wi].states }
                 }
                 d.emit(display.Event.WindowUnmapped(w))
                 place.rebuild(mut d)
             }
             WindowClosed(w) => {
-                discard d.wins.remove(w)
+                let wi = d.win_idx(w)
+                if wi >= 0 {
+                    d.wins[wi] = display.Win {}
+                }
                 d.waits.txn_wins.retain(fn(x) => x != w)
                 d.caps.windows.retain(fn(x) => x != w)
                 d.emit(display.Event.WindowClosed(w))
@@ -100,7 +106,7 @@ fn server_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R])
             PointerHint(st, s, hx, hy) => {
                 let si = seats.seat_index(d, st)
                 if si >= 0 {
-                    if let Some((gx, gy, sc)) = d.origins.get(s) {
+                    if let Some((gx, gy, sc)) = d.origin_of(s) {
                         d.seats[si].px = gx + hx * sc
                         d.seats[si].py = gy + hy * sc
                         seats.move_cursor_on(mut d, si)
@@ -218,13 +224,12 @@ fn request[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: se
 }
 
 fn acked[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, aw: i32, ah: i32) {
-    guard let Some(cur) = d.wins.get(w) else {
+    let wi = d.win_idx(w)
+    guard wi >= 0 else {
         return
     }
-    var win = cur
-    win.inflight = false
-    let resized = aw != win.width or ah != win.height
-    discard d.wins.insert(w, win)
+    d.wins[wi].inflight = false
+    let resized = aw != d.wins[wi].width or ah != d.wins[wi].height
     if d.waits.txn_open or d.waits.txn_layout.is_some() {
         d.waits.txn_wins.retain(fn(x) => x != w)
         waits.try_finish(mut d)
@@ -257,9 +262,12 @@ fn buffer_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b
     }
     // Still shown: the texture lives until the surface moves on.
     var used = false
-    d.surfs.each(fn(s, sf) {
-        used = used or sf.buffer == Some(b)
-    })
+    for i in 0..d.surfs.len() {
+        if d.surfs[i].gen != 0 and d.surfs[i].buffer == Some(b) {
+            used = true
+            break
+        }
+    }
     if not used {
         d.be.forget(bk)
         if d.comp.has(bk) {
@@ -298,6 +306,7 @@ fn drop_orphan[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], b
     }
 }
 
+@noinline
 fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
     if d.waits.txn_layout.is_some() and waits.held_window(d, s) {
         if not d.waits.held.contains(s) {
@@ -306,12 +315,16 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
         return
     }
     let info = d.srv.info(s)
-    var dmg: List[server.Rect] = []
-    var bdmg: List[server.Rect] = []
+    var dmg = mem.replace(mut d.dmg_scratch, [])
+    var bdmg = mem.replace(mut d.bdmg_scratch, [])
+    dmg.clear()
+    bdmg.clear()
     let changed = d.srv.take_changes(s, mut dmg, mut bdmg)
-    var sf = d.surfs.get(s).unwrap_or(display.Surf {})
+    let idx = d.surf_ensure(s)
+    var sf = d.surfs[idx]
     // Damage in buffer pixels.
-    var rects: List[(i32, i32, i32, i32)] = []
+    var rects = mem.replace(mut d.rects_scratch, [])
+    rects.clear()
     for r in bdmg {
         rects.push((r.x, r.y, r.w, r.h))
     }
@@ -324,12 +337,15 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
             break
         }
     }
+    d.dmg_scratch = dmg
+    d.bdmg_scratch = bdmg
     if changed & server.changed_buffer != 0 {
         let old = sf.buffer
         let new = info.buffer
         // Commits replaced before this one was taken were never read; a
         // buffer still shown or current again keeps itself, its point waits.
-        var gone: List[(Option[server.Buffer], int, u64)] = []
+        var gone = mem.replace(mut d.superseded_scratch, [])
+        gone.clear()
         d.srv.take_superseded(s, mut gone)
         for (gb, gfd, gpoint) in gone {
             let rel = if gfd >= 0 { os.dup(gfd).unwrap_or(-1) } else { -1 }
@@ -341,6 +357,7 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
                 None => release_later(mut d, None, 0, rel, gpoint)
             }
         }
+        d.superseded_scratch = gone
         if old != new {
             let old_rel_fd = sf.rel_fd
             let old_rel_point = sf.rel_point
@@ -414,11 +431,12 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
     } else {
         sf.dmg = (0, 0, info.buffer_width, info.buffer_height)
     }
-    discard d.surfs.insert(s, sf)
+    d.surfs[idx] = sf
     if changed & (server.changed_damage | server.changed_buffer) != 0 {
         d.comp.commit(display.skey(s), rects)
         mark_dirty_for(mut d, s)
     }
+    d.rects_scratch = rects
     for si in 0..d.seats.len() {
         if d.seats[si].cursor_surface == Some(s) {
             seats.client_cursor_on(mut d, si, s)
@@ -431,7 +449,7 @@ fn applied[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: se
 
 /// Outputs showing `s` have something to draw.
 fn mark_dirty_for[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
-    guard let Some((gx, gy, sc)) = d.origins.get(s) else {
+    guard let Some((gx, gy, sc)) = d.origin_of(s) else {
         return
     }
     let info = d.srv.info(s)
@@ -446,10 +464,13 @@ fn mark_dirty_for[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
     }
 }
 
+@noinline
 fn surface_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface) {
     d.comp.forget(display.skey(s))
     d.pending_shm.retain(fn(x) => x != s)
-    if let Some(sf) = d.surfs.remove(s) {
+    let idx = d.surf_idx(s)
+    if idx >= 0 {
+        let sf = mem.replace(mut d.surfs[idx], display.Surf {})
         if sf.rel_fd >= 0 {
             d.sync.signal(sf.rel_fd, sf.rel_point)
             os.close(sf.rel_fd)
@@ -459,17 +480,17 @@ fn surface_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         }
         if let Some(b) = sf.buffer {
             var used = false
-            d.surfs.each(fn(_, other) {
-                used = used or other.buffer == Some(b)
-            })
+            for i in 0..d.surfs.len() {
+                if d.surfs[i].gen != 0 and d.surfs[i].buffer == Some(b) {
+                    used = true
+                    break
+                }
+            }
             if not used {
                 drop_orphan(mut d, b)
             }
         }
     }
-    discard d.origins.remove(s)
-    discard d.surf_keys.remove(display.skey(s))
-    discard d.surf_window.remove(s)
     for si in 0..d.seats.len() {
         if d.seats[si].focus == Some(s) {
             d.seats[si].focus = None
@@ -499,7 +520,7 @@ fn surface_gone[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
 fn configure_popup[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], p: server.Popup) {
     var bounds = server.Rect {}
     if let Some(parent) = d.srv.popup_parent(p) {
-        if let Some((gx, gy, sc)) = d.origins.get(parent) {
+        if let Some((gx, gy, sc)) = d.origin_of(parent) {
             let geo = d.srv.info(parent).geometry
             let ax = gx + f64(geo.x) * sc
             let ay = gy + f64(geo.y) * sc

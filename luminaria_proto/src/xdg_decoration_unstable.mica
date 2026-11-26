@@ -21,23 +21,26 @@ pub enum DecorationManagerRequest {
     GetToplevelDecoration(ToplevelDecoration, xdg_shell.Toplevel)
 }
 
-fn decode_decoration_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[DecorationManagerRequest, wire.Error] {
+pub fn decode_decoration_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[DecorationManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DecorationManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DecorationManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = ToplevelDecoration { id: rd.new_id(mut conn, toplevel_decoration_iface, m.version) }
             let toplevel = xdg_shell.Toplevel { id: rd.object(conn, xdg_shell.toplevel_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(DecorationManagerRequest.GetToplevelDecoration(id, toplevel))
+            if rd.valid() {
+                return Ok(DecorationManagerRequest.GetToplevelDecoration(id, toplevel))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zxdg_decoration_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zxdg_decoration_manager_v1") })
 }
 
 /// zxdg_toplevel_decoration_v1: decoration object for a toplevel surface
@@ -78,26 +81,30 @@ pub enum ToplevelDecorationRequest {
     UnsetMode
 }
 
-fn decode_toplevel_decoration(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelDecorationRequest, wire.Error] {
+pub fn decode_toplevel_decoration(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelDecorationRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ToplevelDecorationRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ToplevelDecorationRequest.Destroy)
+            }
         }
         1 => {
             let mode = ToplevelDecorationMode(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelDecorationRequest.SetMode(mode))
+            if rd.valid() {
+                return Ok(ToplevelDecorationRequest.SetMode(mode))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelDecorationRequest.UnsetMode)
+            if rd.valid() {
+                return Ok(ToplevelDecorationRequest.UnsetMode)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zxdg_toplevel_decoration_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zxdg_toplevel_decoration_v1") })
 }
 
 /// notify a decoration mode change
@@ -127,17 +134,19 @@ pub enum ToplevelDecorationEvent {
     Configure(ToplevelDecorationMode)
 }
 
-fn decode_toplevel_decoration_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelDecorationEvent, wire.Error] {
+pub fn decode_toplevel_decoration_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelDecorationEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mode = ToplevelDecorationMode(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelDecorationEvent.Configure(mode))
+            if rd.valid() {
+                return Ok(ToplevelDecorationEvent.Configure(mode))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zxdg_toplevel_decoration_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zxdg_toplevel_decoration_v1") })
 }
 
 /// destroy the decoration object

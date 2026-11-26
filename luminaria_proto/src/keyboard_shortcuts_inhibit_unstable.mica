@@ -26,24 +26,27 @@ pub enum InhibitManagerRequest {
     InhibitShortcuts(Inhibitor, wayland.Surface, wayland.Seat)
 }
 
-fn decode_inhibit_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitManagerRequest, wire.Error] {
+pub fn decode_inhibit_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(InhibitManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(InhibitManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Inhibitor { id: rd.new_id(mut conn, inhibitor_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(InhibitManagerRequest.InhibitShortcuts(id, surface, seat))
+            if rd.valid() {
+                return Ok(InhibitManagerRequest.InhibitShortcuts(id, surface, seat))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_keyboard_shortcuts_inhibit_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_keyboard_shortcuts_inhibit_manager_v1") })
 }
 
 /// zwp_keyboard_shortcuts_inhibitor_v1: context object for keyboard shortcuts inhibitor
@@ -61,17 +64,19 @@ pub enum InhibitorRequest {
     Destroy
 }
 
-fn decode_inhibitor(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitorRequest, wire.Error] {
+pub fn decode_inhibitor(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitorRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(InhibitorRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(InhibitorRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_keyboard_shortcuts_inhibitor_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_keyboard_shortcuts_inhibitor_v1") })
 }
 
 /// shortcuts are inhibited
@@ -108,20 +113,23 @@ pub enum InhibitorEvent {
     Inactive
 }
 
-fn decode_inhibitor_event(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitorEvent, wire.Error] {
+pub fn decode_inhibitor_event(mut conn: wire.Conn, m: wire.Msg) -> Result[InhibitorEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(InhibitorEvent.Active)
+            if rd.valid() {
+                return Ok(InhibitorEvent.Active)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(InhibitorEvent.Inactive)
+            if rd.valid() {
+                return Ok(InhibitorEvent.Inactive)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_keyboard_shortcuts_inhibitor_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_keyboard_shortcuts_inhibitor_v1") })
 }
 
 /// destroy the keyboard shortcuts inhibitor object

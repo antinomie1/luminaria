@@ -358,7 +358,7 @@ pub fn next(mut conn: wire.Conn) -> Result[Option[Request], wire.Error] {
                 if m.iface > ifaces.count {
                     return Ok(Some(Request.Extension(m)))
                 }
-                return Err(conn.error(m.id, wire.invalid_method, "no requests on interface {m.iface}"))
+                return Err(conn.no_messages(m, false))
             }
         }
         return Ok(Some(v))
@@ -531,7 +531,7 @@ pub fn next_event(mut conn: wire.Conn) -> Result[Option[Event], wire.Error] {
             141 => Event.XdgPopup(xdg_shell.Popup { id: m.id }, try xdg_shell.decode_popup_event(mut conn, m))
             145 => Event.XdgToplevelIconManager(xdg_toplevel_icon.IconManager { id: m.id }, try xdg_toplevel_icon.decode_icon_manager_event(mut conn, m))
             _ => {
-                return Err(conn.error(m.id, wire.invalid_method, "no events on interface {m.iface}"))
+                return Err(conn.no_messages(m, true))
             }
         }
         // Events to objects destroyed here are read, then dropped.

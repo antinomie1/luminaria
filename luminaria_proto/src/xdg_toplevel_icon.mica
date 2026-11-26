@@ -24,29 +24,33 @@ pub enum IconManagerRequest {
     SetIcon(xdg_shell.Toplevel, Option[Icon])
 }
 
-fn decode_icon_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[IconManagerRequest, wire.Error] {
+pub fn decode_icon_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[IconManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(IconManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(IconManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Icon { id: rd.new_id(mut conn, icon_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(IconManagerRequest.CreateIcon(id))
+            if rd.valid() {
+                return Ok(IconManagerRequest.CreateIcon(id))
+            }
         }
         2 => {
             let toplevel = xdg_shell.Toplevel { id: rd.object(conn, xdg_shell.toplevel_iface, false) }
             let icon_raw = rd.object(conn, icon_iface, true)
             let icon: Option[Icon] = if icon_raw == 0 { None } else { Some(Icon { id: icon_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(IconManagerRequest.SetIcon(toplevel, icon))
+            if rd.valid() {
+                return Ok(IconManagerRequest.SetIcon(toplevel, icon))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_toplevel_icon_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_toplevel_icon_manager_v1") })
 }
 
 /// describes a supported & preferred icon size
@@ -88,28 +92,32 @@ pub enum IconRequest {
     AddBuffer(wayland.Buffer, i32)
 }
 
-fn decode_icon(mut conn: wire.Conn, m: wire.Msg) -> Result[IconRequest, wire.Error] {
+pub fn decode_icon(mut conn: wire.Conn, m: wire.Msg) -> Result[IconRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(IconRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(IconRequest.Destroy)
+            }
         }
         1 => {
             let icon_name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(IconRequest.SetName(icon_name))
+            if rd.valid() {
+                return Ok(IconRequest.SetName(icon_name))
+            }
         }
         2 => {
             let buffer = wayland.Buffer { id: rd.object(conn, wayland.buffer_iface, false) }
             let scale = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(IconRequest.AddBuffer(buffer, scale))
+            if rd.valid() {
+                return Ok(IconRequest.AddBuffer(buffer, scale))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_toplevel_icon_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_toplevel_icon_v1") })
 }
 
 /// Events of xdg_toplevel_icon_manager_v1.
@@ -120,21 +128,24 @@ pub enum IconManagerEvent {
     Done
 }
 
-fn decode_icon_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[IconManagerEvent, wire.Error] {
+pub fn decode_icon_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[IconManagerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let size = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(IconManagerEvent.IconSize(size))
+            if rd.valid() {
+                return Ok(IconManagerEvent.IconSize(size))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(IconManagerEvent.Done)
+            if rd.valid() {
+                return Ok(IconManagerEvent.Done)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on xdg_toplevel_icon_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "xdg_toplevel_icon_manager_v1") })
 }
 
 /// destroy the toplevel icon manager

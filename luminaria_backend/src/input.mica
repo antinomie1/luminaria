@@ -45,6 +45,8 @@ struct Input {
     next: u32 = 1
 }
 
+@noinline
+@cold
 fn open(seat_name: str) -> Result[Input, str] {
     guard let Some(u) = udev.new() else {
         return Err("udev_new failed")
@@ -68,6 +70,8 @@ fn Input.fd(self) -> int {
     return int(li.get_fd(self.li))
 }
 
+@noinline
+@cold
 fn Input.drop(mut self) {
     for d in self.devices {
         discard li.device_unref(d.dev)
@@ -111,12 +115,14 @@ fn device_seat(d: li.Device, default_seat: str) -> str {
 fn Input.seat_of(self, d: li.Device) -> str {
     for x in self.devices {
         if x.dev == d {
-            return x.seat.clone()
+            return if x.seat.is_empty() { "" } else { x.seat.clone() }
         }
     }
     return device_seat(d, self.seat_name)
 }
 
+@noinline
+@cold
 fn Input.assign_seat(mut self, id: u32, seat: str) -> bool {
     for i in 0..self.devices.len() {
         if self.devices[i].id == id {
@@ -148,12 +154,13 @@ fn Input.dispatch(mut self, mut kb: keyboard.Keyboard, mut extra: List[(str, key
     }
 }
 
-fn Input.event(mut self, ev: li.Event, mut kb: keyboard.Keyboard, mut extra: List[(str, keyboard.Keyboard)], default_names: types.Names, mut out: List[(str, types.Input)]) {
-    let t = int(li.event_get_type(ev))
+@noinline
+@cold
+fn Input.device_event(mut self, t: int, ev: li.Event, mut out: List[(str, types.Input)]) {
+    guard let Some(d) = li.event_get_device(ev) else {
+        return
+    }
     if t == li.libinput_event_device_added {
-        guard let Some(d) = li.event_get_device(ev) else {
-            return
-        }
         let has = fn(c: int) => li.device_has_capability(d, i32(c)) == 1
         let desc = types.DeviceDesc {
             name: li.device_get_name(d).unwrap_or(""),
@@ -170,67 +177,127 @@ fn Input.event(mut self, ev: li.Event, mut kb: keyboard.Keyboard, mut extra: Lis
         self.devices.push(Device { dev: d, id, desc, seat })
         return
     }
-    if t == li.libinput_event_device_removed {
-        guard let Some(d) = li.event_get_device(ev) else {
-            return
+    let id = self.id_of(d)
+    let seat = self.seat_of(d)
+    self.devices.retain(fn(x) => x.id != id)
+    discard li.device_unref(d)
+    out.push((seat, types.Input.DeviceRemoved(id)))
+}
+
+@noinline
+fn key_event(ev: li.Event, take seat: str, mut kb: keyboard.Keyboard, mut extra: List[(str, keyboard.Keyboard)], default_names: types.Names, mut out: List[(str, types.Input)]) {
+    guard let Some(k) = li.event_get_keyboard_event(ev) else {
+        return
+    }
+    let pressed = li.event_keyboard_get_key_state(k) == i32(li.libinput_key_state_pressed)
+    let count = li.event_keyboard_get_seat_key_count(k)
+    guard (pressed and count == 1) or (not pressed and count == 0) else {
+        return
+    }
+    let code = li.event_keyboard_get_key(k)
+    let time = ms(li.event_keyboard_get_time_usec(k))
+    if seat.is_empty() {
+        let (sym, text, changed) = kb.key(code, pressed)
+        out.push(("", types.Input.Key(time, code, pressed, sym, text)))
+        if changed {
+            out.push(("", types.Input.Modifiers(kb.depressed, kb.latched, kb.locked, kb.group)))
         }
-        let id = self.id_of(d)
-        let seat = self.seat_of(d)
-        self.devices.retain(fn(x) => x.id != id)
-        discard li.device_unref(d)
-        out.push((seat, types.Input.DeviceRemoved(id)))
+        return
+    }
+    var si = -1
+    for i in 0..extra.len() {
+        if extra[i].0 == seat {
+            si = i
+            break
+        }
+    }
+    if si < 0 {
+        if let Ok(nkb) = keyboard.Keyboard.new(default_names.clone()) {
+            extra.push((seat.clone(), nkb))
+            si = extra.len() - 1
+        }
+    }
+    if si >= 0 {
+        let (sym, text, changed) = extra[si].1.key(code, pressed)
+        out.push((seat.clone(), types.Input.Key(time, code, pressed, sym, text)))
+        if changed {
+            out.push((seat, types.Input.Modifiers(extra[si].1.depressed, extra[si].1.latched, extra[si].1.locked, extra[si].1.group)))
+        }
+    } else {
+        let (sym, text, changed) = kb.key(code, pressed)
+        out.push((seat.clone(), types.Input.Key(time, code, pressed, sym, text)))
+        if changed {
+            out.push((seat, types.Input.Modifiers(kb.depressed, kb.latched, kb.locked, kb.group)))
+        }
+    }
+}
+
+@noinline
+fn touch_event(t: int, ev: li.Event, take seat: str, mut out: List[(str, types.Input)]) {
+    guard let Some(tc) = li.event_get_touch_event(ev) else {
+        return
+    }
+    let time = ms(li.event_touch_get_time_usec(tc))
+    if t == li.libinput_event_touch_frame {
+        out.push((seat, types.Input.TouchFrame))
+        return
+    }
+    if t == li.libinput_event_touch_cancel {
+        out.push((seat, types.Input.TouchCancel))
+        return
+    }
+    let id = li.event_touch_get_seat_slot(tc)
+    if t == li.libinput_event_touch_up {
+        out.push((seat, types.Input.TouchUp(time, id)))
+        return
+    }
+    let x = li.event_touch_get_x_transformed(tc, 1)
+    let y = li.event_touch_get_y_transformed(tc, 1)
+    if t == li.libinput_event_touch_down {
+        out.push((seat, types.Input.TouchDown(time, id, 0, x, y)))
+    } else {
+        out.push((seat, types.Input.TouchMotion(time, id, 0, x, y)))
+    }
+}
+
+@noinline
+fn gesture_event(t: int, ev: li.Event, take seat: str, mut out: List[(str, types.Input)]) {
+    guard let Some(g) = li.event_get_gesture_event(ev) else {
+        return
+    }
+    let time = ms(li.event_gesture_get_time_usec(g))
+    let fingers = li.event_gesture_get_finger_count(g)
+    let cancelled = li.event_gesture_get_cancelled(g) == 1
+    let dx = li.event_gesture_get_dx(g)
+    let dy = li.event_gesture_get_dy(g)
+    if t == li.libinput_event_gesture_swipe_begin {
+        out.push((seat, types.Input.SwipeBegin(time, fingers)))
+    } else if t == li.libinput_event_gesture_swipe_update {
+        out.push((seat, types.Input.SwipeUpdate(time, dx, dy)))
+    } else if t == li.libinput_event_gesture_swipe_end {
+        out.push((seat, types.Input.SwipeEnd(time, cancelled)))
+    } else if t == li.libinput_event_gesture_pinch_begin {
+        out.push((seat, types.Input.PinchBegin(time, fingers)))
+    } else if t == li.libinput_event_gesture_pinch_update {
+        out.push((seat, types.Input.PinchUpdate(time, dx, dy, li.event_gesture_get_scale(g), li.event_gesture_get_angle_delta(g))))
+    } else if t == li.libinput_event_gesture_pinch_end {
+        out.push((seat, types.Input.PinchEnd(time, cancelled)))
+    } else if t == li.libinput_event_gesture_hold_begin {
+        out.push((seat, types.Input.HoldBegin(time, fingers)))
+    } else {
+        out.push((seat, types.Input.HoldEnd(time, cancelled)))
+    }
+}
+
+fn Input.event(mut self, ev: li.Event, mut kb: keyboard.Keyboard, mut extra: List[(str, keyboard.Keyboard)], default_names: types.Names, mut out: List[(str, types.Input)]) {
+    let t = int(li.event_get_type(ev))
+    if t == li.libinput_event_device_added or t == li.libinput_event_device_removed {
+        self.device_event(t, ev, mut out)
         return
     }
     let seat = match li.event_get_device(ev) {
         Some(d) => self.seat_of(d)
         None => ""
-    }
-    if t == li.libinput_event_keyboard_key {
-        guard let Some(k) = li.event_get_keyboard_event(ev) else {
-            return
-        }
-        let pressed = li.event_keyboard_get_key_state(k) == i32(li.libinput_key_state_pressed)
-        let count = li.event_keyboard_get_seat_key_count(k)
-        guard (pressed and count == 1) or (not pressed and count == 0) else {
-            return
-        }
-        let code = li.event_keyboard_get_key(k)
-        let time = ms(li.event_keyboard_get_time_usec(k))
-        if seat.is_empty() {
-            let (sym, text, changed) = kb.key(code, pressed)
-            out.push(("", types.Input.Key(time, code, pressed, sym, text)))
-            if changed {
-                out.push(("", types.Input.Modifiers(kb.depressed, kb.latched, kb.locked, kb.group)))
-            }
-            return
-        }
-        var si = -1
-        for i in 0..extra.len() {
-            if extra[i].0 == seat {
-                si = i
-                break
-            }
-        }
-        if si < 0 {
-            if let Ok(nkb) = keyboard.Keyboard.new(default_names.clone()) {
-                extra.push((seat.clone(), nkb))
-                si = extra.len() - 1
-            }
-        }
-        if si >= 0 {
-            let (sym, text, changed) = extra[si].1.key(code, pressed)
-            out.push((seat.clone(), types.Input.Key(time, code, pressed, sym, text)))
-            if changed {
-                out.push((seat, types.Input.Modifiers(extra[si].1.depressed, extra[si].1.latched, extra[si].1.locked, extra[si].1.group)))
-            }
-        } else {
-            let (sym, text, changed) = kb.key(code, pressed)
-            out.push((seat.clone(), types.Input.Key(time, code, pressed, sym, text)))
-            if changed {
-                out.push((seat, types.Input.Modifiers(kb.depressed, kb.latched, kb.locked, kb.group)))
-            }
-        }
-        return
     }
     if t >= li.libinput_event_pointer_motion and t <= li.libinput_event_pointer_scroll_continuous {
         guard let Some(p) = li.event_get_pointer_event(ev) else {
@@ -271,65 +338,24 @@ fn Input.event(mut self, ev: li.Event, mut kb: keyboard.Keyboard, mut extra: Lis
         }
         return
     }
+    if t == li.libinput_event_keyboard_key {
+        key_event(ev, seat, mut kb, mut extra, default_names, mut out)
+        return
+    }
     if t >= li.libinput_event_touch_down and t <= li.libinput_event_touch_frame {
-        guard let Some(tc) = li.event_get_touch_event(ev) else {
-            return
-        }
-        let time = ms(li.event_touch_get_time_usec(tc))
-        if t == li.libinput_event_touch_frame {
-            out.push((seat, types.Input.TouchFrame))
-            return
-        }
-        if t == li.libinput_event_touch_cancel {
-            out.push((seat, types.Input.TouchCancel))
-            return
-        }
-        let id = li.event_touch_get_seat_slot(tc)
-        if t == li.libinput_event_touch_up {
-            out.push((seat, types.Input.TouchUp(time, id)))
-            return
-        }
-        let x = li.event_touch_get_x_transformed(tc, 1)
-        let y = li.event_touch_get_y_transformed(tc, 1)
-        if t == li.libinput_event_touch_down {
-            out.push((seat, types.Input.TouchDown(time, id, 0, x, y)))
-        } else {
-            out.push((seat, types.Input.TouchMotion(time, id, 0, x, y)))
-        }
+        touch_event(t, ev, seat, mut out)
         return
     }
     if t >= li.libinput_event_gesture_swipe_begin and t <= li.libinput_event_gesture_hold_end {
-        guard let Some(g) = li.event_get_gesture_event(ev) else {
-            return
-        }
-        let time = ms(li.event_gesture_get_time_usec(g))
-        let fingers = li.event_gesture_get_finger_count(g)
-        let cancelled = li.event_gesture_get_cancelled(g) == 1
-        let dx = li.event_gesture_get_dx(g)
-        let dy = li.event_gesture_get_dy(g)
-        if t == li.libinput_event_gesture_swipe_begin {
-            out.push((seat, types.Input.SwipeBegin(time, fingers)))
-        } else if t == li.libinput_event_gesture_swipe_update {
-            out.push((seat, types.Input.SwipeUpdate(time, dx, dy)))
-        } else if t == li.libinput_event_gesture_swipe_end {
-            out.push((seat, types.Input.SwipeEnd(time, cancelled)))
-        } else if t == li.libinput_event_gesture_pinch_begin {
-            out.push((seat, types.Input.PinchBegin(time, fingers)))
-        } else if t == li.libinput_event_gesture_pinch_update {
-            out.push((seat, types.Input.PinchUpdate(time, dx, dy, li.event_gesture_get_scale(g), li.event_gesture_get_angle_delta(g))))
-        } else if t == li.libinput_event_gesture_pinch_end {
-            out.push((seat, types.Input.PinchEnd(time, cancelled)))
-        } else if t == li.libinput_event_gesture_hold_begin {
-            out.push((seat, types.Input.HoldBegin(time, fingers)))
-        } else {
-            out.push((seat, types.Input.HoldEnd(time, cancelled)))
-        }
+        gesture_event(t, ev, seat, mut out)
     }
 }
 
 /// Device settings the compositor chooses.
 pub type Config = types.InputConfig
 
+@noinline
+@cold
 fn Input.configure(mut self, id: u32, c: Config) {
     for x in self.devices {
         guard x.id == id else {

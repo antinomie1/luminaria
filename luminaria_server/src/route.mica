@@ -85,150 +85,419 @@ fn destroyed(mut srv: server.Server, ci: u32, id: u32, iface: u16) {
     }
 }
 
-fn handle(mut srv: server.Server, ci: u32, take r: proto.Request) {
-    match take r {
-        Extension(m) => ext.request(mut srv, ci, m)
-        WlDisplay(_, req) => display(mut srv, ci, req)
-        WlRegistry(reg, req) => registry(mut srv, ci, reg, req)
-        WlFixes(_, req) => {
-            match req {
-                DestroyRegistry(reg) => {
-                    srv.clients.items[int(ci)].registries.retain(fn(x) => x != reg.id)
-                    srv.conns[int(ci)].remove(reg.id)
-                }
-                _ => {}
-            }
-        }
-        WlCompositor(_, req) => surface.compositor(mut srv, ci, req)
-        WlSurface(s, req) => surface.request(mut srv, ci, s, req)
-        WlRegion(rg, req) => surface.region(mut srv, ci, rg, req)
-        WlSubcompositor(_, req) => surface.subcompositor(mut srv, ci, req)
-        WlSubsurface(sub, req) => surface.subsurface(mut srv, ci, sub, req)
-        WlShm(_, req) => buffer.shm(mut srv, ci, req)
-        WlShmPool(p, req) => buffer.pool(mut srv, ci, p, req)
-        WlBuffer(b, req) => {}
-        XdgWmBase(w, req) => xdg.wm_base(mut srv, ci, w, req)
-        XdgPositioner(p, req) => xdg.positioner_request(mut srv, ci, p, req)
-        XdgSurface(x, req) => xdg.surface_request(mut srv, ci, x, req)
-        XdgToplevel(t, req) => xdg.toplevel(mut srv, ci, t, req)
-        XdgPopup(p, req) => xdg.popup(mut srv, ci, p, req)
-        WlSeat(st, req) => seat.request(mut srv, ci, st, req)
-        WlPointer(p, req) => seat.pointer_request(mut srv, ci, p, req)
-        WlKeyboard(_, req) => {}
-        WlTouch(_, req) => {}
-        WlOutput(_, req) => {}
-        WlDataDeviceManager(_, req) => data.manager(mut srv, ci, req)
-        WlDataDevice(d, req) => data.device(mut srv, ci, d, req)
-        WlDataSource(src, req) => data.source(mut srv, ci, src, req)
-        WlDataOffer(o, req) => data.offer(mut srv, ci, o, req)
-        ZwpLinuxDmabuf(_, req) => buffer.dmabuf(mut srv, ci, req)
-        ZwpLinuxBufferParams(p, req) => buffer.params(mut srv, ci, p, req)
-        ZwpLinuxDmabufFeedback(_, req) => {}
-        WpLinuxDrmSyncobjManager(_, req) => extra.syncobj_manager(mut srv, ci, req)
-        WpLinuxDrmSyncobjTimeline(_, req) => {}
-        WpLinuxDrmSyncobjSurface(o, req) => extra.syncobj_surface(mut srv, ci, o, req)
-        WpPresentation(_, req) => extra.presentation(mut srv, ci, req)
-        WpViewporter(_, req) => extra.viewporter(mut srv, ci, req)
-        WpViewport(v, req) => extra.viewport(mut srv, ci, v, req)
-        WpFractionalScaleManager(_, req) => extra.fractional_manager(mut srv, ci, req)
-        WpFractionalScale(_, req) => {}
-        WpFifoManager(_, req) => extra.fifo_manager(mut srv, ci, req)
-        WpFifo(f, req) => extra.fifo(mut srv, ci, f, req)
-        WpCommitTimingManager(_, req) => extra.timing_manager(mut srv, ci, req)
-        WpCommitTimer(t, req) => extra.timer(mut srv, ci, t, req)
-        WpTearingControlManager(_, req) => extra.tearing_manager(mut srv, ci, req)
-        WpTearingControl(t, req) => extra.tearing(mut srv, ci, t, req)
-        WpAlphaModifier(_, req) => extra.alpha_manager(mut srv, ci, req)
-        WpAlphaModifierSurface(m, req) => extra.alpha_surface(mut srv, ci, m, req)
-        WpContentTypeManager(_, req) => extra.content_manager(mut srv, ci, req)
-        WpContentType(t, req) => extra.content(mut srv, ci, t, req)
-        WpSinglePixelBufferManager(_, req) => buffer.single_pixel(mut srv, ci, req)
-        ZwpPrimarySelectionDeviceManager(_, req) => data.primary_manager(mut srv, ci, req)
-        ZwpPrimarySelectionDevice(d, req) => data.primary_device(mut srv, ci, d, req)
-        ZwpPrimarySelectionSource(s, req) => data.primary_source(mut srv, ci, s, req)
-        ZwpPrimarySelectionOffer(o, req) => data.primary_offer(mut srv, ci, o, req)
-        ExtDataControlManager(_, req) => data.control_manager(mut srv, ci, req)
-        ExtDataControlDevice(d, req) => data.control_device(mut srv, ci, d, req)
-        ExtDataControlSource(s, req) => data.control_source(mut srv, ci, s, req)
-        ExtDataControlOffer(o, req) => data.control_offer(mut srv, ci, o, req)
-        ZwlrLayerShell(_, req) => shell.layer_shell(mut srv, ci, req)
-        ZwlrLayerSurface(l, req) => shell.layer_surface(mut srv, ci, l, req)
-        ExtSessionLockManager(_, req) => shell.lock_manager(mut srv, ci, req)
-        ExtSessionLock(l, req) => shell.session_lock(mut srv, ci, l, req)
-        ExtSessionLockSurface(l, req) => shell.lock_surface(mut srv, ci, l, req)
-        ZwpTextInputManager(_, req) => ime.text_manager(mut srv, ci, req)
-        ZwpTextInput(t, req) => ime.text_input(mut srv, ci, t, req)
-        ZwpInputMethodManager(_, req) => ime.method_manager(mut srv, ci, req)
-        ZwpInputMethod(m, req) => ime.input_method(mut srv, ci, m, req)
-        ZwpInputPopupSurface(p, req) => ime.popup(mut srv, ci, p, req)
-        ZwpInputMethodKeyboardGrab(g, req) => ime.grab_request(mut srv, ci, g, req)
-        ZwpVirtualKeyboardManager(_, req) => ime.keyboard_manager(mut srv, ci, req)
-        ZwpVirtualKeyboard(k, req) => ime.virtual_keyboard(mut srv, ci, k, req)
-        ZwpRelativePointerManager(_, req) => pointer.relative_manager(mut srv, ci, req)
-        ZwpRelativePointer(r, req) => pointer.relative(mut srv, ci, r, req)
-        ZwpPointerConstraints(_, req) => pointer.constraints(mut srv, ci, req)
-        ZwpLockedPointer(l, req) => pointer.locked_pointer(mut srv, ci, l, req)
-        ZwpConfinedPointer(c, req) => pointer.confined_pointer(mut srv, ci, c, req)
-        ZwpPointerGestures(_, req) => pointer.gestures(mut srv, ci, req)
-        ZwpPointerGestureSwipe(g, req) => pointer.gesture_object(mut srv, ci, g.id)
-        ZwpPointerGesturePinch(g, req) => pointer.gesture_object(mut srv, ci, g.id)
-        ZwpPointerGestureHold(g, req) => pointer.gesture_object(mut srv, ci, g.id)
-        WpCursorShapeManager(_, req) => pointer.shape_manager(mut srv, ci, req)
-        WpCursorShapeDevice(d, req) => pointer.shape_device(mut srv, ci, d, req)
-        ZxdgDecorationManager(_, req) => toplevel.decoration_manager(mut srv, ci, req)
-        ZxdgToplevelDecoration(d, req) => toplevel.decoration(mut srv, ci, d, req)
-        XdgToplevelIconManager(_, req) => toplevel.icon_manager(mut srv, ci, req)
-        XdgToplevelIcon(i, req) => toplevel.icon(mut srv, ci, i, req)
-        XdgToplevelTagManager(_, req) => toplevel.tag_manager(mut srv, ci, req)
-        XdgWmDialog(_, req) => toplevel.dialog_manager(mut srv, ci, req)
-        XdgDialog(d, req) => toplevel.dialog(mut srv, ci, d, req)
-        XdgActivation(_, req) => toplevel.activation(mut srv, ci, req)
-        XdgActivationToken(t, req) => toplevel.activation_token(mut srv, ci, t, req)
-        ZxdgExporter(_, req) => toplevel.exporter(mut srv, ci, req)
-        ZxdgExported(e, req) => toplevel.exported(mut srv, ci, e, req)
-        ZxdgImporter(_, req) => toplevel.importer(mut srv, ci, req)
-        ZxdgImported(i, req) => toplevel.imported(mut srv, ci, i, req)
-        ExtForeignToplevelList(l, req) => toplevel.toplevel_list(mut srv, ci, l, req)
-        ExtForeignToplevelHandle(h, req) => toplevel.toplevel_handle(mut srv, ci, h, req)
-        ZwlrForeignToplevelManager(m, req) => taskbar.manager(mut srv, ci, m, req)
-        XdgToplevelDragManager(m, req) => data.toplevel_drag_manager(mut srv, ci, m, req)
-        XdgToplevelDrag(d, req) => data.toplevel_drag(mut srv, ci, d, req)
-        ZwlrForeignToplevelHandle(h, req) => taskbar.toplevel(mut srv, ci, h, req)
-        XdgSystemBell(_, req) => toplevel.system_bell(mut srv, ci, req)
-        ZwpIdleInhibitManager(_, req) => inhibit.inhibit_manager(mut srv, ci, req)
-        ZwpIdleInhibitor(i, req) => inhibit.inhibitor(mut srv, ci, i, req)
-        ExtIdleNotifier(_, req) => inhibit.notifier(mut srv, ci, req)
-        ExtIdleNotification(n, req) => inhibit.notification(mut srv, ci, n, req)
-        ZwpKeyboardShortcutsInhibitManager(_, req) => inhibit.shortcuts_manager(mut srv, ci, req)
-        ZwpKeyboardShortcutsInhibitor(i, req) => inhibit.shortcuts_inhibitor(mut srv, ci, i, req)
-        ZxdgOutputManager(_, req) => output.xdg_manager(mut srv, ci, req)
-        ZxdgOutput(x, req) => output.xdg_output(mut srv, ci, x, req)
-        ExtOutputImageCaptureSourceManager(_, req) => capture.source_manager(mut srv, ci, req)
-        ExtForeignToplevelImageCaptureSourceManager(_, req) => capture.toplevel_source_manager(mut srv, ci, req)
-        ExtImageCaptureSource(src, req) => capture.source_destroy(mut srv, ci, src.id)
-        ExtImageCopyCaptureManager(_, req) => capture.manager(mut srv, ci, req)
-        ExtImageCopyCaptureSession(sess, req) => capture.session(mut srv, ci, sess, req)
-        ExtImageCopyCaptureFrame(f, req) => capture.frame(mut srv, ci, f, req)
-        ExtImageCopyCaptureCursorSession(c, req) => capture.cursor_session(mut srv, ci, c, req)
-        WpSecurityContextManager(_, req) => security.manager(mut srv, ci, req)
-        WpSecurityContext(c, req) => security.context(mut srv, ci, c, req)
-        ZwlrOutputManager(m, req) => outman.manager(mut srv, ci, m, req)
-        ZwlrOutputHead(h, req) => outman.head(mut srv, ci, h, req)
-        ZwlrOutputMode(m, req) => outman.mode(mut srv, ci, m, req)
-        ZwlrOutputConfiguration(c, req) => outman.configuration(mut srv, ci, c, req)
-        ZwlrOutputConfigurationHead(h, req) => outman.config_head(mut srv, ci, h, req)
-        ZwlrVirtualPointerManager(_, req) => vptr.manager(mut srv, ci, req)
-        ZwlrVirtualPointer(p, req) => vptr.pointer(mut srv, ci, p, req)
-        ZwlrGammaControlManager(_, req) => gamma.manager(mut srv, ci, req)
-        ZwlrGammaControl(c, req) => gamma.control(mut srv, ci, c, req)
-        WpColorManager(_, req) => color.manager(mut srv, ci, req)
-        WpColorManagementOutput(co, req) => color.output_req(mut srv, ci, co, req)
-        WpColorManagementSurface(cs, req) => color.surface_req(mut srv, ci, cs, req)
-        WpColorManagementSurfaceFeedback(fb, req) => color.feedback_req(mut srv, ci, fb, req)
-        WpImageDescriptionCreatorParams(cr, req) => color.creator_params(mut srv, ci, cr, req)
-        WpImageDescription(d, req) => color.image_description(mut srv, ci, d, req)
-        _ => {}
+/// Decode and dispatch one received wire message directly without boxing
+/// into `proto.Request` (keeps the hot path compact and drops unadvertised
+/// protocol decoders from server binaries).
+fn dispatch(mut srv: server.Server, ci: u32, m: wire.Msg) -> Result[(), wire.Error] {
+    let iface = m.iface
+    let c = int(ci)
+    if iface == wl.surface_iface {
+        let req = try wl.decode_surface(mut srv.conns[c], m)
+        surface.request(mut srv, ci, wl.Surface { id: m.id }, req)
+    } else if iface == wl.buffer_iface {
+        discard try wl.decode_buffer(mut srv.conns[c], m)
+    } else if iface == wl.region_iface {
+        let req = try wl.decode_region(mut srv.conns[c], m)
+        surface.region(mut srv, ci, wl.Region { id: m.id }, req)
+    } else if iface == wl.subsurface_iface {
+        let req = try wl.decode_subsurface(mut srv.conns[c], m)
+        surface.subsurface(mut srv, ci, wl.Subsurface { id: m.id }, req)
+    } else if iface == wl.compositor_iface {
+        let req = try wl.decode_compositor(mut srv.conns[c], m)
+        surface.compositor(mut srv, ci, req)
+    } else if iface == wl.shm_pool_iface {
+        let req = try wl.decode_shm_pool(mut srv.conns[c], m)
+        buffer.pool(mut srv, ci, wl.ShmPool { id: m.id }, req)
+    } else if iface == wl.shm_iface {
+        let req = try wl.decode_shm(mut srv.conns[c], m)
+        buffer.shm(mut srv, ci, req)
+    } else if iface == proto.xdg_shell.surface_iface {
+        let req = try proto.xdg_shell.decode_surface(mut srv.conns[c], m)
+        xdg.surface_request(mut srv, ci, proto.xdg_shell.Surface { id: m.id }, req)
+    } else if iface == proto.xdg_shell.toplevel_iface {
+        let req = try proto.xdg_shell.decode_toplevel(mut srv.conns[c], m)
+        xdg.toplevel(mut srv, ci, proto.xdg_shell.Toplevel { id: m.id }, req)
+    } else if iface == proto.xdg_shell.popup_iface {
+        let req = try proto.xdg_shell.decode_popup(mut srv.conns[c], m)
+        xdg.popup(mut srv, ci, proto.xdg_shell.Popup { id: m.id }, req)
+    } else if iface == proto.xdg_shell.wm_base_iface {
+        let req = try proto.xdg_shell.decode_wm_base(mut srv.conns[c], m)
+        xdg.wm_base(mut srv, ci, proto.xdg_shell.WmBase { id: m.id }, req)
+    } else if iface == proto.xdg_shell.positioner_iface {
+        let req = try proto.xdg_shell.decode_positioner(mut srv.conns[c], m)
+        xdg.positioner_request(mut srv, ci, proto.xdg_shell.Positioner { id: m.id }, req)
+    } else if iface == wl.display_iface {
+        let req = try wl.decode_display(mut srv.conns[c], m)
+        display(mut srv, ci, req)
+    } else if iface == wl.registry_iface {
+        let req = try wl.decode_registry(mut srv.conns[c], m)
+        registry(mut srv, ci, wl.Registry { id: m.id }, req)
+    } else if iface == wl.pointer_iface {
+        let req = try wl.decode_pointer(mut srv.conns[c], m)
+        seat.pointer_request(mut srv, ci, wl.Pointer { id: m.id }, req)
+    } else if iface == wl.seat_iface {
+        let req = try wl.decode_seat(mut srv.conns[c], m)
+        seat.request(mut srv, ci, wl.Seat { id: m.id }, req)
+    } else if iface == wl.subcompositor_iface {
+        let req = try wl.decode_subcompositor(mut srv.conns[c], m)
+        surface.subcompositor(mut srv, ci, req)
+    } else if iface == proto.linux_dmabuf.dmabuf_iface {
+        let req = try proto.linux_dmabuf.decode_dmabuf(mut srv.conns[c], m)
+        buffer.dmabuf(mut srv, ci, req)
+    } else if iface == proto.linux_dmabuf.buffer_params_iface {
+        let req = try proto.linux_dmabuf.decode_buffer_params(mut srv.conns[c], m)
+        buffer.params(mut srv, ci, proto.linux_dmabuf.BufferParams { id: m.id }, req)
+    } else if iface == proto.linux_drm_syncobj.surface_iface {
+        let req = try proto.linux_drm_syncobj.decode_surface(mut srv.conns[c], m)
+        extra.syncobj_surface(mut srv, ci, proto.linux_drm_syncobj.Surface { id: m.id }, req)
+    } else if iface == proto.viewporter.viewport_iface {
+        let req = try proto.viewporter.decode_viewport(mut srv.conns[c], m)
+        extra.viewport(mut srv, ci, proto.viewporter.Viewport { id: m.id }, req)
+    } else if iface == proto.fifo.fifo_iface {
+        let req = try proto.fifo.decode_fifo(mut srv.conns[c], m)
+        extra.fifo(mut srv, ci, proto.fifo.Fifo { id: m.id }, req)
+    } else {
+        return dispatch_ext(mut srv, ci, m)
     }
+    return Ok(())
+}
+
+@noinline
+fn dispatch_ext(mut srv: server.Server, ci: u32, m: wire.Msg) -> Result[(), wire.Error] {
+    let iface = m.iface
+    let c = int(ci)
+    if iface > ifaces.count {
+        ext.request(mut srv, ci, m)
+    } else if iface == wl.fixes_iface {
+        match try wl.decode_fixes(mut srv.conns[c], m) {
+            DestroyRegistry(reg) => {
+                srv.clients.items[c].registries.retain(fn(x) => x != reg.id)
+                srv.conns[c].remove(reg.id)
+            }
+            _ => {}
+        }
+    } else if iface == wl.keyboard_iface {
+        discard try wl.decode_keyboard(mut srv.conns[c], m)
+    } else if iface == wl.touch_iface {
+        discard try wl.decode_touch(mut srv.conns[c], m)
+    } else if iface == wl.output_iface {
+        discard try wl.decode_output(mut srv.conns[c], m)
+    } else if iface == wl.data_device_manager_iface {
+        let req = try wl.decode_data_device_manager(mut srv.conns[c], m)
+        data.manager(mut srv, ci, req)
+    } else if iface == wl.data_device_iface {
+        let req = try wl.decode_data_device(mut srv.conns[c], m)
+        data.device(mut srv, ci, wl.DataDevice { id: m.id }, req)
+    } else if iface == wl.data_source_iface {
+        let req = try wl.decode_data_source(mut srv.conns[c], m)
+        data.source(mut srv, ci, wl.DataSource { id: m.id }, req)
+    } else if iface == wl.data_offer_iface {
+        let req = try wl.decode_data_offer(mut srv.conns[c], m)
+        data.offer(mut srv, ci, wl.DataOffer { id: m.id }, req)
+    } else if iface == proto.linux_dmabuf.dmabuf_feedback_iface {
+        discard try proto.linux_dmabuf.decode_dmabuf_feedback(mut srv.conns[c], m)
+    } else if iface == proto.linux_drm_syncobj.manager_iface {
+        let req = try proto.linux_drm_syncobj.decode_manager(mut srv.conns[c], m)
+        extra.syncobj_manager(mut srv, ci, req)
+    } else if iface == proto.linux_drm_syncobj.timeline_iface {
+        discard try proto.linux_drm_syncobj.decode_timeline(mut srv.conns[c], m)
+    } else if iface == proto.presentation_time.presentation_iface {
+        let req = try proto.presentation_time.decode_presentation(mut srv.conns[c], m)
+        extra.presentation(mut srv, ci, req)
+    } else if iface == proto.viewporter.viewporter_iface {
+        let req = try proto.viewporter.decode_viewporter(mut srv.conns[c], m)
+        extra.viewporter(mut srv, ci, req)
+    } else if iface == proto.fractional_scale.scale_manager_iface {
+        let req = try proto.fractional_scale.decode_scale_manager(mut srv.conns[c], m)
+        extra.fractional_manager(mut srv, ci, req)
+    } else if iface == proto.fractional_scale.scale_iface {
+        discard try proto.fractional_scale.decode_scale(mut srv.conns[c], m)
+    } else if iface == proto.fifo.fifo_manager_iface {
+        let req = try proto.fifo.decode_fifo_manager(mut srv.conns[c], m)
+        extra.fifo_manager(mut srv, ci, req)
+    } else if iface == proto.commit_timing.timing_manager_iface {
+        let req = try proto.commit_timing.decode_timing_manager(mut srv.conns[c], m)
+        extra.timing_manager(mut srv, ci, req)
+    } else if iface == proto.commit_timing.timer_iface {
+        let req = try proto.commit_timing.decode_timer(mut srv.conns[c], m)
+        extra.timer(mut srv, ci, proto.commit_timing.Timer { id: m.id }, req)
+    } else if iface == proto.tearing_control.control_manager_iface {
+        let req = try proto.tearing_control.decode_control_manager(mut srv.conns[c], m)
+        extra.tearing_manager(mut srv, ci, req)
+    } else if iface == proto.tearing_control.control_iface {
+        let req = try proto.tearing_control.decode_control(mut srv.conns[c], m)
+        extra.tearing(mut srv, ci, proto.tearing_control.Control { id: m.id }, req)
+    } else if iface == proto.alpha_modifier.modifier_iface {
+        let req = try proto.alpha_modifier.decode_modifier(mut srv.conns[c], m)
+        extra.alpha_manager(mut srv, ci, req)
+    } else if iface == proto.alpha_modifier.modifier_surface_iface {
+        let req = try proto.alpha_modifier.decode_modifier_surface(mut srv.conns[c], m)
+        extra.alpha_surface(mut srv, ci, proto.alpha_modifier.ModifierSurface { id: m.id }, req)
+    } else if iface == proto.content_type.type_manager_iface {
+        let req = try proto.content_type.decode_type_manager(mut srv.conns[c], m)
+        extra.content_manager(mut srv, ci, req)
+    } else if iface == proto.content_type.type_iface {
+        let req = try proto.content_type.decode_type(mut srv.conns[c], m)
+        extra.content(mut srv, ci, proto.content_type.Type { id: m.id }, req)
+    } else if iface == proto.single_pixel_buffer.single_pixel_buffer_manager_iface {
+        let req = try proto.single_pixel_buffer.decode_single_pixel_buffer_manager(mut srv.conns[c], m)
+        buffer.single_pixel(mut srv, ci, req)
+    } else if iface == proto.primary_selection_unstable.device_manager_iface {
+        let req = try proto.primary_selection_unstable.decode_device_manager(mut srv.conns[c], m)
+        data.primary_manager(mut srv, ci, req)
+    } else if iface == proto.primary_selection_unstable.device_iface {
+        let req = try proto.primary_selection_unstable.decode_device(mut srv.conns[c], m)
+        data.primary_device(mut srv, ci, proto.primary_selection_unstable.Device { id: m.id }, req)
+    } else if iface == proto.primary_selection_unstable.source_iface {
+        let req = try proto.primary_selection_unstable.decode_source(mut srv.conns[c], m)
+        data.primary_source(mut srv, ci, proto.primary_selection_unstable.Source { id: m.id }, req)
+    } else if iface == proto.primary_selection_unstable.offer_iface {
+        let req = try proto.primary_selection_unstable.decode_offer(mut srv.conns[c], m)
+        data.primary_offer(mut srv, ci, proto.primary_selection_unstable.Offer { id: m.id }, req)
+    } else if iface == proto.ext_data_control.manager_iface {
+        let req = try proto.ext_data_control.decode_manager(mut srv.conns[c], m)
+        data.control_manager(mut srv, ci, req)
+    } else if iface == proto.ext_data_control.device_iface {
+        let req = try proto.ext_data_control.decode_device(mut srv.conns[c], m)
+        data.control_device(mut srv, ci, proto.ext_data_control.Device { id: m.id }, req)
+    } else if iface == proto.ext_data_control.source_iface {
+        let req = try proto.ext_data_control.decode_source(mut srv.conns[c], m)
+        data.control_source(mut srv, ci, proto.ext_data_control.Source { id: m.id }, req)
+    } else if iface == proto.ext_data_control.offer_iface {
+        let req = try proto.ext_data_control.decode_offer(mut srv.conns[c], m)
+        data.control_offer(mut srv, ci, proto.ext_data_control.Offer { id: m.id }, req)
+    } else if iface == proto.wlr_layer_shell_unstable.shell_iface {
+        let req = try proto.wlr_layer_shell_unstable.decode_shell(mut srv.conns[c], m)
+        shell.layer_shell(mut srv, ci, req)
+    } else if iface == proto.wlr_layer_shell_unstable.surface_iface {
+        let req = try proto.wlr_layer_shell_unstable.decode_surface(mut srv.conns[c], m)
+        shell.layer_surface(mut srv, ci, proto.wlr_layer_shell_unstable.Surface { id: m.id }, req)
+    } else if iface == proto.ext_session_lock.lock_manager_iface {
+        let req = try proto.ext_session_lock.decode_lock_manager(mut srv.conns[c], m)
+        shell.lock_manager(mut srv, ci, req)
+    } else if iface == proto.ext_session_lock.lock_iface {
+        let req = try proto.ext_session_lock.decode_lock(mut srv.conns[c], m)
+        shell.session_lock(mut srv, ci, proto.ext_session_lock.Lock { id: m.id }, req)
+    } else if iface == proto.ext_session_lock.lock_surface_iface {
+        let req = try proto.ext_session_lock.decode_lock_surface(mut srv.conns[c], m)
+        shell.lock_surface(mut srv, ci, proto.ext_session_lock.LockSurface { id: m.id }, req)
+    } else if iface == proto.text_input_unstable.input_manager_iface {
+        let req = try proto.text_input_unstable.decode_input_manager(mut srv.conns[c], m)
+        ime.text_manager(mut srv, ci, req)
+    } else if iface == proto.text_input_unstable.input_iface {
+        let req = try proto.text_input_unstable.decode_input(mut srv.conns[c], m)
+        ime.text_input(mut srv, ci, proto.text_input_unstable.Input { id: m.id }, req)
+    } else if iface == proto.input_method_unstable.method_manager_iface {
+        let req = try proto.input_method_unstable.decode_method_manager(mut srv.conns[c], m)
+        ime.method_manager(mut srv, ci, req)
+    } else if iface == proto.input_method_unstable.method_iface {
+        let req = try proto.input_method_unstable.decode_method(mut srv.conns[c], m)
+        ime.input_method(mut srv, ci, proto.input_method_unstable.Method { id: m.id }, req)
+    } else if iface == proto.input_method_unstable.popup_surface_iface {
+        let req = try proto.input_method_unstable.decode_popup_surface(mut srv.conns[c], m)
+        ime.popup(mut srv, ci, proto.input_method_unstable.PopupSurface { id: m.id }, req)
+    } else if iface == proto.input_method_unstable.method_keyboard_grab_iface {
+        let req = try proto.input_method_unstable.decode_method_keyboard_grab(mut srv.conns[c], m)
+        ime.grab_request(mut srv, ci, proto.input_method_unstable.MethodKeyboardGrab { id: m.id }, req)
+    } else if iface == proto.virtual_keyboard_unstable.keyboard_manager_iface {
+        let req = try proto.virtual_keyboard_unstable.decode_keyboard_manager(mut srv.conns[c], m)
+        ime.keyboard_manager(mut srv, ci, req)
+    } else if iface == proto.virtual_keyboard_unstable.keyboard_iface {
+        let req = try proto.virtual_keyboard_unstable.decode_keyboard(mut srv.conns[c], m)
+        ime.virtual_keyboard(mut srv, ci, proto.virtual_keyboard_unstable.Keyboard { id: m.id }, req)
+    } else if iface == proto.relative_pointer_unstable.pointer_manager_iface {
+        let req = try proto.relative_pointer_unstable.decode_pointer_manager(mut srv.conns[c], m)
+        pointer.relative_manager(mut srv, ci, req)
+    } else if iface == proto.relative_pointer_unstable.pointer_iface {
+        let req = try proto.relative_pointer_unstable.decode_pointer(mut srv.conns[c], m)
+        pointer.relative(mut srv, ci, proto.relative_pointer_unstable.Pointer { id: m.id }, req)
+    } else if iface == proto.pointer_constraints_unstable.pointer_constraints_iface {
+        let req = try proto.pointer_constraints_unstable.decode_pointer_constraints(mut srv.conns[c], m)
+        pointer.constraints(mut srv, ci, req)
+    } else if iface == proto.pointer_constraints_unstable.locked_pointer_iface {
+        let req = try proto.pointer_constraints_unstable.decode_locked_pointer(mut srv.conns[c], m)
+        pointer.locked_pointer(mut srv, ci, proto.pointer_constraints_unstable.LockedPointer { id: m.id }, req)
+    } else if iface == proto.pointer_constraints_unstable.confined_pointer_iface {
+        let req = try proto.pointer_constraints_unstable.decode_confined_pointer(mut srv.conns[c], m)
+        pointer.confined_pointer(mut srv, ci, proto.pointer_constraints_unstable.ConfinedPointer { id: m.id }, req)
+    } else if iface == proto.pointer_gestures_unstable.gestures_iface {
+        let req = try proto.pointer_gestures_unstable.decode_gestures(mut srv.conns[c], m)
+        pointer.gestures(mut srv, ci, req)
+    } else if iface == proto.pointer_gestures_unstable.gesture_swipe_iface {
+        discard try proto.pointer_gestures_unstable.decode_gesture_swipe(mut srv.conns[c], m)
+        pointer.gesture_object(mut srv, ci, m.id)
+    } else if iface == proto.pointer_gestures_unstable.gesture_pinch_iface {
+        discard try proto.pointer_gestures_unstable.decode_gesture_pinch(mut srv.conns[c], m)
+        pointer.gesture_object(mut srv, ci, m.id)
+    } else if iface == proto.pointer_gestures_unstable.gesture_hold_iface {
+        discard try proto.pointer_gestures_unstable.decode_gesture_hold(mut srv.conns[c], m)
+        pointer.gesture_object(mut srv, ci, m.id)
+    } else if iface == proto.cursor_shape.manager_iface {
+        let req = try proto.cursor_shape.decode_manager(mut srv.conns[c], m)
+        pointer.shape_manager(mut srv, ci, req)
+    } else if iface == proto.cursor_shape.device_iface {
+        let req = try proto.cursor_shape.decode_device(mut srv.conns[c], m)
+        pointer.shape_device(mut srv, ci, proto.cursor_shape.Device { id: m.id }, req)
+    } else if iface == proto.xdg_decoration_unstable.decoration_manager_iface {
+        let req = try proto.xdg_decoration_unstable.decode_decoration_manager(mut srv.conns[c], m)
+        toplevel.decoration_manager(mut srv, ci, req)
+    } else if iface == proto.xdg_decoration_unstable.toplevel_decoration_iface {
+        let req = try proto.xdg_decoration_unstable.decode_toplevel_decoration(mut srv.conns[c], m)
+        toplevel.decoration(mut srv, ci, proto.xdg_decoration_unstable.ToplevelDecoration { id: m.id }, req)
+    } else if iface == proto.xdg_toplevel_icon.icon_manager_iface {
+        let req = try proto.xdg_toplevel_icon.decode_icon_manager(mut srv.conns[c], m)
+        toplevel.icon_manager(mut srv, ci, req)
+    } else if iface == proto.xdg_toplevel_icon.icon_iface {
+        let req = try proto.xdg_toplevel_icon.decode_icon(mut srv.conns[c], m)
+        toplevel.icon(mut srv, ci, proto.xdg_toplevel_icon.Icon { id: m.id }, req)
+    } else if iface == proto.xdg_toplevel_tag.toplevel_tag_manager_iface {
+        let req = try proto.xdg_toplevel_tag.decode_toplevel_tag_manager(mut srv.conns[c], m)
+        toplevel.tag_manager(mut srv, ci, req)
+    } else if iface == proto.xdg_dialog.wm_dialog_iface {
+        let req = try proto.xdg_dialog.decode_wm_dialog(mut srv.conns[c], m)
+        toplevel.dialog_manager(mut srv, ci, req)
+    } else if iface == proto.xdg_dialog.dialog_iface {
+        let req = try proto.xdg_dialog.decode_dialog(mut srv.conns[c], m)
+        toplevel.dialog(mut srv, ci, proto.xdg_dialog.Dialog { id: m.id }, req)
+    } else if iface == proto.xdg_activation.activation_iface {
+        let req = try proto.xdg_activation.decode_activation(mut srv.conns[c], m)
+        toplevel.activation(mut srv, ci, req)
+    } else if iface == proto.xdg_activation.activation_token_iface {
+        let req = try proto.xdg_activation.decode_activation_token(mut srv.conns[c], m)
+        toplevel.activation_token(mut srv, ci, proto.xdg_activation.ActivationToken { id: m.id }, req)
+    } else if iface == proto.xdg_foreign_unstable.exporter_iface {
+        let req = try proto.xdg_foreign_unstable.decode_exporter(mut srv.conns[c], m)
+        toplevel.exporter(mut srv, ci, req)
+    } else if iface == proto.xdg_foreign_unstable.exported_iface {
+        let req = try proto.xdg_foreign_unstable.decode_exported(mut srv.conns[c], m)
+        toplevel.exported(mut srv, ci, proto.xdg_foreign_unstable.Exported { id: m.id }, req)
+    } else if iface == proto.xdg_foreign_unstable.importer_iface {
+        let req = try proto.xdg_foreign_unstable.decode_importer(mut srv.conns[c], m)
+        toplevel.importer(mut srv, ci, req)
+    } else if iface == proto.xdg_foreign_unstable.imported_iface {
+        let req = try proto.xdg_foreign_unstable.decode_imported(mut srv.conns[c], m)
+        toplevel.imported(mut srv, ci, proto.xdg_foreign_unstable.Imported { id: m.id }, req)
+    } else if iface == proto.ext_foreign_toplevel_list.toplevel_list_iface {
+        let req = try proto.ext_foreign_toplevel_list.decode_toplevel_list(mut srv.conns[c], m)
+        toplevel.toplevel_list(mut srv, ci, proto.ext_foreign_toplevel_list.ToplevelList { id: m.id }, req)
+    } else if iface == proto.ext_foreign_toplevel_list.handle_iface {
+        let req = try proto.ext_foreign_toplevel_list.decode_handle(mut srv.conns[c], m)
+        toplevel.toplevel_handle(mut srv, ci, proto.ext_foreign_toplevel_list.Handle { id: m.id }, req)
+    } else if iface == proto.wlr_foreign_toplevel_management_unstable.manager_iface {
+        let req = try proto.wlr_foreign_toplevel_management_unstable.decode_manager(mut srv.conns[c], m)
+        taskbar.manager(mut srv, ci, proto.wlr_foreign_toplevel_management_unstable.Manager { id: m.id }, req)
+    } else if iface == proto.xdg_toplevel_drag.drag_manager_iface {
+        let req = try proto.xdg_toplevel_drag.decode_drag_manager(mut srv.conns[c], m)
+        data.toplevel_drag_manager(mut srv, ci, proto.xdg_toplevel_drag.DragManager { id: m.id }, req)
+    } else if iface == proto.xdg_toplevel_drag.drag_iface {
+        let req = try proto.xdg_toplevel_drag.decode_drag(mut srv.conns[c], m)
+        data.toplevel_drag(mut srv, ci, proto.xdg_toplevel_drag.Drag { id: m.id }, req)
+    } else if iface == proto.wlr_foreign_toplevel_management_unstable.handle_iface {
+        let req = try proto.wlr_foreign_toplevel_management_unstable.decode_handle(mut srv.conns[c], m)
+        taskbar.toplevel(mut srv, ci, proto.wlr_foreign_toplevel_management_unstable.Handle { id: m.id }, req)
+    } else if iface == proto.xdg_system_bell.system_bell_iface {
+        let req = try proto.xdg_system_bell.decode_system_bell(mut srv.conns[c], m)
+        toplevel.system_bell(mut srv, ci, req)
+    } else if iface == proto.idle_inhibit_unstable.inhibit_manager_iface {
+        let req = try proto.idle_inhibit_unstable.decode_inhibit_manager(mut srv.conns[c], m)
+        inhibit.inhibit_manager(mut srv, ci, req)
+    } else if iface == proto.idle_inhibit_unstable.inhibitor_iface {
+        let req = try proto.idle_inhibit_unstable.decode_inhibitor(mut srv.conns[c], m)
+        inhibit.inhibitor(mut srv, ci, proto.idle_inhibit_unstable.Inhibitor { id: m.id }, req)
+    } else if iface == proto.ext_idle_notify.notifier_iface {
+        let req = try proto.ext_idle_notify.decode_notifier(mut srv.conns[c], m)
+        inhibit.notifier(mut srv, ci, req)
+    } else if iface == proto.ext_idle_notify.notification_iface {
+        let req = try proto.ext_idle_notify.decode_notification(mut srv.conns[c], m)
+        inhibit.notification(mut srv, ci, proto.ext_idle_notify.Notification { id: m.id }, req)
+    } else if iface == proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface {
+        let req = try proto.keyboard_shortcuts_inhibit_unstable.decode_inhibit_manager(mut srv.conns[c], m)
+        inhibit.shortcuts_manager(mut srv, ci, req)
+    } else if iface == proto.keyboard_shortcuts_inhibit_unstable.inhibitor_iface {
+        let req = try proto.keyboard_shortcuts_inhibit_unstable.decode_inhibitor(mut srv.conns[c], m)
+        inhibit.shortcuts_inhibitor(mut srv, ci, proto.keyboard_shortcuts_inhibit_unstable.Inhibitor { id: m.id }, req)
+    } else if iface == proto.xdg_output_unstable.output_manager_iface {
+        let req = try proto.xdg_output_unstable.decode_output_manager(mut srv.conns[c], m)
+        output.xdg_manager(mut srv, ci, req)
+    } else if iface == proto.xdg_output_unstable.output_iface {
+        let req = try proto.xdg_output_unstable.decode_output(mut srv.conns[c], m)
+        output.xdg_output(mut srv, ci, proto.xdg_output_unstable.Output { id: m.id }, req)
+    } else if iface == proto.ext_image_capture_source.output_image_capture_source_manager_iface {
+        let req = try proto.ext_image_capture_source.decode_output_image_capture_source_manager(mut srv.conns[c], m)
+        capture.source_manager(mut srv, ci, req)
+    } else if iface == proto.ext_image_capture_source.foreign_toplevel_image_capture_source_manager_iface {
+        let req = try proto.ext_image_capture_source.decode_foreign_toplevel_image_capture_source_manager(mut srv.conns[c], m)
+        capture.toplevel_source_manager(mut srv, ci, req)
+    } else if iface == proto.ext_image_capture_source.image_capture_source_iface {
+        discard try proto.ext_image_capture_source.decode_image_capture_source(mut srv.conns[c], m)
+        capture.source_destroy(mut srv, ci, m.id)
+    } else if iface == proto.ext_image_copy_capture.manager_iface {
+        let req = try proto.ext_image_copy_capture.decode_manager(mut srv.conns[c], m)
+        capture.manager(mut srv, ci, req)
+    } else if iface == proto.ext_image_copy_capture.session_iface {
+        let req = try proto.ext_image_copy_capture.decode_session(mut srv.conns[c], m)
+        capture.session(mut srv, ci, proto.ext_image_copy_capture.Session { id: m.id }, req)
+    } else if iface == proto.ext_image_copy_capture.frame_iface {
+        let req = try proto.ext_image_copy_capture.decode_frame(mut srv.conns[c], m)
+        capture.frame(mut srv, ci, proto.ext_image_copy_capture.Frame { id: m.id }, req)
+    } else if iface == proto.ext_image_copy_capture.cursor_session_iface {
+        let req = try proto.ext_image_copy_capture.decode_cursor_session(mut srv.conns[c], m)
+        capture.cursor_session(mut srv, ci, proto.ext_image_copy_capture.CursorSession { id: m.id }, req)
+    } else if iface == proto.security_context.context_manager_iface {
+        let req = try proto.security_context.decode_context_manager(mut srv.conns[c], m)
+        security.manager(mut srv, ci, req)
+    } else if iface == proto.security_context.context_iface {
+        let req = try proto.security_context.decode_context(mut srv.conns[c], m)
+        security.context(mut srv, ci, proto.security_context.Context { id: m.id }, req)
+    } else if iface == proto.wlr_output_management_unstable.manager_iface {
+        let req = try proto.wlr_output_management_unstable.decode_manager(mut srv.conns[c], m)
+        outman.manager(mut srv, ci, proto.wlr_output_management_unstable.Manager { id: m.id }, req)
+    } else if iface == proto.wlr_output_management_unstable.head_iface {
+        let req = try proto.wlr_output_management_unstable.decode_head(mut srv.conns[c], m)
+        outman.head(mut srv, ci, proto.wlr_output_management_unstable.Head { id: m.id }, req)
+    } else if iface == proto.wlr_output_management_unstable.mode_iface {
+        let req = try proto.wlr_output_management_unstable.decode_mode(mut srv.conns[c], m)
+        outman.mode(mut srv, ci, proto.wlr_output_management_unstable.Mode { id: m.id }, req)
+    } else if iface == proto.wlr_output_management_unstable.configuration_iface {
+        let req = try proto.wlr_output_management_unstable.decode_configuration(mut srv.conns[c], m)
+        outman.configuration(mut srv, ci, proto.wlr_output_management_unstable.Configuration { id: m.id }, req)
+    } else if iface == proto.wlr_output_management_unstable.configuration_head_iface {
+        let req = try proto.wlr_output_management_unstable.decode_configuration_head(mut srv.conns[c], m)
+        outman.config_head(mut srv, ci, proto.wlr_output_management_unstable.ConfigurationHead { id: m.id }, req)
+    } else if iface == proto.wlr_virtual_pointer_unstable.pointer_manager_iface {
+        let req = try proto.wlr_virtual_pointer_unstable.decode_pointer_manager(mut srv.conns[c], m)
+        vptr.manager(mut srv, ci, req)
+    } else if iface == proto.wlr_virtual_pointer_unstable.pointer_iface {
+        let req = try proto.wlr_virtual_pointer_unstable.decode_pointer(mut srv.conns[c], m)
+        vptr.pointer(mut srv, ci, proto.wlr_virtual_pointer_unstable.Pointer { id: m.id }, req)
+    } else if iface == proto.wlr_gamma_control_unstable.control_manager_iface {
+        let req = try proto.wlr_gamma_control_unstable.decode_control_manager(mut srv.conns[c], m)
+        gamma.manager(mut srv, ci, req)
+    } else if iface == proto.wlr_gamma_control_unstable.control_iface {
+        let req = try proto.wlr_gamma_control_unstable.decode_control(mut srv.conns[c], m)
+        gamma.control(mut srv, ci, proto.wlr_gamma_control_unstable.Control { id: m.id }, req)
+    } else if iface == proto.color_management.color_manager_iface {
+        let req = try proto.color_management.decode_color_manager(mut srv.conns[c], m)
+        color.manager(mut srv, ci, req)
+    } else if iface == proto.color_management.color_management_output_iface {
+        let req = try proto.color_management.decode_color_management_output(mut srv.conns[c], m)
+        color.output_req(mut srv, ci, proto.color_management.ColorManagementOutput { id: m.id }, req)
+    } else if iface == proto.color_management.color_management_surface_iface {
+        let req = try proto.color_management.decode_color_management_surface(mut srv.conns[c], m)
+        color.surface_req(mut srv, ci, proto.color_management.ColorManagementSurface { id: m.id }, req)
+    } else if iface == proto.color_management.color_management_surface_feedback_iface {
+        let req = try proto.color_management.decode_color_management_surface_feedback(mut srv.conns[c], m)
+        color.feedback_req(mut srv, ci, proto.color_management.ColorManagementSurfaceFeedback { id: m.id }, req)
+    } else if iface == proto.color_management.image_description_creator_params_iface {
+        let req = try proto.color_management.decode_image_description_creator_params(mut srv.conns[c], m)
+        color.creator_params(mut srv, ci, proto.color_management.ImageDescriptionCreatorParams { id: m.id }, req)
+    } else if iface == proto.color_management.image_description_iface {
+        let req = try proto.color_management.decode_image_description(mut srv.conns[c], m)
+        color.image_description(mut srv, ci, proto.color_management.ImageDescription { id: m.id }, req)
+    } else {
+        return Err(srv.conns[c].no_messages(m, false))
+    }
+    return Ok(())
 }
 
 fn display(mut srv: server.Server, ci: u32, take req: wl.DisplayRequest) {

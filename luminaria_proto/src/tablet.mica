@@ -21,23 +21,26 @@ pub enum TabletManagerRequest {
     Destroy
 }
 
-fn decode_tablet_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletManagerRequest, wire.Error] {
+pub fn decode_tablet_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let tablet_seat = TabletSeat { id: rd.new_id(mut conn, tablet_seat_iface, m.version) }
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletManagerRequest.GetTabletSeat(tablet_seat, seat))
+            if rd.valid() {
+                return Ok(TabletManagerRequest.GetTabletSeat(tablet_seat, seat))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletManagerRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_manager_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_manager_v2") })
 }
 
 /// zwp_tablet_seat_v2: controller object for graphic tablet devices of a seat
@@ -55,17 +58,19 @@ pub enum TabletSeatRequest {
     Destroy
 }
 
-fn decode_tablet_seat(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletSeatRequest, wire.Error] {
+pub fn decode_tablet_seat(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletSeatRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletSeatRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletSeatRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_seat_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_seat_v2") })
 }
 
 /// new device notification
@@ -158,8 +163,9 @@ pub enum TabletToolRequest {
     Destroy
 }
 
-fn decode_tablet_tool(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletToolRequest, wire.Error] {
+pub fn decode_tablet_tool(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletToolRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
@@ -167,17 +173,19 @@ fn decode_tablet_tool(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletToolRequ
             let surface: Option[wayland.Surface] = if surface_raw == 0 { None } else { Some(wayland.Surface { id: surface_raw }) }
             let hotspot_x = rd.i32(conn)
             let hotspot_y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolRequest.SetCursor(serial, surface, hotspot_x, hotspot_y))
+            if rd.valid() {
+                return Ok(TabletToolRequest.SetCursor(serial, surface, hotspot_x, hotspot_y))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletToolRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletToolRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_tool_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_tool_v2") })
 }
 
 /// tool type
@@ -328,17 +336,19 @@ pub enum TabletRequest {
     Destroy
 }
 
-fn decode_tablet(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletRequest, wire.Error] {
+pub fn decode_tablet(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_v2") })
 }
 
 /// tablet device name
@@ -402,23 +412,26 @@ pub enum TabletPadRingRequest {
     Destroy
 }
 
-fn decode_tablet_pad_ring(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadRingRequest, wire.Error] {
+pub fn decode_tablet_pad_ring(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadRingRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let description = rd.str(conn)
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadRingRequest.SetFeedback(description, serial))
+            if rd.valid() {
+                return Ok(TabletPadRingRequest.SetFeedback(description, serial))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletPadRingRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletPadRingRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_pad_ring_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_pad_ring_v2") })
 }
 
 /// ring event source
@@ -467,23 +480,26 @@ pub enum TabletPadStripRequest {
     Destroy
 }
 
-fn decode_tablet_pad_strip(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadStripRequest, wire.Error] {
+pub fn decode_tablet_pad_strip(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadStripRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let description = rd.str(conn)
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadStripRequest.SetFeedback(description, serial))
+            if rd.valid() {
+                return Ok(TabletPadStripRequest.SetFeedback(description, serial))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletPadStripRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletPadStripRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_pad_strip_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_pad_strip_v2") })
 }
 
 /// strip event source
@@ -524,17 +540,19 @@ pub enum TabletPadGroupRequest {
     Destroy
 }
 
-fn decode_tablet_pad_group(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadGroupRequest, wire.Error] {
+pub fn decode_tablet_pad_group(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadGroupRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletPadGroupRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletPadGroupRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_pad_group_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_pad_group_v2") })
 }
 
 /// buttons announced
@@ -614,24 +632,27 @@ pub enum TabletPadRequest {
     Destroy
 }
 
-fn decode_tablet_pad(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadRequest, wire.Error] {
+pub fn decode_tablet_pad(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let button = rd.u32(conn)
             let description = rd.str(conn)
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadRequest.SetFeedback(button, description, serial))
+            if rd.valid() {
+                return Ok(TabletPadRequest.SetFeedback(button, description, serial))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletPadRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletPadRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_pad_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_pad_v2") })
 }
 
 /// group announced
@@ -704,23 +725,26 @@ pub enum TabletPadDialRequest {
     Destroy
 }
 
-fn decode_tablet_pad_dial(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadDialRequest, wire.Error] {
+pub fn decode_tablet_pad_dial(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadDialRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let description = rd.str(conn)
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadDialRequest.SetFeedback(description, serial))
+            if rd.valid() {
+                return Ok(TabletPadDialRequest.SetFeedback(description, serial))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TabletPadDialRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TabletPadDialRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_tablet_pad_dial_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_tablet_pad_dial_v2") })
 }
 
 /// delta movement
@@ -760,27 +784,31 @@ pub enum TabletSeatEvent {
     PadAdded(TabletPad)
 }
 
-fn decode_tablet_seat_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletSeatEvent, wire.Error] {
+pub fn decode_tablet_seat_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletSeatEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Tablet { id: rd.new_id(mut conn, tablet_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletSeatEvent.TabletAdded(id))
+            if rd.valid() {
+                return Ok(TabletSeatEvent.TabletAdded(id))
+            }
         }
         1 => {
             let id = TabletTool { id: rd.new_id(mut conn, tablet_tool_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletSeatEvent.ToolAdded(id))
+            if rd.valid() {
+                return Ok(TabletSeatEvent.ToolAdded(id))
+            }
         }
         2 => {
             let id = TabletPad { id: rd.new_id(mut conn, tablet_pad_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletSeatEvent.PadAdded(id))
+            if rd.valid() {
+                return Ok(TabletSeatEvent.PadAdded(id))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_seat_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_seat_v2") })
 }
 
 /// release the memory for the tablet seat object
@@ -831,112 +859,132 @@ pub enum TabletToolEvent {
     Frame(u32)
 }
 
-fn decode_tablet_tool_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletToolEvent, wire.Error] {
+pub fn decode_tablet_tool_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletToolEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let tool_type = TabletToolType(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Type(tool_type))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Type(tool_type))
+            }
         }
         1 => {
             let hardware_serial_hi = rd.u32(conn)
             let hardware_serial_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.HardwareSerial(hardware_serial_hi, hardware_serial_lo))
+            if rd.valid() {
+                return Ok(TabletToolEvent.HardwareSerial(hardware_serial_hi, hardware_serial_lo))
+            }
         }
         2 => {
             let hardware_id_hi = rd.u32(conn)
             let hardware_id_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.HardwareIdWacom(hardware_id_hi, hardware_id_lo))
+            if rd.valid() {
+                return Ok(TabletToolEvent.HardwareIdWacom(hardware_id_hi, hardware_id_lo))
+            }
         }
         3 => {
             let capability = TabletToolCapability(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Capability(capability))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Capability(capability))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Done)
+            if rd.valid() {
+                return Ok(TabletToolEvent.Done)
+            }
         }
         5 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Removed)
+            if rd.valid() {
+                return Ok(TabletToolEvent.Removed)
+            }
         }
         6 => {
             let serial = rd.u32(conn)
             let tablet = Tablet { id: rd.object(conn, tablet_iface, false) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.ProximityIn(serial, tablet, surface))
+            if rd.valid() {
+                return Ok(TabletToolEvent.ProximityIn(serial, tablet, surface))
+            }
         }
         7 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.ProximityOut)
+            if rd.valid() {
+                return Ok(TabletToolEvent.ProximityOut)
+            }
         }
         8 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Down(serial))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Down(serial))
+            }
         }
         9 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Up)
+            if rd.valid() {
+                return Ok(TabletToolEvent.Up)
+            }
         }
         10 => {
             let x = rd.fixed(conn)
             let y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Motion(x, y))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Motion(x, y))
+            }
         }
         11 => {
             let pressure = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Pressure(pressure))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Pressure(pressure))
+            }
         }
         12 => {
             let distance = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Distance(distance))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Distance(distance))
+            }
         }
         13 => {
             let tilt_x = rd.fixed(conn)
             let tilt_y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Tilt(tilt_x, tilt_y))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Tilt(tilt_x, tilt_y))
+            }
         }
         14 => {
             let degrees = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Rotation(degrees))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Rotation(degrees))
+            }
         }
         15 => {
             let position = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Slider(position))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Slider(position))
+            }
         }
         16 => {
             let degrees = rd.fixed(conn)
             let clicks = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Wheel(degrees, clicks))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Wheel(degrees, clicks))
+            }
         }
         17 => {
             let serial = rd.u32(conn)
             let button = rd.u32(conn)
             let state = TabletToolButtonState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Button(serial, button, state))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Button(serial, button, state))
+            }
         }
         18 => {
             let time = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletToolEvent.Frame(time))
+            if rd.valid() {
+                return Ok(TabletToolEvent.Frame(time))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_tool_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_tool_v2") })
 }
 
 /// set the tablet tool's surface
@@ -970,44 +1018,51 @@ pub enum TabletEvent {
     Bustype(TabletBustype)
 }
 
-fn decode_tablet_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletEvent, wire.Error] {
+pub fn decode_tablet_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletEvent.Name(name))
+            if rd.valid() {
+                return Ok(TabletEvent.Name(name))
+            }
         }
         1 => {
             let vid = rd.u32(conn)
             let pid = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletEvent.Id(vid, pid))
+            if rd.valid() {
+                return Ok(TabletEvent.Id(vid, pid))
+            }
         }
         2 => {
             let path = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletEvent.Path(path))
+            if rd.valid() {
+                return Ok(TabletEvent.Path(path))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletEvent.Done)
+            if rd.valid() {
+                return Ok(TabletEvent.Done)
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletEvent.Removed)
+            if rd.valid() {
+                return Ok(TabletEvent.Removed)
+            }
         }
         5 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_tablet_v2.bustype needs version 2"))
+                return Err(conn.needs_version(m, "zwp_tablet_v2.bustype", 2))
             }
             let bustype = TabletBustype(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletEvent.Bustype(bustype))
+            if rd.valid() {
+                return Ok(TabletEvent.Bustype(bustype))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_v2") })
 }
 
 /// destroy the tablet object
@@ -1028,31 +1083,36 @@ pub enum TabletPadRingEvent {
     Frame(u32)
 }
 
-fn decode_tablet_pad_ring_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadRingEvent, wire.Error] {
+pub fn decode_tablet_pad_ring_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadRingEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let source = TabletPadRingSource(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadRingEvent.Source(source))
+            if rd.valid() {
+                return Ok(TabletPadRingEvent.Source(source))
+            }
         }
         1 => {
             let degrees = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadRingEvent.Angle(degrees))
+            if rd.valid() {
+                return Ok(TabletPadRingEvent.Angle(degrees))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadRingEvent.Stop)
+            if rd.valid() {
+                return Ok(TabletPadRingEvent.Stop)
+            }
         }
         3 => {
             let time = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadRingEvent.Frame(time))
+            if rd.valid() {
+                return Ok(TabletPadRingEvent.Frame(time))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_pad_ring_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_pad_ring_v2") })
 }
 
 /// set compositor feedback
@@ -1080,31 +1140,36 @@ pub enum TabletPadStripEvent {
     Frame(u32)
 }
 
-fn decode_tablet_pad_strip_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadStripEvent, wire.Error] {
+pub fn decode_tablet_pad_strip_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadStripEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let source = TabletPadStripSource(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadStripEvent.Source(source))
+            if rd.valid() {
+                return Ok(TabletPadStripEvent.Source(source))
+            }
         }
         1 => {
             let position = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadStripEvent.Position(position))
+            if rd.valid() {
+                return Ok(TabletPadStripEvent.Position(position))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadStripEvent.Stop)
+            if rd.valid() {
+                return Ok(TabletPadStripEvent.Stop)
+            }
         }
         3 => {
             let time = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadStripEvent.Frame(time))
+            if rd.valid() {
+                return Ok(TabletPadStripEvent.Frame(time))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_pad_strip_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_pad_strip_v2") })
 }
 
 /// set compositor feedback
@@ -1138,51 +1203,59 @@ pub enum TabletPadGroupEvent {
     Dial(TabletPadDial)
 }
 
-fn decode_tablet_pad_group_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadGroupEvent, wire.Error] {
+pub fn decode_tablet_pad_group_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadGroupEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let buttons = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.Buttons(buttons))
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.Buttons(buttons))
+            }
         }
         1 => {
             let ring = TabletPadRing { id: rd.new_id(mut conn, tablet_pad_ring_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.Ring(ring))
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.Ring(ring))
+            }
         }
         2 => {
             let strip = TabletPadStrip { id: rd.new_id(mut conn, tablet_pad_strip_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.Strip(strip))
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.Strip(strip))
+            }
         }
         3 => {
             let modes = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.Modes(modes))
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.Modes(modes))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.Done)
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.Done)
+            }
         }
         5 => {
             let time = rd.u32(conn)
             let serial = rd.u32(conn)
             let mode = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.ModeSwitch(time, serial, mode))
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.ModeSwitch(time, serial, mode))
+            }
         }
         6 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_tablet_pad_group_v2.dial needs version 2"))
+                return Err(conn.needs_version(m, "zwp_tablet_pad_group_v2.dial", 2))
             }
             let dial = TabletPadDial { id: rd.new_id(mut conn, tablet_pad_dial_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadGroupEvent.Dial(dial))
+            if rd.valid() {
+                return Ok(TabletPadGroupEvent.Dial(dial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_pad_group_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_pad_group_v2") })
 }
 
 /// destroy the pad object
@@ -1211,55 +1284,64 @@ pub enum TabletPadEvent {
     Removed
 }
 
-fn decode_tablet_pad_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadEvent, wire.Error] {
+pub fn decode_tablet_pad_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let pad_group = TabletPadGroup { id: rd.new_id(mut conn, tablet_pad_group_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Group(pad_group))
+            if rd.valid() {
+                return Ok(TabletPadEvent.Group(pad_group))
+            }
         }
         1 => {
             let path = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Path(path))
+            if rd.valid() {
+                return Ok(TabletPadEvent.Path(path))
+            }
         }
         2 => {
             let buttons = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Buttons(buttons))
+            if rd.valid() {
+                return Ok(TabletPadEvent.Buttons(buttons))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Done)
+            if rd.valid() {
+                return Ok(TabletPadEvent.Done)
+            }
         }
         4 => {
             let time = rd.u32(conn)
             let button = rd.u32(conn)
             let state = TabletPadButtonState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Button(time, button, state))
+            if rd.valid() {
+                return Ok(TabletPadEvent.Button(time, button, state))
+            }
         }
         5 => {
             let serial = rd.u32(conn)
             let tablet = Tablet { id: rd.object(conn, tablet_iface, false) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Enter(serial, tablet, surface))
+            if rd.valid() {
+                return Ok(TabletPadEvent.Enter(serial, tablet, surface))
+            }
         }
         6 => {
             let serial = rd.u32(conn)
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Leave(serial, surface))
+            if rd.valid() {
+                return Ok(TabletPadEvent.Leave(serial, surface))
+            }
         }
         7 => {
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadEvent.Removed)
+            if rd.valid() {
+                return Ok(TabletPadEvent.Removed)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_pad_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_pad_v2") })
 }
 
 /// set compositor feedback
@@ -1284,22 +1366,25 @@ pub enum TabletPadDialEvent {
     Frame(u32)
 }
 
-fn decode_tablet_pad_dial_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadDialEvent, wire.Error] {
+pub fn decode_tablet_pad_dial_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TabletPadDialEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let value120 = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadDialEvent.Delta(value120))
+            if rd.valid() {
+                return Ok(TabletPadDialEvent.Delta(value120))
+            }
         }
         1 => {
             let time = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TabletPadDialEvent.Frame(time))
+            if rd.valid() {
+                return Ok(TabletPadDialEvent.Frame(time))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_tablet_pad_dial_v2"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_tablet_pad_dial_v2") })
 }
 
 /// set compositor feedback

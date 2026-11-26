@@ -240,6 +240,28 @@ fn synced(srv: server.Server, si: u32) -> bool {
     return false
 }
 
+/// Fast check whether committing `st` on surface `si` needs any transaction wait.
+fn state_has_waits(srv: server.Server, si: u32, st: state.State) -> bool {
+    if st.attached {
+        if let Some(b) = st.buffer {
+            if srv.buffers.live(b) and srv.buffers.items[int(b.index)].kind == state.BufferKind.Dmabuf {
+                if st.acquire_set {
+                    let tl = st.acquire
+                    if srv.timelines.used(int(tl)) and srv.timelines.items[int(tl)].fd.is_some() {
+                        return true
+                    }
+                } else if not srv.buffers.items[int(b.index)].planes.is_empty() {
+                    return true
+                }
+            }
+        }
+    }
+    if st.fifo_wait and srv.surfaces.items[int(si)].barrier {
+        return true
+    }
+    return st.target_ns > 0
+}
+
 fn commit(mut srv: server.Server, si: u32) {
     let i = int(si)
     var p = mem.replace(mut srv.surfaces.items[i].pending, state.State {})
@@ -254,7 +276,13 @@ fn commit(mut srv: server.Server, si: u32) {
         p = c
         srv.surfaces.items[i].has_cached = false
     }
-    var t = state.TxnData { client: srv.surfaces.items[i].client }
+    let ci = srv.surfaces.items[i].client
+    // Common path: no subsurfaces, no queued client transactions, and no sync waits.
+    if srv.surfaces.items[i].stack.len() <= 1 and srv.clients.items[int(ci)].txns.is_empty() and not state_has_waits(srv, si, p) {
+        apply_state(mut srv, si, take p)
+        return
+    }
+    var t = state.TxnData { client: ci }
     t.surfaces.push(srv.surfaces.id(si))
     t.states.push(p)
     carry(mut srv, si, mut t)

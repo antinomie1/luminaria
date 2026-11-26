@@ -243,62 +243,73 @@ pub struct Server {
     table_size: u32 = 0
     syncobj: bool = false
     no_waits: List[state.Wait] = []
+    /// Reusable scratch buffer for draining destroyed client objects.
+    removed_scratch: List[(u32, u16)] = []
 }
+
+static core_globals: [49](u16, u32) = [
+    (wl.compositor_iface, 6),
+    (wl.subcompositor_iface, 1),
+    (wl.shm_iface, 2),
+    (wl.data_device_manager_iface, 3),
+    (proto.xdg_shell.wm_base_iface, 6),
+    (proto.presentation_time.presentation_iface, 1),
+    (proto.viewporter.viewporter_iface, 1),
+    (proto.fractional_scale.scale_manager_iface, 1),
+    (proto.fifo.fifo_manager_iface, 1),
+    (proto.commit_timing.timing_manager_iface, 1),
+    (proto.tearing_control.control_manager_iface, 1),
+    (wl.fixes_iface, 1),
+    (proto.xdg_decoration_unstable.decoration_manager_iface, 1),
+    (proto.xdg_activation.activation_iface, 1),
+    (proto.xdg_toplevel_icon.icon_manager_iface, 1),
+    (proto.xdg_toplevel_tag.toplevel_tag_manager_iface, 1),
+    (proto.xdg_dialog.wm_dialog_iface, 1),
+    (proto.xdg_system_bell.system_bell_iface, 1),
+    (proto.xdg_foreign_unstable.exporter_iface, 1),
+    (proto.xdg_foreign_unstable.importer_iface, 1),
+    (proto.xdg_output_unstable.output_manager_iface, 3),
+    (proto.ext_foreign_toplevel_list.toplevel_list_iface, 1),
+    (proto.wlr_foreign_toplevel_management_unstable.manager_iface, 3),
+    (proto.xdg_toplevel_drag.drag_manager_iface, 1),
+    (proto.wlr_layer_shell_unstable.shell_iface, 5),
+    (proto.ext_session_lock.lock_manager_iface, 1),
+    (proto.primary_selection_unstable.device_manager_iface, 1),
+    (proto.ext_data_control.manager_iface, 1),
+    (proto.text_input_unstable.input_manager_iface, 1),
+    (proto.input_method_unstable.method_manager_iface, 1),
+    (proto.virtual_keyboard_unstable.keyboard_manager_iface, 1),
+    (proto.relative_pointer_unstable.pointer_manager_iface, 1),
+    (proto.pointer_constraints_unstable.pointer_constraints_iface, 1),
+    (proto.pointer_gestures_unstable.gestures_iface, 3),
+    (proto.cursor_shape.manager_iface, 2),
+    (proto.idle_inhibit_unstable.inhibit_manager_iface, 1),
+    (proto.ext_idle_notify.notifier_iface, 2),
+    (proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface, 1),
+    (proto.single_pixel_buffer.single_pixel_buffer_manager_iface, 1),
+    (proto.alpha_modifier.modifier_iface, 1),
+    (proto.content_type.type_manager_iface, 1),
+    (proto.ext_image_capture_source.output_image_capture_source_manager_iface, 1),
+    (proto.ext_image_capture_source.foreign_toplevel_image_capture_source_manager_iface, 1),
+    (proto.ext_image_copy_capture.manager_iface, 1),
+    (proto.security_context.context_manager_iface, 1),
+    (proto.wlr_output_management_unstable.manager_iface, 4),
+    (proto.wlr_virtual_pointer_unstable.pointer_manager_iface, 2),
+    (proto.wlr_gamma_control_unstable.control_manager_iface, 1),
+    (proto.color_management.color_manager_iface, 1),
+]
 
 /// Listen on `name` ("" for the first free wayland-N) with the core
 /// globals; add outputs, seats, dmabuf and syncobj support afterwards.
+@noinline
+@cold
 pub fn Server.open(name: str) -> Result[Server, str] {
     let l = try wire.listen(name)
     var s = Server { listener: l }
-    s.add_global(wl.compositor_iface, 6)
-    s.add_global(wl.subcompositor_iface, 1)
-    s.add_global(wl.shm_iface, 2)
-    s.add_global(wl.data_device_manager_iface, 3)
-    s.add_global(proto.xdg_shell.wm_base_iface, 6)
-    s.add_global(proto.presentation_time.presentation_iface, 1)
-    s.add_global(proto.viewporter.viewporter_iface, 1)
-    s.add_global(proto.fractional_scale.scale_manager_iface, 1)
-    s.add_global(proto.fifo.fifo_manager_iface, 1)
-    s.add_global(proto.commit_timing.timing_manager_iface, 1)
-    s.add_global(proto.tearing_control.control_manager_iface, 1)
-    s.add_global(wl.fixes_iface, 1)
-    s.add_global(proto.xdg_decoration_unstable.decoration_manager_iface, 1)
-    s.add_global(proto.xdg_activation.activation_iface, 1)
-    s.add_global(proto.xdg_toplevel_icon.icon_manager_iface, 1)
-    s.add_global(proto.xdg_toplevel_tag.toplevel_tag_manager_iface, 1)
-    s.add_global(proto.xdg_dialog.wm_dialog_iface, 1)
-    s.add_global(proto.xdg_system_bell.system_bell_iface, 1)
-    s.add_global(proto.xdg_foreign_unstable.exporter_iface, 1)
-    s.add_global(proto.xdg_foreign_unstable.importer_iface, 1)
-    s.add_global(proto.xdg_output_unstable.output_manager_iface, 3)
-    s.add_global(proto.ext_foreign_toplevel_list.toplevel_list_iface, 1)
-    s.add_global(proto.wlr_foreign_toplevel_management_unstable.manager_iface, 3)
-    s.add_global(proto.xdg_toplevel_drag.drag_manager_iface, 1)
-    s.add_global(proto.wlr_layer_shell_unstable.shell_iface, 5)
-    s.add_global(proto.ext_session_lock.lock_manager_iface, 1)
-    s.add_global(proto.primary_selection_unstable.device_manager_iface, 1)
-    s.add_global(proto.ext_data_control.manager_iface, 1)
-    s.add_global(proto.text_input_unstable.input_manager_iface, 1)
-    s.add_global(proto.input_method_unstable.method_manager_iface, 1)
-    s.add_global(proto.virtual_keyboard_unstable.keyboard_manager_iface, 1)
-    s.add_global(proto.relative_pointer_unstable.pointer_manager_iface, 1)
-    s.add_global(proto.pointer_constraints_unstable.pointer_constraints_iface, 1)
-    s.add_global(proto.pointer_gestures_unstable.gestures_iface, 3)
-    s.add_global(proto.cursor_shape.manager_iface, 2)
-    s.add_global(proto.idle_inhibit_unstable.inhibit_manager_iface, 1)
-    s.add_global(proto.ext_idle_notify.notifier_iface, 2)
-    s.add_global(proto.keyboard_shortcuts_inhibit_unstable.inhibit_manager_iface, 1)
-    s.add_global(proto.single_pixel_buffer.single_pixel_buffer_manager_iface, 1)
-    s.add_global(proto.alpha_modifier.modifier_iface, 1)
-    s.add_global(proto.content_type.type_manager_iface, 1)
-    s.add_global(proto.ext_image_capture_source.output_image_capture_source_manager_iface, 1)
-    s.add_global(proto.ext_image_capture_source.foreign_toplevel_image_capture_source_manager_iface, 1)
-    s.add_global(proto.ext_image_copy_capture.manager_iface, 1)
-    s.add_global(proto.security_context.context_manager_iface, 1)
-    s.add_global(proto.wlr_output_management_unstable.manager_iface, 4)
-    s.add_global(proto.wlr_virtual_pointer_unstable.pointer_manager_iface, 2)
-    s.add_global(proto.wlr_gamma_control_unstable.control_manager_iface, 1)
-    s.add_global(proto.color_management.color_manager_iface, 1)
+    s.globals.reserve(49)
+    for (iface, ver) in core_globals {
+        s.globals.push(state.Global { iface, version: min(ver, ifaces.version(iface)), kind: state.GlobalKind.Static })
+    }
     return Ok(s)
 }
 
@@ -495,10 +506,10 @@ fn Server.add_client(mut self, take conn: wire.Conn, k: u32) -> (ids.Client, int
 /// The generation of client slot `index` (to rebuild a handle from a
 /// poller token).
 pub fn Server.client_gen(self, index: u32) -> u32 {
-    guard int(index) < self.clients.gens.len() else {
+    guard int(index) < self.clients.meta.gens.len() else {
         return 0
     }
-    return self.clients.gens[int(index)]
+    return self.clients.meta.gens[int(index)]
 }
 
 pub fn Server.client_fd(self, c: ids.Client) -> int {
@@ -528,14 +539,24 @@ pub fn Server.client_of(self, s: ids.Surface) -> ids.Client {
 /// Tear down any destroyed client object ids queued in `self.conns[ci]`.
 fn Server.drain_removed(mut self, ci: u32) {
     if self.conns[int(ci)].removed_pending() {
-        var gone: List[(u32, u16)] = []
+        var gone = mem.replace(mut self.removed_scratch, [])
+        gone.clear()
         self.conns[int(ci)].take_removed(mut gone)
         for (id, iface) in gone {
             if self.slot(ci, id) != state.none {
                 route.destroyed(mut self, ci, id, iface)
             }
         }
+        gone.clear()
+        self.removed_scratch = gone
     }
+}
+
+@noinline
+@cold
+fn Server.log_proto_error(mut self, ci: u32, e: wire.Error) {
+    io.eprint("luminaria: client pid={self.clients.items[int(ci)].pid} protocol error: {e}")
+    discard self.conns[int(ci)].flush()
 }
 
 /// Read and handle what client `c` sent. False when it is gone (call
@@ -559,20 +580,26 @@ pub fn Server.dispatch(mut self, c: ids.Client) -> bool {
             // Drain server-side destructor events (e.g. wl_callback.done) before
             // decoding the next request, so a client reusing that id is not torn down.
             self.drain_removed(ci)
-            match proto.next(mut self.conns[int(ci)]) {
-                Ok(Some(r)) => {
-                    route.handle(mut self, ci, r)
-                    // A destructor its handler left alone is torn down like
-                    // at disconnect, so nothing stays behind for the next
-                    // object with the same id.
-                    self.drain_removed(ci)
+            match self.conns[int(ci)].next() {
+                Ok(Some(m)) => {
+                    match route.dispatch(mut self, ci, m) {
+                        Ok => {
+                            // A destructor its handler left alone is torn down like
+                            // at disconnect, so nothing stays behind for the next
+                            // object with the same id.
+                            self.drain_removed(ci)
+                        }
+                        Err(e) => {
+                            self.log_proto_error(ci, e)
+                            return false
+                        }
+                    }
                 }
                 Ok(None) => {
                     break
                 }
                 Err(e) => {
-                    io.eprint("luminaria: client pid={self.clients.items[int(ci)].pid} protocol error: {e}")
-                    discard self.conns[int(ci)].flush()
+                    self.log_proto_error(ci, e)
                     return false
                 }
             }
@@ -629,6 +656,8 @@ pub fn Server.stalled(self, mut out: List[ids.Client]) {
 
 /// Protocol error `code` on `obj`: the client is told and dropped after
 /// the next flush.
+@noinline
+@cold
 fn Server.fail(mut self, ci: u32, obj: u32, code: u32, msg: StrSlice) {
     io.eprint("luminaria: client pid={self.clients.items[int(ci)].pid} fail obj={obj} code={code}: {msg}")
     discard self.conns[int(ci)].error(obj, code, msg)
@@ -670,6 +699,8 @@ fn Server.unbind(mut self, ci: u32, id: u32) {
 }
 
 /// Drop client `c` and everything it made.
+@noinline
+@cold
 pub fn Server.disconnect(mut self, c: ids.Client) {
     guard self.clients.live(c.id) else {
         return
@@ -788,8 +819,14 @@ pub fn Server.take_changes(mut self, s: ids.Surface, mut damage: List[ids.Rect],
         return 0
     }
     let i = int(s.id.index)
-    damage.extend(mem.replace(mut self.surfaces.items[i].applied_damage, []))
-    buffer_damage.extend(mem.replace(mut self.surfaces.items[i].applied_bdamage, []))
+    for r in self.surfaces.items[i].applied_damage {
+        damage.push(r)
+    }
+    self.surfaces.items[i].applied_damage.clear()
+    for r in self.surfaces.items[i].applied_bdamage {
+        buffer_damage.push(r)
+    }
+    self.surfaces.items[i].applied_bdamage.clear()
     let c = self.surfaces.items[i].changed
     self.surfaces.items[i].changed = 0
     return c
@@ -802,7 +839,8 @@ pub fn Server.take_superseded(mut self, s: ids.Surface, mut out: List[(Option[id
     guard self.surfaces.live(s.id) else {
         return
     }
-    for x in mem.replace(mut self.surfaces.items[int(s.id.index)].superseded, []) {
+    let i = int(s.id.index)
+    for x in self.surfaces.items[i].superseded {
         var fd = -1
         if x.release != state.none and self.timelines.used(int(x.release)) {
             if let Some(f) = self.timelines.items[int(x.release)].fd {
@@ -815,6 +853,7 @@ pub fn Server.take_superseded(mut self, s: ids.Surface, mut out: List[(Option[id
         }
         out.push((b, fd, x.point))
     }
+    self.surfaces.items[i].superseded.clear()
 }
 
 /// The largest rectangle of the opaque region (surface coordinates).

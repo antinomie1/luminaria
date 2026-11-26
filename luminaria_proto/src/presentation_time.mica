@@ -29,23 +29,26 @@ pub enum PresentationRequest {
     Feedback(wayland.Surface, PresentationFeedback)
 }
 
-fn decode_presentation(mut conn: wire.Conn, m: wire.Msg) -> Result[PresentationRequest, wire.Error] {
+pub fn decode_presentation(mut conn: wire.Conn, m: wire.Msg) -> Result[PresentationRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PresentationRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PresentationRequest.Destroy)
+            }
         }
         1 => {
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
             let callback = PresentationFeedback { id: rd.new_id(mut conn, presentation_feedback_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(PresentationRequest.Feedback(surface, callback))
+            if rd.valid() {
+                return Ok(PresentationRequest.Feedback(surface, callback))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_presentation"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_presentation") })
 }
 
 /// clock ID for timestamps
@@ -111,17 +114,19 @@ pub enum PresentationEvent {
     ClockId(u32)
 }
 
-fn decode_presentation_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PresentationEvent, wire.Error] {
+pub fn decode_presentation_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PresentationEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let clk_id = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PresentationEvent.ClockId(clk_id))
+            if rd.valid() {
+                return Ok(PresentationEvent.ClockId(clk_id))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_presentation"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_presentation") })
 }
 
 /// unbind from the presentation interface
@@ -149,13 +154,15 @@ pub enum PresentationFeedbackEvent {
     Discarded
 }
 
-fn decode_presentation_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PresentationFeedbackEvent, wire.Error] {
+pub fn decode_presentation_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PresentationFeedbackEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(PresentationFeedbackEvent.SyncOutput(output))
+            if rd.valid() {
+                return Ok(PresentationFeedbackEvent.SyncOutput(output))
+            }
         }
         1 => {
             let tv_sec_hi = rd.u32(conn)
@@ -165,16 +172,18 @@ fn decode_presentation_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Resul
             let seq_hi = rd.u32(conn)
             let seq_lo = rd.u32(conn)
             let flags = PresentationFeedbackKind(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PresentationFeedbackEvent.Presented(tv_sec_hi, tv_sec_lo, tv_nsec, refresh, seq_hi, seq_lo, flags))
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PresentationFeedbackEvent.Presented(tv_sec_hi, tv_sec_lo, tv_nsec, refresh, seq_hi, seq_lo, flags))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PresentationFeedbackEvent.Discarded)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PresentationFeedbackEvent.Discarded)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_presentation_feedback"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_presentation_feedback") })
 }

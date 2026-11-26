@@ -143,77 +143,89 @@ pub enum InputRequest {
     HideInputPanel
 }
 
-fn decode_input(mut conn: wire.Conn, m: wire.Msg) -> Result[InputRequest, wire.Error] {
+pub fn decode_input(mut conn: wire.Conn, m: wire.Msg) -> Result[InputRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(InputRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(InputRequest.Destroy)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.Enable)
+            if rd.valid() {
+                return Ok(InputRequest.Enable)
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.Disable)
+            if rd.valid() {
+                return Ok(InputRequest.Disable)
+            }
         }
         3 => {
             let text = rd.str(conn)
             let cursor = rd.i32(conn)
             let anchor = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.SetSurroundingText(text, cursor, anchor))
+            if rd.valid() {
+                return Ok(InputRequest.SetSurroundingText(text, cursor, anchor))
+            }
         }
         4 => {
             let cause = InputChangeCause(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.SetTextChangeCause(cause))
+            if rd.valid() {
+                return Ok(InputRequest.SetTextChangeCause(cause))
+            }
         }
         5 => {
             let hint = InputContentHint(rd.u32(conn))
             let purpose = InputContentPurpose(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.SetContentType(hint, purpose))
+            if rd.valid() {
+                return Ok(InputRequest.SetContentType(hint, purpose))
+            }
         }
         6 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.SetCursorRectangle(x, y, width, height))
+            if rd.valid() {
+                return Ok(InputRequest.SetCursorRectangle(x, y, width, height))
+            }
         }
         7 => {
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.Commit)
+            if rd.valid() {
+                return Ok(InputRequest.Commit)
+            }
         }
         8 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_text_input_v3.set_available_actions needs version 2"))
+                return Err(conn.needs_version(m, "zwp_text_input_v3.set_available_actions", 2))
             }
             let available_actions = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.SetAvailableActions(available_actions))
+            if rd.valid() {
+                return Ok(InputRequest.SetAvailableActions(available_actions))
+            }
         }
         9 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_text_input_v3.show_input_panel needs version 2"))
+                return Err(conn.needs_version(m, "zwp_text_input_v3.show_input_panel", 2))
             }
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.ShowInputPanel)
+            if rd.valid() {
+                return Ok(InputRequest.ShowInputPanel)
+            }
         }
         10 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_text_input_v3.hide_input_panel needs version 2"))
+                return Err(conn.needs_version(m, "zwp_text_input_v3.hide_input_panel", 2))
             }
-            try rd.finish(mut conn, m)
-            return Ok(InputRequest.HideInputPanel)
+            if rd.valid() {
+                return Ok(InputRequest.HideInputPanel)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_text_input_v3"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_text_input_v3") })
 }
 
 /// enter event
@@ -302,23 +314,26 @@ pub enum InputManagerRequest {
     GetTextInput(Input, wayland.Seat)
 }
 
-fn decode_input_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[InputManagerRequest, wire.Error] {
+pub fn decode_input_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[InputManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(InputManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(InputManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Input { id: rd.new_id(mut conn, input_iface, m.version) }
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(InputManagerRequest.GetTextInput(id, seat))
+            if rd.valid() {
+                return Ok(InputManagerRequest.GetTextInput(id, seat))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_text_input_manager_v3"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_text_input_manager_v3") })
 }
 
 /// Events of zwp_text_input_v3.
@@ -343,72 +358,82 @@ pub enum InputEvent {
     PreeditHint(u32, u32, InputPreeditHint)
 }
 
-fn decode_input_event(mut conn: wire.Conn, m: wire.Msg) -> Result[InputEvent, wire.Error] {
+pub fn decode_input_event(mut conn: wire.Conn, m: wire.Msg) -> Result[InputEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.Enter(surface))
+            if rd.valid() {
+                return Ok(InputEvent.Enter(surface))
+            }
         }
         1 => {
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.Leave(surface))
+            if rd.valid() {
+                return Ok(InputEvent.Leave(surface))
+            }
         }
         2 => {
             let text = rd.opt_str(conn)
             let cursor_begin = rd.i32(conn)
             let cursor_end = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.PreeditString(text, cursor_begin, cursor_end))
+            if rd.valid() {
+                return Ok(InputEvent.PreeditString(text, cursor_begin, cursor_end))
+            }
         }
         3 => {
             let text = rd.opt_str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.CommitString(text))
+            if rd.valid() {
+                return Ok(InputEvent.CommitString(text))
+            }
         }
         4 => {
             let before_length = rd.u32(conn)
             let after_length = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.DeleteSurroundingText(before_length, after_length))
+            if rd.valid() {
+                return Ok(InputEvent.DeleteSurroundingText(before_length, after_length))
+            }
         }
         5 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.Done(serial))
+            if rd.valid() {
+                return Ok(InputEvent.Done(serial))
+            }
         }
         6 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_text_input_v3.action needs version 2"))
+                return Err(conn.needs_version(m, "zwp_text_input_v3.action", 2))
             }
             let action = InputAction(rd.u32(conn))
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.Action(action, serial))
+            if rd.valid() {
+                return Ok(InputEvent.Action(action, serial))
+            }
         }
         7 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_text_input_v3.language needs version 2"))
+                return Err(conn.needs_version(m, "zwp_text_input_v3.language", 2))
             }
             let language = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.Language(language))
+            if rd.valid() {
+                return Ok(InputEvent.Language(language))
+            }
         }
         8 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_text_input_v3.preedit_hint needs version 2"))
+                return Err(conn.needs_version(m, "zwp_text_input_v3.preedit_hint", 2))
             }
             let start = rd.u32(conn)
             let end = rd.u32(conn)
             let hint = InputPreeditHint(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(InputEvent.PreeditHint(start, end, hint))
+            if rd.valid() {
+                return Ok(InputEvent.PreeditHint(start, end, hint))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_text_input_v3"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_text_input_v3") })
 }
 
 /// Destroy the wp_text_input

@@ -4,7 +4,6 @@
 import std.mem
 import std.os
 import std.time
-import std.collections.map
 import luminaria_server as server
 import layout
 import plug
@@ -17,7 +16,7 @@ import place
 struct Waits {
     fences: List[Fence] = []
     /// Waits each transaction still has.
-    left: map.Map[server.Txn, int]
+    left: List[(server.Txn, int)] = []
     fifo: List[(server.Surface, server.Txn)] = []
     timed: List[(int, server.Txn)] = []
     time_fd: int = -1
@@ -36,6 +35,10 @@ struct Fence {
 }
 
 fn start[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], t: server.Txn) {
+    if d.srv.waits(t).is_empty() {
+        d.srv.ready(t)
+        return
+    }
     let ws = d.srv.waits(t).to_list()
     var n = 0
     let now = time.now_ns()
@@ -79,7 +82,17 @@ fn start[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], t: serv
     if n == 0 {
         d.srv.ready(t)
     } else {
-        discard d.waits.left.insert(t, n)
+        var updated = false
+        for i in 0..d.waits.left.len() {
+            if d.waits.left[i].0 == t {
+                d.waits.left[i] = (t, n)
+                updated = true
+                break
+            }
+        }
+        if not updated {
+            d.waits.left.push((t, n))
+        }
     }
 }
 
@@ -101,14 +114,22 @@ fn add_fence[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], t: 
 }
 
 fn resolve[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], t: server.Txn) {
-    guard let Some(n) = d.waits.left.get(t) else {
+    var idx = -1
+    for i in 0..d.waits.left.len() {
+        if d.waits.left[i].0 == t {
+            idx = i
+            break
+        }
+    }
+    guard idx >= 0 else {
         return
     }
+    let n = d.waits.left[idx].1
     if n <= 1 {
-        discard d.waits.left.remove(t)
+        discard d.waits.left.remove(idx)
         d.srv.ready(t)
     } else {
-        discard d.waits.left.insert(t, n - 1)
+        d.waits.left[idx] = (t, n - 1)
     }
 }
 
@@ -140,7 +161,7 @@ fn timed_waits[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
 }
 
 fn held_window[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], s: server.Surface) -> bool {
-    if let Some(w) = d.surf_window.get(s) {
+    if let Some(w) = d.owner_of(s) {
         return d.waits.txn_wins.contains(w)
     }
     for w in d.waits.txn_wins {
@@ -155,7 +176,8 @@ fn try_finish[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     guard d.waits.txn_layout.is_some() and d.waits.txn_wins.is_empty() and not d.waits.txn_open else {
         return
     }
-    d.lay = d.waits.txn_layout.take().unwrap()
+    let next_lay = d.waits.txn_layout.take().unwrap()
+    d.lay_scratch = mem.replace(mut d.lay, next_lay)
     for s in mem.replace(mut d.waits.held, []) {
         if d.srv.surface_alive(s) {
             clients.applied(mut d, s)

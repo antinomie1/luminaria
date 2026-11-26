@@ -80,7 +80,6 @@ fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
         return
     }
     let st = d.seats[si].seat
-    let sname = d.seats[si].name.clone()
     d.srv.input_activity_on(st, time.now_ns())
     match take i {
         Motion(t, dx, dy, rdx, rdy) => {
@@ -110,14 +109,14 @@ fn input_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
             var ev = other
             match take ev {
                 Key(t, code, pressed, sym, text) => {
-                    let mods = d.be.mods_on(sname)
-                    let base_sym = d.be.base_sym_on(sname, code)
+                    let mods = d.be.mods_on(d.seats[si].name)
+                    let base_sym = d.be.base_sym_on(d.seats[si].name, code)
                     d.emit(display.Event.Key(display.Key { seat: st, time: t, code, sym, base_sym, text, pressed, mods }))
                 }
                 Modifiers(desc, l, k, g) => {
                     // Clients always see the modifier state, bindings or not.
                     d.srv.modifiers(st, desc, l, k, g)
-                    let m = d.be.mods_on(sname)
+                    let m = d.be.mods_on(d.seats[si].name)
                     if si == 0 {
                         d.emit(display.Event.Modifiers(m))
                     } else {
@@ -204,8 +203,10 @@ fn moved_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: 
     if si == 0 {
         match d.manip.active {
             Move(w, sx, sy, bx, by) => {
-                if let Some(cur) = d.wins.get(w) {
-                    discard d.wins.insert(w, display.Win { off_x: bx + px - sx, off_y: by + py - sy, ..cur })
+                let wi = d.win_idx(w)
+                if wi >= 0 {
+                    d.wins[wi].off_x = bx + px - sx
+                    d.wins[wi].off_y = by + py - sy
                 }
                 if d.batching_input {
                     d.batch_rebuild = true
@@ -273,7 +274,7 @@ fn drag_target[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: i
     guard let Some((w, _, _)) = d.seats[si].drag_win else {
         return under(d, x, y)
     }
-    return d.hits.find_except(d.srv, x, y, fn(s) => d.surf_window.get(s) == Some(w))
+    return d.hits.find_except(d.srv, x, y, fn(s) => d.owner_of(s) == Some(w))
 }
 
 fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], si: int, t: u32) {
@@ -288,7 +289,7 @@ fn deliver_motion_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
     let dragging = d.srv.dragging(st)
     if d.seats[si].buttons > 0 and not dragging {
         if let Some(g) = d.seats[si].grab {
-            if let Some((gx, gy, sc)) = d.origins.get(g) {
+            if let Some((gx, gy, sc)) = d.origin_of(g) {
                 target = Some((g, (px - gx) / sc, (py - gy) / sc))
             }
         }
@@ -345,7 +346,7 @@ fn constrain_on[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], si: 
     if c.lock {
         return (px, py)
     }
-    guard let Some((gx, gy, sc)) = d.origins.get(s) else {
+    guard let Some((gx, gy, sc)) = d.origin_of(s) else {
         return (x, y)
     }
     let info = d.srv.info(s)
@@ -427,8 +428,8 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
         RequestClose(w) => d.close(w)
         RequestResize(w, edges) => d.manipulate_resize(w, edges)
         RequestMaximize(w, on) => {
-            let cur = d.wins.get(w).unwrap_or(display.Win {})
-            var st = cur.states
+            let wi = d.win_idx(w)
+            var st = if wi >= 0 { d.wins[wi].states } else { server.States {} }
             st.maximized = on
             // Maximized windows stay clear of panels.
             let (ww, hh) = window_output_size(d, w, true)
@@ -439,8 +440,8 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
             }
         }
         RequestFullscreen(w, o, on) => {
-            let cur = d.wins.get(w).unwrap_or(display.Win {})
-            var st = cur.states
+            let wi = d.win_idx(w)
+            var st = if wi >= 0 { d.wins[wi].states } else { server.States {} }
             st.fullscreen = on
             var (ww, hh) = window_output_size(d, w, false)
             if let Some(so) = o {
@@ -457,8 +458,9 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
             }
         }
         Occluded(w, hidden) => {
-            let cur = d.wins.get(w).unwrap_or(display.Win {})
-            if cur.configured {
+            let wi = d.win_idx(w)
+            if wi >= 0 and d.wins[wi].configured {
+                let cur = d.wins[wi]
                 var st = cur.states
                 st.suspended = hidden
                 discard d.configure(w, cur.width, cur.height, st)
@@ -537,7 +539,7 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
                 }
                 Motion => {
                     if let Some(s) = d.srv.touch_target(st, t.id) {
-                        if let Some((gx, gy, sc)) = d.origins.get(s) {
+                        if let Some((gx, gy, sc)) = d.origin_of(s) {
                             d.srv.touch_motion(st, t.time, t.id, (t.x - gx) / sc, (t.y - gy) / sc)
                         }
                     }
@@ -582,7 +584,7 @@ fn accept[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], e: dis
 fn window_output_size[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: server.Window, usable: bool) -> (i32, i32) {
     let s = d.srv.window_surface(w)
     var o = 0
-    if let Some((gx, gy, _)) = d.origins.get(s) {
+    if let Some((gx, gy, _)) = d.origin_of(s) {
         let k = place.output_at(d, gx + 1.0, gy + 1.0)
         if k >= 0 {
             o = k

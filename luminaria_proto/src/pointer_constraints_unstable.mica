@@ -37,13 +37,15 @@ pub enum PointerConstraintsRequest {
     ConfinePointer(ConfinedPointer, wayland.Surface, wayland.Pointer, Option[wayland.Region], PointerConstraintsLifetime)
 }
 
-fn decode_pointer_constraints(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerConstraintsRequest, wire.Error] {
+pub fn decode_pointer_constraints(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerConstraintsRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PointerConstraintsRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PointerConstraintsRequest.Destroy)
+            }
         }
         1 => {
             let id = LockedPointer { id: rd.new_id(mut conn, locked_pointer_iface, m.version) }
@@ -52,8 +54,9 @@ fn decode_pointer_constraints(mut conn: wire.Conn, m: wire.Msg) -> Result[Pointe
             let region_raw = rd.object(conn, wayland.region_iface, true)
             let region: Option[wayland.Region] = if region_raw == 0 { None } else { Some(wayland.Region { id: region_raw }) }
             let lifetime = PointerConstraintsLifetime(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerConstraintsRequest.LockPointer(id, surface, pointer, region, lifetime))
+            if rd.valid() {
+                return Ok(PointerConstraintsRequest.LockPointer(id, surface, pointer, region, lifetime))
+            }
         }
         2 => {
             let id = ConfinedPointer { id: rd.new_id(mut conn, confined_pointer_iface, m.version) }
@@ -62,12 +65,13 @@ fn decode_pointer_constraints(mut conn: wire.Conn, m: wire.Msg) -> Result[Pointe
             let region_raw = rd.object(conn, wayland.region_iface, true)
             let region: Option[wayland.Region] = if region_raw == 0 { None } else { Some(wayland.Region { id: region_raw }) }
             let lifetime = PointerConstraintsLifetime(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerConstraintsRequest.ConfinePointer(id, surface, pointer, region, lifetime))
+            if rd.valid() {
+                return Ok(PointerConstraintsRequest.ConfinePointer(id, surface, pointer, region, lifetime))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_pointer_constraints_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_pointer_constraints_v1") })
 }
 
 /// zwp_locked_pointer_v1: receive relative pointer motion events
@@ -89,29 +93,33 @@ pub enum LockedPointerRequest {
     SetRegion(Option[wayland.Region])
 }
 
-fn decode_locked_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[LockedPointerRequest, wire.Error] {
+pub fn decode_locked_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[LockedPointerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(LockedPointerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(LockedPointerRequest.Destroy)
+            }
         }
         1 => {
             let surface_x = rd.fixed(conn)
             let surface_y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(LockedPointerRequest.SetCursorPositionHint(surface_x, surface_y))
+            if rd.valid() {
+                return Ok(LockedPointerRequest.SetCursorPositionHint(surface_x, surface_y))
+            }
         }
         2 => {
             let region_raw = rd.object(conn, wayland.region_iface, true)
             let region: Option[wayland.Region] = if region_raw == 0 { None } else { Some(wayland.Region { id: region_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(LockedPointerRequest.SetRegion(region))
+            if rd.valid() {
+                return Ok(LockedPointerRequest.SetRegion(region))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_locked_pointer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_locked_pointer_v1") })
 }
 
 /// lock activation event
@@ -141,23 +149,26 @@ pub enum ConfinedPointerRequest {
     SetRegion(Option[wayland.Region])
 }
 
-fn decode_confined_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfinedPointerRequest, wire.Error] {
+pub fn decode_confined_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfinedPointerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ConfinedPointerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ConfinedPointerRequest.Destroy)
+            }
         }
         1 => {
             let region_raw = rd.object(conn, wayland.region_iface, true)
             let region: Option[wayland.Region] = if region_raw == 0 { None } else { Some(wayland.Region { id: region_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(ConfinedPointerRequest.SetRegion(region))
+            if rd.valid() {
+                return Ok(ConfinedPointerRequest.SetRegion(region))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_confined_pointer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_confined_pointer_v1") })
 }
 
 /// pointer confined
@@ -208,20 +219,23 @@ pub enum LockedPointerEvent {
     Unlocked
 }
 
-fn decode_locked_pointer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[LockedPointerEvent, wire.Error] {
+pub fn decode_locked_pointer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[LockedPointerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(LockedPointerEvent.Locked)
+            if rd.valid() {
+                return Ok(LockedPointerEvent.Locked)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(LockedPointerEvent.Unlocked)
+            if rd.valid() {
+                return Ok(LockedPointerEvent.Unlocked)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_locked_pointer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_locked_pointer_v1") })
 }
 
 /// destroy the locked pointer object
@@ -251,20 +265,23 @@ pub enum ConfinedPointerEvent {
     Unconfined
 }
 
-fn decode_confined_pointer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfinedPointerEvent, wire.Error] {
+pub fn decode_confined_pointer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfinedPointerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfinedPointerEvent.Confined)
+            if rd.valid() {
+                return Ok(ConfinedPointerEvent.Confined)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfinedPointerEvent.Unconfined)
+            if rd.valid() {
+                return Ok(ConfinedPointerEvent.Unconfined)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_confined_pointer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_confined_pointer_v1") })
 }
 
 /// destroy the confined pointer object

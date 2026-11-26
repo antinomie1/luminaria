@@ -26,23 +26,26 @@ pub enum ControlManagerRequest {
     GetTearingControl(Control, wayland.Surface)
 }
 
-fn decode_control_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ControlManagerRequest, wire.Error] {
+pub fn decode_control_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ControlManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ControlManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ControlManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Control { id: rd.new_id(mut conn, control_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ControlManagerRequest.GetTearingControl(id, surface))
+            if rd.valid() {
+                return Ok(ControlManagerRequest.GetTearingControl(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_tearing_control_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_tearing_control_manager_v1") })
 }
 
 /// wp_tearing_control_v1: per-surface tearing control interface
@@ -70,22 +73,25 @@ pub enum ControlRequest {
     Destroy
 }
 
-fn decode_control(mut conn: wire.Conn, m: wire.Msg) -> Result[ControlRequest, wire.Error] {
+pub fn decode_control(mut conn: wire.Conn, m: wire.Msg) -> Result[ControlRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let hint = ControlPresentationHint(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ControlRequest.SetPresentationHint(hint))
+            if rd.valid() {
+                return Ok(ControlRequest.SetPresentationHint(hint))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ControlRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ControlRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_tearing_control_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_tearing_control_v1") })
 }
 
 /// destroy tearing control factory object

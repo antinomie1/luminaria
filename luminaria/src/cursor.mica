@@ -19,6 +19,8 @@ fn le32(b: str, at: int) -> u32 {
 }
 
 /// The image of an XCursor file closest to `size` pixels.
+@noinline
+@cold
 fn parse(b: str, size: int) -> Option[Image] {
     guard b.len() >= 16 and b.starts_with("Xcur") else {
         return None
@@ -56,6 +58,8 @@ fn parse(b: str, size: int) -> Option[Image] {
     return Some(Image { width: i32(w), height: i32(h), hot_x: i32(le32(b, best + 24)), hot_y: i32(le32(b, best + 28)), pixels })
 }
 
+@noinline
+@cold
 fn dirs() -> List[str] {
     var out: List[str] = []
     if let Some(p) = env.get("XCURSOR_PATH") {
@@ -74,6 +78,8 @@ fn dirs() -> List[str] {
 }
 
 /// The theme `theme` inherits (index.theme), "" for none.
+@noinline
+@cold
 fn inherits(dir: str, theme: str) -> str {
     guard let Ok(t) = fs.read_to_str("{dir}/{theme}/index.theme") else {
         return ""
@@ -90,13 +96,16 @@ fn inherits(dir: str, theme: str) -> str {
 }
 
 /// Cursor `name` of the user's theme at `size` pixels.
+@noinline
+@cold
 pub fn load(name: str, size: int) -> Image {
+    let search_dirs = dirs()
     var themes: List[str] = []
     themes.push(env.get("XCURSOR_THEME").unwrap_or("default"))
     var k = 0
     while k < themes.len() and k < 8 {
         let theme = themes[k].clone()
-        for d in dirs() {
+        for d in search_dirs {
             if let Ok(b) = fs.read_to_str("{d}/{theme}/cursors/{name}") {
                 if let Some(img) = parse(b, size) {
                     return img
@@ -110,7 +119,7 @@ pub fn load(name: str, size: int) -> Image {
         k += 1
     }
     if not themes.contains("Adwaita") and k < 8 {
-        for d in dirs() {
+        for d in search_dirs {
             if let Ok(b) = fs.read_to_str("{d}/Adwaita/cursors/{name}") {
                 if let Some(img) = parse(b, size) {
                     return img
@@ -122,26 +131,31 @@ pub fn load(name: str, size: int) -> Image {
 }
 
 /// A plain arrow: white with a black outline.
+@noinline
+@cold
 fn arrow(size: int) -> Image {
     let n = max(size, 16)
-    var px: List[u8] = []
+    var px: List[u8] = List.with_cap(n * n * 4)
     for y in 0..n {
         for x in 0..n {
             // Inside the triangle x <= y/2 + ... : a classic left arrow.
             let inside = x <= y * 2 / 3 and y < n * 3 / 4
             let edge = inside and (x == 0 or x == y * 2 / 3 or y == n * 3 / 4 - 1)
             if edge {
-                for c in [u8(0), 0, 0, 255] {
-                    px.push(c)
-                }
+                px.push(0)
+                px.push(0)
+                px.push(0)
+                px.push(255)
             } else if inside {
-                for c in [u8(255), 255, 255, 255] {
-                    px.push(c)
-                }
+                px.push(255)
+                px.push(255)
+                px.push(255)
+                px.push(255)
             } else {
-                for _ in 0..4 {
-                    px.push(0)
-                }
+                px.push(0)
+                px.push(0)
+                px.push(0)
+                px.push(0)
             }
         }
     }

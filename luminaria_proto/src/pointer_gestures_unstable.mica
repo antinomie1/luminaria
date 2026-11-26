@@ -25,41 +25,46 @@ pub enum GesturesRequest {
     GetHoldGesture(GestureHold, wayland.Pointer)
 }
 
-fn decode_gestures(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturesRequest, wire.Error] {
+pub fn decode_gestures(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturesRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = GestureSwipe { id: rd.new_id(mut conn, gesture_swipe_iface, m.version) }
             let pointer = wayland.Pointer { id: rd.object(conn, wayland.pointer_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(GesturesRequest.GetSwipeGesture(id, pointer))
+            if rd.valid() {
+                return Ok(GesturesRequest.GetSwipeGesture(id, pointer))
+            }
         }
         1 => {
             let id = GesturePinch { id: rd.new_id(mut conn, gesture_pinch_iface, m.version) }
             let pointer = wayland.Pointer { id: rd.object(conn, wayland.pointer_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(GesturesRequest.GetPinchGesture(id, pointer))
+            if rd.valid() {
+                return Ok(GesturesRequest.GetPinchGesture(id, pointer))
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_pointer_gestures_v1.release needs version 2"))
+                return Err(conn.needs_version(m, "zwp_pointer_gestures_v1.release", 2))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(GesturesRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(GesturesRequest.Release)
+            }
         }
         3 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_pointer_gestures_v1.get_hold_gesture needs version 3"))
+                return Err(conn.needs_version(m, "zwp_pointer_gestures_v1.get_hold_gesture", 3))
             }
             let id = GestureHold { id: rd.new_id(mut conn, gesture_hold_iface, m.version) }
             let pointer = wayland.Pointer { id: rd.object(conn, wayland.pointer_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(GesturesRequest.GetHoldGesture(id, pointer))
+            if rd.valid() {
+                return Ok(GesturesRequest.GetHoldGesture(id, pointer))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_pointer_gestures_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_pointer_gestures_v1") })
 }
 
 /// zwp_pointer_gesture_swipe_v1: a swipe gesture object
@@ -77,17 +82,19 @@ pub enum GestureSwipeRequest {
     Destroy
 }
 
-fn decode_gesture_swipe(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureSwipeRequest, wire.Error] {
+pub fn decode_gesture_swipe(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureSwipeRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(GestureSwipeRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(GestureSwipeRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_pointer_gesture_swipe_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_pointer_gesture_swipe_v1") })
 }
 
 /// multi-finger swipe begin
@@ -130,17 +137,19 @@ pub enum GesturePinchRequest {
     Destroy
 }
 
-fn decode_gesture_pinch(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturePinchRequest, wire.Error] {
+pub fn decode_gesture_pinch(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturePinchRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(GesturePinchRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(GesturePinchRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_pointer_gesture_pinch_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_pointer_gesture_pinch_v1") })
 }
 
 /// multi-finger pinch begin
@@ -185,20 +194,22 @@ pub enum GestureHoldRequest {
     Destroy
 }
 
-fn decode_gesture_hold(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureHoldRequest, wire.Error] {
+pub fn decode_gesture_hold(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureHoldRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_pointer_gesture_hold_v1.destroy needs version 3"))
+                return Err(conn.needs_version(m, "zwp_pointer_gesture_hold_v1.destroy", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(GestureHoldRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(GestureHoldRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_pointer_gesture_hold_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_pointer_gesture_hold_v1") })
 }
 
 /// multi-finger hold begin
@@ -273,34 +284,38 @@ pub enum GestureSwipeEvent {
     End(u32, u32, i32)
 }
 
-fn decode_gesture_swipe_event(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureSwipeEvent, wire.Error] {
+pub fn decode_gesture_swipe_event(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureSwipeEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
             let fingers = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GestureSwipeEvent.Begin(serial, time, surface, fingers))
+            if rd.valid() {
+                return Ok(GestureSwipeEvent.Begin(serial, time, surface, fingers))
+            }
         }
         1 => {
             let time = rd.u32(conn)
             let dx = rd.fixed(conn)
             let dy = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GestureSwipeEvent.Update(time, dx, dy))
+            if rd.valid() {
+                return Ok(GestureSwipeEvent.Update(time, dx, dy))
+            }
         }
         2 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let cancelled = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GestureSwipeEvent.End(serial, time, cancelled))
+            if rd.valid() {
+                return Ok(GestureSwipeEvent.End(serial, time, cancelled))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_pointer_gesture_swipe_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_pointer_gesture_swipe_v1") })
 }
 
 /// destroy the pointer swipe gesture object
@@ -319,16 +334,18 @@ pub enum GesturePinchEvent {
     End(u32, u32, i32)
 }
 
-fn decode_gesture_pinch_event(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturePinchEvent, wire.Error] {
+pub fn decode_gesture_pinch_event(mut conn: wire.Conn, m: wire.Msg) -> Result[GesturePinchEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
             let fingers = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GesturePinchEvent.Begin(serial, time, surface, fingers))
+            if rd.valid() {
+                return Ok(GesturePinchEvent.Begin(serial, time, surface, fingers))
+            }
         }
         1 => {
             let time = rd.u32(conn)
@@ -336,19 +353,21 @@ fn decode_gesture_pinch_event(mut conn: wire.Conn, m: wire.Msg) -> Result[Gestur
             let dy = rd.fixed(conn)
             let scale = rd.fixed(conn)
             let rotation = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GesturePinchEvent.Update(time, dx, dy, scale, rotation))
+            if rd.valid() {
+                return Ok(GesturePinchEvent.Update(time, dx, dy, scale, rotation))
+            }
         }
         2 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let cancelled = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GesturePinchEvent.End(serial, time, cancelled))
+            if rd.valid() {
+                return Ok(GesturePinchEvent.End(serial, time, cancelled))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_pointer_gesture_pinch_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_pointer_gesture_pinch_v1") })
 }
 
 /// destroy the pinch gesture object
@@ -365,33 +384,36 @@ pub enum GestureHoldEvent {
     End(u32, u32, i32)
 }
 
-fn decode_gesture_hold_event(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureHoldEvent, wire.Error] {
+pub fn decode_gesture_hold_event(mut conn: wire.Conn, m: wire.Msg) -> Result[GestureHoldEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_pointer_gesture_hold_v1.begin needs version 3"))
+                return Err(conn.needs_version(m, "zwp_pointer_gesture_hold_v1.begin", 3))
             }
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
             let fingers = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GestureHoldEvent.Begin(serial, time, surface, fingers))
+            if rd.valid() {
+                return Ok(GestureHoldEvent.Begin(serial, time, surface, fingers))
+            }
         }
         1 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_pointer_gesture_hold_v1.end needs version 3"))
+                return Err(conn.needs_version(m, "zwp_pointer_gesture_hold_v1.end", 3))
             }
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let cancelled = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(GestureHoldEvent.End(serial, time, cancelled))
+            if rd.valid() {
+                return Ok(GestureHoldEvent.End(serial, time, cancelled))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_pointer_gesture_hold_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_pointer_gesture_hold_v1") })
 }
 
 /// destroy the hold gesture object

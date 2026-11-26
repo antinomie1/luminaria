@@ -79,6 +79,8 @@ fn ensure_bg[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -> 
 
 /// Build an output's placement list for offscreen capture, replacing any
 /// `block_capture` surface with solid black (zero overhead when not capturing).
+@noinline
+@cold
 fn redacted_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, mut out: List[types.Placement]) {
     out.clear()
     let bgk = ensure_bg(mut d)
@@ -115,6 +117,8 @@ fn redacted_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[
     }
 }
 
+@noinline
+@cold
 fn window_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], w: server.Window, mut out: List[types.Placement]) -> (i32, i32) {
     out.clear()
     guard d.srv.window_alive(w) and d.srv.mapped(w) else {
@@ -146,10 +150,12 @@ fn window_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
     var tree: List[(server.Surface, i32, i32)] = []
     d.srv.tree(s, mut tree)
     for (ts, dx, dy) in tree {
-        guard let Some(sf) = d.surfs.get(ts) else {
+        let idx = d.surf_idx(ts)
+        guard idx >= 0 else {
             continue
         }
-        guard sf.tex != 0 else {
+        let tex = d.surfs[idx].tex
+        guard tex != 0 else {
             continue
         }
         let tinfo = d.srv.info(ts)
@@ -161,7 +167,7 @@ fn window_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
         }
         out.push(types.Placement {
             key: display.skey(ts),
-            tex: sf.tex,
+            tex,
             x: f32(dx - ox),
             y: f32(dy - oy),
             w: f32(tinfo.width),
@@ -177,6 +183,7 @@ fn window_placements[O: plug.Output, R: plug.Renderer](mut d: display.Display[O,
 }
 
 /// Process pending window shm captures and dmabuf capture requests.
+@noinline
 fn finish_captures[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     var reqs: List[server.CaptureReq] = []
     d.srv.capture_dmabuf_requests(mut reqs)

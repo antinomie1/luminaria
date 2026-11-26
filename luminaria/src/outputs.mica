@@ -68,6 +68,8 @@ fn backend_events[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
     input.flush_batch(mut d)
 }
 
+@noinline
+@cold
 fn output_info[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: int) -> server.OutputInfo {
     let desc = d.be.output(u32(o))
     let out = d.outs[o]
@@ -95,6 +97,8 @@ fn output_info[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], o: in
     }
 }
 
+@noinline
+@cold
 fn output_added[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
     let desc = d.be.output(u32(o))
     while d.outs.len() <= o {
@@ -132,6 +136,8 @@ fn output_added[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
     place.rebuild(mut d)
 }
 
+@noinline
+@cold
 fn output_removed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
     guard o < d.outs.len() and d.outs[o].alive else {
         return
@@ -168,6 +174,8 @@ fn output_removed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]
     place.rebuild(mut d)
 }
 
+@noinline
+@cold
 fn output_changed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) {
     guard o < d.outs.len() and d.outs[o].alive else {
         return

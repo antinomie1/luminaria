@@ -20,6 +20,16 @@ pub import format
 pub type Placement = types.Placement
 pub type Rect = types.Rect
 
+/// Per-view cached state in an output's stable slot array.
+struct OutSlot {
+    key: u64 = 0
+    id: u32 = 0
+    tex_ver: u64 = 0
+    seen_gen: u64 = 0
+    p: Placement = Placement {}
+    alive: bool = false
+}
+
 struct Output {
     scene: vc.Scene
     width: u32 = 1
@@ -29,15 +39,45 @@ struct Output {
     sdr_nits: f32 = 203.0
     max_nits: f32 = 1000.0
     alive: bool = true
-    /// Placement key -> (scene view id, last seen generation, texture key).
-    by_key: map.Map[u64, (u32, u64, u64)]
-    /// Scene view id -> placement key.
-    by_id: map.Map[u32, u64]
+    /// Placement key -> stable index in `slots`.
+    by_key: map.Map[u64, u32]
+    slots: List[OutSlot] = []
+    free_slots: List[u32] = []
+    /// Slot indices in the last applied back-to-front order.
+    cur_order: List[u32] = []
     gen: u64 = 0
+    /// `Compositor.tex_ver` at the last full layout sync on this output.
+    tex_ver: u64 = 0
 }
 
 fn blank() -> Output {
-    return Output { scene: vc.Scene.new(1, 1, vec4(0.0)), alive: false, by_key: map.Map.new(), by_id: map.Map.new() }
+    return Output { scene: vc.Scene.new(1, 1, vec4(0.0)), alive: false, by_key: map.Map.new() }
+}
+
+fn same_visual(a: Placement, b: Placement) -> bool {
+    return a.tex == b.tex and a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h and a.src == b.src and a.transform == b.transform and a.opacity == b.opacity and a.radius == b.radius and a.shadow == b.shadow and a.opaque == b.opaque and a.color_space == b.color_space
+}
+
+fn Output.alloc_slot(mut self, take sl: OutSlot) -> u32 {
+    if let Some(i) = self.free_slots.pop() {
+        self.slots[int(i)] = sl
+        return i
+    }
+    let i = u32(self.slots.len())
+    self.slots.push(sl)
+    return i
+}
+
+fn Output.slot_for_id(self, id: u32) -> int {
+    var i = self.cur_order.len() - 1
+    while i >= 0 {
+        let si = int(self.cur_order[i])
+        if self.slots[si].id == id {
+            return si
+        }
+        i -= 1
+    }
+    return -1
 }
 
 /// The damage of an shm texture still to upload (x0, y0 to x1, y1; none
@@ -64,12 +104,14 @@ pub struct Compositor {
     /// Textures by key; shm ones also have their pending damage.
     texs: map.Map[u64, gpu.Texture]
     shms: map.Map[u64, Shm]
+    /// Monotonic version bumped whenever any texture is inserted, replaced or forgotten.
+    tex_ver: u64 = 1
     /// Render targets by key.
     targets: map.Map[u64, gpu.Texture]
     next_target: u64 = 1
     /// Reusable scratch lists for O(N) layout diff & overlay updates.
     order: List[u32] = []
-    rm_keys: List[u64] = []
+    next_slots: List[u32] = []
     rm_ids: List[u32] = []
     ov_ids: List[u32] = []
 }
@@ -77,6 +119,8 @@ pub struct Compositor {
 /// The renderer on a GPU of its own choosing (`validation` loads the
 /// Vulkan validation layer; requests `Realtime` global queue priority and
 /// falls back automatically if unsupported or unpermitted).
+@noinline
+@cold
 pub fn Compositor.open(validation: bool) -> Result[Compositor, str] {
     let dev = try gpu.Device.open(gpu.Options { headless: true, validation, priority: gpu.Priority.Realtime })
     var c = try Compositor.with(dev)
@@ -85,6 +129,8 @@ pub fn Compositor.open(validation: bool) -> Result[Compositor, str] {
     return Ok(c)
 }
 
+@noinline
+@cold
 pub fn Compositor.with(take dev: gpu.Device) -> Result[Compositor, str] {
     let prio = dev.priority()
     var c = Compositor { dev, want_priority: prio, texs: map.Map.new(), shms: map.Map.new(), targets: map.Map.new() }
@@ -135,6 +181,8 @@ pub fn Compositor.stats(self, mut s: types.Stats) {
 
 /// Rebuild the Vulkan device, canvases and output scenes after device loss.
 /// Caller (`Display`) re-imports client textures and re-acquires output targets.
+@noinline
+@cold
 pub fn Compositor.recover(mut self) -> Result[(), str] {
     var new_dev = try gpu.Device.open(gpu.Options { headless: true, validation: self.validation, priority: self.want_priority })
     let new_canvas = try draw2d.Canvas.create(mut new_dev, gpu.Format.B8G8R8A8_UNORM)
@@ -148,6 +196,7 @@ pub fn Compositor.recover(mut self) -> Result[(), str] {
     self.texs.clear()
     self.shms.clear()
     self.targets.clear()
+    self.tex_ver += 1
     discard self.canvas.take()
     self.extra_canvases.clear()
     self.dev = new_dev
@@ -167,7 +216,6 @@ pub fn Compositor.recover(mut self) -> Result[(), str] {
                 max_nits: prev.max_nits,
                 alive: true,
                 by_key: map.Map.new(),
-                by_id: map.Map.new(),
             }
         }
     }
@@ -187,7 +235,6 @@ pub fn Compositor.add_output(mut self, o: int, width: u32, height: u32, backgrou
         background,
         alive: true,
         by_key: map.Map.new(),
-        by_id: map.Map.new(),
     }
 }
 
@@ -203,7 +250,9 @@ pub fn Compositor.remove_output(mut self, o: int) {
     if o < self.outputs.len() {
         self.outputs[o].alive = false
         self.outputs[o].by_key.clear()
-        self.outputs[o].by_id.clear()
+        self.outputs[o].slots.clear()
+        self.outputs[o].free_slots.clear()
+        self.outputs[o].cur_order.clear()
     }
 }
 
@@ -245,50 +294,97 @@ pub fn Compositor.layout(mut self, o: int, placements: Slice[Placement]) {
         return
     }
     var out = mem.replace(mut self.outputs[o], blank())
+    let tver = self.tex_ver
+    // Fast path: identical key list and no texture table changes since the last sync.
+    if out.tex_ver == tver and placements.len() == out.cur_order.len() {
+        var same_order = true
+        for i in 0..placements.len() {
+            if out.slots[int(out.cur_order[i])].key != placements[i].key {
+                same_order = false
+                break
+            }
+        }
+        if same_order {
+            for i in 0..placements.len() {
+                let si = int(out.cur_order[i])
+                let p = placements[i]
+                if not same_visual(out.slots[si].p, p) {
+                    if let Some(t) = self.texs.get(p.tex) {
+                        out.scene.set(out.slots[si].id, view(p, t))
+                        out.slots[si].p = p
+                    }
+                }
+            }
+            self.outputs[o] = out
+            return
+        }
+    }
     out.gen += 1
     let gen = out.gen
     var order = mem.replace(mut self.order, [])
+    var next_slots = mem.replace(mut self.next_slots, [])
     order.clear()
+    next_slots.clear()
+    var seen_count = 0
     for p in placements {
-        guard let Some(t) = self.texs.get(p.tex) else {
-            continue
-        }
-        let v = view(p, t)
-        if let Some((id, seen_gen, _)) = out.by_key.get(p.key) {
-            if seen_gen == gen {
+        if let Some(si_u32) = out.by_key.get(p.key) {
+            let si = int(si_u32)
+            if out.slots[si].seen_gen == gen {
                 continue
             }
-            out.scene.set(id, v)
-            discard out.by_key.insert(p.key, (id, gen, p.tex))
+            if out.slots[si].tex_ver == tver and same_visual(out.slots[si].p, p) {
+                out.slots[si].seen_gen = gen
+                seen_count += 1
+                next_slots.push(si_u32)
+                order.push(out.slots[si].id)
+                continue
+            }
+            guard let Some(t) = self.texs.get(p.tex) else {
+                continue
+            }
+            let id = out.slots[si].id
+            out.scene.set(id, view(p, t))
+            out.slots[si].tex_ver = tver
+            out.slots[si].seen_gen = gen
+            out.slots[si].p = p
+            seen_count += 1
+            next_slots.push(si_u32)
             order.push(id)
         } else {
-            let id = out.scene.add(v)
-            discard out.by_key.insert(p.key, (id, gen, p.tex))
-            discard out.by_id.insert(id, p.key)
+            guard let Some(t) = self.texs.get(p.tex) else {
+                continue
+            }
+            let id = out.scene.add(view(p, t))
+            let si_u32 = out.alloc_slot(OutSlot { key: p.key, id, tex_ver: tver, seen_gen: gen, p, alive: true })
+            discard out.by_key.insert(p.key, si_u32)
+            next_slots.push(si_u32)
             order.push(id)
         }
     }
-    var rm_keys = mem.replace(mut self.rm_keys, [])
-    var rm_ids = mem.replace(mut self.rm_ids, [])
-    rm_keys.clear()
-    rm_ids.clear()
-    for e in out.by_key.entries() {
-        if e.val.1 != gen {
-            rm_keys.push(e.key)
-            rm_ids.push(e.val.0)
+    if seen_count < out.cur_order.len() {
+        var rm_ids = mem.replace(mut self.rm_ids, [])
+        rm_ids.clear()
+        for idx in 0..out.cur_order.len() {
+            let si_u32 = out.cur_order[idx]
+            let si = int(si_u32)
+            if out.slots[si].seen_gen != gen {
+                rm_ids.push(out.slots[si].id)
+                discard out.by_key.remove(out.slots[si].key)
+                out.slots[si].alive = false
+                out.free_slots.push(si_u32)
+            }
         }
-    }
-    if not rm_keys.is_empty() {
-        for i in 0..rm_keys.len() {
-            discard out.by_key.remove(rm_keys[i])
-            discard out.by_id.remove(rm_ids[i])
+        if not rm_ids.is_empty() {
+            out.scene.remove_many(rm_ids)
         }
-        out.scene.remove_many(rm_ids)
+        self.rm_ids = rm_ids
     }
     out.scene.reorder(order)
+    out.tex_ver = tver
+    var old_order = mem.replace(mut out.cur_order, next_slots)
+    old_order.clear()
+    self.next_slots = old_order
     self.order = order
-    self.rm_keys = rm_keys
-    self.rm_ids = rm_ids
     self.outputs[o] = out
 }
 
@@ -296,9 +392,10 @@ pub fn Compositor.layout(mut self, o: int, placements: Slice[Placement]) {
 /// (empty: all of it). Damages every output showing it.
 pub fn Compositor.commit(mut self, key: u64, rects: Slice[(i32, i32, i32, i32)]) {
     for o in 0..self.outputs.len() {
-        guard let Some((id, _, _)) = self.outputs[o].by_key.get(key) else {
+        guard let Some(si) = self.outputs[o].by_key.get(key) else {
             continue
         }
+        let id = self.outputs[o].slots[int(si)].id
         if rects.is_empty() {
             self.outputs[o].scene.commit(id, None)
         }
@@ -326,10 +423,10 @@ pub fn Compositor.visible(self, o: int, key: u64) -> bool {
     guard o < self.outputs.len() else {
         return false
     }
-    guard let Some((id, _, _)) = self.outputs[o].by_key.get(key) else {
+    guard let Some(si) = self.outputs[o].by_key.get(key) else {
         return false
     }
-    return self.outputs[o].scene.visible(id)
+    return self.outputs[o].scene.visible(self.outputs[o].slots[int(si)].id)
 }
 
 /// The key of the view that alone fills output `o` as it is, when one
@@ -341,23 +438,25 @@ pub fn Compositor.scanout(self, o: int) -> Option[u64] {
     guard let Some(id) = self.outputs[o].scene.scanout() else {
         return None
     }
-    return self.outputs[o].by_id.get(id)
+    let si = self.outputs[o].slot_for_id(id)
+    return if si >= 0 { Some(self.outputs[o].slots[si].key) } else { None }
 }
 
 /// Up to `max_count` placement candidates eligible for hardware overlay
 /// planes above the primary plane on output `o` (top to bottom).
+@noinline
 pub fn Compositor.overlay_candidates(self, o: int, max_count: int) -> List[types.OverlayCand] {
     var out: List[types.OverlayCand] = []
     guard o < self.outputs.len() and self.outputs[o].alive else {
         return out
     }
     for id in self.outputs[o].scene.overlay_candidates(max_count) {
-        guard let Some(key) = self.outputs[o].by_id.get(id) else {
+        let si = self.outputs[o].slot_for_id(id)
+        guard si >= 0 else {
             continue
         }
-        guard let Some((_, _, tex)) = self.outputs[o].by_key.get(key) else {
-            continue
-        }
+        let key = self.outputs[o].slots[si].key
+        let tex = self.outputs[o].slots[si].p.tex
         guard let Some(v) = self.outputs[o].scene.get(id) else {
             continue
         }
@@ -389,8 +488,8 @@ pub fn Compositor.set_overlays(mut self, o: int, keys: Slice[u64]) {
     var ids = mem.replace(mut self.ov_ids, [])
     ids.clear()
     for key in keys {
-        if let Some((id, _, _)) = self.outputs[o].by_key.get(key) {
-            ids.push(id)
+        if let Some(si) = self.outputs[o].by_key.get(key) {
+            ids.push(self.outputs[o].slots[int(si)].id)
         }
     }
     self.outputs[o].scene.set_overlays(ids)
@@ -407,6 +506,7 @@ fn Compositor.encoder(mut self) -> Result[gpu.Encoder, str] {
 }
 
 fn Compositor.put(mut self, key: u64, t: gpu.Texture) {
+    self.tex_ver += 1
     if let Some(old) = self.texs.insert(key, t) {
         self.dev.destroy_texture(old)
     }
@@ -420,6 +520,7 @@ pub fn Compositor.has(self, key: u64) -> bool {
 /// Free texture `key` (nothing shows it any more).
 pub fn Compositor.forget(mut self, key: u64) {
     if let Some(t) = self.texs.remove(key) {
+        self.tex_ver += 1
         self.dev.destroy_texture(t)
     }
     discard self.shms.remove(key)
@@ -441,7 +542,7 @@ pub fn Compositor.import_dmabuf(mut self, key: u64, d: types.Dmabuf) -> bool {
 /// Texture `key` is one premultiplied pixel (32 bits a channel),
 /// stretched by its viewport.
 pub fn Compositor.solid(mut self, key: u64, rgba: [4]u32) -> bool {
-    let px: List[u8] = [u8(rgba[0] >> 24), u8(rgba[1] >> 24), u8(rgba[2] >> 24), u8(rgba[3] >> 24)]
+    let px: [4]u8 = [u8(rgba[0] >> 24), u8(rgba[1] >> 24), u8(rgba[2] >> 24), u8(rgba[3] >> 24)]
     let fourcc = if rgba[3] == 0xFFFFFFFF { types.buffer.xbgr8888 } else { types.buffer.abgr8888 }
     return self.image(key, 1, 1, fourcc, px, 4)
 }
@@ -480,6 +581,7 @@ fn Compositor.target(mut self, key: u64, width: i32, height: i32, fourcc: u32) -
     return true
 }
 
+@noinline
 fn Compositor.write(mut self, key: u64, pixels: Slice[u8], stride: int, rects: Slice[(i32, i32, i32, i32)]) -> bool {
     guard let Some(t) = self.texs.get(key) else {
         return false
@@ -538,7 +640,7 @@ pub fn Compositor.shm_upload(mut self, key: u64, bytes: Slice[u8], stride: int) 
     guard s.x0 < s.x1 and s.y0 < s.y1 else {
         return true
     }
-    let rect: List[(i32, i32, i32, i32)] = [(s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0)]
+    let rect: [1](i32, i32, i32, i32) = [(s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0)]
     return self.write(key, bytes, stride, rect)
 }
 
@@ -553,6 +655,8 @@ fn Compositor.flush_uploads(mut self) -> Result[(), str] {
 }
 
 /// Render targets an output asked for.
+@noinline
+@cold
 pub fn Compositor.targets(mut self, w: types.Want) -> Result[List[types.Target], str] {
     guard let Some((vf, _)) = format.vk_format(w.format) else {
         return Err("render target format {w.format:08x} is not supported")
@@ -600,6 +704,7 @@ pub fn Compositor.drop_target(mut self, key: u64) {
     }
 }
 
+@noinline
 fn Compositor.take_canvas(mut self, fmt: gpu.Format) -> Result[draw2d.Canvas, str] {
     if fmt == gpu.Format.B8G8R8A8_UNORM {
         guard let Some(cv) = self.canvas.take() else {
@@ -616,6 +721,7 @@ fn Compositor.take_canvas(mut self, fmt: gpu.Format) -> Result[draw2d.Canvas, st
     return draw2d.Canvas.create(mut self.dev, fmt)
 }
 
+@noinline
 fn Compositor.put_canvas(mut self, fmt: gpu.Format, take cv: draw2d.Canvas) {
     if fmt == gpu.Format.B8G8R8A8_UNORM {
         self.canvas = Some(cv)
@@ -666,6 +772,8 @@ pub fn Compositor.render(mut self, o: int, key: u64, age: u32) -> Result[Option[
 }
 
 /// The pixels of target `key` (B8G8R8A8), once the GPU is done with it.
+@noinline
+@cold
 pub fn Compositor.read(mut self, key: u64) -> Result[List[u8], str] {
     guard let Some(t) = self.targets.get(key) else {
         return Err("no render target {key}")
@@ -673,6 +781,8 @@ pub fn Compositor.read(mut self, key: u64) -> Result[List[u8], str] {
     return self.dev.read_texture(t)
 }
 
+@noinline
+@cold
 fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encoder, dst: gpu.Texture, ps: Slice[Placement]) -> Result[(), str] {
     cv.clear()
     cv.set_output_color(types.dst_sdr, 203.0, 1000.0)
@@ -713,6 +823,8 @@ fn Compositor.draw_placements(mut self, mut cv: draw2d.Canvas, mut e: gpu.Encode
 
 /// Zero-copy GPU copy from render target `target_key` into a client's capture
 /// dmabuf `dst_buf`, returning the completion sync_file fd (or -1 if already signaled).
+@noinline
+@cold
 pub fn Compositor.copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, sx: i32, sy: i32, w: i32, h: i32) -> Result[int, str] {
     try self.flush_uploads()
     guard let Some(src) = self.targets.get(target_key) else {
@@ -743,6 +855,8 @@ pub fn Compositor.copy_dmabuf(mut self, target_key: u64, dst_buf: types.Dmabuf, 
 }
 
 /// Render `ps` into an offscreen `width` x `height` B8G8R8A8 target and return pixels.
+@noinline
+@cold
 pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: Slice[Placement]) -> Result[List[u8], str] {
     try self.flush_uploads()
     guard width > 0 and height > 0 else {
@@ -789,6 +903,8 @@ pub fn Compositor.render_offscreen(mut self, width: u32, height: u32, ps: Slice[
 
 /// Render `ps` directly into (or copy into) a client's capture dmabuf `dst_buf`,
 /// returning the completion sync_file fd (or -1 if already signaled).
+@noinline
+@cold
 pub fn Compositor.render_offscreen_dmabuf(mut self, dst_buf: types.Dmabuf, ps: Slice[Placement]) -> Result[int, str] {
     try self.flush_uploads()
     guard let Some((vf, _)) = format.vk_format(dst_buf.format) else {
@@ -865,6 +981,8 @@ pub fn Compositor.changed(self, o: int, mut out: List[(i32, i32, i32, i32)]) {
 }
 
 /// Free everything (after the outputs let go of their targets).
+@noinline
+@cold
 pub fn Compositor.close(mut self) {
     if not self.dev.lost() {
         discard self.dev.idle()

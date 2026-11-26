@@ -10,7 +10,6 @@ import std.os
 import std.str as strs
 import std.time
 import luminaria_wire as wire
-import luminaria_proto as proto
 import luminaria_proto.wayland as wl
 import luminaria_proto.xdg_shell as xdg
 import luminaria_proto.xdg_decoration_unstable as deco
@@ -141,11 +140,116 @@ fn Nested.flush(mut self) {
 
 fn Nested.handle(mut self, mut out: List[types.Event]) -> Result[(), str] {
     while true {
-        let e = proto.next_event(mut self.c).map_err(fn(e) => "{e}")
-        guard let Some(ev) = try e else {
+        let next_m = self.c.next().map_err(fn(e) => "{e}")
+        guard let Some(m) = try next_m else {
             break
         }
-        self.event(ev, mut out)
+        let iface = m.iface
+        if iface == wl.registry_iface {
+            let ev = try wl.decode_registry_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Global(name, name_str, version) => self.bind(name, name_str, version)
+                    _ => {}
+                }
+            }
+        } else if iface == xdg.wm_base_iface {
+            let ev = try xdg.decode_wm_base_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Ping(serial) => xdg.WmBase { id: m.id }.pong(mut self.c, serial)
+                }
+            }
+        } else if iface == xdg.toplevel_iface {
+            let ev = try xdg.decode_toplevel_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Configure(w, h, _) => {
+                        if w > 0 and h > 0 and (w != self.width or h != self.height) {
+                            self.width = w
+                            self.height = h
+                            self.resized = true
+                        }
+                    }
+                    Close => self.closed = true
+                    _ => {}
+                }
+            }
+        } else if iface == xdg.surface_iface {
+            let ev = try xdg.decode_surface_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Configure(serial) => {
+                        xdg.Surface { id: m.id }.ack_configure(mut self.c, serial)
+                        self.configured = true
+                        if self.resized {
+                            out.push(types.Event.OutputChanged(0))
+                        }
+                    }
+                }
+            }
+        } else if iface == wl.callback_iface {
+            let ev = try wl.decode_callback_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Done => {
+                        if m.id == self.frame_cb {
+                            self.frame_cb = 0
+                            self.seq += 1
+                            out.push(types.Event.Presented(0, self.seq, time.now_ns(), 0))
+                        }
+                    }
+                }
+            }
+        } else if iface == wl.buffer_iface {
+            let ev = try wl.decode_buffer_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Release => {
+                        if let Some(sw) = self.swap.take() {
+                            var s = sw
+                            let i = s.find(m.id)
+                            if i >= 0 {
+                                s.free(i)
+                                out.push(types.Event.Released(0))
+                            }
+                            self.swap = Some(s)
+                        }
+                        for mut p in self.passed {
+                            if p.buffer == m.id {
+                                p.busy = false
+                            }
+                        }
+                    }
+                }
+            }
+        } else if iface == wl.seat_iface {
+            let ev = try wl.decode_seat_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                match ev {
+                    Capabilities(caps) => {
+                        let s = wl.Seat { id: m.id }
+                        if caps.contains(wl.SeatCapability.Pointer) and self.pointer.id == 0 {
+                            self.pointer = s.get_pointer(mut self.c)
+                        }
+                        if caps.contains(wl.SeatCapability.Keyboard) and self.kb.id == 0 {
+                            self.kb = s.get_keyboard(mut self.c)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if iface == wl.pointer_iface {
+            let ev = try wl.decode_pointer_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                self.pointer_event(ev, mut out)
+            }
+        } else if iface == wl.keyboard_iface {
+            let ev = try wl.decode_keyboard_event(mut self.c, m).map_err(fn(e) => "{e}")
+            if m.alive {
+                self.keyboard_event(take ev, mut out)
+            }
+        }
     }
     return Ok(())
 }
@@ -171,74 +275,32 @@ fn axis_ms() -> u32 {
     return u32((time.now_ns() / 1000000) & 0xffffffff)
 }
 
-fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
-    match take ev {
-        WlRegistry(_, Global(name, iface, version)) => self.bind(name, iface, version)
-        XdgWmBase(w, Ping(serial)) => w.pong(mut self.c, serial)
-        XdgToplevel(_, Configure(w, h, _)) => {
-            if w > 0 and h > 0 and (w != self.width or h != self.height) {
-                self.width = w
-                self.height = h
-                self.resized = true
-            }
-        }
-        XdgToplevel(_, Close) => self.closed = true
-        XdgSurface(x, Configure(serial)) => {
-            x.ack_configure(mut self.c, serial)
-            self.configured = true
-            if self.resized {
-                out.push(types.Event.OutputChanged(0))
-            }
-        }
-        WlCallback(cb, Done(ms)) => {
-            if cb.id == self.frame_cb {
-                self.frame_cb = 0
-                self.seq += 1
-                out.push(types.Event.Presented(0, self.seq, time.now_ns(), 0))
-            }
-        }
-        WlBuffer(b, Release) => {
-            if let Some(sw) = self.swap.take() {
-                var s = sw
-                let i = s.find(b.id)
-                if i >= 0 {
-                    s.free(i)
-                    out.push(types.Event.Released(0))
-                }
-                self.swap = Some(s)
-            }
-            for mut p in self.passed {
-                if p.buffer == b.id {
-                    p.busy = false
-                }
-            }
-        }
-        WlSeat(s, Capabilities(caps)) => {
-            if caps.contains(wl.SeatCapability.Pointer) and self.pointer.id == 0 {
-                self.pointer = s.get_pointer(mut self.c)
-            }
-            if caps.contains(wl.SeatCapability.Keyboard) and self.kb.id == 0 {
-                self.kb = s.get_keyboard(mut self.c)
-            }
-        }
-        WlPointer(_, Enter(serial, _, x, y)) => {
+fn Nested.pointer_event(mut self, ev: wl.PointerEvent, mut out: List[types.Event]) {
+    match ev {
+        Enter(serial, _, x, y) => {
             self.enter_serial = serial
             self.show_cursor()
             out.push(self.motion(x, y))
         }
-        WlPointer(_, Motion(t, x, y)) => out.push(self.motion(x, y))
-        WlPointer(_, Button(_, t, button, st)) => out.push(types.Event.Input(types.Input.Button(t, button, st == wl.PointerButtonState.Pressed)))
-        WlPointer(_, Axis(t, axis, v)) => {
+        Motion(t, x, y) => out.push(self.motion(x, y))
+        Button(_, t, button, st) => out.push(types.Event.Input(types.Input.Button(t, button, st == wl.PointerButtonState.Pressed)))
+        Axis(t, axis, v) => {
             let vertical = axis == wl.PointerAxis.VerticalScroll
             let dx = if vertical { 0.0 } else { v }
             let dy = if vertical { v } else { 0.0 }
             out.push(types.Event.Input(types.Input.Axis(t, types.AxisSource.Finger, dx, dy, 0, 0, false)))
         }
-        WlPointer(_, AxisValue120(axis, v120)) => {
+        AxisValue120(axis, v120) => {
             let vertical = axis == wl.PointerAxis.VerticalScroll
             out.push(types.Event.Input(types.Input.Axis(axis_ms(), types.AxisSource.Wheel, 0.0, 0.0, if vertical { 0 } else { v120 }, if vertical { v120 } else { 0 }, false)))
         }
-        WlKeyboard(_, Keymap(_, f, size)) => {
+        _ => {}
+    }
+}
+
+fn Nested.keyboard_event(mut self, take ev: wl.KeyboardEvent, mut out: List[types.Event]) {
+    match take ev {
+        Keymap(_, f, size) => {
             var ktext = ""
             let sz = int(size)
             if let Ok(m) = os.map(f.raw(), sz, 0, false) {
@@ -279,7 +341,7 @@ fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
                 }
             }
         }
-        WlKeyboard(_, Key(_, t, code, st)) => {
+        Key(_, t, code, st) => {
             let pressed = st == wl.KeyboardKeyState.Pressed
             if let Some(k) = self.keyboard.take() {
                 var kb = k
@@ -288,7 +350,7 @@ fn Nested.event(mut self, take ev: proto.Event, mut out: List[types.Event]) {
                 out.push(types.Event.Input(types.Input.Key(t, code, pressed, sym, text)))
             }
         }
-        WlKeyboard(_, Modifiers(_, d, l, k, g)) => {
+        Modifiers(_, d, l, k, g) => {
             if let Some(kk) = self.keyboard.take() {
                 var kb = kk
                 kb.set_mods(d, l, k, g)

@@ -20,21 +20,24 @@ pub enum ToplevelListRequest {
     Destroy
 }
 
-fn decode_toplevel_list(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelListRequest, wire.Error] {
+pub fn decode_toplevel_list(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelListRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelListRequest.Stop)
+            if rd.valid() {
+                return Ok(ToplevelListRequest.Stop)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ToplevelListRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ToplevelListRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_foreign_toplevel_list_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_foreign_toplevel_list_v1") })
 }
 
 /// a toplevel has been created
@@ -65,17 +68,19 @@ pub enum HandleRequest {
     Destroy
 }
 
-fn decode_handle(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleRequest, wire.Error] {
+pub fn decode_handle(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(HandleRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(HandleRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_foreign_toplevel_handle_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_foreign_toplevel_handle_v1") })
 }
 
 /// the toplevel has been closed
@@ -114,21 +119,24 @@ pub enum ToplevelListEvent {
     Finished
 }
 
-fn decode_toplevel_list_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelListEvent, wire.Error] {
+pub fn decode_toplevel_list_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelListEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let toplevel = Handle { id: rd.new_id(mut conn, handle_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelListEvent.Toplevel(toplevel))
+            if rd.valid() {
+                return Ok(ToplevelListEvent.Toplevel(toplevel))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelListEvent.Finished)
+            if rd.valid() {
+                return Ok(ToplevelListEvent.Finished)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_foreign_toplevel_list_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_foreign_toplevel_list_v1") })
 }
 
 /// stop sending events
@@ -156,35 +164,41 @@ pub enum HandleEvent {
     Identifier(str)
 }
 
-fn decode_handle_event(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleEvent, wire.Error] {
+pub fn decode_handle_event(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Closed)
+            if rd.valid() {
+                return Ok(HandleEvent.Closed)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Done)
+            if rd.valid() {
+                return Ok(HandleEvent.Done)
+            }
         }
         2 => {
             let title = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Title(title))
+            if rd.valid() {
+                return Ok(HandleEvent.Title(title))
+            }
         }
         3 => {
             let app_id = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.AppId(app_id))
+            if rd.valid() {
+                return Ok(HandleEvent.AppId(app_id))
+            }
         }
         4 => {
             let identifier = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Identifier(identifier))
+            if rd.valid() {
+                return Ok(HandleEvent.Identifier(identifier))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_foreign_toplevel_handle_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_foreign_toplevel_handle_v1") })
 }
 
 /// destroy the ext_foreign_toplevel_handle_v1 object

@@ -26,23 +26,26 @@ pub enum ViewporterRequest {
     GetViewport(Viewport, wayland.Surface)
 }
 
-fn decode_viewporter(mut conn: wire.Conn, m: wire.Msg) -> Result[ViewporterRequest, wire.Error] {
+pub fn decode_viewporter(mut conn: wire.Conn, m: wire.Msg) -> Result[ViewporterRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ViewporterRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ViewporterRequest.Destroy)
+            }
         }
         1 => {
             let id = Viewport { id: rd.new_id(mut conn, viewport_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ViewporterRequest.GetViewport(id, surface))
+            if rd.valid() {
+                return Ok(ViewporterRequest.GetViewport(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_viewporter"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_viewporter") })
 }
 
 /// wp_viewport: crop and scale interface to a wl_surface
@@ -75,31 +78,35 @@ pub enum ViewportRequest {
     SetDestination(i32, i32)
 }
 
-fn decode_viewport(mut conn: wire.Conn, m: wire.Msg) -> Result[ViewportRequest, wire.Error] {
+pub fn decode_viewport(mut conn: wire.Conn, m: wire.Msg) -> Result[ViewportRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ViewportRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ViewportRequest.Destroy)
+            }
         }
         1 => {
             let x = rd.fixed(conn)
             let y = rd.fixed(conn)
             let width = rd.fixed(conn)
             let height = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ViewportRequest.SetSource(x, y, width, height))
+            if rd.valid() {
+                return Ok(ViewportRequest.SetSource(x, y, width, height))
+            }
         }
         2 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ViewportRequest.SetDestination(width, height))
+            if rd.valid() {
+                return Ok(ViewportRequest.SetDestination(width, height))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_viewport"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_viewport") })
 }
 
 /// unbind from the cropping and scaling interface

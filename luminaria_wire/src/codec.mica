@@ -183,13 +183,25 @@ pub fn Reader.fd(mut self, mut c: conn.Conn) -> fd.Fd {
     return f
 }
 
+/// Fast check that every argument was valid and consumed.
+pub fn Reader.valid(self) -> bool {
+    return self.ok and self.at == self.end and self.bad_object == 0
+}
+
+/// Cold error path when `Reader.valid()` is false.
+@noinline
+@cold
+pub fn Reader.finish_err(self, mut c: conn.Conn, m: conn.Msg) -> conn.Error {
+    if self.bad_object != 0 {
+        return c.error(m.id, conn.invalid_object, "invalid object {self.bad_object} in request {m.op}")
+    }
+    return c.error(m.id, conn.invalid_method, "invalid arguments for request {m.op}")
+}
+
 /// Check that every argument of message `m` was valid and read.
 pub fn Reader.finish(self, mut c: conn.Conn, m: conn.Msg) -> Result[(), conn.Error] {
-    guard self.bad_object == 0 else {
-        return Err(c.error(m.id, conn.invalid_object, "invalid object {self.bad_object} in request {m.op}"))
-    }
-    guard self.ok and self.at == self.end else {
-        return Err(c.error(m.id, conn.invalid_method, "invalid arguments for request {m.op}"))
+    guard self.valid() else {
+        return Err(self.finish_err(mut c, m))
     }
     return Ok(())
 }

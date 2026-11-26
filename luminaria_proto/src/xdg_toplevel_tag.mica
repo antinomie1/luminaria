@@ -23,29 +23,33 @@ pub enum ToplevelTagManagerRequest {
     SetToplevelDescription(xdg_shell.Toplevel, str)
 }
 
-fn decode_toplevel_tag_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelTagManagerRequest, wire.Error] {
+pub fn decode_toplevel_tag_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelTagManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ToplevelTagManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ToplevelTagManagerRequest.Destroy)
+            }
         }
         1 => {
             let toplevel = xdg_shell.Toplevel { id: rd.object(conn, xdg_shell.toplevel_iface, false) }
             let tag = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelTagManagerRequest.SetToplevelTag(toplevel, tag))
+            if rd.valid() {
+                return Ok(ToplevelTagManagerRequest.SetToplevelTag(toplevel, tag))
+            }
         }
         2 => {
             let toplevel = xdg_shell.Toplevel { id: rd.object(conn, xdg_shell.toplevel_iface, false) }
             let description = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelTagManagerRequest.SetToplevelDescription(toplevel, description))
+            if rd.valid() {
+                return Ok(ToplevelTagManagerRequest.SetToplevelDescription(toplevel, description))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_toplevel_tag_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_toplevel_tag_manager_v1") })
 }
 
 /// destroy toplevel tag object

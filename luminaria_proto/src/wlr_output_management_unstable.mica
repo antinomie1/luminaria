@@ -21,22 +21,25 @@ pub enum ManagerRequest {
     Stop
 }
 
-fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
+pub fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Configuration { id: rd.new_id(mut conn, configuration_iface, m.version) }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.CreateConfiguration(id, serial))
+            if rd.valid() {
+                return Ok(ManagerRequest.CreateConfiguration(id, serial))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.Stop)
+            if rd.valid() {
+                return Ok(ManagerRequest.Stop)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_output_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_output_manager_v1") })
 }
 
 /// introduce a new head
@@ -81,20 +84,22 @@ pub enum HeadRequest {
     Release
 }
 
-fn decode_head(mut conn: wire.Conn, m: wire.Msg) -> Result[HeadRequest, wire.Error] {
+pub fn decode_head(mut conn: wire.Conn, m: wire.Msg) -> Result[HeadRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_head_v1.release needs version 3"))
+                return Err(conn.needs_version(m, "zwlr_output_head_v1.release", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(HeadRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(HeadRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_output_head_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_output_head_v1") })
 }
 
 /// head name
@@ -211,20 +216,22 @@ pub enum ModeRequest {
     Release
 }
 
-fn decode_mode(mut conn: wire.Conn, m: wire.Msg) -> Result[ModeRequest, wire.Error] {
+pub fn decode_mode(mut conn: wire.Conn, m: wire.Msg) -> Result[ModeRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_mode_v1.release needs version 3"))
+                return Err(conn.needs_version(m, "zwlr_output_mode_v1.release", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ModeRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ModeRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_output_mode_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_output_mode_v1") })
 }
 
 /// mode size
@@ -282,36 +289,42 @@ pub enum ConfigurationRequest {
     Destroy
 }
 
-fn decode_configuration(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfigurationRequest, wire.Error] {
+pub fn decode_configuration(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfigurationRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = ConfigurationHead { id: rd.new_id(mut conn, configuration_head_iface, m.version) }
             let head = Head { id: rd.object(conn, head_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationRequest.EnableHead(id, head))
+            if rd.valid() {
+                return Ok(ConfigurationRequest.EnableHead(id, head))
+            }
         }
         1 => {
             let head = Head { id: rd.object(conn, head_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationRequest.DisableHead(head))
+            if rd.valid() {
+                return Ok(ConfigurationRequest.DisableHead(head))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationRequest.Apply)
+            if rd.valid() {
+                return Ok(ConfigurationRequest.Apply)
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationRequest.Test)
+            if rd.valid() {
+                return Ok(ConfigurationRequest.Test)
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ConfigurationRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ConfigurationRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_output_configuration_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_output_configuration_v1") })
 }
 
 /// configuration changes succeeded
@@ -369,48 +382,55 @@ pub enum ConfigurationHeadRequest {
     SetAdaptiveSync(HeadAdaptiveSyncState)
 }
 
-fn decode_configuration_head(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfigurationHeadRequest, wire.Error] {
+pub fn decode_configuration_head(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfigurationHeadRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mode = Mode { id: rd.object(conn, mode_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationHeadRequest.SetMode(mode))
+            if rd.valid() {
+                return Ok(ConfigurationHeadRequest.SetMode(mode))
+            }
         }
         1 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
             let refresh = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationHeadRequest.SetCustomMode(width, height, refresh))
+            if rd.valid() {
+                return Ok(ConfigurationHeadRequest.SetCustomMode(width, height, refresh))
+            }
         }
         2 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationHeadRequest.SetPosition(x, y))
+            if rd.valid() {
+                return Ok(ConfigurationHeadRequest.SetPosition(x, y))
+            }
         }
         3 => {
             let transform = wayland.OutputTransform(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationHeadRequest.SetTransform(transform))
+            if rd.valid() {
+                return Ok(ConfigurationHeadRequest.SetTransform(transform))
+            }
         }
         4 => {
             let scale = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationHeadRequest.SetScale(scale))
+            if rd.valid() {
+                return Ok(ConfigurationHeadRequest.SetScale(scale))
+            }
         }
         5 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_configuration_head_v1.set_adaptive_sync needs version 4"))
+                return Err(conn.needs_version(m, "zwlr_output_configuration_head_v1.set_adaptive_sync", 4))
             }
             let state = HeadAdaptiveSyncState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationHeadRequest.SetAdaptiveSync(state))
+            if rd.valid() {
+                return Ok(ConfigurationHeadRequest.SetAdaptiveSync(state))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_output_configuration_head_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_output_configuration_head_v1") })
 }
 
 /// Events of zwlr_output_manager_v1.
@@ -423,27 +443,31 @@ pub enum ManagerEvent {
     Finished
 }
 
-fn decode_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerEvent, wire.Error] {
+pub fn decode_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let head = Head { id: rd.new_id(mut conn, head_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ManagerEvent.Head(head))
+            if rd.valid() {
+                return Ok(ManagerEvent.Head(head))
+            }
         }
         1 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ManagerEvent.Done(serial))
+            if rd.valid() {
+                return Ok(ManagerEvent.Done(serial))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ManagerEvent.Finished)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ManagerEvent.Finished)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_output_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_output_manager_v1") })
 }
 
 /// create a new output configuration object
@@ -492,95 +516,110 @@ pub enum HeadEvent {
     AdaptiveSync(HeadAdaptiveSyncState)
 }
 
-fn decode_head_event(mut conn: wire.Conn, m: wire.Msg) -> Result[HeadEvent, wire.Error] {
+pub fn decode_head_event(mut conn: wire.Conn, m: wire.Msg) -> Result[HeadEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Name(name))
+            if rd.valid() {
+                return Ok(HeadEvent.Name(name))
+            }
         }
         1 => {
             let description = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Description(description))
+            if rd.valid() {
+                return Ok(HeadEvent.Description(description))
+            }
         }
         2 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.PhysicalSize(width, height))
+            if rd.valid() {
+                return Ok(HeadEvent.PhysicalSize(width, height))
+            }
         }
         3 => {
             let mode = Mode { id: rd.new_id(mut conn, mode_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Mode(mode))
+            if rd.valid() {
+                return Ok(HeadEvent.Mode(mode))
+            }
         }
         4 => {
             let enabled = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Enabled(enabled))
+            if rd.valid() {
+                return Ok(HeadEvent.Enabled(enabled))
+            }
         }
         5 => {
             let mode = Mode { id: rd.object(conn, mode_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.CurrentMode(mode))
+            if rd.valid() {
+                return Ok(HeadEvent.CurrentMode(mode))
+            }
         }
         6 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Position(x, y))
+            if rd.valid() {
+                return Ok(HeadEvent.Position(x, y))
+            }
         }
         7 => {
             let transform = wayland.OutputTransform(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Transform(transform))
+            if rd.valid() {
+                return Ok(HeadEvent.Transform(transform))
+            }
         }
         8 => {
             let scale = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Scale(scale))
+            if rd.valid() {
+                return Ok(HeadEvent.Scale(scale))
+            }
         }
         9 => {
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Finished)
+            if rd.valid() {
+                return Ok(HeadEvent.Finished)
+            }
         }
         10 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_head_v1.make needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_output_head_v1.make", 2))
             }
             let make = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Make(make))
+            if rd.valid() {
+                return Ok(HeadEvent.Make(make))
+            }
         }
         11 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_head_v1.model needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_output_head_v1.model", 2))
             }
             let model = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.Model(model))
+            if rd.valid() {
+                return Ok(HeadEvent.Model(model))
+            }
         }
         12 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_head_v1.serial_number needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_output_head_v1.serial_number", 2))
             }
             let serial_number = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.SerialNumber(serial_number))
+            if rd.valid() {
+                return Ok(HeadEvent.SerialNumber(serial_number))
+            }
         }
         13 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_output_head_v1.adaptive_sync needs version 4"))
+                return Err(conn.needs_version(m, "zwlr_output_head_v1.adaptive_sync", 4))
             }
             let state = HeadAdaptiveSyncState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(HeadEvent.AdaptiveSync(state))
+            if rd.valid() {
+                return Ok(HeadEvent.AdaptiveSync(state))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_output_head_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_output_head_v1") })
 }
 
 /// destroy the head object
@@ -604,31 +643,36 @@ pub enum ModeEvent {
     Finished
 }
 
-fn decode_mode_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ModeEvent, wire.Error] {
+pub fn decode_mode_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ModeEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ModeEvent.Size(width, height))
+            if rd.valid() {
+                return Ok(ModeEvent.Size(width, height))
+            }
         }
         1 => {
             let refresh = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ModeEvent.Refresh(refresh))
+            if rd.valid() {
+                return Ok(ModeEvent.Refresh(refresh))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(ModeEvent.Preferred)
+            if rd.valid() {
+                return Ok(ModeEvent.Preferred)
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(ModeEvent.Finished)
+            if rd.valid() {
+                return Ok(ModeEvent.Finished)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_output_mode_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_output_mode_v1") })
 }
 
 /// destroy the mode object
@@ -650,24 +694,28 @@ pub enum ConfigurationEvent {
     Cancelled
 }
 
-fn decode_configuration_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfigurationEvent, wire.Error] {
+pub fn decode_configuration_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ConfigurationEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationEvent.Succeeded)
+            if rd.valid() {
+                return Ok(ConfigurationEvent.Succeeded)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationEvent.Failed)
+            if rd.valid() {
+                return Ok(ConfigurationEvent.Failed)
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(ConfigurationEvent.Cancelled)
+            if rd.valid() {
+                return Ok(ConfigurationEvent.Cancelled)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_output_configuration_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_output_configuration_v1") })
 }
 
 /// enable and configure a head

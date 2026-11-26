@@ -853,3 +853,356 @@ test "output queued for a client that stopped reading goes out once it reads" {
     assert_eq(done, n)
     p.close()
 }
+
+fn solid_shm_buffer(mut f: Fx, w: i32, h: i32, b: u8, g: u8, r: u8, a: u8) -> wl.Buffer {
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+    let size = int(w) * int(h) * 4
+    let fd = os.memfd("solid", size).expect("memfd")
+    var m = os.map(fd, size, 0, true).expect("map")
+    let px = m.bytes()
+    for i in 0..int(w) * int(h) {
+        px[i * 4] = b
+        px[i * 4 + 1] = g
+        px[i * 4 + 2] = r
+        px[i * 4 + 3] = a
+    }
+    let fmt = if a == u8(255) { wl.ShmFormat.Xrgb8888 } else { wl.ShmFormat.Argb8888 }
+    let buf = shm.create_pool(mut f.c, fd, i32(size)).create_buffer(mut f.c, 0, w, h, w * 4, fmt)
+    os.close(fd)
+    return buf
+}
+
+fn setup_two() -> Option[Fx] {
+    let dir = fs.create_temp_dir("luminaria-shell2").expect("temp dir")
+    discard env.set("XDG_RUNTIME_DIR", dir)
+    let m = lum.Mode { width: 128, height: 96, refresh_mhz: 60000 }
+    match lum.open(lum.Options { backend: lum.Kind.Headless, headless: [m, m] }) {
+        Ok(d) => {
+            let c = wire.connect(d.socket()).expect("connect")
+            return Some(Fx { d, c })
+        }
+        Err(e) => {
+            io.eprint("skipped: {e}")
+            return None
+        }
+    }
+}
+
+test "fullscreen toplevel renders above Layer.Top, gets pointer hits, stays below Layer.Overlay, and restores on exit" {
+    guard let Some(fx) = setup() else {
+        return
+    }
+    var f = fx
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 2) }
+    let shell = ls.Shell { id: bind(mut f, ls.shell_iface, 5) }
+    let out = wl.Output { id: bind(mut f, wl.output_iface, 4) }
+    let out_srcs = ics.OutputImageCaptureSourceManager { id: bind(mut f, ics.output_image_capture_source_manager_iface, 1) }
+    let cap_mgr = icc.Manager { id: bind(mut f, icc.manager_iface, 1) }
+    let shm = wl.Shm { id: bind(mut f, wl.shm_iface, 1) }
+
+    // 1. Map a bright RED Layer.Top panel along the top 30px with exclusive zone 30.
+    let top_surf = comp.create_surface(mut f.c)
+    let top_layer = shell.get_layer_surface(mut f.c, top_surf, None, ls.ShellLayer.Top, "bar")
+    top_layer.set_anchor(mut f.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    top_layer.set_size(mut f.c, 0, 30)
+    top_layer.set_exclusive_zone(mut f.c, 30)
+    top_layer.set_keyboard_interactivity(mut f.c, ls.SurfaceKeyboardInteractivity.OnDemand)
+    top_surf.commit(mut f.c)
+    var top_serial: u32 = 0
+    for e in pump(mut f, 80) {
+        match e {
+            ZwlrLayerSurface(lsurf, Configure(s, _, _)) => {
+                if lsurf.id == top_layer.id {
+                    top_serial = s
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(top_serial != 0)
+    top_layer.ack_configure(mut f.c, top_serial)
+    top_surf.attach(mut f.c, Some(solid_shm_buffer(mut f, 128, 30, 0, 0, 255, 255)), 0, 0)
+    top_surf.commit(mut f.c)
+    discard pump(mut f, 80)
+    let o0 = f.d.outputs()[0]
+    assert_eq(f.d.usable(o0), (0.0, 30.0, 128.0, 66.0))
+
+    // 2. Map a bright BLUE opaque toplevel window (128x96) at (0, 0) in normal (non-fullscreen) state.
+    let win_surf = comp.create_surface(mut f.c)
+    let win_xs = wm.get_xdg_surface(mut f.c, win_surf)
+    let win_tl = win_xs.get_toplevel(mut f.c)
+    win_tl.set_app_id(mut f.c, "minecraft")
+    win_surf.commit(mut f.c)
+    for e in pump(mut f, 60) {
+        match e {
+            XdgSurface(s, Configure(ser)) => {
+                if s.id == win_xs.id {
+                    s.ack_configure(mut f.c, ser)
+                }
+            }
+            _ => {}
+        }
+    }
+    win_surf.attach(mut f.c, Some(solid_shm_buffer(mut f, 128, 96, 255, 0, 0, 255)), 0, 0)
+    win_surf.commit(mut f.c)
+    discard pump(mut f, 80)
+    var win_opt: Option[lum.Window] = None
+    for e in f.seen.clone() {
+        match e {
+            WindowMapped(w) => win_opt = Some(w)
+            _ => {}
+        }
+    }
+    let win = win_opt.expect("mapped window")
+    f.d.layout(fn(mut l) {
+        l.window(win, 0.0, 0.0, lum.Style {})
+    })
+    discard pump(mut f, 80)
+
+    // Non-fullscreen: Layer.Top (RED) covers top 30px and intercepts pointer hits; window (BLUE) shows below.
+    let p_top = (10 * 128 + 16) * 4
+    let p_mid = (60 * 128 + 16) * 4
+    let px_norm = f.d.read_output(o0).expect("read normal")
+    assert_eq((px_norm[p_top], px_norm[p_top + 1], px_norm[p_top + 2]), (u8(0), u8(0), u8(255)))
+    assert_eq((px_norm[p_mid], px_norm[p_mid + 1], px_norm[p_mid + 2]), (u8(255), u8(0), u8(0)))
+    assert(f.d.window_at(16.0, 10.0).is_none())
+    assert_eq(f.d.window_at(16.0, 60.0), Some(win))
+
+    // 3. Enter fullscreen: window MUST render above Layer.Top, receive pointer hits at (16, 10),
+    //    preserve usable exclusive zone, and show above Layer.Top in screen capture.
+    win_tl.set_fullscreen(mut f.c, None)
+    for e in pump(mut f, 80) {
+        match e {
+            XdgSurface(s, Configure(ser)) => {
+                if s.id == win_xs.id {
+                    s.ack_configure(mut f.c, ser)
+                }
+            }
+            _ => {}
+        }
+    }
+    win_surf.commit(mut f.c)
+    discard pump(mut f, 80)
+    let px_fs = f.d.read_output(o0).expect("read fullscreen")
+    assert_eq((px_fs[p_top], px_fs[p_top + 1], px_fs[p_top + 2]), (u8(255), u8(0), u8(0)))
+    assert_eq(f.d.window_at(16.0, 10.0), Some(win))
+    assert_eq(f.d.usable(o0), (0.0, 30.0, 128.0, 66.0))
+
+    // Output capture while fullscreen also shows BLUE (not RED Layer.Top) at (16, 10).
+    let osess = cap_mgr.create_session(mut f.c, out_srcs.create_source(mut f.c, out), icc.ManagerOptions(0))
+    discard pump(mut f, 50)
+    let csize = 128 * 96 * 4
+    let cfd = os.memfd("cap-fs", csize).expect("memfd")
+    var cmap = os.map(cfd, csize, 0, true).expect("map")
+    let cbuf = shm.create_pool(mut f.c, cfd, i32(csize)).create_buffer(mut f.c, 0, 128, 96, 128 * 4, wl.ShmFormat.Xrgb8888)
+    os.close(cfd)
+    let fr = osess.create_frame(mut f.c)
+    fr.attach_buffer(mut f.c, cbuf)
+    fr.damage_buffer(mut f.c, 0, 0, 128, 96)
+    fr.capture(mut f.c)
+    assert(pump(mut f, 200).any(fn(e) => match e {
+        ExtImageCopyCaptureFrame(_, Ready) => true
+        _ => false
+    }))
+    let cpx = cmap.bytes()
+    assert_eq((cpx[p_top], cpx[p_top + 1], cpx[p_top + 2]), (u8(255), u8(0), u8(0)))
+
+    // 4. Map a bright GREEN Layer.Overlay surface at top-right (88..128, 0..20): MUST stay above fullscreen!
+    let ov_surf = comp.create_surface(mut f.c)
+    let ov_layer = shell.get_layer_surface(mut f.c, ov_surf, None, ls.ShellLayer.Overlay, "osd")
+    ov_layer.set_anchor(mut f.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Right)
+    ov_layer.set_size(mut f.c, 40, 20)
+    ov_layer.set_exclusive_zone(mut f.c, -1)
+    ov_surf.commit(mut f.c)
+    var ov_serial: u32 = 0
+    for e in pump(mut f, 80) {
+        match e {
+            ZwlrLayerSurface(lsurf, Configure(s, _, _)) => {
+                if lsurf.id == ov_layer.id {
+                    ov_serial = s
+                }
+            }
+            _ => {}
+        }
+    }
+    assert(ov_serial != 0)
+    ov_layer.ack_configure(mut f.c, ov_serial)
+    ov_surf.attach(mut f.c, Some(solid_shm_buffer(mut f, 40, 20, 0, 255, 0, 255)), 0, 0)
+    ov_surf.commit(mut f.c)
+    discard pump(mut f, 80)
+    let p_ov = (10 * 128 + 100) * 4
+    let px_ov = f.d.read_output(o0).expect("read overlay")
+    // Top-left (16, 10): still BLUE fullscreen above Layer.Top; top-right (100, 10): GREEN Layer.Overlay above fullscreen!
+    assert_eq((px_ov[p_top], px_ov[p_top + 1], px_ov[p_top + 2]), (u8(255), u8(0), u8(0)))
+    assert_eq((px_ov[p_ov], px_ov[p_ov + 1], px_ov[p_ov + 2]), (u8(0), u8(255), u8(0)))
+    assert_eq(f.d.window_at(16.0, 10.0), Some(win))
+    assert(f.d.window_at(100.0, 10.0).is_none())
+    ov_layer.destroy(mut f.c)
+    ov_surf.destroy(mut f.c)
+    discard pump(mut f, 60)
+
+    // 5. Scaled Overview thumbnail (scale < 0.99) keeps Layer.Top visible even while window state is fullscreen.
+    f.d.layout(fn(mut l) {
+        l.window(win, 0.0, 0.0, lum.Style { scale: 0.5 })
+    })
+    discard pump(mut f, 80)
+    let px_scaled = f.d.read_output(o0).expect("read scaled")
+    assert_eq((px_scaled[p_top], px_scaled[p_top + 1], px_scaled[p_top + 2]), (u8(0), u8(0), u8(255)))
+    f.d.layout(fn(mut l) {
+        l.window(win, 0.0, 0.0, lum.Style {})
+    })
+    discard pump(mut f, 80)
+
+    // 6. Exit fullscreen: Layer.Top immediately returns above the normal window with exclusive zone intact.
+    win_tl.unset_fullscreen(mut f.c)
+    for e in pump(mut f, 80) {
+        match e {
+            XdgSurface(s, Configure(ser)) => {
+                if s.id == win_xs.id {
+                    s.ack_configure(mut f.c, ser)
+                }
+            }
+            _ => {}
+        }
+    }
+    win_surf.commit(mut f.c)
+    discard pump(mut f, 80)
+    let px_exit = f.d.read_output(o0).expect("read exit")
+    assert_eq((px_exit[p_top], px_exit[p_top + 1], px_exit[p_top + 2]), (u8(0), u8(0), u8(255)))
+    assert(f.d.window_at(16.0, 10.0).is_none())
+    assert_eq(f.d.usable(o0), (0.0, 30.0, 128.0, 66.0))
+}
+
+test "fullscreen Layer.Top suppression is per-output and releases occluded exclusive keyboard grab" {
+    guard let Some(fx) = setup_two() else {
+        return
+    }
+    var f = fx
+    let comp = wl.Compositor { id: bind(mut f, wl.compositor_iface, 6) }
+    let wm = xdg.WmBase { id: bind(mut f, xdg.wm_base_iface, 2) }
+    let shell = ls.Shell { id: bind(mut f, ls.shell_iface, 5) }
+    let seat = wl.Seat { id: bind(mut f, wl.seat_iface, 7) }
+    let kb = seat.get_keyboard(mut f.c)
+
+    // Bind both wl_output globals.
+    var wl_outs: List[wl.Output] = []
+    for (n, iface) in f.globals.clone() {
+        if iface == wl.output_iface {
+            wl_outs.push(wl.Output { id: f.reg.bind(mut f.c, n, wl.output_iface, 4) })
+        }
+    }
+    assert_eq(wl_outs.len(), 2)
+    discard pump(mut f, 40)
+
+    // Place a RED Layer.Top panel on output 0 (exclusive keyboard) and a RED Layer.Top panel on output 1.
+    let s_top0 = comp.create_surface(mut f.c)
+    let l_top0 = shell.get_layer_surface(mut f.c, s_top0, Some(wl_outs[0]), ls.ShellLayer.Top, "bar0")
+    l_top0.set_anchor(mut f.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    l_top0.set_size(mut f.c, 0, 30)
+    l_top0.set_keyboard_interactivity(mut f.c, ls.SurfaceKeyboardInteractivity.Exclusive)
+    s_top0.commit(mut f.c)
+
+    let s_top1 = comp.create_surface(mut f.c)
+    let l_top1 = shell.get_layer_surface(mut f.c, s_top1, Some(wl_outs[1]), ls.ShellLayer.Top, "bar1")
+    l_top1.set_anchor(mut f.c, ls.SurfaceAnchor.Top | ls.SurfaceAnchor.Left | ls.SurfaceAnchor.Right)
+    l_top1.set_size(mut f.c, 0, 30)
+    s_top1.commit(mut f.c)
+
+    var ser0: u32 = 0
+    var ser1: u32 = 0
+    for e in pump(mut f, 80) {
+        match e {
+            ZwlrLayerSurface(lsurf, Configure(s, _, _)) => {
+                if lsurf.id == l_top0.id {
+                    ser0 = s
+                } else if lsurf.id == l_top1.id {
+                    ser1 = s
+                }
+            }
+            _ => {}
+        }
+    }
+    l_top0.ack_configure(mut f.c, ser0)
+    s_top0.attach(mut f.c, Some(solid_shm_buffer(mut f, 128, 30, 0, 0, 255, 255)), 0, 0)
+    s_top0.commit(mut f.c)
+    l_top1.ack_configure(mut f.c, ser1)
+    s_top1.attach(mut f.c, Some(solid_shm_buffer(mut f, 128, 30, 0, 0, 255, 255)), 0, 0)
+    s_top1.commit(mut f.c)
+    discard pump(mut f, 80)
+
+    // Map BLUE window on output 0 and GREEN window on output 1.
+    let s0 = comp.create_surface(mut f.c)
+    let xs0 = wm.get_xdg_surface(mut f.c, s0)
+    let tl0 = xs0.get_toplevel(mut f.c)
+    s0.commit(mut f.c)
+    let s1 = comp.create_surface(mut f.c)
+    let xs1 = wm.get_xdg_surface(mut f.c, s1)
+    let tl1 = xs1.get_toplevel(mut f.c)
+    s1.commit(mut f.c)
+    for e in pump(mut f, 60) {
+        match e {
+            XdgSurface(s, Configure(ser)) => s.ack_configure(mut f.c, ser)
+            _ => {}
+        }
+    }
+    s0.attach(mut f.c, Some(solid_shm_buffer(mut f, 128, 96, 255, 0, 0, 255)), 0, 0)
+    s0.commit(mut f.c)
+    s1.attach(mut f.c, Some(solid_shm_buffer(mut f, 128, 96, 0, 255, 0, 255)), 0, 0)
+    s1.commit(mut f.c)
+    discard pump(mut f, 80)
+    var wins: List[lum.Window] = []
+    for e in f.seen.clone() {
+        match e {
+            WindowMapped(w) => wins.push(w)
+            _ => {}
+        }
+    }
+    assert_eq(wins.len(), 2)
+    let w0 = wins[0]
+    let w1 = wins[1]
+    let outs = f.d.outputs()
+    let (o0x, o0y, _, _) = f.d.output_rect(outs[0])
+    let (o1x, o1y, _, _) = f.d.output_rect(outs[1])
+    f.d.focus(Some(w0))
+    f.d.layout(fn(mut l) {
+        l.window_on(w0, outs[0], o0x, o0y, lum.Style {})
+        l.window_on(w1, outs[1], o1x, o1y, lum.Style {})
+    })
+    discard pump(mut f, 80)
+
+    // Fullscreen ONLY w0 on output 0: output 0 shows BLUE above Layer.Top and returns keyboard focus to s0;
+    // output 1 keeps RED Layer.Top above normal w1.
+    var kb_entered: u32 = 0
+    tl0.set_fullscreen(mut f.c, Some(wl_outs[0]))
+    for e in pump(mut f, 100) {
+        match e {
+            XdgSurface(s, Configure(ser)) => s.ack_configure(mut f.c, ser)
+            WlKeyboard(k, Enter(_, surf, _)) => {
+                if k.id == kb.id {
+                    kb_entered = surf.id
+                }
+            }
+            _ => {}
+        }
+    }
+    s0.commit(mut f.c)
+    for e in pump(mut f, 100) {
+        match e {
+            WlKeyboard(k, Enter(_, surf, _)) => {
+                if k.id == kb.id {
+                    kb_entered = surf.id
+                }
+            }
+            _ => {}
+        }
+    }
+    let p_top = (10 * 128 + 16) * 4
+    let px0 = f.d.read_output(outs[0]).expect("read out0")
+    let px1 = f.d.read_output(outs[1]).expect("read out1")
+    assert_eq((px0[p_top], px0[p_top + 1], px0[p_top + 2]), (u8(255), u8(0), u8(0)))
+    assert_eq((px1[p_top], px1[p_top + 1], px1[p_top + 2]), (u8(0), u8(0), u8(255)))
+    assert_eq(f.d.window_at(o0x + 16.0, o0y + 10.0), Some(w0))
+    assert(f.d.window_at(o1x + 16.0, o1y + 10.0).is_none())
+    assert_eq(kb_entered, s0.id)
+}

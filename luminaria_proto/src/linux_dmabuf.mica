@@ -25,39 +25,44 @@ pub enum DmabufRequest {
     GetSurfaceFeedback(DmabufFeedback, wayland.Surface)
 }
 
-fn decode_dmabuf(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufRequest, wire.Error] {
+pub fn decode_dmabuf(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DmabufRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DmabufRequest.Destroy)
+            }
         }
         1 => {
             let params_id = BufferParams { id: rd.new_id(mut conn, buffer_params_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DmabufRequest.CreateParams(params_id))
+            if rd.valid() {
+                return Ok(DmabufRequest.CreateParams(params_id))
+            }
         }
         2 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_linux_dmabuf_v1.get_default_feedback needs version 4"))
+                return Err(conn.needs_version(m, "zwp_linux_dmabuf_v1.get_default_feedback", 4))
             }
             let id = DmabufFeedback { id: rd.new_id(mut conn, dmabuf_feedback_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DmabufRequest.GetDefaultFeedback(id))
+            if rd.valid() {
+                return Ok(DmabufRequest.GetDefaultFeedback(id))
+            }
         }
         3 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_linux_dmabuf_v1.get_surface_feedback needs version 4"))
+                return Err(conn.needs_version(m, "zwp_linux_dmabuf_v1.get_surface_feedback", 4))
             }
             let id = DmabufFeedback { id: rd.new_id(mut conn, dmabuf_feedback_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(DmabufRequest.GetSurfaceFeedback(id, surface))
+            if rd.valid() {
+                return Ok(DmabufRequest.GetSurfaceFeedback(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_linux_dmabuf_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_linux_dmabuf_v1") })
 }
 
 /// supported buffer format
@@ -131,13 +136,15 @@ pub enum BufferParamsRequest {
     SetSamplingDevice(List[u8])
 }
 
-fn decode_buffer_params(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferParamsRequest, wire.Error] {
+pub fn decode_buffer_params(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferParamsRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(BufferParamsRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(BufferParamsRequest.Destroy)
+            }
         }
         1 => {
             let fd = rd.fd(mut conn)
@@ -146,40 +153,44 @@ fn decode_buffer_params(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferParams
             let stride = rd.u32(conn)
             let modifier_hi = rd.u32(conn)
             let modifier_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(BufferParamsRequest.Add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo))
+            if rd.valid() {
+                return Ok(BufferParamsRequest.Add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo))
+            }
         }
         2 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
             let format = rd.u32(conn)
             let flags = BufferParamsFlags(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(BufferParamsRequest.Create(width, height, format, flags))
+            if rd.valid() {
+                return Ok(BufferParamsRequest.Create(width, height, format, flags))
+            }
         }
         3 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_linux_buffer_params_v1.create_immed needs version 2"))
+                return Err(conn.needs_version(m, "zwp_linux_buffer_params_v1.create_immed", 2))
             }
             let buffer_id = wayland.Buffer { id: rd.new_id(mut conn, wayland.buffer_iface, m.version) }
             let width = rd.i32(conn)
             let height = rd.i32(conn)
             let format = rd.u32(conn)
             let flags = BufferParamsFlags(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(BufferParamsRequest.CreateImmed(buffer_id, width, height, format, flags))
+            if rd.valid() {
+                return Ok(BufferParamsRequest.CreateImmed(buffer_id, width, height, format, flags))
+            }
         }
         4 => {
             guard m.version >= 6 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_linux_buffer_params_v1.set_sampling_device needs version 6"))
+                return Err(conn.needs_version(m, "zwp_linux_buffer_params_v1.set_sampling_device", 6))
             }
             let device = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(BufferParamsRequest.SetSamplingDevice(device))
+            if rd.valid() {
+                return Ok(BufferParamsRequest.SetSamplingDevice(device))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_linux_buffer_params_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_linux_buffer_params_v1") })
 }
 
 /// buffer creation succeeded
@@ -218,17 +229,19 @@ pub enum DmabufFeedbackRequest {
     Destroy
 }
 
-fn decode_dmabuf_feedback(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufFeedbackRequest, wire.Error] {
+pub fn decode_dmabuf_feedback(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufFeedbackRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DmabufFeedbackRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DmabufFeedbackRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_linux_dmabuf_feedback_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_linux_dmabuf_feedback_v1") })
 }
 
 /// all feedback has been sent
@@ -280,27 +293,30 @@ pub enum DmabufEvent {
     Modifier(u32, u32, u32)
 }
 
-fn decode_dmabuf_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufEvent, wire.Error] {
+pub fn decode_dmabuf_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let format = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DmabufEvent.Format(format))
+            if rd.valid() {
+                return Ok(DmabufEvent.Format(format))
+            }
         }
         1 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwp_linux_dmabuf_v1.modifier needs version 3"))
+                return Err(conn.needs_version(m, "zwp_linux_dmabuf_v1.modifier", 3))
             }
             let format = rd.u32(conn)
             let modifier_hi = rd.u32(conn)
             let modifier_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DmabufEvent.Modifier(format, modifier_hi, modifier_lo))
+            if rd.valid() {
+                return Ok(DmabufEvent.Modifier(format, modifier_hi, modifier_lo))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_linux_dmabuf_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_linux_dmabuf_v1") })
 }
 
 /// unbind the factory
@@ -348,21 +364,24 @@ pub enum BufferParamsEvent {
     Failed
 }
 
-fn decode_buffer_params_event(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferParamsEvent, wire.Error] {
+pub fn decode_buffer_params_event(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferParamsEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let buffer = wayland.Buffer { id: rd.new_id(mut conn, wayland.buffer_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(BufferParamsEvent.Created(buffer))
+            if rd.valid() {
+                return Ok(BufferParamsEvent.Created(buffer))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(BufferParamsEvent.Failed)
+            if rd.valid() {
+                return Ok(BufferParamsEvent.Failed)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_linux_buffer_params_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_linux_buffer_params_v1") })
 }
 
 /// delete this object, used or not
@@ -433,46 +452,54 @@ pub enum DmabufFeedbackEvent {
     TrancheFlags(DmabufFeedbackTrancheFlags)
 }
 
-fn decode_dmabuf_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufFeedbackEvent, wire.Error] {
+pub fn decode_dmabuf_feedback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DmabufFeedbackEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.Done)
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.Done)
+            }
         }
         1 => {
             let fd = rd.fd(mut conn)
             let size = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.FormatTable(fd, size))
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.FormatTable(fd, size))
+            }
         }
         2 => {
             let device = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.MainDevice(device))
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.MainDevice(device))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.TrancheDone)
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.TrancheDone)
+            }
         }
         4 => {
             let device = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.TrancheTargetDevice(device))
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.TrancheTargetDevice(device))
+            }
         }
         5 => {
             let indices = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.TrancheFormats(indices))
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.TrancheFormats(indices))
+            }
         }
         6 => {
             let flags = DmabufFeedbackTrancheFlags(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(DmabufFeedbackEvent.TrancheFlags(flags))
+            if rd.valid() {
+                return Ok(DmabufFeedbackEvent.TrancheFlags(flags))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwp_linux_dmabuf_feedback_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwp_linux_dmabuf_feedback_v1") })
 }
 
 /// destroy the feedback object

@@ -68,9 +68,11 @@ fn resize_step[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], f
     }
     match d.manip.active {
         Resize(w, edges, sx, sy, w0, h0, _, _) => {
-            guard let Some(cur) = d.wins.get(w) else {
+            let wi = d.win_idx(w)
+            guard wi >= 0 else {
                 return
             }
+            let cur = d.wins[wi]
             guard force or not cur.inflight else {
                 return
             }
@@ -94,9 +96,11 @@ fn needs_resize_sync[O: plug.Output, R: plug.Renderer](d: display.Display[O, R])
     }
     return match d.manip.active {
         Resize(w, edges, sx, sy, w0, h0, _, _) => {
-            guard let Some(cur) = d.wins.get(w) else {
+            let wi = d.win_idx(w)
+            guard wi >= 0 else {
                 return false
             }
+            let cur = d.wins[wi]
             let (nw, nh) = resize_target(d, w, edges, sx, sy, w0, h0)
             return nw != cur.width or nh != cur.height
         }
@@ -121,19 +125,23 @@ fn resize_offset[O: plug.Output, R: plug.Renderer](d: display.Display[O, R], w: 
     return (win.off_x, win.off_y)
 }
 
+@noinline
 fn end_manipulation[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     match d.manip.active {
         Move(w, _, _, _, _) => {
-            let cur = d.wins.get(w).unwrap_or(display.Win {})
-            d.emit(display.Event.Moved(w, cur.off_x, cur.off_y))
+            let wi = d.win_idx(w)
+            let (ox, oy) = if wi >= 0 { (d.wins[wi].off_x, d.wins[wi].off_y) } else { (0.0, 0.0) }
+            d.emit(display.Event.Moved(w, ox, oy))
         }
         Resize(w, edges, _, _, w0, h0, ox, oy) => {
-            let cur = d.wins.get(w).unwrap_or(display.Win {})
+            let wi = d.win_ensure(w)
+            let cur = d.wins[wi]
             let rw = if cur.width > 0 { cur.width } else { w0 }
             let rh = if cur.height > 0 { cur.height } else { h0 }
             let fx = if edges & 4 != 0 and rw > 0 { ox + f64(w0 - rw) } else { ox }
             let fy = if edges & 1 != 0 and rh > 0 { oy + f64(h0 - rh) } else { oy }
-            discard d.wins.insert(w, display.Win { off_x: fx, off_y: fy, ..cur })
+            d.wins[wi].off_x = fx
+            d.wins[wi].off_y = fy
             var st = cur.states
             st.resizing = false
             discard d.configure(w, rw, rh, st)
@@ -187,9 +195,10 @@ fn drag_changed[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], 
         let next = now.map(fn(x) => x.0)
         if was != next {
             if let Some(w) = was {
-                let cur = d.wins.get(w).unwrap_or(display.Win {})
+                let wi = d.win_idx(w)
+                let (ox, oy) = if wi >= 0 { (d.wins[wi].off_x, d.wins[wi].off_y) } else { (0.0, 0.0) }
                 d.manip.offsets_done = true
-                d.emit(display.Event.Moved(w, cur.off_x, cur.off_y))
+                d.emit(display.Event.Moved(w, ox, oy))
             }
             if let Some(w) = next {
                 d.emit(display.Event.WindowDragged(w))

@@ -19,16 +19,18 @@ pub enum ManagerRequest {
     Stop
 }
 
-fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
+pub fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.Stop)
+            if rd.valid() {
+                return Ok(ManagerRequest.Stop)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_foreign_toplevel_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_foreign_toplevel_manager_v1") })
 }
 
 /// a toplevel has been created
@@ -95,33 +97,40 @@ pub enum HandleRequest {
     UnsetFullscreen
 }
 
-fn decode_handle(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleRequest, wire.Error] {
+pub fn decode_handle(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.SetMaximized)
+            if rd.valid() {
+                return Ok(HandleRequest.SetMaximized)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.UnsetMaximized)
+            if rd.valid() {
+                return Ok(HandleRequest.UnsetMaximized)
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.SetMinimized)
+            if rd.valid() {
+                return Ok(HandleRequest.SetMinimized)
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.UnsetMinimized)
+            if rd.valid() {
+                return Ok(HandleRequest.UnsetMinimized)
+            }
         }
         4 => {
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.Activate(seat))
+            if rd.valid() {
+                return Ok(HandleRequest.Activate(seat))
+            }
         }
         5 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.Close)
+            if rd.valid() {
+                return Ok(HandleRequest.Close)
+            }
         }
         6 => {
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
@@ -129,33 +138,37 @@ fn decode_handle(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleRequest, wire
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.SetRectangle(surface, x, y, width, height))
+            if rd.valid() {
+                return Ok(HandleRequest.SetRectangle(surface, x, y, width, height))
+            }
         }
         7 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(HandleRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(HandleRequest.Destroy)
+            }
         }
         8 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_foreign_toplevel_handle_v1.set_fullscreen needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_foreign_toplevel_handle_v1.set_fullscreen", 2))
             }
             let output_raw = rd.object(conn, wayland.output_iface, true)
             let output: Option[wayland.Output] = if output_raw == 0 { None } else { Some(wayland.Output { id: output_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.SetFullscreen(output))
+            if rd.valid() {
+                return Ok(HandleRequest.SetFullscreen(output))
+            }
         }
         9 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_foreign_toplevel_handle_v1.unset_fullscreen needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_foreign_toplevel_handle_v1.unset_fullscreen", 2))
             }
-            try rd.finish(mut conn, m)
-            return Ok(HandleRequest.UnsetFullscreen)
+            if rd.valid() {
+                return Ok(HandleRequest.UnsetFullscreen)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_foreign_toplevel_handle_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_foreign_toplevel_handle_v1") })
 }
 
 /// title change
@@ -215,22 +228,25 @@ pub enum ManagerEvent {
     Finished
 }
 
-fn decode_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerEvent, wire.Error] {
+pub fn decode_manager_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let toplevel = Handle { id: rd.new_id(mut conn, handle_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ManagerEvent.Toplevel(toplevel))
+            if rd.valid() {
+                return Ok(ManagerEvent.Toplevel(toplevel))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ManagerEvent.Finished)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ManagerEvent.Finished)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_foreign_toplevel_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_foreign_toplevel_manager_v1") })
 }
 
 /// stop sending events
@@ -258,54 +274,63 @@ pub enum HandleEvent {
     Parent(Option[Handle])
 }
 
-fn decode_handle_event(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleEvent, wire.Error] {
+pub fn decode_handle_event(mut conn: wire.Conn, m: wire.Msg) -> Result[HandleEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let title = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Title(title))
+            if rd.valid() {
+                return Ok(HandleEvent.Title(title))
+            }
         }
         1 => {
             let app_id = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.AppId(app_id))
+            if rd.valid() {
+                return Ok(HandleEvent.AppId(app_id))
+            }
         }
         2 => {
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.OutputEnter(output))
+            if rd.valid() {
+                return Ok(HandleEvent.OutputEnter(output))
+            }
         }
         3 => {
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.OutputLeave(output))
+            if rd.valid() {
+                return Ok(HandleEvent.OutputLeave(output))
+            }
         }
         4 => {
             let state = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.State(state))
+            if rd.valid() {
+                return Ok(HandleEvent.State(state))
+            }
         }
         5 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Done)
+            if rd.valid() {
+                return Ok(HandleEvent.Done)
+            }
         }
         6 => {
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Closed)
+            if rd.valid() {
+                return Ok(HandleEvent.Closed)
+            }
         }
         7 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_foreign_toplevel_handle_v1.parent needs version 3"))
+                return Err(conn.needs_version(m, "zwlr_foreign_toplevel_handle_v1.parent", 3))
             }
             let parent_raw = rd.object(conn, handle_iface, true)
             let parent: Option[Handle] = if parent_raw == 0 { None } else { Some(Handle { id: parent_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(HandleEvent.Parent(parent))
+            if rd.valid() {
+                return Ok(HandleEvent.Parent(parent))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zwlr_foreign_toplevel_handle_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zwlr_foreign_toplevel_handle_v1") })
 }
 
 /// requests that the toplevel be maximized

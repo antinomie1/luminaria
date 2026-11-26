@@ -21,23 +21,26 @@ pub enum OutputManagerRequest {
     GetXdgOutput(Output, wayland.Output)
 }
 
-fn decode_output_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputManagerRequest, wire.Error] {
+pub fn decode_output_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(OutputManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(OutputManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Output { id: rd.new_id(mut conn, output_iface, m.version) }
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(OutputManagerRequest.GetXdgOutput(id, output))
+            if rd.valid() {
+                return Ok(OutputManagerRequest.GetXdgOutput(id, output))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zxdg_output_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zxdg_output_manager_v1") })
 }
 
 /// zxdg_output_v1: compositor logical output region
@@ -55,17 +58,19 @@ pub enum OutputRequest {
     Destroy
 }
 
-fn decode_output(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputRequest, wire.Error] {
+pub fn decode_output(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(OutputRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(OutputRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zxdg_output_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zxdg_output_v1") })
 }
 
 /// position of the output within the global compositor space
@@ -134,44 +139,50 @@ pub enum OutputEvent {
     Description(str)
 }
 
-fn decode_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputEvent, wire.Error] {
+pub fn decode_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.LogicalPosition(x, y))
+            if rd.valid() {
+                return Ok(OutputEvent.LogicalPosition(x, y))
+            }
         }
         1 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.LogicalSize(width, height))
+            if rd.valid() {
+                return Ok(OutputEvent.LogicalSize(width, height))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Done)
+            if rd.valid() {
+                return Ok(OutputEvent.Done)
+            }
         }
         3 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zxdg_output_v1.name needs version 2"))
+                return Err(conn.needs_version(m, "zxdg_output_v1.name", 2))
             }
             let name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Name(name))
+            if rd.valid() {
+                return Ok(OutputEvent.Name(name))
+            }
         }
         4 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zxdg_output_v1.description needs version 2"))
+                return Err(conn.needs_version(m, "zxdg_output_v1.description", 2))
             }
             let description = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Description(description))
+            if rd.valid() {
+                return Ok(OutputEvent.Description(description))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on zxdg_output_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "zxdg_output_v1") })
 }
 
 /// destroy the xdg_output object

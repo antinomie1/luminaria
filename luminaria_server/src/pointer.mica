@@ -367,10 +367,10 @@ fn shape_device(mut srv: server.Server, ci: u32, d: cs.Device, take req: cs.Devi
 
 /// CSS cursor names of wp_cursor_shape_device_v1.shape (1-based), the
 /// names XCursor themes use.
-let shape_names: List[str] = ["default", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text", "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing", "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize", "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out", "dnd-ask", "all-resize"]
+static shape_names: [36]str = ["default", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text", "vertical-text", "alias", "copy", "move", "no-drop", "not-allowed", "grab", "grabbing", "e-resize", "n-resize", "ne-resize", "nw-resize", "s-resize", "se-resize", "sw-resize", "w-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "col-resize", "row-resize", "all-scroll", "zoom-in", "zoom-out", "dnd-ask", "all-resize"]
 
 fn shape_name(n: u32) -> str {
-    guard n >= 1 and int(n) <= shape_names.len() else {
+    guard n >= 1 and int(n) <= 36 else {
         return "default"
     }
     return shape_names[int(n - 1)].clone()

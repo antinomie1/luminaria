@@ -1,7 +1,6 @@
 // The layout made concrete: each output's placements, animations and
 // occlusion.
 
-import std.collections.map
 import std.mem
 import std.os
 import std.time
@@ -66,19 +65,75 @@ fn Anim.at(self, now: int) -> (f64, f64, f32) {
     return (self.fx + (self.x - self.fx) * e, self.fy + (self.y - self.fy) * e, self.fo + (self.opacity - self.fo) * f32(e))
 }
 
+/// Bitmask of alive output indices (0..63) currently showing a mapped fullscreen
+/// toplevel at full scale (`scale >= 0.99`, so scaled Overview thumbnails do not
+/// demote `Layer.Top` panels).
+@noinline
+fn fullscreen_outputs[O: plug.Output, R: plug.Renderer](d: display.Display[O, R]) -> u64 {
+    var mask: u64 = 0
+    for p in d.lay.places {
+        guard p.style.scale >= 0.99 else {
+            continue
+        }
+        match p.what {
+            Window(w) => {
+                guard d.srv.mapped(w) else {
+                    continue
+                }
+                let wi = d.win_idx(w)
+                guard wi >= 0 else {
+                    continue
+                }
+                let win = d.wins[wi]
+                guard win.states.fullscreen else {
+                    continue
+                }
+                if let Some(target_so) = p.only_output {
+                    for o in 0..min(d.outs.len(), 64) {
+                        if d.outs[o].alive and d.outs[o].sout == target_so {
+                            mask |= u64(1) << u64(o)
+                            break
+                        }
+                    }
+                    continue
+                }
+                let s = d.srv.window_surface(w)
+                let info = d.srv.info(s)
+                let geo = info.geometry
+                let eff_w = if geo.w > 0 { geo.w } else if info.width > 0 { info.width } else { win.width }
+                let eff_h = if geo.h > 0 { geo.h } else if info.height > 0 { info.height } else { win.height }
+                let sc = f64(p.style.scale)
+                let wx = p.x + win.off_x + d.manip.pan_x
+                let wy = p.y + win.off_y + d.manip.pan_y
+                let ww = max(f64(eff_w) * sc, 1.0)
+                let wh = max(f64(eff_h) * sc, 1.0)
+                for o in 0..min(d.outs.len(), 64) {
+                    let out = d.outs[o]
+                    if out.alive and wx < out.x + out.lw() and wy < out.y + out.lh() and wx + ww > out.x and wy + wh > out.y {
+                        mask |= u64(1) << u64(o)
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    return mask
+}
+
 /// Turn the layout (and the library's offsets) into each output's
 /// placements, hit rectangles and surface outputs, reusing scratch buffers
-/// and indexing popups by root surface to avoid per-frame allocations.
+/// and dense surface/window slot tables to avoid per-frame allocations.
+@noinline
 fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let now = time.now_ns()
     d.refocus = true
     d.animating = false
     d.hits.clear()
-    d.origins.clear()
-    d.surf_keys.clear()
-    d.surf_window.clear()
+    d.placed_gen += 1
+    d.placed_surfs.clear()
     d.blocked_keys.clear()
     d.blocked_wins.clear()
+    d.popups_by_root.clear()
     for o in 0..d.outs.len() {
         d.outs[o].has_blocked = false
     }
@@ -89,12 +144,9 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     for o in 0..per.len() {
         per[o].clear()
     }
-    var masks = mem.replace(mut d.masks_scratch, map.Map.new())
-    masks.clear()
-    var pmap = mem.replace(mut d.popups_by_root, map.Map.new())
-    pmap.clear()
     if not d.locked and not d.popups.is_empty() {
-        for pp in d.popups {
+        for pi in 0..d.popups.len() {
+            let pp = d.popups[pi]
             var top = d.srv.popup_parent(pp)
             for _ in 0..16 {
                 guard let Some(t) = top else {
@@ -106,18 +158,26 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                 top = d.srv.popup_parent(up)
             }
             if let Some(root) = top {
-                var list = pmap.remove(root).unwrap_or([])
-                list.push(pp)
-                discard pmap.insert(root, list)
+                d.popups_by_root.push((root, pp))
             }
         }
     }
     shell.arrange(mut d)
     if d.locked {
-        shell.place_lock(mut d, mut per, mut masks)
+        shell.place_lock(mut d, mut per)
     } else {
-        shell.place_layers(mut d, 0, pmap, mut per, mut masks)
-        shell.place_layers(mut d, 1, pmap, mut per, mut masks)
+        let has_layers = d.srv.has_layers()
+        let fs_mask = if has_layers { fullscreen_outputs(d) } else { u64(0) }
+        if has_layers {
+            shell.place_layers(mut d, 0, mut per)
+            shell.place_layers(mut d, 1, mut per)
+            // Outputs with an active fullscreen toplevel place `Layer.Top` (layer 2) below
+            // windows so panels/bars neither occlude fullscreen, steal pointer focus, nor
+            // block direct scanout, while `Layer.Overlay` (layer 3) stays on top.
+            if fs_mask != 0 {
+                shell.place_layers_masked(mut d, 2, fs_mask, true, mut per)
+            }
+        }
         let places = mem.replace(mut d.lay.places, [])
         var last_win = -1
         for i in 0..places.len() {
@@ -126,7 +186,8 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                 _ => {}
             }
         }
-        var win_popups: List[(server.Surface, f32, server.Window)] = []
+        var win_popups = mem.replace(mut d.win_popups_scratch, [])
+        win_popups.clear()
         for i in 0..places.len() {
             let p = places[i]
             match p.what {
@@ -134,39 +195,42 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
                     guard d.srv.mapped(w) else {
                         if i == last_win {
                             for (ps, pop_op, pw) in win_popups {
-                                shell.place_popups(mut d, ps, pmap, pop_op, Some(pw), mut per, mut masks)
+                                shell.place_popups(mut d, ps, pop_op, Some(pw), mut per)
                             }
                             win_popups.clear()
                         }
                         continue
                     }
-                    if p.style.block_capture {
-                        discard d.blocked_wins.insert(w, true)
+                    if p.style.block_capture and not d.blocked_wins.contains(w) {
+                        d.blocked_wins.push(w)
                     }
                     let s = d.srv.window_surface(w)
                     let info = d.srv.info(s)
                     let geo = info.geometry
                     let eff_w = if geo.w > 0 { geo.w } else { info.width }
                     let eff_h = if geo.h > 0 { geo.h } else { info.height }
-                    var win = d.wins.get(w).unwrap_or(display.Win {})
+                    let wi = d.win_idx(w)
+                    var win = if wi >= 0 { d.wins[wi] } else { display.Win {} }
                     if let Some((hx, hy)) = manipulation.drag_hold(d, w) {
                         // A drag carries it: the offset puts it under the pointer.
                         win.off_x = hx - p.x - d.manip.pan_x
                         win.off_y = hy - p.y - d.manip.pan_y
-                        discard d.wins.insert(w, win)
+                        let wj = d.win_ensure(w)
+                        d.wins[wj].off_x = win.off_x
+                        d.wins[wj].off_y = win.off_y
                     }
                     let (off_x, off_y) = manipulation.resize_offset(d, w, eff_w, eff_h, win)
                     let tx = p.x + off_x + d.manip.pan_x
                     let ty = p.y + off_y + d.manip.pan_y
                     let (x, y, opacity) = animate(mut d, display.skey(s), tx, ty, p.style.opacity, p.style.transition_ms, now)
                     let sc = f64(p.style.scale)
-                    place_tree_on(mut d, s, x - f64(geo.x) * sc, y - f64(geo.y) * sc, sc, p.style, opacity, Some(w), p.only_output, mut per, mut masks)
-                    if pmap.contains(s) {
+                    place_tree_on(mut d, s, x - f64(geo.x) * sc, y - f64(geo.y) * sc, sc, p.style, opacity, Some(w), p.only_output, mut per)
+                    if d.has_popups(s) {
                         win_popups.push((s, opacity, w))
                     }
                     if i == last_win {
                         for (ps, pop_op, pw) in win_popups {
-                            shell.place_popups(mut d, ps, pmap, pop_op, Some(pw), mut per, mut masks)
+                            shell.place_popups(mut d, ps, pop_op, Some(pw), mut per)
                         }
                         win_popups.clear()
                     }
@@ -190,19 +254,26 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             }
         }
         for (ps, pop_op, pw) in win_popups {
-            shell.place_popups(mut d, ps, pmap, pop_op, Some(pw), mut per, mut masks)
+            shell.place_popups(mut d, ps, pop_op, Some(pw), mut per)
         }
+        win_popups.clear()
+        d.win_popups_scratch = win_popups
         d.lay.places = places
-        shell.place_layers(mut d, 2, pmap, mut per, mut masks)
-        shell.place_layers(mut d, 3, pmap, mut per, mut masks)
-        shell.place_ime(mut d, mut per, mut masks)
+        if has_layers {
+            shell.place_layers_masked(mut d, 2, fs_mask, false, mut per)
+            shell.place_layers(mut d, 3, mut per)
+        }
+        shell.place_ime(mut d, mut per)
         // Each seat's drag image follows that seat's pointer.
         for si in 0..d.seats.len() {
             if let Some((icon, ix, iy)) = d.srv.drag_icon(d.seats[si].seat) {
                 if d.srv.info(icon).mapped {
-                    place_tree(mut d, icon, d.seats[si].px + f64(ix), d.seats[si].py + f64(iy), 1.0, layout.Style {}, 1.0, None, mut per, mut masks)
+                    place_tree(mut d, icon, d.seats[si].px + f64(ix), d.seats[si].py + f64(iy), 1.0, layout.Style {}, 1.0, None, mut per)
                 }
             }
+        }
+        if has_layers {
+            shell.update_keyboard(mut d)
         }
     }
     // Software cursors across all seats (seat 0 uses SW cursor when HW unavailable;
@@ -234,9 +305,13 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             }
         }
     }
-    for e in masks.entries() {
-        let s = e.key
-        let m = e.val
+    for pi in 0..d.placed_surfs.len() {
+        let s = d.placed_surfs[pi]
+        let idx = d.surf_idx(s)
+        guard idx >= 0 and d.surfs[idx].has_mask else {
+            continue
+        }
+        let m = d.surfs[idx].out_mask
         d.srv.set_outputs(s, m)
         var best = 1.0
         for o in 0..d.outs.len() {
@@ -245,25 +320,22 @@ fn rebuild[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             }
         }
         let want = i32(best * 120.0 + 0.5)
-        var sf = d.surfs.get(s).unwrap_or(display.Surf {})
-        if sf.scale120 != want {
-            sf.scale120 = want
-            discard d.surfs.insert(s, sf)
+        if d.surfs[idx].scale120 != want {
+            d.surfs[idx].scale120 = want
             d.srv.preferred(s, want, 0)
         }
     }
     d.per_scratch = per
-    d.masks_scratch = masks
-    d.popups_by_root = pmap
 }
 
 /// Place surface `s`'s tree with its origin at `ox, oy`.
-fn place_tree[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface, ox: f64, oy: f64, sc: f64, style: layout.Style, opacity: f32, owner: Option[server.Window], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
-    place_tree_on(mut d, s, ox, oy, sc, style, opacity, owner, None, mut per, mut masks)
+fn place_tree[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface, ox: f64, oy: f64, sc: f64, style: layout.Style, opacity: f32, owner: Option[server.Window], mut per: List[List[types.Placement]]) {
+    place_tree_on(mut d, s, ox, oy, sc, style, opacity, owner, None, mut per)
 }
 
 /// Place surface `s`'s tree with its origin at `ox, oy`, optionally restricted to `only_output`.
-fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface, ox: f64, oy: f64, sc: f64, style: layout.Style, opacity: f32, owner: Option[server.Window], only_output: Option[server.Output], mut per: List[List[types.Placement]], mut masks: map.Map[server.Surface, u64]) {
+@noinline
+fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], s: server.Surface, ox: f64, oy: f64, sc: f64, style: layout.Style, opacity: f32, owner: Option[server.Window], only_output: Option[server.Output], mut per: List[List[types.Placement]]) {
     var clip_out = -1
     if let Some(target_so) = only_output {
         for oi in 0..d.outs.len() {
@@ -276,6 +348,7 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
             return
         }
     }
+    let pgen = d.placed_gen
     var tree = mem.replace(mut d.tree_scratch, [])
     tree.clear()
     d.srv.tree(s, mut tree)
@@ -285,11 +358,16 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
         let gy = oy + f64(dy) * sc
         let gw = f64(info.width) * sc
         let gh = f64(info.height) * sc
-        discard d.origins.insert(ts, (gx, gy, sc))
-        discard d.surf_keys.insert(display.skey(ts), ts)
-        if let Some(w) = owner {
-            discard d.surf_window.insert(ts, w)
+        let idx = d.surf_ensure(ts)
+        if d.surfs[idx].placed_gen != pgen {
+            d.surfs[idx].placed_gen = pgen
+            d.surfs[idx].has_mask = false
+            d.placed_surfs.push(ts)
         }
+        d.surfs[idx].gx = gx
+        d.surfs[idx].gy = gy
+        d.surfs[idx].sc = sc
+        d.surfs[idx].owner = owner
         if clip_out >= 0 {
             let co = d.outs[clip_out]
             let hx0 = max(gx, co.x)
@@ -300,16 +378,16 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
         } else {
             d.hits.add(ts, gx, gy, gw, gh, sc)
         }
-        guard let Some(sf) = d.surfs.get(ts) else {
+        let tex = d.surfs[idx].tex
+        guard tex != 0 else {
             continue
         }
-        guard sf.tex != 0 else {
-            continue
-        }
-        let tex = sf.tex
         let root = ts == s
         if style.block_capture {
-            discard d.blocked_keys.insert(display.skey(ts), true)
+            let sk = display.skey(ts)
+            if not d.blocked_keys.contains(sk) {
+                d.blocked_keys.push(sk)
+            }
         }
         let opq = if info.alpha < 1.0 { server.Rect {} } else { d.srv.opaque(ts) }
         let alpha = opacity * info.alpha
@@ -369,61 +447,52 @@ fn place_tree_on[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R],
             })
             mask |= u64(1) << u64(out.sout.id.index)
         }
-        discard masks.insert(ts, mask)
+        d.surfs[idx].out_mask = mask
+        d.surfs[idx].has_mask = true
     }
     d.tree_scratch = tree
 }
 
 /// Windows hidden for a while are told (Occluded); visible ones again.
+@noinline
 fn occlusion[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     let now = time.now_ns()
     var soon = 0
-    var updates: List[(server.Window, display.Win)] = []
-    var emitted: List[(server.Window, bool)] = []
-    for e in d.wins.entries() {
-        let w = e.key
-        let cur = e.val
+    for i in 0..d.wins.len() {
+        let gen = d.wins[i].gen
+        guard gen != 0 else {
+            continue
+        }
+        let w = server.Window { id: server.ids.Id { index: u32(i), gen } }
         guard d.srv.mapped(w) else {
             continue
         }
         let s = d.srv.window_surface(w)
         var seen = false
         for o in 0..d.outs.len() {
-            seen = seen or (d.outs[o].alive and d.comp.visible(o, display.skey(s)))
+            if d.outs[o].alive and d.comp.visible(o, display.skey(s)) {
+                seen = true
+                break
+            }
         }
-        var win = cur
-        var changed = false
         if seen {
-            if win.hidden {
-                win.hidden = false
-                changed = true
+            if d.wins[i].hidden {
+                d.wins[i].hidden = false
             }
-            if win.occluded {
-                win.occluded = false
-                changed = true
-                emitted.push((w, false))
+            if d.wins[i].occluded {
+                d.wins[i].occluded = false
+                d.emit(display.Event.Occluded(w, false))
             }
-        } else if not win.hidden {
-            win.hidden = true
-            win.hidden_since = now
-            changed = true
+        } else if not d.wins[i].hidden {
+            d.wins[i].hidden = true
+            d.wins[i].hidden_since = now
             soon = sooner(soon, 500000000)
-        } else if not win.occluded and now - win.hidden_since >= 500000000 {
-            win.occluded = true
-            changed = true
-            emitted.push((w, true))
-        } else if not win.occluded {
-            soon = sooner(soon, 500000000 - (now - win.hidden_since))
+        } else if not d.wins[i].occluded and now - d.wins[i].hidden_since >= 500000000 {
+            d.wins[i].occluded = true
+            d.emit(display.Event.Occluded(w, true))
+        } else if not d.wins[i].occluded {
+            soon = sooner(soon, 500000000 - (now - d.wins[i].hidden_since))
         }
-        if changed {
-            updates.push((w, win))
-        }
-    }
-    for (w, occ) in emitted {
-        d.emit(display.Event.Occluded(w, occ))
-    }
-    for (w, win) in updates {
-        discard d.wins.insert(w, win)
     }
     d.occl_due = if soon > 0 { now + soon } else { 0 }
     arm_house(mut d)

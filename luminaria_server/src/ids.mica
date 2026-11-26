@@ -73,45 +73,76 @@ pub struct Txn {
     pub id: Id
 }
 
-/// Items in stable slots, reused after removal.
-struct Slab[T] {
-    items: List[T] = []
+/// Non-generic slot index/generation metadata shared by every `Slab[T]`.
+struct SlabMeta {
     gens: List[u32] = []
     free: List[u32] = []
 }
 
-fn Slab[T].add(mut self, take v: T) -> Id {
+@noinline
+fn SlabMeta.alloc(mut self) -> (Id, bool) {
     if let Some(i) = self.free.pop() {
-        self.items[int(i)] = v
         self.gens[int(i)] += 1
-        return Id { index: i, gen: self.gens[int(i)] }
+        return (Id { index: i, gen: self.gens[int(i)] }, true)
     }
-    self.items.push(v)
     self.gens.push(1)
-    return Id { index: u32(self.items.len() - 1), gen: 1 }
+    return (Id { index: u32(self.gens.len() - 1), gen: 1 }, false)
+}
+
+@noinline
+fn SlabMeta.free_slot(mut self, i: u32) -> bool {
+    guard int(i) < self.gens.len() and self.gens[int(i)] % 2 == 1 else {
+        return false
+    }
+    self.gens[int(i)] += 1
+    self.free.push(i)
+    return true
+}
+
+@noinline
+fn SlabMeta.live(self, id: Id) -> bool {
+    return int(id.index) < self.gens.len() and self.gens[int(id.index)] == id.gen and id.gen % 2 == 1
+}
+
+@noinline
+fn SlabMeta.used(self, i: int) -> bool {
+    return i >= 0 and i < self.gens.len() and self.gens[i] % 2 == 1
+}
+
+/// Items in stable slots, reused after removal.
+struct Slab[T] {
+    items: List[T] = []
+    meta: SlabMeta = SlabMeta {}
+}
+
+fn Slab[T].add(mut self, take v: T) -> Id {
+    let (id, reused) = self.meta.alloc()
+    if reused {
+        self.items[int(id.index)] = v
+    } else {
+        self.items.push(v)
+    }
+    return id
 }
 
 fn Slab[T].live(self, id: Id) -> bool {
-    return int(id.index) < self.gens.len() and self.gens[int(id.index)] == id.gen and id.gen % 2 == 1
+    return self.meta.live(id)
 }
 
 /// Free slot `i`, leaving `empty` in it.
 fn Slab[T].remove(mut self, i: u32, take empty: T) {
-    guard int(i) < self.gens.len() and self.gens[int(i)] % 2 == 1 else {
-        return
+    if self.meta.free_slot(i) {
+        self.items[int(i)] = empty
     }
-    self.items[int(i)] = empty
-    self.gens[int(i)] += 1
-    self.free.push(i)
 }
 
 fn Slab[T].id(self, i: u32) -> Id {
-    return Id { index: i, gen: self.gens[int(i)] }
+    return Id { index: i, gen: self.meta.gens[int(i)] }
 }
 
 /// Whether slot `i` is in use.
 fn Slab[T].used(self, i: int) -> bool {
-    return i >= 0 and i < self.gens.len() and self.gens[i] % 2 == 1
+    return self.meta.used(i)
 }
 
 /// Client coordinates and sizes are kept within ±2^24 px: no surface is

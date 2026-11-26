@@ -30,39 +30,44 @@ pub enum KeyboardRequest {
     Destroy
 }
 
-fn decode_keyboard(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardRequest, wire.Error] {
+pub fn decode_keyboard(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let format = rd.u32(conn)
             let fd = rd.fd(mut conn)
             let size = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardRequest.Keymap(format, fd, size))
+            if rd.valid() {
+                return Ok(KeyboardRequest.Keymap(format, fd, size))
+            }
         }
         1 => {
             let time = rd.u32(conn)
             let key = rd.u32(conn)
             let state = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardRequest.Key(time, key, state))
+            if rd.valid() {
+                return Ok(KeyboardRequest.Key(time, key, state))
+            }
         }
         2 => {
             let mods_depressed = rd.u32(conn)
             let mods_latched = rd.u32(conn)
             let mods_locked = rd.u32(conn)
             let group = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardRequest.Modifiers(mods_depressed, mods_latched, mods_locked, group))
+            if rd.valid() {
+                return Ok(KeyboardRequest.Modifiers(mods_depressed, mods_latched, mods_locked, group))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(KeyboardRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(KeyboardRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_virtual_keyboard_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_virtual_keyboard_v1") })
 }
 
 /// zwp_virtual_keyboard_manager_v1: virtual keyboard manager
@@ -85,18 +90,20 @@ pub enum KeyboardManagerRequest {
     CreateVirtualKeyboard(wayland.Seat, Keyboard)
 }
 
-fn decode_keyboard_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardManagerRequest, wire.Error] {
+pub fn decode_keyboard_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
             let id = Keyboard { id: rd.new_id(mut conn, keyboard_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardManagerRequest.CreateVirtualKeyboard(seat, id))
+            if rd.valid() {
+                return Ok(KeyboardManagerRequest.CreateVirtualKeyboard(seat, id))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwp_virtual_keyboard_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwp_virtual_keyboard_manager_v1") })
 }
 
 /// keyboard mapping

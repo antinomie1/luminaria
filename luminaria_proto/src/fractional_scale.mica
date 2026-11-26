@@ -26,23 +26,26 @@ pub enum ScaleManagerRequest {
     GetFractionalScale(Scale, wayland.Surface)
 }
 
-fn decode_scale_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleManagerRequest, wire.Error] {
+pub fn decode_scale_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ScaleManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ScaleManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Scale { id: rd.new_id(mut conn, scale_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ScaleManagerRequest.GetFractionalScale(id, surface))
+            if rd.valid() {
+                return Ok(ScaleManagerRequest.GetFractionalScale(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_fractional_scale_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_fractional_scale_manager_v1") })
 }
 
 /// wp_fractional_scale_v1: fractional scale interface to a wl_surface
@@ -60,17 +63,19 @@ pub enum ScaleRequest {
     Destroy
 }
 
-fn decode_scale(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleRequest, wire.Error] {
+pub fn decode_scale(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ScaleRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ScaleRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_fractional_scale_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_fractional_scale_v1") })
 }
 
 /// notify of new preferred scale
@@ -100,17 +105,19 @@ pub enum ScaleEvent {
     PreferredScale(u32)
 }
 
-fn decode_scale_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleEvent, wire.Error] {
+pub fn decode_scale_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ScaleEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let scale = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ScaleEvent.PreferredScale(scale))
+            if rd.valid() {
+                return Ok(ScaleEvent.PreferredScale(scale))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wp_fractional_scale_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wp_fractional_scale_v1") })
 }
 
 /// remove surface scale information for surface

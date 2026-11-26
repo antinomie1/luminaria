@@ -292,8 +292,9 @@ fn Out.lh(self) -> f64 {
     return f64(self.height) / self.scale
 }
 
-/// Composition state of a client surface.
+/// Composition state of a client surface (dense-indexed by `Surface.id.index`).
 struct Surf {
+    gen: u32 = 0
     /// The renderer's key of the texture shown (the buffer's, or the
     /// surface's shm texture); 0: none.
     tex: u64 = 0
@@ -308,9 +309,18 @@ struct Surf {
     dmg: (i32, i32, i32, i32) = (0, 0, 0, 0)
     /// Preferred scale last sent, in 120ths.
     scale120: i32 = 0
+    /// Last `Display.placed_gen` in which this surface appeared in the scene.
+    placed_gen: u64 = 0
+    gx: f64 = 0.0
+    gy: f64 = 0.0
+    sc: f64 = 1.0
+    owner: Option[server.Window] = None
+    out_mask: u64 = 0
+    has_mask: bool = false
 }
 
 struct Win {
+    gen: u32 = 0
     width: i32 = 0
     height: i32 = 0
     states: server.States = server.States {}
@@ -363,10 +373,12 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     /// Per output: what it measured (`stats`).
     probes: List[types.Stats] = []
     lay: layout.Layout = layout.Layout {}
+    lay_scratch: layout.Layout = layout.Layout {}
     hits: hit.Hits = hit.Hits {}
-    surfs: map.Map[server.Surface, Surf]
-    wins: map.Map[server.Window, Win]
-    origins: map.Map[server.Surface, (f64, f64, f64)]
+    surfs: List[Surf] = []
+    wins: List[Win] = []
+    placed_gen: u64 = 0
+    placed_surfs: List[server.Surface] = []
     anims: map.Map[u64, place.Anim]
     animating: bool = false
     /// The scene changed under the pointers since they last looked.
@@ -375,7 +387,7 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     images: List[ImageData] = []
     queue: List[Event] = []
     qhead: int = 0
-    waits: waits.Waits
+    waits: waits.Waits = waits.Waits {}
     caps: capture.Captures = capture.Captures {}
     house_fd: int = -1
     /// When occlusion next needs a look (ns, 0: never); shares `house_fd`
@@ -385,6 +397,7 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     /// scratch list the next flush fills.
     writing: List[server.Client] = []
     stalled_scratch: List[server.Client] = []
+    gone_scratch: List[server.Client] = []
     cursor_size: int = 24
     manip: manipulation.State = manipulation.State {}
     batching_input: bool = false
@@ -392,24 +405,99 @@ pub struct Display[O: plug.Output, R: plug.Renderer] {
     batch_rebuild: bool = false
     batch_resize: bool = false
     timers: List[(int, int)] = []
+    free_timers: List[int] = []
     quit: bool = false
-    /// Layer surface positions.
-    spots: map.Map[server.Layer, shell.Spot]
+    /// Layer surface positions (dense-indexed by `Layer.id.index`).
+    spots: List[shell.Spot] = []
     had_layers: bool = false
     locked: bool = false
     /// Outputs still to show a frame before the locker hears `locked`.
     lock_wait: List[int] = []
     idle_fd: int = -1
-    /// Reusable rebuild scratch & O(1) lookup tables.
+    /// Reusable rebuild / frame / commit scratch buffers.
     per_scratch: List[List[types.Placement]] = []
-    masks_scratch: map.Map[server.Surface, u64]
-    popups_by_root: map.Map[server.Surface, List[server.Popup]]
+    popups_by_root: List[(server.Surface, server.Popup)] = []
     tree_scratch: List[(server.Surface, i32, i32)] = []
-    surf_keys: map.Map[u64, server.Surface]
-    surf_window: map.Map[server.Surface, server.Window]
-    blocked_keys: map.Map[u64, bool]
-    blocked_wins: map.Map[server.Window, bool]
+    win_popups_scratch: List[(server.Surface, f32, server.Window)] = []
+    rects_scratch: List[(i32, i32, i32, i32)] = []
+    dmg_scratch: List[server.Rect] = []
+    bdmg_scratch: List[server.Rect] = []
+    superseded_scratch: List[(Option[server.Buffer], int, u64)] = []
+    u64_scratch: List[u64] = []
+    blocked_keys: List[u64] = []
+    blocked_wins: List[server.Window] = []
     pending_shm: List[server.Surface] = []
+    pending_shm_scratch: List[server.Surface] = []
+    releases_scratch: List[Release] = []
+}
+
+fn Display[O, R].surf_idx(self, s: server.Surface) -> int {
+    let idx = int(s.id.index)
+    return if s.id.gen != 0 and idx < self.surfs.len() and self.surfs[idx].gen == s.id.gen { idx } else { -1 }
+}
+
+fn Display[O, R].surf_ensure(mut self, s: server.Surface) -> int {
+    let idx = int(s.id.index)
+    while self.surfs.len() <= idx {
+        self.surfs.push(Surf {})
+    }
+    if self.surfs[idx].gen != s.id.gen {
+        self.surfs[idx] = Surf { gen: s.id.gen }
+    }
+    return idx
+}
+
+fn Display[O, R].win_idx(self, w: server.Window) -> int {
+    let idx = int(w.id.index)
+    return if w.id.gen != 0 and idx < self.wins.len() and self.wins[idx].gen == w.id.gen { idx } else { -1 }
+}
+
+fn Display[O, R].win_ensure(mut self, w: server.Window) -> int {
+    let idx = int(w.id.index)
+    while self.wins.len() <= idx {
+        self.wins.push(Win {})
+    }
+    if self.wins[idx].gen != w.id.gen {
+        self.wins[idx] = Win { gen: w.id.gen }
+    }
+    return idx
+}
+
+fn Display[O, R].origin_of(self, s: server.Surface) -> Option[(f64, f64, f64)] {
+    let idx = self.surf_idx(s)
+    guard idx >= 0 and self.surfs[idx].placed_gen == self.placed_gen else {
+        return None
+    }
+    return Some((self.surfs[idx].gx, self.surfs[idx].gy, self.surfs[idx].sc))
+}
+
+fn Display[O, R].owner_of(self, s: server.Surface) -> Option[server.Window] {
+    let idx = self.surf_idx(s)
+    guard idx >= 0 and self.surfs[idx].placed_gen == self.placed_gen else {
+        return None
+    }
+    return self.surfs[idx].owner
+}
+
+fn Display[O, R].surf_from_key(self, key: u64) -> Option[server.Surface] {
+    guard key < (u64(1) << 62) else {
+        return None
+    }
+    let s = server.Surface { id: server.ids.Id { index: u32(key >> 32), gen: u32(key & 0xffffffff) } }
+    let idx = self.surf_idx(s)
+    guard idx >= 0 and self.surfs[idx].placed_gen == self.placed_gen else {
+        return None
+    }
+    return Some(s)
+}
+
+fn Display[O, R].has_popups(self, root: server.Surface) -> bool {
+    for (r, _) in self.popups_by_root {
+        if r == root {
+            return true
+        }
+    }
+    return false
 }
 
 fn skey(s: server.Surface) -> u64 {
@@ -431,6 +519,8 @@ let bg_key: u64 = 0x7ffffffffe000002
 /// A display on output `be` and renderer `comp` (any types with the
 /// methods of plug.Output and plug.Renderer; `lum.open` picks the
 /// built-in ones). Of `o`, the device fields are for `lum.open`.
+@noinline
+@cold
 pub fn Display[O, R].with(o: Options, take be: O, take comp: R) -> Result[Display[O, R], str] {
     var srv = try server.Server.open(o.socket.clone())
     let poll = try net.poller().map_err(fn(e) => "{e}")
@@ -450,18 +540,7 @@ pub fn Display[O, R].with(o: Options, take be: O, take comp: R) -> Result[Displa
         repeat_rate: o.repeat_rate,
         repeat_delay: o.repeat_delay,
         background: vec4(0.0),
-        surfs: map.Map.new(),
-        wins: map.Map.new(),
-        origins: map.Map.new(),
         anims: map.Map.new(),
-        waits: waits.Waits { left: map.Map.new() },
-        spots: map.Map.new(),
-        masks_scratch: map.Map.new(),
-        popups_by_root: map.Map.new(),
-        surf_keys: map.Map.new(),
-        surf_window: map.Map.new(),
-        blocked_keys: map.Map.new(),
-        blocked_wins: map.Map.new(),
     }
     let formats = d.comp.formats()
     if not formats.is_empty() {
@@ -523,7 +602,7 @@ fn Display[O, R].emit(mut self, take e: Event) {
 pub fn Display[O, R].next(mut self) -> Result[Option[Event], str] {
     while true {
         if self.qhead < self.queue.len() {
-            let e = self.queue[self.qhead].clone()
+            let e = mem.replace(mut self.queue[self.qhead], Event.GpuReset)
             self.qhead += 1
             return Ok(Some(e))
         }
@@ -552,7 +631,7 @@ pub fn Display[O, R].poll(mut self) -> Result[Option[Event], str] {
     guard self.qhead < self.queue.len() else {
         return Ok(None)
     }
-    let e = self.queue[self.qhead].clone()
+    let e = mem.replace(mut self.queue[self.qhead], Event.GpuReset)
     self.qhead += 1
     return Ok(Some(e))
 }
@@ -626,7 +705,11 @@ fn Display[O, R].ready(mut self, t: int) -> Result[(), str] {
                 let fd = self.timers[i].0
                 discard os.count(fd)
                 discard self.poll.remove(fd)
-                os.close(fd)
+                if self.free_timers.len() < 8 {
+                    self.free_timers.push(fd)
+                } else {
+                    os.close(fd)
+                }
                 discard self.timers.remove(i)
                 self.emit(Event.Timer(k))
                 break
@@ -699,11 +782,13 @@ fn Display[O, R].finish(mut self) -> Result[(), str] {
     for o in 0..self.outs.len() {
         frames.schedule(mut self, o)
     }
-    var gone: List[server.Client] = []
+    var gone = mem.replace(mut self.gone_scratch, [])
+    gone.clear()
     self.srv.flush(mut gone)
     for c in gone {
         self.drop_client(c)
     }
+    self.gone_scratch = gone
     self.watch_writes()
     clients.server_events(mut self)
     return Ok(())
@@ -755,8 +840,9 @@ pub fn Display[O, R].manipulate_move(mut self, w: server.Window) {
     guard not self.seats.is_empty() and self.seats[0].buttons > 0 else {
         return
     }
-    let cur = self.wins.get(w).unwrap_or(Win {})
-    self.manip.active = manipulation.Manip.Move(w, self.seats[0].px, self.seats[0].py, cur.off_x, cur.off_y)
+    let wi = self.win_idx(w)
+    let (ox, oy) = if wi >= 0 { (self.wins[wi].off_x, self.wins[wi].off_y) } else { (0.0, 0.0) }
+    self.manip.active = manipulation.Manip.Move(w, self.seats[0].px, self.seats[0].py, ox, oy)
     clients.dismiss_popups(mut self)
     self.set_cursor_named("grabbing")
 }
@@ -769,7 +855,8 @@ pub fn Display[O, R].manipulate_resize(mut self, w: server.Window, edges: u32) {
     guard not self.seats.is_empty() and self.seats[0].buttons > 0 else {
         return
     }
-    let cur = self.wins.get(w).unwrap_or(Win {})
+    let wi = self.win_idx(w)
+    let cur = if wi >= 0 { self.wins[wi] } else { Win {} }
     let info = self.srv.info(self.srv.window_surface(w))
     let geo = info.geometry
     let w0 = if geo.w > 0 { geo.w } else if info.width > 0 { info.width } else { cur.width }
@@ -813,17 +900,18 @@ pub fn Display[O, R].hide_cursor(mut self) {
 /// popups come along.
 pub fn Display[O, R].layout(mut self, f: fn(mut layout.Layout)) {
     if self.manip.offsets_done {
-        let keys = self.wins.keys()
-        for w in keys {
-            if let Some(cur) = self.wins.get(w) {
-                discard self.wins.insert(w, Win { off_x: 0.0, off_y: 0.0, ..cur })
+        for i in 0..self.wins.len() {
+            if self.wins[i].gen != 0 {
+                self.wins[i].off_x = 0.0
+                self.wins[i].off_y = 0.0
             }
         }
         self.manip.pan_x = 0.0
         self.manip.pan_y = 0.0
         self.manip.offsets_done = false
     }
-    var l = layout.Layout {}
+    var l = mem.replace(mut self.lay_scratch, layout.Layout {})
+    l.places.clear()
     f(mut l)
     if self.waits.txn_open {
         self.waits.txn_layout = Some(l)
@@ -840,7 +928,7 @@ pub fn Display[O, R].layout(mut self, f: fn(mut layout.Layout)) {
             }
         }
     }
-    self.lay = l
+    self.lay_scratch = mem.replace(mut self.lay, l)
     place.rebuild(mut self)
 }
 
@@ -848,8 +936,12 @@ pub fn Display[O, R].layout(mut self, f: fn(mut layout.Layout)) {
 /// choose) and states. The serial it will ack.
 pub fn Display[O, R].configure(mut self, w: server.Window, width: i32, height: i32, st: server.States) -> u32 {
     let serial = self.srv.configure(w, width, height, st)
-    let cur = self.wins.get(w).unwrap_or(Win {})
-    discard self.wins.insert(w, Win { width, height, states: st, configured: true, inflight: true, ..cur })
+    let wi = self.win_ensure(w)
+    self.wins[wi].width = width
+    self.wins[wi].height = height
+    self.wins[wi].states = st
+    self.wins[wi].configured = true
+    self.wins[wi].inflight = true
     if self.waits.txn_open and not self.waits.txn_wins.contains(w) {
         self.waits.txn_wins.push(w)
     }
@@ -880,8 +972,9 @@ pub fn Display[O, R].end(mut self, timeout_ms: int) {
 /// images in the layout) or the client.
 pub fn Display[O, R].decorate(mut self, w: server.Window, server_side: bool) {
     self.srv.set_decoration(w, server_side)
-    let cur = self.wins.get(w).unwrap_or(Win {})
-    if cur.configured {
+    let wi = self.win_idx(w)
+    if wi >= 0 and self.wins[wi].configured {
+        let cur = self.wins[wi]
         discard self.configure(w, cur.width, cur.height, cur.states)
     }
 }
@@ -992,6 +1085,8 @@ pub fn Display[O, R].hung(self, w: server.Window, ms: int) -> bool {
 
 /// End the client of window `w` at once: SIGKILL to its process (not this
 /// one) and the connection dropped, its windows with it.
+@noinline
+@cold
 pub fn Display[O, R].kill(mut self, w: server.Window) {
     let c = self.srv.window_client(w)
     let (pid, _, _) = self.srv.credentials(c)
@@ -1053,7 +1148,7 @@ pub fn Display[O, R].window_at(self, x: f64, y: f64) -> Option[server.Window] {
     if let Some(w) = self.srv.window_of(s) {
         return Some(w)
     }
-    return self.surf_window.get(s)
+    return self.owner_of(s)
 }
 
 pub fn Display[O, R].title(self, w: server.Window) -> str {
@@ -1181,6 +1276,8 @@ pub fn Display[O, R].set_position(mut self, so: server.Output, x: f64, y: f64) {
     outputs.output_moved(mut self, o)
 }
 
+@noinline
+@cold
 pub fn Display[O, R].set_mode(mut self, so: server.Output, m: types.Mode) {
     let o = outputs.out_index(self, so)
     if o >= 0 {
@@ -1190,6 +1287,8 @@ pub fn Display[O, R].set_mode(mut self, so: server.Output, m: types.Mode) {
 }
 
 /// Turn an output off (power saving) or on.
+@noinline
+@cold
 pub fn Display[O, R].enable(mut self, so: server.Output, on: bool) {
     let o = outputs.out_index(self, so)
     if o >= 0 {
@@ -1201,6 +1300,8 @@ pub fn Display[O, R].enable(mut self, so: server.Output, on: bool) {
     }
 }
 
+@noinline
+@cold
 pub fn Display[O, R].set_vrr(mut self, so: server.Output, on: bool) {
     let o = outputs.out_index(self, so)
     if o >= 0 {
@@ -1224,6 +1325,8 @@ pub fn Display[O, R].output_enabled(self, so: server.Output) -> bool {
 
 /// Enable or disable HDR output (BT.2020 + ST.2084 PQ) and 10-bit scanout on `so`.
 /// Returns false if the output does not support HDR.
+@noinline
+@cold
 pub fn Display[O, R].set_hdr(mut self, so: server.Output, on: bool, sdr_nits: f32, max_nits: f32) -> bool {
     let o = outputs.out_index(self, so)
     guard o >= 0 else {
@@ -1270,6 +1373,8 @@ pub fn Display[O, R].output_config_done(mut self, c: server.OutputConfig, ok: bo
 /// whether every output can do it. Modes are the output's own (any mode
 /// only nested or headless, where it must stay the current one); outputs
 /// are not rotated.
+@noinline
+@cold
 pub fn Display[O, R].apply_output_config(mut self, c: server.OutputConfig, only_test: bool) -> bool {
     let heads = self.srv.output_config(c)
     for h in heads {
@@ -1340,6 +1445,8 @@ pub fn Display[O, R].output_under(self, x: f64, y: f64) -> Option[server.Output]
 // --------------------------------------------------------------- pointer & seats
 
 /// Add a logical seat with its own focus, pointer, keymap and software cursor.
+@noinline
+@cold
 pub fn Display[O, R].add_seat(mut self, name: str) -> server.Seat {
     let idx = seats.seat_by_name(self, name)
     if idx >= 0 {
@@ -1375,6 +1482,8 @@ pub fn Display[O, R].add_seat(mut self, name: str) -> server.Seat {
 }
 
 /// Remove a secondary seat (the primary seat cannot be removed).
+@noinline
+@cold
 pub fn Display[O, R].remove_seat(mut self, st: server.Seat) {
     let si = seats.seat_index(self, st)
     guard si > 0 else {
@@ -1473,7 +1582,7 @@ pub fn Display[O, R].update_image(mut self, img: layout.Image, x: i32, y: i32, w
     guard int(img.index) < self.images.len() and self.images[int(img.index)].alive and self.images[int(img.index)].gen == img.gen else {
         return Err("no such image")
     }
-    let rects: List[(i32, i32, i32, i32)] = [(x, y, w, h)]
+    let rects: [1](i32, i32, i32, i32) = [(x, y, w, h)]
     guard self.comp.update(ikey(img), pixels, int(stride), rects) else {
         return Err("image update {x},{y} {w}x{h} does not fit")
     }
@@ -1537,8 +1646,14 @@ pub fn Display[O, R].want_frame(mut self) {
 
 /// Timer(token) after `ms` milliseconds.
 pub fn Display[O, R].timer(mut self, ms: int, token: int) {
-    guard let Ok(fd) = os.timerfd() else {
-        return
+    var fd = -1
+    if let Some(cached) = self.free_timers.pop() {
+        fd = cached
+    } else {
+        guard let Ok(fresh) = os.timerfd() else {
+            return
+        }
+        fd = fresh
     }
     discard os.timer_arm(fd, max(ms, 1) * 1000000, 0)
     discard self.poll.add(fd, tok_timer + token, true, false)
@@ -1654,6 +1769,8 @@ pub fn Display[O, R].read_output(mut self, so: server.Output) -> Result[List[u8]
     return self.comp.read(t)
 }
 
+@noinline
+@cold
 fn Display[O, R].drop(mut self) {
     if self.waits.time_fd >= 0 {
         os.close(self.waits.time_fd)
@@ -1679,6 +1796,12 @@ fn Display[O, R].drop(mut self) {
         }
     }
     self.timers.clear()
+    for fd in self.free_timers {
+        if fd >= 0 {
+            os.close(fd)
+        }
+    }
+    self.free_timers.clear()
     for i in 0..self.waits.fences.len() {
         if self.waits.fences[i].used and self.waits.fences[i].fd >= 0 {
             os.close(self.waits.fences[i].fd)
@@ -1696,11 +1819,12 @@ fn Display[O, R].drop(mut self) {
             os.close(r.fd)
         }
     }
-    self.surfs.each(fn(_, sf) {
-        if sf.rel_fd >= 0 {
-            os.close(sf.rel_fd)
+    for i in 0..self.surfs.len() {
+        if self.surfs[i].gen != 0 and self.surfs[i].rel_fd >= 0 {
+            os.close(self.surfs[i].rel_fd)
+            self.surfs[i].rel_fd = -1
         }
-    })
+    }
     // The output lets go of its targets first; the renderer frees them all.
     var gone: List[u64] = []
     self.be.shutdown(mut gone)

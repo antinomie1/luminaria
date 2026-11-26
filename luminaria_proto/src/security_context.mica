@@ -27,24 +27,27 @@ pub enum ContextManagerRequest {
     CreateListener(Context, wire.Fd, wire.Fd)
 }
 
-fn decode_context_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ContextManagerRequest, wire.Error] {
+pub fn decode_context_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ContextManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ContextManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ContextManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Context { id: rd.new_id(mut conn, context_iface, m.version) }
             let listen_fd = rd.fd(mut conn)
             let close_fd = rd.fd(mut conn)
-            try rd.finish(mut conn, m)
-            return Ok(ContextManagerRequest.CreateListener(id, listen_fd, close_fd))
+            if rd.valid() {
+                return Ok(ContextManagerRequest.CreateListener(id, listen_fd, close_fd))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_security_context_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_security_context_manager_v1") })
 }
 
 /// wp_security_context_v1: client security context
@@ -79,36 +82,42 @@ pub enum ContextRequest {
     Commit
 }
 
-fn decode_context(mut conn: wire.Conn, m: wire.Msg) -> Result[ContextRequest, wire.Error] {
+pub fn decode_context(mut conn: wire.Conn, m: wire.Msg) -> Result[ContextRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ContextRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ContextRequest.Destroy)
+            }
         }
         1 => {
             let name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ContextRequest.SetSandboxEngine(name))
+            if rd.valid() {
+                return Ok(ContextRequest.SetSandboxEngine(name))
+            }
         }
         2 => {
             let app_id = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ContextRequest.SetAppId(app_id))
+            if rd.valid() {
+                return Ok(ContextRequest.SetAppId(app_id))
+            }
         }
         3 => {
             let instance_id = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ContextRequest.SetInstanceId(instance_id))
+            if rd.valid() {
+                return Ok(ContextRequest.SetInstanceId(instance_id))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(ContextRequest.Commit)
+            if rd.valid() {
+                return Ok(ContextRequest.Commit)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_security_context_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_security_context_v1") })
 }
 
 /// destroy the manager object

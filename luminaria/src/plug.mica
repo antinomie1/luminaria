@@ -125,6 +125,10 @@ pub trait Output: Input {
     /// Add the device's counters to `s` (commits, scheduling).
     fn stats(self, mut s: types.Stats) {}
 
+    /// Whether output `o` has hardware overlay planes available.
+    fn has_overlays(self, o: u32) -> bool {
+        return true
+    }
     /// Probe hardware overlay candidates against primary target `target_key`.
     fn test_overlays(mut self, o: u32, target_key: u64, cands: Slice[types.Overlay]) -> List[u64] {
         let none: List[u64] = []

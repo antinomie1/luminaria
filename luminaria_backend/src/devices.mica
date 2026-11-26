@@ -4,6 +4,7 @@
 // keyboards and pointers: add its `fds`, pass their tokens to `dispatch`,
 // drain `next` and forward the plug.Input calls to it.
 
+import std.mem
 import std.time
 import luminaria_types as types
 import session
@@ -24,6 +25,7 @@ pub struct Devices {
     /// Keymaps of the other logical seats.
     extra: List[(str, keyboard.Keyboard)] = []
     events: List[types.Event] = []
+    got_scratch: List[(str, types.Input)] = []
     head: int = 0
     boost: sched.Boost = sched.Boost {}
 }
@@ -88,10 +90,13 @@ pub fn Devices.dispatch(mut self, token: int) -> Option[bool] {
     }
     var inp = ii
     let before = self.extra.len()
-    var got: List[(str, types.Input)] = []
+    var got = mem.replace(mut self.got_scratch, [])
+    got.clear()
     if let Some(kk) = self.kb.take() {
         var kb = kk
-        inp.dispatch(mut kb, mut self.extra, self.names.clone(), mut got)
+        var extra = mem.replace(mut self.extra, [])
+        inp.dispatch(mut kb, mut extra, self.names, mut got)
+        self.extra = extra
         self.kb = Some(kb)
     }
     self.input = Some(inp)
@@ -101,13 +106,16 @@ pub fn Devices.dispatch(mut self, token: int) -> Option[bool] {
     if not got.is_empty() {
         self.boost.pulse(time.now_ns())
     }
-    for (seat, g) in take got {
+    for i in 0..got.len() {
+        let (seat, g) = mem.replace(mut got[i], ("", types.Input.TouchCancel))
         if seat.is_empty() {
             self.events.push(types.Event.Input(g))
         } else {
             self.events.push(types.Event.InputOn(seat, g))
         }
     }
+    got.clear()
+    self.got_scratch = got
     return None
 }
 
@@ -118,7 +126,7 @@ pub fn Devices.next(mut self) -> Option[types.Event] {
         self.head = 0
         return None
     }
-    let e = self.events[self.head].clone()
+    let e = mem.replace(mut self.events[self.head], types.Event.Closed)
     self.head += 1
     return Some(e)
 }

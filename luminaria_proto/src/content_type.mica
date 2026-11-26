@@ -26,23 +26,26 @@ pub enum TypeManagerRequest {
     GetSurfaceContentType(Type, wayland.Surface)
 }
 
-fn decode_type_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TypeManagerRequest, wire.Error] {
+pub fn decode_type_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[TypeManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TypeManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TypeManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Type { id: rd.new_id(mut conn, type_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(TypeManagerRequest.GetSurfaceContentType(id, surface))
+            if rd.valid() {
+                return Ok(TypeManagerRequest.GetSurfaceContentType(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_content_type_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_content_type_manager_v1") })
 }
 
 /// wp_content_type_v1: content type object for a surface
@@ -74,22 +77,25 @@ pub enum TypeRequest {
     SetContentType(TypeType)
 }
 
-fn decode_type(mut conn: wire.Conn, m: wire.Msg) -> Result[TypeRequest, wire.Error] {
+pub fn decode_type(mut conn: wire.Conn, m: wire.Msg) -> Result[TypeRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TypeRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TypeRequest.Destroy)
+            }
         }
         1 => {
             let content_type = TypeType(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(TypeRequest.SetContentType(content_type))
+            if rd.valid() {
+                return Ok(TypeRequest.SetContentType(content_type))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_content_type_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_content_type_v1") })
 }
 
 /// destroy the content type manager object

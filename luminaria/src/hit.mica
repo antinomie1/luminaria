@@ -1,9 +1,10 @@
 // Hit testing: which surface is under a point. Every pointer motion asks
-// (1000 Hz mice, hundreds of surfaces), so the rectangles live in
-// structure-of-arrays form as whole logical pixels and are tested eight at
-// a time: a lane is outside when any of x - x0, x1 - x - 1, y - y0,
-// y1 - y - 1 is negative, so one OR of four lane-wise subtractions and one
-// bitmask answer a block (2.6x the scalar loop). Candidates are then
+// (1000 Hz mice, hundreds of surfaces), so the rectangles live in blocked
+// structure-of-arrays form as whole logical pixels ([x0 x8, x1-1 x8,
+// y0 x8, y1-1 x8] per 8-rect block, 2 cache lines) and are tested eight at
+// a time: a lane is outside when any of x - x0, (x1 - 1) - x, y - y0,
+// (y1 - 1) - y is negative. All 8 sign bits are AND-reduced in registers
+// so empty blocks skip bitmask extraction completely; candidate lanes are
 // checked top-down against the surface's input region.
 
 import luminaria_server as server
@@ -11,17 +12,18 @@ import luminaria_server as server
 /// Padding lanes: never inside.
 let far: i32 = 0x3fffffff
 
+struct HitEntry {
+    surf: server.Surface
+    ox: f64
+    oy: f64
+    sc: f64
+}
+
 pub struct Hits {
-    x0: List[i32] = []
-    y0: List[i32] = []
-    x1: List[i32] = []
-    y1: List[i32] = []
-    /// Surface and where its origin is (global logical coordinates).
-    surfs: List[server.Surface] = []
-    ox: List[f64] = []
-    oy: List[f64] = []
-    /// Global units per surface unit (a scaled-down window: 0.5).
-    sc: List[f64] = []
+    /// Interleaved 8-rect blocks: 32 i32s per block ([x0 x8, x1-1 x8, y0 x8, y1-1 x8]).
+    boxes: List[i32] = []
+    /// Surface, origin (global logical coordinates) and scale (global/surface).
+    entries: List[HitEntry] = []
 }
 
 pub fn Hits.new() -> Hits {
@@ -29,14 +31,8 @@ pub fn Hits.new() -> Hits {
 }
 
 pub fn Hits.clear(mut self) {
-    self.x0.clear()
-    self.y0.clear()
-    self.x1.clear()
-    self.y1.clear()
-    self.surfs.clear()
-    self.ox.clear()
-    self.oy.clear()
-    self.sc.clear()
+    self.boxes.clear()
+    self.entries.clear()
 }
 
 /// A surface on top of the previous ones, at `x, y`, `w` x `h` global
@@ -51,68 +47,131 @@ pub fn Hits.add_clipped(mut self, s: server.Surface, ox: f64, oy: f64, cx0: f64,
     guard cx1 > cx0 and cy1 > cy0 else {
         return
     }
-    let n = self.surfs.len()
-    // Overwrite the padding of the last block, or start a new block.
-    if n == self.x0.len() {
+    let n = self.entries.len()
+    let lane = n & 7
+    let blk = (n >> 3) * 32
+    // Start a new padded 8-rect block when this block begins.
+    if lane == 0 {
         for _ in 0..8 {
-            self.x0.push(far)
-            self.x1.push(-far)
-            self.y0.push(far)
-            self.y1.push(-far)
+            self.boxes.push(far)
+        }
+        for _ in 0..8 {
+            self.boxes.push(-far)
+        }
+        for _ in 0..8 {
+            self.boxes.push(far)
+        }
+        for _ in 0..8 {
+            self.boxes.push(-far)
         }
     }
-    self.x0[n] = i32(cx0.floor())
-    self.y0[n] = i32(cy0.floor())
-    self.x1[n] = i32(cx1.ceil())
-    self.y1[n] = i32(cy1.ceil())
-    self.surfs.push(s)
-    self.ox.push(ox)
-    self.oy.push(oy)
-    self.sc.push(scale)
+    self.boxes[blk + lane] = i32(cx0.floor())
+    self.boxes[blk + 8 + lane] = i32(cx1.ceil()) - 1
+    self.boxes[blk + 16 + lane] = i32(cy0.floor())
+    self.boxes[blk + 24 + lane] = i32(cy1.ceil()) - 1
+    self.entries.push(HitEntry { surf: s, ox, oy, sc: scale })
 }
 
 pub fn Hits.len(self) -> int {
-    return self.surfs.len()
+    return self.entries.len()
 }
 
 /// The topmost surface accepting input at `x, y` and the point in its
 /// coordinates.
 pub fn Hits.find(self, srv: server.Server, x: f64, y: f64) -> Option[(server.Surface, f64, f64)] {
-    return self.find_except(srv, x, y, fn(_) => false)
-}
-
-/// `find`, passing over the surfaces `skip` names.
-pub fn Hits.find_except(self, srv: server.Server, x: f64, y: f64, skip: fn(server.Surface) -> bool) -> Option[(server.Surface, f64, f64)] {
-    let n = self.surfs.len()
+    let n = self.entries.len()
     guard n > 0 else {
         return None
     }
-    let px = u32x8(u32(int(i32(x.floor())).bits() & 0xffffffff))
-    let py = u32x8(u32(int(i32(y.floor())).bits() & 0xffffffff))
-    let one = u32x8(1)
-    var base = ((n - 1) / 8) * 8
-    while base >= 0 {
-        var out: u32 = 0
+    let px = u32x4(u32(int(i32(x.floor())).bits() & 0xffffffff))
+    let py = u32x4(u32(int(i32(y.floor())).bits() & 0xffffffff))
+    var off = ((n - 1) >> 3) * 32
+    while off >= 0 {
+        var m0 = u32x4(0)
+        var m1 = u32x4(0)
+        var all_out: u32 = 0
         unsafe {
-            let a = u32x8.load(self.x0.as_ptr().offset(base).cast[u32]())
-            let b = u32x8.load(self.x1.as_ptr().offset(base).cast[u32]())
-            let c = u32x8.load(self.y0.as_ptr().offset(base).cast[u32]())
-            let d = u32x8.load(self.y1.as_ptr().offset(base).cast[u32]())
-            out = ((px - a) | (b - px - one) | (py - c) | (d - py - one)).bitmask()
+            let p = self.boxes.as_ptr().offset(off).cast[u32]()
+            let a0 = u32x4.load(p)
+            let a1 = u32x4.load(p.offset(4))
+            let b0 = u32x4.load(p.offset(8))
+            let b1 = u32x4.load(p.offset(12))
+            let c0 = u32x4.load(p.offset(16))
+            let c1 = u32x4.load(p.offset(20))
+            let d0 = u32x4.load(p.offset(24))
+            let d1 = u32x4.load(p.offset(28))
+            m0 = (px - a0) | (b0 - px) | (py - c0) | (d0 - py)
+            m1 = (px - a1) | (b1 - px) | (py - c1) | (d1 - py)
+            let both = m0 & m1
+            let q = both & both.shuffle(both, [2, 3, 0, 1])
+            let s = q & q.shuffle(q, [1, 0, 3, 2])
+            all_out = s.shuffle(s, [0])
         }
-        var inside = ~out & 0xff
-        while inside != 0 {
-            let k = 31 - int(inside.clz())
-            inside &= ~(u32(1) << u32(k))
-            let i = base + k
-            let s = self.surfs[i]
-            let lx = (x - self.ox[i]) / self.sc[i]
-            let ly = (y - self.oy[i]) / self.sc[i]
-            if not skip(s) and srv.accepts(s, lx, ly) {
-                return Some((s, lx, ly))
+        if all_out < 0x80000000 {
+            let base = off >> 2
+            var inside = ~(m0.bitmask() | (m1.bitmask() << 4)) & 0xff
+            while inside != 0 {
+                let k = 31 - int(inside.clz())
+                inside &= ~(u32(1) << u32(k))
+                let e = self.entries[base + k]
+                let lx = (x - e.ox) / e.sc
+                let ly = (y - e.oy) / e.sc
+                if srv.accepts(e.surf, lx, ly) {
+                    return Some((e.surf, lx, ly))
+                }
             }
         }
-        base -= 8
+        off -= 32
+    }
+    return None
+}
+
+/// `find`, passing over the surfaces `skip` names.
+@noinline
+pub fn Hits.find_except(self, srv: server.Server, x: f64, y: f64, skip: fn(server.Surface) -> bool) -> Option[(server.Surface, f64, f64)] {
+    let n = self.entries.len()
+    guard n > 0 else {
+        return None
+    }
+    let px = u32x4(u32(int(i32(x.floor())).bits() & 0xffffffff))
+    let py = u32x4(u32(int(i32(y.floor())).bits() & 0xffffffff))
+    var off = ((n - 1) >> 3) * 32
+    while off >= 0 {
+        var m0 = u32x4(0)
+        var m1 = u32x4(0)
+        var all_out: u32 = 0
+        unsafe {
+            let p = self.boxes.as_ptr().offset(off).cast[u32]()
+            let a0 = u32x4.load(p)
+            let a1 = u32x4.load(p.offset(4))
+            let b0 = u32x4.load(p.offset(8))
+            let b1 = u32x4.load(p.offset(12))
+            let c0 = u32x4.load(p.offset(16))
+            let c1 = u32x4.load(p.offset(20))
+            let d0 = u32x4.load(p.offset(24))
+            let d1 = u32x4.load(p.offset(28))
+            m0 = (px - a0) | (b0 - px) | (py - c0) | (d0 - py)
+            m1 = (px - a1) | (b1 - px) | (py - c1) | (d1 - py)
+            let both = m0 & m1
+            let q = both & both.shuffle(both, [2, 3, 0, 1])
+            let s = q & q.shuffle(q, [1, 0, 3, 2])
+            all_out = s.shuffle(s, [0])
+        }
+        if all_out < 0x80000000 {
+            let base = off >> 2
+            var inside = ~(m0.bitmask() | (m1.bitmask() << 4)) & 0xff
+            while inside != 0 {
+                let k = 31 - int(inside.clz())
+                inside &= ~(u32(1) << u32(k))
+                let e = self.entries[base + k]
+                let lx = (x - e.ox) / e.sc
+                let ly = (y - e.oy) / e.sc
+                if not skip(e.surf) and srv.accepts(e.surf, lx, ly) {
+                    return Some((e.surf, lx, ly))
+                }
+            }
+        }
+        off -= 32
     }
     return None
 }

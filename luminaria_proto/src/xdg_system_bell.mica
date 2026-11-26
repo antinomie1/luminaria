@@ -21,23 +21,26 @@ pub enum SystemBellRequest {
     Ring(Option[wayland.Surface])
 }
 
-fn decode_system_bell(mut conn: wire.Conn, m: wire.Msg) -> Result[SystemBellRequest, wire.Error] {
+pub fn decode_system_bell(mut conn: wire.Conn, m: wire.Msg) -> Result[SystemBellRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SystemBellRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SystemBellRequest.Destroy)
+            }
         }
         1 => {
             let surface_raw = rd.object(conn, wayland.surface_iface, true)
             let surface: Option[wayland.Surface] = if surface_raw == 0 { None } else { Some(wayland.Surface { id: surface_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(SystemBellRequest.Ring(surface))
+            if rd.valid() {
+                return Ok(SystemBellRequest.Ring(surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_system_bell_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_system_bell_v1") })
 }
 
 /// destroy the system bell object

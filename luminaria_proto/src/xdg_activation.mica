@@ -23,28 +23,32 @@ pub enum ActivationRequest {
     Activate(str, wayland.Surface)
 }
 
-fn decode_activation(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationRequest, wire.Error] {
+pub fn decode_activation(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ActivationRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ActivationRequest.Destroy)
+            }
         }
         1 => {
             let id = ActivationToken { id: rd.new_id(mut conn, activation_token_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ActivationRequest.GetActivationToken(id))
+            if rd.valid() {
+                return Ok(ActivationRequest.GetActivationToken(id))
+            }
         }
         2 => {
             let token = rd.str(conn)
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ActivationRequest.Activate(token, surface))
+            if rd.valid() {
+                return Ok(ActivationRequest.Activate(token, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_activation_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_activation_v1") })
 }
 
 /// xdg_activation_token_v1: an exported activation handle
@@ -75,37 +79,43 @@ pub enum ActivationTokenRequest {
     Destroy
 }
 
-fn decode_activation_token(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationTokenRequest, wire.Error] {
+pub fn decode_activation_token(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationTokenRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ActivationTokenRequest.SetSerial(serial, seat))
+            if rd.valid() {
+                return Ok(ActivationTokenRequest.SetSerial(serial, seat))
+            }
         }
         1 => {
             let app_id = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ActivationTokenRequest.SetAppId(app_id))
+            if rd.valid() {
+                return Ok(ActivationTokenRequest.SetAppId(app_id))
+            }
         }
         2 => {
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ActivationTokenRequest.SetSurface(surface))
+            if rd.valid() {
+                return Ok(ActivationTokenRequest.SetSurface(surface))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(ActivationTokenRequest.Commit)
+            if rd.valid() {
+                return Ok(ActivationTokenRequest.Commit)
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ActivationTokenRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ActivationTokenRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_activation_token_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_activation_token_v1") })
 }
 
 /// the exported activation token
@@ -141,17 +151,19 @@ pub enum ActivationTokenEvent {
     Done(str)
 }
 
-fn decode_activation_token_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationTokenEvent, wire.Error] {
+pub fn decode_activation_token_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ActivationTokenEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let token = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ActivationTokenEvent.Done(token))
+            if rd.valid() {
+                return Ok(ActivationTokenEvent.Done(token))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on xdg_activation_token_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "xdg_activation_token_v1") })
 }
 
 /// specifies the seat and serial of the activating event

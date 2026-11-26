@@ -30,29 +30,33 @@ pub enum ManagerRequest {
     ImportTimeline(Timeline, wire.Fd)
 }
 
-fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
+pub fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Surface { id: rd.new_id(mut conn, surface_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.GetSurface(id, surface))
+            if rd.valid() {
+                return Ok(ManagerRequest.GetSurface(id, surface))
+            }
         }
         2 => {
             let id = Timeline { id: rd.new_id(mut conn, timeline_iface, m.version) }
             let fd = rd.fd(mut conn)
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.ImportTimeline(id, fd))
+            if rd.valid() {
+                return Ok(ManagerRequest.ImportTimeline(id, fd))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_linux_drm_syncobj_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_linux_drm_syncobj_manager_v1") })
 }
 
 /// wp_linux_drm_syncobj_timeline_v1: synchronization object timeline
@@ -70,17 +74,19 @@ pub enum TimelineRequest {
     Destroy
 }
 
-fn decode_timeline(mut conn: wire.Conn, m: wire.Msg) -> Result[TimelineRequest, wire.Error] {
+pub fn decode_timeline(mut conn: wire.Conn, m: wire.Msg) -> Result[TimelineRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TimelineRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TimelineRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_linux_drm_syncobj_timeline_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_linux_drm_syncobj_timeline_v1") })
 }
 
 /// wp_linux_drm_syncobj_surface_v1: per-surface explicit synchronization
@@ -117,31 +123,35 @@ pub enum SurfaceRequest {
     SetReleasePoint(Timeline, u32, u32)
 }
 
-fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
+pub fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SurfaceRequest.Destroy)
+            }
         }
         1 => {
             let timeline = Timeline { id: rd.object(conn, timeline_iface, false) }
             let point_hi = rd.u32(conn)
             let point_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetAcquirePoint(timeline, point_hi, point_lo))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetAcquirePoint(timeline, point_hi, point_lo))
+            }
         }
         2 => {
             let timeline = Timeline { id: rd.object(conn, timeline_iface, false) }
             let point_hi = rd.u32(conn)
             let point_lo = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetReleasePoint(timeline, point_hi, point_lo))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetReleasePoint(timeline, point_hi, point_lo))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_linux_drm_syncobj_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_linux_drm_syncobj_surface_v1") })
 }
 
 /// destroy explicit synchronization factory object

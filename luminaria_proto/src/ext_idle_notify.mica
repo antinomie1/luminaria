@@ -23,34 +23,38 @@ pub enum NotifierRequest {
     GetInputIdleNotification(Notification, u32, wayland.Seat)
 }
 
-fn decode_notifier(mut conn: wire.Conn, m: wire.Msg) -> Result[NotifierRequest, wire.Error] {
+pub fn decode_notifier(mut conn: wire.Conn, m: wire.Msg) -> Result[NotifierRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(NotifierRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(NotifierRequest.Destroy)
+            }
         }
         1 => {
             let id = Notification { id: rd.new_id(mut conn, notification_iface, m.version) }
             let timeout = rd.u32(conn)
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(NotifierRequest.GetIdleNotification(id, timeout, seat))
+            if rd.valid() {
+                return Ok(NotifierRequest.GetIdleNotification(id, timeout, seat))
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "ext_idle_notifier_v1.get_input_idle_notification needs version 2"))
+                return Err(conn.needs_version(m, "ext_idle_notifier_v1.get_input_idle_notification", 2))
             }
             let id = Notification { id: rd.new_id(mut conn, notification_iface, m.version) }
             let timeout = rd.u32(conn)
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(NotifierRequest.GetInputIdleNotification(id, timeout, seat))
+            if rd.valid() {
+                return Ok(NotifierRequest.GetInputIdleNotification(id, timeout, seat))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_idle_notifier_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_idle_notifier_v1") })
 }
 
 /// ext_idle_notification_v1: idle notification
@@ -68,17 +72,19 @@ pub enum NotificationRequest {
     Destroy
 }
 
-fn decode_notification(mut conn: wire.Conn, m: wire.Msg) -> Result[NotificationRequest, wire.Error] {
+pub fn decode_notification(mut conn: wire.Conn, m: wire.Msg) -> Result[NotificationRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(NotificationRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(NotificationRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_idle_notification_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_idle_notification_v1") })
 }
 
 /// notification object is idle
@@ -128,20 +134,23 @@ pub enum NotificationEvent {
     Resumed
 }
 
-fn decode_notification_event(mut conn: wire.Conn, m: wire.Msg) -> Result[NotificationEvent, wire.Error] {
+pub fn decode_notification_event(mut conn: wire.Conn, m: wire.Msg) -> Result[NotificationEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(NotificationEvent.Idled)
+            if rd.valid() {
+                return Ok(NotificationEvent.Idled)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(NotificationEvent.Resumed)
+            if rd.valid() {
+                return Ok(NotificationEvent.Resumed)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_idle_notification_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_idle_notification_v1") })
 }
 
 /// destroy the notification object

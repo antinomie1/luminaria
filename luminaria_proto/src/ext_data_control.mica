@@ -23,28 +23,32 @@ pub enum ManagerRequest {
     Destroy
 }
 
-fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
+pub fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Source { id: rd.new_id(mut conn, source_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.CreateDataSource(id))
+            if rd.valid() {
+                return Ok(ManagerRequest.CreateDataSource(id))
+            }
         }
         1 => {
             let id = Device { id: rd.new_id(mut conn, device_iface, m.version) }
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.GetDataDevice(id, seat))
+            if rd.valid() {
+                return Ok(ManagerRequest.GetDataDevice(id, seat))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ManagerRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_data_control_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_data_control_manager_v1") })
 }
 
 /// ext_data_control_device_v1: manage a data device for a seat
@@ -71,29 +75,33 @@ pub enum DeviceRequest {
     SetPrimarySelection(Option[Source])
 }
 
-fn decode_device(mut conn: wire.Conn, m: wire.Msg) -> Result[DeviceRequest, wire.Error] {
+pub fn decode_device(mut conn: wire.Conn, m: wire.Msg) -> Result[DeviceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let source_raw = rd.object(conn, source_iface, true)
             let source: Option[Source] = if source_raw == 0 { None } else { Some(Source { id: source_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(DeviceRequest.SetSelection(source))
+            if rd.valid() {
+                return Ok(DeviceRequest.SetSelection(source))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DeviceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DeviceRequest.Destroy)
+            }
         }
         2 => {
             let source_raw = rd.object(conn, source_iface, true)
             let source: Option[Source] = if source_raw == 0 { None } else { Some(Source { id: source_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(DeviceRequest.SetPrimarySelection(source))
+            if rd.valid() {
+                return Ok(DeviceRequest.SetPrimarySelection(source))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_data_control_device_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_data_control_device_v1") })
 }
 
 /// introduce a new ext_data_control_offer
@@ -143,22 +151,25 @@ pub enum SourceRequest {
     Destroy
 }
 
-fn decode_source(mut conn: wire.Conn, m: wire.Msg) -> Result[SourceRequest, wire.Error] {
+pub fn decode_source(mut conn: wire.Conn, m: wire.Msg) -> Result[SourceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SourceRequest.Offer(mime_type))
+            if rd.valid() {
+                return Ok(SourceRequest.Offer(mime_type))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SourceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SourceRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_data_control_source_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_data_control_source_v1") })
 }
 
 /// send the data
@@ -190,23 +201,26 @@ pub enum OfferRequest {
     Destroy
 }
 
-fn decode_offer(mut conn: wire.Conn, m: wire.Msg) -> Result[OfferRequest, wire.Error] {
+pub fn decode_offer(mut conn: wire.Conn, m: wire.Msg) -> Result[OfferRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.str(conn)
             let fd = rd.fd(mut conn)
-            try rd.finish(mut conn, m)
-            return Ok(OfferRequest.Receive(mime_type, fd))
+            if rd.valid() {
+                return Ok(OfferRequest.Receive(mime_type, fd))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(OfferRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(OfferRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_data_control_offer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_data_control_offer_v1") })
 }
 
 /// advertise offered MIME type
@@ -250,33 +264,38 @@ pub enum DeviceEvent {
     PrimarySelection(Option[Offer])
 }
 
-fn decode_device_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DeviceEvent, wire.Error] {
+pub fn decode_device_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DeviceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Offer { id: rd.new_id(mut conn, offer_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DeviceEvent.DataOffer(id))
+            if rd.valid() {
+                return Ok(DeviceEvent.DataOffer(id))
+            }
         }
         1 => {
             let id_arg_raw = rd.object(conn, offer_iface, true)
             let id_arg: Option[Offer] = if id_arg_raw == 0 { None } else { Some(Offer { id: id_arg_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(DeviceEvent.Selection(id_arg))
+            if rd.valid() {
+                return Ok(DeviceEvent.Selection(id_arg))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(DeviceEvent.Finished)
+            if rd.valid() {
+                return Ok(DeviceEvent.Finished)
+            }
         }
         3 => {
             let id_arg_raw = rd.object(conn, offer_iface, true)
             let id_arg: Option[Offer] = if id_arg_raw == 0 { None } else { Some(Offer { id: id_arg_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(DeviceEvent.PrimarySelection(id_arg))
+            if rd.valid() {
+                return Ok(DeviceEvent.PrimarySelection(id_arg))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_data_control_device_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_data_control_device_v1") })
 }
 
 /// copy data to the selection
@@ -305,22 +324,25 @@ pub enum SourceEvent {
     Cancelled
 }
 
-fn decode_source_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SourceEvent, wire.Error] {
+pub fn decode_source_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SourceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.str(conn)
             let fd = rd.fd(mut conn)
-            try rd.finish(mut conn, m)
-            return Ok(SourceEvent.Send(mime_type, fd))
+            if rd.valid() {
+                return Ok(SourceEvent.Send(mime_type, fd))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(SourceEvent.Cancelled)
+            if rd.valid() {
+                return Ok(SourceEvent.Cancelled)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_data_control_source_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_data_control_source_v1") })
 }
 
 /// add an offered MIME type
@@ -341,17 +363,19 @@ pub enum OfferEvent {
     Offer(str)
 }
 
-fn decode_offer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OfferEvent, wire.Error] {
+pub fn decode_offer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OfferEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OfferEvent.Offer(mime_type))
+            if rd.valid() {
+                return Ok(OfferEvent.Offer(mime_type))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_data_control_offer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_data_control_offer_v1") })
 }
 
 /// request that the data is transferred

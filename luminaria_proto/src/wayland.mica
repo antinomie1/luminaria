@@ -33,22 +33,25 @@ pub enum DisplayRequest {
     GetRegistry(Registry)
 }
 
-fn decode_display(mut conn: wire.Conn, m: wire.Msg) -> Result[DisplayRequest, wire.Error] {
+pub fn decode_display(mut conn: wire.Conn, m: wire.Msg) -> Result[DisplayRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let callback = Callback { id: rd.new_id(mut conn, callback_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DisplayRequest.Sync(callback))
+            if rd.valid() {
+                return Ok(DisplayRequest.Sync(callback))
+            }
         }
         1 => {
             let registry = Registry { id: rd.new_id(mut conn, registry_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DisplayRequest.GetRegistry(registry))
+            if rd.valid() {
+                return Ok(DisplayRequest.GetRegistry(registry))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_display"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_display") })
 }
 
 /// fatal error event
@@ -80,20 +83,22 @@ pub enum RegistryRequest {
     Bind(u32, wire.Object)
 }
 
-fn decode_registry(mut conn: wire.Conn, m: wire.Msg) -> Result[RegistryRequest, wire.Error] {
+pub fn decode_registry(mut conn: wire.Conn, m: wire.Msg) -> Result[RegistryRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let name = rd.u32(conn)
             let id_iface = rd.str(conn)
             let id_version = rd.u32(conn)
             let id = rd.new_object(mut conn, conn.resolve(ifaces.by_name(id_iface), id_iface), id_version)
-            try rd.finish(mut conn, m)
-            return Ok(RegistryRequest.Bind(name, id))
+            if rd.valid() {
+                return Ok(RegistryRequest.Bind(name, id))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_registry"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_registry") })
 }
 
 /// announce global object
@@ -145,30 +150,34 @@ pub enum CompositorRequest {
     Release
 }
 
-fn decode_compositor(mut conn: wire.Conn, m: wire.Msg) -> Result[CompositorRequest, wire.Error] {
+pub fn decode_compositor(mut conn: wire.Conn, m: wire.Msg) -> Result[CompositorRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Surface { id: rd.new_id(mut conn, surface_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(CompositorRequest.CreateSurface(id))
+            if rd.valid() {
+                return Ok(CompositorRequest.CreateSurface(id))
+            }
         }
         1 => {
             let id = Region { id: rd.new_id(mut conn, region_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(CompositorRequest.CreateRegion(id))
+            if rd.valid() {
+                return Ok(CompositorRequest.CreateRegion(id))
+            }
         }
         2 => {
             guard m.version >= 7 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_compositor.release needs version 7"))
+                return Err(conn.needs_version(m, "wl_compositor.release", 7))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(CompositorRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(CompositorRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_compositor"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_compositor") })
 }
 
 /// wl_shm_pool: a shared memory pool
@@ -198,8 +207,9 @@ pub enum ShmPoolRequest {
     Resize(i32)
 }
 
-fn decode_shm_pool(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmPoolRequest, wire.Error] {
+pub fn decode_shm_pool(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmPoolRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Buffer { id: rd.new_id(mut conn, buffer_iface, m.version) }
@@ -208,22 +218,25 @@ fn decode_shm_pool(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmPoolRequest, w
             let height = rd.i32(conn)
             let stride = rd.i32(conn)
             let format = ShmFormat(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ShmPoolRequest.CreateBuffer(id, offset, width, height, stride, format))
+            if rd.valid() {
+                return Ok(ShmPoolRequest.CreateBuffer(id, offset, width, height, stride, format))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ShmPoolRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ShmPoolRequest.Destroy)
+            }
         }
         2 => {
             let size = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShmPoolRequest.Resize(size))
+            if rd.valid() {
+                return Ok(ShmPoolRequest.Resize(size))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_shm_pool"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_shm_pool") })
 }
 
 /// wl_shm: shared memory support
@@ -540,27 +553,30 @@ pub enum ShmRequest {
     Release
 }
 
-fn decode_shm(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmRequest, wire.Error] {
+pub fn decode_shm(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = ShmPool { id: rd.new_id(mut conn, shm_pool_iface, m.version) }
             let fd = rd.fd(mut conn)
             let size = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShmRequest.CreatePool(id, fd, size))
+            if rd.valid() {
+                return Ok(ShmRequest.CreatePool(id, fd, size))
+            }
         }
         1 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_shm.release needs version 2"))
+                return Err(conn.needs_version(m, "wl_shm.release", 2))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ShmRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ShmRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_shm"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_shm") })
 }
 
 /// pixel format description
@@ -584,17 +600,19 @@ pub enum BufferRequest {
     Destroy
 }
 
-fn decode_buffer(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferRequest, wire.Error] {
+pub fn decode_buffer(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(BufferRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(BufferRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_buffer"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_buffer") })
 }
 
 /// compositor releases buffer
@@ -636,45 +654,51 @@ pub enum DataOfferRequest {
     SetActions(DataDeviceManagerDndAction, DataDeviceManagerDndAction)
 }
 
-fn decode_data_offer(mut conn: wire.Conn, m: wire.Msg) -> Result[DataOfferRequest, wire.Error] {
+pub fn decode_data_offer(mut conn: wire.Conn, m: wire.Msg) -> Result[DataOfferRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let mime_type = rd.opt_str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferRequest.Accept(serial, mime_type))
+            if rd.valid() {
+                return Ok(DataOfferRequest.Accept(serial, mime_type))
+            }
         }
         1 => {
             let mime_type = rd.str(conn)
             let fd = rd.fd(mut conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferRequest.Receive(mime_type, fd))
+            if rd.valid() {
+                return Ok(DataOfferRequest.Receive(mime_type, fd))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DataOfferRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DataOfferRequest.Destroy)
+            }
         }
         3 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_offer.finish needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_offer.finish", 3))
             }
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferRequest.Finish)
+            if rd.valid() {
+                return Ok(DataOfferRequest.Finish)
+            }
         }
         4 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_offer.set_actions needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_offer.set_actions", 3))
             }
             let dnd_actions = DataDeviceManagerDndAction(rd.u32(conn))
             let preferred_action = DataDeviceManagerDndAction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferRequest.SetActions(dnd_actions, preferred_action))
+            if rd.valid() {
+                return Ok(DataOfferRequest.SetActions(dnd_actions, preferred_action))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_data_offer"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_data_offer") })
 }
 
 /// advertise offered mime type
@@ -727,30 +751,34 @@ pub enum DataSourceRequest {
     SetActions(DataDeviceManagerDndAction)
 }
 
-fn decode_data_source(mut conn: wire.Conn, m: wire.Msg) -> Result[DataSourceRequest, wire.Error] {
+pub fn decode_data_source(mut conn: wire.Conn, m: wire.Msg) -> Result[DataSourceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceRequest.Offer(mime_type))
+            if rd.valid() {
+                return Ok(DataSourceRequest.Offer(mime_type))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DataSourceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DataSourceRequest.Destroy)
+            }
         }
         2 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_source.set_actions needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_source.set_actions", 3))
             }
             let dnd_actions = DataDeviceManagerDndAction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceRequest.SetActions(dnd_actions))
+            if rd.valid() {
+                return Ok(DataSourceRequest.SetActions(dnd_actions))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_data_source"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_data_source") })
 }
 
 /// a target accepts an offered mime type
@@ -822,8 +850,9 @@ pub enum DataDeviceRequest {
     Release
 }
 
-fn decode_data_device(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceRequest, wire.Error] {
+pub fn decode_data_device(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let source_raw = rd.object(conn, data_source_iface, true)
@@ -832,27 +861,30 @@ fn decode_data_device(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceRequ
             let icon_raw = rd.object(conn, surface_iface, true)
             let icon: Option[Surface] = if icon_raw == 0 { None } else { Some(Surface { id: icon_raw }) }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceRequest.StartDrag(source, origin, icon, serial))
+            if rd.valid() {
+                return Ok(DataDeviceRequest.StartDrag(source, origin, icon, serial))
+            }
         }
         1 => {
             let source_raw = rd.object(conn, data_source_iface, true)
             let source: Option[DataSource] = if source_raw == 0 { None } else { Some(DataSource { id: source_raw }) }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceRequest.SetSelection(source, serial))
+            if rd.valid() {
+                return Ok(DataDeviceRequest.SetSelection(source, serial))
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_device.release needs version 2"))
+                return Err(conn.needs_version(m, "wl_data_device.release", 2))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DataDeviceRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DataDeviceRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_data_device"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_data_device") })
 }
 
 /// introduce a new wl_data_offer
@@ -929,31 +961,35 @@ pub enum DataDeviceManagerRequest {
     Release
 }
 
-fn decode_data_device_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceManagerRequest, wire.Error] {
+pub fn decode_data_device_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = DataSource { id: rd.new_id(mut conn, data_source_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceManagerRequest.CreateDataSource(id))
+            if rd.valid() {
+                return Ok(DataDeviceManagerRequest.CreateDataSource(id))
+            }
         }
         1 => {
             let id = DataDevice { id: rd.new_id(mut conn, data_device_iface, m.version) }
             let seat = Seat { id: rd.object(conn, seat_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceManagerRequest.GetDataDevice(id, seat))
+            if rd.valid() {
+                return Ok(DataDeviceManagerRequest.GetDataDevice(id, seat))
+            }
         }
         2 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_device_manager.release needs version 4"))
+                return Err(conn.needs_version(m, "wl_data_device_manager.release", 4))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(DataDeviceManagerRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(DataDeviceManagerRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_data_device_manager"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_data_device_manager") })
 }
 
 /// wl_shell: create desktop-style surfaces
@@ -976,18 +1012,20 @@ pub enum ShellRequest {
     GetShellSurface(ShellSurface, Surface)
 }
 
-fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.Error] {
+pub fn decode_shell(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = ShellSurface { id: rd.new_id(mut conn, shell_surface_iface, m.version) }
             let surface = Surface { id: rd.object(conn, surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ShellRequest.GetShellSurface(id, surface))
+            if rd.valid() {
+                return Ok(ShellRequest.GetShellSurface(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_shell"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_shell") })
 }
 
 /// wl_shell_surface: desktop-style metadata interface
@@ -1065,46 +1103,53 @@ pub enum ShellSurfaceRequest {
     SetClass(str)
 }
 
-fn decode_shell_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellSurfaceRequest, wire.Error] {
+pub fn decode_shell_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellSurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.Pong(serial))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.Pong(serial))
+            }
         }
         1 => {
             let seat = Seat { id: rd.object(conn, seat_iface, false) }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.Move(seat, serial))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.Move(seat, serial))
+            }
         }
         2 => {
             let seat = Seat { id: rd.object(conn, seat_iface, false) }
             let serial = rd.u32(conn)
             let edges = ShellSurfaceResize(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.Resize(seat, serial, edges))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.Resize(seat, serial, edges))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetToplevel)
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetToplevel)
+            }
         }
         4 => {
             let parent = Surface { id: rd.object(conn, surface_iface, false) }
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let flags = ShellSurfaceTransient(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetTransient(parent, x, y, flags))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetTransient(parent, x, y, flags))
+            }
         }
         5 => {
             let method = ShellSurfaceFullscreenMethod(rd.u32(conn))
             let framerate = rd.u32(conn)
             let output_raw = rd.object(conn, output_iface, true)
             let output: Option[Output] = if output_raw == 0 { None } else { Some(Output { id: output_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetFullscreen(method, framerate, output))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetFullscreen(method, framerate, output))
+            }
         }
         6 => {
             let seat = Seat { id: rd.object(conn, seat_iface, false) }
@@ -1113,28 +1158,32 @@ fn decode_shell_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellSurface
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let flags = ShellSurfaceTransient(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetPopup(seat, serial, parent, x, y, flags))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetPopup(seat, serial, parent, x, y, flags))
+            }
         }
         7 => {
             let output_raw = rd.object(conn, output_iface, true)
             let output: Option[Output] = if output_raw == 0 { None } else { Some(Output { id: output_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetMaximized(output))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetMaximized(output))
+            }
         }
         8 => {
             let title = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetTitle(title))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetTitle(title))
+            }
         }
         9 => {
             let class_ = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceRequest.SetClass(class_))
+            if rd.valid() {
+                return Ok(ShellSurfaceRequest.SetClass(class_))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_shell_surface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_shell_surface") })
 }
 
 /// ping client
@@ -1209,98 +1258,111 @@ pub enum SurfaceRequest {
     GetRelease(Callback)
 }
 
-fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
+pub fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SurfaceRequest.Destroy)
+            }
         }
         1 => {
             let buffer_raw = rd.object(conn, buffer_iface, true)
             let buffer: Option[Buffer] = if buffer_raw == 0 { None } else { Some(Buffer { id: buffer_raw }) }
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.Attach(buffer, x, y))
+            if rd.valid() {
+                return Ok(SurfaceRequest.Attach(buffer, x, y))
+            }
         }
         2 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.Damage(x, y, width, height))
+            if rd.valid() {
+                return Ok(SurfaceRequest.Damage(x, y, width, height))
+            }
         }
         3 => {
             let callback = Callback { id: rd.new_id(mut conn, callback_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.Frame(callback))
+            if rd.valid() {
+                return Ok(SurfaceRequest.Frame(callback))
+            }
         }
         4 => {
             let region_raw = rd.object(conn, region_iface, true)
             let region: Option[Region] = if region_raw == 0 { None } else { Some(Region { id: region_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetOpaqueRegion(region))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetOpaqueRegion(region))
+            }
         }
         5 => {
             let region_raw = rd.object(conn, region_iface, true)
             let region: Option[Region] = if region_raw == 0 { None } else { Some(Region { id: region_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetInputRegion(region))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetInputRegion(region))
+            }
         }
         6 => {
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.Commit)
+            if rd.valid() {
+                return Ok(SurfaceRequest.Commit)
+            }
         }
         7 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.set_buffer_transform needs version 2"))
+                return Err(conn.needs_version(m, "wl_surface.set_buffer_transform", 2))
             }
             let transform = OutputTransform(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetBufferTransform(transform))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetBufferTransform(transform))
+            }
         }
         8 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.set_buffer_scale needs version 3"))
+                return Err(conn.needs_version(m, "wl_surface.set_buffer_scale", 3))
             }
             let scale = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetBufferScale(scale))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetBufferScale(scale))
+            }
         }
         9 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.damage_buffer needs version 4"))
+                return Err(conn.needs_version(m, "wl_surface.damage_buffer", 4))
             }
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.DamageBuffer(x, y, width, height))
+            if rd.valid() {
+                return Ok(SurfaceRequest.DamageBuffer(x, y, width, height))
+            }
         }
         10 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.offset needs version 5"))
+                return Err(conn.needs_version(m, "wl_surface.offset", 5))
             }
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.Offset(x, y))
+            if rd.valid() {
+                return Ok(SurfaceRequest.Offset(x, y))
+            }
         }
         11 => {
             guard m.version >= 7 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.get_release needs version 7"))
+                return Err(conn.needs_version(m, "wl_surface.get_release", 7))
             }
             let callback = Callback { id: rd.new_id(mut conn, callback_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.GetRelease(callback))
+            if rd.valid() {
+                return Ok(SurfaceRequest.GetRelease(callback))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_surface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_surface") })
 }
 
 /// surface enters an output
@@ -1371,35 +1433,40 @@ pub enum SeatRequest {
     Release
 }
 
-fn decode_seat(mut conn: wire.Conn, m: wire.Msg) -> Result[SeatRequest, wire.Error] {
+pub fn decode_seat(mut conn: wire.Conn, m: wire.Msg) -> Result[SeatRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = Pointer { id: rd.new_id(mut conn, pointer_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SeatRequest.GetPointer(id))
+            if rd.valid() {
+                return Ok(SeatRequest.GetPointer(id))
+            }
         }
         1 => {
             let id = Keyboard { id: rd.new_id(mut conn, keyboard_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SeatRequest.GetKeyboard(id))
+            if rd.valid() {
+                return Ok(SeatRequest.GetKeyboard(id))
+            }
         }
         2 => {
             let id = Touch { id: rd.new_id(mut conn, touch_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SeatRequest.GetTouch(id))
+            if rd.valid() {
+                return Ok(SeatRequest.GetTouch(id))
+            }
         }
         3 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_seat.release needs version 5"))
+                return Err(conn.needs_version(m, "wl_seat.release", 5))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SeatRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SeatRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_seat"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_seat") })
 }
 
 /// seat capabilities changed
@@ -1475,8 +1542,9 @@ pub enum PointerRequest {
     Release
 }
 
-fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wire.Error] {
+pub fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
@@ -1484,20 +1552,22 @@ fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wi
             let surface: Option[Surface] = if surface_raw == 0 { None } else { Some(Surface { id: surface_raw }) }
             let hotspot_x = rd.i32(conn)
             let hotspot_y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.SetCursor(serial, surface, hotspot_x, hotspot_y))
+            if rd.valid() {
+                return Ok(PointerRequest.SetCursor(serial, surface, hotspot_x, hotspot_y))
+            }
         }
         1 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.release needs version 3"))
+                return Err(conn.needs_version(m, "wl_pointer.release", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PointerRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PointerRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_pointer"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_pointer") })
 }
 
 /// enter event
@@ -1641,20 +1711,22 @@ pub enum KeyboardRequest {
     Release
 }
 
-fn decode_keyboard(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardRequest, wire.Error] {
+pub fn decode_keyboard(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_keyboard.release needs version 3"))
+                return Err(conn.needs_version(m, "wl_keyboard.release", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(KeyboardRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(KeyboardRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_keyboard"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_keyboard") })
 }
 
 /// keyboard mapping
@@ -1724,20 +1796,22 @@ pub enum TouchRequest {
     Release
 }
 
-fn decode_touch(mut conn: wire.Conn, m: wire.Msg) -> Result[TouchRequest, wire.Error] {
+pub fn decode_touch(mut conn: wire.Conn, m: wire.Msg) -> Result[TouchRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_touch.release needs version 3"))
+                return Err(conn.needs_version(m, "wl_touch.release", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(TouchRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(TouchRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_touch"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_touch") })
 }
 
 /// touch down event and beginning of a touch sequence
@@ -1859,20 +1933,22 @@ pub enum OutputRequest {
     Release
 }
 
-fn decode_output(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputRequest, wire.Error] {
+pub fn decode_output(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_output.release needs version 3"))
+                return Err(conn.needs_version(m, "wl_output.release", 3))
             }
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(OutputRequest.Release)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(OutputRequest.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_output"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_output") })
 }
 
 /// properties of the output
@@ -1951,33 +2027,37 @@ pub enum RegionRequest {
     Subtract(i32, i32, i32, i32)
 }
 
-fn decode_region(mut conn: wire.Conn, m: wire.Msg) -> Result[RegionRequest, wire.Error] {
+pub fn decode_region(mut conn: wire.Conn, m: wire.Msg) -> Result[RegionRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(RegionRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(RegionRequest.Destroy)
+            }
         }
         1 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(RegionRequest.Add(x, y, width, height))
+            if rd.valid() {
+                return Ok(RegionRequest.Add(x, y, width, height))
+            }
         }
         2 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(RegionRequest.Subtract(x, y, width, height))
+            if rd.valid() {
+                return Ok(RegionRequest.Subtract(x, y, width, height))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_region"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_region") })
 }
 
 /// wl_subcompositor: sub-surface compositing
@@ -2004,24 +2084,27 @@ pub enum SubcompositorRequest {
     GetSubsurface(Subsurface, Surface, Surface)
 }
 
-fn decode_subcompositor(mut conn: wire.Conn, m: wire.Msg) -> Result[SubcompositorRequest, wire.Error] {
+pub fn decode_subcompositor(mut conn: wire.Conn, m: wire.Msg) -> Result[SubcompositorRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SubcompositorRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SubcompositorRequest.Destroy)
+            }
         }
         1 => {
             let id = Subsurface { id: rd.new_id(mut conn, subsurface_iface, m.version) }
             let surface = Surface { id: rd.object(conn, surface_iface, false) }
             let parent = Surface { id: rd.object(conn, surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SubcompositorRequest.GetSubsurface(id, surface, parent))
+            if rd.valid() {
+                return Ok(SubcompositorRequest.GetSubsurface(id, surface, parent))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_subcompositor"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_subcompositor") })
 }
 
 /// wl_subsurface: sub-surface interface to a wl_surface
@@ -2054,41 +2137,48 @@ pub enum SubsurfaceRequest {
     SetDesync
 }
 
-fn decode_subsurface(mut conn: wire.Conn, m: wire.Msg) -> Result[SubsurfaceRequest, wire.Error] {
+pub fn decode_subsurface(mut conn: wire.Conn, m: wire.Msg) -> Result[SubsurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SubsurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SubsurfaceRequest.Destroy)
+            }
         }
         1 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SubsurfaceRequest.SetPosition(x, y))
+            if rd.valid() {
+                return Ok(SubsurfaceRequest.SetPosition(x, y))
+            }
         }
         2 => {
             let sibling = Surface { id: rd.object(conn, surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SubsurfaceRequest.PlaceAbove(sibling))
+            if rd.valid() {
+                return Ok(SubsurfaceRequest.PlaceAbove(sibling))
+            }
         }
         3 => {
             let sibling = Surface { id: rd.object(conn, surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SubsurfaceRequest.PlaceBelow(sibling))
+            if rd.valid() {
+                return Ok(SubsurfaceRequest.PlaceBelow(sibling))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(SubsurfaceRequest.SetSync)
+            if rd.valid() {
+                return Ok(SubsurfaceRequest.SetSync)
+            }
         }
         5 => {
-            try rd.finish(mut conn, m)
-            return Ok(SubsurfaceRequest.SetDesync)
+            if rd.valid() {
+                return Ok(SubsurfaceRequest.SetDesync)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_subsurface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_subsurface") })
 }
 
 /// wl_fixes: wayland protocol fixes
@@ -2116,31 +2206,35 @@ pub enum FixesRequest {
     AckGlobalRemove(Registry, u32)
 }
 
-fn decode_fixes(mut conn: wire.Conn, m: wire.Msg) -> Result[FixesRequest, wire.Error] {
+pub fn decode_fixes(mut conn: wire.Conn, m: wire.Msg) -> Result[FixesRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(FixesRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(FixesRequest.Destroy)
+            }
         }
         1 => {
             let registry = Registry { id: rd.object(conn, registry_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(FixesRequest.DestroyRegistry(registry))
+            if rd.valid() {
+                return Ok(FixesRequest.DestroyRegistry(registry))
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_fixes.ack_global_remove needs version 2"))
+                return Err(conn.needs_version(m, "wl_fixes.ack_global_remove", 2))
             }
             let registry = Registry { id: rd.object(conn, registry_iface, false) }
             let name = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(FixesRequest.AckGlobalRemove(registry, name))
+            if rd.valid() {
+                return Ok(FixesRequest.AckGlobalRemove(registry, name))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wl_fixes"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wl_fixes") })
 }
 
 /// Events of wl_display.
@@ -2151,24 +2245,27 @@ pub enum DisplayEvent {
     DeleteId(u32)
 }
 
-fn decode_display_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DisplayEvent, wire.Error] {
+pub fn decode_display_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DisplayEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let object_id = rd.object(conn, 0, false)
             let code = rd.u32(conn)
             let message = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DisplayEvent.Error(object_id, code, message))
+            if rd.valid() {
+                return Ok(DisplayEvent.Error(object_id, code, message))
+            }
         }
         1 => {
             let id_arg = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DisplayEvent.DeleteId(id_arg))
+            if rd.valid() {
+                return Ok(DisplayEvent.DeleteId(id_arg))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_display"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_display") })
 }
 
 /// asynchronous roundtrip
@@ -2195,24 +2292,27 @@ pub enum RegistryEvent {
     GlobalRemove(u32)
 }
 
-fn decode_registry_event(mut conn: wire.Conn, m: wire.Msg) -> Result[RegistryEvent, wire.Error] {
+pub fn decode_registry_event(mut conn: wire.Conn, m: wire.Msg) -> Result[RegistryEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let name = rd.u32(conn)
             let interface = rd.str(conn)
             let version = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(RegistryEvent.Global(name, interface, version))
+            if rd.valid() {
+                return Ok(RegistryEvent.Global(name, interface, version))
+            }
         }
         1 => {
             let name = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(RegistryEvent.GlobalRemove(name))
+            if rd.valid() {
+                return Ok(RegistryEvent.GlobalRemove(name))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_registry"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_registry") })
 }
 
 /// bind an object to the display
@@ -2232,18 +2332,20 @@ pub enum CallbackEvent {
     Done(u32)
 }
 
-fn decode_callback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[CallbackEvent, wire.Error] {
+pub fn decode_callback_event(mut conn: wire.Conn, m: wire.Msg) -> Result[CallbackEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let callback_data = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(CallbackEvent.Done(callback_data))
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(CallbackEvent.Done(callback_data))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_callback"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_callback") })
 }
 
 /// create new surface
@@ -2302,17 +2404,19 @@ pub enum ShmEvent {
     Format(ShmFormat)
 }
 
-fn decode_shm_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmEvent, wire.Error] {
+pub fn decode_shm_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ShmEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let format = ShmFormat(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ShmEvent.Format(format))
+            if rd.valid() {
+                return Ok(ShmEvent.Format(format))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_shm"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_shm") })
 }
 
 /// create a shm pool
@@ -2340,16 +2444,18 @@ pub enum BufferEvent {
     Release
 }
 
-fn decode_buffer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferEvent, wire.Error] {
+pub fn decode_buffer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[BufferEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(BufferEvent.Release)
+            if rd.valid() {
+                return Ok(BufferEvent.Release)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_buffer"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_buffer") })
 }
 
 /// destroy a buffer
@@ -2368,33 +2474,37 @@ pub enum DataOfferEvent {
     Action(DataDeviceManagerDndAction)
 }
 
-fn decode_data_offer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataOfferEvent, wire.Error] {
+pub fn decode_data_offer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataOfferEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferEvent.Offer(mime_type))
+            if rd.valid() {
+                return Ok(DataOfferEvent.Offer(mime_type))
+            }
         }
         1 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_offer.source_actions needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_offer.source_actions", 3))
             }
             let source_actions = DataDeviceManagerDndAction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferEvent.SourceActions(source_actions))
+            if rd.valid() {
+                return Ok(DataOfferEvent.SourceActions(source_actions))
+            }
         }
         2 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_offer.action needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_offer.action", 3))
             }
             let dnd_action = DataDeviceManagerDndAction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(DataOfferEvent.Action(dnd_action))
+            if rd.valid() {
+                return Ok(DataOfferEvent.Action(dnd_action))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_data_offer"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_data_offer") })
 }
 
 /// accept one of the offered mime types
@@ -2451,49 +2561,56 @@ pub enum DataSourceEvent {
     Action(DataDeviceManagerDndAction)
 }
 
-fn decode_data_source_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataSourceEvent, wire.Error] {
+pub fn decode_data_source_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataSourceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let mime_type = rd.opt_str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceEvent.Target(mime_type))
+            if rd.valid() {
+                return Ok(DataSourceEvent.Target(mime_type))
+            }
         }
         1 => {
             let mime_type = rd.str(conn)
             let fd = rd.fd(mut conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceEvent.Send(mime_type, fd))
+            if rd.valid() {
+                return Ok(DataSourceEvent.Send(mime_type, fd))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceEvent.Cancelled)
+            if rd.valid() {
+                return Ok(DataSourceEvent.Cancelled)
+            }
         }
         3 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_source.dnd_drop_performed needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_source.dnd_drop_performed", 3))
             }
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceEvent.DndDropPerformed)
+            if rd.valid() {
+                return Ok(DataSourceEvent.DndDropPerformed)
+            }
         }
         4 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_source.dnd_finished needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_source.dnd_finished", 3))
             }
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceEvent.DndFinished)
+            if rd.valid() {
+                return Ok(DataSourceEvent.DndFinished)
+            }
         }
         5 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_data_source.action needs version 3"))
+                return Err(conn.needs_version(m, "wl_data_source.action", 3))
             }
             let dnd_action = DataDeviceManagerDndAction(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(DataSourceEvent.Action(dnd_action))
+            if rd.valid() {
+                return Ok(DataSourceEvent.Action(dnd_action))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_data_source"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_data_source") })
 }
 
 /// add an offered mime type
@@ -2533,13 +2650,15 @@ pub enum DataDeviceEvent {
     Selection(Option[DataOffer])
 }
 
-fn decode_data_device_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceEvent, wire.Error] {
+pub fn decode_data_device_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDeviceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let id = DataOffer { id: rd.new_id(mut conn, data_offer_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceEvent.DataOffer(id))
+            if rd.valid() {
+                return Ok(DataDeviceEvent.DataOffer(id))
+            }
         }
         1 => {
             let serial = rd.u32(conn)
@@ -2548,33 +2667,38 @@ fn decode_data_device_event(mut conn: wire.Conn, m: wire.Msg) -> Result[DataDevi
             let y = rd.fixed(conn)
             let id_arg_raw = rd.object(conn, data_offer_iface, true)
             let id_arg: Option[DataOffer] = if id_arg_raw == 0 { None } else { Some(DataOffer { id: id_arg_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceEvent.Enter(serial, surface, x, y, id_arg))
+            if rd.valid() {
+                return Ok(DataDeviceEvent.Enter(serial, surface, x, y, id_arg))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceEvent.Leave)
+            if rd.valid() {
+                return Ok(DataDeviceEvent.Leave)
+            }
         }
         3 => {
             let time = rd.u32(conn)
             let x = rd.fixed(conn)
             let y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceEvent.Motion(time, x, y))
+            if rd.valid() {
+                return Ok(DataDeviceEvent.Motion(time, x, y))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceEvent.Drop)
+            if rd.valid() {
+                return Ok(DataDeviceEvent.Drop)
+            }
         }
         5 => {
             let id_arg_raw = rd.object(conn, data_offer_iface, true)
             let id_arg: Option[DataOffer] = if id_arg_raw == 0 { None } else { Some(DataOffer { id: id_arg_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(DataDeviceEvent.Selection(id_arg))
+            if rd.valid() {
+                return Ok(DataDeviceEvent.Selection(id_arg))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_data_device"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_data_device") })
 }
 
 /// start drag-and-drop operation
@@ -2647,28 +2771,32 @@ pub enum ShellSurfaceEvent {
     PopupDone
 }
 
-fn decode_shell_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellSurfaceEvent, wire.Error] {
+pub fn decode_shell_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ShellSurfaceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceEvent.Ping(serial))
+            if rd.valid() {
+                return Ok(ShellSurfaceEvent.Ping(serial))
+            }
         }
         1 => {
             let edges = ShellSurfaceResize(rd.u32(conn))
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceEvent.Configure(edges, width, height))
+            if rd.valid() {
+                return Ok(ShellSurfaceEvent.Configure(edges, width, height))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            return Ok(ShellSurfaceEvent.PopupDone)
+            if rd.valid() {
+                return Ok(ShellSurfaceEvent.PopupDone)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_shell_surface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_shell_surface") })
 }
 
 /// respond to a ping event
@@ -2755,38 +2883,43 @@ pub enum SurfaceEvent {
     PreferredBufferTransform(OutputTransform)
 }
 
-fn decode_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceEvent, wire.Error] {
+pub fn decode_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let output = Output { id: rd.object(conn, output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.Enter(output))
+            if rd.valid() {
+                return Ok(SurfaceEvent.Enter(output))
+            }
         }
         1 => {
             let output = Output { id: rd.object(conn, output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.Leave(output))
+            if rd.valid() {
+                return Ok(SurfaceEvent.Leave(output))
+            }
         }
         2 => {
             guard m.version >= 6 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.preferred_buffer_scale needs version 6"))
+                return Err(conn.needs_version(m, "wl_surface.preferred_buffer_scale", 6))
             }
             let factor = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.PreferredBufferScale(factor))
+            if rd.valid() {
+                return Ok(SurfaceEvent.PreferredBufferScale(factor))
+            }
         }
         3 => {
             guard m.version >= 6 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_surface.preferred_buffer_transform needs version 6"))
+                return Err(conn.needs_version(m, "wl_surface.preferred_buffer_transform", 6))
             }
             let transform = OutputTransform(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.PreferredBufferTransform(transform))
+            if rd.valid() {
+                return Ok(SurfaceEvent.PreferredBufferTransform(transform))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_surface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_surface") })
 }
 
 /// delete surface
@@ -2896,25 +3029,28 @@ pub enum SeatEvent {
     Name(str)
 }
 
-fn decode_seat_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SeatEvent, wire.Error] {
+pub fn decode_seat_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SeatEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let capabilities = SeatCapability(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SeatEvent.Capabilities(capabilities))
+            if rd.valid() {
+                return Ok(SeatEvent.Capabilities(capabilities))
+            }
         }
         1 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_seat.name needs version 2"))
+                return Err(conn.needs_version(m, "wl_seat.name", 2))
             }
             let name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SeatEvent.Name(name))
+            if rd.valid() {
+                return Ok(SeatEvent.Name(name))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_seat"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_seat") })
 }
 
 /// return pointer object
@@ -2978,108 +3114,121 @@ pub enum PointerEvent {
     Warp(f64, f64)
 }
 
-fn decode_pointer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerEvent, wire.Error] {
+pub fn decode_pointer_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let surface = Surface { id: rd.object(conn, surface_iface, false) }
             let surface_x = rd.fixed(conn)
             let surface_y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Enter(serial, surface, surface_x, surface_y))
+            if rd.valid() {
+                return Ok(PointerEvent.Enter(serial, surface, surface_x, surface_y))
+            }
         }
         1 => {
             let serial = rd.u32(conn)
             let surface = Surface { id: rd.object(conn, surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Leave(serial, surface))
+            if rd.valid() {
+                return Ok(PointerEvent.Leave(serial, surface))
+            }
         }
         2 => {
             let time = rd.u32(conn)
             let surface_x = rd.fixed(conn)
             let surface_y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Motion(time, surface_x, surface_y))
+            if rd.valid() {
+                return Ok(PointerEvent.Motion(time, surface_x, surface_y))
+            }
         }
         3 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let button = rd.u32(conn)
             let state = PointerButtonState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Button(serial, time, button, state))
+            if rd.valid() {
+                return Ok(PointerEvent.Button(serial, time, button, state))
+            }
         }
         4 => {
             let time = rd.u32(conn)
             let axis = PointerAxis(rd.u32(conn))
             let value = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Axis(time, axis, value))
+            if rd.valid() {
+                return Ok(PointerEvent.Axis(time, axis, value))
+            }
         }
         5 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.frame needs version 5"))
+                return Err(conn.needs_version(m, "wl_pointer.frame", 5))
             }
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Frame)
+            if rd.valid() {
+                return Ok(PointerEvent.Frame)
+            }
         }
         6 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.axis_source needs version 5"))
+                return Err(conn.needs_version(m, "wl_pointer.axis_source", 5))
             }
             let axis_source = PointerAxisSource(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.AxisSource(axis_source))
+            if rd.valid() {
+                return Ok(PointerEvent.AxisSource(axis_source))
+            }
         }
         7 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.axis_stop needs version 5"))
+                return Err(conn.needs_version(m, "wl_pointer.axis_stop", 5))
             }
             let time = rd.u32(conn)
             let axis = PointerAxis(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.AxisStop(time, axis))
+            if rd.valid() {
+                return Ok(PointerEvent.AxisStop(time, axis))
+            }
         }
         8 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.axis_discrete needs version 5"))
+                return Err(conn.needs_version(m, "wl_pointer.axis_discrete", 5))
             }
             let axis = PointerAxis(rd.u32(conn))
             let discrete = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.AxisDiscrete(axis, discrete))
+            if rd.valid() {
+                return Ok(PointerEvent.AxisDiscrete(axis, discrete))
+            }
         }
         9 => {
             guard m.version >= 8 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.axis_value120 needs version 8"))
+                return Err(conn.needs_version(m, "wl_pointer.axis_value120", 8))
             }
             let axis = PointerAxis(rd.u32(conn))
             let value120 = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.AxisValue120(axis, value120))
+            if rd.valid() {
+                return Ok(PointerEvent.AxisValue120(axis, value120))
+            }
         }
         10 => {
             guard m.version >= 9 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.axis_relative_direction needs version 9"))
+                return Err(conn.needs_version(m, "wl_pointer.axis_relative_direction", 9))
             }
             let axis = PointerAxis(rd.u32(conn))
             let direction = PointerAxisRelativeDirection(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.AxisRelativeDirection(axis, direction))
+            if rd.valid() {
+                return Ok(PointerEvent.AxisRelativeDirection(axis, direction))
+            }
         }
         11 => {
             guard m.version >= 11 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_pointer.warp needs version 11"))
+                return Err(conn.needs_version(m, "wl_pointer.warp", 11))
             }
             let surface_x = rd.fixed(conn)
             let surface_y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerEvent.Warp(surface_x, surface_y))
+            if rd.valid() {
+                return Ok(PointerEvent.Warp(surface_x, surface_y))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_pointer"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_pointer") })
 }
 
 /// set the pointer surface
@@ -3116,36 +3265,41 @@ pub enum KeyboardEvent {
     RepeatInfo(i32, i32)
 }
 
-fn decode_keyboard_event(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardEvent, wire.Error] {
+pub fn decode_keyboard_event(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let format = KeyboardKeymapFormat(rd.u32(conn))
             let fd = rd.fd(mut conn)
             let size = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardEvent.Keymap(format, fd, size))
+            if rd.valid() {
+                return Ok(KeyboardEvent.Keymap(format, fd, size))
+            }
         }
         1 => {
             let serial = rd.u32(conn)
             let surface = Surface { id: rd.object(conn, surface_iface, false) }
             let keys = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardEvent.Enter(serial, surface, keys))
+            if rd.valid() {
+                return Ok(KeyboardEvent.Enter(serial, surface, keys))
+            }
         }
         2 => {
             let serial = rd.u32(conn)
             let surface = Surface { id: rd.object(conn, surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardEvent.Leave(serial, surface))
+            if rd.valid() {
+                return Ok(KeyboardEvent.Leave(serial, surface))
+            }
         }
         3 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let key = rd.u32(conn)
             let state = KeyboardKeyState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardEvent.Key(serial, time, key, state))
+            if rd.valid() {
+                return Ok(KeyboardEvent.Key(serial, time, key, state))
+            }
         }
         4 => {
             let serial = rd.u32(conn)
@@ -3153,21 +3307,23 @@ fn decode_keyboard_event(mut conn: wire.Conn, m: wire.Msg) -> Result[KeyboardEve
             let mods_latched = rd.u32(conn)
             let mods_locked = rd.u32(conn)
             let group = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardEvent.Modifiers(serial, mods_depressed, mods_latched, mods_locked, group))
+            if rd.valid() {
+                return Ok(KeyboardEvent.Modifiers(serial, mods_depressed, mods_latched, mods_locked, group))
+            }
         }
         5 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_keyboard.repeat_info needs version 4"))
+                return Err(conn.needs_version(m, "wl_keyboard.repeat_info", 4))
             }
             let rate = rd.i32(conn)
             let delay = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(KeyboardEvent.RepeatInfo(rate, delay))
+            if rd.valid() {
+                return Ok(KeyboardEvent.RepeatInfo(rate, delay))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_keyboard"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_keyboard") })
 }
 
 /// release the keyboard object
@@ -3197,8 +3353,9 @@ pub enum TouchEvent {
     Orientation(i32, f64)
 }
 
-fn decode_touch_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TouchEvent, wire.Error] {
+pub fn decode_touch_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TouchEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
@@ -3207,54 +3364,61 @@ fn decode_touch_event(mut conn: wire.Conn, m: wire.Msg) -> Result[TouchEvent, wi
             let id_arg = rd.i32(conn)
             let x = rd.fixed(conn)
             let y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Down(serial, time, surface, id_arg, x, y))
+            if rd.valid() {
+                return Ok(TouchEvent.Down(serial, time, surface, id_arg, x, y))
+            }
         }
         1 => {
             let serial = rd.u32(conn)
             let time = rd.u32(conn)
             let id_arg = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Up(serial, time, id_arg))
+            if rd.valid() {
+                return Ok(TouchEvent.Up(serial, time, id_arg))
+            }
         }
         2 => {
             let time = rd.u32(conn)
             let id_arg = rd.i32(conn)
             let x = rd.fixed(conn)
             let y = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Motion(time, id_arg, x, y))
+            if rd.valid() {
+                return Ok(TouchEvent.Motion(time, id_arg, x, y))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Frame)
+            if rd.valid() {
+                return Ok(TouchEvent.Frame)
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Cancel)
+            if rd.valid() {
+                return Ok(TouchEvent.Cancel)
+            }
         }
         5 => {
             guard m.version >= 6 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_touch.shape needs version 6"))
+                return Err(conn.needs_version(m, "wl_touch.shape", 6))
             }
             let id_arg = rd.i32(conn)
             let major = rd.fixed(conn)
             let minor = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Shape(id_arg, major, minor))
+            if rd.valid() {
+                return Ok(TouchEvent.Shape(id_arg, major, minor))
+            }
         }
         6 => {
             guard m.version >= 6 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_touch.orientation needs version 6"))
+                return Err(conn.needs_version(m, "wl_touch.orientation", 6))
             }
             let id_arg = rd.i32(conn)
             let orientation = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(TouchEvent.Orientation(id_arg, orientation))
+            if rd.valid() {
+                return Ok(TouchEvent.Orientation(id_arg, orientation))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_touch"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_touch") })
 }
 
 /// release the touch object
@@ -3282,8 +3446,9 @@ pub enum OutputEvent {
     Description(str)
 }
 
-fn decode_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputEvent, wire.Error] {
+pub fn decode_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let x = rd.i32(conn)
@@ -3294,51 +3459,57 @@ fn decode_output_event(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputEvent, 
             let make = rd.str(conn)
             let model = rd.str(conn)
             let transform = OutputTransform(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Geometry(x, y, physical_width, physical_height, subpixel, make, model, transform))
+            if rd.valid() {
+                return Ok(OutputEvent.Geometry(x, y, physical_width, physical_height, subpixel, make, model, transform))
+            }
         }
         1 => {
             let flags = OutputMode(rd.u32(conn))
             let width = rd.i32(conn)
             let height = rd.i32(conn)
             let refresh = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Mode(flags, width, height, refresh))
+            if rd.valid() {
+                return Ok(OutputEvent.Mode(flags, width, height, refresh))
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_output.done needs version 2"))
+                return Err(conn.needs_version(m, "wl_output.done", 2))
             }
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Done)
+            if rd.valid() {
+                return Ok(OutputEvent.Done)
+            }
         }
         3 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_output.scale needs version 2"))
+                return Err(conn.needs_version(m, "wl_output.scale", 2))
             }
             let factor = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Scale(factor))
+            if rd.valid() {
+                return Ok(OutputEvent.Scale(factor))
+            }
         }
         4 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_output.name needs version 4"))
+                return Err(conn.needs_version(m, "wl_output.name", 4))
             }
             let name = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Name(name))
+            if rd.valid() {
+                return Ok(OutputEvent.Name(name))
+            }
         }
         5 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "wl_output.description needs version 4"))
+                return Err(conn.needs_version(m, "wl_output.description", 4))
             }
             let description = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(OutputEvent.Description(description))
+            if rd.valid() {
+                return Ok(OutputEvent.Description(description))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on wl_output"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "wl_output") })
 }
 
 /// release the output object

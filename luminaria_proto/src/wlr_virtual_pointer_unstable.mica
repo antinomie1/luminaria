@@ -42,15 +42,17 @@ pub enum PointerRequest {
     Destroy
 }
 
-fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wire.Error] {
+pub fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let time = rd.u32(conn)
             let dx = rd.fixed(conn)
             let dy = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.Motion(time, dx, dy))
+            if rd.valid() {
+                return Ok(PointerRequest.Motion(time, dx, dy))
+            }
         }
         1 => {
             let time = rd.u32(conn)
@@ -58,54 +60,62 @@ fn decode_pointer(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerRequest, wi
             let y = rd.u32(conn)
             let x_extent = rd.u32(conn)
             let y_extent = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.MotionAbsolute(time, x, y, x_extent, y_extent))
+            if rd.valid() {
+                return Ok(PointerRequest.MotionAbsolute(time, x, y, x_extent, y_extent))
+            }
         }
         2 => {
             let time = rd.u32(conn)
             let button = rd.u32(conn)
             let state = wayland.PointerButtonState(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.Button(time, button, state))
+            if rd.valid() {
+                return Ok(PointerRequest.Button(time, button, state))
+            }
         }
         3 => {
             let time = rd.u32(conn)
             let axis = wayland.PointerAxis(rd.u32(conn))
             let value = rd.fixed(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.Axis(time, axis, value))
+            if rd.valid() {
+                return Ok(PointerRequest.Axis(time, axis, value))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.Frame)
+            if rd.valid() {
+                return Ok(PointerRequest.Frame)
+            }
         }
         5 => {
             let axis_source = wayland.PointerAxisSource(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.AxisSource(axis_source))
+            if rd.valid() {
+                return Ok(PointerRequest.AxisSource(axis_source))
+            }
         }
         6 => {
             let time = rd.u32(conn)
             let axis = wayland.PointerAxis(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.AxisStop(time, axis))
+            if rd.valid() {
+                return Ok(PointerRequest.AxisStop(time, axis))
+            }
         }
         7 => {
             let time = rd.u32(conn)
             let axis = wayland.PointerAxis(rd.u32(conn))
             let value = rd.fixed(conn)
             let discrete = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PointerRequest.AxisDiscrete(time, axis, value, discrete))
+            if rd.valid() {
+                return Ok(PointerRequest.AxisDiscrete(time, axis, value, discrete))
+            }
         }
         8 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PointerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PointerRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_virtual_pointer_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_virtual_pointer_v1") })
 }
 
 /// zwlr_virtual_pointer_manager_v1: virtual pointer manager
@@ -127,36 +137,40 @@ pub enum PointerManagerRequest {
     CreateVirtualPointerWithOutput(Option[wayland.Seat], Option[wayland.Output], Pointer)
 }
 
-fn decode_pointer_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerManagerRequest, wire.Error] {
+pub fn decode_pointer_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[PointerManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let seat_raw = rd.object(conn, wayland.seat_iface, true)
             let seat: Option[wayland.Seat] = if seat_raw == 0 { None } else { Some(wayland.Seat { id: seat_raw }) }
             let id = Pointer { id: rd.new_id(mut conn, pointer_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(PointerManagerRequest.CreateVirtualPointer(seat, id))
+            if rd.valid() {
+                return Ok(PointerManagerRequest.CreateVirtualPointer(seat, id))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PointerManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PointerManagerRequest.Destroy)
+            }
         }
         2 => {
             guard m.version >= 2 else {
-                return Err(conn.error(m.id, wire.invalid_method, "zwlr_virtual_pointer_manager_v1.create_virtual_pointer_with_output needs version 2"))
+                return Err(conn.needs_version(m, "zwlr_virtual_pointer_manager_v1.create_virtual_pointer_with_output", 2))
             }
             let seat_raw = rd.object(conn, wayland.seat_iface, true)
             let seat: Option[wayland.Seat] = if seat_raw == 0 { None } else { Some(wayland.Seat { id: seat_raw }) }
             let output_raw = rd.object(conn, wayland.output_iface, true)
             let output: Option[wayland.Output] = if output_raw == 0 { None } else { Some(wayland.Output { id: output_raw }) }
             let id = Pointer { id: rd.new_id(mut conn, pointer_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(PointerManagerRequest.CreateVirtualPointerWithOutput(seat, output, id))
+            if rd.valid() {
+                return Ok(PointerManagerRequest.CreateVirtualPointerWithOutput(seat, output, id))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on zwlr_virtual_pointer_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "zwlr_virtual_pointer_manager_v1") })
 }
 
 /// pointer relative motion event

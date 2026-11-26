@@ -21,22 +21,25 @@ pub enum LockManagerRequest {
     Lock(Lock)
 }
 
-fn decode_lock_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[LockManagerRequest, wire.Error] {
+pub fn decode_lock_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[LockManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(LockManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(LockManagerRequest.Destroy)
+            }
         }
         1 => {
             let id = Lock { id: rd.new_id(mut conn, lock_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(LockManagerRequest.Lock(id))
+            if rd.valid() {
+                return Ok(LockManagerRequest.Lock(id))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_session_lock_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_session_lock_manager_v1") })
 }
 
 /// ext_session_lock_v1: manage lock state and create lock surfaces
@@ -71,29 +74,33 @@ pub enum LockRequest {
     UnlockAndDestroy
 }
 
-fn decode_lock(mut conn: wire.Conn, m: wire.Msg) -> Result[LockRequest, wire.Error] {
+pub fn decode_lock(mut conn: wire.Conn, m: wire.Msg) -> Result[LockRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(LockRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(LockRequest.Destroy)
+            }
         }
         1 => {
             let id = LockSurface { id: rd.new_id(mut conn, lock_surface_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(LockRequest.GetLockSurface(id, surface, output))
+            if rd.valid() {
+                return Ok(LockRequest.GetLockSurface(id, surface, output))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(LockRequest.UnlockAndDestroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(LockRequest.UnlockAndDestroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_session_lock_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_session_lock_v1") })
 }
 
 /// session successfully locked
@@ -134,22 +141,25 @@ pub enum LockSurfaceRequest {
     AckConfigure(u32)
 }
 
-fn decode_lock_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[LockSurfaceRequest, wire.Error] {
+pub fn decode_lock_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[LockSurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(LockSurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(LockSurfaceRequest.Destroy)
+            }
         }
         1 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(LockSurfaceRequest.AckConfigure(serial))
+            if rd.valid() {
+                return Ok(LockSurfaceRequest.AckConfigure(serial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_session_lock_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_session_lock_surface_v1") })
 }
 
 /// the client should resize its surface
@@ -182,20 +192,23 @@ pub enum LockEvent {
     Finished
 }
 
-fn decode_lock_event(mut conn: wire.Conn, m: wire.Msg) -> Result[LockEvent, wire.Error] {
+pub fn decode_lock_event(mut conn: wire.Conn, m: wire.Msg) -> Result[LockEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(LockEvent.Locked)
+            if rd.valid() {
+                return Ok(LockEvent.Locked)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(LockEvent.Finished)
+            if rd.valid() {
+                return Ok(LockEvent.Finished)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_session_lock_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_session_lock_v1") })
 }
 
 /// destroy the session lock
@@ -226,19 +239,21 @@ pub enum LockSurfaceEvent {
     Configure(u32, u32, u32)
 }
 
-fn decode_lock_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[LockSurfaceEvent, wire.Error] {
+pub fn decode_lock_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[LockSurfaceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
             let width = rd.u32(conn)
             let height = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(LockSurfaceEvent.Configure(serial, width, height))
+            if rd.valid() {
+                return Ok(LockSurfaceEvent.Configure(serial, width, height))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_session_lock_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_session_lock_surface_v1") })
 }
 
 /// destroy the lock surface object

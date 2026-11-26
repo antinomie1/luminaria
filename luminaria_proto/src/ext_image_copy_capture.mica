@@ -35,31 +35,35 @@ pub enum ManagerRequest {
     Destroy
 }
 
-fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
+pub fn decode_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let session = Session { id: rd.new_id(mut conn, session_iface, m.version) }
             let source = ext_image_capture_source.ImageCaptureSource { id: rd.object(conn, ext_image_capture_source.image_capture_source_iface, false) }
             let options = ManagerOptions(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.CreateSession(session, source, options))
+            if rd.valid() {
+                return Ok(ManagerRequest.CreateSession(session, source, options))
+            }
         }
         1 => {
             let session = CursorSession { id: rd.new_id(mut conn, cursor_session_iface, m.version) }
             let source = ext_image_capture_source.ImageCaptureSource { id: rd.object(conn, ext_image_capture_source.image_capture_source_iface, false) }
             let pointer = wayland.Pointer { id: rd.object(conn, wayland.pointer_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ManagerRequest.CreatePointerCursorSession(session, source, pointer))
+            if rd.valid() {
+                return Ok(ManagerRequest.CreatePointerCursorSession(session, source, pointer))
+            }
         }
         2 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ManagerRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_image_copy_capture_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_image_copy_capture_manager_v1") })
 }
 
 /// ext_image_copy_capture_session_v1: image copy capture session
@@ -84,22 +88,25 @@ pub enum SessionRequest {
     Destroy
 }
 
-fn decode_session(mut conn: wire.Conn, m: wire.Msg) -> Result[SessionRequest, wire.Error] {
+pub fn decode_session(mut conn: wire.Conn, m: wire.Msg) -> Result[SessionRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let frame = Frame { id: rd.new_id(mut conn, frame_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SessionRequest.CreateFrame(frame))
+            if rd.valid() {
+                return Ok(SessionRequest.CreateFrame(frame))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SessionRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SessionRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_image_copy_capture_session_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_image_copy_capture_session_v1") })
 }
 
 /// image capture source dimensions
@@ -177,34 +184,39 @@ pub enum FrameRequest {
     Capture
 }
 
-fn decode_frame(mut conn: wire.Conn, m: wire.Msg) -> Result[FrameRequest, wire.Error] {
+pub fn decode_frame(mut conn: wire.Conn, m: wire.Msg) -> Result[FrameRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(FrameRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(FrameRequest.Destroy)
+            }
         }
         1 => {
             let buffer = wayland.Buffer { id: rd.object(conn, wayland.buffer_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(FrameRequest.AttachBuffer(buffer))
+            if rd.valid() {
+                return Ok(FrameRequest.AttachBuffer(buffer))
+            }
         }
         2 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(FrameRequest.DamageBuffer(x, y, width, height))
+            if rd.valid() {
+                return Ok(FrameRequest.DamageBuffer(x, y, width, height))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(FrameRequest.Capture)
+            if rd.valid() {
+                return Ok(FrameRequest.Capture)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_image_copy_capture_frame_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_image_copy_capture_frame_v1") })
 }
 
 /// buffer transform
@@ -263,22 +275,25 @@ pub enum CursorSessionRequest {
     GetCaptureSession(Session)
 }
 
-fn decode_cursor_session(mut conn: wire.Conn, m: wire.Msg) -> Result[CursorSessionRequest, wire.Error] {
+pub fn decode_cursor_session(mut conn: wire.Conn, m: wire.Msg) -> Result[CursorSessionRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(CursorSessionRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(CursorSessionRequest.Destroy)
+            }
         }
         1 => {
             let session = Session { id: rd.new_id(mut conn, session_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(CursorSessionRequest.GetCaptureSession(session))
+            if rd.valid() {
+                return Ok(CursorSessionRequest.GetCaptureSession(session))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_image_copy_capture_cursor_session_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_image_copy_capture_cursor_session_v1") })
 }
 
 /// cursor entered captured area
@@ -347,42 +362,49 @@ pub enum SessionEvent {
     Stopped
 }
 
-fn decode_session_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SessionEvent, wire.Error] {
+pub fn decode_session_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SessionEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let width = rd.u32(conn)
             let height = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SessionEvent.BufferSize(width, height))
+            if rd.valid() {
+                return Ok(SessionEvent.BufferSize(width, height))
+            }
         }
         1 => {
             let format = wayland.ShmFormat(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(SessionEvent.ShmFormat(format))
+            if rd.valid() {
+                return Ok(SessionEvent.ShmFormat(format))
+            }
         }
         2 => {
             let device = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SessionEvent.DmabufDevice(device))
+            if rd.valid() {
+                return Ok(SessionEvent.DmabufDevice(device))
+            }
         }
         3 => {
             let format = rd.u32(conn)
             let modifiers = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SessionEvent.DmabufFormat(format, modifiers))
+            if rd.valid() {
+                return Ok(SessionEvent.DmabufFormat(format, modifiers))
+            }
         }
         4 => {
-            try rd.finish(mut conn, m)
-            return Ok(SessionEvent.Done)
+            if rd.valid() {
+                return Ok(SessionEvent.Done)
+            }
         }
         5 => {
-            try rd.finish(mut conn, m)
-            return Ok(SessionEvent.Stopped)
+            if rd.valid() {
+                return Ok(SessionEvent.Stopped)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_image_copy_capture_session_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_image_copy_capture_session_v1") })
 }
 
 /// create a frame
@@ -413,41 +435,47 @@ pub enum FrameEvent {
     Failed(FrameFailureReason)
 }
 
-fn decode_frame_event(mut conn: wire.Conn, m: wire.Msg) -> Result[FrameEvent, wire.Error] {
+pub fn decode_frame_event(mut conn: wire.Conn, m: wire.Msg) -> Result[FrameEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let transform = wayland.OutputTransform(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(FrameEvent.Transform(transform))
+            if rd.valid() {
+                return Ok(FrameEvent.Transform(transform))
+            }
         }
         1 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(FrameEvent.Damage(x, y, width, height))
+            if rd.valid() {
+                return Ok(FrameEvent.Damage(x, y, width, height))
+            }
         }
         2 => {
             let tv_sec_hi = rd.u32(conn)
             let tv_sec_lo = rd.u32(conn)
             let tv_nsec = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(FrameEvent.PresentationTime(tv_sec_hi, tv_sec_lo, tv_nsec))
+            if rd.valid() {
+                return Ok(FrameEvent.PresentationTime(tv_sec_hi, tv_sec_lo, tv_nsec))
+            }
         }
         3 => {
-            try rd.finish(mut conn, m)
-            return Ok(FrameEvent.Ready)
+            if rd.valid() {
+                return Ok(FrameEvent.Ready)
+            }
         }
         4 => {
             let reason = FrameFailureReason(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(FrameEvent.Failed(reason))
+            if rd.valid() {
+                return Ok(FrameEvent.Failed(reason))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_image_copy_capture_frame_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_image_copy_capture_frame_v1") })
 }
 
 /// destroy this object
@@ -488,32 +516,37 @@ pub enum CursorSessionEvent {
     Hotspot(i32, i32)
 }
 
-fn decode_cursor_session_event(mut conn: wire.Conn, m: wire.Msg) -> Result[CursorSessionEvent, wire.Error] {
+pub fn decode_cursor_session_event(mut conn: wire.Conn, m: wire.Msg) -> Result[CursorSessionEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            return Ok(CursorSessionEvent.Enter)
+            if rd.valid() {
+                return Ok(CursorSessionEvent.Enter)
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(CursorSessionEvent.Leave)
+            if rd.valid() {
+                return Ok(CursorSessionEvent.Leave)
+            }
         }
         2 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(CursorSessionEvent.Position(x, y))
+            if rd.valid() {
+                return Ok(CursorSessionEvent.Position(x, y))
+            }
         }
         3 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(CursorSessionEvent.Hotspot(x, y))
+            if rd.valid() {
+                return Ok(CursorSessionEvent.Hotspot(x, y))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on ext_image_copy_capture_cursor_session_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "ext_image_copy_capture_cursor_session_v1") })
 }
 
 /// delete this object

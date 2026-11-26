@@ -168,7 +168,7 @@ pub fn Conn.read(mut self) -> Result[bool, Error] {
         self.fds_in_lo = 0
     }
     guard self.rx_hi < rx_cap and self.fds_in.len() < max_fds_in else {
-        return Err(self.error(1, implementation, "too much unprocessed input"))
+        return Err(self.err_unprocessed())
     }
     let base = self.fds_in.len()
     self.fds_in.reserve(64)
@@ -207,14 +207,14 @@ pub fn Conn.next(mut self) -> Result[Option[Msg], Error] {
     let w = self.rx_u32(self.rx_lo + 4)
     let size = int(w >> 16)
     guard size >= 8 and size % 4 == 0 and size <= max_message else {
-        return Err(self.error(1, implementation, "malformed message of {size} bytes"))
+        return Err(self.err_malformed(size))
     }
     guard avail >= size else {
         return Ok(None)
     }
     let o = self.lookup(id)
     guard o.iface != 0 else {
-        return Err(self.error(1, invalid_object, "invalid object {id}"))
+        return Err(self.err_invalid_obj(id))
     }
     let m = Msg { id, op: u16(w & 0xffff), iface: o.iface, version: o.version, alive: o.alive, at: self.rx_lo, size }
     self.rx_lo += size
@@ -383,9 +383,9 @@ pub fn Conn.begin(mut self, id: u32, op: u16, size: int) -> codec.Writer {
         self.tx.clear()
         self.tx_lo = 0
     } else if size > max_message {
-        self.dead = Some("message of {size} bytes to object {id}")
+        self.mark_dead_size(id, size)
     } else if self.tx.len() - self.tx_lo + size > max_queued {
-        self.dead = Some("peer stopped reading")
+        self.mark_dead_queued()
     }
     if self.tx_lo > 0 and self.tx_lo >= self.tx.len() / 2 {
         let n = self.tx.len() - self.tx_lo
@@ -472,6 +472,8 @@ pub fn Conn.flush(mut self) -> Result[bool, Error] {
 
 /// A protocol error on object `id`. A server tells the client
 /// (wl_display.error) and closes after the next flush.
+@noinline
+@cold
 pub fn Conn.error(mut self, id: u32, code: u32, msg: StrSlice) -> Error {
     if self.end == End.Server and self.dead.is_none() {
         var w = self.begin(1, 0, 16 + codec.str_size(msg))
@@ -481,4 +483,57 @@ pub fn Conn.error(mut self, id: u32, code: u32, msg: StrSlice) -> Error {
         self.dead = Some(msg.to_str())
     }
     return Error.Protocol(id, code, msg.to_str())
+}
+
+@noinline
+@cold
+fn Conn.err_unprocessed(mut self) -> Error {
+    return self.error(1, implementation, "too much unprocessed input")
+}
+
+@noinline
+@cold
+fn Conn.err_malformed(mut self, size: int) -> Error {
+    return self.error(1, implementation, "malformed message of {size} bytes")
+}
+
+@noinline
+@cold
+fn Conn.err_invalid_obj(mut self, id: u32) -> Error {
+    return self.error(1, invalid_object, "invalid object {id}")
+}
+
+@noinline
+@cold
+fn Conn.mark_dead_size(mut self, id: u32, size: int) {
+    self.dead = Some("message of {size} bytes to object {id}")
+}
+
+@noinline
+@cold
+fn Conn.mark_dead_queued(mut self) {
+    self.dead = Some("peer stopped reading")
+}
+
+/// Shared cold protocol error for an invalid opcode on `iface`.
+@noinline
+@cold
+pub fn Conn.invalid_op(mut self, m: Msg, is_event: bool, iface: StrSlice) -> Error {
+    let what = if is_event { "event" } else { "request" }
+    return self.error(m.id, invalid_method, "invalid {what} {m.op} on {iface}")
+}
+
+/// Shared cold protocol error for a message requiring a newer interface version.
+@noinline
+@cold
+pub fn Conn.needs_version(mut self, m: Msg, what: StrSlice, since: u32) -> Error {
+    return self.error(m.id, invalid_method, "{what} needs version {since}")
+}
+
+/// Shared cold protocol error for an interface with no requests/events.
+@noinline
+@cold
+pub fn Conn.no_messages(mut self, m: Msg, is_event: bool) -> Error {
+    let what = if is_event { "events" } else { "requests" }
+    return self.error(m.id, invalid_method, "no {what} on interface {m.iface}")
 }

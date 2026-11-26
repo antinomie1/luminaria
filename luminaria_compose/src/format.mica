@@ -40,6 +40,8 @@ pub fn vk_format(fourcc: u32) -> Option[(gpu.Format, bool)] {
 
 /// Every fourcc and modifier the GPU samples dmabufs of (linux-dmabuf's
 /// format table).
+@noinline
+@cold
 pub fn dmabuf_formats(dev: gpu.Device) -> List[(u32, u64)] {
     var out: List[(u32, u64)] = []
     for f in [argb8888, xrgb8888, abgr8888, xbgr8888, argb2101010, xrgb2101010, abgr2101010, xbgr2101010, abgr16161616f, xbgr16161616f] {
@@ -53,6 +55,8 @@ pub fn dmabuf_formats(dev: gpu.Device) -> List[(u32, u64)] {
 }
 
 /// Every fourcc and modifier writable as a GPU dmabuf capture destination.
+@noinline
+@cold
 pub fn capture_formats(dev: gpu.Device) -> List[(u32, u64)] {
     var out: List[(u32, u64)] = []
     for f in [argb8888, xrgb8888, abgr8888, xbgr8888] {
@@ -65,6 +69,8 @@ pub fn capture_formats(dev: gpu.Device) -> List[(u32, u64)] {
     return out
 }
 
+@noinline
+@cold
 fn to_gpu_dmabuf(d: types.Dmabuf, vf: gpu.Format, opaque: bool, mut dup_fds: List[i32]) -> Result[gpu.Dmabuf, str] {
     guard d.width > 0 and d.height > 0 and d.planes >= 1 and d.planes <= 4 else {
         return Err("dmabuf {d.width}x{d.height} planes {d.planes}")

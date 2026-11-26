@@ -20,17 +20,19 @@ pub enum ImageCaptureSourceRequest {
     Destroy
 }
 
-fn decode_image_capture_source(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageCaptureSourceRequest, wire.Error] {
+pub fn decode_image_capture_source(mut conn: wire.Conn, m: wire.Msg) -> Result[ImageCaptureSourceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ImageCaptureSourceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ImageCaptureSourceRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_image_capture_source_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_image_capture_source_v1") })
 }
 
 /// ext_output_image_capture_source_manager_v1: image capture source manager for outputs
@@ -50,23 +52,26 @@ pub enum OutputImageCaptureSourceManagerRequest {
     Destroy
 }
 
-fn decode_output_image_capture_source_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputImageCaptureSourceManagerRequest, wire.Error] {
+pub fn decode_output_image_capture_source_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[OutputImageCaptureSourceManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let source = ImageCaptureSource { id: rd.new_id(mut conn, image_capture_source_iface, m.version) }
             let output = wayland.Output { id: rd.object(conn, wayland.output_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(OutputImageCaptureSourceManagerRequest.CreateSource(source, output))
+            if rd.valid() {
+                return Ok(OutputImageCaptureSourceManagerRequest.CreateSource(source, output))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(OutputImageCaptureSourceManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(OutputImageCaptureSourceManagerRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_output_image_capture_source_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_output_image_capture_source_manager_v1") })
 }
 
 /// ext_foreign_toplevel_image_capture_source_manager_v1: image capture source manager for foreign toplevels
@@ -86,23 +91,26 @@ pub enum ForeignToplevelImageCaptureSourceManagerRequest {
     Destroy
 }
 
-fn decode_foreign_toplevel_image_capture_source_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ForeignToplevelImageCaptureSourceManagerRequest, wire.Error] {
+pub fn decode_foreign_toplevel_image_capture_source_manager(mut conn: wire.Conn, m: wire.Msg) -> Result[ForeignToplevelImageCaptureSourceManagerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let source = ImageCaptureSource { id: rd.new_id(mut conn, image_capture_source_iface, m.version) }
             let toplevel_handle = ext_foreign_toplevel_list.Handle { id: rd.object(conn, ext_foreign_toplevel_list.handle_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ForeignToplevelImageCaptureSourceManagerRequest.CreateSource(source, toplevel_handle))
+            if rd.valid() {
+                return Ok(ForeignToplevelImageCaptureSourceManagerRequest.CreateSource(source, toplevel_handle))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ForeignToplevelImageCaptureSourceManagerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ForeignToplevelImageCaptureSourceManagerRequest.Destroy)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on ext_foreign_toplevel_image_capture_source_manager_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "ext_foreign_toplevel_image_capture_source_manager_v1") })
 }
 
 /// delete this object

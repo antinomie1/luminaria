@@ -71,30 +71,35 @@ fn frame_due[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: 
 /// Upload what shm commits left for this frame (once per surface, whatever
 /// the number of commits), then hand the buffers back.
 fn upload_pending[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
-    let pending = mem.replace(mut d.pending_shm, [])
-    guard not pending.is_empty() else {
+    guard not d.pending_shm.is_empty() else {
         return
     }
+    var pending = mem.replace(mut d.pending_shm, [])
     // The server lends each buffer's bytes while the device records them.
     var srv = mem.replace(mut d.srv, server.Server.none())
     for s in pending {
-        guard let Some(sf) = d.surfs.get(s) else {
+        let idx = d.surf_idx(s)
+        guard idx >= 0 else {
             continue
         }
-        guard let Some(b) = sf.pending else {
+        guard let Some(b) = d.surfs[idx].pending else {
             continue
         }
         discard srv.with_shm(b, fn(bytes: Slice[u8], stride: int) {
             discard d.comp.shm_upload(display.skey(s), bytes, stride)
         })
         srv.release(b)
-        discard d.surfs.insert(s, display.Surf { pending: None, ..sf })
+        d.surfs[idx].pending = None
     }
     d.srv = srv
+    pending.clear()
+    d.pending_shm = pending
 }
 
 /// Recover after a GPU device-lost error: reset scanout targets, reopen GPU
 /// device and re-upload live buffers/cursors, then emit display.Event.GpuReset.
+@noinline
+@cold
 fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -> Result[(), str] {
     var retired: List[u64] = []
     d.be.reset_targets(mut retired)
@@ -107,23 +112,22 @@ fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -
             d.outs[o].dirty = true
         }
     }
-    var cur_surfs: List[(server.Surface, display.Surf)] = []
-    d.surfs.each(fn(s, sf) {
-        cur_surfs.push((s, sf))
-    })
     d.pending_shm.clear()
     var srv = mem.replace(mut d.srv, server.Server.none())
     let all: List[(i32, i32, i32, i32)] = []
-    for (s, cur_sf) in cur_surfs {
-        var sf = cur_sf
-        guard let Some(b) = sf.buffer else {
+    for idx in 0..d.surfs.len() {
+        let gen = d.surfs[idx].gen
+        guard gen != 0 else {
             continue
         }
+        guard let Some(b) = d.surfs[idx].buffer else {
+            continue
+        }
+        let s = server.Surface { id: server.ids.Id { index: u32(idx), gen } }
         if not srv.buffer_alive(b) {
-            sf.buffer = None
-            sf.tex = 0
-            sf.pending = None
-            discard d.surfs.insert(s, sf)
+            d.surfs[idx].buffer = None
+            d.surfs[idx].tex = 0
+            d.surfs[idx].pending = None
             continue
         }
         let bi = srv.buffer(b)
@@ -131,28 +135,27 @@ fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -
             if not d.comp.has(display.bkey(b)) {
                 discard d.comp.solid(display.bkey(b), bi.color)
             }
-            sf.tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
+            d.surfs[idx].tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
         } else if bi.kind == server.BufferKind.Dmabuf {
             if not d.comp.has(display.bkey(b)) {
                 discard d.comp.import_dmabuf(display.bkey(b), srv.dmabuf(b))
             }
-            sf.tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
+            d.surfs[idx].tex = if d.comp.has(display.bkey(b)) { display.bkey(b) } else { 0 }
         } else {
             if d.comp.shm_commit(display.skey(s), bi.width, bi.height, bi.format, all) {
                 var ok = false
                 discard srv.with_shm(b, fn(bytes: Slice[u8], stride: int) {
                     ok = d.comp.shm_upload(display.skey(s), bytes, stride)
                 })
-                sf.tex = if ok { display.skey(s) } else { 0 }
-                if sf.pending == Some(b) and ok {
+                d.surfs[idx].tex = if ok { display.skey(s) } else { 0 }
+                if d.surfs[idx].pending == Some(b) and ok {
                     srv.release(b)
-                    sf.pending = None
+                    d.surfs[idx].pending = None
                 }
             } else {
-                sf.tex = 0
+                d.surfs[idx].tex = 0
             }
         }
-        discard d.surfs.insert(s, sf)
     }
     d.srv = srv
     for si in 0..d.seats.len() {
@@ -168,6 +171,53 @@ fn recover_gpu[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) -
     place.rebuild(mut d)
     d.emit(display.Event.GpuReset)
     return Ok(())
+}
+
+@noinline
+fn probe_overlays[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, key: u64, capturing: bool) -> List[u64] {
+    var promoted: List[u64] = []
+    if not capturing {
+        let cands = d.comp.overlay_candidates(o, 8)
+        if not cands.is_empty() {
+            var blocked: List[(i32, i32, i32, i32)] = []
+            var ov_cands: List[types.Overlay] = []
+            for c in cands {
+                let rect = (c.x, c.y, c.w, c.h)
+                var overlap = false
+                for b in blocked {
+                    if rect.0 < b.0 + b.2 and rect.0 + rect.2 > b.0 and rect.1 < b.1 + b.3 and rect.1 + rect.3 > b.1 {
+                        overlap = true
+                        break
+                    }
+                }
+                if overlap {
+                    blocked.push(rect)
+                    continue
+                }
+                if let Some(s) = d.surf_from_key(c.key) {
+                    let idx = d.surf_idx(s)
+                    if idx >= 0 {
+                        if let Some(b) = d.surfs[idx].buffer {
+                            let bi = d.srv.buffer(b)
+                            if bi.kind == server.BufferKind.Dmabuf and display.bkey(b) == c.tex {
+                                ov_cands.push(types.Overlay { key: c.key, buf_key: display.bkey(b), buf: d.srv.dmabuf(b), x: c.x, y: c.y, w: c.w, h: c.h, src: c.src })
+                            }
+                        }
+                    }
+                }
+                blocked.push(rect)
+            }
+            if not ov_cands.is_empty() {
+                promoted = d.be.test_overlays(u32(o), key, ov_cands)
+                d.comp.set_overlays(o, promoted)
+                return promoted
+            }
+        }
+    }
+    d.be.clear_overlays(u32(o))
+    let empty: List[u64] = []
+    d.comp.set_overlays(o, empty)
+    return promoted
 }
 
 fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int) -> Result[(), str] {
@@ -206,55 +256,7 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
                 // Every target is on screen (or GPU reset ran): try again on the next cycle.
                 return Ok(())
             }
-            var promoted: List[u64] = []
-            if not capturing {
-                let cands = d.comp.overlay_candidates(o, 8)
-                if not cands.is_empty() {
-                    var blocked: List[(i32, i32, i32, i32)] = []
-                    var ov_cands: List[types.Overlay] = []
-                    for c in cands {
-                        let rect = (c.x, c.y, c.w, c.h)
-                        var overlap = false
-                        for b in blocked {
-                            if rect.0 < b.0 + b.2 and rect.0 + rect.2 > b.0 and rect.1 < b.1 + b.3 and rect.1 + rect.3 > b.1 {
-                                overlap = true
-                                break
-                            }
-                        }
-                        if overlap {
-                            blocked.push(rect)
-                            continue
-                        }
-                        if let Some(s) = d.surf_keys.get(c.key) {
-                            if let Some(sf) = d.surfs.get(s) {
-                                if let Some(b) = sf.buffer {
-                                    let bi = d.srv.buffer(b)
-                                    if bi.kind == server.BufferKind.Dmabuf and display.bkey(b) == c.tex {
-                                        ov_cands.push(types.Overlay { key: c.key, buf_key: display.bkey(b), buf: d.srv.dmabuf(b), x: c.x, y: c.y, w: c.w, h: c.h, src: c.src })
-                                    }
-                                }
-                            }
-                        }
-                        blocked.push(rect)
-                    }
-                    if not ov_cands.is_empty() {
-                        promoted = d.be.test_overlays(u32(o), key, ov_cands)
-                        d.comp.set_overlays(o, promoted)
-                    } else {
-                        d.be.clear_overlays(u32(o))
-                        let empty: List[u64] = []
-                        d.comp.set_overlays(o, empty)
-                    }
-                } else {
-                    d.be.clear_overlays(u32(o))
-                    let empty: List[u64] = []
-                    d.comp.set_overlays(o, empty)
-                }
-            } else {
-                d.be.clear_overlays(u32(o))
-                let empty: List[u64] = []
-                d.comp.set_overlays(o, empty)
-            }
+            let promoted = if d.be.has_overlays(u32(o)) { probe_overlays(mut d, o, key, capturing) } else { [] }
             let r = d.comp.render(o, key, age)
             guard let Ok(maybe_fence) = r else {
                 if d.comp.device_lost() {
@@ -274,10 +276,13 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
                         present_fence = -1
                     }
                 }
-                var rects: List[(i32, i32, i32, i32)] = []
+                var rects = mem.replace(mut d.rects_scratch, [])
+                rects.clear()
                 d.comp.changed(o, mut rects)
                 count_damage(mut d, o, rects)
-                try d.be.present(u32(o), present_fence, rects, false)
+                let pres = d.be.present(u32(o), present_fence, rects, false)
+                d.rects_scratch = rects
+                try pres
                 d.probes[o].frame(time.now_ns() - t0)
                 shows = true
                 composed = true
@@ -351,12 +356,14 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
     // frame-paced clients receive the exact pointer target in the same flush.
     manipulation.resize_step(mut d, true)
     // What this frame shows: its clients hear of it.
-    var drawn: List[server.Surface] = []
-    d.origins.each(fn(s, _) {
+    var drawn = mem.replace(mut d.drawn[o], [])
+    drawn.clear()
+    for i in 0..d.placed_surfs.len() {
+        let s = d.placed_surfs[i]
         if d.comp.visible(o, display.skey(s)) {
             drawn.push(s)
         }
-    })
+    }
     let ms = u32((time.now_ns() / 1000000) & 0xffffffff)
     for s in drawn {
         d.srv.frame_done(s, ms)
@@ -364,8 +371,9 @@ fn render[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int
     if composed {
         d.reads[o].clear()
         for s in drawn {
-            if let Some(sf) = d.surfs.get(s) {
-                if let Some(b) = sf.buffer {
+            let idx = d.surf_idx(s)
+            if idx >= 0 {
+                if let Some(b) = d.surfs[idx].buffer {
                     d.reads[o].push(display.bkey(b))
                 }
             }
@@ -414,28 +422,31 @@ fn acquire[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: in
 
 /// Free the render targets the output let go of.
 fn free_targets[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
-    var gone: List[u64] = []
+    var gone = mem.replace(mut d.u64_scratch, [])
+    gone.clear()
     d.be.retired(mut gone)
     for k in gone {
         d.comp.drop_target(k)
     }
+    d.u64_scratch = gone
 }
 
 fn try_scanout[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o: int, key: u64) -> bool {
-    guard let Some(s) = d.surf_keys.get(key) else {
+    guard let Some(s) = d.surf_from_key(key) else {
         return false
     }
-    guard let Some(sf) = d.surfs.get(s) else {
+    let idx = d.surf_idx(s)
+    guard idx >= 0 else {
         return false
     }
-    guard let Some(b) = sf.buffer else {
+    guard let Some(b) = d.surfs[idx].buffer else {
         return false
     }
     let bi = d.srv.buffer(b)
     guard bi.kind == server.BufferKind.Dmabuf and bi.planes >= 1 and bi.planes <= 4 else {
         return false
     }
-    let rects: List[(i32, i32, i32, i32)] = [sf.dmg]
+    let rects: [1](i32, i32, i32, i32) = [d.surfs[idx].dmg]
     let tear = d.srv.info(s).tearing
     let t0 = time.now_ns()
     guard d.be.scanout(u32(o), display.bkey(b), d.srv.dmabuf(b), rects, tear) else {
@@ -494,18 +505,24 @@ fn cycle_done[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R], o:
     for s in drawn {
         d.srv.latch(s)
     }
-    var done: List[server.Txn] = []
-    for (s, t) in d.waits.fifo {
-        if drawn.contains(s) {
-            done.push(t)
+    if not d.waits.fifo.is_empty() {
+        var done: List[server.Txn] = []
+        for (s, t) in d.waits.fifo {
+            if drawn.contains(s) {
+                done.push(t)
+            }
         }
-    }
-    if not done.is_empty() {
-        d.waits.fifo.retain(fn(f) => not drawn.contains(f.0))
-    }
-    d.drawn[o] = drawn
-    for t in done {
-        waits.resolve(mut d, t)
+        if not done.is_empty() {
+            d.waits.fifo.retain(fn(f) => not drawn.contains(f.0))
+            d.drawn[o] = drawn
+            for t in done {
+                waits.resolve(mut d, t)
+            }
+        } else {
+            d.drawn[o] = drawn
+        }
+    } else {
+        d.drawn[o] = drawn
     }
     d.reads[o].clear()
     retire(mut d)
@@ -529,7 +546,10 @@ fn retire[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
     guard not d.releases.is_empty() else {
         return
     }
-    for r in mem.replace(mut d.releases, []) {
+    var next = mem.replace(mut d.releases_scratch, [])
+    next.clear()
+    var prev = mem.replace(mut d.releases, next)
+    for r in prev {
         if read(d, r.key) {
             d.releases.push(r)
         } else {
@@ -543,6 +563,8 @@ fn retire[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {
             }
         }
     }
+    prev.clear()
+    d.releases_scratch = prev
 }
 
 fn housekeeping[O: plug.Output, R: plug.Renderer](mut d: display.Display[O, R]) {

@@ -42,33 +42,38 @@ pub enum WmBaseRequest {
     Pong(u32)
 }
 
-fn decode_wm_base(mut conn: wire.Conn, m: wire.Msg) -> Result[WmBaseRequest, wire.Error] {
+pub fn decode_wm_base(mut conn: wire.Conn, m: wire.Msg) -> Result[WmBaseRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(WmBaseRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(WmBaseRequest.Destroy)
+            }
         }
         1 => {
             let id = Positioner { id: rd.new_id(mut conn, positioner_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(WmBaseRequest.CreatePositioner(id))
+            if rd.valid() {
+                return Ok(WmBaseRequest.CreatePositioner(id))
+            }
         }
         2 => {
             let id = Surface { id: rd.new_id(mut conn, surface_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(WmBaseRequest.GetXdgSurface(id, surface))
+            if rd.valid() {
+                return Ok(WmBaseRequest.GetXdgSurface(id, surface))
+            }
         }
         3 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(WmBaseRequest.Pong(serial))
+            if rd.valid() {
+                return Ok(WmBaseRequest.Pong(serial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_wm_base"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_wm_base") })
 }
 
 /// check if the client is alive
@@ -158,76 +163,87 @@ pub enum PositionerRequest {
     SetParentConfigure(u32)
 }
 
-fn decode_positioner(mut conn: wire.Conn, m: wire.Msg) -> Result[PositionerRequest, wire.Error] {
+pub fn decode_positioner(mut conn: wire.Conn, m: wire.Msg) -> Result[PositionerRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PositionerRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PositionerRequest.Destroy)
+            }
         }
         1 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetSize(width, height))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetSize(width, height))
+            }
         }
         2 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetAnchorRect(x, y, width, height))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetAnchorRect(x, y, width, height))
+            }
         }
         3 => {
             let anchor = PositionerAnchor(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetAnchor(anchor))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetAnchor(anchor))
+            }
         }
         4 => {
             let gravity = PositionerGravity(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetGravity(gravity))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetGravity(gravity))
+            }
         }
         5 => {
             let constraint_adjustment = PositionerConstraintAdjustment(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetConstraintAdjustment(constraint_adjustment))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetConstraintAdjustment(constraint_adjustment))
+            }
         }
         6 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetOffset(x, y))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetOffset(x, y))
+            }
         }
         7 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_positioner.set_reactive needs version 3"))
+                return Err(conn.needs_version(m, "xdg_positioner.set_reactive", 3))
             }
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetReactive)
+            if rd.valid() {
+                return Ok(PositionerRequest.SetReactive)
+            }
         }
         8 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_positioner.set_parent_size needs version 3"))
+                return Err(conn.needs_version(m, "xdg_positioner.set_parent_size", 3))
             }
             let parent_width = rd.i32(conn)
             let parent_height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetParentSize(parent_width, parent_height))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetParentSize(parent_width, parent_height))
+            }
         }
         9 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_positioner.set_parent_configure needs version 3"))
+                return Err(conn.needs_version(m, "xdg_positioner.set_parent_configure", 3))
             }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PositionerRequest.SetParentConfigure(serial))
+            if rd.valid() {
+                return Ok(PositionerRequest.SetParentConfigure(serial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_positioner"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_positioner") })
 }
 
 /// xdg_surface: desktop user interface surface base interface
@@ -268,43 +284,49 @@ pub enum SurfaceRequest {
     AckConfigure(u32)
 }
 
-fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
+pub fn decode_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(SurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(SurfaceRequest.Destroy)
+            }
         }
         1 => {
             let id = Toplevel { id: rd.new_id(mut conn, toplevel_iface, m.version) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.GetToplevel(id))
+            if rd.valid() {
+                return Ok(SurfaceRequest.GetToplevel(id))
+            }
         }
         2 => {
             let id = Popup { id: rd.new_id(mut conn, popup_iface, m.version) }
             let parent_raw = rd.object(conn, surface_iface, true)
             let parent: Option[Surface] = if parent_raw == 0 { None } else { Some(Surface { id: parent_raw }) }
             let positioner = Positioner { id: rd.object(conn, positioner_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.GetPopup(id, parent, positioner))
+            if rd.valid() {
+                return Ok(SurfaceRequest.GetPopup(id, parent, positioner))
+            }
         }
         3 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.SetWindowGeometry(x, y, width, height))
+            if rd.valid() {
+                return Ok(SurfaceRequest.SetWindowGeometry(x, y, width, height))
+            }
         }
         4 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceRequest.AckConfigure(serial))
+            if rd.valid() {
+                return Ok(SurfaceRequest.AckConfigure(serial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_surface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_surface") })
 }
 
 /// suggest a surface change
@@ -417,88 +439,103 @@ pub enum ToplevelRequest {
     SetMinimized
 }
 
-fn decode_toplevel(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelRequest, wire.Error] {
+pub fn decode_toplevel(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ToplevelRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ToplevelRequest.Destroy)
+            }
         }
         1 => {
             let parent_raw = rd.object(conn, toplevel_iface, true)
             let parent: Option[Toplevel] = if parent_raw == 0 { None } else { Some(Toplevel { id: parent_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetParent(parent))
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetParent(parent))
+            }
         }
         2 => {
             let title = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetTitle(title))
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetTitle(title))
+            }
         }
         3 => {
             let app_id = rd.str(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetAppId(app_id))
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetAppId(app_id))
+            }
         }
         4 => {
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
             let serial = rd.u32(conn)
             let x = rd.i32(conn)
             let y = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.ShowWindowMenu(seat, serial, x, y))
+            if rd.valid() {
+                return Ok(ToplevelRequest.ShowWindowMenu(seat, serial, x, y))
+            }
         }
         5 => {
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.Move(seat, serial))
+            if rd.valid() {
+                return Ok(ToplevelRequest.Move(seat, serial))
+            }
         }
         6 => {
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
             let serial = rd.u32(conn)
             let edges = ToplevelResizeEdge(rd.u32(conn))
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.Resize(seat, serial, edges))
+            if rd.valid() {
+                return Ok(ToplevelRequest.Resize(seat, serial, edges))
+            }
         }
         7 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetMaxSize(width, height))
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetMaxSize(width, height))
+            }
         }
         8 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetMinSize(width, height))
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetMinSize(width, height))
+            }
         }
         9 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetMaximized)
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetMaximized)
+            }
         }
         10 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.UnsetMaximized)
+            if rd.valid() {
+                return Ok(ToplevelRequest.UnsetMaximized)
+            }
         }
         11 => {
             let output_raw = rd.object(conn, wayland.output_iface, true)
             let output: Option[wayland.Output] = if output_raw == 0 { None } else { Some(wayland.Output { id: output_raw }) }
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetFullscreen(output))
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetFullscreen(output))
+            }
         }
         12 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.UnsetFullscreen)
+            if rd.valid() {
+                return Ok(ToplevelRequest.UnsetFullscreen)
+            }
         }
         13 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelRequest.SetMinimized)
+            if rd.valid() {
+                return Ok(ToplevelRequest.SetMinimized)
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_toplevel"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_toplevel") })
 }
 
 /// suggest a surface change
@@ -557,32 +594,36 @@ pub enum PopupRequest {
     Reposition(Positioner, u32)
 }
 
-fn decode_popup(mut conn: wire.Conn, m: wire.Msg) -> Result[PopupRequest, wire.Error] {
+pub fn decode_popup(mut conn: wire.Conn, m: wire.Msg) -> Result[PopupRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(PopupRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(PopupRequest.Destroy)
+            }
         }
         1 => {
             let seat = wayland.Seat { id: rd.object(conn, wayland.seat_iface, false) }
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PopupRequest.Grab(seat, serial))
+            if rd.valid() {
+                return Ok(PopupRequest.Grab(seat, serial))
+            }
         }
         2 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_popup.reposition needs version 3"))
+                return Err(conn.needs_version(m, "xdg_popup.reposition", 3))
             }
             let positioner = Positioner { id: rd.object(conn, positioner_iface, false) }
             let token = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PopupRequest.Reposition(positioner, token))
+            if rd.valid() {
+                return Ok(PopupRequest.Reposition(positioner, token))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on xdg_popup"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "xdg_popup") })
 }
 
 /// configure the popup surface
@@ -614,17 +655,19 @@ pub enum WmBaseEvent {
     Ping(u32)
 }
 
-fn decode_wm_base_event(mut conn: wire.Conn, m: wire.Msg) -> Result[WmBaseEvent, wire.Error] {
+pub fn decode_wm_base_event(mut conn: wire.Conn, m: wire.Msg) -> Result[WmBaseEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(WmBaseEvent.Ping(serial))
+            if rd.valid() {
+                return Ok(WmBaseEvent.Ping(serial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on xdg_wm_base"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "xdg_wm_base") })
 }
 
 /// destroy xdg_wm_base
@@ -736,17 +779,19 @@ pub enum SurfaceEvent {
     Configure(u32)
 }
 
-fn decode_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceEvent, wire.Error] {
+pub fn decode_surface_event(mut conn: wire.Conn, m: wire.Msg) -> Result[SurfaceEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let serial = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(SurfaceEvent.Configure(serial))
+            if rd.valid() {
+                return Ok(SurfaceEvent.Configure(serial))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on xdg_surface"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "xdg_surface") })
 }
 
 /// destroy the xdg_surface
@@ -800,40 +845,45 @@ pub enum ToplevelEvent {
     WmCapabilities(List[u8])
 }
 
-fn decode_toplevel_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelEvent, wire.Error] {
+pub fn decode_toplevel_event(mut conn: wire.Conn, m: wire.Msg) -> Result[ToplevelEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let width = rd.i32(conn)
             let height = rd.i32(conn)
             let states = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelEvent.Configure(width, height, states))
+            if rd.valid() {
+                return Ok(ToplevelEvent.Configure(width, height, states))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelEvent.Close)
+            if rd.valid() {
+                return Ok(ToplevelEvent.Close)
+            }
         }
         2 => {
             guard m.version >= 4 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_toplevel.configure_bounds needs version 4"))
+                return Err(conn.needs_version(m, "xdg_toplevel.configure_bounds", 4))
             }
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelEvent.ConfigureBounds(width, height))
+            if rd.valid() {
+                return Ok(ToplevelEvent.ConfigureBounds(width, height))
+            }
         }
         3 => {
             guard m.version >= 5 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_toplevel.wm_capabilities needs version 5"))
+                return Err(conn.needs_version(m, "xdg_toplevel.wm_capabilities", 5))
             }
             let capabilities = rd.array(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ToplevelEvent.WmCapabilities(capabilities))
+            if rd.valid() {
+                return Ok(ToplevelEvent.WmCapabilities(capabilities))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on xdg_toplevel"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "xdg_toplevel") })
 }
 
 /// destroy the xdg_toplevel
@@ -934,32 +984,36 @@ pub enum PopupEvent {
     Repositioned(u32)
 }
 
-fn decode_popup_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PopupEvent, wire.Error] {
+pub fn decode_popup_event(mut conn: wire.Conn, m: wire.Msg) -> Result[PopupEvent, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
             let x = rd.i32(conn)
             let y = rd.i32(conn)
             let width = rd.i32(conn)
             let height = rd.i32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PopupEvent.Configure(x, y, width, height))
+            if rd.valid() {
+                return Ok(PopupEvent.Configure(x, y, width, height))
+            }
         }
         1 => {
-            try rd.finish(mut conn, m)
-            return Ok(PopupEvent.PopupDone)
+            if rd.valid() {
+                return Ok(PopupEvent.PopupDone)
+            }
         }
         2 => {
             guard m.version >= 3 else {
-                return Err(conn.error(m.id, wire.invalid_method, "xdg_popup.repositioned needs version 3"))
+                return Err(conn.needs_version(m, "xdg_popup.repositioned", 3))
             }
             let token = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(PopupEvent.Repositioned(token))
+            if rd.valid() {
+                return Ok(PopupEvent.Repositioned(token))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid event {m.op} on xdg_popup"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, true, "xdg_popup") })
 }
 
 /// remove xdg_popup interface

@@ -26,23 +26,26 @@ pub enum ModifierRequest {
     GetSurface(ModifierSurface, wayland.Surface)
 }
 
-fn decode_modifier(mut conn: wire.Conn, m: wire.Msg) -> Result[ModifierRequest, wire.Error] {
+pub fn decode_modifier(mut conn: wire.Conn, m: wire.Msg) -> Result[ModifierRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ModifierRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ModifierRequest.Destroy)
+            }
         }
         1 => {
             let id = ModifierSurface { id: rd.new_id(mut conn, modifier_surface_iface, m.version) }
             let surface = wayland.Surface { id: rd.object(conn, wayland.surface_iface, false) }
-            try rd.finish(mut conn, m)
-            return Ok(ModifierRequest.GetSurface(id, surface))
+            if rd.valid() {
+                return Ok(ModifierRequest.GetSurface(id, surface))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_alpha_modifier_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_alpha_modifier_v1") })
 }
 
 /// wp_alpha_modifier_surface_v1: alpha modifier object for a surface
@@ -67,22 +70,25 @@ pub enum ModifierSurfaceRequest {
     SetMultiplier(u32)
 }
 
-fn decode_modifier_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ModifierSurfaceRequest, wire.Error] {
+pub fn decode_modifier_surface(mut conn: wire.Conn, m: wire.Msg) -> Result[ModifierSurfaceRequest, wire.Error] {
     var rd = conn.reader(m)
+    var matched = true
     match m.op {
         0 => {
-            try rd.finish(mut conn, m)
-            conn.remove(m.id)
-            return Ok(ModifierSurfaceRequest.Destroy)
+            if rd.valid() {
+                conn.remove(m.id)
+                return Ok(ModifierSurfaceRequest.Destroy)
+            }
         }
         1 => {
             let factor = rd.u32(conn)
-            try rd.finish(mut conn, m)
-            return Ok(ModifierSurfaceRequest.SetMultiplier(factor))
+            if rd.valid() {
+                return Ok(ModifierSurfaceRequest.SetMultiplier(factor))
+            }
         }
-        _ => {}
+        _ => matched = false
     }
-    return Err(conn.error(m.id, wire.invalid_method, "invalid request {m.op} on wp_alpha_modifier_surface_v1"))
+    return Err(if matched { rd.finish_err(mut conn, m) } else { conn.invalid_op(m, false, "wp_alpha_modifier_surface_v1") })
 }
 
 /// destroy the alpha modifier manager object
