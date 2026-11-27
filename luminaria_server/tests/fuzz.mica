@@ -427,7 +427,7 @@ test "broken framing is refused, not read past" {
     let path = "{dir}/{srv.name()}"
     var r = rand.Rng.new(knob("FUZZ_SEED", 7))
     for _ in 0..knob("FUZZ_ROUNDS", 200) {
-        let raw = net.unix_connect(path).expect("connect")
+        var raw = net.unix_connect(path).expect("connect")
         let sc = accept(mut srv)
         var bytes: List[u8] = []
         // A plausible header now and then, so some messages get decoded.

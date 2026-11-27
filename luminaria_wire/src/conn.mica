@@ -111,8 +111,10 @@ pub struct Conn {
 /// Wrap a connected socket (made non-blocking here). Id 1 is the display,
 /// interface 1 at version 1.
 pub fn Conn.new(sock: int, end: End) -> Result[Conn, Error] {
-    let c = net.Conn { fd: sock }
-    match c.set_nonblocking(true) {
+    var c = net.Conn { fd: sock }
+    let nb = c.set_nonblocking(true)
+    c.fd = -1
+    match take nb {
         Err(e) => {
             return Err(Error.Io(e))
         }

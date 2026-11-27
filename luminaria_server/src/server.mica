@@ -486,8 +486,10 @@ fn Server.add_client(mut self, take conn: wire.Conn, k: u32) -> (ids.Client, int
         cd.app_id = self.contexts.items[int(k)].app_id.clone()
         cd.instance_id = self.contexts.items[int(k)].instance_id.clone()
     }
-    let sock = net.Conn { fd }
-    if let Ok(cred) = sock.peer_cred() {
+    var sock = net.Conn { fd }
+    let cred_res = sock.peer_cred()
+    sock.fd = -1
+    if let Ok(cred) = cred_res {
         cd.pid = cred.pid
         cd.uid = cred.uid
         cd.gid = cred.gid

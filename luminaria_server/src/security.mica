@@ -65,7 +65,10 @@ fn manager(mut srv: server.Server, ci: u32, take req: sc.ContextManagerRequest) 
                 srv.fail(ci, ctx.id, u32(sc.ContextManagerError.Nested), "a sandboxed client cannot make sandboxes")
                 return
             }
-            guard listening(listen.raw()) and (net.Listener { fd: listen.raw() }).set_nonblocking(true).is_ok() else {
+            var l = net.Listener { fd: listen.raw() }
+            let nb = l.set_nonblocking(true)
+            l.fd = -1
+            guard listening(listen.raw()) and nb.is_ok() else {
                 srv.fail(ci, ctx.id, u32(sc.ContextManagerError.InvalidListenFd), "not a listening socket")
                 return
             }

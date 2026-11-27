@@ -51,7 +51,7 @@ fn bind(dir: str, take name: str) -> Result[Option[Listener], str] {
     if fs.exists(path) {
         discard fs.remove(path)
     }
-    let l = match net.unix_listen(path) {
+    var l = match net.unix_listen(path) {
         Ok(v) => v
         Err(e) => {
             os.close(lock)
@@ -66,7 +66,9 @@ fn bind(dir: str, take name: str) -> Result[Option[Listener], str] {
         }
         Ok => {}
     }
-    return Ok(Some(Listener { fd: l.fd, name, path, lock_path, lock }))
+    let fd = l.fd
+    l.fd = -1
+    return Ok(Some(Listener { fd, name, path, lock_path, lock }))
 }
 
 /// Listen for clients on display `name`; "" takes the first free of
@@ -95,14 +97,22 @@ pub fn Listener.accept(self) -> Result[Option[conn.Conn], conn.Error] {
 /// A waiting client on the non-blocking listening socket `fd` (one a
 /// sandbox handed over, say), or `None`.
 pub fn accept_on(fd: int) -> Result[Option[conn.Conn], conn.Error] {
-    let l = net.Listener { fd }
-    let c = match l.accept() {
+    var l = net.Listener { fd }
+    let res = l.accept()
+    l.fd = -1
+    var c = match take res {
         Ok(v) => v
         Err(e) => {
             return if e.would_block() { Ok(None) } else { Err(conn.Error.Io(e)) }
         }
     }
-    return Ok(Some(try conn.Conn.new(c.fd, conn.End.Server)))
+    match conn.Conn.new(c.fd, conn.End.Server) {
+        Ok(out) => {
+            c.fd = -1
+            return Ok(Some(out))
+        }
+        Err(e) => { return Err(e) }
+    }
 }
 
 /// A listener on nothing (a placeholder to move one out).
@@ -136,13 +146,19 @@ pub fn connect(name: str) -> Result[conn.Conn, str] {
     if not display.starts_with("/") {
         display = "{try runtime_dir()}/{display}"
     }
-    let c = match net.unix_connect(display) {
+    var c = match net.unix_connect(display) {
         Ok(v) => v
         Err(e) => {
             return Err("{e}")
         }
     }
-    return open(c.fd)
+    match open(c.fd) {
+        Ok(out) => {
+            c.fd = -1
+            return Ok(out)
+        }
+        Err(e) => { return Err(e) }
+    }
 }
 
 fn open(fd: int) -> Result[conn.Conn, str] {
